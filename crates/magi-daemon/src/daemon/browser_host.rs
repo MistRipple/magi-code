@@ -650,10 +650,9 @@ fn restore_browser_sessions(state: &ApiState) -> Result<(), String> {
         // Tab 保持 Suspended，直到右侧面板首次激活时由 Electron 物化真实 Surface。
         state.event_bus.publish(
             EventEnvelope::domain(
-                EventId::new(format!(
-                    "event-browser-session-recovered-{}-{}",
-                    restored.browser_session_id,
-                    UtcMillis::now().0
+                EventId::unique(format!(
+                    "event-browser-session-recovered-{}",
+                    restored.browser_session_id
                 )),
                 "browser.session.recovered",
                 serde_json::json!({
@@ -1234,11 +1233,7 @@ fn publish_tab_event(
     };
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-{}-{}",
-                event_type.replace('.', "-"),
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("event-{}", event_type.replace('.', "-"))),
             event_type,
             payload,
         )
@@ -1284,10 +1279,9 @@ fn suspend_browser_sessions_for_host_disconnect(state: &ApiState) -> Vec<Browser
         };
         state.event_bus.publish(
             EventEnvelope::domain(
-                EventId::new(format!(
-                    "event-browser-session-interrupted-{}-{}",
-                    interrupted_session.browser_session_id,
-                    UtcMillis::now().0
+                EventId::unique(format!(
+                    "event-browser-session-interrupted-{}",
+                    interrupted_session.browser_session_id
                 )),
                 "browser.session.status_changed",
                 serde_json::json!({
@@ -1402,11 +1396,7 @@ fn interrupt_all_tasks_for_daemon_shutdown(state: &ApiState) {
                 }
                 state.event_bus.publish(
                     EventEnvelope::domain(
-                        EventId::new(format!(
-                            "event-browser-turn-interrupted-{}-{}",
-                            session_id,
-                            UtcMillis::now().0
-                        )),
+                        EventId::unique(format!("event-browser-turn-interrupted-{}", session_id)),
                         "session.turn.interrupted",
                         serde_json::json!({
                             "session_id": &session_id,
@@ -1472,11 +1462,7 @@ fn set_host_status(
 fn publish_host_status(state: &ApiState) {
     let runtime = state.browser_host_status();
     state.event_bus.publish(EventEnvelope::system(
-        EventId::new(format!(
-            "event-browser-host-status-{:?}-{}",
-            runtime.status,
-            UtcMillis::now().0
-        )),
+        EventId::unique(format!("event-browser-host-status-{:?}", runtime.status)),
         "browser.host.status_changed",
         serde_json::json!({
             "host_status": runtime.status,

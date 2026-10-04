@@ -264,13 +264,11 @@ await withGoldenViteServer(async (server) => {
 
   {
     const { client, socket } = await connectReady(AppServerClient);
-    const listPromise = client.request('browser/tools/list', {
-      sessionId: 'session-golden',
-    });
+    const listPromise = client.request('browser/tools/list', {});
     await Promise.resolve();
     const listRequest = lastRequest(socket, 'browser/tools/list');
     assert.ok(listRequest);
-    assert.deepEqual(listRequest.params, { sessionId: 'session-golden' });
+    assert.deepEqual(listRequest.params, {});
     reply(socket, listRequest, {
       tools: [
         {
@@ -292,7 +290,6 @@ await withGoldenViteServer(async (server) => {
         browserUseEnabled: true,
         hostStatus: 'ready',
         hostProtocolCompatible: true,
-        accessProfile: 'full_access',
       },
       runtimeEpoch: 'runtime-golden-browser-1',
     });

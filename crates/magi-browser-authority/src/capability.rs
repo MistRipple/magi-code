@@ -1,4 +1,3 @@
-use magi_core::AccessProfile;
 use serde::{Deserialize, Serialize};
 
 use crate::{BrowserToolAccess, BrowserToolKind};
@@ -41,7 +40,6 @@ pub struct BrowserCapabilitySnapshot {
     pub browser_use_enabled: bool,
     pub host_status: BrowserHostStatus,
     pub host_protocol_compatible: bool,
-    pub access_profile: AccessProfile,
 }
 
 impl BrowserCapabilitySnapshot {
@@ -134,7 +132,6 @@ mod tests {
             browser_use_enabled: true,
             host_status: BrowserHostStatus::Ready,
             host_protocol_compatible: true,
-            access_profile: AccessProfile::default(),
         }
     }
 

@@ -984,7 +984,6 @@ export interface BrowserCapabilitiesSnapshot {
   browserUseEnabled: boolean;
   hostStatus: 'stopped' | 'starting' | 'ready' | 'reconnecting' | 'failed';
   hostProtocolCompatible: boolean;
-  accessProfile: string;
   hostState: string;
   lastErrorCode: string | null;
   platformCapabilities: {
@@ -1051,9 +1050,8 @@ export async function getAgentVersion(): Promise<VersionHandshakeDto> {
   return parseAgentJson<VersionHandshakeDto>(response, 'load version');
 }
 
-export async function getBrowserCapabilities(sessionId?: string): Promise<BrowserCapabilitiesSnapshot> {
+export async function getBrowserCapabilities(): Promise<BrowserCapabilitiesSnapshot> {
   const queryParams = new URLSearchParams({ clientPlatform: browserClientPlatform() });
-  if (sessionId?.trim()) queryParams.set('sessionId', sessionId.trim());
   const response = await getTransport().request(
     agentUrl('/api/browser/capabilities', queryParams.toString()),
     {

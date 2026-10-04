@@ -70,7 +70,7 @@ pub struct BrowserToolRuntimeDependencies {
 }
 
 impl BrowserToolRuntimeDependencies {
-    pub fn capabilities(&self, session_id: Option<&SessionId>) -> BrowserCapabilitySnapshot {
+    pub fn capabilities(&self) -> BrowserCapabilitySnapshot {
         let host = self
             .host_status
             .read()
@@ -82,10 +82,6 @@ impl BrowserToolRuntimeDependencies {
             browser_use_enabled: host.browser_use_enabled,
             host_status: host.status,
             host_protocol_compatible: host.protocol_compatible,
-            access_profile: session_id
-                .and_then(|id| self.session_store.active_goal(id))
-                .map(|goal| goal.access_profile)
-                .unwrap_or(magi_core::AccessProfile::Restricted),
         }
     }
 
@@ -171,19 +167,18 @@ impl BrowserToolRuntimeDependencies {
         let Some(kind) = BrowserToolKind::from_name(tool_name) else {
             return failure(tool_name, "unknown_browser_tool", "未知的浏览器工具");
         };
-        let Some(mut capability) = context.browser_capability_snapshot.clone() else {
+        let Some(capability) = context.browser_capability_snapshot.clone() else {
             return failure(
                 tool_name,
                 "browser_capability_snapshot_missing",
                 "浏览器工具调用缺少当前模型轮次的能力快照",
             );
         };
-        capability.access_profile = context.access_profile;
         let requested_access = browser_tool_requested_access(kind, arguments);
         if let Err(error) = capability.allows_execution(kind, requested_access) {
             return capability_unavailable(tool_name, &error.to_string());
         }
-        let live_capability = self.capabilities(Some(&session_id));
+        let live_capability = self.capabilities();
         if let Some(reason) = live_capability.unavailable_reason() {
             return capability_unavailable(
                 tool_name,
@@ -445,7 +440,7 @@ impl BrowserToolRuntimeDependencies {
                 let page = page_state(reply.response.outcome, "浏览器导航失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
-                    let snapshot = self.capture_snapshot(&client, &tab.tab_id, None).await?;
+                    let snapshot = self.capture_snapshot(&client, &tab.tab_id).await?;
                     Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id))
                 } else {
                     None
@@ -459,13 +454,7 @@ impl BrowserToolRuntimeDependencies {
                 .to_string())
             }
             "browser_snapshot" => {
-                let snapshot = self
-                    .capture_snapshot(
-                        &client,
-                        &tab.tab_id,
-                        optional_string(arguments, "subtree_ref"),
-                    )
-                    .await?;
+                let snapshot = self.capture_snapshot(&client, &tab.tab_id).await?;
                 let snapshot = browser_tool_snapshot_value(&snapshot, &tab.tab_id);
                 Ok(serde_json::to_string(&json!({
                     "tool": tool_name,
@@ -512,10 +501,10 @@ impl BrowserToolRuntimeDependencies {
                     .request(command)
                     .await
                     .map_err(browser_host_client_error)?;
-                let page = page_state(reply.response.outcome, "浏览器交互失败")?;
-                let updated = self.apply_page_state(&tab.tab_id, page)?;
+                let interaction = interaction_result(reply.response.outcome, "浏览器交互失败")?;
+                let updated = self.apply_page_state(&tab.tab_id, interaction.page_state)?;
                 let (snapshot, snapshot_error) = if bool_arg(arguments, "include_snapshot", false) {
-                    match self.capture_snapshot(&client, &tab.tab_id, None).await {
+                    match self.capture_snapshot(&client, &tab.tab_id).await {
                         Ok(snapshot) => (
                             Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id)),
                             None,
@@ -536,6 +525,7 @@ impl BrowserToolRuntimeDependencies {
                     "tool": tool_name,
                     "status": "succeeded",
                     "tab": updated,
+                    "target": interaction.target,
                     "snapshot": snapshot,
                     "snapshot_error": snapshot_error,
                 })
@@ -683,6 +673,7 @@ impl BrowserToolRuntimeDependencies {
             "heap" => matches!(action.as_deref(), Some("take_snapshot" | "close_snapshot")),
             "third_party" => matches!(action.as_deref(), Some("clear")),
             "webmcp" => matches!(action.as_deref(), Some("execute")),
+            "storage" => matches!(action.as_deref(), Some("set" | "remove" | "clear")),
             "pwa" => false,
             _ => false,
         };
@@ -713,7 +704,7 @@ impl BrowserToolRuntimeDependencies {
         };
         let snapshot = if bool_arg(arguments, "include_snapshot", false) {
             Some(browser_tool_snapshot_value(
-                &self.capture_snapshot(client, &tab.tab_id, None).await?,
+                &self.capture_snapshot(client, &tab.tab_id).await?,
                 &tab.tab_id,
             ))
         } else {
@@ -1288,7 +1279,6 @@ impl BrowserToolRuntimeDependencies {
         &self,
         client: &BrowserHostClient,
         tab_id: &BrowserTabId,
-        subtree_ref: Option<String>,
     ) -> Result<magi_browser_authority::BrowserHostSnapshot, BrowserToolError> {
         let (navigation_revision, snapshot_revision) =
             self.mutate(|authority| authority.record_snapshot(tab_id, UtcMillis::now()))?;
@@ -1298,7 +1288,6 @@ impl BrowserToolRuntimeDependencies {
                 navigation_revision,
                 snapshot_revision,
                 limits: Default::default(),
-                subtree_ref,
             })
             .await
             .map_err(browser_host_client_error)?;
@@ -1650,6 +1639,8 @@ fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
         "browser_third_party" => Some("third_party"),
         "browser_webmcp" => Some("webmcp"),
         "browser_pwa" => Some("pwa"),
+        "browser_read" => Some("read"),
+        "browser_storage" => Some("storage"),
         _ => None,
     }
 }
@@ -1754,6 +1745,85 @@ fn validate_devtools_arguments(
                 ));
             }
         }
+        "read" => {
+            if arguments.contains_key("element_ref") {
+                validate_snapshot_target_object(arguments, "browser_read")?;
+            }
+            if let Some(value) = arguments.get("max_chars")
+                && !value
+                    .as_u64()
+                    .is_some_and(|value| (1..=50_000).contains(&value))
+            {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_read.max_chars 必须是 1 到 50000 的整数",
+                ));
+            }
+            if let Some(value) = arguments.get("offset")
+                && value.as_u64().is_none()
+            {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_read.offset 必须是非负整数",
+                ));
+            }
+            if let Some(value) = arguments.get("query")
+                && !value.as_str().is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_read.query 必须是非空字符串",
+                ));
+            }
+            if let Some(value) = arguments.get("include_links")
+                && !value.is_boolean()
+            {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_read.include_links 必须是布尔值",
+                ));
+            }
+        }
+        "storage" => {
+            let area = arguments
+                .get("area")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let valid = match area {
+                "local" | "session" => {
+                    matches!(action, "list" | "get" | "set" | "remove" | "clear")
+                }
+                // cookie 只开放元数据列表与清理：不读值，也不写入，登录凭证不进入模型上下文。
+                "cookies" => matches!(action, "list" | "clear"),
+                _ => false,
+            };
+            if !valid {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    format!("browser_storage 不支持 area={area} 的 action={action}"),
+                ));
+            }
+            let key = arguments
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty());
+            if matches!(action, "get" | "set" | "remove") && key.is_none() {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    format!("browser_storage 的 {action} 必须提供非空 key"),
+                ));
+            }
+            if action == "set" && !arguments.get("value").is_some_and(Value::is_string) {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_storage 的 set 必须提供字符串 value",
+                ));
+            }
+        }
         "pwa" => {
             if arguments.get("action").and_then(Value::as_str) != Some("state") {
                 return Err(BrowserToolError::new(
@@ -1853,17 +1923,6 @@ fn validate_snapshot_target_object(
     target: &Map<String, Value>,
     context: &str,
 ) -> Result<(), BrowserToolError> {
-    let revision = target
-        .get("snapshot_revision")
-        .and_then(Value::as_u64)
-        .filter(|revision| *revision > 0)
-        .ok_or_else(|| {
-            BrowserToolError::new(
-                "invalid_arguments",
-                format!("{context}.snapshot_revision 必须是正整数"),
-            )
-        })?;
-    let _ = revision;
     let element_ref = target
         .get("element_ref")
         .and_then(Value::as_str)
@@ -1968,6 +2027,7 @@ fn browser_tool_requested_access(
             | BrowserToolKind::ThirdParty
             | BrowserToolKind::WebMcp
             | BrowserToolKind::Pwa
+            | BrowserToolKind::Storage
     ) {
         return match (kind, action) {
             (BrowserToolKind::Dialog, Some("list"))
@@ -1984,7 +2044,8 @@ fn browser_tool_requested_access(
             )
             | (BrowserToolKind::ThirdParty, Some("list"))
             | (BrowserToolKind::WebMcp, Some("list"))
-            | (BrowserToolKind::Pwa, Some("state")) => BrowserToolAccess::Read,
+            | (BrowserToolKind::Pwa, Some("state"))
+            | (BrowserToolKind::Storage, Some("list" | "get")) => BrowserToolAccess::Read,
             (BrowserToolKind::Lighthouse, _) if lighthouse_mode == Some("snapshot") => {
                 BrowserToolAccess::Read
             }
@@ -2033,7 +2094,6 @@ struct BrowserToolError {
     requires_user_action: bool,
     details: Option<Value>,
     status: ExecutionResultStatus,
-    indeterminate: bool,
 }
 
 impl BrowserToolError {
@@ -2045,7 +2105,6 @@ impl BrowserToolError {
             requires_user_action: false,
             details: None,
             status: ExecutionResultStatus::Failed,
-            indeterminate: false,
         }
     }
 
@@ -2064,12 +2123,14 @@ impl BrowserToolError {
                     "diagnostic": error.diagnostic,
                 },
             })),
+            // 结果未确认（写操作已发出但无法确认是否生效）是独立的执行状态，不是普通失败。
             status: if sensitive_action {
                 ExecutionResultStatus::NeedsApproval
+            } else if indeterminate {
+                ExecutionResultStatus::Indeterminate
             } else {
                 ExecutionResultStatus::Failed
             },
-            indeterminate,
         }
     }
 }
@@ -2095,7 +2156,7 @@ fn capability_unavailable(tool: &str, message: &str) -> (String, ExecutionResult
 }
 
 fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, ExecutionResultStatus) {
-    let (mut payload, _) = failure_payload_with_status(
+    failure_payload_with_status(
         tool,
         &error.code,
         &error.message,
@@ -2103,14 +2164,7 @@ fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, Executio
         error.requires_user_action,
         error.details.as_ref(),
         error.status,
-    );
-    if error.indeterminate
-        && let Ok(mut value) = serde_json::from_str::<Value>(&payload)
-    {
-        value["status"] = Value::String("indeterminate".to_string());
-        payload = value.to_string();
-    }
-    (payload, error.status)
+    )
 }
 
 fn failure_payload(
@@ -2141,16 +2195,9 @@ fn failure_payload_with_status(
     details: Option<&Value>,
     status: ExecutionResultStatus,
 ) -> (String, ExecutionResultStatus) {
-    let status_label = match status {
-        ExecutionResultStatus::NeedsApproval => "needs_approval",
-        ExecutionResultStatus::Rejected => "rejected",
-        ExecutionResultStatus::Cancelled => "cancelled",
-        ExecutionResultStatus::Succeeded => "succeeded",
-        ExecutionResultStatus::Failed => "failed",
-    };
     let mut payload = json!({
         "tool": tool,
-        "status": status_label,
+        "status": status.wire_label(),
         "error_code": code,
         "recoverable": recoverable,
         "requires_user_action": requires_user_action,
@@ -2195,10 +2242,6 @@ fn snapshot_target(
     arguments: &Map<String, Value>,
 ) -> Result<BrowserSnapshotTarget, BrowserToolError> {
     Ok(BrowserSnapshotTarget {
-        snapshot_revision: arguments
-            .get("snapshot_revision")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| BrowserToolError::new("invalid_arguments", "缺少 snapshot_revision"))?,
         element_ref: string_arg(arguments, "element_ref")?,
     })
 }
@@ -2354,7 +2397,12 @@ fn browser_host_client_error(error: BrowserHostClientError) -> BrowserToolError 
         | BrowserHostClientError::DesktopEpochMismatch { .. }
         | BrowserHostClientError::DesktopProcessMismatch { .. } => "browser_host_unavailable",
     };
-    BrowserToolError::new(code, error.to_string())
+    let indeterminate = matches!(error, BrowserHostClientError::RequestIndeterminate(_));
+    let mut tool_error = BrowserToolError::new(code, error.to_string());
+    if indeterminate {
+        tool_error.status = ExecutionResultStatus::Indeterminate;
+    }
+    tool_error
 }
 
 fn page_state(
@@ -2363,6 +2411,16 @@ fn page_state(
 ) -> Result<magi_browser_authority::BrowserHostPageState, BrowserToolError> {
     match succeeded_result(outcome, context)? {
         BrowserHostCommandResult::PageState(page) => Ok(page),
+        _ => Err(BrowserToolError::new("browser_result_invalid", context)),
+    }
+}
+
+fn interaction_result(
+    outcome: BrowserHostCommandOutcome,
+    context: &str,
+) -> Result<magi_browser_authority::BrowserHostInteraction, BrowserToolError> {
+    match succeeded_result(outcome, context)? {
+        BrowserHostCommandResult::Interaction(interaction) => Ok(interaction),
         _ => Err(BrowserToolError::new("browser_result_invalid", context)),
     }
 }
@@ -2384,10 +2442,6 @@ fn browser_tool_snapshot_value(
     value.insert(
         "navigation_revision".to_string(),
         json!(snapshot.navigation_revision),
-    );
-    value.insert(
-        "snapshot_revision".to_string(),
-        json!(snapshot.snapshot_revision),
     );
     let mut remaining_text_bytes = MODEL_SNAPSHOT_TEXT_LIMIT_BYTES;
     insert_model_snapshot_string(
@@ -2469,17 +2523,14 @@ fn browser_tool_snapshot_value(
             if let Some(kind) = node.sensitive_input_kind {
                 element.insert("sensitive_input_kind".to_string(), json!(kind));
             }
+            if !node.states.is_empty() {
+                element.insert("states".to_string(), json!(node.states));
+            }
             Value::Object(element)
         })
         .collect::<Vec<_>>();
 
     value.insert("elements".to_string(), Value::Array(elements));
-    if !snapshot.accessibility_tree.is_empty() {
-        value.insert(
-            "accessibility_tree".to_string(),
-            Value::Array(snapshot.accessibility_tree.clone()),
-        );
-    }
     Value::Object(value)
 }
 
@@ -2603,11 +2654,11 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::{
-        BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
-        browser_tool_snapshot_value, normalize_screenshot_clip, optional_snapshot_target,
-        parse_browser_navigation, parse_normalized_rect, screenshot_has_element_scope,
-        tab_in_session, validate_browser_tabs_arguments, validate_devtools_arguments,
-        validate_screenshot_binary, validate_screenshot_scope,
+        BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_devtools_operation,
+        browser_tool_requested_access, browser_tool_snapshot_value, normalize_screenshot_clip,
+        optional_snapshot_target, parse_browser_navigation, parse_normalized_rect,
+        screenshot_has_element_scope, tab_in_session, validate_browser_tabs_arguments,
+        validate_devtools_arguments, validate_screenshot_binary, validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
     use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
@@ -2920,7 +2971,6 @@ mod tests {
                 browser_use_enabled: true,
                 host_status: BrowserHostStatus::Ready,
                 host_protocol_compatible: true,
-                access_profile: magi_core::AccessProfile::Restricted,
             }),
             ..Default::default()
         };
@@ -3071,6 +3121,7 @@ mod tests {
                             focused: false,
                             editable: false,
                             sensitive_input_kind: None,
+                            states: Vec::new(),
                             visible: true,
                             bounds: Some(BrowserHostRect {
                                 x: 0.0,
@@ -3084,8 +3135,6 @@ mod tests {
                         total_nodes: 1,
                         text_bytes: 11,
                         truncated: false,
-                        continuation_refs: Vec::new(),
-                        accessibility_tree: Vec::new(),
                     }),
                     _ => BrowserHostCommandResult::Empty,
                 };
@@ -3168,7 +3217,6 @@ mod tests {
                     browser_use_enabled: true,
                     host_status: BrowserHostStatus::Ready,
                     host_protocol_compatible: true,
-                    access_profile,
                 }),
                 ..Default::default()
             };
@@ -3236,14 +3284,8 @@ mod tests {
     #[test]
     fn browser_devtools_contract_uses_source_target_fields_and_expression() {
         let mut arguments = Map::new();
-        arguments.insert(
-            "source".to_string(),
-            json!({"snapshot_revision": 2, "element_ref": "e-1"}),
-        );
-        arguments.insert(
-            "target".to_string(),
-            json!({"snapshot_revision": 2, "element_ref": "e-2"}),
-        );
+        arguments.insert("source".to_string(), json!({"element_ref": "e-1"}));
+        arguments.insert("target".to_string(), json!({"element_ref": "e-2"}));
         validate_devtools_arguments("drag", &arguments)
             .expect("drag should use source and target snapshot references");
         assert!(validate_devtools_arguments("drag", &Map::new()).is_err());
@@ -3251,7 +3293,7 @@ mod tests {
         let mut fill_arguments = Map::new();
         fill_arguments.insert(
             "fields".to_string(),
-            json!([{"snapshot_revision": 2, "element_ref": "e-1", "value": "Magi"}]),
+            json!([{"element_ref": "e-1", "value": "Magi"}]),
         );
         validate_devtools_arguments("fill_form", &fill_arguments)
             .expect("fill_form should use fields");
@@ -3259,7 +3301,7 @@ mod tests {
         let mut invalid_fill = Map::new();
         invalid_fill.insert(
             "fields".to_string(),
-            json!([{"snapshot_revision": 2, "element_ref": "e-1", "value": {"unexpected": true}}]),
+            json!([{"element_ref": "e-1", "value": {"unexpected": true}}]),
         );
         assert!(validate_devtools_arguments("fill_form", &invalid_fill).is_err());
 
@@ -3300,6 +3342,122 @@ mod tests {
             BrowserToolAccess::Read
         );
 
+        // browser_read 是只读工具：整页读取、分页、检索和元素范围读取都不需要写租约。
+        assert_eq!(browser_devtools_operation("browser_read"), Some("read"));
+        let mut read_page = Map::new();
+        read_page.insert("max_chars".to_string(), json!(3000));
+        read_page.insert("offset".to_string(), json!(0));
+        read_page.insert("query".to_string(), json!("价格"));
+        read_page.insert("include_links".to_string(), json!(true));
+        validate_devtools_arguments("read", &read_page).expect("read page should be valid");
+        validate_devtools_arguments("read", &Map::new()).expect("read defaults to whole page");
+        assert_eq!(
+            browser_tool_requested_access(BrowserToolKind::Read, &read_page),
+            BrowserToolAccess::Read
+        );
+        let mut read_scoped = Map::new();
+        read_scoped.insert("element_ref".to_string(), json!("e:2:5"));
+        validate_devtools_arguments("read", &read_scoped).expect("scoped read should be valid");
+        for (name, key, value) in [
+            ("element_ref 为合成根节点", "element_ref", json!("root")),
+            ("max_chars 为 0", "max_chars", json!(0)),
+            ("max_chars 超上限", "max_chars", json!(50_001)),
+            ("offset 为负数", "offset", json!(-1)),
+            ("query 为空白", "query", json!("   ")),
+            ("include_links 不是布尔", "include_links", json!("yes")),
+        ] {
+            let mut invalid = Map::new();
+            invalid.insert(key.to_string(), value);
+            assert!(
+                validate_devtools_arguments("read", &invalid).is_err(),
+                "{name} 应被拒绝"
+            );
+        }
+
+        // browser_storage：存储可读写；cookie 只能列出元数据与清理，读值和写入都被拒绝。
+        assert_eq!(
+            browser_devtools_operation("browser_storage"),
+            Some("storage")
+        );
+        let storage_args = |pairs: &[(&str, Value)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect::<Map<String, Value>>()
+        };
+        for valid in [
+            storage_args(&[("area", json!("local")), ("action", json!("list"))]),
+            storage_args(&[
+                ("area", json!("session")),
+                ("action", json!("get")),
+                ("key", json!("flag")),
+            ]),
+            storage_args(&[
+                ("area", json!("local")),
+                ("action", json!("set")),
+                ("key", json!("flag")),
+                ("value", json!("on")),
+            ]),
+            storage_args(&[("area", json!("cookies")), ("action", json!("list"))]),
+            storage_args(&[("area", json!("cookies")), ("action", json!("clear"))]),
+        ] {
+            validate_devtools_arguments("storage", &valid).expect("valid storage call");
+        }
+        for (name, invalid) in [
+            (
+                "cookie 不能读值",
+                storage_args(&[
+                    ("area", json!("cookies")),
+                    ("action", json!("get")),
+                    ("key", json!("sid")),
+                ]),
+            ),
+            (
+                "cookie 不能写入",
+                storage_args(&[
+                    ("area", json!("cookies")),
+                    ("action", json!("set")),
+                    ("key", json!("sid")),
+                    ("value", json!("x")),
+                ]),
+            ),
+            (
+                "get 缺少 key",
+                storage_args(&[("area", json!("local")), ("action", json!("get"))]),
+            ),
+            (
+                "set 缺少 value",
+                storage_args(&[
+                    ("area", json!("local")),
+                    ("action", json!("set")),
+                    ("key", json!("k")),
+                ]),
+            ),
+            (
+                "未知 area",
+                storage_args(&[("area", json!("indexeddb")), ("action", json!("list"))]),
+            ),
+        ] {
+            assert!(
+                validate_devtools_arguments("storage", &invalid).is_err(),
+                "{name} 应被拒绝"
+            );
+        }
+        assert_eq!(
+            browser_tool_requested_access(
+                BrowserToolKind::Storage,
+                &storage_args(&[("area", json!("cookies")), ("action", json!("list"))])
+            ),
+            BrowserToolAccess::Read
+        );
+        assert_eq!(
+            browser_tool_requested_access(
+                BrowserToolKind::Storage,
+                &storage_args(&[("area", json!("cookies")), ("action", json!("clear"))])
+            ),
+            BrowserToolAccess::Write
+        );
+
         let mut evaluate_arguments = Map::new();
         evaluate_arguments.insert("expression".to_string(), json!("document.title"));
         validate_devtools_arguments("evaluate", &evaluate_arguments)
@@ -3309,14 +3467,14 @@ mod tests {
 
     #[test]
     fn browser_screenshot_root_is_page_scope_and_normalized_clip_is_validated() {
-        let root = json!({ "element_ref": "root", "snapshot_revision": 4 });
+        let root = json!({ "element_ref": "root" });
         assert_eq!(
             optional_snapshot_target(root.as_object().expect("root target object"))
                 .expect("root target should parse"),
             None
         );
 
-        let element = json!({ "element_ref": "e:4:1", "snapshot_revision": 4 });
+        let element = json!({ "element_ref": "e:4:1" });
         assert_eq!(
             optional_snapshot_target(element.as_object().expect("element target object"))
                 .expect("element target should parse")
@@ -3436,6 +3594,7 @@ mod tests {
                 focused: false,
                 editable: false,
                 sensitive_input_kind: None,
+                states: Vec::new(),
                 visible: true,
                 bounds: None,
                 children: nodes,
@@ -3444,8 +3603,6 @@ mod tests {
             total_nodes: 201,
             text_bytes: 20,
             truncated: true,
-            continuation_refs: vec!["e-2-1".to_string()],
-            accessibility_tree: Vec::new(),
         };
 
         let logical_tab_id = BrowserTabId::new("browser-logical-tab");
@@ -3460,7 +3617,8 @@ mod tests {
         assert_eq!(elements[0]["editable"], true);
         assert!(elements[0].get("bounds").is_none());
         assert!(elements[0].get("disabled").is_none());
-        assert!(value.get("continuation_refs").is_none());
+        assert!(elements[0].get("states").is_none());
+        assert!(value.get("accessibility_tree").is_none());
         assert!(value.get("truncated").is_none());
         assert!(value.get("returned_nodes").is_none());
         assert!(value.get("total_nodes").is_none());
@@ -3524,6 +3682,7 @@ mod tests {
             focused,
             editable,
             sensitive_input_kind: None,
+            states: Vec::new(),
             visible: true,
             bounds: Some(BrowserHostRect {
                 x: 0.0,
@@ -3533,5 +3692,51 @@ mod tests {
             }),
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn snapshot_elements_expose_node_states_for_the_model() {
+        use magi_browser_authority::BrowserNodeState;
+        let mut checkbox = snapshot_node("e-1-1", Some("checkbox"), Some("同意条款"), false, false);
+        checkbox.states = vec![BrowserNodeState::Unchecked, BrowserNodeState::Required];
+        let plain = snapshot_node("e-1-2", Some("button"), Some("提交"), false, false);
+        let snapshot = BrowserHostSnapshot {
+            tab_id: BrowserTabId::new("browser-tab-states"),
+            navigation_revision: 1,
+            snapshot_revision: 1,
+            root: BrowserSnapshotNode {
+                element_ref: "root".to_string(),
+                role: Some("document".to_string()),
+                name: Some("表单".to_string()),
+                value: None,
+                description: None,
+                disabled: false,
+                focused: false,
+                editable: false,
+                sensitive_input_kind: None,
+                states: Vec::new(),
+                visible: true,
+                bounds: None,
+                children: vec![checkbox, plain],
+            },
+            returned_nodes: 2,
+            total_nodes: 2,
+            text_bytes: 10,
+            truncated: false,
+        };
+        let value =
+            browser_tool_snapshot_value(&snapshot, &BrowserTabId::new("browser-logical-tab"));
+        let elements = value["elements"]
+            .as_array()
+            .expect("elements should be an array");
+        let by_ref = |element_ref: &str| {
+            elements
+                .iter()
+                .find(|element| element["element_ref"] == element_ref)
+                .expect("element should be present")
+        };
+        // 未勾选和必填是模型判断“现在能不能提交”的依据，必须出现在元素上。
+        assert_eq!(by_ref("e-1-1")["states"], json!(["unchecked", "required"]));
+        assert!(by_ref("e-1-2").get("states").is_none());
     }
 }

@@ -190,6 +190,30 @@ pub struct ToolExecutionSummary {
     pub successful_invocations: usize,
     pub blocked_invocations: usize,
     pub failed_invocations: usize,
+    /// 写操作已发出但无法确认是否生效，不能算作失败（副作用可能已经发生）。
+    /// 早于该计数写入的数据没有这个字段，其值就是 0。
+    #[serde(default)]
+    pub unconfirmed_invocations: usize,
+}
+
+impl ToolExecutionSummary {
+    /// 按执行状态统计工具调用；全仓唯一的统计口径。取消是用户主动中止，不计入失败。
+    pub fn from_statuses(statuses: impl IntoIterator<Item = ExecutionResultStatus>) -> Self {
+        let mut summary = Self::default();
+        for status in statuses {
+            summary.total_invocations += 1;
+            match status {
+                ExecutionResultStatus::Succeeded => summary.successful_invocations += 1,
+                ExecutionResultStatus::NeedsApproval | ExecutionResultStatus::Rejected => {
+                    summary.blocked_invocations += 1
+                }
+                ExecutionResultStatus::Failed => summary.failed_invocations += 1,
+                ExecutionResultStatus::Indeterminate => summary.unconfirmed_invocations += 1,
+                ExecutionResultStatus::Cancelled => {}
+            }
+        }
+        summary
+    }
 }
 
 pub type ExternalToolCatalogProvider =
@@ -224,9 +248,8 @@ pub type BrowserToolExecutor = Arc<
         + Sync
         + 'static,
 >;
-pub type BrowserCapabilityProvider = Arc<
-    dyn Fn(Option<&SessionId>) -> magi_browser_authority::BrowserCapabilitySnapshot + Send + Sync,
->;
+pub type BrowserCapabilityProvider =
+    Arc<dyn Fn() -> magi_browser_authority::BrowserCapabilitySnapshot + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageGenerationRequest {

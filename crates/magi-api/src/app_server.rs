@@ -16,24 +16,20 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use magi_app_server_protocol::{
-    AppServerRequestMethod, ApprovalDecision, ApprovalRequestParams, BrowserAccessProfile,
-    BrowserToolParams, BrowserToolsListParams, BrowserToolsListResult, CancelRequestParams,
-    ClientCapabilities, ClientInfo, ClientMessage, ClientNotification, ClientRequest,
-    ClientResponse, ERROR_ALREADY_INITIALIZED, ERROR_INTERNAL, ERROR_INVALID_PARAMS,
-    ERROR_INVALID_REQUEST, ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED, ERROR_REQUEST_CANCELLED,
-    ERROR_REQUEST_CONFLICT, ERROR_REQUEST_TIMEOUT, ERROR_SERVER_OVERLOADED,
-    ERROR_SESSION_NOT_FOUND, ErrorObject, EventNotificationParams, EventResyncRequiredParams,
-    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, PingResult,
-    ProtocolVersion, RequestId, ServerCapabilities, ServerNotification, ServerRequest,
-    ServerResponse, SessionListParams, SessionListResult, SessionReadParams, SessionReadResult,
-    SessionSummary, TurnStartParams, TurnStartResult, classify_client_message, error_response,
-    typed_notification, typed_response,
+    AppServerRequestMethod, ApprovalDecision, ApprovalRequestParams, BrowserToolParams,
+    BrowserToolsListResult, CancelRequestParams, ClientCapabilities, ClientInfo, ClientMessage,
+    ClientNotification, ClientRequest, ClientResponse, ERROR_ALREADY_INITIALIZED, ERROR_INTERNAL,
+    ERROR_INVALID_PARAMS, ERROR_INVALID_REQUEST, ERROR_METHOD_NOT_FOUND, ERROR_NOT_INITIALIZED,
+    ERROR_REQUEST_CANCELLED, ERROR_REQUEST_CONFLICT, ERROR_REQUEST_TIMEOUT,
+    ERROR_SERVER_OVERLOADED, ERROR_SESSION_NOT_FOUND, EmptyParams, ErrorObject,
+    EventNotificationParams, EventResyncRequiredParams, EventSubscribeParams, EventSubscribeResult,
+    InitializeParams, InitializeResult, PingResult, ProtocolVersion, RequestId, ServerCapabilities,
+    ServerNotification, ServerRequest, ServerResponse, SessionListParams, SessionListResult,
+    SessionReadParams, SessionReadResult, SessionSummary, TurnStartParams, TurnStartResult,
+    classify_client_message, error_response, typed_notification, typed_response,
 };
 use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
-use magi_core::{
-    AccessProfile, EventId, ExecutionResultStatus, SessionId, ThreadId, ToolCallId, UtcMillis,
-    WorkspaceId,
-};
+use magi_core::{EventId, ExecutionResultStatus, SessionId, ThreadId, ToolCallId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, EventStreamSnapshot};
 use magi_session_store::ActiveExecutionTurnItem;
 use serde::{Serialize, de::DeserializeOwned};
@@ -1087,25 +1083,16 @@ async fn list_browser_tools(
     request_id: RequestId,
     params: Value,
 ) -> magi_app_server_protocol::ServerResponse {
-    let params = match serde_json::from_value::<BrowserToolsListParams>(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return error_response(
-                request_id,
-                ErrorObject::new(
-                    ERROR_INVALID_PARAMS,
-                    format!("browser/tools/list 参数无效: {error}"),
-                ),
-            );
-        }
-    };
-    let session_id = params
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(SessionId::new);
-    let capability = state.browser_capability_snapshot(session_id.as_ref());
+    if let Err(error) = serde_json::from_value::<EmptyParams>(params) {
+        return error_response(
+            request_id,
+            ErrorObject::new(
+                ERROR_INVALID_PARAMS,
+                format!("browser/tools/list 参数无效: {error}"),
+            ),
+        );
+    }
+    let capability = state.browser_capability_snapshot();
     let tools = capability
         .visible_tools()
         .into_iter()
@@ -1381,15 +1368,6 @@ fn browser_tool_turn_context(
     })
 }
 
-fn browser_access_profile(profile: Option<BrowserAccessProfile>) -> AccessProfile {
-    match profile {
-        Some(BrowserAccessProfile::ReadOnly) => AccessProfile::ReadOnly,
-        Some(BrowserAccessProfile::Restricted) => AccessProfile::Restricted,
-        Some(BrowserAccessProfile::FullAccess) => AccessProfile::FullAccess,
-        None => AccessProfile::FullAccess,
-    }
-}
-
 fn publish_browser_tool_item(
     state: &ApiState,
     session_id: &SessionId,
@@ -1405,10 +1383,9 @@ fn publish_browser_tool_item(
     let Some(canonical) = canonical else {
         return;
     };
-    let now = UtcMillis::now();
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-browser-item-{item_id}-{}", now.0)),
+            EventId::unique(format!("event-browser-item-{item_id}")),
             "session.turn.item.upserted",
             json!({"source": "browser", "item": canonical}),
         )
@@ -1450,7 +1427,7 @@ async fn execute_browser_tool(
             ErrorObject::new(ERROR_SESSION_NOT_FOUND, "会话不存在"),
         );
     }
-    let browser_capability_snapshot = state.browser_capability_snapshot(Some(&session_id));
+    let browser_capability_snapshot = state.browser_capability_snapshot();
     let call_id = params
         .call_id
         .filter(|value| !value.trim().is_empty())
@@ -1473,7 +1450,6 @@ async fn execute_browser_tool(
         workspace_id,
         task_id: params.task_id.map(magi_core::TaskId::new),
         worker_id: params.worker_id.map(magi_core::WorkerId::new),
-        access_profile: browser_access_profile(params.access_profile),
         browser_capability_snapshot: Some(browser_capability_snapshot),
         browser_execution_id: params.browser_execution_id,
         ..magi_tool_runtime::ToolExecutionContext::default()
@@ -1547,16 +1523,7 @@ async fn execute_browser_tool(
         ExecutionResultStatus::NeedsApproval => "blocked",
         ExecutionResultStatus::Cancelled => "cancelled",
         ExecutionResultStatus::Rejected | ExecutionResultStatus::Failed => "failed",
-    };
-    let status_value = if status_value == "failed"
-        && serde_json::from_str::<Value>(&payload)
-            .ok()
-            .is_some_and(|value| {
-                value.get("status").and_then(Value::as_str) == Some("indeterminate")
-            }) {
-        "indeterminate"
-    } else {
-        status_value
+        ExecutionResultStatus::Indeterminate => "indeterminate",
     };
     let commit = match writer.commit(&payload, status_value) {
         Ok(commit) => commit,
@@ -1951,7 +1918,7 @@ async fn start_turn_once(
                     "replayed": true,
                     "requestId": request.request_id(),
                     "entryId": format!("timeline-{}-{}", existing_turn.session_id, existing_turn.accepted_at.0),
-                    "eventId": format!("event-session-turn-task-{}", existing_turn.accepted_at.0),
+                    "eventId": format!("event-session-turn-task-{}", existing_turn.turn_id),
                     "sessionId": existing_turn.session_id,
                     "turnId": existing_turn.turn_id,
                     "acceptedAt": existing_turn.accepted_at,
@@ -1997,7 +1964,7 @@ async fn start_turn_once(
                     "replayed": true,
                     "requestId": queued_turn.request.request_id(),
                     "entryId": queue_id,
-                    "eventId": format!("event-session-turn-queued-{}", queued_turn.accepted_at.0),
+                    "eventId": format!("event-session-turn-queued-{}", queued_turn.queue_id),
                     "sessionId": queued_turn.session_id,
                     "turnId": null,
                     "acceptedAt": queued_turn.accepted_at,
@@ -2006,7 +1973,7 @@ async fn start_turn_once(
                     "status": "accepted",
                     "eventSequence": event_sequence_for_event_id(
                         state,
-                        &format!("event-session-turn-queued-{}", queued_turn.accepted_at.0),
+                        &format!("event-session-turn-queued-{}", queued_turn.queue_id),
                     ),
                     "createdSession": false,
                     "userMessageItemId": user_message_item_id,

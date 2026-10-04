@@ -333,6 +333,54 @@ test("不同 Browser Tab 使用独立资源队列，可以并行执行而不互�
   }
 });
 
+test("交互命令合并动作后的页面状态与 Worker 报告的作用元素", async () => {
+  const worker = {
+    execute: async () => ({
+      outcome: {
+        status: "succeeded",
+        payload: { type: "action_target", payload: { role: "button", name: "提交订单" } },
+      },
+    }),
+    forwardSurfaceEvent: () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    recordForBinding: () => ({ getURL: () => "https://shop.test/done", getTitle: () => "完成" }),
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    const responsePromise = nextJsonMatching(client, (message) => message.request_id === "click-request");
+    client.send(JSON.stringify(request("click-request", {
+      type: "click",
+      payload: {
+        tab_id: binding.tab_id,
+        control: { mode: "user", fence: 1 },
+        target: { element_ref: "e:1:submit" },
+      },
+    })));
+    const response = await responsePromise;
+    assert.deepEqual(response.outcome, {
+      status: "succeeded",
+      payload: {
+        type: "interaction",
+        payload: {
+          page_state: {
+            tab_id: binding.tab_id,
+            url: "https://shop.test/done",
+            origin: "https://shop.test",
+            title: "完成",
+            navigation_revision: binding.navigation_revision,
+          },
+          target: { role: "button", name: "提交订单" },
+        },
+      },
+    });
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("新建 Browser Page 只物化 WebContents，不等待可见内容槽", async () => {
   const worker = {
     execute: async () => failedOutcome("unused"),

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
   import {
     parseLeadingJson,
@@ -16,7 +17,7 @@
 
   interface Props {
     toolCall?: ToolCall;
-    status?: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+    status?: ToolCallStatus;
   }
 
   let { toolCall, status = 'running' }: Props = $props();
@@ -60,7 +61,7 @@
   }
 
   function terminalStatusFromCanonical(
-    canonicalStatus?: 'pending' | 'running' | 'success' | 'error' | 'cancelled',
+    canonicalStatus?: ToolCallStatus,
     payloadStatus?: string,
   ): string {
     if (canonicalStatus === 'error') {

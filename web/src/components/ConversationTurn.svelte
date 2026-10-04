@@ -19,14 +19,13 @@
   import ConversationToolGroup from './ConversationToolGroup.svelte';
   import ConversationPhase from './ConversationPhase.svelte';
   import {
-    conversationPresentationRole,
+    inferConversationPresentationRole,
   } from '../lib/conversation-presentation';
   import {
     buildConversationDisclosureBlocks,
+    buildConversationStreamEntries,
     isConversationFinalMessage,
-    isToolLikeMessage,
     type ConversationDisclosureBlock,
-    type ConversationStreamEntry,
   } from '../lib/conversation-disclosure';
 
   interface Props {
@@ -58,29 +57,18 @@
   }: Props = $props();
 
   // 自动状态只负责实时轮次；用户手动展开/收起后，流式更新不能覆盖这个选择。
-  let expanded = $state(untrack(() => initialExpanded || runtimeActive));
+  // 与结束时的自动收起规则一致：没有最终回答的轮次默认展开过程。
+  let expanded = $state(untrack(() => (
+    initialExpanded
+    || runtimeActive
+    || !items.some((item) => isConversationFinalMessage(item.message))
+  )));
   let manualTurnOverride = false;
   let previousLive = false;
 
   function metadataString(message: Message, key: string): string {
     const value = message.metadata?.[key];
     return typeof value === 'string' ? value.trim() : '';
-  }
-
-  function isUsefulFinalCandidate(message: Message): boolean {
-    if (isToolLikeMessage(message) || message.type === 'thinking') return false;
-    if (message.type === 'error' || message.type === 'result' || message.type === 'text') return true;
-    return Boolean(
-      message.content?.trim()
-      || (message.blocks || []).some((block) => (
-        Boolean(block)
-          && typeof block === 'object'
-          && (Boolean(block.content?.trim())
-            || block.type === 'file_change'
-            || block.type === 'plan'
-            || block.type === 'code')
-      )),
-    );
   }
 
   // 超长 turn 在历史页里只带最新一段条目；被折叠的更早步骤在这里按需向前补齐。
@@ -120,81 +108,16 @@
 
   const userItems = $derived(items.filter((item) => item.message.type === 'user_input'));
   const assistantItems = $derived(items.filter((item) => item.message.type !== 'user_input'));
-  const explicitFinalItems = $derived(assistantItems.filter((item) => isConversationFinalMessage(item.message)));
-  const finalItems = $derived.by(() => {
-    if (explicitFinalItems.length > 0) return explicitFinalItems;
-    for (let index = assistantItems.length - 1; index >= 0; index -= 1) {
-      const candidate = assistantItems[index];
-      if (isUsefulFinalCandidate(candidate.message)) return [candidate];
-    }
-    // 只有明确的最终输出才离开过程区；工具结果不能伪装成最终回答。
-    return [];
-  });
-  const finalItemKeys = $derived(new Set(finalItems.map((item) => item.key)));
+  // 最终区只承载后端标记为 final / error 的输出；进行中的文字按真实顺序留在过程区。
+  // 呈现角色是投影写入的事实（两种显示模式共用），这里只按角色布局。
   const presentationItems = $derived(assistantItems.map((item) => ({
     item,
-    role: conversationPresentationRole(item, finalItemKeys),
+    role: inferConversationPresentationRole(item.message),
   })));
-  const processItems = $derived(
-    presentationItems.filter((entry) => entry.role === 'process').map((entry) => entry.item),
+  const finalItems = $derived(
+    presentationItems.filter((entry) => entry.role === 'final').map((entry) => entry.item),
   );
-  const delegationItems = $derived(
-    presentationItems.filter((entry) => entry.role === 'delegation').map((entry) => entry.item),
-  );
-  const streamEntries = $derived.by(() => {
-    const result: ConversationStreamEntry[] = [];
-    let agentGroupEmitted = false;
-    let toolGroupItems: TimelineRenderItem[] = [];
-    const hasToolItems = processItems.some((item) => isToolLikeMessage(item.message));
-
-    const flushToolGroup = () => {
-      if (toolGroupItems.length === 0) return;
-      const firstKey = toolGroupItems[0].key;
-      result.push({
-        kind: 'tool-group',
-        key: `tool-group:${firstKey}`,
-        items: toolGroupItems,
-      });
-      toolGroupItems = [];
-    };
-
-    for (const entry of presentationItems) {
-      if (entry.role === 'final') continue;
-      if (entry.role === 'delegation') {
-        flushToolGroup();
-        if (!agentGroupEmitted) {
-          result.push({
-            kind: 'agent-group',
-            key: `agent-group:${entry.item.key}`,
-            items: delegationItems,
-          });
-          agentGroupEmitted = true;
-        }
-        continue;
-      }
-      if (entry.role === 'artifact' || entry.role === 'attention') {
-        flushToolGroup();
-        result.push({
-          kind: 'item',
-          key: `${entry.role}:${entry.item.key}`,
-          item: entry.item,
-          role: entry.role,
-        });
-        continue;
-      }
-      if (isToolLikeMessage(entry.item.message)) {
-        toolGroupItems.push(entry.item);
-        continue;
-      }
-      // 同一轮中的思考输出只是模型内部过程，不应把连续工具调用切成多个组。
-      // 有工具时省略这些重复的思考行；没有工具时仍保留思考事件供用户展开查看。
-      if (hasToolItems && entry.item.message.type === 'thinking') continue;
-      flushToolGroup();
-      result.push({ kind: 'event', key: `event:${entry.item.key}`, item: entry.item });
-    }
-    flushToolGroup();
-    return result;
-  });
+  const streamEntries = $derived(buildConversationStreamEntries(presentationItems));
 
   const hasProcess = $derived(
     streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
@@ -209,10 +132,12 @@
       }),
   );
 
+  // 进行中自动展开过程；结束后只有存在最终回答时才自动收起——
+  // 没有最终回答（例如被中断）的轮次收起后就什么也看不到，所以保持展开。
   $effect(() => {
     const nextLive = isLive;
     if (nextLive !== previousLive) {
-      if (!manualTurnOverride) expanded = nextLive;
+      if (!manualTurnOverride) expanded = nextLive || finalItems.length === 0;
       previousLive = nextLive;
     }
   });
@@ -363,7 +288,6 @@
           filePreviewScope={filePreviewScopeForItem(block.item)}
           onContinueInterrupted={continueInterruptedSession}
           hideResponseDuration
-          presentationRole={block.role}
         />
       </section>
       {/if}

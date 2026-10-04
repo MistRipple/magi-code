@@ -3564,13 +3564,12 @@ fn registry_enforces_workspace_boundary_and_keeps_browser_available_without_work
                 ExecutionResultStatus::Succeeded,
             )
         }),
-        Arc::new(|_| magi_browser_authority::BrowserCapabilitySnapshot {
+        Arc::new(|| magi_browser_authority::BrowserCapabilitySnapshot {
             revision: 1,
             in_app_browser_enabled: true,
             browser_use_enabled: true,
             host_status: magi_browser_authority::BrowserHostStatus::Ready,
             host_protocol_compatible: true,
-            access_profile: magi_core::AccessProfile::FullAccess,
         }),
     );
 
@@ -5516,70 +5515,55 @@ fn permission_engine_shell_and_path_axes_cover_read_restricted_and_full_access()
 fn browser_access_profile_matrix_keeps_read_and_write_capabilities_distinct() {
     use magi_browser_authority::{BrowserCapabilitySnapshot, BrowserHostStatus};
 
-    let ready = |access_profile| BrowserCapabilitySnapshot {
+    // 能力快照只取决于 Host 状态和开关，与访问档位无关；
+    // 档位对浏览器工具的影响由下面的 policy_rows 覆盖。
+    let snapshot = BrowserCapabilitySnapshot {
         revision: 1,
         in_app_browser_enabled: true,
         browser_use_enabled: true,
         host_status: BrowserHostStatus::Ready,
         host_protocol_compatible: true,
-        access_profile,
     };
-    for profile in [
-        magi_core::AccessProfile::ReadOnly,
-        magi_core::AccessProfile::Restricted,
-        magi_core::AccessProfile::FullAccess,
-    ] {
-        let snapshot = ready(profile);
-        for kind in magi_browser_authority::BrowserToolKind::ALL {
-            let tool = BuiltinToolName::from_name(kind.name()).expect("catalog browser tool");
-            assert!(snapshot.allows_catalog_tool(kind));
-            assert!(!tool.is_access_profile_write_operation());
-            match kind.catalog_access() {
-                magi_browser_authority::BrowserToolAccess::Read => {
-                    assert!(
-                        snapshot
-                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
-                            .is_ok()
-                    );
-                    assert!(
-                        snapshot
-                            .allows_execution(
-                                kind,
-                                magi_browser_authority::BrowserToolAccess::Write
-                            )
-                            .is_err()
-                    );
-                }
-                magi_browser_authority::BrowserToolAccess::Write => {
-                    assert!(
-                        snapshot
-                            .allows_execution(
-                                kind,
-                                magi_browser_authority::BrowserToolAccess::Write
-                            )
-                            .is_ok()
-                    );
-                    assert!(
-                        snapshot
-                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
-                            .is_err()
-                    );
-                }
-                magi_browser_authority::BrowserToolAccess::Mixed => {
-                    assert!(
-                        snapshot
-                            .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
-                            .is_ok()
-                    );
-                    assert!(
-                        snapshot
-                            .allows_execution(
-                                kind,
-                                magi_browser_authority::BrowserToolAccess::Write
-                            )
-                            .is_ok()
-                    );
-                }
+    for kind in magi_browser_authority::BrowserToolKind::ALL {
+        let tool = BuiltinToolName::from_name(kind.name()).expect("catalog browser tool");
+        assert!(snapshot.allows_catalog_tool(kind));
+        assert!(!tool.is_access_profile_write_operation());
+        match kind.catalog_access() {
+            magi_browser_authority::BrowserToolAccess::Read => {
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                        .is_ok()
+                );
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Write)
+                        .is_err()
+                );
+            }
+            magi_browser_authority::BrowserToolAccess::Write => {
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Write)
+                        .is_ok()
+                );
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                        .is_err()
+                );
+            }
+            magi_browser_authority::BrowserToolAccess::Mixed => {
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Read)
+                        .is_ok()
+                );
+                assert!(
+                    snapshot
+                        .allows_execution(kind, magi_browser_authority::BrowserToolAccess::Write)
+                        .is_ok()
+                );
             }
         }
     }
@@ -5638,13 +5622,12 @@ fn browser_access_profile_matrix_records_host_executor_side_effects() {
                 ExecutionResultStatus::Succeeded,
             )
         }),
-        Arc::new(|_| BrowserCapabilitySnapshot {
+        Arc::new(|| BrowserCapabilitySnapshot {
             revision: 1,
             in_app_browser_enabled: true,
             browser_use_enabled: true,
             host_status: BrowserHostStatus::Ready,
             host_protocol_compatible: true,
-            access_profile: magi_core::AccessProfile::Restricted,
         }),
     );
     let context = ToolExecutionContext {
@@ -5672,7 +5655,7 @@ fn browser_access_profile_matrix_records_host_executor_side_effects() {
             ),
         ] {
             let capability = registry
-                .browser_capability_snapshot(access_profile, context.session_id.as_ref())
+                .browser_capability_snapshot()
                 .expect("browser capability provider should return a snapshot");
             capability
                 .allows_execution(
@@ -6542,6 +6525,8 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "browser_third_party",
             "browser_webmcp",
             "browser_pwa",
+            "browser_read",
+            "browser_storage",
             "diagram_render",
             "image_generate",
             "knowledge_query",

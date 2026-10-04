@@ -4818,8 +4818,8 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         "session action should succeed: {body:?}"
     );
 
-    let accepted_at = body["acceptedAt"].as_u64().unwrap();
-    let expected_event_id = format!("event-session-turn-task-{accepted_at}");
+    let turn_id = body["turnId"].as_str().unwrap();
+    let expected_event_id = format!("event-session-turn-task-{turn_id}");
 
     let snapshot = state.event_bus.snapshot();
     let action_event = snapshot

@@ -3149,6 +3149,18 @@ async function ensureEventStream(
         markEventStreamActive();
         handleRustEventStreamMessage(event);
       },
+      onNotification(notification) {
+        if (streamToken !== activeEventStreamToken) return;
+        if (notification.method !== 'events/resyncRequired') return;
+        // 服务端已跳过部分事件（客户端落后或游标过期）。随附快照只含最近窗口，
+        // 被跳过的事实可能不在其中，必须和 SSE 的 event.stream.lagged 一样走完整的
+        // bootstrap 恢复；恢复后游标推进到 bootstrap 水位，不会再次触发重同步。
+        console.warn('[web-client-bridge] App Server 要求重同步，切换到 bootstrap recovery', {
+          params: notification.params ?? {},
+        });
+        closeEventStream();
+        scheduleRecovery('event_stream_resync_required', undefined, true);
+      },
     });
     activeEventStreamConnection = client;
     const connectPromise = client.connect().catch((error: unknown) => {

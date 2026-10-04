@@ -33,20 +33,16 @@
   };
   setContext(MARKDOWN_IMAGE_CONTEXT, markdownImageContext);
 
+  // 流式与完成态共用同一结构：完成态就是“全部内容都已稳定、没有易变尾段”。
+  // 稳定段渲染器在流式结束时保持同一个实例，只是收到完整内容并原地更新，
+  // 不会因为切换分支而整体销毁重建（那会导致闪烁、滚动跳动和选区丢失）。
   const markdownParts = $derived.by(() => {
     const source = content || '';
     if (!isStreaming) {
-      return {
-        isSplit: false,
-        completed: preprocessMarkdown(source, false),
-        stable: '',
-        volatile: '',
-      };
+      return { stable: preprocessMarkdown(source, false), volatile: '' };
     }
     const parts = splitStreamingMarkdown(source);
     return {
-      isSplit: true,
-      completed: '',
       stable: preprocessMarkdown(parts.stable, false),
       volatile: preprocessMarkdown(parts.volatile, true),
     };
@@ -54,15 +50,11 @@
 </script>
 
 <div class="markdown-content">
-  {#if markdownParts.isSplit}
-    {#if markdownParts.stable}
-      <MarkdownRenderer source={markdownParts.stable} isStreaming={false} />
-    {/if}
-    {#if markdownParts.volatile}
-      <MarkdownRenderer source={markdownParts.volatile} isStreaming={true} />
-    {/if}
-  {:else}
-    <MarkdownRenderer source={markdownParts.completed} isStreaming={false} />
+  {#if markdownParts.stable}
+    <MarkdownRenderer source={markdownParts.stable} isStreaming={false} />
+  {/if}
+  {#if markdownParts.volatile}
+    <MarkdownRenderer source={markdownParts.volatile} isStreaming={true} />
   {/if}
 </div>
 

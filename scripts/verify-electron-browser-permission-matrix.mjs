@@ -719,7 +719,6 @@ async function runAppServerBrowserTurn(page, input) {
       const browserArguments = browserTool.case === "allow_click"
         ? {
             tab_id: input.tabId,
-            snapshot_revision: latestSnapshot?.snapshot?.snapshot_revision,
             element_ref: latestSnapshot?.snapshot?.elements?.find((element) => element.name?.startsWith("Noop "))?.element_ref,
           }
         : browserTool.arguments;
@@ -732,7 +731,6 @@ async function runAppServerBrowserTurn(page, input) {
           arguments: browserArguments,
           ...(browserTool.workspaceId ? { workspaceId: browserTool.workspaceId } : {}),
           callId: `electron-browser-permission-call-${input.turnIndex}-${index + 1}`,
-          accessProfile: input.profileWire,
           browserExecutionId,
         }),
       });
@@ -810,7 +808,6 @@ async function runCrossSessionTabAttempt(page, input) {
         tool: "browser_snapshot",
         arguments: { tab_id: input.foreignTabId },
         callId: "electron-browser-cross-session-tab-call",
-        accessProfile: "full_access",
         browserExecutionId: turn.result.turnId,
       });
     }

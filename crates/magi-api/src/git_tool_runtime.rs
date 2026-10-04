@@ -578,13 +578,9 @@ fn publish_context_changed(
     context: &SessionCodeContext,
     observation: &GitObservation,
 ) {
-    let now = UtcMillis::now();
     deps.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "workspace-git-context-changed-{workspace_id}-{}",
-                now.0
-            )),
+            EventId::unique(format!("workspace-git-context-changed-{workspace_id}")),
             "workspace.git.context.changed",
             json!({
                 "workspace_id": workspace_id,

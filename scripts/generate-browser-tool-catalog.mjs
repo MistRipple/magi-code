@@ -20,6 +20,23 @@ function rustString(value) {
   return JSON.stringify(value);
 }
 
+/** rustfmt 按 Unicode 显示宽度计算行宽：CJK 与全角字符占 2 列。 */
+function displayWidth(text) {
+  let width = 0;
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+    const wide = (code >= 0x1100 && code <= 0x115f)
+      || (code >= 0x2e80 && code <= 0xa4cf)
+      || (code >= 0xac00 && code <= 0xd7a3)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xfe30 && code <= 0xfe4f)
+      || (code >= 0xff00 && code <= 0xff60)
+      || (code >= 0xffe0 && code <= 0xffe6);
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
 function tsString(value) {
   return JSON.stringify(value);
 }
@@ -71,13 +88,15 @@ function renderRust(schema, catalog) {
   const access = catalog.map((entry) => `            Self::${entry.rustVariant} => BrowserToolAccess::${entry.access[0].toUpperCase()}${entry.access.slice(1)},`);
   const descriptions = catalog.map((entry) => {
     const value = rustString(entry.description);
-    return entry.description.length > 100
+    const singleLine = `            Self::${entry.rustVariant} => ${value},`;
+    // 与 rustfmt 一致：一行放不下（max_width=100，按显示宽度计）的分支改用块形式。
+    return displayWidth(singleLine) > 100
       ? [
         `            Self::${entry.rustVariant} => {`,
         `                ${value}`,
         '            }',
       ].join('\n')
-      : `            Self::${entry.rustVariant} => ${value},`;
+      : singleLine;
   });
   const schemas = catalog.map((entry) => [
     `            Self::${entry.rustVariant} => {`,

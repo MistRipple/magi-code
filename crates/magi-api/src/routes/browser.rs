@@ -146,6 +146,10 @@ pub fn routes() -> Router<ApiState> {
             "/browser/annotations/{annotation_id}/artifact",
             get(annotation_artifact),
         )
+        .route(
+            "/browser/artifacts/{session_id}/{file_name}",
+            get(session_browser_artifact),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +175,6 @@ async fn get_desktop_connection(
 ) -> Json<BrowserCapabilitiesResponse> {
     Json(browser_capabilities_response(
         &state,
-        None,
         BrowserClientPlatform::Desktop,
     ))
 }
@@ -222,7 +225,6 @@ async fn register_desktop_connection(
     }
     Ok(Json(browser_capabilities_response(
         &state,
-        None,
         BrowserClientPlatform::Desktop,
     )))
 }
@@ -256,7 +258,6 @@ async fn clear_desktop_connection(
     }
     Ok(Json(browser_capabilities_response(
         &state,
-        None,
         BrowserClientPlatform::Desktop,
     )))
 }
@@ -271,11 +272,7 @@ fn bounded_connection_value(value: String, field: &str) -> Result<String, ApiErr
 
 fn publish_browser_host_status(state: &ApiState, status: &BrowserHostStatusSnapshot) {
     state.event_bus.publish(EventEnvelope::system(
-        EventId::new(format!(
-            "event-browser-host-status-{:?}-{}",
-            status.status,
-            UtcMillis::now().0
-        )),
+        EventId::unique(format!("event-browser-host-status-{:?}", status.status)),
         "browser.host.status_changed",
         serde_json::json!({
             "host_status": status.status,
@@ -286,7 +283,7 @@ fn publish_browser_host_status(state: &ApiState, status: &BrowserHostStatusSnaps
     ));
 }
 
-fn browser_annotation_artifact_path(
+fn browser_artifact_path(
     state: &ApiState,
     artifact_id: &str,
 ) -> Result<Option<std::path::PathBuf>, ApiError> {
@@ -313,20 +310,18 @@ fn browser_annotation_artifact_path(
         .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 根目录失败", error))?;
     let canonical_path = std::fs::canonicalize(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            ApiError::NotFound("浏览器标记截图 artifact 不存在".to_string())
+            ApiError::NotFound("浏览器 artifact 不存在".to_string())
         } else {
-            ApiError::internal_assembly("解析浏览器标记截图 artifact 失败", error)
+            ApiError::internal_assembly("解析浏览器 artifact 失败", error)
         }
     })?;
     if !canonical_path.starts_with(&canonical_root) {
         return Err(ApiError::Conflict("浏览器 artifact 引用越界".to_string()));
     }
     let metadata = std::fs::metadata(&canonical_path)
-        .map_err(|error| ApiError::internal_assembly("读取浏览器标记截图元数据失败", error))?;
+        .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 元数据失败", error))?;
     if !metadata.is_file() {
-        return Err(ApiError::NotFound(
-            "浏览器标记截图 artifact 不是文件".to_string(),
-        ));
+        return Err(ApiError::NotFound("浏览器 artifact 不是文件".to_string()));
     }
     Ok(Some(canonical_path))
 }
@@ -391,7 +386,7 @@ pub(crate) fn resolve_browser_annotation_context(
         let screenshot_path = annotation
             .screenshot_artifact_id
             .as_deref()
-            .map(|artifact_id| browser_annotation_artifact_path(state, artifact_id))
+            .map(|artifact_id| browser_artifact_path(state, artifact_id))
             .transpose()?
             .flatten()
             .map(|path| path.to_string_lossy().into_owned());
@@ -415,7 +410,6 @@ pub(crate) fn resolve_browser_annotation_context(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BrowserCapabilitiesQuery {
-    session_id: Option<String>,
     client_platform: Option<BrowserClientPlatform>,
 }
 
@@ -506,7 +500,6 @@ struct BrowserCapabilitiesResponse {
     browser_use_enabled: bool,
     host_status: magi_browser_authority::BrowserHostStatus,
     host_protocol_compatible: bool,
-    access_profile: magi_core::AccessProfile,
     host_state: String,
     last_error_code: Option<String>,
     desktop_connection_generation: u64,
@@ -518,28 +511,24 @@ async fn capabilities(
     headers: HeaderMap,
     Query(query): Query<BrowserCapabilitiesQuery>,
 ) -> Json<BrowserCapabilitiesResponse> {
-    let session_id = query.session_id.as_deref().map(SessionId::new);
     Json(browser_capabilities_response(
         &state,
-        session_id.as_ref(),
         request_client_platform(&state, &headers, query.client_platform),
     ))
 }
 
 fn browser_capabilities_response(
     state: &ApiState,
-    session_id: Option<&SessionId>,
     client_platform: BrowserClientPlatform,
 ) -> BrowserCapabilitiesResponse {
     let host = state.browser_host_status();
-    let capability = state.browser_capability_snapshot(session_id);
+    let capability = state.browser_capability_snapshot();
     BrowserCapabilitiesResponse {
         revision: host.revision,
         in_app_browser_enabled: capability.in_app_browser_enabled,
         browser_use_enabled: capability.browser_use_enabled,
         host_status: host.status,
         host_protocol_compatible: host.protocol_compatible,
-        access_profile: capability.access_profile,
         host_state: serde_json::to_value(host.status)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -581,14 +570,10 @@ async fn update_browser_settings(
     )?;
     let response = browser_capabilities_response(
         &state,
-        None,
         request_client_platform(&state, &headers, request.client_platform),
     );
     state.event_bus.publish(EventEnvelope::system(
-        EventId::new(format!(
-            "event-browser-settings-updated-{}",
-            UtcMillis::now().0
-        )),
+        EventId::unique("event-browser-settings-updated"),
         "browser.settings.updated",
         serde_json::json!({
             "in_app_browser_enabled": response.in_app_browser_enabled,
@@ -1188,7 +1173,7 @@ async fn create_session(
         request.session_id.trim(),
     )?;
     let workspace_id = scope.workspace_id();
-    ensure_browser_ui_ready(&state, &session_id)?;
+    ensure_browser_ui_ready(&state)?;
 
     // Browser Session 与 Magi Session 同生命周期。桌面端长期运行时，旧版本或
     // 异常退出可能留下不再属于 SessionStore 的逻辑 Tab；在新建浏览器会话前
@@ -2580,7 +2565,8 @@ async fn list_annotations(
 ) -> Result<Json<Vec<BrowserAnnotationResponse>>, ApiError> {
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
+    require_session_scope(&session)?;
+    ensure_browser_ui_ready(&state)?;
     let annotations = state
         .browser_authority
         .lock()
@@ -2833,7 +2819,7 @@ async fn persist_browser_annotation_screenshot(
 }
 
 fn delete_browser_annotation_artifact(state: &ApiState, artifact_id: &str) -> Result<(), ApiError> {
-    let Some(path) = browser_annotation_artifact_path(state, artifact_id)? else {
+    let Some(path) = browser_artifact_path(state, artifact_id)? else {
         return Ok(());
     };
     match std::fs::remove_file(path) {
@@ -3036,7 +3022,7 @@ async fn annotation_artifact(
             .clone()
             .ok_or_else(|| ApiError::NotFound("浏览器标记没有截图 artifact".to_string()))?
     };
-    let path = browser_annotation_artifact_path(&state, &artifact_id)?
+    let path = browser_artifact_path(&state, &artifact_id)?
         .ok_or_else(|| ApiError::Conflict("浏览器 artifact 存储不可用".to_string()))?;
     let bytes = std::fs::read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -3056,6 +3042,54 @@ async fn annotation_artifact(
         .into_response())
 }
 
+/// 浏览器工具（如 browser_screenshot）写入 `browser/artifacts/<session>/` 的图片。
+/// 只按「会话 + 单段文件名」寻址，供该会话的工具卡片预览；个人会话没有工作区，
+/// 不能走工作区文件预览接口。
+async fn session_browser_artifact(
+    State(state): State<ApiState>,
+    Path((session_id, file_name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let single_segment = |value: &str| {
+        let mut components = std::path::Path::new(value).components();
+        matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        )
+    };
+    if !single_segment(&session_id) || !single_segment(&file_name) {
+        return Err(ApiError::Conflict("浏览器 artifact 引用无效".to_string()));
+    }
+    if state
+        .session_store
+        .session(&SessionId::new(session_id.as_str()))
+        .is_none()
+    {
+        return Err(ApiError::not_found("会话不存在", session_id.as_str()));
+    }
+    let content_type = match std::path::Path::new(&file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("png") => "image/png",
+        Some("jpg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => return Err(ApiError::Conflict("浏览器 artifact 不是图片".to_string())),
+    };
+    let path = browser_artifact_path(&state, &format!("{session_id}/{file_name}"))?
+        .ok_or_else(|| ApiError::Conflict("浏览器 artifact 存储不可用".to_string()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 失败", error))?;
+    Ok((
+        StatusCode::OK,
+        [
+            ("content-type", content_type),
+            ("cache-control", "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 async fn activate_tab(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -3064,7 +3098,8 @@ async fn activate_tab(
     require_desktop_browser_capability(&state, &headers, None)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
+    require_session_scope(&session)?;
+    ensure_browser_ui_ready(&state)?;
     let mut tab = state
         .mutate_browser_authority(|authority| prepare_browser_tab_activation(authority, &tab_id))?;
     // Host 的真实 Surface 只有在右栏 Renderer 已经切换到目标 Browser Tab
@@ -3195,7 +3230,8 @@ async fn navigate_tab(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
+    require_session_scope(&session)?;
+    ensure_browser_ui_ready(&state)?;
     let action = request.action.trim();
     let navigation = match action {
         "url" => {
@@ -3320,7 +3356,8 @@ async fn screenshot_tab(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
-    ensure_browser_ui_ready(&state, require_session_scope(&session)?)?;
+    require_session_scope(&session)?;
+    ensure_browser_ui_ready(&state)?;
     let reply = require_browser_host(&state)?
         .request(BrowserHostCommand::Screenshot {
             tab_id,
@@ -3511,7 +3548,8 @@ async fn ensure_user_control_for_ui(
     session: &BrowserSession,
     tab_id: &BrowserTabId,
 ) -> Result<BrowserSurfaceControlSnapshot, ApiError> {
-    ensure_browser_ui_ready(state, require_session_scope(session)?)?;
+    require_session_scope(session)?;
+    ensure_browser_ui_ready(state)?;
     // Authority 的短临界区与 Session/Host 的异步等待分开。这里不能由调用方
     // 先持有 browser_control_lock 再进入 interrupt_session_turn，否则关闭
     // 会话的固定顺序（session turn -> browser control）会与用户接管互锁。
@@ -3634,8 +3672,8 @@ fn validate_session_scope(
     Ok((request_scope.scope, session_id))
 }
 
-fn ensure_browser_ui_ready(state: &ApiState, session_id: &SessionId) -> Result<(), ApiError> {
-    let capability = state.browser_capability_snapshot(Some(session_id));
+fn ensure_browser_ui_ready(state: &ApiState) -> Result<(), ApiError> {
+    let capability = state.browser_capability_snapshot();
     if !capability.in_app_browser_enabled {
         return Err(ApiError::Conflict("内置浏览器功能未启用".to_string()));
     }
@@ -3815,10 +3853,9 @@ fn publish_browser_event(
     session_id: &SessionId,
     payload: serde_json::Value,
 ) {
-    let now = UtcMillis::now();
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-{}-{}", event_type.replace('.', "-"), now.0)),
+            EventId::unique(format!("event-{}", event_type.replace('.', "-"))),
             event_type,
             payload,
         )
@@ -3864,7 +3901,7 @@ mod tests {
         browser_session_response, clear_desktop_connection, create_app_session,
         finish_browser_tab_creation, normalize_hit_bounds, prepare_browser_tab_activation,
         reclaim_browser_resources, register_desktop_connection, require_desktop_browser_capability,
-        resolve_browser_annotation_context,
+        resolve_browser_annotation_context, session_browser_artifact,
     };
     use crate::{
         errors::ApiError,
@@ -4316,6 +4353,41 @@ mod tests {
             })
             .expect("restored browser annotation state should become ready");
 
+        // 工具截图按「会话 + 单段文件名」读取：只能读已存在会话自己目录下的图片。
+        state
+            .session_store
+            .create_session(session_id.clone(), "截图会话")
+            .expect("session should create");
+        let screenshot = session_browser_artifact(
+            State(state.clone()),
+            Path((session_id.to_string(), "annotation.png".to_string())),
+        )
+        .await
+        .expect("session should read its own browser artifact");
+        assert_eq!(
+            screenshot
+                .headers()
+                .get("content-type")
+                .map(|value| value.as_bytes()),
+            Some(b"image/png".as_slice())
+        );
+        for (artifact_session, file_name) in [
+            (session_id.to_string(), "../annotation.png".to_string()),
+            (session_id.to_string(), "state.json".to_string()),
+            ("..".to_string(), "state.json".to_string()),
+            (other_session_id.to_string(), "annotation.png".to_string()),
+        ] {
+            assert!(
+                session_browser_artifact(
+                    State(state.clone()),
+                    Path((artifact_session.clone(), file_name.clone())),
+                )
+                .await
+                .is_err(),
+                "{artifact_session}/{file_name} must be rejected"
+            );
+        }
+
         let response = annotation_artifact(
             State(state.clone()),
             Path(annotation_id.to_string()),
@@ -4353,11 +4425,11 @@ mod tests {
             Err(ApiError::NotFound(_))
         ));
         assert!(matches!(
-            super::browser_annotation_artifact_path(&state, "../outside.png"),
+            super::browser_artifact_path(&state, "../outside.png"),
             Err(ApiError::Conflict(_))
         ));
         assert!(matches!(
-            super::browser_annotation_artifact_path(&state, "missing.png"),
+            super::browser_artifact_path(&state, "missing.png"),
             Err(ApiError::NotFound(_))
         ));
 

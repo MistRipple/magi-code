@@ -8,7 +8,7 @@ use magi_appearance::{
     AppearanceError, AppearanceErrorKind, AppearanceSnapshot, ImportConflictStrategy, ThemePack,
     ThemeSource,
 };
-use magi_core::{EventId, UtcMillis};
+use magi_core::EventId;
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -227,10 +227,7 @@ fn appearance_error(error: AppearanceError) -> ApiError {
 
 fn publish_appearance_changed(state: &ApiState, snapshot: &AppearanceSnapshot, operation: &str) {
     state.event_bus.publish(EventEnvelope::domain(
-        EventId::new(format!(
-            "event-appearance-{operation}-{}",
-            UtcMillis::now().0
-        )),
+        EventId::unique(format!("event-appearance-{operation}")),
         "appearance.changed",
         json!({
             "operation": operation,

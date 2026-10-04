@@ -177,10 +177,7 @@ async fn resolve_session_tool_approval(
         .map_err(ApiError::Conflict)?;
     let _ = state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-tool-approval-resolved-{}",
-                UtcMillis::now().0
-            )),
+            EventId::unique("event-tool-approval-resolved"),
             "tool.approval.resolved",
             json!({
                 "session_id": session_id,
@@ -854,7 +851,7 @@ pub(crate) async fn submit_session_turn_internal(
             state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(
                 &accepted.session_id,
             ))?;
-            let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
+            let event_id = publish_session_turn_continue_event(&state, &accepted)?;
             Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
                 session_id: accepted.session_id,
                 entry_id,
@@ -1146,10 +1143,7 @@ async fn submit_steer_current_turn_after_turn_commit(
         })
         .cloned();
 
-    let event_id = EventId::new(format!(
-        "event-session-turn-steered-{}-{}",
-        session_id, accepted_at.0
-    ));
+    let event_id = EventId::unique(format!("event-session-turn-steered-{}", session_id));
     let event_sequence = state.event_bus.publish(
         EventEnvelope::domain(
             event_id.clone(),
@@ -2995,14 +2989,11 @@ async fn submit_conversation_session_turn(
             "建立 conversation Turn 输入通道失败: {error}"
         )));
     }
-    publish_session_user_message_event(
-        &state,
-        &session_id,
-        workspace_id.clone(),
-        accepted_at,
-        &message,
-    );
-    let event_id = EventId::new(format!("event-session-turn-conversation-{}", accepted_at.0));
+    publish_session_user_message_event(&state, &session_id, workspace_id.clone(), &message);
+    let event_id = EventId::new(format!(
+        "event-session-turn-conversation-{}",
+        canonical_turn.turn_id
+    ));
     let canonical_item = canonical_turn
         .items
         .iter()
@@ -3235,7 +3226,7 @@ fn conversation_turn_replay_response(
     let item_id = canonical_item.as_ref().map(|item| item.item_id.clone());
     let event_id = EventId::new(format!(
         "event-session-turn-conversation-{}",
-        canonical_turn.accepted_at.0
+        canonical_turn.turn_id
     ));
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: session_id.clone(),
@@ -4261,7 +4252,8 @@ fn publish_regular_session_turn_queued_event(
     request_id: Option<String>,
     user_message_id: Option<String>,
 ) -> (EventId, u64) {
-    let event_id = EventId::new(format!("event-session-turn-queued-{}", accepted_at.0));
+    // 由排队身份推导：turn/start 重放排队请求时按同一规则找回这条事件的序号。
+    let event_id = EventId::new(format!("event-session-turn-queued-{queue_id}"));
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.queued",
@@ -4300,7 +4292,7 @@ fn publish_regular_session_turn_queue_failed_event(
     retry_count: u8,
     direct_error: &str,
 ) {
-    let event_id = EventId::new(format!("event-session-turn-queue-failed-{}", accepted_at.0));
+    let event_id = EventId::unique("event-session-turn-queue-failed");
     let event = EventEnvelope::domain(
         event_id,
         "session.turn.queue_failed",
@@ -4332,9 +4324,8 @@ fn publish_regular_session_turn_queue_failed_event(
 fn publish_session_turn_continue_event(
     state: &ApiState,
     accepted: &SessionContinueAccepted,
-    continued_at: UtcMillis,
 ) -> Result<EventId, ApiError> {
-    let event_id = EventId::new(format!("event-session-turn-continue-{}", continued_at.0));
+    let event_id = EventId::unique("event-session-turn-continue");
     let workspace_id = session_workspace_for_event(state, &accepted.session_id);
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -4546,31 +4537,6 @@ fn session_workspace_for_event(state: &ApiState, session_id: &SessionId) -> Opti
         .and_then(|session| session_workspace_id(state, &session))
 }
 
-fn publish_session_user_message_created_event(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<WorkspaceId>,
-    occurred_at: UtcMillis,
-    message: &str,
-) {
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-message-user-{}", occurred_at.0)),
-            "message.created",
-            json!({
-                "session_id": session_id.to_string(),
-                "role": "user",
-                "content": message,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            workspace_id,
-            ..EventContext::default()
-        }),
-    );
-}
-
 struct ContinueUserMessageInput<'a> {
     state: &'a ApiState,
     accepted: &'a SessionContinueAccepted,
@@ -4736,11 +4702,10 @@ fn write_continue_user_message(
     }
     state.persist_session_state_checkpoint("session_continue_user_message")?;
     if let Some(user_message) = user_message {
-        publish_session_user_message_created_event(
+        publish_session_user_message_event(
             state,
             &accepted.session_id,
             session_workspace_for_event(state, &accepted.session_id),
-            continued_at,
             &user_message,
         );
     }
@@ -4935,7 +4900,7 @@ async fn interrupt_session_turn(
     }
 
     state.persist_session_state_checkpoint("session_turn_interrupted")?;
-    let event_id = EventId::new(format!("event-session-turn-interrupt-{}", now.0));
+    let event_id = EventId::unique("event-session-turn-interrupt");
     let mut interrupt_payload = json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
@@ -5251,7 +5216,7 @@ async fn execute_session_continue(
     state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(
         &accepted.session_id,
     ))?;
-    let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
+    let event_id = EventId::unique("event-session-continue");
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.continue.executed",
@@ -5527,10 +5492,9 @@ fn publish_session_directory_event(
     session_id: &SessionId,
     workspace_id: Option<&WorkspaceId>,
 ) {
-    let occurred_at = UtcMillis::now();
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-{event_type}-{session_id}-{}", occurred_at.0)),
+            EventId::unique(format!("event-{event_type}-{session_id}")),
             event_type,
             json!({
                 "session_id": session_id.to_string(),

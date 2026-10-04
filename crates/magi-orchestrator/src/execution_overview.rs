@@ -135,6 +135,7 @@ pub(crate) fn build_execution_overview_payload(overview: &ExecutionOverview) -> 
         "tool_success": overview.tool_summary.successful_invocations,
         "tool_blocked": overview.tool_summary.blocked_invocations,
         "tool_failed": overview.tool_summary.failed_invocations,
+        "tool_unconfirmed": overview.tool_summary.unconfirmed_invocations,
         "skill_dispatch_total": overview.skill_dispatch_summary.total_dispatches,
         "skill_dispatch_builtin": overview.skill_dispatch_summary.builtin_dispatches,
         "skill_dispatch_bridge": overview.skill_dispatch_summary.bridge_dispatches,

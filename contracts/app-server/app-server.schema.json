@@ -45,7 +45,7 @@
     },
     "browser/tools/list": {
       "kind": "request",
-      "params": "BrowserToolsListParams",
+      "params": "EmptyParams",
       "result": "BrowserToolsListResult"
     },
     "browser/tool": {
@@ -170,13 +170,6 @@
         "protocol": { "$ref": "#/$defs/ProtocolVersion" },
         "runtimeEpoch": { "type": "string", "minLength": 1 },
         "capabilities": { "$ref": "#/$defs/ServerCapabilities" }
-      }
-    },
-    "BrowserToolsListParams": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "sessionId": { "type": ["string", "null"] }
       }
     },
     "EventSubscribeParams": {
@@ -416,7 +409,7 @@
     },
     "CanonicalTurnItemStatus": {
       "type": "string",
-      "enum": ["pending", "running", "completed", "blocked", "failed", "cancelled"]
+      "enum": ["pending", "running", "completed", "blocked", "failed", "cancelled", "indeterminate"]
     },
     "CanonicalTurnVisibility": {
       "type": "object",
@@ -658,10 +651,6 @@
         "snapshot": { "$ref": "#/$defs/EventStreamSnapshot" }
       }
     },
-    "BrowserAccessProfile": {
-      "type": "string",
-      "enum": ["read_only", "restricted", "full_access"]
-    },
     "BrowserToolAccess": {
       "type": "string",
       "enum": ["read", "write", "mixed"]
@@ -690,15 +679,14 @@
       "additionalProperties": false,
       "required": [
         "revision", "inAppBrowserEnabled", "browserUseEnabled", "hostStatus",
-        "hostProtocolCompatible", "accessProfile"
+        "hostProtocolCompatible"
       ],
       "properties": {
         "revision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
         "inAppBrowserEnabled": { "type": "boolean" },
         "browserUseEnabled": { "type": "boolean" },
         "hostStatus": { "$ref": "#/$defs/BrowserHostStatus" },
-        "hostProtocolCompatible": { "type": "boolean" },
-        "accessProfile": { "$ref": "#/$defs/BrowserAccessProfile" }
+        "hostProtocolCompatible": { "type": "boolean" }
       }
     },
     "BrowserToolsListResult": {
@@ -746,7 +734,6 @@
         },
         "workspaceId": { "type": ["string", "null"] },
         "callId": { "type": ["string", "null"] },
-        "accessProfile": { "$ref": "#/$defs/BrowserAccessProfile" },
         "browserExecutionId": { "type": ["string", "null"] },
         "taskId": { "type": ["string", "null"] },
         "workerId": { "type": ["string", "null"] }

@@ -140,7 +140,6 @@
           filePreviewScope={filePreviewScopeForItem(item)}
           onContinueInterrupted={continueInterruptedSession}
           hideResponseDuration
-          presentationRole="delegation"
         />
       {/each}
     </div>

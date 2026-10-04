@@ -1,5 +1,5 @@
 use crate::EventEnvelope;
-use magi_core::{EventId, UtcMillis};
+use magi_core::EventId;
 use serde_json::json;
 // --- Task submission lifecycle
 
@@ -33,7 +33,7 @@ pub fn task_status_changed_event(
     kind: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-status-changed-{}", UtcMillis::now().0)),
+        EventId::unique("event-task-status-changed"),
         TASK_STATUS_CHANGED,
         json!({
             "task_id": task_id,
@@ -52,10 +52,7 @@ pub fn task_submission_created_event(
     task_count: usize,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-submission-created-{}",
-            UtcMillis::now().0
-        )),
+        EventId::unique("event-task-submission-created"),
         TASK_SUBMISSION_CREATED,
         json!({
             "mission_id": mission_id,
@@ -73,7 +70,7 @@ pub fn lease_granted_event(
     role: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-lease-granted-{}", UtcMillis::now().0)),
+        EventId::unique("event-task-lease-granted"),
         LEASE_GRANTED,
         json!({
             "lease_id": lease_id,
@@ -87,7 +84,7 @@ pub fn lease_granted_event(
 /// Create a domain event when a lease is completed.
 pub fn lease_completed_event(lease_id: &str, task_id: &str, worker_id: &str) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-lease-completed-{}", UtcMillis::now().0)),
+        EventId::unique("event-task-lease-completed"),
         LEASE_COMPLETED,
         json!({
             "lease_id": lease_id,
@@ -100,7 +97,7 @@ pub fn lease_completed_event(lease_id: &str, task_id: &str, worker_id: &str) -> 
 /// Create a domain event when a lease expires.
 pub fn lease_expired_event(lease_id: &str, task_id: &str, worker_id: &str) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-lease-expired-{}", UtcMillis::now().0)),
+        EventId::unique("event-task-lease-expired"),
         LEASE_EXPIRED,
         json!({
             "lease_id": lease_id,
@@ -118,7 +115,7 @@ pub fn lease_revoked_event(
     reason: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-lease-revoked-{}", UtcMillis::now().0)),
+        EventId::unique("event-task-lease-revoked"),
         LEASE_REVOKED,
         json!({
             "lease_id": lease_id,
@@ -136,10 +133,7 @@ pub fn checkpoint_saved_event(
     mission_id: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-checkpoint-saved-{}",
-            UtcMillis::now().0
-        )),
+        EventId::unique("event-task-checkpoint-saved"),
         CHECKPOINT_SAVED,
         json!({
             "checkpoint_id": checkpoint_id,
@@ -156,10 +150,7 @@ pub fn checkpoint_restored_event(
     mission_id: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-checkpoint-restored-{}",
-            UtcMillis::now().0
-        )),
+        EventId::unique("event-task-checkpoint-restored"),
         CHECKPOINT_RESTORED,
         json!({
             "checkpoint_id": checkpoint_id,

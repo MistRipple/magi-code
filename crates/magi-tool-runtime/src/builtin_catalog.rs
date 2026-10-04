@@ -55,6 +55,8 @@ pub enum BuiltinToolName {
     BrowserThirdParty,
     BrowserWebMcp,
     BrowserPwa,
+    BrowserRead,
+    BrowserStorage,
     // ── 可视化 ──
     DiagramRender,
     /// 通过已配置的图片生成模型生成图片并保存到当前工作区。
@@ -119,7 +121,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 76] = [
+    pub const ALL: [Self; 78] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -167,6 +169,8 @@ impl BuiltinToolName {
         Self::BrowserThirdParty,
         Self::BrowserWebMcp,
         Self::BrowserPwa,
+        Self::BrowserRead,
+        Self::BrowserStorage,
         Self::DiagramRender,
         Self::ImageGenerate,
         Self::KnowledgeQuery,
@@ -247,6 +251,8 @@ impl BuiltinToolName {
             Self::BrowserThirdParty => "browser_third_party",
             Self::BrowserWebMcp => "browser_webmcp",
             Self::BrowserPwa => "browser_pwa",
+            Self::BrowserRead => "browser_read",
+            Self::BrowserStorage => "browser_storage",
             Self::DiagramRender => "diagram_render",
             Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
@@ -325,7 +331,9 @@ impl BuiltinToolName {
             | Self::BrowserHeap
             | Self::BrowserThirdParty
             | Self::BrowserWebMcp
-            | Self::BrowserPwa => "browser",
+            | Self::BrowserPwa
+            | Self::BrowserRead
+            | Self::BrowserStorage => "browser",
             Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery | Self::KnowledgeGraphQuery => "knowledge",
             Self::ToolCatalog => "tooling",
@@ -402,6 +410,8 @@ impl BuiltinToolName {
             "browser_third_party" => Some(Self::BrowserThirdParty),
             "browser_webmcp" => Some(Self::BrowserWebMcp),
             "browser_pwa" => Some(Self::BrowserPwa),
+            "browser_read" => Some(Self::BrowserRead),
+            "browser_storage" => Some(Self::BrowserStorage),
             "diagram_render" => Some(Self::DiagramRender),
             "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
@@ -741,7 +751,8 @@ impl BuiltinToolName {
             | Self::BrowserPerformance
             | Self::BrowserLighthouse
             | Self::BrowserHeap
-            | Self::BrowserPwa => RiskLevel::Low,
+            | Self::BrowserPwa
+            | Self::BrowserRead => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
@@ -767,7 +778,8 @@ impl BuiltinToolName {
             | Self::BrowserEvaluate
             | Self::BrowserThirdParty
             | Self::BrowserWebMcp
-            | Self::BrowserEmulate => RiskLevel::Medium,
+            | Self::BrowserEmulate
+            | Self::BrowserStorage => RiskLevel::Medium,
             Self::FileRemove
             | Self::ShellExec
             | Self::ProcessLaunch
@@ -813,6 +825,10 @@ impl BuiltinToolName {
     }
 
     pub fn description(&self) -> &'static str {
+        // 浏览器工具的描述和参数 schema 一样只有一个事实源：browser-tool.schema.json。
+        if let Some(tool) = self.browser_tool_kind() {
+            return tool.description();
+        }
         match self {
             Self::FileRead => {
                 "读取指定路径文件的内容。\n\n\
@@ -922,78 +938,6 @@ impl BuiltinToolName {
             Self::DiffPreview => "对两段文本生成 unified diff 预览",
             Self::WebSearch => "通过 DuckDuckGo 搜索网络并返回结果",
             Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
-            Self::BrowserNavigate => {
-                "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。\n\n\
-                # Web 项目验收\n\
-                - 先读取项目清单确认启动命令，再用 shell_exec(background=true) 启动开发服务\n\
-                - 从服务输出确认实际监听 URL 和端口，不要臆测 localhost 端口\n\
-                - 导航后还要继续交互时，在本次调用设置 include_snapshot=true，直接取得最新可交互元素，避免再单独调用 browser_snapshot\n\
-                - 使用 browser_click、browser_type、browser_press 和 browser_scroll 完成真实用户路径；搜索或表单提交优先 browser_type(submit_key=Enter)\n\
-                - 文本、标题、计数、控件与状态全部从快照读取；只读取 URL 或标题时不要附带快照\n\
-                - 仅在页面结构确实变化且当前结果未附带快照时调用 browser_snapshot，不要因为页面内容很多而重复快照\n\
-                - browser_screenshot 只用于布局、样式、图像等视觉问题或用户明确要求截图的场景，不能用于读取文本或定位控件\n\
-                - 响应式任务使用 browser_viewport 覆盖桌面和手机视口\n\
-                - 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
-            }
-            Self::BrowserSnapshot => {
-                "读取当前浏览器页面的 DOM 交互快照和 Chromium Accessibility Tree，优先用于读取文本、标题、计数、控件和状态。返回的 element_ref（包括结构性节点的 group 引用）只在本次 snapshot_revision 内有效；后续交互必须使用最近一次工具结果里的引用和 revision，页面发生交互或结构变化后不要复用旧快照。不要用截图替代文本快照。"
-            }
-            Self::BrowserClick => {
-                "点击当前浏览器快照中的元素。必须传入 browser_snapshot 返回的 element_ref 和 snapshot_revision。"
-            }
-            Self::BrowserType => {
-                "向当前浏览器快照中的可编辑元素输入文本。需要提交搜索或表单时同时传 submit_key=Enter，避免再调用 browser_press。不能用于密码、验证码或支付字段。"
-            }
-            Self::BrowserPress => "向当前浏览器页面发送一个按键或组合键。",
-            Self::BrowserScroll => "滚动当前浏览器页面或快照中的指定元素。",
-            Self::BrowserScreenshot => {
-                "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取文本、标题、计数、控件和状态必须使用 browser_snapshot。截图范围三选一：省略 element_ref、clip、full_page 时截取当前视口；指定 clip 时不能同时传 full_page；指定 element_ref 时不能同时传 clip 或 full_page。quality 只对 jpeg/webp 有效，png 不要传 quality。"
-            }
-            Self::BrowserTabs => {
-                "列出、激活或新建当前 Magi 会话的内置浏览器标签页；任务完成时必须保留标签及其当前页面，不得把 close 当作清理动作。只有用户明确要求关闭指定标签时才允许使用 close。"
-            }
-            Self::BrowserViewport => {
-                "读取或设置当前内置浏览器页面的设备视口。使用 action=set、mode=auto 恢复跟随右侧内容槽的自适应布局；使用 mode=fixed 并传入 width/height 验证电脑/平板宽屏或手机窄屏响应式布局。可选 device_scale_factor_millis 调整设备像素比（500-4000，默认 1000）。该工具只通过 Chromium 原生 device metrics、设备类型和触控语义改变页面 CSS 视口，不修改页面 DOM，也不使用 Magi 外层缩放。"
-            }
-            Self::BrowserWaitFor => {
-                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
-            }
-            Self::BrowserHover => "将鼠标悬停到当前浏览器快照中的元素。",
-            Self::BrowserDrag => {
-                "把当前浏览器快照中的 source 元素拖到 target 元素。两个引用必须来自最近一次 browser_snapshot 或交互工具结果中的同一个 snapshot_revision；可使用快照里的 e 引用或结构性 draggable div 等节点的 group 引用。页面发生变化后先重新获取快照，不要复用旧 revision。"
-            }
-            Self::BrowserFillForm => {
-                "按 fields 中的统一快照引用一次性填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。"
-            }
-            Self::BrowserDialog => {
-                "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
-            }
-            Self::BrowserUploadFile => {
-                "将一个或多个本地文件设置到当前页面的 file input。元素必须来自当前浏览器快照。"
-            }
-            Self::BrowserClickAt => "在当前浏览器页面的坐标位置点击，支持双击。",
-            Self::BrowserEvaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
-            Self::BrowserConsole => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
-            Self::BrowserNetwork => "读取、筛选、查看请求体或清理当前浏览器页面的网络请求记录。",
-            Self::BrowserEmulate => {
-                "使用 Chromium DevTools 协议仿真颜色、CPU、网络、地理位置、UA 和请求头。"
-            }
-            Self::BrowserPerformance => {
-                "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪；analyze 返回 Magi 支持的聚合指标。"
-            }
-            Self::BrowserLighthouse => {
-                "复用当前 Browser Surface 执行 Lighthouse 页面审计，不创建新的浏览器页面。"
-            }
-            Self::BrowserHeap => {
-                "读取当前页面堆和 DOM 计数，或在当前浏览器 Tab 内生成和分析内存快照。"
-            }
-            Self::BrowserThirdParty => {
-                "按请求来源统计当前页面加载的第三方资源、请求数、字节数和资源类型。"
-            }
-            Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
-            Self::BrowserPwa => {
-                "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
-            }
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
@@ -1161,6 +1105,7 @@ impl BuiltinToolName {
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
             }
+            _ => unreachable!("浏览器工具描述已由 browser-tool.schema.json 的唯一目录提供"),
         }
     }
 

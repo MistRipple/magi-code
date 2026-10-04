@@ -488,9 +488,8 @@ pub fn publish_context_usage_update(
     });
     let _ = event_bus.publish(
         EventEnvelope::usage(
-            EventId::new(format!(
-                "session-context-usage-{call_id}-{phase}-{token_used}-{}",
-                updated_at.0,
+            EventId::unique(format!(
+                "session-context-usage-{call_id}-{phase}-{token_used}"
             )),
             "session.context.pressure.updated",
             payload,

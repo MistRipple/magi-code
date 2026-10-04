@@ -458,7 +458,7 @@ async fn restart_task(
         .runtime_sidecar(&accepted.session_id)
         .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
     let event = EventEnvelope::domain(
-        EventId::new(format!("event-task-restart-{}", now.0)),
+        EventId::unique("event-task-restart"),
         "task.restart.requested",
         json!({
             "taskId": task_id,
@@ -525,7 +525,7 @@ async fn archive_task(
         .map_err(|error| ApiError::internal_assembly("归档任务失败", error))?;
     state.persist_runtime_durable_state_for_sessions_for_api(std::slice::from_ref(&session_id))?;
 
-    let event_id = EventId::new(format!("event-task-archive-{}", now.0));
+    let event_id = EventId::unique("event-task-archive");
     let event = EventEnvelope::domain(
         event_id.clone(),
         "task.archive.requested",

@@ -1742,6 +1742,7 @@ fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
                 successful_invocations: 3,
                 failed_invocations: 1,
                 blocked_invocations: 0,
+                unconfirmed_invocations: 0,
             },
             skill_dispatch_observations: &skill_observations,
             governance_observations: &governance_observations,

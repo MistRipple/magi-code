@@ -35,11 +35,26 @@ export function createCanonicalTurnReducerState(sessionId: string): CanonicalTur
   });
 }
 
-function buildTurnIndexes(turns: CanonicalTurn[]): Pick<CanonicalTurnReducerState, 'turnIndexById' | 'itemIndexByTurnId'> {
+/**
+ * 重建 turn / item 索引。`previous` 中同一个 turn 对象（未被替换）的 item 索引直接复用：
+ * 一次事件只会替换少数 turn，不能为了它把整个会话的 item 索引重算一遍。
+ */
+function buildTurnIndexes(
+  turns: CanonicalTurn[],
+  previous?: CanonicalTurnReducerState,
+): Pick<CanonicalTurnReducerState, 'turnIndexById' | 'itemIndexByTurnId'> {
   const turnIndexById: Record<string, number> = {};
   const itemIndexByTurnId: Record<string, Record<string, number>> = {};
   turns.forEach((turn, turnIndex) => {
     turnIndexById[turn.turnId] = turnIndex;
+    const previousIndex = previous?.turnIndexById[turn.turnId];
+    const previousIndexes = previousIndex !== undefined && previous?.turns[previousIndex] === turn
+      ? previous.itemIndexByTurnId[turn.turnId]
+      : undefined;
+    if (previousIndexes) {
+      itemIndexByTurnId[turn.turnId] = previousIndexes;
+      return;
+    }
     const itemIndexes: Record<string, number> = {};
     turn.items.forEach((item, itemIndex) => {
       itemIndexes[item.itemId] = itemIndex;
@@ -65,7 +80,7 @@ function stateWithTurns(
   state: CanonicalTurnReducerState,
   turns: CanonicalTurn[],
 ): CanonicalTurnReducerState {
-  return { ...state, turns, ...buildTurnIndexes(turns) };
+  return { ...state, turns, ...buildTurnIndexes(turns, state) };
 }
 
 function normalizeSessionId(value: string | null | undefined): string {
@@ -125,6 +140,20 @@ function valuesEqual(left: unknown, right: unknown): boolean {
         && valuesEqual(leftRecord[key], rightRecord[key]));
   }
   return false;
+}
+
+/**
+ * item 对象不可变，内容的码点长度按对象缓存；流式追加时由上一版长度直接推算新长度，
+ * 避免每个 delta 都把整段已输出内容扫描一遍（长回复下会退化成平方级开销）。
+ */
+const contentCodePointLengthByItem = new WeakMap<CanonicalTurnItem, number>();
+
+function itemContentCodePointLength(item: CanonicalTurnItem): number {
+  const cached = contentCodePointLengthByItem.get(item);
+  if (cached !== undefined) return cached;
+  const length = codePointLength(item.content || '');
+  contentCodePointLengthByItem.set(item, length);
+  return length;
 }
 
 function codePointLength(value: string): number {
@@ -384,11 +413,13 @@ function applyCanonicalStreamUpdate(
     return { state, changed: false, error: statusError };
   }
   const currentContent = item.content || '';
-  const currentLength = codePointLength(currentContent);
+  const currentLength = itemContentCodePointLength(item);
   const deltaLength = codePointLength(stream.delta);
   let rawContent = currentContent;
+  let reconciledLength = currentLength;
   if (stream.reset) {
     rawContent = stream.delta;
+    reconciledLength = deltaLength;
   } else if (currentLength < stream.baseContentLength) {
     // 此处不能猜测缺失片段，也不能继续拼接后续 delta；保留当前可见内容，
     // 推进事件游标并交给 bootstrap 快照恢复完整权威内容。
@@ -416,19 +447,22 @@ function applyCanonicalStreamUpdate(
   } else if (currentLength <= stream.contentLength) {
     const overlapLength = currentLength - stream.baseContentLength;
     const expectedDeltaLength = stream.contentLength - stream.baseContentLength;
-    const currentOverlap = codePointSlice(currentContent, stream.baseContentLength);
-    const deltaOverlap = codePointSlice(stream.delta, 0, overlapLength);
-    if (deltaLength !== expectedDeltaLength || currentOverlap !== deltaOverlap) {
+    // 常见情况是本地内容恰好停在 delta 起点（无重叠），此时无需切片比对。
+    const overlapMatches = overlapLength === 0
+      || codePointSlice(currentContent, stream.baseContentLength) === codePointSlice(stream.delta, 0, overlapLength);
+    if (deltaLength !== expectedDeltaLength || !overlapMatches) {
       return {
         state,
         changed: false,
         error: `canonical stream event ${event.eventId} does not continue the local content baseline`,
       };
     }
-    rawContent = `${currentContent}${codePointSlice(stream.delta, overlapLength)}`;
+    rawContent = overlapLength === 0
+      ? `${currentContent}${stream.delta}`
+      : `${currentContent}${codePointSlice(stream.delta, overlapLength)}`;
+    reconciledLength = stream.contentLength;
   }
   const content = rawContent;
-  const reconciledLength = codePointLength(content);
   if ((stream.reset && reconciledLength !== stream.contentLength) || reconciledLength < stream.contentLength) {
     return {
       state,
@@ -436,14 +470,16 @@ function applyCanonicalStreamUpdate(
       error: `canonical stream event ${event.eventId} content length mismatch: ${reconciledLength} != ${stream.contentLength}`,
     };
   }
-  const nextItems = [...turn.items];
-  nextItems[itemIndex] = {
+  const nextItem: CanonicalTurnItem = {
     ...item,
     content,
-      status: stream.itemStatus,
-      itemVersion: stream.itemVersion,
-      updatedAt: event.occurredAt,
+    status: stream.itemStatus,
+    itemVersion: stream.itemVersion,
+    updatedAt: event.occurredAt,
   };
+  contentCodePointLengthByItem.set(nextItem, reconciledLength);
+  const nextItems = [...turn.items];
+  nextItems[itemIndex] = nextItem;
   const nextTurns = [...state.turns];
   nextTurns[turnIndex] = { ...turn, items: nextItems };
   return {
@@ -522,7 +558,9 @@ export function reduceCanonicalTurnEvent(
       turnId: event.item.turnId,
       turnSeq: event.item.turnSeq,
       acceptedAt: event.item.createdAt,
-      status: event.item.status,
+      // indeterminate 只描述一次工具调用的结果，不会让整轮结束；占位 turn 视为进行中，
+      // 真实的 turn 状态由后续 turn 事件更新。
+      status: event.item.status === 'indeterminate' ? 'running' : event.item.status,
       items: [],
     };
   }

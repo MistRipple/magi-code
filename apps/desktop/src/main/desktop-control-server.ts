@@ -976,12 +976,15 @@ export class DesktopControlServer {
         // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
         // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
         // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一
-        // WebContents 的最新地址、标题和 navigation revision，统一满足
-        // Rust 工具层的 PageState 契约。
+        // WebContents 的最新地址、标题和 navigation revision，与 Worker
+        // 报告的实际作用元素合并为 Rust 工具层的 Interaction 结果。
         if (
           executed.outcome.status === "succeeded" &&
-          isPageStateInteraction(command)
+          isInteractionCommand(command)
         ) {
+          if (executed.outcome.payload.type !== "action_target") {
+            throw new Error("browser_worker_interaction_result_invalid");
+          }
           const currentBinding =
             await this.requireRenderablePrimaryBinding(tabId);
           const contents =
@@ -990,13 +993,16 @@ export class DesktopControlServer {
             outcome: {
               status: "succeeded",
               payload: {
-                type: "page_state",
+                type: "interaction",
                 payload: {
-                  tab_id: currentBinding.tab_id,
-                  url: contents.getURL() || "about:blank",
-                  origin: safeOrigin(contents.getURL()),
-                  title: contents.getTitle() || "",
-                  navigation_revision: currentBinding.navigation_revision,
+                  page_state: {
+                    tab_id: currentBinding.tab_id,
+                    url: contents.getURL() || "about:blank",
+                    origin: safeOrigin(contents.getURL()),
+                    title: contents.getTitle() || "",
+                    navigation_revision: currentBinding.navigation_revision,
+                  },
+                  target: executed.outcome.payload.payload,
                 },
               },
             },
@@ -1268,7 +1274,7 @@ function isNavigationInterruptCommand(command: BrowserHostCommand): boolean {
   return command.type === "stop_navigation";
 }
 
-function isPageStateInteraction(command: BrowserHostCommand): boolean {
+function isInteractionCommand(command: BrowserHostCommand): boolean {
   return (
     command.type === "click" ||
     command.type === "type" ||

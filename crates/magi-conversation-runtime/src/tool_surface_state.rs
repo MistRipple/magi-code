@@ -16,7 +16,6 @@ pub(crate) struct BrowserToolSurfaceSnapshot {
 pub(crate) struct BrowserToolSurfaceContext<'a> {
     skill_runtime: Option<&'a SkillRuntime>,
     active_skill_id: Option<&'a str>,
-    access_profile: AccessProfile,
     allowed_tools: Option<&'a [String]>,
     denied_tools: &'a [String],
 }
@@ -25,14 +24,12 @@ impl<'a> BrowserToolSurfaceContext<'a> {
     pub(crate) fn new(
         skill_runtime: Option<&'a SkillRuntime>,
         active_skill_id: Option<&'a str>,
-        access_profile: AccessProfile,
         allowed_tools: Option<&'a [String]>,
         denied_tools: &'a [String],
     ) -> Self {
         Self {
             skill_runtime,
             active_skill_id,
-            access_profile,
             allowed_tools,
             denied_tools,
         }
@@ -50,13 +47,12 @@ pub(crate) fn build_browser_tool_surface(
             .is_none_or(|tool| tool.browser_tool_kind().is_none())
     });
 
-    let Some(mut capability) = capability else {
+    let Some(capability) = capability else {
         return BrowserToolSurfaceSnapshot {
             definitions,
             capability: None,
         };
     };
-    capability.access_profile = context.access_profile;
     let skill_allowed_tools = context.active_skill_id.and_then(|skill_id| {
         context.skill_runtime.and_then(|runtime| {
             let policy = runtime
@@ -273,13 +269,12 @@ mod tests {
                     ExecutionResultStatus::Succeeded,
                 )
             }),
-            Arc::new(move |_| BrowserCapabilitySnapshot {
+            Arc::new(move || BrowserCapabilitySnapshot {
                 revision: provider_revision.load(Ordering::Acquire),
                 in_app_browser_enabled: true,
                 browser_use_enabled: provider_enabled.load(Ordering::Acquire),
                 host_status: BrowserHostStatus::Ready,
                 host_protocol_compatible: true,
-                access_profile: AccessProfile::Restricted,
             }),
         );
         registry.register_default_builtins();
@@ -287,8 +282,8 @@ mod tests {
         let first = build_browser_tool_surface(
             Vec::new(),
             &registry,
-            BrowserToolSurfaceContext::new(None, None, AccessProfile::FullAccess, None, &[]),
-            registry.browser_capability_snapshot(AccessProfile::FullAccess, None),
+            BrowserToolSurfaceContext::new(None, None, None, &[]),
+            registry.browser_capability_snapshot(),
         );
         assert_eq!(
             first.capability.as_ref().map(|snapshot| snapshot.revision),
@@ -320,8 +315,8 @@ mod tests {
         let disabled = build_browser_tool_surface(
             first.definitions,
             &registry,
-            BrowserToolSurfaceContext::new(None, None, AccessProfile::FullAccess, None, &[]),
-            registry.browser_capability_snapshot(AccessProfile::FullAccess, None),
+            BrowserToolSurfaceContext::new(None, None, None, &[]),
+            registry.browser_capability_snapshot(),
         );
         assert_eq!(
             disabled
@@ -334,13 +329,13 @@ mod tests {
 
         revision.store(9, Ordering::Release);
         enabled.store(true, Ordering::Release);
-        let read_only = build_browser_tool_surface(
+        let reenabled = build_browser_tool_surface(
             disabled.definitions,
             &registry,
-            BrowserToolSurfaceContext::new(None, None, AccessProfile::ReadOnly, None, &[]),
-            registry.browser_capability_snapshot(AccessProfile::ReadOnly, None),
+            BrowserToolSurfaceContext::new(None, None, None, &[]),
+            registry.browser_capability_snapshot(),
         );
-        let names = read_only
+        let names = reenabled
             .definitions
             .iter()
             .map(|definition| definition.function.name.as_str())
@@ -354,7 +349,7 @@ mod tests {
             .map(BuiltinToolName::as_str)
             .collect::<Vec<_>>();
         assert_eq!(
-            read_only
+            reenabled
                 .capability
                 .as_ref()
                 .map(|snapshot| snapshot.revision),

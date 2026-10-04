@@ -737,7 +737,7 @@ impl LlmTaskDispatcher {
             workspace_id,
         } = input;
         let event = EventEnvelope::domain(
-            EventId::new(format!("event-task-dispatched-{}", UtcMillis::now().0)),
+            EventId::unique("event-task-dispatched"),
             "task.dispatched",
             serde_json::json!({
                 "task_id": task_id.to_string(),
@@ -1159,7 +1159,7 @@ impl LlmTaskDispatcher {
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or(serde_json::Value::Null);
         let event = EventEnvelope::audit(
-            EventId::new(format!("event-mission-overview-{}", UtcMillis::now().0)),
+            EventId::unique("event-mission-overview"),
             "mission.execution.overview",
             serde_json::json!({
                 "mission_id": task.mission_id.to_string(),
@@ -1187,11 +1187,7 @@ impl LlmTaskDispatcher {
         task_id: Option<&TaskId>,
     ) {
         let event = EventEnvelope::audit(
-            EventId::new(format!(
-                "event-knowledge-context-{}-{}",
-                session_id,
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("event-knowledge-context-{}", session_id)),
             "knowledge.context.selected",
             serde_json::json!({
                 "consumer": selection.consumer,
@@ -1232,11 +1228,7 @@ impl LlmTaskDispatcher {
         inserted_count: usize,
     ) {
         let event = EventEnvelope::audit(
-            EventId::new(format!(
-                "event-learning-extraction-{}-{}",
-                session_id,
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("event-learning-extraction-{}", session_id)),
             "knowledge.learning.extraction",
             serde_json::json!({
                 "status": status,
@@ -1343,11 +1335,7 @@ impl LlmTaskDispatcher {
                                     tool,
                                     tool_surface_access_profile,
                                 )
-                                && registry.browser_tool_available(
-                                    tool,
-                                    tool_surface_access_profile,
-                                    None,
-                                )
+                                && registry.browser_tool_available(tool)
                         },
                     )
                 })
@@ -1881,11 +1869,7 @@ impl LlmTaskDispatcher {
         }
         self.event_bus.publish(
             EventEnvelope::domain(
-                EventId::new(format!(
-                    "agent-worktree-released-{}-{}",
-                    task.task_id,
-                    UtcMillis::now().0
-                )),
+                EventId::unique(format!("agent-worktree-released-{}", task.task_id)),
                 "agent.git.worktree.released",
                 serde_json::json!({
                     "session_id": session_id,
@@ -3525,13 +3509,12 @@ mod tests {
                         magi_core::ExecutionResultStatus::Succeeded,
                     )
                 }),
-                Arc::new(|_| magi_browser_authority::BrowserCapabilitySnapshot {
+                Arc::new(|| magi_browser_authority::BrowserCapabilitySnapshot {
                     revision: 11,
                     in_app_browser_enabled: true,
                     browser_use_enabled: true,
                     host_status: magi_browser_authority::BrowserHostStatus::Ready,
                     host_protocol_compatible: true,
-                    access_profile: magi_core::AccessProfile::Restricted,
                 }),
             );
         tool_registry.register_default_builtins();

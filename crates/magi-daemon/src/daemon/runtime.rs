@@ -1528,7 +1528,7 @@ impl DaemonRuntime {
         };
         let browser_capability_provider: magi_tool_runtime::BrowserCapabilityProvider = {
             let holder = Arc::clone(&browser_automation_dependencies);
-            Arc::new(move |session_id| {
+            Arc::new(move || {
                 holder.get().map_or_else(
                     || magi_browser_authority::BrowserCapabilitySnapshot {
                         revision: 0,
@@ -1536,9 +1536,8 @@ impl DaemonRuntime {
                         browser_use_enabled: false,
                         host_status: magi_browser_authority::BrowserHostStatus::Stopped,
                         host_protocol_compatible: false,
-                        access_profile: magi_core::AccessProfile::Restricted,
                     },
-                    |dependencies| dependencies.capabilities(session_id),
+                    |dependencies| dependencies.capabilities(),
                 )
             })
         };
@@ -2630,11 +2629,7 @@ fn publish_task_status_changed_event(
         })
         .flatten();
     let event = EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-status-changed-{}-{}",
-            task_id,
-            UtcMillis::now().0
-        )),
+        EventId::unique(format!("event-task-status-changed-{}", task_id)),
         magi_event_bus::task_events::TASK_STATUS_CHANGED,
         serde_json::json!({
             "task_id": task_id.to_string(),

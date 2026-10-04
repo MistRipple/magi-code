@@ -50,6 +50,8 @@ const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
   browser_third_party: 'toolCall.displayName.browserThirdParty',
   browser_webmcp: 'toolCall.displayName.browserWebMcp',
   browser_pwa: 'toolCall.displayName.browserPwa',
+  browser_read: 'toolCall.displayName.browserRead',
+  browser_storage: 'toolCall.displayName.browserStorage',
   diagram_render: 'toolCall.displayName.diagramRender',
   knowledge_query: 'toolCall.displayName.knowledgeQuery',
   knowledge_graph_query: 'toolCall.displayName.knowledgeGraphQuery',

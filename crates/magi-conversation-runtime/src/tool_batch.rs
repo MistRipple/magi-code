@@ -57,7 +57,7 @@ use crate::{
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
     tool_result_utils::{
         approval_resume_contract_failure, approval_resume_is_safe, safety_gate_public_error,
-        tool_execution_failed_result, tool_execution_status_label,
+        tool_execution_failed_result,
     },
 };
 use crate::{
@@ -138,7 +138,7 @@ where
         tool_call,
         serde_json::json!({
             "phase": "finished",
-            "status": tool_execution_status_label(result.1),
+            "status": result.1.wire_label(),
             "duration_ms": finished_at.0.saturating_sub(started_at.0),
             "result_preview": tool_arguments_preview(&result.0),
         }),
@@ -164,11 +164,9 @@ fn publish_tool_lifecycle_event(
         "lifecycle": payload,
     });
     let event = EventEnvelope::domain(
-        EventId::new(format!(
-            "event-tool-lifecycle-{}-{}-{}",
-            event_type,
-            tool_call.id,
-            UtcMillis::now().0
+        EventId::unique(format!(
+            "event-tool-lifecycle-{}-{}",
+            event_type, tool_call.id
         )),
         event_type,
         payload,
@@ -584,7 +582,7 @@ fn execute_coordinator_tool(
     let publish_event = |kind: &str, payload: serde_json::Value| {
         let _ = event_bus.publish(
             EventEnvelope::domain(
-                EventId::new(format!("event-coordinator-{kind}-{}", UtcMillis::now().0)),
+                EventId::unique(format!("event-coordinator-{kind}")),
                 kind,
                 payload,
             )
@@ -2632,7 +2630,7 @@ fn execute_task_tool_call(
 
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-task-tool-invoked-{}", UtcMillis::now().0)),
+            EventId::unique("event-task-tool-invoked"),
             "task.tool.invoked",
             serde_json::json!({
                 "task_id": task.task_id.to_string(),
@@ -2862,10 +2860,7 @@ fn await_task_tool_approval(
     }
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-tool-approval-requested-{}",
-                UtcMillis::now().0
-            )),
+            EventId::unique("event-tool-approval-requested"),
             "tool.approval.requested",
             serde_json::json!({
                 "session_id": session_id,
@@ -3388,7 +3383,7 @@ fn task_policy_decision_payload(
     };
     tracing::warn!(
         tool_name,
-        status = %tool_execution_status_label(status),
+        status = %status.wire_label(),
         access_profile = access_profile.map(|profile| profile.as_str()).unwrap_or_default(),
         reason = %reason,
         "tool preflight policy decision"
@@ -3396,7 +3391,7 @@ fn task_policy_decision_payload(
     ToolPreflightDecision {
         payload: serde_json::json!({
             "tool": tool_name,
-            "status": tool_execution_status_label(status),
+            "status": status.wire_label(),
             "error_code": error_code,
             "error": public_error,
             "access_profile": access_profile.map(|profile| profile.as_str()),
@@ -3446,7 +3441,7 @@ fn task_tool_visibility_decision_payload(
     ToolPreflightDecision {
         payload: serde_json::json!({
             "tool": tool_name,
-            "status": tool_execution_status_label(ExecutionResultStatus::Rejected),
+            "status": ExecutionResultStatus::Rejected.wire_label(),
             "error_code": "tool_policy_rejected",
             "error": TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR,
             "retryable_with_same_arguments": false,
@@ -3541,11 +3536,7 @@ pub(crate) fn publish_safety_evaluation_audit(
     };
     let _ = event_bus.publish(
         EventEnvelope::audit(
-            EventId::new(format!(
-                "event-safety-evaluation-{}-{}",
-                tool_call_id,
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("event-safety-evaluation-{}", tool_call_id)),
             "security.safety.evaluated",
             serde_json::json!({
                 "tool_name": canonical_tool_name,
@@ -3580,7 +3571,7 @@ fn safety_gate_decision_payload(
     let public_error = safety_gate_public_error(status);
     tracing::warn!(
         tool_name,
-        status = %tool_execution_status_label(status),
+        status = %status.wire_label(),
         category = category.as_str(),
         action = action.as_str(),
         pattern = %pattern,
@@ -3590,7 +3581,7 @@ fn safety_gate_decision_payload(
     ToolPreflightDecision {
         payload: serde_json::json!({
             "tool": tool_name,
-            "status": tool_execution_status_label(status),
+            "status": status.wire_label(),
             "error_code": public_error.error_code,
             "error": public_error.error,
             "retryable_with_same_arguments": status == ExecutionResultStatus::Rejected,

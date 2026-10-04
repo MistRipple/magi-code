@@ -41,6 +41,93 @@ await withGoldenViteServer(async (server) => {
   const long = label('字'.repeat(500));
   assert.ok(long.length <= 160 && long.endsWith('…'), '预览必须截断，避免超长标题');
 
+  // ---- 工具组标签：用真实文案渲染，不能出现未替换的占位符；浏览器工具按命名空间归类 ----
+  const { readFileSync } = await import('node:fs');
+  const zh = JSON.parse(readFileSync(new URL('../src/i18n/zh-CN.json', import.meta.url), 'utf8'));
+  const zhTranslate = (key, vars = {}) => {
+    const template = zh[key];
+    assert.equal(typeof template, 'string', `缺少文案 ${key}`);
+    return template.replace(/\{(\w+)\}/gu, (match, name) => (name in vars ? String(vars[name]) : match));
+  };
+  const toolItem = (key, name, args = {}, status = 'success') => ({
+    key,
+    message: message({
+      type: 'tool_call',
+      metadata: { toolName: name },
+      blocks: [{ id: `${key}-b`, type: 'tool_call', toolCall: { id: key, name, arguments: args, status } }],
+    }),
+  });
+  const groupLabel = (items) => disclosure.resolveConversationToolGroupLabel(items, zhTranslate);
+  for (const [name, args] of [['file_read', {}], ['shell_exec', {}], ['search_text', {}], ['file_write', {}]]) {
+    const text = groupLabel([toolItem('t', name, args)]);
+    assert.ok(!/\{\w+\}/u.test(text), `${name} 缺少目标时不得显示占位符：${text}`);
+  }
+  assert.equal(groupLabel([toolItem('t', 'file_read', { path: 'src/lib/a.ts' })]), '读取 a.ts');
+  assert.equal(groupLabel([toolItem('t', 'file_read', {})]), '读取文件');
+  assert.equal(groupLabel([toolItem('t', 'browser_read', { query: '价格' })]), '浏览器读取正文 “价格”', 'browser_read 是浏览器操作而不是读文件');
+  assert.equal(groupLabel([toolItem('t', 'browser_click', { element_ref: 'e:1:2' })]), '浏览器点击', '结果未到达时不显示元素引用');
+  {
+    const clicked = toolItem('c', 'browser_click', { element_ref: 'e:1:2' });
+    clicked.message.blocks[0].toolCall.result = JSON.stringify({
+      tool: 'browser_click', status: 'succeeded', target: { role: 'button', name: '提交订单' },
+    });
+    assert.equal(groupLabel([clicked]), '浏览器点击 提交订单', '点击完成后显示运行时报告的实际元素');
+  }
+  assert.equal(
+    groupLabel([toolItem('a', 'browser_read'), toolItem('b', 'browser_click')]),
+    '完成了 2 项浏览器操作',
+    '浏览器读取与点击应合并成浏览器操作组',
+  );
+  assert.equal(
+    groupLabel([toolItem('a', 'file_read', { path: 'a.ts' }), toolItem('b', 'browser_read')]),
+    '完成了 2 项操作',
+    '文件读取与浏览器读取不能被合并成“读取了 2 个文件”',
+  );
+  assert.equal(
+    groupLabel([toolItem('t', 'browser_click', {}, 'error')]),
+    '浏览器点击 · 失败',
+  );
+
+  // ---- 结果未确认（副作用可能已发生）与普通失败分开呈现 ----
+  const unconfirmedItem = (key) => {
+    const item = toolItem(key, 'browser_click', { element_ref: 'e:1:1' }, 'unconfirmed');
+    item.message.blocks[0].toolCall.result = JSON.stringify({ tool: 'browser_click', status: 'indeterminate', error_code: 'browser_host_request_indeterminate' });
+    return item;
+  };
+  assert.equal(groupLabel([unconfirmedItem('u')]), '浏览器点击 · 结果未确认');
+  {
+    // 未确认来自正式的 item 状态，而不是从结果文本里嗅探
+    const sniffed = toolItem('s', 'browser_click', {}, 'error');
+    sniffed.message.blocks[0].toolCall.result = JSON.stringify({ status: 'indeterminate' });
+    assert.equal(groupLabel([sniffed]), '浏览器点击 · 失败');
+  }
+  assert.equal(
+    groupLabel([unconfirmedItem('u'), toolItem('f', 'browser_type', { text: 'x' }, 'error'), toolItem('ok', 'browser_read')]),
+    '完成了 3 项浏览器操作，其中 1 项失败，1 项结果未确认',
+  );
+
+  // ---- 过程流：追加条目不能让已显示的条目消失或改变 key（否则阶段重挂载、展开状态丢失） ----
+  const thinkingItem = (key) => ({ key, message: message({ id: key, type: 'thinking', content: '想一想' }) });
+  const textItem = (key) => ({ key, message: message({ id: key, type: 'text', content: '我先看看。' }) });
+  const process = (...items) => items.map((item) => ({ item, role: 'process' }));
+  const streamKeys = (entries) => disclosure.buildConversationStreamEntries(entries).map((entry) => entry.key);
+  const t1 = thinkingItem('t1');
+  const a = toolItem('a', 'file_read', { path: 'a.ts' });
+  const t2 = thinkingItem('t2');
+  const b = toolItem('b', 'shell_exec', { command: 'ls' });
+  assert.deepEqual(streamKeys(process(t1)), ['event:t1']);
+  assert.deepEqual(
+    streamKeys(process(t1, a)),
+    ['event:t1', 'tool-group:a'],
+    '第一个工具出现后，之前已显示的思考必须保留',
+  );
+  const withMiddleThinking = disclosure.buildConversationStreamEntries(process(t1, a, t2, b));
+  assert.deepEqual(withMiddleThinking.map((entry) => entry.key), ['event:t1', 'tool-group:a'], '工具之间的思考不能把工具组切开');
+  assert.deepEqual(withMiddleThinking[1].items.map((item) => item.key), ['a', 'b']);
+  const prefixKeys = streamKeys(process(textItem('x'), a));
+  const extendedKeys = streamKeys(process(textItem('x'), a, textItem('y'), b));
+  assert.deepEqual(extendedKeys.slice(0, prefixKeys.length), prefixKeys, '追加条目后，已有条目的 key 保持不变');
+
   // ---- 紧凑事件：短小纯文字才是紧凑的 ----
   assert.equal(disclosure.isCompactProcessEvent(message({ content: '我先读取入口文件。' })), true);
   assert.equal(disclosure.isCompactProcessEvent(message({ content: 'a\nb' })), false, '含换行不能压成一行');
@@ -81,12 +168,17 @@ await withGoldenViteServer(async (server) => {
     '首条短文字由标题表达；工具组沿用工具卡片；其余短文字保持紧凑行',
   );
 
-  // ---- 最终输出：工具调用不能靠耗时元数据冒充回答（否则会以原始卡片风格混进摘要视图）----
+  // ---- 最终输出：唯一依据是后端的 assistantOutputKind（final / error），不靠位置或耗时元数据猜测 ----
   const toolCallBlock = { id: 't', type: 'tool_call', content: '', toolCall: { name: 'shell_exec', status: 'success' } };
   assert.equal(
     disclosure.isConversationFinalMessage(message({ content: '答案', metadata: { responseDurationMs: 1200 } })),
-    true,
-    '带耗时的文字回答仍是最终输出',
+    false,
+    '没有 final 标记的文字即使带耗时也不是最终输出',
+  );
+  assert.equal(
+    disclosure.isConversationFinalMessage(message({ content: '我先看看', metadata: { assistantOutputKind: 'progress' } })),
+    false,
+    '流式中的 progress 文字不是最终输出，模型之后可能继续调用工具',
   );
   assert.equal(
     disclosure.isConversationFinalMessage(message({ content: '答案', metadata: { assistantOutputKind: 'final' } })),

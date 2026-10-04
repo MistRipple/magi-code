@@ -178,31 +178,22 @@ impl ToolRegistry {
         self
     }
 
-    pub fn browser_tool_available(
-        &self,
-        tool: BuiltinToolName,
-        access_profile: AccessProfile,
-        session_id: Option<&magi_core::SessionId>,
-    ) -> bool {
+    pub fn browser_tool_available(&self, tool: BuiltinToolName) -> bool {
         let Some(kind) = tool.browser_tool_kind() else {
             return true;
         };
-        self.browser_capability_snapshot(access_profile, session_id)
+        self.browser_capability_snapshot()
             .is_some_and(|snapshot| snapshot.allows_catalog_tool(kind))
     }
 
     pub fn browser_capability_snapshot(
         &self,
-        access_profile: AccessProfile,
-        session_id: Option<&magi_core::SessionId>,
     ) -> Option<magi_browser_authority::BrowserCapabilitySnapshot> {
         let provider = self
             .runtime_resources
             .browser_capability_provider
             .as_ref()?;
-        let mut snapshot = provider(session_id);
-        snapshot.access_profile = access_profile;
-        Some(snapshot)
+        Some(provider())
     }
 
     pub fn register_builtin(&mut self, tool: Arc<dyn BuiltinTool>) {
@@ -584,30 +575,7 @@ impl ToolRegistry {
     }
 
     fn summarize_invocations(&self, invocations: &[ToolInvocationRecord]) -> ToolExecutionSummary {
-        let total_invocations = invocations.len();
-        let successful_invocations = invocations
-            .iter()
-            .filter(|record| record.status == ExecutionResultStatus::Succeeded)
-            .count();
-        let blocked_invocations = invocations
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    ExecutionResultStatus::NeedsApproval | ExecutionResultStatus::Rejected
-                )
-            })
-            .count();
-        let failed_invocations = invocations
-            .iter()
-            .filter(|record| record.status == ExecutionResultStatus::Failed)
-            .count();
-        ToolExecutionSummary {
-            total_invocations,
-            successful_invocations,
-            blocked_invocations,
-            failed_invocations,
-        }
+        ToolExecutionSummary::from_statuses(invocations.iter().map(|record| record.status))
     }
 
     fn record_invocation(

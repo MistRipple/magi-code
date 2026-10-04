@@ -211,7 +211,9 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::BrowserHeap
             | BuiltinToolName::BrowserThirdParty
             | BuiltinToolName::BrowserWebMcp
-            | BuiltinToolName::BrowserPwa => {
+            | BuiltinToolName::BrowserPwa
+            | BuiltinToolName::BrowserRead
+            | BuiltinToolName::BrowserStorage => {
                 execute_browser_tool(tool_call_id, self.name, input, context, resources)
             }
             BuiltinToolName::DiagramRender => execute_diagram_render(input),

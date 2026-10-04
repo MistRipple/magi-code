@@ -149,10 +149,7 @@ fn run_approval(
 
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            magi_core::EventId::new(format!(
-                "event-tool-approval-requested-{}",
-                UtcMillis::now().0
-            )),
+            magi_core::EventId::unique("event-tool-approval-requested"),
             "tool.approval.requested",
             serde_json::json!({
                 "session_id": request.session_id,

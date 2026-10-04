@@ -1211,9 +1211,7 @@ fn run_session_turn_execution_inner(
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
     let turn_browser_capability = if request.use_tools {
-        tool_registry.and_then(|registry| {
-            registry.browser_capability_snapshot(request.access_profile, Some(&request.session_id))
-        })
+        tool_registry.and_then(|registry| registry.browser_capability_snapshot())
     } else {
         None
     };
@@ -1259,7 +1257,6 @@ fn run_session_turn_execution_inner(
                 BrowserToolSurfaceContext::new(
                     skill_runtime,
                     active_skill_name.as_deref(),
-                    request.access_profile,
                     None,
                     &[],
                 ),

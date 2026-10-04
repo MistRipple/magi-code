@@ -62,6 +62,23 @@ pub enum ExecutionResultStatus {
     Rejected,
     NeedsApproval,
     Cancelled,
+    /// 写操作已经发出，但无法确认是否生效（例如执行中途与 Host 断开）。
+    /// 它是终态但不是成功；副作用可能已经发生，所以不得自动重试，也不计入重复失败判定。
+    Indeterminate,
+}
+
+impl ExecutionResultStatus {
+    /// 工具结果 payload、事件与日志中使用的状态标签；全仓只此一份映射。
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::NeedsApproval => "needs_approval",
+            Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

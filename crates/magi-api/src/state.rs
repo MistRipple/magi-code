@@ -39,8 +39,8 @@ use magi_conversation_runtime::{
     task_runner_bridge::{RunCycleOutcome, TaskDispatchGate, TaskDispatcher},
 };
 use magi_core::{
-    AccessProfile, BrowserProfileId, BrowserTabId, DomainError, DomainResult, SessionId,
-    SessionLifecycleStatus, TaskId, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
+    BrowserProfileId, BrowserTabId, DomainError, DomainResult, SessionId, SessionLifecycleStatus,
+    TaskId, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
@@ -1105,9 +1105,9 @@ impl ExecutionResourceCoordinator {
         for lease in &revoked {
             self.event_bus.publish(
                 EventEnvelope::domain(
-                    magi_core::EventId::new(format!(
-                        "event-browser-lease-revoked-{}-{}",
-                        lease.lease_id, now.0
+                    magi_core::EventId::unique(format!(
+                        "event-browser-lease-revoked-{}",
+                        lease.lease_id
                     )),
                     "browser.lease.revoked",
                     serde_json::json!({
@@ -2781,21 +2781,14 @@ impl ApiState {
         }
     }
 
-    pub fn browser_capability_snapshot(
-        &self,
-        session_id: Option<&SessionId>,
-    ) -> BrowserCapabilitySnapshot {
+    pub fn browser_capability_snapshot(&self) -> BrowserCapabilitySnapshot {
         let host = self.browser_host_status();
-        let access_profile = session_id
-            .and_then(|session_id| self.session_store.active_goal(session_id))
-            .map_or(AccessProfile::Restricted, |goal| goal.access_profile);
         BrowserCapabilitySnapshot {
             revision: host.revision,
             in_app_browser_enabled: host.in_app_browser_enabled,
             browser_use_enabled: host.browser_use_enabled,
             host_status: host.status,
             host_protocol_compatible: host.protocol_compatible,
-            access_profile,
         }
     }
 
@@ -3721,13 +3714,9 @@ impl ApiState {
         context: &magi_git::SessionCodeContext,
         previous_head: &str,
     ) {
-        let now = UtcMillis::now();
         self.event_bus.publish(
             EventEnvelope::domain(
-                magi_core::EventId::new(format!(
-                    "workspace-git-context-changed-{workspace_id}-{}",
-                    now.0
-                )),
+                magi_core::EventId::unique(format!("workspace-git-context-changed-{workspace_id}")),
                 "workspace.git.context.changed",
                 serde_json::json!({
                     "workspace_id": workspace_id,
@@ -3758,13 +3747,9 @@ impl ApiState {
         previous_head: Option<&str>,
         change_kind: &str,
     ) {
-        let now = UtcMillis::now();
         self.event_bus.publish(
             EventEnvelope::domain(
-                magi_core::EventId::new(format!(
-                    "workspace-git-context-changed-{workspace_id}-{}",
-                    now.0
-                )),
+                magi_core::EventId::unique(format!("workspace-git-context-changed-{workspace_id}")),
                 "workspace.git.context.changed",
                 serde_json::json!({
                     "workspace_id": workspace_id,
@@ -4953,25 +4938,17 @@ fn public_mcp_servers_section(snapshot: &HashMap<String, serde_json::Value>) -> 
 fn runtime_settings_from_snapshot(
     snapshot: &HashMap<String, serde_json::Value>,
 ) -> serde_json::Value {
-    let runtime = snapshot
-        .get("runtimeSettings")
-        .and_then(|value| value.as_object());
-    let locale = runtime
-        .and_then(|value| value.get("locale"))
+    // 运行时偏好只由 `/settings/update` 写入顶层的 `locale` / `conversationDisplayMode`，
+    // 这里只读这一个位置。
+    let locale = snapshot
+        .get("locale")
         .and_then(|value| value.as_str())
-        .or_else(|| snapshot.get("locale").and_then(|value| value.as_str()))
         .filter(|value| matches!(*value, "zh-CN" | "en-US"))
         .unwrap_or("zh-CN");
-    let conversation_display_mode = runtime
-        .and_then(|value| value.get("conversationDisplayMode"))
+    let conversation_display_mode = snapshot
+        .get("conversationDisplayMode")
         .and_then(|value| value.as_str())
         .filter(|value| matches!(*value, "original" | "summary"))
-        .or_else(|| {
-            snapshot
-                .get("conversationDisplayMode")
-                .and_then(|value| value.as_str())
-                .filter(|value| matches!(*value, "original" | "summary"))
-        })
         .unwrap_or("original");
     serde_json::json!({
         "locale": locale,

@@ -1,5 +1,8 @@
 import type { Message, TimelineRenderItem, ToolCall, ToolCallStatus } from '../types/message';
+import { browserToolSummary } from './browser-tool-display';
+import { inferConversationPresentationRole, type ConversationPresentationRole } from './conversation-presentation';
 import { firstToolDisplayText, resolveToolCardTarget } from './tool-call-display';
+import { resolveToolDisplayName } from './tool-display-name';
 import { parseToolIdentity } from './tool-identity';
 
 export type ConversationStreamEntry =
@@ -7,6 +10,78 @@ export type ConversationStreamEntry =
   | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] }
   | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' }
   | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] };
+
+export interface ConversationPresentationEntry {
+  item: TimelineRenderItem;
+  role: ConversationPresentationRole;
+}
+
+/**
+ * 把一轮里按呈现角色标注好的条目组织成摘要模式的过程流：委派合并成一个代理组，
+ * 产物和待处理交互单独成块，连续工具调用合并成工具组，其余文字作为事件。
+ *
+ * 结果只依赖每个条目之前的内容：流式追加新条目时，已经产生的条目不会消失或改变 key，
+ * 用户在阶段和工具组上的展开状态因此得以保持。
+ */
+export function buildConversationStreamEntries(
+  presentationItems: ConversationPresentationEntry[],
+): ConversationStreamEntry[] {
+  const result: ConversationStreamEntry[] = [];
+  const delegationItems = presentationItems
+    .filter((entry) => entry.role === 'delegation')
+    .map((entry) => entry.item);
+  let agentGroupEmitted = false;
+  let toolGroupItems: TimelineRenderItem[] = [];
+  let toolSeen = false;
+
+  const flushToolGroup = () => {
+    if (toolGroupItems.length === 0) return;
+    result.push({
+      kind: 'tool-group',
+      key: `tool-group:${toolGroupItems[0].key}`,
+      items: toolGroupItems,
+    });
+    toolGroupItems = [];
+  };
+
+  for (const entry of presentationItems) {
+    if (entry.role === 'final') continue;
+    if (entry.role === 'delegation') {
+      flushToolGroup();
+      if (!agentGroupEmitted) {
+        result.push({
+          kind: 'agent-group',
+          key: `agent-group:${entry.item.key}`,
+          items: delegationItems,
+        });
+        agentGroupEmitted = true;
+      }
+      continue;
+    }
+    if (entry.role === 'artifact' || entry.role === 'attention') {
+      flushToolGroup();
+      result.push({
+        kind: 'item',
+        key: `${entry.role}:${entry.item.key}`,
+        item: entry.item,
+        role: entry.role,
+      });
+      continue;
+    }
+    if (isToolLikeMessage(entry.item.message)) {
+      toolGroupItems.push(entry.item);
+      toolSeen = true;
+      continue;
+    }
+    // 工具调用之间的思考只是模型内部过程，不应把连续工具调用切成多个组，因此省略。
+    // 去留只看它之前是否出现过工具，保证追加新条目不会让已显示的思考消失。
+    if (toolSeen && entry.item.message.type === 'thinking') continue;
+    flushToolGroup();
+    result.push({ kind: 'event', key: `event:${entry.item.key}`, item: entry.item });
+  }
+  flushToolGroup();
+  return result;
+}
 
 export type ConversationPhaseEntry =
   | Extract<ConversationStreamEntry, { kind: 'event' }>
@@ -64,18 +139,12 @@ export function isToolLikeMessage(message: Message): boolean {
 }
 
 /**
- * 这条助手消息是否是本轮的最终输出。
- * 明确的 final/error 标记优先。轮次耗时元数据会附着在本轮最后一条可渲染消息上——
- * 一轮以工具调用结束（没有文字回答）时，那条消息就是工具调用——所以凭耗时判断最终输出
- * 时必须排除工具与思考消息，否则它会被提升到过程之外，以原始卡片风格混进摘要视图。
+ * 这条助手消息是否是本轮的最终输出。唯一依据是后端写入的 assistantOutputKind：
+ * 只有 final / error 才是最终输出。流式中的文字是 progress，模型之后可能继续调用工具，
+ * 前端不能凭位置或耗时元数据把它提前当成最终回答——那会让它先出现在过程下方、再被收回。
  */
 export function isConversationFinalMessage(message: Message): boolean {
-  const outputKind = typeof message.metadata?.assistantOutputKind === 'string'
-    ? message.metadata.assistantOutputKind.trim()
-    : '';
-  if (outputKind === 'final' || outputKind === 'error') return true;
-  if (isToolLikeMessage(message) || message.type === 'thinking') return false;
-  return typeof message.metadata?.responseDurationMs === 'number';
+  return inferConversationPresentationRole(message) === 'final';
 }
 
 function rawMessageText(message: Message): string {
@@ -147,6 +216,7 @@ interface ConversationToolDescriptor {
   name: string;
   action: ConversationToolAction;
   status: ToolCallStatus;
+  unconfirmed: boolean;
 }
 
 function toolCall(item: TimelineRenderItem): ToolCall | undefined {
@@ -174,6 +244,8 @@ function canonicalToolName(name: string): string {
 
 function classifyToolAction(name: string): ConversationToolAction {
   const baseName = canonicalToolName(name);
+  // 命名空间优先于动作词：browser_read、browser_type 等是浏览器操作，不是文件读写。
+  if (baseName.startsWith('browser_') || baseName === 'browser') return 'browser';
   if (baseName === 'file_read' || baseName === 'view_image' || /(?:^|_)(?:read|view)(?:_|$)/u.test(baseName)) {
     return 'read';
   }
@@ -190,7 +262,6 @@ function classifyToolAction(name: string): ConversationToolAction {
   if (baseName === 'shell_exec' || /(?:^|_)(?:shell|exec|command|terminal)(?:_|$)/u.test(baseName)) {
     return 'command';
   }
-  if (baseName.startsWith('browser_') || baseName === 'browser') return 'browser';
   if (baseName === 'web_search'
     || baseName === 'search_text'
     || baseName === 'search_semantic'
@@ -215,7 +286,7 @@ function toolStatus(item: TimelineRenderItem): ToolCallStatus {
   if (call?.status) return call.status;
   const metadataStatus = item.message.metadata?.toolStatus;
   if (metadataStatus === 'pending' || metadataStatus === 'running'
-    || metadataStatus === 'success' || metadataStatus === 'error') {
+    || metadataStatus === 'success' || metadataStatus === 'error' || metadataStatus === 'unconfirmed') {
     return metadataStatus;
   }
   return item.message.isStreaming ? 'running' : 'success';
@@ -228,6 +299,8 @@ function toolDescriptor(item: TimelineRenderItem): ConversationToolDescriptor {
     name,
     action: classifyToolAction(name),
     status: toolStatus(item),
+    // 副作用可能已发生但无法确认（item 状态 indeterminate），和普通失败分开呈现。
+    unconfirmed: toolStatus(item) === 'unconfirmed',
   };
 }
 
@@ -296,15 +369,28 @@ function singleToolLabel(
     descriptor.action === 'read' || descriptor.action === 'edit',
   );
   const actionKey = `messageList.turnDisclosure.toolSingle${capitalize(descriptor.action)}`;
-  const label = target && (descriptor.action === 'read'
-    || descriptor.action === 'edit'
-    || descriptor.action === 'command'
-    || descriptor.action === 'search')
-    ? translate(actionKey, { target })
-    : translate(actionKey);
+  // 浏览器工具各自有展示名（浏览器点击、浏览器读取正文……），比笼统的“浏览器操作”更有信息量。
+  // 有目标与无目标是两条独立文案，不能让带 {target} 的文案在缺少目标时原样显示占位符。
+  const label = descriptor.action === 'browser'
+    ? browserToolLabel(descriptor, translate)
+    : target && TARGETED_TOOL_ACTIONS.has(descriptor.action)
+      ? translate(`${actionKey}Target`, { target })
+      : translate(actionKey);
+  if (descriptor.unconfirmed) return `${label} · ${translate('messageList.turnDisclosure.toolUnconfirmed')}`;
   return descriptor.status === 'error'
     ? `${label} · ${translate('messageList.turnDisclosure.toolFailed')}`
     : label;
+}
+
+const TARGETED_TOOL_ACTIONS = new Set<ConversationToolAction>(['read', 'edit', 'command', 'search']);
+
+/** 浏览器工具：展示名 + 对人有意义的目标（网址、输入内容、实际点击的元素……）。 */
+function browserToolLabel(descriptor: ConversationToolDescriptor, translate: ConversationTranslate): string {
+  const displayName = resolveToolDisplayName(descriptor.name, { t: translate });
+  const call = toolCall(descriptor.item);
+  const args = call?.arguments && typeof call.arguments === 'object' ? call.arguments as Record<string, unknown> : {};
+  const summary = compactTarget(browserToolSummary(descriptor.name, args, call?.result) || '', false);
+  return summary ? `${displayName} ${summary}` : displayName;
 }
 
 function capitalize(value: string): string {
@@ -328,12 +414,20 @@ export function resolveConversationToolGroupLabel(
     `messageList.turnDisclosure.toolGroup${capitalize(action)}${state}`,
     { count: items.length },
   );
-  const errorCount = descriptors.filter((descriptor) => descriptor.status === 'error').length;
-  if (errorCount === 0) return label;
+  const unconfirmedCount = descriptors.filter((descriptor) => descriptor.unconfirmed).length;
+  const errorCount = descriptors.filter(
+    (descriptor) => descriptor.status === 'error',
+  ).length;
   if (errorCount === items.length) {
     return translate('messageList.turnDisclosure.toolGroupAllFailed', { count: items.length });
   }
-  return `${label}${translate('messageList.turnDisclosure.toolGroupFailureSuffix', { count: errorCount })}`;
+  const failureSuffix = errorCount > 0
+    ? translate('messageList.turnDisclosure.toolGroupFailureSuffix', { count: errorCount })
+    : '';
+  const unconfirmedSuffix = unconfirmedCount > 0
+    ? translate('messageList.turnDisclosure.toolGroupUnconfirmedSuffix', { count: unconfirmedCount })
+    : '';
+  return `${label}${failureSuffix}${unconfirmedSuffix}`;
 }
 
 export type ConversationPhaseDetailEntry =

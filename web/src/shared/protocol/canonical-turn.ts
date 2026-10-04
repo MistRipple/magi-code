@@ -2,7 +2,8 @@ export const CANONICAL_TURN_SCHEMA_VERSION = 'canonical-turn.v1' as const;
 
 export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'interrupted' | 'cancelled' | 'superseded';
 
-export type CanonicalTurnItemStatus = Exclude<CanonicalTurnStatus, 'interrupted' | 'superseded'>;
+/** item 状态独立定义：indeterminate（写操作已发出但无法确认是否生效）只属于 item，不属于 turn。 */
+export type CanonicalTurnItemStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled' | 'indeterminate';
 
 export type CanonicalTurnItemKind =
   | 'user_message'
@@ -107,7 +108,7 @@ export class CanonicalProtocolError extends Error {
 }
 
 const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'interrupted', 'cancelled', 'superseded'];
-const CANONICAL_TURN_ITEM_STATUSES: CanonicalTurnItemStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled'];
+const CANONICAL_TURN_ITEM_STATUSES: CanonicalTurnItemStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled', 'indeterminate'];
 const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'user_message',
   'assistant_text',
@@ -552,17 +553,18 @@ export function parseCanonicalTurnEventPayload(
   };
 }
 
-export function isCanonicalTerminalStatus(status: CanonicalTurnStatus): boolean {
+export function isCanonicalTerminalStatus(status: CanonicalTurnStatus | CanonicalTurnItemStatus): boolean {
   return status === 'completed'
     || status === 'failed'
     || status === 'interrupted'
     || status === 'cancelled'
-    || status === 'superseded';
+    || status === 'superseded'
+    || status === 'indeterminate';
 }
 
 export function canTransitionCanonicalStatus(
-  current: CanonicalTurnStatus,
-  next: CanonicalTurnStatus
+  current: CanonicalTurnStatus | CanonicalTurnItemStatus,
+  next: CanonicalTurnStatus | CanonicalTurnItemStatus,
 ): boolean {
   if (current === next) {
     return true;
@@ -573,21 +575,24 @@ export function canTransitionCanonicalStatus(
       || next === 'blocked'
       || next === 'failed'
       || next === 'interrupted'
-      || next === 'cancelled';
+      || next === 'cancelled'
+      || next === 'indeterminate';
   }
   if (current === 'running') {
     return next === 'completed'
       || next === 'blocked'
       || next === 'failed'
       || next === 'interrupted'
-      || next === 'cancelled';
+      || next === 'cancelled'
+      || next === 'indeterminate';
   }
   if (current === 'blocked') {
     return next === 'running'
       || next === 'completed'
       || next === 'failed'
       || next === 'interrupted'
-      || next === 'cancelled';
+      || next === 'cancelled'
+      || next === 'indeterminate';
   }
   if (current === 'cancelled') {
     return next === 'superseded';

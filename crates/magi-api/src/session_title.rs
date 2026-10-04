@@ -151,11 +151,7 @@ pub(crate) fn publish_session_title_updated(
     workspace_id: Option<WorkspaceId>,
     title: &str,
 ) {
-    let event_id = EventId::new(format!(
-        "event-session-title-updated-{}-{}",
-        session_id,
-        UtcMillis::now().0
-    ));
+    let event_id = EventId::unique(format!("event-session-title-updated-{}", session_id));
     let event = EventEnvelope::domain(
         event_id,
         "session.title.updated",

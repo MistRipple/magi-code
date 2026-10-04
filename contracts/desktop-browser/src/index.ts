@@ -1,4 +1,4 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 5 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 6 } as const;
 
 /**
  * Browser Surface 允许自动化附着的页面内部 Target 类型。
@@ -125,8 +125,8 @@ export type BrowserControlUpdate =
   | { mode: "user"; fence: number }
   | { mode: "released"; fence: number };
 
+/** 快照元素引用（形如 e:3:12）本身就标识了所属快照；过期由页面运行时的引用表判断。 */
 export interface BrowserSnapshotTarget {
-  snapshot_revision: number;
   element_ref: string;
 }
 
@@ -210,7 +210,6 @@ export type BrowserHostCommand =
         navigation_revision: number;
         snapshot_revision: number;
         limits: { max_nodes: number; max_text_bytes: number };
-        subtree_ref?: string | null;
       };
     }
   | {
@@ -506,6 +505,10 @@ export type BrowserCommandResult =
   | { type: "empty" }
   | { type: "pong"; payload: { monotonic_millis: number } }
   | { type: "page_state"; payload: BrowserPageState }
+  /** Worker → Main：交互命令实际作用的元素；无元素目标（如按键）时为 null。 */
+  | { type: "action_target"; payload: BrowserActionTarget | null }
+  /** Main → Rust：交互命令完成后的页面状态，以及实际作用的元素。 */
+  | { type: "interaction"; payload: BrowserInteraction }
   | { type: "snapshot"; payload: BrowserSnapshot }
   | { type: "binary_payload"; payload: BrowserBinaryPayload }
   | { type: "hit_test"; payload: BrowserHitTest }
@@ -522,6 +525,17 @@ export interface BrowserHostResponseEnvelope {
   request_id: string;
   protocol_version: ProtocolVersion;
   outcome: BrowserCommandOutcome;
+}
+
+/** 交互命令实际作用的元素，用于向模型和用户确认操作对象（不含元素的值）。 */
+export interface BrowserActionTarget {
+  role: string | null;
+  name: string | null;
+}
+
+export interface BrowserInteraction {
+  page_state: BrowserPageState;
+  target: BrowserActionTarget | null;
 }
 
 export interface BrowserPageState {
@@ -542,10 +556,24 @@ export interface BrowserSnapshotNode {
   focused: boolean;
   editable: boolean;
   sensitive_input_kind?: "password" | "one_time_code" | "payment_card" | null;
+  /** 勾选、展开、选中等交互状态，由页面运行时从 DOM/ARIA 属性读取。 */
+  states?: BrowserNodeState[];
   visible: boolean;
   bounds: BrowserNormalizedRect | null;
   children: BrowserSnapshotNode[];
 }
+
+export type BrowserNodeState =
+  | "checked"
+  | "unchecked"
+  | "mixed"
+  | "expanded"
+  | "collapsed"
+  | "selected"
+  | "pressed"
+  | "required"
+  | "invalid"
+  | "read_only";
 
 export interface BrowserSnapshot {
   tab_id: BrowserTabId;
@@ -556,23 +584,6 @@ export interface BrowserSnapshot {
   total_nodes: number;
   text_bytes: number;
   truncated: boolean;
-  continuation_refs: string[];
-  accessibility_tree?: BrowserAccessibilityNode[];
-}
-
-export interface BrowserAccessibilityNode {
-  node_id: string;
-  element_ref?: string | null;
-  parent_id?: string | null;
-  child_ids: string[];
-  role?: string | null;
-  name?: string | null;
-  value?: string | null;
-  description?: string | null;
-  ignored: boolean;
-  properties: Record<string, unknown>;
-  actions: string[];
-  backend_dom_node_id?: number | null;
 }
 
 export interface BrowserBinaryPayload {

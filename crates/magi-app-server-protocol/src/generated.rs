@@ -90,7 +90,7 @@ pub const APP_SERVER_METHOD_SIGNATURES: &[AppServerMethodSignature] = &[
     AppServerMethodSignature {
         method: "browser/tools/list",
         kind: AppServerMethodKind::Request,
-        params: "BrowserToolsListParams",
+        params: "EmptyParams",
         result: Some("BrowserToolsListResult"),
         server_request: false,
     },
@@ -183,7 +183,7 @@ pub enum AppServerRequestParams {
     SessionRead(SessionReadParams),
     TurnStart(TurnStartParams),
     EventsSubscribe(EventSubscribeParams),
-    BrowserToolsList(BrowserToolsListParams),
+    BrowserToolsList(EmptyParams),
     BrowserTool(BrowserToolParams),
     ApprovalRequest(ApprovalRequestParams),
 }
@@ -351,15 +351,6 @@ pub struct InitializeResult {
     #[serde(rename = "runtimeEpoch")]
     pub runtime_epoch: String,
     pub capabilities: ServerCapabilities,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BrowserToolsListParams {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "sessionId")]
-    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -682,6 +673,8 @@ pub enum CanonicalTurnItemStatus {
     Failed,
     #[serde(rename = "cancelled")]
     Cancelled,
+    #[serde(rename = "indeterminate")]
+    Indeterminate,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -1001,17 +994,6 @@ pub struct EventResyncRequiredParams {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum BrowserAccessProfile {
-    #[serde(rename = "read_only")]
-    ReadOnly,
-    #[serde(rename = "restricted")]
-    Restricted,
-    #[serde(rename = "full_access")]
-    FullAccess,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum BrowserToolAccess {
     #[serde(rename = "read")]
     Read,
@@ -1058,8 +1040,6 @@ pub struct BrowserCapabilitySnapshot {
     pub host_status: BrowserHostStatus,
     #[serde(rename = "hostProtocolCompatible")]
     pub host_protocol_compatible: bool,
-    #[serde(rename = "accessProfile")]
-    pub access_profile: BrowserAccessProfile,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1115,10 +1095,6 @@ pub struct BrowserToolParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "callId")]
     pub call_id: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "accessProfile")]
-    pub access_profile: Option<BrowserAccessProfile>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "browserExecutionId")]

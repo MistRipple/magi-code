@@ -19,7 +19,7 @@ export interface AppServerMethodParams {
   "session/read": SessionReadParams;
   "turn/start": TurnStartParams;
   "events/subscribe": EventSubscribeParams;
-  "browser/tools/list": BrowserToolsListParams;
+  "browser/tools/list": EmptyParams;
   "browser/tool": BrowserToolParams;
   "approval/request": ApprovalRequestParams;
   "$/cancelRequest": CancelRequestParams;
@@ -85,7 +85,7 @@ export const APP_SERVER_METHOD_SIGNATURES = {
   },
   "browser/tools/list": {
     kind: "request",
-    params: "BrowserToolsListParams",
+    params: "EmptyParams",
     result: "BrowserToolsListResult"
   },
   "browser/tool": {
@@ -156,10 +156,6 @@ export interface InitializeResult {
   protocol: ProtocolVersion;
   runtimeEpoch: string;
   capabilities: ServerCapabilities;
-}
-
-export interface BrowserToolsListParams {
-  sessionId?: string | null;
 }
 
 export interface EventSubscribeParams {
@@ -278,7 +274,7 @@ export type CanonicalTurnStatus = "pending" | "running" | "completed" | "blocked
 
 export type CanonicalTurnItemKind = "user_message" | "assistant_text" | "assistant_thinking" | "tool_call" | "task_status" | "system_notice";
 
-export type CanonicalTurnItemStatus = "pending" | "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type CanonicalTurnItemStatus = "pending" | "running" | "completed" | "blocked" | "failed" | "cancelled" | "indeterminate";
 
 export interface CanonicalTurnVisibility {
   renderable?: boolean;
@@ -418,8 +414,6 @@ export interface EventResyncRequiredParams {
   snapshot: EventStreamSnapshot;
 }
 
-export type BrowserAccessProfile = "read_only" | "restricted" | "full_access";
-
 export type BrowserToolAccess = "read" | "write" | "mixed";
 
 export interface BrowserToolDescriptor {
@@ -437,7 +431,6 @@ export interface BrowserCapabilitySnapshot {
   browserUseEnabled: boolean;
   hostStatus: BrowserHostStatus;
   hostProtocolCompatible: boolean;
-  accessProfile: BrowserAccessProfile;
 }
 
 export interface BrowserToolsListResult {
@@ -463,7 +456,6 @@ export interface BrowserToolParams {
   arguments: Record<string, JsonValue>;
   workspaceId?: string | null;
   callId?: string | null;
-  accessProfile?: BrowserAccessProfile;
   browserExecutionId?: string | null;
   taskId?: string | null;
   workerId?: string | null;

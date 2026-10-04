@@ -1,4 +1,4 @@
-import type { Message, TimelineRenderItem } from '../types/message';
+import type { Message } from '../types/message';
 import { parseToolApprovalPayload } from './tool-error-payload';
 
 export type ConversationPresentationRole =
@@ -93,10 +93,3 @@ export function inferConversationPresentationRole(message: Message): Conversatio
   return 'process';
 }
 
-export function conversationPresentationRole(
-  item: TimelineRenderItem,
-  finalItemKeys: ReadonlySet<string>,
-): ConversationPresentationRole {
-  if (finalItemKeys.has(item.key)) return 'final';
-  return inferConversationPresentationRole(item.message);
-}

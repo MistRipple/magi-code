@@ -39,9 +39,20 @@ function renderItemScope(
   };
 }
 
-function prepareRenderMessage(message: Message, displayContext: TimelineDisplayContext): Message {
-  void displayContext;
-  return cloneMessagePayload(message);
+/**
+ * 渲染用的消息副本按源消息对象缓存。投影对 renderRevision 未变的条目复用同一个源对象，
+ * 这里就返回同一个副本：流式增量只让发生变化的那条消息拿到新对象，其余消息引用不变，
+ * MessageList 里对应的 MessageItem 不会因为别的消息在流式输出而重新计算。
+ * 源对象被替换时缓存自然失效（WeakMap 不阻止旧对象回收）。
+ */
+const renderMessageBySource = new WeakMap<Message, Message>();
+
+function prepareRenderMessage(message: Message): Message {
+  const cached = renderMessageBySource.get(message);
+  if (cached) return cached;
+  const prepared = cloneMessagePayload(message);
+  renderMessageBySource.set(message, prepared);
+  return prepared;
 }
 
 function buildProjectionArtifactLookup(
@@ -78,7 +89,7 @@ function buildProjectionPanelView(
     for (const entry of projection.threadRenderEntries) {
       const artifact = artifactById.get(entry.artifactId);
       if (!artifact?.message) continue;
-      const message = prepareRenderMessage(artifact.message, displayContext);
+      const message = prepareRenderMessage(artifact.message);
       items.push({ key: entry.entryId, message, ...itemScope });
       messages.push(message);
     }
@@ -93,7 +104,7 @@ function buildProjectionPanelView(
   for (const artifact of projection.artifacts || []) {
     if (artifactTaskId(artifact) !== targetTaskId) continue;
     if (!artifact.message) continue;
-    const message = prepareRenderMessage(artifact.message, displayContext);
+    const message = prepareRenderMessage(artifact.message);
     items.push({ key: `artifact:${artifact.artifactId}`, message, ...itemScope });
     messages.push(message);
   }

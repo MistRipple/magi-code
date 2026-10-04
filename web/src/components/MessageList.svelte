@@ -504,9 +504,11 @@
           entries.push(entry);
           continue;
         }
-        const previous = entries[entries.length - 1];
-        if (previous?.kind === 'turn' && previous.turnId === turnId) {
-          previous.items.push(entry.item);
+        // turn 条目以 turnId 为唯一 key：同一 turn 的条目按身份归并，
+        // 而不是只合并相邻条目，否则被隔开的条目会生成重复 key。
+        const existing = findTurnEntry(turnId);
+        if (existing) {
+          existing.items.push(entry.item);
         } else {
           entries.push({
             kind: 'turn',

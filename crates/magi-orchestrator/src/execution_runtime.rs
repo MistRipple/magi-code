@@ -7,8 +7,8 @@ use crate::{
 };
 use magi_context_runtime::{ExecutionContextAssemblyRequest, ExecutionContextClues};
 use magi_core::{
-    DomainError, ExecutionResultStatus, LeaseId, SessionId, TaskCompletionAttempt,
-    TaskExecutionTarget, TaskStatus, WorkerId, WorkspaceId,
+    DomainError, LeaseId, SessionId, TaskCompletionAttempt, TaskExecutionTarget, TaskStatus,
+    WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext};
 use magi_skill_runtime::SkillToolRuntimePlan;
@@ -598,18 +598,10 @@ fn map_task_store_error(
 }
 
 fn tool_summary_from_worker_snapshot(snapshot: &TaskExecutionSnapshot) -> ToolExecutionSummary {
-    let mut summary = ToolExecutionSummary::default();
-    for invocation in &snapshot.tool_invocations {
-        summary.total_invocations += 1;
-        match invocation.status {
-            ExecutionResultStatus::Succeeded => summary.successful_invocations += 1,
-            ExecutionResultStatus::Failed | ExecutionResultStatus::Cancelled => {
-                summary.failed_invocations += 1
-            }
-            ExecutionResultStatus::Rejected | ExecutionResultStatus::NeedsApproval => {
-                summary.blocked_invocations += 1
-            }
-        }
-    }
-    summary
+    ToolExecutionSummary::from_statuses(
+        snapshot
+            .tool_invocations
+            .iter()
+            .map(|invocation| invocation.status),
+    )
 }

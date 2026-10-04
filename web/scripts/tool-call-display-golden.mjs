@@ -120,8 +120,21 @@ assert.doesNotMatch(
   /const publicErrorText = \$derived\([\s\S]*?publicToolPayloadMessage\(terminal\?\.output\)/,
   'Shell 标准输出不得被当作公开错误提示',
 );
+// 呈现角色是投影写入消息的事实：原始与摘要两种模式都由 MessageItem 自己读取，
+// 不能由某个调用方单独传入，否则两种模式对同一条消息（例如产物卡片）的默认展开会不一致。
+{
+  const messageItemSource = await readFile(new URL('../src/components/MessageItem.svelte', import.meta.url), 'utf8');
+  assert.match(
+    messageItemSource,
+    /const presentationRole = \$derived\(inferConversationPresentationRole\(message\)\);/,
+    'MessageItem 必须从消息本身推断呈现角色',
+  );
+  assert.doesNotMatch(messageItemSource, /presentationRole\?: ConversationPresentationRole/, 'MessageItem 不再接受外部传入的呈现角色');
+}
+// 过程流的组织逻辑在 conversation-disclosure.ts 里（组件只调用 buildConversationStreamEntries），
+// 其追加稳定性另由 conversation-disclosure 黄金测试按行为验证。
 assert.match(
-  conversationTurnSource,
+  await readFile(new URL('../src/lib/conversation-disclosure.ts', import.meta.url), 'utf8'),
   /const flushToolGroup = \(\) => \{[\s\S]*?toolGroupItems = \[\];[\s\S]*?flushToolGroup\(\);\s*result\.push\(\{ kind: 'event'/,
   '非工具过程事件必须提交当前连续工具组，保持真实时间顺序',
 );
@@ -528,6 +541,56 @@ await withGoldenViteServer(async (server) => {
   assert.equal(applyPatchBlocks[0].fileChange.filePath, 'src/App.svelte');
   assert.match(applyPatchBlocks[0].fileChange.diff, /-old/);
   assert.match(applyPatchBlocks[0].fileChange.diff, /\+new/);
+
+  // 浏览器工具卡片：摘要只展示对人有意义的参数，browser_read 展示正文而不是 JSON。
+  const browserDisplay = await server.ssrLoadModule('/src/lib/browser-tool-display.ts');
+  assert.equal(browserDisplay.browserToolSummary('file_read', { path: 'a' }), null, '非浏览器工具交回通用摘要');
+  assert.equal(browserDisplay.browserToolSummary('browser_navigate', { url: 'https://example.com' }), 'https://example.com');
+  assert.equal(browserDisplay.browserToolSummary('browser_navigate', { action: 'back' }), 'back');
+  assert.equal(browserDisplay.browserToolSummary('browser_type', { element_ref: 'e:3:1', text: 'magi' }), '“magi”');
+  assert.equal(browserDisplay.browserToolSummary('browser_click', { element_ref: 'e:3:12' }), '', '元素引用对用户没有意义，不显示');
+  const clickResult = JSON.stringify({ tool: 'browser_click', status: 'succeeded', target: { role: 'button', name: '提交订单' } });
+  assert.equal(browserDisplay.browserToolSummary('browser_click', { element_ref: 'e:3:12' }, clickResult), '提交订单', '显示实际点击的元素名称');
+  assert.equal(
+    browserDisplay.browserToolSummary('browser_click', {}, JSON.stringify({ status: 'succeeded', target: { role: 'link', name: null } })),
+    'link',
+    '元素没有名称时退回角色',
+  );
+  assert.equal(
+    browserDisplay.browserToolSummary('browser_type', { text: 'magi' }, JSON.stringify({ status: 'succeeded', target: { role: 'searchbox', name: '搜索' } })),
+    '“magi” → 搜索',
+  );
+  assert.equal(
+    browserDisplay.browserToolSummary('browser_hover', {}, JSON.stringify({ status: 'succeeded', result: { hovered: true, target: { role: 'menuitem', name: '设置' } } })),
+    '设置',
+    'hover 的目标在 DevTools 操作结果里',
+  );
+  assert.deepEqual(
+    browserDisplay.parseBrowserScreenshotPreview('browser_screenshot', JSON.stringify({
+      tool: 'browser_screenshot', status: 'succeeded', path: '/state/browser/artifacts/s1/browser-shot-1-0.png', mime: 'image/png', bytes: 42,
+    })),
+    { path: '/state/browser/artifacts/s1/browser-shot-1-0.png', fileName: 'browser-shot-1-0.png', mime: 'image/png', bytes: 42 },
+  );
+  assert.equal(
+    browserDisplay.parseBrowserScreenshotPreview('browser_screenshot', JSON.stringify({ status: 'failed', path: '/x.png', mime: 'image/png' })),
+    null,
+    '失败的截图没有预览',
+  );
+  assert.equal(browserDisplay.browserToolSummary('browser_read', { query: '价格' }), '“价格”');
+  assert.equal(browserDisplay.browserToolSummary('browser_viewport', { action: 'set', mode: 'fixed', width: 390, height: 844 }), 'fixed 390×844');
+  assert.equal(browserDisplay.browserToolSummary('browser_upload_file', { file_paths: ['/tmp/a/x.png', '/tmp/a/y.pdf'] }), 'x.png, y.pdf');
+  assert.equal(browserDisplay.browserToolSummary('browser_storage', { area: 'local', action: 'set', key: 'feature_flag', value: 'on' }), 'local set feature_flag', '存储摘要不展示写入的值');
+  assert.equal(browserDisplay.browserToolSummary('browser_storage', { area: 'cookies', action: 'list' }), 'cookies list');
+  const readPayload = JSON.stringify({
+    tool: 'browser_read',
+    status: 'succeeded',
+    result: { url: 'https://example.com', title: 'Example', text: '# 标题\n正文内容', total_chars: 9, truncated: false },
+  });
+  assert.equal(browserDisplay.formatBrowserReadToolOutput('browser_read', readPayload), '# 标题\n正文内容');
+  const queryPayload = { tool: 'browser_read', status: 'succeeded', result: { query: '价格', match_count: 2, matches: [{ index: 3, context: '本月价格上涨' }, { index: 40, context: '价格 说明' }] } };
+  assert.equal(browserDisplay.formatBrowserReadToolOutput('browser_read', queryPayload), '- …本月价格上涨…\n- …价格 说明…');
+  assert.equal(browserDisplay.formatBrowserReadToolOutput('browser_click', readPayload), null);
+  assert.equal(browserDisplay.formatBrowserReadToolOutput('browser_read', 'not json'), null, '结构不符时交回通用格式化');
 
   console.log('tool call display golden replay passed');
 }, { configFile: './vite.web.config.ts' });

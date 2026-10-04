@@ -1244,10 +1244,7 @@ impl<'a> ContextAuthority<'a> {
         }
         let _ = self.event_bus.publish(
             EventEnvelope::usage(
-                EventId::new(format!(
-                    "event-session-context-compacted-{}",
-                    compacted_at.0
-                )),
+                EventId::unique("event-session-context-compacted"),
                 "session.context.compacted",
                 payload,
             )

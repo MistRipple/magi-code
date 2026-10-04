@@ -4,7 +4,7 @@ use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     DeterministicToolFailure, approval_resume_contract_failure, approval_resume_is_safe,
     model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
-    tool_execution_failed_result, tool_execution_status_label, turn_item_status_for_tool_result,
+    tool_execution_failed_result, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::turn_contract::{TurnEventEnvelope, TurnRecord};
@@ -330,12 +330,16 @@ pub struct SessionToolCallBatchOutcome {
 const STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS: u64 = 80;
 const STREAM_ITEM_PUBLISH_MIN_CHARS: usize = 24;
 
+/// 流式发布节流闸门：只决定“这一次要不要发布”以及相对上次发布的增量。
+///
+/// 事件携带的 itemVersion 必须是 SessionStore 里该 item 的版本——它也是快照、
+/// 整条 upsert 和恢复使用的版本。闸门若自己计数，会因为节流跳过的刷新而落后于
+/// 存储版本，客户端从快照恢复后就会把后续增量全部当成旧版本丢弃。
 #[derive(Clone, Debug, Default)]
 pub struct SessionTurnStreamPublishGate {
     last_published_at: Option<UtcMillis>,
     last_published_content_length: usize,
     last_published_content: String,
-    published_version: u64,
 }
 
 impl SessionTurnStreamPublishGate {
@@ -351,32 +355,30 @@ impl SessionTurnStreamPublishGate {
                 >= STREAM_ITEM_PUBLISH_MIN_CHARS
     }
 
+    /// 返回 `(是否为第一帧, 相对上次发布的增量)`；第一帧需要附带完整 item。
     fn prepare_publish_at(
         &mut self,
         candidate: &SessionTurnStreamUpdate,
         current_content: &str,
         now: UtcMillis,
-    ) -> Option<(u64, SessionTurnStreamUpdate)> {
+    ) -> Option<(bool, SessionTurnStreamUpdate)> {
         if !self.should_publish_at(candidate, now) {
             return None;
         }
         let update = session_turn_stream_update(&self.last_published_content, current_content)?;
+        let first_frame = self.last_published_at.is_none();
         self.last_published_at = Some(now);
         self.last_published_content_length = update.content_length;
         self.last_published_content.clear();
         self.last_published_content.push_str(current_content);
-        self.published_version = self
-            .published_version
-            .checked_add(1)
-            .expect("stream publish version overflow");
-        Some((self.published_version, update))
+        Some((first_frame, update))
     }
 
     fn prepare_publish(
         &mut self,
         candidate: &SessionTurnStreamUpdate,
         current_content: &str,
-    ) -> Option<(u64, SessionTurnStreamUpdate)> {
+    ) -> Option<(bool, SessionTurnStreamUpdate)> {
         self.prepare_publish_at(candidate, current_content, UtcMillis::now())
     }
 }
@@ -507,7 +509,7 @@ fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
 
 fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
     if status.trim().eq_ignore_ascii_case("indeterminate") {
-        return Some(CanonicalTurnItemStatus::Failed);
+        return Some(CanonicalTurnItemStatus::Indeterminate);
     }
     match canonical_turn_status(status)? {
         CanonicalTurnStatus::Pending => Some(CanonicalTurnItemStatus::Pending),
@@ -1271,11 +1273,7 @@ pub fn publish_model_retry_runtime_event(
     });
     event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "model-retry-runtime-{}-{}",
-                message_id,
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("model-retry-runtime-{}", message_id)),
             "model.retry.runtime",
             payload,
         )
@@ -1392,15 +1390,12 @@ fn publish_session_turn_item_stream_event_raw(
     stream_update: &SessionTurnStreamUpdate,
     publish_gate: &mut SessionTurnStreamPublishGate,
 ) -> Option<u64> {
-    let Some(canonical_item) = published.canonical_item.as_ref() else {
-        return None;
-    };
+    let canonical_item = published.canonical_item.as_ref()?;
+    // 存储写入后的版本就是这份内容的事实版本；没有版本的 item 不能作为增量事实发布。
+    let item_version = canonical_item.item_version?;
     let current_content = canonical_item.content.as_deref().unwrap_or_default();
-    let Some((item_version, stream_update)) =
-        publish_gate.prepare_publish(stream_update, current_content)
-    else {
-        return None;
-    };
+    let (first_frame, stream_update) =
+        publish_gate.prepare_publish(stream_update, current_content)?;
     let mut payload = serde_json::json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
@@ -1423,9 +1418,7 @@ fn publish_session_turn_item_stream_event_raw(
         "delta": stream_update.delta,
         "reset": stream_update.reset,
     });
-    if item_version == 1 {
-        let mut canonical_item = canonical_item.clone();
-        canonical_item.item_version = Some(item_version);
+    if first_frame {
         payload
             .as_object_mut()
             .expect("stream event payload must be an object")
@@ -1451,7 +1444,7 @@ fn publish_session_turn_item_payload(
 ) -> u64 {
     event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-session-turn-item-{}", UtcMillis::now().0)),
+            EventId::unique("event-session-turn-item"),
             "session.turn.item",
             payload,
         )
@@ -1994,7 +1987,7 @@ fn upsert_session_tool_call_result_item(
     tool_result: &str,
     tool_status: ExecutionResultStatus,
 ) -> Result<(), String> {
-    let status_label = tool_execution_status_label(tool_status);
+    let status_label = tool_status.wire_label();
     let mut result_item = session_turn_item(
         "tool_call_result",
         turn_item_status_for_tool_result(tool_status),
@@ -2129,7 +2122,7 @@ impl ExternalToolItemWriter<'_> {
         item.source = "tool".to_string();
         item.tool_call_id = Some(call_id.to_string());
         item.tool_name = Some(tool_name.to_string());
-        item.tool_status = Some(tool_execution_status_label(status).to_string());
+        item.tool_status = Some(status.wire_label().to_string());
         item.tool_arguments = Some(arguments_json.to_string());
         item.tool_result = Some(result.to_string());
         if matches!(
@@ -2818,10 +2811,7 @@ fn await_session_tool_approval(
     }
     event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-tool-approval-requested-{}",
-                UtcMillis::now().0
-            )),
+            EventId::unique("event-tool-approval-requested"),
             "tool.approval.requested",
             serde_json::json!({
                 "session_id": session_id,
@@ -3061,7 +3051,7 @@ fn execute_session_turn_tool_call_scoped(
 
     event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-session-turn-tool-{}", UtcMillis::now().0)),
+            EventId::unique("event-session-turn-tool"),
             "session.turn.tool.invoked",
             serde_json::json!({
                 "session_id": session_id.to_string(),
@@ -3398,10 +3388,10 @@ mod tests {
             content_length: 1,
             reset: false,
         };
-        let (version, published) = gate
+        let (first_frame, published) = gate
             .prepare_publish_at(&first, "a", UtcMillis(1_000))
             .expect("first frame should publish");
-        assert_eq!(version, 1);
+        assert!(first_frame, "第一次发布必须标记为第一帧，以便附带完整 item");
         assert_eq!(published.delta, "a");
 
         let burst = SessionTurnStreamUpdate {
@@ -3422,10 +3412,10 @@ mod tests {
             reset: false,
         };
         let enough_content = format!("ab{}", "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS));
-        let (version, published) = gate
+        let (first_frame, published) = gate
             .prepare_publish_at(&enough_chars, &enough_content, UtcMillis(1_002))
             .expect("coalesced content should publish");
-        assert_eq!(version, 2);
+        assert!(!first_frame);
         assert_eq!(
             published.delta,
             format!("b{}", "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS))
@@ -3438,14 +3428,14 @@ mod tests {
             reset: false,
         };
         let delayed_content = format!("{enough_content}d");
-        let (version, published) = gate
+        let (first_frame, published) = gate
             .prepare_publish_at(
                 &delayed,
                 &delayed_content,
                 UtcMillis(1_002 + STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS),
             )
             .expect("delayed frame should publish");
-        assert_eq!(version, 3);
+        assert!(!first_frame);
         assert_eq!(published.delta, "d");
 
         let reset = SessionTurnStreamUpdate {
@@ -3454,10 +3444,10 @@ mod tests {
             content_length: 5,
             reset: true,
         };
-        let (version, published) = gate
+        let (first_frame, published) = gate
             .prepare_publish_at(&reset, "reset", UtcMillis(1_003))
             .expect("reset frame should publish");
-        assert_eq!(version, 4);
+        assert!(!first_frame);
         assert!(published.reset);
     }
 
@@ -3614,8 +3604,19 @@ mod tests {
             second_payload["canonical_item_id"],
             Value::String(item_id.to_string())
         );
-        assert_eq!(second_payload["canonical_item_version"], Value::from(2_u64));
-        assert_eq!(second_payload["itemVersion"], Value::from(2_u64));
+        // 中间那次写入被节流、没有发布，但存储版本照样前进到 3。事件必须携带存储版本：
+        // 它也是快照和恢复使用的版本，否则客户端从快照恢复后会把后续增量当成旧版本丢弃。
+        let stored_version = second_published
+            .canonical_item
+            .as_ref()
+            .and_then(|item| item.item_version)
+            .expect("stored item should carry a version");
+        assert_eq!(stored_version, 3);
+        assert_eq!(
+            second_payload["canonical_item_version"],
+            Value::from(stored_version)
+        );
+        assert_eq!(second_payload["itemVersion"], Value::from(stored_version));
         assert_eq!(second_payload["baseContentLength"], Value::from(1_u64));
         assert_eq!(
             second_payload["contentLength"],

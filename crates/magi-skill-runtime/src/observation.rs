@@ -82,9 +82,11 @@ fn map_builtin_dispatch_status(status: ExecutionResultStatus) -> SkillDispatchSt
         ExecutionResultStatus::Succeeded => SkillDispatchStatus::Succeeded,
         ExecutionResultStatus::NeedsApproval => SkillDispatchStatus::NeedsApproval,
         ExecutionResultStatus::Rejected => SkillDispatchStatus::Rejected,
-        ExecutionResultStatus::Failed | ExecutionResultStatus::Cancelled => {
-            SkillDispatchStatus::Failed
-        }
+        // Skill 调度只区分成功 / 待审批 / 拒绝 / 失败；结果未确认按失败上报，
+        // 原始工具结果仍携带 indeterminate 状态供调用方区分。
+        ExecutionResultStatus::Failed
+        | ExecutionResultStatus::Cancelled
+        | ExecutionResultStatus::Indeterminate => SkillDispatchStatus::Failed,
     }
 }
 

@@ -219,11 +219,16 @@ pub enum CanonicalTurnItemStatus {
     Blocked,
     Failed,
     Cancelled,
+    /// 写操作已发出但无法确认是否生效；终态，不是成功也不等同失败。
+    Indeterminate,
 }
 
 impl CanonicalTurnItemStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Indeterminate
+        )
     }
 
     pub fn allows_transition_to(self, next: Self) -> bool {
@@ -233,17 +238,30 @@ impl CanonicalTurnItemStatus {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+                Self::Running
+                    | Self::Completed
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Cancelled
+                    | Self::Indeterminate
             ),
             Self::Running => matches!(
                 next,
-                Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+                Self::Completed
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Cancelled
+                    | Self::Indeterminate
             ),
             Self::Blocked => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Running
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Cancelled
+                    | Self::Indeterminate
             ),
-            Self::Completed | Self::Failed | Self::Cancelled => false,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Indeterminate => false,
         }
     }
 }

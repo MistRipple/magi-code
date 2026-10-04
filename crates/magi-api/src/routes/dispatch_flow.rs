@@ -431,19 +431,12 @@ async fn execute_dispatch_submission(
             return Err(error);
         }
     };
-    publish_session_user_message_event(
-        state,
-        &session_id,
-        workspace_id.clone(),
-        accepted_at,
-        &message,
-    );
+    publish_session_user_message_event(state, &session_id, workspace_id.clone(), &message);
     if let Some(superseded_turn) = accepted.superseded_turn.as_ref() {
         super::publish_superseded_turn_event(
             state,
             &session_id,
             workspace_id.as_ref(),
-            accepted_at,
             superseded_turn,
         );
     }
@@ -557,10 +550,8 @@ pub(super) fn publish_goal_continuation_task_accepted_event(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let session_summary = accepted_session_directory_entry(state, accepted);
-    let event_id = EventId::new(format!(
-        "event-session-turn-task-{}",
-        accepted.accepted_at.0
-    ));
+    // 由 turn 身份推导：turn/start 重放时按同一规则找回这条事件的序号。
+    let event_id = EventId::new(format!("event-session-turn-task-{}", accepted.turn_id));
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.task.accepted",
@@ -1131,10 +1122,8 @@ fn publish_session_turn_task_accepted_event(
     let workspace_id_payload = workspace_id.as_ref().map(ToString::to_string);
     let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(accepted);
     let session_summary = accepted_session_directory_entry(state, accepted);
-    let event_id = EventId::new(format!(
-        "event-session-turn-task-{}",
-        accepted.accepted_at.0
-    ));
+    // 由 turn 身份推导：turn/start 重放时按同一规则找回这条事件的序号。
+    let event_id = EventId::new(format!("event-session-turn-task-{}", accepted.turn_id));
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.task.accepted",
@@ -1205,12 +1194,11 @@ pub(crate) fn publish_session_user_message_event(
     state: &ApiState,
     session_id: &SessionId,
     workspace_id: Option<WorkspaceId>,
-    accepted_at: UtcMillis,
     message: &str,
 ) {
     let _ = state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-message-user-{}", accepted_at.0)),
+            EventId::unique("event-message-user"),
             "message.created",
             json!({
                 "session_id": session_id.to_string(),

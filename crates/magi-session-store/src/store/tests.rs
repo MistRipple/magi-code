@@ -6443,3 +6443,24 @@ fn rename_and_delete_hand_the_persistence_callback_only_the_affected_sessions_hi
     assert!(store.session(&target_id).is_none());
     assert_eq!(store.current_session_id(), Some(other_id));
 }
+
+#[test]
+fn indeterminate_item_status_is_terminal_and_not_rewritable() {
+    use crate::models::CanonicalTurnItemStatus as Status;
+    assert!(Status::Indeterminate.is_terminal());
+    for from in [Status::Pending, Status::Running, Status::Blocked] {
+        assert!(from.allows_transition_to(Status::Indeterminate));
+    }
+    for next in [
+        Status::Running,
+        Status::Completed,
+        Status::Failed,
+        Status::Cancelled,
+    ] {
+        assert!(!Status::Indeterminate.allows_transition_to(next));
+    }
+    assert_eq!(
+        serde_json::to_value(Status::Indeterminate).unwrap(),
+        json!("indeterminate")
+    );
+}

@@ -29,7 +29,7 @@ use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
     model_visible_tool_history_budget_bytes, model_visible_tool_result, non_retryable_tool_failure,
-    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
+    summarize_tool_result, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
@@ -1178,14 +1178,8 @@ fn run_conversation_loop_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
-    let task_access_profile = task
-        .policy_snapshot
-        .as_ref()
-        .map(magi_core::TaskPolicy::effective_access_profile)
-        .unwrap_or_default();
-    let task_browser_capability = tool_registry.and_then(|registry| {
-        registry.browser_capability_snapshot(task_access_profile, Some(session_id))
-    });
+    let task_browser_capability =
+        tool_registry.and_then(|registry| registry.browser_capability_snapshot());
     let mut tool_call_records = if recovery_history {
         tool_call_records_from_thread_history(&thread_history_snapshot)
     } else {
@@ -1381,7 +1375,6 @@ fn run_conversation_loop_inner(
                 BrowserToolSurfaceContext::new(
                     skill_runtime,
                     active_skill_name.as_deref(),
-                    access_profile,
                     allowed_tools,
                     denied_tools,
                 ),
@@ -3806,7 +3799,7 @@ fn publish_task_llm_started(
 ) {
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-task-llm-started-{}", UtcMillis::now().0)),
+            EventId::unique("event-task-llm-started"),
             "task.llm.started",
             serde_json::json!({
                 "task_id": task.task_id.to_string(),
@@ -4106,7 +4099,7 @@ fn upsert_task_tool_call_result_turn_item(
     tool_result: &str,
     tool_status: ExecutionResultStatus,
 ) -> Result<(), String> {
-    let status_label = tool_execution_status_label(tool_status);
+    let status_label = tool_status.wire_label();
     let mut item = session_turn_item(
         "tool_call_result",
         turn_item_status_for_tool_result(tool_status),

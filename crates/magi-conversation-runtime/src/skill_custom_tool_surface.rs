@@ -10,7 +10,7 @@ use magi_skill_runtime::{
 use magi_tool_runtime::{ToolExecutionContext, ToolExecutionPolicy};
 use serde_json::Value;
 
-use crate::tool_result_utils::{safety_gate_public_error, tool_execution_status_label};
+use crate::tool_result_utils::safety_gate_public_error;
 
 const SKILL_CUSTOM_TOOL_PREFIX: &str = "skill";
 const SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 工具暂不可用，请稍后重试";
@@ -563,7 +563,7 @@ fn custom_tool_safety_payload(
     pattern: String,
     reason: String,
 ) -> (String, ExecutionResultStatus) {
-    let status_label = tool_execution_status_label(status);
+    let status_label = status.wire_label();
     let public_error = safety_gate_public_error(status);
     tracing::warn!(
         tool_name,

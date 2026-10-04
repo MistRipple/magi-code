@@ -159,16 +159,6 @@ impl DeterministicToolFailureTracker {
     }
 }
 
-pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static str {
-    match status {
-        ExecutionResultStatus::Succeeded => "succeeded",
-        ExecutionResultStatus::Failed => "failed",
-        ExecutionResultStatus::Rejected => "rejected",
-        ExecutionResultStatus::NeedsApproval => "needs_approval",
-        ExecutionResultStatus::Cancelled => "cancelled",
-    }
-}
-
 pub fn tool_result_execution_status(result: &str) -> ExecutionResultStatus {
     let explicit = serde_json::from_str::<Value>(result)
         .ok()
@@ -181,6 +171,7 @@ pub fn tool_result_execution_status(result: &str) -> ExecutionResultStatus {
         Some("needs_approval" | "needsapproval") => ExecutionResultStatus::NeedsApproval,
         Some("cancelled" | "canceled" | "aborted" | "killed") => ExecutionResultStatus::Cancelled,
         Some("failed" | "error" | "timeout" | "timed_out") => ExecutionResultStatus::Failed,
+        Some("indeterminate") => ExecutionResultStatus::Indeterminate,
         _ if infer_tool_call_status(result) == "success" => ExecutionResultStatus::Succeeded,
         _ => ExecutionResultStatus::Failed,
     }
@@ -248,6 +239,7 @@ pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'stat
         ExecutionResultStatus::NeedsApproval => "awaiting_approval",
         ExecutionResultStatus::Cancelled => "cancelled",
         ExecutionResultStatus::Failed | ExecutionResultStatus::Rejected => "failed",
+        ExecutionResultStatus::Indeterminate => "indeterminate",
     }
 }
 
@@ -342,7 +334,7 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
     let mut envelope = Map::new();
     envelope.insert(
         "execution_status".to_string(),
-        Value::String(tool_execution_status_label(status).to_string()),
+        Value::String(status.wire_label().to_string()),
     );
     envelope.insert("model_truncated".to_string(), Value::Bool(true));
     envelope.insert(
@@ -416,7 +408,7 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
     let encoded = serde_json::to_string(&envelope).unwrap_or_else(|_| {
         format!(
             "{{\"execution_status\":\"{}\",\"model_truncated\":true,\"original_bytes\":{},\"preview\":{}}}",
-            tool_execution_status_label(status),
+            status.wire_label(),
             original_bytes,
             serde_json::to_string(&truncate_utf8_middle(
                 result,
@@ -429,7 +421,7 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
         encoded
     } else {
         serde_json::json!({
-            "execution_status": tool_execution_status_label(status),
+            "execution_status": status.wire_label(),
             "model_truncated": true,
             "original_bytes": original_bytes,
             "preview": truncate_utf8_middle(result, MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 3),
@@ -571,11 +563,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_labels_are_stable() {
-        assert_eq!(
-            tool_execution_status_label(ExecutionResultStatus::Succeeded),
-            "succeeded"
+    fn indeterminate_tool_result_stays_unconfirmed_end_to_end() {
+        let status = tool_result_execution_status(
+            r#"{"status":"indeterminate","error_code":"browser_host_request_indeterminate"}"#,
         );
+        assert_eq!(status, ExecutionResultStatus::Indeterminate);
+        assert_eq!(status.wire_label(), "indeterminate");
+        assert_eq!(turn_item_status_for_tool_result(status), "indeterminate");
+    }
+
+    #[test]
+    fn status_labels_are_stable() {
+        assert_eq!(ExecutionResultStatus::Succeeded.wire_label(), "succeeded");
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::NeedsApproval),
             "awaiting_approval"

@@ -3,11 +3,11 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type {
   BrowserCommandOutcome,
+  BrowserActionTarget,
   BrowserCommandResult,
   BrowserHostCommand,
   BrowserSnapshot,
   BrowserSnapshotTarget,
-  BrowserAccessibilityNode,
   BrowserSurfaceBinding,
   WorkerCommandResponse,
 } from "@magi/desktop-browser-contracts";
@@ -217,20 +217,18 @@ export class BrowserAutomationRuntime {
           },
         };
       case "click":
-        await this.click(binding, command.payload.target);
-        return empty();
+        return actionTargetResult(await this.click(binding, command.payload.target));
       case "type":
-        await this.typeText(
+        return actionTargetResult(await this.typeText(
           binding,
           command.payload.target,
           command.payload.text,
           command.payload.replace,
           command.payload.submit_key ?? null,
-        );
-        return empty();
+        ));
       case "press":
         await this.press(binding, command.payload.key);
-        return empty();
+        return actionTargetResult(null);
       case "scroll":
         await this.scroll(
           binding,
@@ -238,7 +236,7 @@ export class BrowserAutomationRuntime {
           command.payload.delta_x,
           command.payload.delta_y,
         );
-        return empty();
+        return actionTargetResult(null);
       case "screenshot":
         return this.screenshot(binding, command.payload);
       case "hit_test":
@@ -836,7 +834,7 @@ export class BrowserAutomationRuntime {
     if (!Number.isSafeInteger(snapshotRevision) || snapshotRevision < 0) {
       throw protocolFailure("browser_snapshot_revision_invalid", "snapshot_revision is invalid");
     }
-    const value = await this.evaluate<Omit<BrowserSnapshot, "tab_id" | "navigation_revision" | "continuation_refs">>(
+    const value = await this.evaluate<Omit<BrowserSnapshot, "tab_id" | "navigation_revision">>(
       binding,
       `globalThis.__magiBrowserAutomation.snapshot(${safeInteger(limits.max_nodes, 400)}, ${safeInteger(limits.max_text_bytes, 32768)}, ${snapshotRevision})`,
     );
@@ -846,79 +844,11 @@ export class BrowserAutomationRuntime {
         `expected ${snapshotRevision}, received ${value.snapshot_revision}`,
       );
     }
-    const accessibilityTree = await this.accessibilityTree(binding, safeInteger(limits.max_nodes, 400), snapshotRevision);
     return {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
       ...value,
-      continuation_refs: [],
-      accessibility_tree: accessibilityTree,
     };
-  }
-
-  private async accessibilityTree(binding: BrowserSurfaceBinding, maxNodes: number, snapshotRevision: number): Promise<BrowserAccessibilityNode[]> {
-    const response = await this.#cdp.send<{ nodes?: Array<Record<string, unknown>> }>(
-      binding,
-      "Accessibility.getFullAXTree",
-      {},
-    );
-    const nodes = Array.isArray(response.nodes) ? response.nodes : [];
-    const mapped = [];
-    for (const node of nodes.slice(0, maxNodes)) {
-      const backendDomNodeId = typeof node.backendDOMNodeId === "number" ? node.backendDOMNodeId : null;
-      const elementRef = backendDomNodeId === null
-        ? null
-        : await this.accessibilityElementRef(binding, backendDomNodeId, snapshotRevision);
-      mapped.push({
-      node_id: String(node.nodeId ?? ""),
-      element_ref: elementRef,
-      parent_id: node.parentId == null ? null : String(node.parentId),
-      child_ids: Array.isArray(node.childIds) ? node.childIds.map(String) : [],
-      role: axValue(node.role),
-      name: axValue(node.name),
-      value: axValue(node.value),
-      description: axValue(node.description),
-      ignored: Boolean(node.ignored),
-      properties: Array.isArray(node.properties)
-        ? Object.fromEntries(node.properties
-          .filter((property): property is { name: string; value?: unknown } => Boolean(property && typeof property === "object" && typeof (property as { name?: unknown }).name === "string"))
-          .map((property) => [property.name, axValueObject(property.value)]))
-        : {},
-      actions: Array.isArray(node.actions)
-        ? node.actions.map((action) => typeof action === "object" && action !== null ? String((action as { name?: unknown }).name ?? "") : String(action)).filter(Boolean)
-        : [],
-      backend_dom_node_id: backendDomNodeId,
-      });
-    }
-    return mapped;
-  }
-
-  private async accessibilityElementRef(
-    binding: BrowserSurfaceBinding,
-    backendDomNodeId: number,
-    snapshotRevision: number,
-  ): Promise<string | null> {
-    try {
-      const described = await this.#cdp.send<{ node?: { nodeId?: number } }>(binding, "DOM.describeNode", { backendNodeId: backendDomNodeId });
-      if (!described.node?.nodeId) return null;
-      const executionContextId = await this.context(binding);
-      const resolved = await this.#cdp.send<{ object?: { objectId?: string } }>(binding, "DOM.resolveNode", {
-        nodeId: described.node.nodeId,
-        executionContextId,
-      });
-      const objectId = resolved.object?.objectId;
-      if (!objectId) return null;
-      const result = await this.#cdp.send<{ result?: { value?: unknown } }>(binding, "Runtime.callFunctionOn", {
-        objectId,
-        functionDeclaration: `function() { return globalThis.__magiBrowserAutomation.elementRef(this); }`,
-        returnByValue: true,
-        awaitPromise: false,
-        arguments: [],
-      });
-      return typeof result.result?.value === "string" ? result.result.value : null;
-    } catch {
-      return null;
-    }
   }
 
   private async setAnnotations(binding: BrowserSurfaceBinding, annotations: unknown[]): Promise<unknown> {
@@ -935,27 +865,41 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     target: BrowserSnapshotTarget,
     focus = false,
-  ): Promise<{ x: number; y: number; bounds: { x: number; y: number; width: number; height: number }; editable: boolean; sensitive: string | null }> {
+  ): Promise<PageTarget> {
     if (target.element_ref === "root") {
       throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
     }
     return this.evaluate(
       binding,
-      `globalThis.__magiBrowserAutomation.${focus ? "focus" : "target"}(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)})`,
+      `globalThis.__magiBrowserAutomation.${focus ? "focus" : "target"}(${JSON.stringify(target.element_ref)})`,
     );
   }
 
-  private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget): Promise<void> {
+  /** 点击并返回实际点击的元素（角色与名称），让模型和用户能确认点中的是什么。 */
+  private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget): Promise<BrowserActionTarget> {
     const clickToken = `click-${randomUUID()}`;
-    await this.evaluate(
-      binding,
-      `globalThis.__magiBrowserAutomation.prepareClick(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)}, ${JSON.stringify(clickToken)})`,
-    );
+    if (ref.element_ref === "root") {
+      throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
+    }
     // 浏览器视口可能小于文档内容高度。真实鼠标事件发到视口外的坐标
     // 时，Chromium 不会触发页面 click，但此前命令仍可能返回 succeeded，
     // 让后续 wait_for 误报为页面异步逻辑失败。先用与输入聚焦相同的
     // scrollIntoView 路径把目标收敛到当前视口，再读取滚动后的坐标。
-    const target = await this.target(binding, ref, true);
+    // 登记 click 监听与聚焦合并为一次页面往返，少一次 CDP 来回。
+    const target = await this.evaluate<PageTarget>(
+      binding,
+      `globalThis.__magiBrowserAutomation.prepareAndFocus(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(clickToken)})`,
+    );
+    await this.dispatchClick(binding, ref, target, clickToken);
+    return actionTarget(target);
+  }
+
+  private async dispatchClick(
+    binding: BrowserSurfaceBinding,
+    ref: BrowserSnapshotTarget,
+    target: PageTarget,
+    clickToken: string,
+  ): Promise<void> {
     if (!await this.pointer(binding, "mouseMoved", target.x, target.y)) return;
     if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) return;
     // mousePressed 可能已经触发了主文档导航。此时点击副作用已经发生，
@@ -983,7 +927,7 @@ export class BrowserAutomationRuntime {
     if (observed?.observed) return;
     await this.evaluate(
       binding,
-      `globalThis.__magiBrowserAutomation.fallbackClick(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)})`,
+      `globalThis.__magiBrowserAutomation.fallbackClick(${JSON.stringify(ref.element_ref)})`,
     ).catch((cause) => {
       if (isNavigationStaleError(cause)) return;
       throw cause;
@@ -996,12 +940,23 @@ export class BrowserAutomationRuntime {
     text: string,
     replace: boolean,
     submitKey: string | null,
-  ): Promise<void> {
+  ): Promise<BrowserActionTarget> {
     const target = await this.target(binding, ref, true);
     if (!target.editable) throw protocolFailure("browser_target_not_editable", "target is not editable");
     if (target.sensitive) {
       throw protocolFailure("browser_sensitive_action_requires_user", `sensitive input: ${target.sensitive}`);
     }
+    await this.insertText(binding, ref, text, replace, submitKey);
+    return actionTarget(target);
+  }
+
+  private async insertText(
+    binding: BrowserSurfaceBinding,
+    ref: BrowserSnapshotTarget,
+    text: string,
+    replace: boolean,
+    submitKey: string | null,
+  ): Promise<void> {
     if (replace) {
       if (!await this.key(binding, "keyDown", "a", process.platform === "darwin" ? 4 : 2)) return;
       if (!await this.key(binding, "keyUp", "a", process.platform === "darwin" ? 4 : 2)) return;
@@ -1026,7 +981,7 @@ export class BrowserAutomationRuntime {
     try {
       const result = await this.evaluate<{ value: string | null }>(
         binding,
-        `globalThis.__magiBrowserAutomation.readValue(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)})`,
+        `globalThis.__magiBrowserAutomation.readValue(${JSON.stringify(ref.element_ref)})`,
       );
       return typeof result?.value === "string" ? result.value : null;
     } catch {
@@ -1053,7 +1008,7 @@ export class BrowserAutomationRuntime {
     if (applied(current)) return;
     const filled = await this.evaluate<{ value: string | null }>(
       binding,
-      `globalThis.__magiBrowserAutomation.fillValue(${JSON.stringify(ref.element_ref)}, ${safeInteger(ref.snapshot_revision, 0)}, ${JSON.stringify(text)}, ${JSON.stringify(replace)})`,
+      `globalThis.__magiBrowserAutomation.fillValue(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(text)}, ${JSON.stringify(replace)})`,
     );
     if (applied(typeof filled?.value === "string" ? filled.value : null)) return;
     throw protocolFailure(
@@ -1110,7 +1065,7 @@ export class BrowserAutomationRuntime {
     const vertical = finiteNumber(deltaY, "delta_y");
     const expression = target
       ? `(() => {
-          const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
+          const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
           element.scrollBy({ left: ${JSON.stringify(horizontal)}, top: ${JSON.stringify(vertical)}, behavior: "instant" });
         })()`
       : `window.scrollBy({ left: ${JSON.stringify(horizontal)}, top: ${JSON.stringify(vertical)}, behavior: "instant" })`;
@@ -1290,13 +1245,10 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     target: BrowserSnapshotTarget,
   ): Promise<{ bounds: { x: number; y: number; width: number; height: number } }> {
-    await this.evaluate(
-      binding,
-      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); e.scrollIntoView({ block: "center", inline: "center" }); })()`,
-    );
+    // 滚动与取边界合并为一次往返；边界使用相对主视口的矩形，iframe 内元素也能正确截取。
     const resolved = await this.evaluate<{ bounds: { x: number; y: number; width: number; height: number } }>(
       binding,
-      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); const r = e.getBoundingClientRect(); return { bounds: { x: scrollX + r.x, y: scrollY + r.y, width: r.width, height: r.height } }; })()`,
+      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}); e.scrollIntoView({ block: "center", inline: "center" }); const r = globalThis.__magiBrowserAutomation.target(${JSON.stringify(target.element_ref)}).bounds; return { bounds: { x: scrollX + r.x, y: scrollY + r.y, width: r.width, height: r.height } }; })()`,
     );
     const bounds = resolved?.bounds;
     if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) {
@@ -1327,7 +1279,7 @@ export class BrowserAutomationRuntime {
       case "hover": {
         const target = await this.target(binding, snapshotTarget(args));
         await this.pointer(binding, "mouseMoved", target.x, target.y);
-        return { hovered: true };
+        return { hovered: true, target: actionTarget(target) };
       }
       case "click_at": {
         const x = finiteNumber(args.x, "x");
@@ -1423,6 +1375,10 @@ export class BrowserAutomationRuntime {
         return { handled: true };
       case "webmcp":
         return this.webmcp(binding, args);
+      case "read":
+        return this.readPage(binding, args);
+      case "storage":
+        return this.storage(binding, args);
       case "pwa": {
         if (args.action !== "state") {
           throw protocolFailure("browser_pwa_action_unsupported", "only the state action is supported");
@@ -1442,15 +1398,103 @@ export class BrowserAutomationRuntime {
     }
   }
 
+  /**
+   * 读取页面正文。文本由页面运行时按渲染结构生成（穿透 shadow DOM 与同源 iframe），
+   * 这里只负责参数校验和分页/检索参数的传递，不在 Worker 里复制第二份提取算法。
+   */
+  private async readPage(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const scoped = typeof args.element_ref === "string" && args.element_ref.trim().length > 0;
+    const target = scoped ? snapshotTarget(args) : null;
+    if (args.offset !== undefined && safeInteger(args.offset, -1) < 0) {
+      throw protocolFailure("browser_read_invalid", "offset must be a non-negative integer");
+    }
+    if (args.max_chars !== undefined && (safeInteger(args.max_chars, 0) < 1 || safeInteger(args.max_chars, 0) > 50_000)) {
+      throw protocolFailure("browser_read_invalid", "max_chars must be between 1 and 50000");
+    }
+    const query = typeof args.query === "string" ? args.query.trim() : "";
+    const options = {
+      offset: safeInteger(args.offset, 0),
+      maxChars: safeInteger(args.max_chars, 12_000),
+      includeLinks: args.include_links === true,
+      ...(query ? { query } : {}),
+    };
+    return this.evaluate(
+      binding,
+      `globalThis.__magiBrowserAutomation.readText(${JSON.stringify(target?.element_ref ?? "root")}, ${JSON.stringify(options)})`,
+    );
+  }
+
+  /**
+   * 当前页面所属站点的存储：localStorage / sessionStorage 可读写；cookie 只返回元数据并可清理。
+   * cookie 值是登录凭证，任何路径都不返回、也不允许写入，避免它进入模型上下文。
+   */
+  private async storage(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const area = String(args.area ?? "");
+    const action = String(args.action ?? "");
+    const key = typeof args.key === "string" ? args.key : "";
+    if (area === "cookies") {
+      if (action !== "list" && action !== "clear") {
+        throw protocolFailure("browser_storage_cookie_action_unsupported", "cookies only support list and clear");
+      }
+      const url = await this.evaluate<string>(binding, "location.href");
+      if (!/^https?:/iu.test(url)) {
+        return { url, area, cookies: [], cleared: 0 };
+      }
+      const response = await this.#cdp.send<{ cookies?: Array<Record<string, unknown>> }>(binding, "Network.getCookies", { urls: [url] });
+      const cookies = Array.isArray(response.cookies) ? response.cookies : [];
+      if (action === "clear") {
+        for (const cookie of cookies) {
+          await this.#cdp.send(binding, "Network.deleteCookies", {
+            name: cookie.name,
+            domain: cookie.domain,
+            path: cookie.path,
+          });
+        }
+        return { url, area, cleared: cookies.length };
+      }
+      return {
+        url,
+        area,
+        cookies: cookies.map((cookie) => ({
+          name: cookie.name,
+          domain: cookie.domain,
+          path: cookie.path,
+          expires: typeof cookie.expires === "number" && cookie.expires > 0 ? cookie.expires : null,
+          session: cookie.session === true,
+          http_only: cookie.httpOnly === true,
+          secure: cookie.secure === true,
+          same_site: typeof cookie.sameSite === "string" ? cookie.sameSite : null,
+          size: typeof cookie.size === "number" ? cookie.size : null,
+        })),
+      };
+    }
+    if (area !== "local" && area !== "session") {
+      throw protocolFailure("browser_storage_area_invalid", "area must be local, session or cookies");
+    }
+    if (!["list", "get", "set", "remove", "clear"].includes(action)) {
+      throw protocolFailure("browser_storage_action_invalid", `unsupported action: ${action}`);
+    }
+    if ((action === "get" || action === "set" || action === "remove") && !key) {
+      throw protocolFailure("browser_storage_key_required", `${action} requires key`);
+    }
+    if (action === "set" && typeof args.value !== "string") {
+      throw protocolFailure("browser_storage_value_required", "set requires a string value");
+    }
+    return this.evaluate(
+      binding,
+      `globalThis.__magiBrowserAutomation.storage(${JSON.stringify(area)}, ${JSON.stringify(action)}, ${JSON.stringify(key)}, ${JSON.stringify(typeof args.value === "string" ? args.value : null)})`,
+    );
+  }
+
   private async drag(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const source = snapshotTarget(args, "source");
     const target = snapshotTarget(args, "target");
     const result = await this.evaluate<Record<string, unknown>>(
       binding,
       `(() => {
-        const source = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(source.element_ref)}, ${safeInteger(source.snapshot_revision, 0)});
-        const target = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
-        if (!(source instanceof Element) || !(target instanceof Element)) throw new Error('browser_drag_target_stale');
+        const source = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(source.element_ref)});
+        const target = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
+        if (!source || source.nodeType !== 1 || !target || target.nodeType !== 1) throw new Error('browser_drag_target_stale');
         if (typeof DataTransfer !== 'function' || typeof DragEvent !== 'function') throw new Error('browser_drag_unsupported');
         const sourceRect = source.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
@@ -1522,7 +1566,7 @@ export class BrowserAutomationRuntime {
     const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: -1, pierce: true });
     const selector = await this.evaluate<string | null>(
       binding,
-      "(() => { const e = globalThis.__magiBrowserAutomation.resolve(" + JSON.stringify(snapshot.element_ref) + ", " + safeInteger(snapshot.snapshot_revision, 0) + "); return e instanceof HTMLInputElement && e.type === 'file' ? globalThis.__magiBrowserAutomation.cssPath(e) : null; })()",
+      "(() => { const e = globalThis.__magiBrowserAutomation.resolve(" + JSON.stringify(snapshot.element_ref) + "); return e && e.tagName === 'INPUT' && e.type === 'file' ? globalThis.__magiBrowserAutomation.cssPath(e) : null; })()",
     );
     if (!selector) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
     const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
@@ -1631,20 +1675,13 @@ export class BrowserAutomationRuntime {
         throw protocolFailure("browser_fill_form_invalid", "each fields item must include value");
       }
       const target = snapshotTarget(field);
-      const targetExpression = `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)})`;
-      const selectControl = await this.evaluate<{ kind: "select"; multiple: boolean } | null>(
+      const targetExpression = `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)})`;
+      // 一次页面往返判断控件类型，原先 select/checkbox/radio 需要三次串行探测。
+      const probed = await this.evaluate<{ kind: "select"; multiple: boolean } | { kind: "checkbox" } | { kind: "radio" } | null>(
         binding,
-        `(() => { const element = ${targetExpression}; if (element instanceof HTMLSelectElement && !element.disabled) return { kind: 'select', multiple: element.multiple }; if (element instanceof HTMLSelectElement) throw new Error('browser_fill_form_target_disabled'); return null; })()`,
+        `(() => { const element = ${targetExpression}; if (!element) return null; const tag = element.tagName; if (tag === 'SELECT') { if (element.disabled) throw new Error('browser_fill_form_target_disabled'); return { kind: 'select', multiple: element.multiple }; } if (tag === 'INPUT' && (element.type === 'checkbox' || element.type === 'radio')) { if (element.disabled) throw new Error('browser_fill_form_target_disabled'); return { kind: element.type }; } return null; })()`,
       );
-      const checkboxControl = selectControl ? null : await this.evaluate<{ kind: "checkbox" } | null>(
-        binding,
-        `(() => { const element = ${targetExpression}; if (element instanceof HTMLInputElement && element.type === 'checkbox' && !element.disabled) return { kind: 'checkbox' }; if (element instanceof HTMLInputElement && element.type === 'checkbox') throw new Error('browser_fill_form_target_disabled'); return null; })()`,
-      );
-      const radioControl = selectControl || checkboxControl ? null : await this.evaluate<{ kind: "radio" } | null>(
-        binding,
-        `(() => { const element = ${targetExpression}; if (element instanceof HTMLInputElement && element.type === 'radio' && !element.disabled) return { kind: 'radio' }; if (element instanceof HTMLInputElement && element.type === 'radio') throw new Error('browser_fill_form_target_disabled'); return null; })()`,
-      );
-      const control = selectControl || checkboxControl || radioControl || { kind: "text" as const };
+      const control = probed || { kind: "text" as const };
       if (control.kind === "text") {
         if (Array.isArray(field.value)) {
           throw protocolFailure("browser_fill_form_invalid", "text controls require a scalar value");
@@ -1677,8 +1714,8 @@ export class BrowserAutomationRuntime {
     await this.evaluate(
       binding,
       `(() => {
-        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
-        if (!(element instanceof HTMLSelectElement)) throw new Error('browser_fill_form_target_stale');
+        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
+        if (!element || element.tagName !== 'SELECT') throw new Error('browser_fill_form_target_stale');
         const values = ${JSON.stringify(serialized)};
         const options = [...element.options];
         if (values.some((value) => !options.some((option) => option.value === value))) throw new Error('browser_fill_form_select_option_not_found');
@@ -1709,8 +1746,8 @@ export class BrowserAutomationRuntime {
     await this.evaluate(
       binding,
       `(() => {
-        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
-        if (!(element instanceof HTMLInputElement) || element.type !== ${JSON.stringify(kind)}) throw new Error('browser_fill_form_target_stale');
+        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
+        if (!element || element.tagName !== 'INPUT' || element.type !== ${JSON.stringify(kind)}) throw new Error('browser_fill_form_target_stale');
         if (element.checked !== ${value}) element.click();
         return { checked: element.checked };
       })()`,
@@ -2220,6 +2257,32 @@ function empty(): { result: BrowserCommandResult } {
   return { result: { type: "empty" } };
 }
 
+/** 页面运行时 target()/focus()/prepareAndFocus() 返回的目标信息。 */
+interface PageTarget {
+  x: number;
+  y: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  editable: boolean;
+  sensitive: string | null;
+  role: string | null;
+  name: string | null;
+}
+
+const ACTION_TARGET_NAME_LIMIT = 120;
+
+function actionTarget(target: PageTarget): BrowserActionTarget {
+  const name = typeof target.name === "string" ? target.name.replace(/\s+/gu, " ").trim() : "";
+  return {
+    role: typeof target.role === "string" && target.role ? target.role : null,
+    name: name ? name.slice(0, ACTION_TARGET_NAME_LIMIT) : null,
+  };
+}
+
+/** 交互命令的结果：实际作用的元素；Desktop Main 会再合并动作后的页面状态。 */
+function actionTargetResult(target: BrowserActionTarget | null): { result: BrowserCommandResult } {
+  return { result: { type: "action_target", payload: target } };
+}
+
 function isNativeDialogOpenedResult(value: unknown): value is NativeDialogOpenedResult {
   return Boolean(
     value
@@ -2454,17 +2517,6 @@ function safeInteger(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : fallback;
-}
-
-function axValue(value: unknown): string | null {
-  const raw = axValueObject(value);
-  return raw == null ? null : String(raw);
-}
-
-function axValueObject(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value ?? null;
-  const candidate = value as { value?: unknown };
-  return "value" in candidate ? candidate.value : value;
 }
 
 function parseHeapSnapshot(raw: string): HeapSnapshotData {
@@ -3027,11 +3079,10 @@ function snapshotTarget(args: Record<string, unknown>, prefix = ""): BrowserSnap
     : typeof candidate.elementRef === "string"
       ? candidate.elementRef.trim()
       : "";
-  const revision = Number(candidate.snapshot_revision ?? candidate.snapshotRevision);
-  if (!elementRef || !Number.isSafeInteger(revision) || revision < 0) {
-    throw protocolFailure("browser_snapshot_target_invalid", "element_ref and snapshot_revision are required");
+  if (!elementRef) {
+    throw protocolFailure("browser_snapshot_target_invalid", "element_ref is required");
   }
-  return { element_ref: elementRef, snapshot_revision: revision };
+  return { element_ref: elementRef };
 }
 
 function isNavigationStaleError(cause: unknown): boolean {

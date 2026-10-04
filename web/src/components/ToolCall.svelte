@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
@@ -22,6 +23,7 @@
     formatViewImageToolOutput,
     parseViewImagePreview,
   } from '../lib/view-image-preview';
+  import { browserToolSummary, formatBrowserReadToolOutput, parseBrowserScreenshotPreview } from '../lib/browser-tool-display';
   import {
     formatImageGenerationToolOutput,
     parseImageGenerationPreview,
@@ -64,7 +66,7 @@
     output?: unknown;
     error?: string;
     standardized?: StandardizedToolResult;
-    status?: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+    status?: ToolCallStatus;
     duration?: number;
     filepath?: string;
     filePreviewScope?: FilePreviewScope;
@@ -129,6 +131,10 @@
     const viewImageOutput = formatViewImageToolOutput(toolName, content);
     if (viewImageOutput !== null) {
       return viewImageOutput;
+    }
+    const browserReadOutput = formatBrowserReadToolOutput(toolName, content);
+    if (browserReadOutput !== null) {
+      return browserReadOutput;
     }
     return formatContent(content);
   }
@@ -216,7 +222,7 @@
     return 'tool';
   }
 
-  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error' | 'degraded' | 'cancelled';
+  type VisualToolStatus = ToolCallStatus | 'degraded';
 
   function visualStatusInfo(value: VisualToolStatus): { class: string } {
     const map: Record<string, { class: string }> = {
@@ -226,13 +232,14 @@
       error: { class: 'error' },
       degraded: { class: 'degraded' },
       cancelled: { class: 'cancelled' },
+      unconfirmed: { class: 'unconfirmed' },
     };
     return map[value] || { class: 'success' };
   }
 
   // 状态信息
   const statusInfo = $derived.by(() => {
-    return visualStatusInfo(status);
+    return visualStatusInfo(visualStatus);
   });
 
   // 文件变更工具：diff 面板由 FileChangeCard 展示，ToolCall 仅渲染紧凑 header
@@ -441,6 +448,10 @@
   });
   const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
   const hasError = $derived(!!errorForDiagnosis);
+  // 写操作已经发出但无法确认是否生效（例如浏览器命令执行中途连接断开）。这是 item 的正式状态，
+  // 不是普通失败：副作用可能已经发生，盲目重试可能重复提交，所以单独呈现并提示先确认状态。
+  const outcomeUnconfirmed = $derived(status === 'unconfirmed');
+  const visualStatus = $derived<VisualToolStatus>(status);
 
   const hasContent = $derived(hasInput || hasOutput || hasError || Boolean(toolApproval));
   // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
@@ -464,17 +475,43 @@
   );
   const imagePreview = $derived.by(() => {
     if (!detailVisible || outputIsStructuredError) return null;
-    if (viewImagePreview) return { ...viewImagePreview, revisedPrompt: '' };
-    if (!generatedImagePreview) return null;
+    if (viewImagePreview) return { ...viewImagePreview, revisedPrompt: '', open: handleOpenFile };
+    if (generatedImagePreview) {
+      return {
+        ...generatedImagePreview,
+        src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
+          workspaceId: filePreviewScope?.workspaceId,
+          workspacePath: filePreviewScope?.workspacePath,
+          sessionId: '',
+        })),
+        open: handleOpenFile,
+      };
+    }
+    // 浏览器截图保存在会话的浏览器 artifact 目录（不属于工作区），按会话读取；
+    // 点击时以图片地址直接在右栏打开，个人会话同样可用。
+    const screenshot = parseBrowserScreenshotPreview(name, output);
+    const sessionId = filePreviewScope?.sessionId || getCurrentSessionId();
+    if (!screenshot || !sessionId) return null;
+    const src = agentUrl(
+      `/api/browser/artifacts/${encodeURIComponent(sessionId)}/${encodeURIComponent(screenshot.fileName)}`,
+    );
     return {
-      ...generatedImagePreview,
-      src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
-        workspaceId: filePreviewScope?.workspaceId,
-        workspacePath: filePreviewScope?.workspacePath,
-        sessionId: '',
-      })),
+      path: screenshot.path,
+      mime: screenshot.mime,
+      bytes: screenshot.bytes,
+      revisedPrompt: '',
+      src,
+      open: () => openImageInPreview(screenshot.path, src, screenshot.mime, screenshot.bytes),
     };
   });
+
+  function openImageInPreview(filepath: string, src: string, mime: string, size: number | undefined) {
+    if (typeof window === 'undefined') return;
+    window.dispatchEvent(new CustomEvent('magi:previewFile', {
+      detail: { filepath, ...filePreviewScope, imageDataUrl: src, mime, size, contentKind: 'binary' },
+      cancelable: true,
+    }));
+  }
   const outputText = $derived(
     detailVisible && !outputIsStructuredError ? formatToolOutput(name, output) : '',
   );
@@ -505,10 +542,12 @@
   }
 
   // 从工具参数中提取语义摘要
-  function getToolSummary(toolName: string, toolInput: unknown): string {
+  function getToolSummary(toolName: string, toolInput: unknown, toolOutput: unknown): string {
     if (!toolInput || typeof toolInput !== 'object') return '';
     const args = toolInput as Record<string, unknown>;
     const parsedTool = parseToolIdentity(toolName);
+    const browserSummary = browserToolSummary(toolName, args, toolOutput);
+    if (browserSummary !== null) return browserSummary;
     if (parsedTool.source === 'skill') {
       return typeof args.payload === 'string'
         ? args.payload
@@ -618,7 +657,7 @@
       });
   });
   const toolSummary = $derived(
-    toolTargetSummary || getToolSummary(name, input)
+    toolTargetSummary || getToolSummary(name, input, output)
   );
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
@@ -815,6 +854,7 @@
   });
 
   function toolStatusLabel(value: VisualToolStatus): string {
+    if (value === 'unconfirmed') return i18n.t('toolCall.status.unconfirmed');
     if (value === 'cancelled') return i18n.t('terminalSession.status.cancelled');
     if (value === 'degraded') return i18n.t('toolCall.agentSpawn.degraded');
     return i18n.t(`terminalSession.status.${value}`);
@@ -923,8 +963,8 @@
 
   <span
     class="tool-status status-{statusInfo.class}"
-    title={toolStatusLabel(status)}
-    aria-label={toolStatusLabel(status)}
+    title={toolStatusLabel(visualStatus)}
+    aria-label={toolStatusLabel(visualStatus)}
   >
     {#if status === 'running' || status === 'pending'}
       <span class="status-dot pulsing"></span>
@@ -1024,7 +1064,8 @@
     <div
       class="tool-call"
       class:collapsed={canExpand && collapsed}
-      class:has-error={hasError}
+      class:has-error={hasError && !outcomeUnconfirmed}
+      class:has-warning={outcomeUnconfirmed}
       class:file-mutation={isCompactMutation}
       class:compact-readonly={isCompactReadOnlyTool}
       data-tool-name={name}
@@ -1095,14 +1136,14 @@
                     <button
                       type="button"
                       class="image-output-open"
-                      onclick={imagePreview.path ? handleOpenFile : undefined}
+                      onclick={imagePreview.path ? imagePreview.open : undefined}
                       disabled={!imagePreview.path}
                       title={imagePreview.path ? i18n.t('toolCall.openGeneratedImage') : undefined}
                       use:desktopContextMenu={{
                         kind: 'image',
                         filePath: imagePreview.path || undefined,
                         fileScope: filePreviewScope,
-                        open: imagePreview.path ? handleOpenFile : undefined,
+                        open: imagePreview.path ? imagePreview.open : undefined,
                       }}
                     >
                       <img src={imagePreview.src} alt={imagePreview.path || toolDisplayName} />
@@ -1174,15 +1215,17 @@
           {/if}
 
           {#if hasError}
-            <div class="tool-section error">
+            <div class="tool-section error" class:unconfirmed={outcomeUnconfirmed}>
               <div class="section-header">
-                <span class="section-label">{i18n.t('toolCall.section.error')}</span>
-                {#if errorDiagnosis}
+                <span class="section-label">{i18n.t(outcomeUnconfirmed ? 'toolCall.section.unconfirmed' : 'toolCall.section.error')}</span>
+                {#if errorDiagnosis && !outcomeUnconfirmed}
                   <span class="diagnosis-owner">{errorDiagnosis.ownerLabel}</span>
                 {/if}
               </div>
               <div class="section-content error-content">{publicErrorMessage}</div>
-              {#if errorDiagnosis}
+              {#if outcomeUnconfirmed}
+                <div class="error-hint">{i18n.t('toolCall.unconfirmedHint')}</div>
+              {:else if errorDiagnosis}
                 <div class="error-hint">{errorDiagnosis.hint}</div>
               {/if}
             </div>
@@ -1205,6 +1248,10 @@
 
   .tool-call.has-error {
     border-color: var(--error);
+  }
+
+  .tool-call.has-warning {
+    border-color: var(--warning);
   }
 
   /* 文件变更工具：紧凑 header-only 卡片，不可展开 */
@@ -1335,6 +1382,7 @@
   .status-success { color: var(--success); }
   .status-error { color: var(--error); }
   .status-cancelled { color: var(--foreground-muted); }
+  .status-unconfirmed { color: var(--warning); }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; }
@@ -1503,6 +1551,11 @@
   .error-content {
     color: var(--error);
     background: rgba(239, 68, 68, 0.1);
+  }
+
+  .tool-section.unconfirmed .error-content {
+    color: var(--warning);
+    background: var(--warning-muted);
   }
 
   .diagnosis-owner {

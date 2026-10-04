@@ -18,10 +18,28 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     annotationListenersInstalled: false,
     clickGuards: new Map(),
   };
+  // iframe 内的元素属于另一个 realm，instanceof Element 对它们恒为 false，
+  // 因此所有“是不是元素”的判断都改用 nodeType，保证同源 iframe 内的节点可被快照和操作。
+  const isElement = (value) => Boolean(value) && value.nodeType === 1 && typeof value.tagName === 'string';
+  const MAX_FRAME_DEPTH = 4;
+  const isFrameElement = (element) => {
+    const tag = element.tagName?.toLowerCase?.();
+    return tag === 'iframe' || tag === 'frame';
+  };
+  // 只有同源 iframe 才能读到 contentDocument；跨域或已销毁的 frame 返回 null。
+  const frameDocument = (element) => {
+    if (!isFrameElement(element)) return null;
+    try {
+      return element.contentDocument || null;
+    } catch {
+      return null;
+    }
+  };
   const roleFor = (element) => {
     const explicit = element.getAttribute?.('role');
     if (explicit) return explicit;
     const tag = element.tagName?.toLowerCase?.() || '';
+    if (tag === 'iframe' || tag === 'frame') return 'iframe';
     if (tag === 'a' && element.hasAttribute('href')) return 'link';
     if (tag === 'button') return 'button';
     if (tag === 'textarea') return 'textbox';
@@ -41,9 +59,10 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     const tag = element.tagName?.toLowerCase?.() || '';
     const aria = element.getAttribute?.('aria-label')?.trim();
     if (aria) return aria;
+    const ownerDoc = element.ownerDocument || document;
     const labelledBy = element.getAttribute?.('aria-labelledby');
     if (labelledBy) {
-      const text = labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.textContent || '').join(' ').trim();
+      const text = labelledBy.split(/\s+/).map((id) => ownerDoc.getElementById(id)?.textContent || '').join(' ').trim();
       if (text) return text;
     }
     const alt = element.getAttribute?.('alt')?.trim();
@@ -51,26 +70,47 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     const title = element.getAttribute?.('title')?.trim();
     if (title) return title;
     const explicitLabel = element.id
-      ? document.querySelector('label[for="' + CSS.escape(element.id) + '"]')?.textContent?.replace(/\s+/g, ' ').trim()
+      ? ownerDoc.querySelector('label[for="' + CSS.escape(element.id) + '"]')?.textContent?.replace(/\s+/g, ' ').trim()
       : '';
     if (explicitLabel) return explicitLabel;
     const parentLabel = element.closest?.('label')?.textContent?.replace(/\s+/g, ' ').trim();
     if (parentLabel) return parentLabel;
     if (tag === 'input' && (element.getAttribute('type') || '').toLowerCase() === 'file') return 'file input';
+    if (tag === 'iframe' || tag === 'frame') {
+      return (element.getAttribute('name') || element.getAttribute('src') || '').slice(0, 240) || null;
+    }
     const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
     return text.slice(0, 240) || null;
   };
+  // 返回相对主文档视口的矩形。iframe 内元素的 getBoundingClientRect 只相对 iframe 自己的
+  // 视口，CDP 输入事件使用主视口坐标，因此要逐层累加 frame 元素的位置和边框。
   const rectFor = (element) => {
     const rect = element.getBoundingClientRect();
+    let x = rect.x;
+    let y = rect.y;
+    let view = element.ownerDocument?.defaultView;
+    for (let depth = 0; view && depth < 16; depth += 1) {
+      let frame = null;
+      try {
+        frame = view.frameElement;
+      } catch {
+        frame = null;
+      }
+      if (!frame) break;
+      const frameRect = frame.getBoundingClientRect();
+      x += frameRect.x + (frame.clientLeft || 0);
+      y += frameRect.y + (frame.clientTop || 0);
+      view = frame.ownerDocument?.defaultView;
+    }
     return {
-      x: rect.x,
-      y: rect.y,
+      x,
+      y,
       width: rect.width,
       height: rect.height,
     };
   };
   const visible = (element) => {
-    const style = getComputedStyle(element);
+    const style = (element.ownerDocument?.defaultView || window).getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.display !== 'none'
       && style.visibility !== 'hidden'
@@ -87,8 +127,30 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     if (autocomplete.startsWith('cc-')) return 'payment_card';
     return null;
   };
+  // 元素当前的交互状态（勾选、展开、选中、按下、必填、无效、只读）。模型只能靠这些状态判断
+  // “现在是什么样”，取值来自 DOM 属性或 ARIA 属性，在页面内同步读取，不经过 CDP。
+  const statesFor = (element) => {
+    const states = [];
+    const tag = element.tagName?.toLowerCase?.() || '';
+    const aria = (name) => element.getAttribute?.(name);
+    const type = tag === 'input' ? (aria('type') || 'text').toLowerCase() : '';
+    if (type === 'checkbox' || type === 'radio') {
+      states.push(element.indeterminate ? 'mixed' : element.checked ? 'checked' : 'unchecked');
+    } else if (aria('aria-checked') === 'true') states.push('checked');
+    else if (aria('aria-checked') === 'false') states.push('unchecked');
+    else if (aria('aria-checked') === 'mixed') states.push('mixed');
+    if (tag === 'details') states.push(element.open ? 'expanded' : 'collapsed');
+    else if (aria('aria-expanded') === 'true') states.push('expanded');
+    else if (aria('aria-expanded') === 'false') states.push('collapsed');
+    if (tag === 'option' ? element.selected : aria('aria-selected') === 'true') states.push('selected');
+    if (aria('aria-pressed') === 'true') states.push('pressed');
+    if (element.required === true || aria('aria-required') === 'true') states.push('required');
+    if (aria('aria-invalid') === 'true') states.push('invalid');
+    if (element.readOnly === true || aria('aria-readonly') === 'true') states.push('read_only');
+    return states;
+  };
   const shouldInclude = (element) => {
-    if (!(element instanceof Element) || !visible(element)) return false;
+    if (!isElement(element) || !visible(element)) return false;
     const role = roleFor(element);
     const tag = element.tagName.toLowerCase();
     return Boolean(role)
@@ -115,6 +177,22 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       if (serialized) children.push(serialized);
       if (budget.nodes >= budget.maxNodes) break;
     }
+    // 同源 iframe 的文档并入同一棵快照树，引用与普通元素一致；跨域 iframe 无法读取，
+    // 节点本身仍然返回，并在 description 里提示改用坐标点击。
+    const isFrame = isFrameElement(element);
+    const frameDoc = isFrame && budget.frameDepth < MAX_FRAME_DEPTH ? frameDocument(element) : null;
+    if (frameDoc && budget.nodes < budget.maxNodes) {
+      const frameRoot = frameDoc.body || frameDoc.documentElement;
+      if (frameRoot) {
+        budget.frameDepth += 1;
+        try {
+          const serialized = serialize(frameRoot, budget);
+          if (serialized) children.push(serialized);
+        } finally {
+          budget.frameDepth -= 1;
+        }
+      }
+    }
     if (!include && children.length === 0) return null;
     const name = include ? nameFor(element) : null;
     if (name) budget.textBytes += new TextEncoder().encode(name).byteLength;
@@ -134,11 +212,13 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       role: roleFor(element),
       name,
       value: 'value' in element && typeof element.value === 'string' ? element.value.slice(0, 240) : null,
-      description: element.getAttribute?.('aria-description') || null,
+      description: element.getAttribute?.('aria-description')
+        || (isFrame && !frameDoc ? 'iframe 内容不可检查（跨域或超过嵌套深度），请用 browser_click_at 按坐标操作' : null),
       disabled: Boolean(element.disabled) || element.getAttribute?.('aria-disabled') === 'true',
-      focused: document.activeElement === element,
+      focused: (element.ownerDocument || document).activeElement === element,
       editable: Boolean(element.isContentEditable) || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()),
       sensitive_input_kind: sensitiveKind(element),
+      states: include ? statesFor(element) : [],
       visible: true,
       bounds: include ? rectFor(element) : null,
       children,
@@ -388,7 +468,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       state.snapshotRevision = revision;
       state.nextRef = 1;
       state.refs = new Map();
-      const budget = { nodes: 0, textBytes: 0, maxNodes, maxTextBytes };
+      const budget = { nodes: 0, textBytes: 0, maxNodes, maxTextBytes, frameDepth: 0 };
       const children = [];
       const root = document.body || document.documentElement;
       if (root) {
@@ -407,6 +487,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
           focused: false,
           editable: false,
           sensitive_input_kind: null,
+          states: [],
           visible: true,
           bounds: { x: 0, y: 0, width: innerWidth, height: innerHeight },
           children,
@@ -417,14 +498,15 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         truncated: budget.nodes >= maxNodes || budget.textBytes >= maxTextBytes,
       };
     },
-    resolve(ref, revision) {
-      if (revision !== state.snapshotRevision) throw new Error('browser_element_ref_stale');
+    // 引用（e:<快照版本>:<序号>）本身标识了所属快照；每次快照都会重建引用表，
+    // 所以旧快照、旧文档或 Worker 重启前的引用在这里都查不到，统一视为过期。
+    resolve(ref) {
       const element = state.refs.get(ref);
       if (!element || !element.isConnected) throw new Error('browser_element_ref_stale');
       return element;
     },
-    target(ref, revision) {
-      const element = this.resolve(ref, revision);
+    target(ref) {
+      const element = this.resolve(ref);
       const rect = rectFor(element);
       return {
         x: rect.x + rect.width / 2,
@@ -432,16 +514,18 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         bounds: rect,
         editable: Boolean(element.isContentEditable) || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()),
         sensitive: sensitiveKind(element),
+        role: roleFor(element),
+        name: nameFor(element),
       };
     },
-    focus(ref, revision) {
-      const element = this.resolve(ref, revision);
+    focus(ref) {
+      const element = this.resolve(ref);
       element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       element.focus({ preventScroll: true });
-      return this.target(ref, revision);
+      return this.target(ref);
     },
-    readValue(ref, revision) {
-      const element = this.resolve(ref, revision);
+    readValue(ref) {
+      const element = this.resolve(ref);
       const tag = element.tagName.toLowerCase();
       if (tag === 'select') return { value: null };
       if (tag === 'input' || tag === 'textarea') return { value: String(element.value ?? '') };
@@ -450,8 +534,8 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     },
     // 原生输入事件被后台/失焦的 guest 吞掉时的兜底：用与框架一致的方式写入值并派发事件，
     // 让 React/Vue 等受控组件也能感知。只用于校验发现原生输入没有生效之后。
-    fillValue(ref, revision, text, replace) {
-      const element = this.resolve(ref, revision);
+    fillValue(ref, text, replace) {
+      const element = this.resolve(ref);
       const tag = element.tagName.toLowerCase();
       const value = String(text);
       if (tag === 'input' || tag === 'textarea') {
@@ -465,8 +549,10 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       }
       if (element.isContentEditable) {
         element.focus({ preventScroll: true });
-        if (replace) document.execCommand('selectAll');
-        if (!document.execCommand('insertText', false, value)) {
+        // iframe 内的可编辑元素要用它自己所属文档的 execCommand，否则会写到主文档的选区里。
+        const ownerDoc = element.ownerDocument || document;
+        if (replace) ownerDoc.execCommand('selectAll');
+        if (!ownerDoc.execCommand('insertText', false, value)) {
           element.textContent = replace ? value : String(element.textContent ?? '') + value;
           element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
         }
@@ -474,8 +560,10 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       }
       return { value: null };
     },
-    prepareClick(ref, revision, token) {
-      const element = this.resolve(ref, revision);
+    // 点击前先登记 click 监听（用来确认原生鼠标事件是否真的形成了 DOM click），再把目标滚动到
+    // 视口并聚焦，一次页面往返完成，返回滚动后的目标坐标。
+    prepareAndFocus(ref, token) {
+      const element = this.resolve(ref);
       const guard = { element, observed: false, listener: null };
       guard.listener = () => { guard.observed = true; };
       element.addEventListener('click', guard.listener, { capture: true, once: true });
@@ -485,7 +573,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         element.removeEventListener('click', guard.listener, true);
         state.clickGuards.delete(String(token));
       }, 60000);
-      return { prepared: true };
+      return this.focus(ref);
     },
     finishClick(token) {
       const guard = state.clickGuards.get(String(token));
@@ -494,8 +582,8 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       state.clickGuards.delete(String(token));
       return { observed: guard.observed };
     },
-    fallbackClick(ref, revision) {
-      const element = this.resolve(ref, revision);
+    fallbackClick(ref) {
+      const element = this.resolve(ref);
       // Runtime.evaluate 必须先返回，避免 alert/confirm/prompt 在同步
       // evaluate 内阻塞 CDP。下一轮任务会通过 Page.javascriptDialogOpening
       // 收到对话框事件，并可由 browser_dialog 接管。
@@ -546,8 +634,193 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     cssPath(element) {
       return cssPath(element);
     },
-    elementRef(element) {
-      return element instanceof Element && element.isConnected ? refFor(element) : null;
+    // 读取页面正文：按渲染结构输出文本，穿透 open shadow DOM 和同源 iframe，
+    // 跳过脚本、样式和不可见节点，不返回密码等敏感输入的值。
+    readText(ref, options) {
+      const opts = options || {};
+      const maxChars = Math.max(1, Math.min(Number(opts.maxChars) || 12000, 50000));
+      const offset = Math.max(0, Number(opts.offset) || 0);
+      const includeLinks = opts.includeLinks === true;
+      const query = typeof opts.query === 'string' ? opts.query.trim() : '';
+      const scope = ref && ref !== 'root' ? this.resolve(ref) : (document.body || document.documentElement);
+      const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template', 'head', 'svg', 'canvas', 'link', 'meta']);
+      const MAX_SCANNED_ELEMENTS = 20000;
+      const frames = [];
+      let scanned = 0;
+      let scanTruncated = false;
+      let out = '';
+      const endsWithBreak = () => out === '' || out.endsWith('\n');
+      const breakLine = () => {
+        if (!endsWithBreak()) out += '\n';
+      };
+      const appendInline = (text) => {
+        let value = text.replace(/\s+/g, ' ');
+        if (!value.trim()) {
+          if (!endsWithBreak() && !out.endsWith(' ')) out += ' ';
+          return;
+        }
+        if (endsWithBreak() || out.endsWith(' ')) value = value.replace(/^ /, '');
+        out += value;
+      };
+      const childNodesOf = (node) => {
+        const tag = node.tagName.toLowerCase();
+        if (tag === 'slot' && typeof node.assignedNodes === 'function') {
+          const assigned = node.assignedNodes({ flatten: true });
+          if (assigned.length > 0) return assigned;
+        }
+        return node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+      };
+      const walk = (node, frameDepth) => {
+        if (scanned >= MAX_SCANNED_ELEMENTS) {
+          scanTruncated = true;
+          return;
+        }
+        if (node.nodeType === 3) {
+          appendInline(node.nodeValue || '');
+          return;
+        }
+        if (!isElement(node)) return;
+        scanned += 1;
+        const tag = node.tagName.toLowerCase();
+        if (SKIP_TAGS.has(tag)) return;
+        const view = node.ownerDocument?.defaultView || window;
+        const style = view.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+        if (isFrameElement(node)) {
+          const label = (node.getAttribute('title') || node.getAttribute('name') || node.getAttribute('src') || '').slice(0, 120);
+          const frameDoc = frameDepth < MAX_FRAME_DEPTH ? frameDocument(node) : null;
+          if (frames.length < 20) frames.push({ src: (node.getAttribute('src') || '').slice(0, 300), accessible: Boolean(frameDoc) });
+          breakLine();
+          if (!frameDoc) {
+            out += '[iframe 内容不可读取（跨域或超过嵌套深度）: ' + label + ']\n';
+            return;
+          }
+          out += '[iframe: ' + label + ']\n';
+          const frameRoot = frameDoc.body || frameDoc.documentElement;
+          if (frameRoot) walk(frameRoot, frameDepth + 1);
+          breakLine();
+          return;
+        }
+        if (tag === 'br') {
+          out += '\n';
+          return;
+        }
+        if (tag === 'hr') {
+          breakLine();
+          out += '---\n';
+          return;
+        }
+        if (tag === 'input') {
+          const type = (node.getAttribute('type') || 'text').toLowerCase();
+          if (type === 'hidden' || type === 'password' || sensitiveKind(node)) return;
+          if (type === 'checkbox' || type === 'radio') {
+            out += node.checked ? '[x] ' : '[ ] ';
+          } else if (type !== 'button' && type !== 'submit' && type !== 'reset' && type !== 'image' && type !== 'file') {
+            const value = node.value || '';
+            if (value) appendInline('[' + value + ']');
+          }
+          return;
+        }
+        if (tag === 'textarea') {
+          const value = node.value || '';
+          if (value) {
+            breakLine();
+            out += value + '\n';
+          }
+          return;
+        }
+        if (tag === 'select') {
+          const chosen = [...node.selectedOptions].map((option) => (option.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+          if (chosen.length) appendInline('[' + chosen.join(', ') + ']');
+          return;
+        }
+        const display = style.display;
+        const isBlock = !(display.startsWith('inline') || display === 'contents');
+        const isCell = tag === 'td' || tag === 'th';
+        if (isBlock && !isCell) breakLine();
+        if (/^h[1-6]$/.test(tag)) out += '#'.repeat(Number(tag[1])) + ' ';
+        else if (tag === 'li') out += '- ';
+        else if (tag === 'pre' || tag === 'code') { /* 保留原样由子文本节点输出 */ }
+        const linkStart = out.length;
+        for (const child of childNodesOf(node)) {
+          walk(child, frameDepth);
+          if (scanned >= MAX_SCANNED_ELEMENTS) break;
+        }
+        if (includeLinks && tag === 'a' && node.href && out.length > linkStart && /^https?:/i.test(node.href)) {
+          out += ' (' + node.href + ')';
+        }
+        if (isCell) out += ' | ';
+        if (isBlock && !isCell) breakLine();
+      };
+      walk(scope, 0);
+      const full = out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      const base = { url: location.href, title: document.title || '', total_chars: full.length, scan_truncated: scanTruncated, frames };
+      if (query) {
+        const needle = query.toLowerCase();
+        const haystack = full.toLowerCase();
+        const matches = [];
+        let from = 0;
+        let total = 0;
+        while (true) {
+          const index = haystack.indexOf(needle, from);
+          if (index < 0) break;
+          total += 1;
+          if (matches.length < 50) {
+            matches.push({
+              index,
+              context: full.slice(Math.max(0, index - 80), Math.min(full.length, index + needle.length + 80)).replace(/\s+/g, ' '),
+            });
+          }
+          from = index + Math.max(1, needle.length);
+        }
+        return { ...base, query, match_count: total, matches };
+      }
+      const text = full.slice(offset, offset + maxChars);
+      const end = offset + text.length;
+      return { ...base, offset, returned_chars: text.length, truncated: end < full.length, next_offset: end < full.length ? end : null, text };
+    },
+    // 当前页面所在源的 localStorage / sessionStorage 读写。列表里的值截断，避免单次结果过大。
+    storage(area, action, key, value) {
+      const store = area === 'session' ? sessionStorage : localStorage;
+      const base = { origin: location.origin, area };
+      const LIST_VALUE_LIMIT = 2000;
+      const GET_VALUE_LIMIT = 50000;
+      if (action === 'list') {
+        const entries = [];
+        for (let index = 0; index < store.length && entries.length < 200; index += 1) {
+          const entryKey = store.key(index);
+          if (entryKey === null) continue;
+          const entryValue = store.getItem(entryKey) ?? '';
+          entries.push({
+            key: entryKey,
+            value: entryValue.slice(0, LIST_VALUE_LIMIT),
+            length: entryValue.length,
+            truncated: entryValue.length > LIST_VALUE_LIMIT,
+          });
+        }
+        return { ...base, total: store.length, entries };
+      }
+      if (action === 'get') {
+        const entryValue = store.getItem(key);
+        return entryValue === null
+          ? { ...base, key, found: false }
+          : { ...base, key, found: true, value: entryValue.slice(0, GET_VALUE_LIMIT), length: entryValue.length, truncated: entryValue.length > GET_VALUE_LIMIT };
+      }
+      if (action === 'set') {
+        store.setItem(key, String(value));
+        return { ...base, key, length: String(value).length };
+      }
+      if (action === 'remove') {
+        const existed = store.getItem(key) !== null;
+        store.removeItem(key);
+        return { ...base, key, removed: existed };
+      }
+      if (action === 'clear') {
+        const cleared = store.length;
+        store.clear();
+        return { ...base, cleared };
+      }
+      throw new Error('browser_storage_action_invalid');
     },
     evaluate(expression) {
       return (0, eval)(expression);

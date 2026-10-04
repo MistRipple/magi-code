@@ -531,7 +531,7 @@ pub fn execute_memory_write_tool(
     mission_id: &magi_core::MissionId,
     arguments: &str,
 ) -> (String, magi_core::ExecutionResultStatus) {
-    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_core::{EventId, ExecutionResultStatus};
     use magi_event_bus::{EventContext, EventEnvelope};
     let Some(store) = store else {
         return (
@@ -623,10 +623,7 @@ pub fn execute_memory_write_tool(
     };
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-project-memory-updated-{}",
-                UtcMillis::now().0
-            )),
+            EventId::unique("event-project-memory-updated"),
             "task.project_memory.updated",
             serde_json::json!({
                 "task_id": task_id.to_string(),

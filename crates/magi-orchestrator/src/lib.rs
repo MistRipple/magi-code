@@ -475,31 +475,21 @@ impl OrchestratorService {
         payload: serde_json::Value,
     ) {
         let base = match category {
-            EventCategory::Domain => EventEnvelope::domain(
-                EventId::new(format!("{event_type}-{}", UtcMillis::now().0)),
-                event_type,
-                payload,
-            ),
-            EventCategory::Audit => EventEnvelope::audit(
-                EventId::new(format!("{event_type}-{}", UtcMillis::now().0)),
-                event_type,
-                payload,
-            ),
-            EventCategory::Usage => EventEnvelope::usage(
-                EventId::new(format!("{event_type}-{}", UtcMillis::now().0)),
-                event_type,
-                payload,
-            ),
-            EventCategory::Projection => EventEnvelope::projection(
-                EventId::new(format!("{event_type}-{}", UtcMillis::now().0)),
-                event_type,
-                payload,
-            ),
-            EventCategory::System => EventEnvelope::system(
-                EventId::new(format!("{event_type}-{}", UtcMillis::now().0)),
-                event_type,
-                payload,
-            ),
+            EventCategory::Domain => {
+                EventEnvelope::domain(EventId::unique(event_type), event_type, payload)
+            }
+            EventCategory::Audit => {
+                EventEnvelope::audit(EventId::unique(event_type), event_type, payload)
+            }
+            EventCategory::Usage => {
+                EventEnvelope::usage(EventId::unique(event_type), event_type, payload)
+            }
+            EventCategory::Projection => {
+                EventEnvelope::projection(EventId::unique(event_type), event_type, payload)
+            }
+            EventCategory::System => {
+                EventEnvelope::system(EventId::unique(event_type), event_type, payload)
+            }
         };
         let _ = self.event_bus.publish(base.with_context(context));
     }

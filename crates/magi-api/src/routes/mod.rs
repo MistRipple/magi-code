@@ -241,15 +241,11 @@ pub(super) fn publish_superseded_turn_event(
     state: &ApiState,
     session_id: &SessionId,
     workspace_id: Option<&WorkspaceId>,
-    occurred_at: UtcMillis,
     turn: &CanonicalTurn,
 ) {
     state.event_bus.publish(
         EventEnvelope::domain(
-            magi_core::EventId::new(format!(
-                "event-session-turn-superseded-{}-{}",
-                turn.turn_id, occurred_at.0
-            )),
+            magi_core::EventId::unique(format!("event-session-turn-superseded-{}", turn.turn_id)),
             "session.turn.superseded",
             serde_json::json!({
                 "session_id": session_id,

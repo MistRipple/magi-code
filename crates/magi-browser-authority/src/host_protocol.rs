@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 5;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 6;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
@@ -180,7 +180,6 @@ pub enum BrowserHostCommand {
         navigation_revision: u64,
         snapshot_revision: u64,
         limits: BrowserSnapshotLimits,
-        subtree_ref: Option<String>,
     },
     Click {
         tab_id: BrowserTabId,
@@ -437,8 +436,9 @@ impl Default for BrowserSnapshotLimits {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 快照元素引用（形如 `e:3:12`）。引用本身就标识了所属快照，
+/// 过期判断由页面运行时的当前引用表完成，不再单独传快照版本号。
 pub struct BrowserSnapshotTarget {
-    pub snapshot_revision: u64,
     pub element_ref: String,
 }
 
@@ -483,11 +483,31 @@ pub enum BrowserHostCommandResult {
     Empty,
     Pong { monotonic_millis: u64 },
     PageState(BrowserHostPageState),
+    ActionTarget(Option<BrowserActionTarget>),
+    Interaction(BrowserHostInteraction),
     Snapshot(BrowserHostSnapshot),
     BinaryPayload(BrowserHostBinaryPayload),
     HitTest(BrowserHostHitTest),
     SurfaceBinding(BrowserSurfaceBinding),
     Json { value: serde_json::Value },
+}
+
+/// 交互命令实际作用的元素（角色与可访问名称，不含元素的值）。
+///
+/// Worker 以 `ActionTarget` 结果报告给 Desktop Main，Main 再与动作后的页面状态合并为
+/// `Interaction` 交给 Rust 工具层。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserActionTarget {
+    pub role: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserHostInteraction {
+    pub page_state: BrowserHostPageState,
+    pub target: Option<BrowserActionTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -511,9 +531,6 @@ pub struct BrowserHostSnapshot {
     pub total_nodes: u32,
     pub text_bytes: u32,
     pub truncated: bool,
-    pub continuation_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub accessibility_tree: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -529,9 +546,28 @@ pub struct BrowserSnapshotNode {
     pub editable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensitive_input_kind: Option<BrowserSensitiveInputKind>,
+    /// 勾选、展开、选中等交互状态，由页面运行时从 DOM/ARIA 属性读取。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<BrowserNodeState>,
     pub visible: bool,
     pub bounds: Option<BrowserHostRect>,
     pub children: Vec<BrowserSnapshotNode>,
+}
+
+/// 快照节点的交互状态。取值与 `desktop-control.schema.json` 的 `snapshotNode.states` 一一对应。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserNodeState {
+    Checked,
+    Unchecked,
+    Mixed,
+    Expanded,
+    Collapsed,
+    Selected,
+    Pressed,
+    Required,
+    Invalid,
+    ReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -724,7 +760,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 5 },
+                "protocol_version": { "major": 3, "minor": 6 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",
@@ -906,6 +942,51 @@ mod tests {
                 height: 40.0,
             }),
         }
+    }
+
+    #[test]
+    fn interaction_results_match_typescript_contract() {
+        let interaction = serde_json::json!({
+            "type": "interaction",
+            "payload": {
+                "page_state": {
+                    "tab_id": "tab-1",
+                    "url": "https://shop.test/done",
+                    "origin": "https://shop.test",
+                    "title": "完成",
+                    "navigation_revision": 2
+                },
+                "target": { "role": "button", "name": "提交订单" }
+            }
+        });
+        let parsed: BrowserHostCommandResult =
+            serde_json::from_value(interaction.clone()).expect("interaction should parse");
+        let BrowserHostCommandResult::Interaction(BrowserHostInteraction { target, .. }) = &parsed
+        else {
+            panic!("expected interaction result");
+        };
+        assert_eq!(
+            target,
+            &Some(BrowserActionTarget {
+                role: Some("button".to_string()),
+                name: Some("提交订单".to_string()),
+            })
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), interaction);
+
+        let no_target = serde_json::json!({ "type": "action_target", "payload": null });
+        assert_eq!(
+            serde_json::from_value::<BrowserHostCommandResult>(no_target).unwrap(),
+            BrowserHostCommandResult::ActionTarget(None)
+        );
+        assert!(
+            serde_json::from_value::<BrowserHostCommandResult>(serde_json::json!({
+                "type": "action_target",
+                "payload": { "role": "button", "name": "x", "value": "secret" }
+            }))
+            .is_err(),
+            "action target must not carry element values"
+        );
     }
 
     #[test]

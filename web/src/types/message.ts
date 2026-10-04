@@ -258,7 +258,8 @@ export type MessageType =
 export type NoticeType = 'info' | 'success' | 'warning' | 'error';
 
 // 工具调用状态
-export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+/** unconfirmed：写操作已发出但无法确认是否生效（canonical item 状态 indeterminate）。 */
+export type ToolCallStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled' | 'unconfirmed';
 
 // 工具结果标准化状态（与协议层保持一致）
 export type StandardizedToolStatus =

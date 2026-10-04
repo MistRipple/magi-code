@@ -847,11 +847,7 @@ pub fn publish_plan_cleared_event(
 ) {
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-plan-cleared-{}-{}",
-                plan.plan_id,
-                UtcMillis::now().0
-            )),
+            EventId::unique(format!("event-plan-cleared-{}", plan.plan_id)),
             "session.plan.cleared",
             serde_json::json!({
                 "session_id": plan.session_id.to_string(),

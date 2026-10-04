@@ -27,7 +27,7 @@
   import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import { resolveBrowserAnnotationArtifactUrl } from '../web/agent-api';
-  import type { ConversationPresentationRole } from '../lib/conversation-presentation';
+  import { inferConversationPresentationRole } from '../lib/conversation-presentation';
 
   // Props
   interface Props {
@@ -42,8 +42,6 @@
     onContinueInterrupted?: () => void;
     /** 轮次折叠容器已在外层展示总耗时时，避免最终消息重复显示。 */
     hideResponseDuration?: boolean;
-    /** 摘要投影中的语义角色；原始模式不传入，保持现有时间线呈现。 */
-    presentationRole?: ConversationPresentationRole;
   }
   let {
     message,
@@ -54,8 +52,11 @@
     onEdit = undefined,
     onContinueInterrupted = undefined,
     hideResponseDuration = false,
-    presentationRole = 'process',
   }: Props = $props();
+
+  // 呈现角色（过程、产物、待处理交互、最终输出……）是投影写入消息的事实。
+  // 原始与摘要两种模式都按同一事实决定卡片默认展开与否，只是布局不同。
+  const presentationRole = $derived(inferConversationPresentationRole(message));
 
   let copied = $state(false);
   let interruptedRecoverySubmitting = $state(false);

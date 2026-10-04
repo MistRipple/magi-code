@@ -16,7 +16,7 @@ const requiredDefinitions = [
   'InitializeParams', 'InitializeResult', 'JsonRpcRequest', 'JsonRpcNotification',
   'JsonRpcResponse', 'JsonRpcServerRequest', 'JsonRpcServerNotification',
   'JsonRpcServerResponse', 'JsonRpcError', 'CancelNotification',
-  'BrowserToolsListParams', 'BrowserToolParams', 'ApprovalRequestParams',
+  'BrowserToolParams', 'ApprovalRequestParams',
   'EventSubscribeParams', 'SessionListParams', 'SessionReadParams',
   'TurnStartParams', 'SessionSummary', 'SessionListResult', 'SessionReadResult',
   'TurnStartResult', 'EventSubscribeResult', 'BrowserToolsListResult',

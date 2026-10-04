@@ -56,30 +56,7 @@ impl ToolRegistry {
     }
 
     fn summarize_invocations(&self, invocations: &[ToolInvocationRecord]) -> ToolExecutionSummary {
-        let total_invocations = invocations.len();
-        let successful_invocations = invocations
-            .iter()
-            .filter(|record| record.status == ExecutionResultStatus::Succeeded)
-            .count();
-        let blocked_invocations = invocations
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    ExecutionResultStatus::NeedsApproval | ExecutionResultStatus::Rejected
-                )
-            })
-            .count();
-        let failed_invocations = invocations
-            .iter()
-            .filter(|record| record.status == ExecutionResultStatus::Failed)
-            .count();
-        ToolExecutionSummary {
-            total_invocations,
-            successful_invocations,
-            blocked_invocations,
-            failed_invocations,
-        }
+        ToolExecutionSummary::from_statuses(invocations.iter().map(|record| record.status))
     }
 
     pub(crate) fn record_invocation(

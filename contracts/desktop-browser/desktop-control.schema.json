@@ -201,9 +201,8 @@
     "snapshotTarget": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["snapshot_revision", "element_ref"],
+      "required": ["element_ref"],
       "properties": {
-        "snapshot_revision": { "type": "integer", "minimum": 0 },
         "element_ref": { "$ref": "#/$defs/id" }
       }
     },
@@ -341,8 +340,7 @@
         "tab_id": { "$ref": "#/$defs/id" },
         "navigation_revision": { "type": "integer", "minimum": 0 },
         "snapshot_revision": { "type": "integer", "minimum": 0 },
-        "limits": { "$ref": "#/$defs/snapshotLimits" },
-        "subtree_ref": { "type": ["string", "null"], "minLength": 1 }
+        "limits": { "$ref": "#/$defs/snapshotLimits" }
       }
     },
     "clickPayload": {
@@ -577,6 +575,26 @@
         "worker_epoch": { "$ref": "#/$defs/id" }
       }
     },
+    "actionTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "name"],
+      "properties": {
+        "role": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] }
+      }
+    },
+    "interaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["page_state", "target"],
+      "properties": {
+        "page_state": { "$ref": "#/$defs/pageState" },
+        "target": {
+          "oneOf": [{ "$ref": "#/$defs/actionTarget" }, { "type": "null" }]
+        }
+      }
+    },
     "pageState": {
       "type": "object",
       "additionalProperties": false,
@@ -617,6 +635,23 @@
         "sensitive_input_kind": {
           "enum": ["password", "one_time_code", "payment_card", null]
         },
+        "states": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "checked",
+              "unchecked",
+              "mixed",
+              "expanded",
+              "collapsed",
+              "selected",
+              "pressed",
+              "required",
+              "invalid",
+              "read_only"
+            ]
+          }
+        },
         "visible": { "type": "boolean" },
         "bounds": {
           "oneOf": [{ "$ref": "#/$defs/normalizedRect" }, { "type": "null" }]
@@ -625,38 +660,6 @@
           "type": "array",
           "items": { "$ref": "#/$defs/snapshotNode" }
         }
-      }
-    },
-    "accessibilityNode": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "node_id",
-        "element_ref",
-        "parent_id",
-        "child_ids",
-        "role",
-        "name",
-        "value",
-        "description",
-        "ignored",
-        "properties",
-        "actions",
-        "backend_dom_node_id"
-      ],
-      "properties": {
-        "node_id": { "type": "string" },
-        "element_ref": { "type": ["string", "null"] },
-        "parent_id": { "type": ["string", "null"] },
-        "child_ids": { "type": "array", "items": { "type": "string" } },
-        "role": { "type": ["string", "null"] },
-        "name": { "type": ["string", "null"] },
-        "value": { "type": ["string", "null"] },
-        "description": { "type": ["string", "null"] },
-        "ignored": { "type": "boolean" },
-        "properties": { "type": "object" },
-        "actions": { "type": "array", "items": { "type": "string" } },
-        "backend_dom_node_id": { "type": ["integer", "null"], "minimum": 1 }
       }
     },
     "snapshot": {
@@ -670,8 +673,7 @@
         "returned_nodes",
         "total_nodes",
         "text_bytes",
-        "truncated",
-        "continuation_refs"
+        "truncated"
       ],
       "properties": {
         "tab_id": { "$ref": "#/$defs/id" },
@@ -681,15 +683,7 @@
         "returned_nodes": { "type": "integer", "minimum": 0 },
         "total_nodes": { "type": "integer", "minimum": 0 },
         "text_bytes": { "type": "integer", "minimum": 0 },
-        "truncated": { "type": "boolean" },
-        "continuation_refs": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/id" }
-        },
-        "accessibility_tree": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/accessibilityNode" }
-        }
+        "truncated": { "type": "boolean" }
       }
     },
     "binaryPayload": {
@@ -794,6 +788,26 @@
           "properties": {
             "type": { "const": "page_state" },
             "payload": { "$ref": "#/$defs/pageState" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "action_target" },
+            "payload": {
+              "oneOf": [{ "$ref": "#/$defs/actionTarget" }, { "type": "null" }]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "interaction" },
+            "payload": { "$ref": "#/$defs/interaction" }
           }
         },
         {

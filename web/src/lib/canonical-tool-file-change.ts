@@ -1,3 +1,4 @@
+import type { ToolCallStatus } from '../types/message';
 import type { ContentBlock } from '../types/message';
 import {
   coerceToolArgumentsRecord,
@@ -11,7 +12,7 @@ interface FileChangeProjectionInput {
   toolName: string;
   arguments: unknown;
   result?: unknown;
-  status: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+  status: ToolCallStatus;
 }
 
 interface TextPatch {

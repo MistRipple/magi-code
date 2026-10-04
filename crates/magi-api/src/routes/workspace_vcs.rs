@@ -1068,17 +1068,13 @@ fn publish_git_context_changed(
     session_id: Option<&str>,
     observation: &GitObservation,
 ) {
-    let now = UtcMillis::now();
     let typed_session_id = session_id.map(|value| SessionId::new(value.to_string()));
     let context_revision = session_id
         .and_then(|value| state.session_code_contexts.get(value))
         .map(|context| context.context_revision);
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "workspace-git-context-changed-{}-{}",
-                scope.workspace_id, now.0
-            )),
+            EventId::unique(format!("workspace-git-context-changed-{}", scope.workspace_id)),
             "workspace.git.context.changed",
             serde_json::json!({
                 "workspace_id": scope.workspace_id,

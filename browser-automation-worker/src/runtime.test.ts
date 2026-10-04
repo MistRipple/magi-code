@@ -799,7 +799,7 @@ test("滚动目标元素时直接调用元素 scrollBy，不依赖鼠标坐标",
     payload: {
       tab_id: binding.tab_id,
       control: { mode: "user", fence: 1 },
-      target: { snapshot_revision: 1, element_ref: "e:1:1" },
+      target: { element_ref: "e:1:1" },
       delta_x: 0,
       delta_y: 300,
     },
@@ -903,7 +903,7 @@ test("文本插入触发导航后不再向新文档提交旧按键", async () =>
     payload: {
       tab_id: binding.tab_id,
       control: { mode: "user", fence: 1 },
-      target: { snapshot_revision: 1, element_ref: "e:1:search" },
+      target: { element_ref: "e:1:search" },
       text: "magi",
       replace: false,
       submit_key: "Enter",
@@ -934,7 +934,7 @@ test("点击触发 JavaScript 对话框时，CDP 鼠标超时不会掩盖已经�
     payload: {
       tab_id: binding.tab_id,
       control: { mode: "user", fence: 1 },
-      target: { snapshot_revision: 1, element_ref: "e:1:dialog" },
+      target: { element_ref: "e:1:dialog" },
     },
   });
   assert.equal(result.outcome.status, "succeeded");
@@ -950,7 +950,7 @@ test("原生鼠标事件未形成 DOM click 时异步回退到元素点击", asy
   const port = new ScriptedPort((method) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null } } };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null, role: "button", name: "  提交\n  订单 " } } };
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -959,13 +959,18 @@ test("原生鼠标事件未形成 DOM click 时异步回退到元素点击", asy
     payload: {
       tab_id: binding.tab_id,
       control: { mode: "user", fence: 1 },
-      target: { snapshot_revision: 1, element_ref: "e:1:button" },
+      target: { element_ref: "e:1:button" },
     },
   });
   assert.equal(result.outcome.status, "succeeded");
   assert.ok(
     port.requests.some((request) => String(request.params.expression).includes("fallbackClick")),
     "未观察到 DOM click 时应调度异步元素点击",
+  );
+  assert.deepEqual(
+    result.outcome.status === "succeeded" ? result.outcome.payload : null,
+    { type: "action_target", payload: { role: "button", name: "提交 订单" } },
+    "点击结果应报告实际点击的元素（名称折叠空白）",
   );
 });
 
@@ -985,7 +990,7 @@ test("点击完成后异步到达的 JavaScript 对话框事件仍可被下一�
     payload: {
       tab_id: binding.tab_id,
       control: { mode: "user", fence: 1 },
-      target: { snapshot_revision: 1, element_ref: "e:1:dialog" },
+      target: { element_ref: "e:1:dialog" },
     },
   });
   assert.equal(clicked.outcome.status, "succeeded");
@@ -1019,8 +1024,8 @@ test("drag 使用完整 HTML DragEvent 生命周期，而不是只发送一次�
       tab_id: binding.tab_id,
       operation: "drag",
       arguments: {
-        source: { snapshot_revision: 1, element_ref: "e:1:source" },
-        target: { snapshot_revision: 1, element_ref: "e:1:target" },
+        source: { element_ref: "e:1:source" },
+        target: { element_ref: "e:1:target" },
       },
     },
   });
@@ -1132,7 +1137,7 @@ test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async 
       const expression = String(params.expression);
       if (expression.includes("e:1:radio") && expression.includes("element.type === 'radio'")) return { result: { value: { kind: "radio" } } };
       if (expression.includes("e:1:checkbox") && expression.includes("element.type === 'checkbox'")) return { result: { value: { kind: "checkbox" } } };
-      if (expression.includes("e:1:select") && expression.includes("element instanceof HTMLSelectElement")) return { result: { value: { kind: "select", multiple: true } } };
+      if (expression.includes("e:1:select") && expression.includes("tag === 'SELECT'")) return { result: { value: { kind: "select", multiple: true } } };
       return { result: { value: null } };
     }
     return {};
@@ -1145,9 +1150,9 @@ test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async 
       operation: "fill_form",
       arguments: {
         fields: [
-          { snapshot_revision: 1, element_ref: "e:1:select", value: ["one", "two"] },
-          { snapshot_revision: 1, element_ref: "e:1:checkbox", value: true },
-          { snapshot_revision: 1, element_ref: "e:1:radio", value: true },
+          { element_ref: "e:1:select", value: ["one", "two"] },
+          { element_ref: "e:1:checkbox", value: true },
+          { element_ref: "e:1:radio", value: true },
         ],
       },
     },
@@ -1219,7 +1224,6 @@ test("文件上传支持单文件和多文件 file input", async () => {
       tab_id: binding.tab_id,
       operation: "upload_file",
       arguments: {
-        snapshot_revision: 1,
         element_ref: "e:1:1",
         file_paths: [firstPath, secondPath],
       },
@@ -1257,7 +1261,7 @@ test("文件上传拒绝无法解析为 file input 的快照目标", async () =>
     payload: {
       tab_id: binding.tab_id,
       operation: "upload_file",
-      arguments: { snapshot_revision: 1, element_ref: "e:1:1", file_path: filePath },
+      arguments: { element_ref: "e:1:1", file_path: filePath },
     },
   });
   assert.equal(result.outcome.status, "failed");
@@ -1291,7 +1295,7 @@ test("文件上传拒绝 Magi staging 目录之外的路径", async () => {
     payload: {
       tab_id: binding.tab_id,
       operation: "upload_file",
-      arguments: { snapshot_revision: 1, element_ref: "e:1:1", file_path: outsidePath },
+      arguments: { element_ref: "e:1:1", file_path: outsidePath },
     },
   });
   assert.equal(result.outcome.status, "failed");
@@ -1316,7 +1320,7 @@ test("浏览器截图收到快照根节点时必须捕获整页范围而不是�
     payload: {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
-      target: { snapshot_revision: 1, element_ref: "root" },
+      target: { element_ref: "root" },
       full_page: false,
       format: "png",
     },
@@ -1341,7 +1345,7 @@ test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头",
     payload: {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
-      target: { snapshot_revision: 1, element_ref: "e:1:1" },
+      target: { element_ref: "e:1:1" },
       clip: { x: 0, y: 0, width: 1, height: 1 },
       full_page: false,
       format: "png",
@@ -1458,7 +1462,7 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
       if (expression.trim().endsWith("globalThis.__magiBrowserAutomation.viewport()")) {
         return { result: { value: { width: 1200, height: 800, scrollX: 0, scrollY: 400 } } };
       }
-      if (expression.includes("getBoundingClientRect")) {
+      if (expression.includes("scrollIntoView") && expression.includes("bounds")) {
         return { result: { value: { bounds: { x: 20, y: 30, width: 400, height: 200 } } } };
       }
       return { result: { value: null } };
@@ -1472,7 +1476,7 @@ test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
     payload: {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
-      target: { snapshot_revision: 1, element_ref: "e:1:1" },
+      target: { element_ref: "e:1:1" },
       full_page: false,
       format: "png",
     },
@@ -1768,37 +1772,30 @@ test("区域标记按创建视口归一化到当前 Chromium 视口", () => {
   );
 });
 
-test("Accessibility 节点引用使用 Worker isolated world 的执行上下文", async () => {
+test("快照直接返回页面运行时的节点状态，不再往返 CDP 解析无障碍树", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 7 };
     if (method === "Runtime.evaluate") {
-      const expression = String(params.expression);
-      if (expression.includes("snapshot(")) {
+      if (String(params.expression).startsWith("globalThis.__magiBrowserAutomation.snapshot(")) {
         return { result: { value: {
           snapshot_revision: 4,
-          root: { element_ref: "root", children: [] },
-          returned_nodes: 0,
-          total_nodes: 1,
-          text_bytes: 0,
+          root: {
+            element_ref: "root",
+            children: [{ element_ref: "e:4:1", role: "checkbox", name: "同意条款", states: ["checked", "required"], children: [] }],
+          },
+          returned_nodes: 1,
+          total_nodes: 2,
+          text_bytes: 12,
           truncated: false,
         } } };
       }
       return { result: { value: null } };
     }
-    if (method === "Accessibility.getFullAXTree") {
-      return { nodes: [{ nodeId: "ax-1", backendDOMNodeId: 42, role: { value: "button" }, name: { value: "提交" }, childIds: [] }] };
-    }
-    if (method === "DOM.describeNode") return { node: { nodeId: 11 } };
-    if (method === "DOM.resolveNode") {
-      assert.equal(params.executionContextId, 7);
-      return { object: { objectId: "object-1" } };
-    }
-    if (method === "Runtime.callFunctionOn") return { result: { value: "e:4:1" } };
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
-  const result = await runtime.execute("ax-call", binding, {
+  const result = await runtime.execute("snapshot-states", binding, {
     type: "snapshot",
     payload: {
       tab_id: binding.tab_id,
@@ -1810,7 +1807,147 @@ test("Accessibility 节点引用使用 Worker isolated world 的执行上下文"
 
   assert.equal(result.outcome.status, "succeeded");
   const snapshot = result.outcome.payload.type === "snapshot" ? result.outcome.payload.payload : null;
-  assert.equal(snapshot?.accessibility_tree?.[0]?.element_ref, "e:4:1");
+  assert.deepEqual(snapshot?.root.children[0]?.states, ["checked", "required"]);
+  assert.equal("accessibility_tree" in (snapshot ?? {}), false);
+  assert.equal("continuation_refs" in (snapshot ?? {}), false);
+  const cdpMethods = port.requests.map((request) => request.method);
+  for (const removed of ["Accessibility.getFullAXTree", "DOM.describeNode", "DOM.resolveNode", "Runtime.callFunctionOn"]) {
+    assert.equal(cdpMethods.includes(removed), false, `快照不应再调用 ${removed}`);
+  }
+});
+
+test("read 校验参数后把分页与检索选项交给页面运行时", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      if (String(params.expression).includes("readText(")) return { result: { value: { text: "页面正文", total_chars: 4, truncated: false } } };
+      return { result: { value: null } };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const run = (call: string, args: Record<string, unknown>) => runtime.execute(call, binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "read", arguments: args },
+  });
+
+  const ok = await run("read-ok", { query: " 价格 ", max_chars: 300, offset: 20, include_links: true });
+  assert.equal(ok.outcome.status, "succeeded");
+  // 安装页面运行时的表达式也包含 readText 定义，这里只看真正的调用。
+  const calls = () => port.requests
+    .filter((request) => request.method === "Runtime.evaluate")
+    .map((request) => String(request.params.expression))
+    .filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation."));
+  const readExpression = calls().find((expression) => expression.includes("readText("));
+  assert.ok(readExpression?.includes('readText("root", {'), "未指定 element_ref 时读取整页");
+  assert.ok(readExpression?.includes('"maxChars":300'));
+  assert.ok(readExpression?.includes('"offset":20'));
+  assert.ok(readExpression?.includes('"includeLinks":true'));
+  assert.ok(readExpression?.includes('"query":"价格"'), "query 去掉首尾空白");
+
+  const scoped = await run("read-scoped", { element_ref: "e:3:7" });
+  assert.equal(scoped.outcome.status, "succeeded");
+  assert.ok(calls().some((expression) => expression.includes('readText("e:3:7", {')));
+
+  const blankRef = await run("read-blank-ref", { element_ref: "   " });
+  assert.equal(blankRef.outcome.status, "succeeded", "空白引用视为未指定范围，读取整页");
+
+  for (const [call, args] of [
+    ["read-zero", { max_chars: 0 }],
+    ["read-huge", { max_chars: 50_001 }],
+    ["read-negative-offset", { offset: -1 }],
+  ] as const) {
+    const bad = await run(call, args);
+    assert.equal(bad.outcome.status, "failed", call);
+    assert.equal(bad.outcome.payload.code, "browser_read_invalid", call);
+  }
+});
+
+test("browser_storage 的 cookie 只返回元数据，清理逐个删除当前站点 cookie，且不允许读值", async () => {
+  const deleted: Array<Record<string, unknown>> = [];
+  let cookieQueryUrls: unknown = null;
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      if (String(params.expression) === "location.href") return { result: { value: "https://app.example.test/login" } };
+      return { result: { value: null } };
+    }
+    if (method === "Network.getCookies") {
+      cookieQueryUrls = params.urls;
+      return { cookies: [
+        { name: "sid", value: "SECRET-SESSION-TOKEN", domain: "app.example.test", path: "/", expires: -1, session: true, httpOnly: true, secure: true, sameSite: "Lax", size: 23 },
+        { name: "theme", value: "dark", domain: ".example.test", path: "/", expires: 1900000000, session: false, httpOnly: false, secure: false, size: 9 },
+      ] };
+    }
+    if (method === "Network.deleteCookies") {
+      deleted.push(params);
+      return {};
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const run = (call: string, args: Record<string, unknown>) => runtime.execute(call, binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "storage", arguments: args },
+  });
+
+  const listed = await run("cookie-list", { area: "cookies", action: "list" });
+  assert.equal(listed.outcome.status, "succeeded");
+  assert.deepEqual(cookieQueryUrls, ["https://app.example.test/login"], "只查询当前页面 URL 的 cookie");
+  assert.ok(!JSON.stringify(listed.outcome.payload).includes("SECRET-SESSION-TOKEN"), "cookie 值绝不能出现在结果中");
+  const value = listed.outcome.payload.type === "json" ? listed.outcome.payload.payload.value as { cookies: Array<Record<string, unknown>> } : null;
+  assert.deepEqual(value?.cookies.map((cookie) => cookie.name), ["sid", "theme"]);
+  assert.ok(value?.cookies.every((cookie) => !("value" in cookie)), "cookie 元数据中不能有 value 字段");
+  assert.equal(value?.cookies[0]?.http_only, true);
+  assert.equal(value?.cookies[0]?.expires, null, "会话 cookie 没有过期时间");
+
+  const cleared = await run("cookie-clear", { area: "cookies", action: "clear" });
+  assert.equal(cleared.outcome.status, "succeeded");
+  assert.deepEqual(deleted, [
+    { name: "sid", domain: "app.example.test", path: "/" },
+    { name: "theme", domain: ".example.test", path: "/" },
+  ], "只删除当前站点的 cookie，不清空整个浏览器分区");
+
+  const readValue = await run("cookie-get", { area: "cookies", action: "get", key: "sid" });
+  assert.equal(readValue.outcome.status, "failed");
+  assert.equal(readValue.outcome.payload.code, "browser_storage_cookie_action_unsupported");
+  assert.equal(port.requests.some((request) => request.method === "Network.clearBrowserCookies"), false);
+});
+
+test("点击把登记监听与聚焦合并为一次页面往返", async () => {
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null, observed: true } } };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("click-merged", binding, {
+    type: "click",
+    payload: {
+      tab_id: binding.tab_id,
+      control: { mode: "user", fence: 1 },
+      target: { element_ref: "e:1:btn" },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  // 安装页面运行时的表达式包含这些方法的定义，这里只统计对页面运行时的真实调用。
+  const expressions = port.requests
+    .filter((request) => request.method === "Runtime.evaluate")
+    .map((request) => String(request.params.expression))
+    .filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation."));
+  assert.equal(expressions.filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.prepareAndFocus(")).length, 1);
+  assert.equal(expressions.some((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.focus(")), false, "不再单独往返 focus");
+});
+
+test("页面运行时对同源 iframe 使用主视口坐标，并以 nodeType 判断元素", () => {
+  assert.match(INSTALL_PAGE_RUNTIME, /frame\.clientLeft/u, "frame 边框参与坐标累加");
+  assert.match(INSTALL_PAGE_RUNTIME, /view\.frameElement/u);
+  assert.match(INSTALL_PAGE_RUNTIME, /const isElement = \(value\) => Boolean\(value\) && value\.nodeType === 1/u);
+  // 快照与引用相关路径必须用 isElement；标注功能只作用于主文档，仍可使用 instanceof。
+  assert.match(INSTALL_PAGE_RUNTIME, /if \(!isElement\(element\) \|\| !visible\(element\)\) return false;/u);
 });
 
 test("导航 revision 变化后不会复用上一文档的 Console 和 Network 记录", async () => {

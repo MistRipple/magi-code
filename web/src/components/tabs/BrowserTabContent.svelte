@@ -81,6 +81,8 @@
     downloadId?: string;
     suggestedFilename?: string;
     state?: string;
+    /** agent_cursor：Agent 是否持有该 Surface 的控制权（虚拟光标可见）。 */
+    visible?: boolean;
     receivedBytes?: number;
     totalBytes?: number | null;
     error?: string;
@@ -151,6 +153,10 @@
   let addressEditing = $state(false);
   let loading = $state(true);
   let browserLoading = $state(false);
+  // Agent 是否正在控制当前页面。这不是独立的状态源：它直接投影 Desktop 的 agent_cursor 事件
+  // （可见 = Agent 持有该 Surface 的控制权）。用户接管、控制权撤销、Surface 失去 Primary 时，
+  // Desktop 会发出对应事件，在下面清除它。
+  let agentControlling = $state(false);
   let sessionError = $state('');
   let actionError = $state('');
   let busy = $state(false);
@@ -1321,6 +1327,7 @@
     ) {
       clearNodeInspection();
       cancelAnnotationCreation();
+      agentControlling = false;
       if (event.type === 'page_crashed') {
         pageError = event.reason?.trim() || event.diagnostic?.trim() || i18n.t('browser.error.pageLoadFailed');
         browserLoading = false;
@@ -1349,6 +1356,11 @@
       annotationComment = '';
       annotationPhase = 'comment';
       actionError = '';
+      return;
+    }
+
+    if (event.type === 'agent_cursor') {
+      agentControlling = event.visible === true;
       return;
     }
 
@@ -1402,6 +1414,7 @@
       // 这里仅结束当前 Inspect 状态，保留对话框中的节点引用直到用户
       // 主动移除，或页面/Tab 生命周期明确使其失效。
       clearNodeInspection(true);
+      agentControlling = false;
       return;
     }
     if (event.type === 'loading_changed') {
@@ -1731,6 +1744,12 @@
         <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} style:anchor-name={annotationHistoryAnchorName} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')} aria-expanded={annotationMenuOpen}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
       {/if}
     </div>
+    {#if desktopRuntime && agentControlling}
+      <span class="agent-badge" role="status" aria-live="polite" title={i18n.t('browser.agent.takeoverHint')}>
+        <span class="agent-badge-dot" aria-hidden="true"></span>
+        <span class="agent-badge-label">{i18n.t('browser.agent.active')}</span>
+      </span>
+    {/if}
     {#if desktopRuntime}
       <span class="status-light" class:ready={connectionState === 'ready' && !browserLoading} class:loading={connectionState === 'ready' && browserLoading} class:error={connectionState === 'error'} title={connectionStatusText} role="status"></span>
     {:else}
@@ -1963,6 +1982,12 @@
   .annotation-history-button { position: relative; }
   .annotation-count { position: absolute; top: 1px; right: 1px; min-width: 12px; height: 12px; padding: 0 2px; border-radius: 6px; background: var(--info); color: white; font-size: 8px; font-weight: 700; line-height: 12px; text-align: center; }
   .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: 700; }
+  /* 胶囊放在工具栏内而不是单独占一行：额外的一行会改变网页视口高度，让页面在每次 Agent 动作时重排。 */
+  .agent-badge { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; max-width: 104px; height: 20px; padding: 0 8px; border-radius: 9999px; background: var(--primary-muted); color: var(--primary); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1; white-space: nowrap; }
+  .agent-badge-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .agent-badge-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--primary); animation: agent-badge-pulse 1.4s ease-in-out infinite; }
+  @keyframes agent-badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .agent-badge-dot { animation: none; } }
   .status-light { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--foreground-muted); }
   .status-light.ready { background: var(--success); }
   .status-light.loading { background: var(--warning); }

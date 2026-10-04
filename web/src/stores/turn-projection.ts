@@ -10,6 +10,7 @@ import type {
   ThinkingSegmentStatus,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
+  ToolCallStatus,
 } from '../types/message';
 import type {
   CanonicalToolCall,
@@ -192,9 +193,17 @@ function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
   return 'orchestrator';
 }
 
-function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' | 'cancelled' {
+/** 思考 item 不会产生 indeterminate（只有发出副作用的工具调用会）；类型上收敛为失败。 */
+function thinkingSegmentStatus(status: CanonicalTurnItemStatus): ThinkingSegmentStatus {
+  return status === 'indeterminate' ? 'failed' : status;
+}
+
+function statusToToolStatus(status: CanonicalTurnItemStatus): ToolCallStatus {
   if (status === 'completed') {
     return 'success';
+  }
+  if (status === 'indeterminate') {
+    return 'unconfirmed';
   }
   if (status === 'blocked' || status === 'failed') {
     return 'error';
@@ -208,6 +217,12 @@ function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'runni
   return 'pending';
 }
 
+/**
+ * canonical 状态里的对象值不可变（reducer 只替换、不原地修改），因此结构化工具结果的
+ * 展示文本按对象缓存：流式增量会反复投影同一轮里没有变化的工具卡片，不能每次重新序列化。
+ */
+const displayTextByObject = new WeakMap<object, string>();
+
 export function valueToDisplayText(value: unknown): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -215,11 +230,21 @@ export function valueToDisplayText(value: unknown): string | undefined {
   if (typeof value === 'string') {
     return value;
   }
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
+  if (typeof value !== 'object') {
     return String(value);
   }
+  const cached = displayTextByObject.get(value);
+  if (cached !== undefined) {
+    return cached;
+  }
+  let text: string;
+  try {
+    text = JSON.stringify(value, null, 2);
+  } catch {
+    text = String(value);
+  }
+  displayTextByObject.set(value, text);
+  return text;
 }
 
 function readTruncatedResultOmittedChars(item: CanonicalTurnItem): number | undefined {
@@ -282,11 +307,11 @@ function buildMessageBlocks(
           segmentId: item.itemId,
           messageId: artifactId,
           content,
-          status: item.status,
+          status: thinkingSegmentStatus(item.status),
           createdAt: item.createdAt,
           updatedAt: item.updatedAt,
         }],
-        status: item.status,
+        status: thinkingSegmentStatus(item.status),
         isStreaming: !isCanonicalTerminalStatus(item.status),
         startedAt: item.createdAt,
         updatedAt: item.updatedAt,

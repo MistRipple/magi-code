@@ -513,6 +513,9 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Network.setCacheDisabled",
   "Network.setBlockedURLs",
   "Network.getAllCookies",
+  // browser_storage：按当前页面 URL 列出 cookie 元数据、逐个删除当前站点的 cookie。
+  "Network.getCookies",
+  "Network.deleteCookies",
   "Network.clearBrowserCookies",
   "Emulation.setScriptExecutionDisabled",
   "Storage.getCookies",

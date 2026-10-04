@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const BROWSER_TOOL_CATALOG_SCHEMA_ID: &str =
     "https://magi.dev/contracts/browser-tool.schema.json";
-pub const BROWSER_TOOL_CATALOG_SIZE: usize = 26;
+pub const BROWSER_TOOL_CATALOG_SIZE: usize = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +36,8 @@ pub enum BrowserToolKind {
     ThirdParty,
     WebMcp,
     Pwa,
+    Read,
+    Storage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +49,7 @@ pub enum BrowserToolAccess {
 }
 
 impl BrowserToolKind {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::Navigate,
         Self::Snapshot,
         Self::Click,
@@ -74,6 +76,8 @@ impl BrowserToolKind {
         Self::ThirdParty,
         Self::WebMcp,
         Self::Pwa,
+        Self::Read,
+        Self::Storage,
     ];
 
     pub fn name(self) -> &'static str {
@@ -104,6 +108,8 @@ impl BrowserToolKind {
             Self::ThirdParty => "browser_third_party",
             Self::WebMcp => "browser_webmcp",
             Self::Pwa => "browser_pwa",
+            Self::Read => "browser_read",
+            Self::Storage => "browser_storage",
         }
     }
 
@@ -135,6 +141,8 @@ impl BrowserToolKind {
             "browser_third_party" => Some(Self::ThirdParty),
             "browser_webmcp" => Some(Self::WebMcp),
             "browser_pwa" => Some(Self::Pwa),
+            "browser_read" => Some(Self::Read),
+            "browser_storage" => Some(Self::Storage),
             _ => None,
         }
     }
@@ -167,39 +175,81 @@ impl BrowserToolKind {
             Self::ThirdParty => BrowserToolAccess::Mixed,
             Self::WebMcp => BrowserToolAccess::Mixed,
             Self::Pwa => BrowserToolAccess::Read,
+            Self::Read => BrowserToolAccess::Read,
+            Self::Storage => BrowserToolAccess::Mixed,
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Navigate => "导航、后退、前进或刷新当前浏览器页面。",
-            Self::Snapshot => "读取当前页面的可交互 DOM 与辅助功能快照。",
-            Self::Click => "点击当前快照中的元素。",
-            Self::Type => "向当前快照中的可编辑元素输入文本。",
-            Self::Press => "向当前页面发送按键或组合键。",
-            Self::Scroll => "滚动页面或指定快照元素。",
-            Self::Screenshot => "截取当前视口、整页、指定元素或规范化区域。",
-            Self::Tabs => {
-                "列出、创建、激活或在用户明确要求时关闭 Magi 右栏的一级浏览器标签。每个一级浏览器标签只有一个 Chromium 页面；网页 popup、window.open 或 target=_blank 只在当前一级页面内导航，绝不创建网页子标签。"
+            Self::Navigate => {
+                "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。\n\n# Web 项目验收\n- 先读取项目清单确认启动命令，再用 shell_exec(background=true) 启动开发服务\n- 从服务输出确认实际监听 URL 和端口，不要臆测 localhost 端口\n- 导航后还要继续交互时，在本次调用设置 include_snapshot=true，直接取得最新可交互元素，避免再单独调用 browser_snapshot\n- 使用 browser_click、browser_type、browser_press 和 browser_scroll 完成真实用户路径；搜索或表单提交优先 browser_type(submit_key=Enter)\n- 控件、按钮及其勾选/展开等状态从快照读取；正文、文章、列表和表格内容用 browser_read 读取（可用 query 检索）；只读取 URL 或标题时不要附带快照\n- 仅在页面结构确实变化且当前结果未附带快照时调用 browser_snapshot，不要因为页面内容很多而重复快照\n- browser_screenshot 只用于布局、样式、图像等视觉问题或用户明确要求截图的场景，不能用于读取文本或定位控件\n- 响应式任务使用 browser_viewport 覆盖桌面和手机视口\n- 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
-            Self::Viewport => "读取或通过 Chromium 原生设备指标设置页面视口。",
-            Self::WaitFor => "等待文本、选择器或 URL 条件在当前页面满足。",
-            Self::Hover => "将浏览器指针悬停到当前快照元素。",
-            Self::Drag => "在同一快照版本中拖拽 source 元素至 target 元素。",
-            Self::FillForm => "按当前快照引用批量填写表单字段。",
-            Self::Dialog => "列出、接受、关闭或清理页面对话框。",
-            Self::UploadFile => "向当前快照中的 file input 设置用户授权的文件。",
-            Self::ClickAt => "在当前页面的 CSS 坐标点击或双击。",
-            Self::Evaluate => "执行受控页面表达式并返回可序列化结果。",
-            Self::Console => "读取、筛选、查看或清理控制台记录。",
-            Self::Network => "读取、筛选、查看响应或清理网络记录。",
-            Self::Emulate => "通过 Chromium DevTools 仿真网络、颜色、UA、地理位置等。",
-            Self::Performance => "读取性能指标或控制性能追踪。",
-            Self::Lighthouse => "复用当前真实 Browser Surface 执行 Lighthouse 审计。",
-            Self::Heap => "读取堆和 DOM 计数，或生成并分析堆快照。",
-            Self::ThirdParty => "统计、读取或清理第三方资源记录。",
-            Self::WebMcp => "列出或调用页面暴露的 WebMCP 工具。",
-            Self::Pwa => "读取当前页面的 PWA 条件和安装状态。",
+            Self::Snapshot => {
+                "读取当前浏览器页面的可交互元素快照：每个元素带 element_ref、角色、名称、值，以及 checked、expanded 等状态（states），同源 iframe 内的元素也包含在内。element_ref（例如 e:3:12，包括结构性节点的 group 引用）只在本次快照内有效；页面发生交互或结构变化后使用最近一次工具结果里的引用，不要复用旧引用。读取正文内容用 browser_read；不要用截图替代快照。"
+            }
+            Self::Click => {
+                "点击当前浏览器快照中的元素，传入 browser_snapshot 返回的 element_ref。结果中的 target 是实际点击的元素（角色与名称），可据此确认点中的是预期元素。"
+            }
+            Self::Type => {
+                "向当前浏览器快照中的可编辑元素输入文本。需要提交搜索或表单时同时传 submit_key=Enter，避免再调用 browser_press。不能用于密码、验证码或支付字段。结果中的 target 是实际输入的元素（角色与名称）。"
+            }
+            Self::Press => "向当前浏览器页面发送一个按键或组合键。",
+            Self::Scroll => "滚动当前浏览器页面或快照中的指定元素。",
+            Self::Screenshot => {
+                "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取正文内容用 browser_read，读取控件、标题和状态用 browser_snapshot。截图范围三选一：省略 element_ref、clip、full_page 时截取当前视口；指定 clip 时不能同时传 full_page；指定 element_ref 时不能同时传 clip 或 full_page。quality 只对 jpeg/webp 有效，png 不要传 quality。"
+            }
+            Self::Tabs => {
+                "列出、创建、激活或关闭 Magi 右栏的一级浏览器标签。每个一级浏览器标签只有一个 Chromium 页面；网页 popup、window.open 或 target=_blank 只在当前一级页面内导航，绝不创建网页子标签。任务完成时必须保留标签及其当前页面，不得把 close 当作清理动作；只有用户明确要求关闭指定标签时才允许使用 close。"
+            }
+            Self::Viewport => {
+                "读取或设置当前内置浏览器页面的设备视口。使用 action=set、mode=auto 恢复跟随右侧内容槽的自适应布局；使用 mode=fixed 并传入 width/height 验证电脑/平板宽屏或手机窄屏响应式布局。可选 device_scale_factor_millis 调整设备像素比（500-4000，默认 1000）。该工具只通过 Chromium 原生 device metrics、设备类型和触控语义改变页面 CSS 视口，不修改页面 DOM，也不使用 Magi 外层缩放。"
+            }
+            Self::WaitFor => {
+                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
+            }
+            Self::Hover => "将鼠标悬停到当前浏览器快照中的元素。",
+            Self::Drag => {
+                "把当前浏览器快照中的 source 元素拖到 target 元素。两个 element_ref 必须来自最近一次 browser_snapshot 或交互工具结果；可使用快照里的 e 引用或结构性 draggable div 等节点的 group 引用。页面发生变化后先重新获取快照，不要复用旧引用。"
+            }
+            Self::FillForm => {
+                "按 fields 中的统一快照引用一次性填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。"
+            }
+            Self::Dialog => {
+                "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
+            }
+            Self::UploadFile => {
+                "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。只能上传用户授权的文件：file_path / file_paths 必须是位于 Magi 上传暂存目录内的绝对路径。"
+            }
+            Self::ClickAt => {
+                "在当前浏览器页面的 CSS 坐标位置点击，支持双击；用于快照无法检查的元素，例如跨域 iframe 内的控件。"
+            }
+            Self::Evaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
+            Self::Console => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
+            Self::Network => "读取、筛选、查看请求体或清理当前浏览器页面的网络请求记录。",
+            Self::Emulate => {
+                "使用 Chromium DevTools 协议仿真颜色、CPU、网络、地理位置、UA 和请求头。"
+            }
+            Self::Performance => {
+                "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪；analyze 返回 Magi 支持的聚合指标。"
+            }
+            Self::Lighthouse => {
+                "复用当前 Browser Surface 执行 Lighthouse 页面审计，不创建新的浏览器页面。"
+            }
+            Self::Heap => "读取当前页面堆和 DOM 计数，或在当前浏览器 Tab 内生成和分析内存快照。",
+            Self::ThirdParty => {
+                "按请求来源统计当前页面加载的第三方资源、请求数、字节数和资源类型，或清理这些记录。"
+            }
+            Self::WebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
+            Self::Pwa => {
+                "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
+            }
+            Self::Read => {
+                "读取当前页面的可见正文文本，支持分页和关键词检索；读文章、列表、表格内容时优先使用，而不是用 browser_snapshot 拼正文。"
+            }
+            Self::Storage => {
+                "读写当前页面所属站点的 localStorage / sessionStorage，列出或清理该站点的 cookie，适合 Web 测试中检查登录态、预置或清空存储。cookie 只返回名称、域、路径、过期时间和 HttpOnly/Secure/SameSite 等属性，任何情况下都不返回 cookie 值，也不能写入 cookie。"
+            }
         }
     }
 
@@ -212,19 +262,19 @@ impl BrowserToolKind {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"}},"required":[]}"#
             }
             Self::Click => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["snapshot_revision","element_ref"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["element_ref"]}"#
             }
             Self::Type => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string"},"text":{"type":"string"},"replace":{"type":"boolean","description":"默认 true"},"submit_key":{"type":"string","description":"可选；输入后立即发送的按键，例如 Enter。搜索或表单提交应与输入合并，避免额外 browser_press 往返"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["snapshot_revision","element_ref","text"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"text":{"type":"string"},"replace":{"type":"boolean","description":"默认 true"},"submit_key":{"type":"string","description":"可选；输入后立即发送的按键，例如 Enter。搜索或表单提交应与输入合并，避免额外 browser_press 往返"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["element_ref","text"]}"#
             }
             Self::Press => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"key":{"type":"string","description":"按键或组合键，例如 Enter、Control+L"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["key"]}"#
             }
             Self::Scroll => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","description":"可选；省略时滚动页面"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["delta_y"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"可选；省略时滚动页面"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["delta_y"]}"#
             }
             Self::Screenshot => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","description":"可选；省略时截取页面；与 clip、full_page 互斥"},"clip":{"type":"object","properties":{"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},"width":{"type":"number","exclusiveMinimum":0,"maximum":1},"height":{"type":"number","exclusiveMinimum":0,"maximum":1}},"required":["x","y","width","height"],"description":"按当前视口归一化坐标截取区域；与 element_ref、full_page 互斥，只能三选一"},"format":{"type":"string","enum":["png","jpeg","webp"],"description":"图片格式，默认 png"},"quality":{"type":"integer","minimum":0,"maximum":100,"description":"jpeg/webp 压缩质量；format=png 时不要传此字段"},"full_page":{"type":"boolean","description":"设为 true 截取整页；不能同时传 element_ref 或 clip，默认 false"}},"required":[]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"可选；省略时截取页面；与 clip、full_page 互斥"},"clip":{"type":"object","properties":{"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},"width":{"type":"number","exclusiveMinimum":0,"maximum":1},"height":{"type":"number","exclusiveMinimum":0,"maximum":1}},"required":["x","y","width","height"],"description":"按当前视口归一化坐标截取区域；与 element_ref、full_page 互斥，只能三选一"},"format":{"type":"string","enum":["png","jpeg","webp"],"description":"图片格式，默认 png"},"quality":{"type":"integer","minimum":0,"maximum":100,"description":"jpeg/webp 压缩质量；format=png 时不要传此字段"},"full_page":{"type":"boolean","description":"设为 true 截取整页；不能同时传 element_ref 或 clip，默认 false"}},"required":[]}"#
             }
             Self::Tabs => {
                 r#"{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["list","new","activate","close"],"description":"任务完成后不要使用 close；仅在用户明确要求关闭指定的 Magi 右栏一级标签时使用。网页 popup、window.open 或 target=_blank 不得通过此 action 创建子标签。"},"tab_id":{"type":"string","description":"activate/close 时必填，指向 Magi 右栏一级浏览器标签；不存在 parent_tab_id 或子标签身份"},"url":{"type":"string","description":"new 时可选；创建新的 Magi 右栏一级浏览器标签并立即打开 URL，省略时为 about:blank。不要为网页 popup 调用 new"}},"required":["action"]}"#
@@ -236,19 +286,19 @@ impl BrowserToolKind {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"text":{"anyOf":[{"type":"string","minLength":1},{"type":"array","items":{"type":"string","minLength":1},"minItems":1}]},"texts":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"selector":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"timeout_ms":{"type":"integer","minimum":1,"maximum":60000}},"required":[],"anyOf":[{"required":["selector"]},{"required":["text"]},{"required":["texts"]},{"required":["url"]}]}"#
             }
             Self::Hover => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string"},"include_snapshot":{"type":"boolean"}},"required":["snapshot_revision","element_ref"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"include_snapshot":{"type":"boolean"}},"required":["element_ref"]}"#
             }
             Self::Drag => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"source":{"type":"object","properties":{"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","minLength":1}},"required":["snapshot_revision","element_ref"]},"target":{"type":"object","properties":{"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","minLength":1}},"required":["snapshot_revision","element_ref"]},"include_snapshot":{"type":"boolean"}},"required":["source","target"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"source":{"type":"object","properties":{"element_ref":{"type":"string","minLength":1,"description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"}},"required":["element_ref"]},"target":{"type":"object","properties":{"element_ref":{"type":"string","minLength":1,"description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"}},"required":["element_ref"]},"include_snapshot":{"type":"boolean"}},"required":["source","target"]}"#
             }
             Self::FillForm => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"fields":{"type":"array","items":{"type":"object","properties":{"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string","minLength":1},"value":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"array","items":{"type":["string","number"]}}]},"replace":{"type":"boolean"}},"required":["snapshot_revision","element_ref","value"]},"minItems":1},"include_snapshot":{"type":"boolean"}},"required":["fields"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"fields":{"type":"array","items":{"type":"object","properties":{"element_ref":{"type":"string","minLength":1,"description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"value":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"array","items":{"type":["string","number"]}}]},"replace":{"type":"boolean"}},"required":["element_ref","value"]},"minItems":1},"include_snapshot":{"type":"boolean"}},"required":["fields"]}"#
             }
             Self::Dialog => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"action":{"type":"string","enum":["list","clear","accept","dismiss"]},"prompt_text":{"type":"string"}},"required":["action"]}"#
             }
             Self::UploadFile => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"snapshot_revision":{"type":"integer","minimum":1},"element_ref":{"type":"string"},"file_path":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},"include_snapshot":{"type":"boolean"}},"required":["snapshot_revision","element_ref"],"anyOf":[{"required":["file_path"]},{"required":["file_paths"]}]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"file_path":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},"include_snapshot":{"type":"boolean"}},"required":["element_ref"],"anyOf":[{"required":["file_path"]},{"required":["file_paths"]}]}"#
             }
             Self::ClickAt => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"double_click":{"type":"boolean"},"include_snapshot":{"type":"boolean"}},"required":["x","y"]}"#
@@ -282,6 +332,12 @@ impl BrowserToolKind {
             }
             Self::Pwa => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"action":{"type":"string","enum":["state"]}},"required":["action"]}"#
+            }
+            Self::Read => {
+                r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"element_ref":{"type":"string","description":"可选；browser_snapshot 返回的元素引用，只读取该元素内的正文；省略时读取整页"},"query":{"type":"string","minLength":1,"description":"可选关键词（忽略大小写）。提供后只返回命中次数和每处命中的上下文，不返回全文"},"offset":{"type":"integer","minimum":0,"description":"从第几个字符开始读取；上次结果 truncated 为 true 时用 next_offset 继续翻页"},"max_chars":{"type":"integer","minimum":1,"maximum":50000,"description":"本次最多返回的字符数，默认 12000"},"include_links":{"type":"boolean","description":"为 http(s) 链接文字追加地址，默认 false"}},"required":[]}"#
+            }
+            Self::Storage => {
+                r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"area":{"type":"string","enum":["local","session","cookies"],"description":"local=localStorage，session=sessionStorage，cookies=当前站点的 cookie"},"action":{"type":"string","enum":["list","get","set","remove","clear"],"description":"cookies 只支持 list 与 clear；get/set/remove 只用于 local、session"},"key":{"type":"string","minLength":1,"description":"get/set/remove 时必填的存储键名"},"value":{"type":"string","description":"set 时必填的存储值"}},"required":["area","action"]}"#
             }
         }
     }

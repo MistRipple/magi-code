@@ -368,10 +368,9 @@ fn save_orchestrator_session_override_for_session_with_policy(
         .and_then(|session| state.session_workspace_id(&session));
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-session-configuration-updated-{}-{}",
-                session_id,
-                UtcMillis::now().0
+            EventId::unique(format!(
+                "event-session-configuration-updated-{}",
+                session_id
             )),
             "session.configuration.updated",
             json!({
@@ -1207,32 +1206,60 @@ async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value
     Json(state.runtime_status_json())
 }
 
+/// `/settings/update` 只负责运行时偏好（界面语言、对话显示模式）。其他设置都有各自的
+/// 专用接口；这里不接受任意键，避免写出与专用接口或运行时读取位置不一致的数据。
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateSettingRequest {
-    key: String,
-    value: serde_json::Value,
+#[serde(tag = "key", content = "value", deny_unknown_fields)]
+enum RuntimeSettingUpdate {
+    #[serde(rename = "locale")]
+    Locale(RuntimeLocale),
+    #[serde(rename = "conversationDisplayMode")]
+    ConversationDisplayMode(ConversationDisplayMode),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum RuntimeLocale {
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en-US")]
+    EnUs,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConversationDisplayMode {
+    Original,
+    Summary,
 }
 
 async fn update_setting(
     State(state): State<ApiState>,
-    Json(request): Json<UpdateSettingRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if request.key.trim() == "browser" {
-        return Err(ApiError::InvalidInput(
-            "浏览器能力设置必须通过专用接口更新".to_string(),
-        ));
-    }
-    if request.key.trim() == "conversationDisplayMode"
-        && !matches!(request.value.as_str(), Some("original" | "summary"))
-    {
-        return Err(ApiError::InvalidInput(
-            "conversationDisplayMode 必须是 original 或 summary".to_string(),
-        ));
-    }
+    let update = serde_json::from_value::<RuntimeSettingUpdate>(request).map_err(|error| {
+        ApiError::InvalidInput(format!(
+            "只能更新 locale（zh-CN / en-US）或 conversationDisplayMode（original / summary）：{error}"
+        ))
+    })?;
+    let (key, value) = match update {
+        RuntimeSettingUpdate::Locale(locale) => (
+            "locale",
+            match locale {
+                RuntimeLocale::ZhCn => "zh-CN",
+                RuntimeLocale::EnUs => "en-US",
+            },
+        ),
+        RuntimeSettingUpdate::ConversationDisplayMode(mode) => (
+            "conversationDisplayMode",
+            match mode {
+                ConversationDisplayMode::Original => "original",
+                ConversationDisplayMode::Summary => "summary",
+            },
+        ),
+    };
     state
         .settings_store
-        .set(&request.key, request.value.clone())
+        .set(key, serde_json::Value::String(value.to_string()))
         .map_err(settings_persistence_error)?;
     Ok(Json(state.settings_runtime_json()))
 }
@@ -1377,10 +1404,7 @@ async fn save_model_context_window(
         .map_err(ApiError::InvalidInput)?;
     let updated_at = UtcMillis::now();
     let _ = state.event_bus.publish(EventEnvelope::domain(
-        EventId::new(format!(
-            "event-model-context-window-updated-{}",
-            updated_at.0
-        )),
+        EventId::unique("event-model-context-window-updated"),
         "model.context_window.updated",
         json!({
             "model": model,
@@ -1612,10 +1636,7 @@ async fn save_safeguard_config(
         .map_err(settings_persistence_error)?;
     state.event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-safeguard-config-updated-{}",
-                UtcMillis::now().0
-            )),
+            EventId::unique("event-safeguard-config-updated"),
             "settings.safeguard.updated",
             serde_json::json!({
                 "revision": next_revision,
@@ -3001,6 +3022,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_setting_update_accepts_only_typed_runtime_preferences() {
+        let state = test_state();
+        let saved = update_setting(
+            State(state.clone()),
+            Json(json!({ "key": "conversationDisplayMode", "value": "summary" })),
+        )
+        .await
+        .expect("display mode should be saved")
+        .0;
+        assert_eq!(saved["conversationDisplayMode"], json!("summary"));
+        assert_eq!(
+            state.settings_runtime_json()["conversationDisplayMode"],
+            json!("summary")
+        );
+
+        for rejected in [
+            json!({ "key": "conversationDisplayMode", "value": "compact" }),
+            json!({ "key": "locale", "value": "fr-FR" }),
+            json!({ "key": "browser", "value": {} }),
+            json!({ "key": "runtimeSettings", "value": { "conversationDisplayMode": "original" } }),
+        ] {
+            assert!(
+                update_setting(State(state.clone()), Json(rejected.clone()))
+                    .await
+                    .is_err(),
+                "{rejected} must be rejected"
+            );
+        }
+        assert_eq!(
+            state.settings_runtime_json()["conversationDisplayMode"],
+            json!("summary"),
+            "rejected updates must not change the stored preference"
+        );
+    }
+
+    #[tokio::test]
     async fn connection_probe_supports_anthropic_messages_api() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3521,6 +3578,8 @@ mod tests {
             "browser_third_party",
             "browser_webmcp",
             "browser_pwa",
+            "browser_read",
+            "browser_storage",
             "diagram_render",
             "image_generate",
             "knowledge_query",

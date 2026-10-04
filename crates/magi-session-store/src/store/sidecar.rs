@@ -202,6 +202,7 @@ fn canonical_turn_item_status_name(status: CanonicalTurnItemStatus) -> &'static 
         CanonicalTurnItemStatus::Blocked => "blocked",
         CanonicalTurnItemStatus::Failed => "failed",
         CanonicalTurnItemStatus::Cancelled => "cancelled",
+        CanonicalTurnItemStatus::Indeterminate => "indeterminate",
     }
 }
 

@@ -104,6 +104,8 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
   assertInterruptedTurnIsTerminalAndKeepsRecoveryNotice(reducer, projection, canonicalProtocol);
   assertBlockedTurnRemainsRecoverable(canonicalProtocol);
+  assertReducerIndexesStayConsistent(reducer);
+  assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, canonicalProtocol);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertTruncatedToolResultCarriesHistoryRef(reducer, projection);
   assertCompactedAndFullItemsOfSameVersionAreCompatible(reducer);
@@ -306,6 +308,22 @@ function assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore) {
   }), null);
 }
 
+function assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, canonicalProtocol) {
+  assert.equal(canonicalProtocol.isCanonicalTerminalStatus('indeterminate'), true, 'indeterminate item is terminal');
+  assert.equal(canonicalProtocol.canTransitionCanonicalStatus('running', 'indeterminate'), true);
+  assert.equal(
+    canonicalProtocol.canTransitionCanonicalStatus('indeterminate', 'completed'),
+    false,
+    'indeterminate result must not be silently rewritten to success',
+  );
+  const c = baseCase('indeterminate-tool', 'session-golden-indeterminate-tool', 'turn-golden-indeterminate-tool', 11_705);
+  const unconfirmed = tool(c, 1, 'tool-indeterminate', 'call-indeterminate', 'click', 'indeterminate', { status: 'indeterminate' });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [unconfirmed])]);
+  const toolCall = projection.buildCanonicalTimelineProjection(state).artifacts[0]
+    ?.message.blocks?.find((block) => block.type === 'tool_call')?.toolCall;
+  assert.equal(toolCall?.status, 'unconfirmed', 'indeterminate item must project as an unconfirmed tool card');
+}
+
 function assertSingleThinkingProjectsAsGroup(reducer, projection) {
   const c = baseCase('single-thinking-group', 'session-golden-thinking-single', 'turn-golden-thinking-single', 11_710);
   const segment = thinking(c, 1, 'thinking-single', '先确认当前结构。', 'completed');
@@ -438,6 +456,32 @@ function assertThinkingGroupUsesTaskLocalTimeline(reducer, projection, timelineR
     1,
     'mainline must keep only its own ThinkingGroup lane',
   );
+
+  // 渲染消息按源消息对象复用：同一投影重复构建时引用不变；只有被替换的源消息得到新副本，
+  // 其它消息保持原引用，流式增量不会让无关的 MessageItem 重新计算。
+  const rebuilt = timelineRenderItems.buildTimelineRenderItems(projectionValue, 'thread');
+  assert.equal(rebuilt.length, threadItems.length);
+  rebuilt.forEach((entry, index) => {
+    assert.equal(entry.message, threadItems[index].message, `未变化的渲染消息必须复用同一对象：${entry.key}`);
+  });
+  const replacedArtifactId = projectionValue.threadRenderEntries[0].artifactId;
+  const replacedProjection = {
+    ...projectionValue,
+    artifacts: projectionValue.artifacts.map((artifact) => (
+      artifact.artifactId === replacedArtifactId
+        ? { ...artifact, message: { ...artifact.message } }
+        : artifact
+    )),
+  };
+  const afterReplace = timelineRenderItems.buildTimelineRenderItems(replacedProjection, 'thread');
+  afterReplace.forEach((entry, index) => {
+    const changed = projectionValue.threadRenderEntries[index].artifactId === replacedArtifactId;
+    if (changed) {
+      assert.notEqual(entry.message, threadItems[index].message, '被替换的源消息必须得到新的渲染副本');
+    } else {
+      assert.equal(entry.message, threadItems[index].message, '其它渲染消息必须保持原引用');
+    }
+  });
 }
 
 function assertThinkingGroupKeepsStableIdentityDuringIncrementalAppend(reducer, projection) {
@@ -956,6 +1000,49 @@ function assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection) {
   }));
   assert.equal(overlapped.error, undefined, 'bootstrap-covered delta prefix should reconcile without recovery');
   assert.equal(overlapped.state.turns[0].items[1].content, '你好呀');
+
+  // 码点长度按 item 缓存并由上一版推算：连续的代理对（emoji）追加、重置、重叠续传都必须
+  // 与真实码点长度一致，否则下一帧会被误判为不连续。
+  const streamFrame = (seq, version, base, delta, length, reset = false) => event(c, seq, 'turn_item_upsert', {
+    stream: { itemId: snapshotItem.itemId, itemVersion: version, itemStatus: 'running', baseContentLength: base, delta, contentLength: length, reset },
+  });
+  let emojiState = overlapped.state;
+  for (const [seq, version, base, delta, length, reset] of [
+    [8, 3, 3, '😀', 4],
+    [9, 4, 4, '👍🏽', 6],
+    [10, 5, 6, '😀👍🏽', 3, true],
+    [11, 6, 2, '🏽!', 4],
+    [12, 7, 4, '?', 5],
+  ]) {
+    const result = reducer.reduceCanonicalTurnEvent(emojiState, streamFrame(seq, version, base, delta, length, reset));
+    assert.equal(result.error, undefined, `emoji stream frame ${seq}: ${result.error || ''}`);
+    emojiState = result.state;
+  }
+  assert.equal(emojiState.turns[0].items[1].content, '😀👍🏽!?');
+  const gap = reducer.reduceCanonicalTurnEvent(emojiState, streamFrame(13, 8, 6, 'x', 7));
+  assert.equal(gap.recoveryRequired, true, 'a frame starting past the real code point length must request recovery');
+}
+
+function assertReducerIndexesStayConsistent(reducer) {
+  const first = baseCase('index-first', 'session-golden-index', 'turn-golden-index-a', 11_810);
+  const second = baseCase('index-second', 'session-golden-index', 'turn-golden-index-b', 11_820);
+  let state = reducer.replaceCanonicalTurns(first.sessionId, [
+    turn(first, 'completed', [user(first, 1, '第一轮'), assistantText(first, 2, 'index-a-answer', '好', 'completed')]),
+    turn(second, 'running', [user(second, 1, '第二轮')]),
+  ]);
+  const untouchedIndexes = state.itemIndexByTurnId[first.turnId];
+  const upsert = reducer.reduceCanonicalTurnEvent(state, event(second, 1, 'turn_item_upsert', {
+    item: assistantText(second, 0, 'index-b-early', '插到最前', 'running'),
+  }));
+  assert.equal(upsert.error, undefined);
+  state = upsert.state;
+  assert.equal(state.itemIndexByTurnId[first.turnId], untouchedIndexes, 'unchanged turns must reuse their item index');
+  for (const [turnIndex, candidate] of state.turns.entries()) {
+    assert.equal(state.turnIndexById[candidate.turnId], turnIndex);
+    for (const [itemIndex, candidateItem] of candidate.items.entries()) {
+      assert.equal(state.itemIndexByTurnId[candidate.turnId][candidateItem.itemId], itemIndex, 'changed turn must re-index reordered items');
+    }
+  }
 }
 
 function assertCanonicalModelFailurePreservesServerDiagnostic(canonicalProtocol) {

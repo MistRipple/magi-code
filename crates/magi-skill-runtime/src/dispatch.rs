@@ -379,13 +379,7 @@ fn bridge_public_payload(
 ) -> String {
     serde_json::json!({
         "tool": &input.tool_name,
-        "status": match status {
-            ExecutionResultStatus::Succeeded => "succeeded",
-            ExecutionResultStatus::Failed => "failed",
-            ExecutionResultStatus::Rejected => "rejected",
-            ExecutionResultStatus::NeedsApproval => "needs_approval",
-            ExecutionResultStatus::Cancelled => "cancelled",
-        },
+        "status": status.wire_label(),
         "error_code": error_code,
         "error": message.into(),
         "approval_resume_safe": status == ExecutionResultStatus::NeedsApproval,
