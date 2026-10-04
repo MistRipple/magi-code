@@ -1188,8 +1188,6 @@ fn run_conversation_loop_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
-    let task_browser_capability =
-        tool_registry.and_then(|registry| registry.browser_capability_snapshot());
     let mut tool_call_records = if recovery_history {
         tool_call_records_from_thread_history(&thread_history_snapshot)
     } else {
@@ -1381,7 +1379,9 @@ fn run_conversation_loop_inner(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
-        let mut browser_capability_snapshot = task_browser_capability.clone();
+        // 浏览器可用性每轮重新判断：桌面端恰好在重连时，不能让整轮都失去浏览器工具。
+        let mut browser_capability_snapshot =
+            tool_registry.and_then(|registry| registry.browser_capability_snapshot());
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy

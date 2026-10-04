@@ -1217,11 +1217,6 @@ fn run_session_turn_execution_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut deferred_mcp_tools_loaded = false;
-    let turn_browser_capability = if request.use_tools {
-        tool_registry.and_then(|registry| registry.browser_capability_snapshot())
-    } else {
-        None
-    };
     let mut tool_execution_ledger = ToolExecutionLedger::from_thread_history(
         &request.prompt,
         &session_store.thread_message_history(&orchestrator_thread_id),
@@ -1254,7 +1249,12 @@ fn run_session_turn_execution_inner(
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
     loop {
-        let mut browser_capability_snapshot = turn_browser_capability.clone();
+        // 浏览器可用性每轮重新判断：桌面端恰好在重连时，不能让整轮都失去浏览器工具。
+        let mut browser_capability_snapshot = if request.use_tools {
+            tool_registry.and_then(|registry| registry.browser_capability_snapshot())
+        } else {
+            None
+        };
         if request.use_tools
             && let Some(registry) = tool_registry
         {

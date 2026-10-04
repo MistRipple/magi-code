@@ -2218,7 +2218,7 @@ fn capability_unavailable(tool: &str, message: &str) -> (String, ExecutionResult
     let details = json!({
         "capability": "desktop_browser_surface",
         "supported_platform": "desktop",
-        "available_fallback": "browser_records",
+        "suggestion": "内置浏览器只在 Magi 桌面端可用。若当前就在桌面端，说明浏览器宿主正在启动或重连，请稍后重试；否则请告知用户需要在桌面端完成这一步。",
     });
     failure_payload(
         tool,
@@ -3060,7 +3060,13 @@ mod tests {
         assert_eq!(payload["error_code"], "capability_unavailable");
         assert_eq!(payload["details"]["capability"], "desktop_browser_surface");
         assert_eq!(payload["details"]["supported_platform"], "desktop");
-        assert_eq!(payload["details"]["available_fallback"], "browser_records");
+        assert!(
+            payload["details"]["suggestion"]
+                .as_str()
+                .is_some_and(|suggestion| suggestion.contains("桌面端")),
+            "不可用时必须给出可执行的建议，而不是指向不存在的回退能力"
+        );
+        assert!(payload["details"].get("available_fallback").is_none());
     }
 
     #[cfg(unix)]
