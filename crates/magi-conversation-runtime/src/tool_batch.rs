@@ -24,15 +24,14 @@ use magi_core::{
     AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextReference,
     AgentContextReferenceKind, AgentContextSupplement, EventId, ExecutionResultStatus, GoalId,
     SessionId, TaskExecutorBinding, TaskId, TaskPolicy, TaskRuntimePayload, TaskStatus, ToolCallId,
-    UtcMillis, WorkspaceId, classify_public_task_failure, estimate_text_tokens,
-    public_task_failure_is_degraded, public_task_output_refs,
+    UtcMillis, WorkspaceId, estimate_text_tokens,
 };
 #[cfg(test)]
 use magi_core::{AgentContextPackage, TaskTier};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
-    ExecutionThread, GoalRevisionExpectation, GoalStatus, SessionStore, TimelineEntryKind,
+    GoalRevisionExpectation, GoalStatus, SessionStore, TimelineEntryKind,
     timeline_entry_visible_text,
 };
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
@@ -73,10 +72,7 @@ const MIN_CREATE_GOAL_TOKEN_BUDGET: u64 = 16_000;
 /// child_id，进而触发 TaskStore 的重复插入。配合毫秒时间戳一起拼到 task_id
 /// 末尾，保证同一进程内绝对唯一。
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
-const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
-const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
 const AGENT_CONTEXT_ACCESS_LIMIT: usize = 8;
-const AGENT_UNAVAILABLE_PUBLIC_TEXT: &str = "代理当前不可用，主线需要改派或接管。";
 const AGENT_SPAWN_STARTED_INSTRUCTION: &str = "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 task_ids=[child_task_id] 收集终态结果；不要在未等待必要代理结果时直接给最终答复。";
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
@@ -188,13 +184,6 @@ fn tool_arguments_preview(value: &str) -> String {
         preview.push_str("...");
     }
     preview
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ChildAgentOutput {
-    summary: String,
-    final_text: String,
-    truncated: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -591,20 +580,16 @@ fn execute_coordinator_tool(
             &parsed,
             &publish_event,
         ),
-        magi_tool_runtime::BuiltinToolName::AgentWait => {
-            let session_threads = session_store.thread_registry_snapshot(session_id);
-            execute_agent_wait_with_runtime(
-                AgentWaitRuntime {
-                    task_store,
-                    conversation_registry,
-                    session_id,
-                    session_threads: &session_threads,
-                },
-                task,
-                tool,
-                &parsed,
-            )
-        }
+        magi_tool_runtime::BuiltinToolName::AgentWait => execute_agent_wait_with_runtime(
+            AgentWaitRuntime {
+                task_store,
+                conversation_registry,
+                session_id,
+            },
+            task,
+            tool,
+            &parsed,
+        ),
         magi_tool_runtime::BuiltinToolName::AgentSend => execute_agent_send(
             task_store,
             conversation_registry,
@@ -1915,13 +1900,21 @@ struct AgentWaitRuntime<'a> {
     task_store: &'a TaskStore,
     conversation_registry: &'a ConversationRegistry,
     session_id: &'a SessionId,
-    session_threads: &'a [ExecutionThread],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentWaitMode {
+    /// 全部代理进入终态才返回。
+    All,
+    /// 任一代理进入终态即返回。
+    Any,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentWaitRequest {
     task_ids: Vec<TaskId>,
     timeout_ms: u64,
+    mode: AgentWaitMode,
 }
 
 fn execute_agent_wait_with_runtime(
@@ -1934,7 +1927,6 @@ fn execute_agent_wait_with_runtime(
         task_store,
         conversation_registry,
         session_id,
-        session_threads,
     } = runtime;
     let request = match parse_agent_wait_request(parsed) {
         Ok(request) => request,
@@ -1947,7 +1939,7 @@ fn execute_agent_wait_with_runtime(
                     "failure_stage": "input_validation",
                     "child_task_id": serde_json::Value::Null,
                     "error": error,
-                    "instruction": "请传入不含未知字段的对象；task_ids 必须是至少一个不重复的 child_task_id，timeout_ms 可省略或使用 1000-1800000 的整数。",
+                    "instruction": "请传入不含未知字段的对象；task_ids 必须是至少一个不重复的 child_task_id，timeout_ms 可省略或使用 1000-1800000 的整数，mode 可省略或为 all/any。",
                 })
                 .to_string(),
                 ExecutionResultStatus::Rejected,
@@ -1955,21 +1947,6 @@ fn execute_agent_wait_with_runtime(
         }
     };
     let task_ids = request.task_ids;
-    if task_ids.is_empty() {
-        return (
-            serde_json::json!({
-                "tool": tool.as_str(),
-                "status": "rejected",
-                "error_code": "invalid_arguments",
-                "failure_stage": "input_validation",
-                "child_task_id": serde_json::Value::Null,
-                "error": "agent_wait 缺少必需字段 task_ids",
-                "instruction": "请传入至少一个由当前任务通过 agent_spawn 创建的 task_ids。",
-            })
-            .to_string(),
-            ExecutionResultStatus::Rejected,
-        );
-    }
     if let Some(task_id) = task_ids
         .iter()
         .find(|task_id| !agent_wait_task_is_direct_child(task_store, parent_task, task_id))
@@ -1988,98 +1965,88 @@ fn execute_agent_wait_with_runtime(
             ExecutionResultStatus::Rejected,
         );
     }
-    let timeout_ms = request.timeout_ms;
     let started_at = std::time::Instant::now();
     let mut observed_status_version = task_store.status_change_version();
     loop {
         let runtime_signals =
             conversation_registry.drain_task_signals(session_id, &parent_task.task_id);
-        if !runtime_signals.is_empty() {
-            return (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "attention_required",
-                    "timed_out": false,
-                    "pending_task_ids": task_ids.iter().filter_map(|task_id| {
-                        task_store.get_task(task_id).and_then(|task| {
-                            matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                                .then(|| task_id.to_string())
-                        })
-                    }).collect::<Vec<_>>(),
-                    "runtime_signals": runtime_signals,
-                    "instruction": "代理等待期间收到运行时消息。若为 agent_context_request，请先读取 child_task_id 和 request，使用 agent_send 回复对应代理，再继续 agent_wait。",
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            );
-        }
-        let mut results = Vec::with_capacity(task_ids.len());
+        let mut receipts = Vec::new();
         let mut pending_task_ids = Vec::new();
-        let requested_task_ids = task_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
         for task_id in &task_ids {
-            let Some(child) = task_store.get_task(task_id) else {
-                results.push(serde_json::json!({
-                    "child_task_id": task_id.to_string(),
-                    "status": "failed",
-                    "child_status": "missing",
-                    "failure_stage": "runtime_lookup",
-                    "error_code": "agent_task_unavailable",
-                    "fallback_mode": "mainline_or_reassign",
-                    "error": "代理任务不可用",
-                    "instruction": "该代理任务不存在或已不可用。请改派可用角色，或由主线继续推进。",
-                }));
-                continue;
-            };
-            if matches!(child.status, TaskStatus::Pending | TaskStatus::Running) {
-                pending_task_ids.push(task_id.to_string());
+            match task_store
+                .get_task(task_id)
+                .and_then(|child| crate::agent_receipt::AgentReceipt::from_terminal_task(&child))
+            {
+                Some(receipt) => receipts.push(receipt),
+                None => pending_task_ids.push(task_id.to_string()),
             }
-            results.push(child_agent_terminal_payload(
-                &child,
-                agent_thread_for_task(session_threads, &child.task_id),
-            ));
         }
-        if pending_task_ids.is_empty() {
-            return (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "completed",
-                    "timed_out": false,
-                    "results": results,
-                    "merge_requirements": {
-                        "must_consume_child_task_ids": requested_task_ids,
-                        "must_read_fields": ["assignment.goal", "status", "child_status", "result.final_text", "error"],
-                        "final_answer_rule": "最终答复必须明确吸收每个代理结果；如果代理失败或降级，必须说明改派、主线接管或遗留风险。",
-                    },
-                    "instruction": "请读取 results 中每个代理的 assignment.goal 与 result.final_text，合并结论、证据、风险与缺口后再向用户答复。",
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            );
-        }
+        let condition_met = match request.mode {
+            AgentWaitMode::All => pending_task_ids.is_empty(),
+            AgentWaitMode::Any => !receipts.is_empty(),
+        };
         let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if elapsed_ms >= timeout_ms {
-            return (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "timeout",
-                    "timed_out": true,
-                    "pending_task_ids": pending_task_ids,
-                    "results": results,
-                    "merge_requirements": {
-                        "must_consume_child_task_ids": requested_task_ids,
-                        "must_read_fields": ["assignment.goal", "status", "child_status", "result.final_text", "error"],
-                        "final_answer_rule": "未完成代理不能被当成已完成结论；最终答复依赖这些代理时必须稍后再次 agent_wait。",
-                    },
-                    "instruction": "仍有代理未完成。可以继续处理不依赖这些代理结果的工作；如果最终答复依赖它们，请稍后再次调用 agent_wait。",
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
+        let timed_out = !condition_met && elapsed_ms >= request.timeout_ms;
+        if runtime_signals.is_empty() && !condition_met && !timed_out {
+            observed_status_version = task_store.wait_for_status_change_since(
+                observed_status_version,
+                std::time::Duration::from_millis(request.timeout_ms - elapsed_ms),
             );
+            continue;
         }
-        observed_status_version = task_store.wait_for_status_change_since(
-            observed_status_version,
-            std::time::Duration::from_millis(timeout_ms - elapsed_ms),
-        );
+        let count = |child_status: &str| {
+            receipts
+                .iter()
+                .filter(|receipt| receipt.child_status() == child_status)
+                .count()
+        };
+        let (completed, failed, killed) = (count("completed"), count("failed"), count("killed"));
+        let (status, instruction) = if !runtime_signals.is_empty() {
+            (
+                "attention_required",
+                "代理等待期间收到运行时消息。若为 agent_context_request，请先读取 child_task_id 和 request，使用 agent_send 回复对应代理；若为审批等待，告知用户需要处理的审批。之后对 pending_task_ids 继续 agent_wait。",
+            )
+        } else if timed_out {
+            (
+                "timed_out",
+                "仍有代理未结束。results 中已结束代理的结果已经收集；可以先处理不依赖未结束代理的工作，需要时再对 pending_task_ids 调用 agent_wait，或用 agent_cancel 取消不再需要的代理。",
+            )
+        } else if pending_task_ids.is_empty() {
+            (
+                "completed",
+                "对照每个代理的 assignment.goal 阅读 result.final_text 与 activity（实际执行的命令、退出码和改动文件），合并结论、证据、风险与缺口；代理失败时决定改派或由主线接管。",
+            )
+        } else {
+            (
+                "completed",
+                "已有代理结束，results 中的结果已经收集。处理后对 pending_task_ids 继续 agent_wait。",
+            )
+        };
+        let mut payload = serde_json::json!({
+            "tool": tool.as_str(),
+            "status": status,
+            "mode": match request.mode {
+                AgentWaitMode::All => "all",
+                AgentWaitMode::Any => "any",
+            },
+            "timed_out": timed_out,
+            "all_terminal": pending_task_ids.is_empty(),
+            "completed_count": completed,
+            "failed_count": failed,
+            "killed_count": killed,
+            "pending_task_ids": pending_task_ids,
+            "results": crate::agent_receipt::render_receipts(
+                receipts,
+                crate::agent_receipt::AGENT_WAIT_FINAL_TEXT_BUDGET_BYTES,
+            ),
+            // agent_wait 已按代理分配最终答复的展示预算，模型视图不再做通用截断。
+            "model_budgeted": true,
+            "instruction": instruction,
+        });
+        if !runtime_signals.is_empty() {
+            payload["runtime_signals"] = serde_json::json!(runtime_signals);
+        }
+        return (payload.to_string(), ExecutionResultStatus::Succeeded);
     }
 }
 
@@ -2087,7 +2054,6 @@ fn execute_agent_wait_with_runtime(
 fn execute_agent_wait(
     task_store: &TaskStore,
     parent_task: &magi_core::Task,
-    session_threads: &[ExecutionThread],
     tool: magi_tool_runtime::BuiltinToolName,
     parsed: &serde_json::Value,
 ) -> (String, ExecutionResultStatus) {
@@ -2099,7 +2065,6 @@ fn execute_agent_wait(
             task_store,
             conversation_registry: &registry,
             session_id: &session_id,
-            session_threads,
         },
         parent_task,
         tool,
@@ -2218,7 +2183,7 @@ fn parse_agent_wait_request(parsed: &serde_json::Value) -> Result<AgentWaitReque
         .as_object()
         .ok_or_else(|| "agent_wait 参数必须是 JSON 对象".to_string())?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "task_ids" | "timeout_ms") {
+        if !matches!(key.as_str(), "task_ids" | "timeout_ms" | "mode") {
             return Err(format!("agent_wait 不支持字段 {key}"));
         }
     }
@@ -2257,195 +2222,19 @@ fn parse_agent_wait_request(parsed: &serde_json::Value) -> Result<AgentWaitReque
             timeout_ms
         }
     };
+    let mode = match object.get("mode") {
+        None => AgentWaitMode::All,
+        Some(value) => match value.as_str() {
+            Some("all") => AgentWaitMode::All,
+            Some("any") => AgentWaitMode::Any,
+            _ => return Err("agent_wait mode 只能是 all 或 any".to_string()),
+        },
+    };
     Ok(AgentWaitRequest {
         task_ids,
         timeout_ms,
+        mode,
     })
-}
-
-fn agent_thread_for_task<'a>(
-    session_threads: &'a [ExecutionThread],
-    task_id: &TaskId,
-) -> Option<&'a ExecutionThread> {
-    session_threads.iter().find(|thread| {
-        thread
-            .handled_task_ids
-            .iter()
-            .any(|handled| handled == task_id)
-    })
-}
-
-fn child_agent_terminal_payload(
-    child: &magi_core::Task,
-    thread: Option<&ExecutionThread>,
-) -> serde_json::Value {
-    let role = child.executor_binding_target_role().unwrap_or("agent");
-    let base = |status: &str, child_status: &str| {
-        serde_json::json!({
-            "status": status,
-            "child_status": child_status,
-            "child_task_id": child.task_id.to_string(),
-            "role": role,
-            "title": child.title,
-            "assignment": {
-                "title": child.title,
-                "goal": child.goal,
-                "role": role,
-            },
-        })
-    };
-    let transcript_output = thread.and_then(child_agent_output_from_thread);
-    match child.status {
-        TaskStatus::Completed => {
-            let output =
-                transcript_output.unwrap_or_else(|| child_agent_output(&child.output_refs));
-            let mut payload = base("completed", "completed");
-            payload["result"] = serde_json::json!({
-                "final_text": output.final_text,
-                "truncated": output.truncated,
-                "output_ref_count": child.output_refs.len(),
-            });
-            payload["summary"] = serde_json::Value::String(output.summary);
-            payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
-            payload
-        }
-        TaskStatus::Failed => {
-            let public_output_refs =
-                public_task_output_refs(TaskStatus::Failed, &child.output_refs);
-            let error = public_output_refs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "代理任务执行失败".to_string());
-            let unavailable = public_output_refs
-                .iter()
-                .any(|output| agent_unavailable_failure(output));
-            if unavailable {
-                let mut payload = base("degraded", "failed");
-                payload["failure_stage"] = serde_json::Value::String("dispatch".to_string());
-                payload["fallback_mode"] =
-                    serde_json::Value::String("mainline_or_reassign".to_string());
-                payload["error_code"] = serde_json::Value::String("agent_unavailable".to_string());
-                payload["instruction"] = serde_json::Value::String(
-                    "代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。".to_string(),
-                );
-                payload["result"] = serde_json::json!({
-                    "final_text": AGENT_UNAVAILABLE_PUBLIC_TEXT,
-                    "truncated": false,
-                    "output_ref_count": child.output_refs.len(),
-                });
-                payload["summary"] =
-                    serde_json::Value::String(AGENT_UNAVAILABLE_PUBLIC_TEXT.to_string());
-                payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
-                payload["error"] = serde_json::Value::String("代理当前不可用".to_string());
-                return payload;
-            }
-            let output = child_agent_output(&public_output_refs);
-            let mut payload = base("failed", "failed");
-            let failure = classify_public_task_failure(&error);
-            payload["failure_stage"] = serde_json::Value::String(failure.failure_stage.to_string());
-            payload["error_code"] = serde_json::Value::String(failure.error_code.to_string());
-            payload["fallback_mode"] = serde_json::Value::String(failure.fallback_mode.to_string());
-            payload["result"] = serde_json::json!({
-                "final_text": output.final_text,
-                "truncated": output.truncated,
-                "output_ref_count": child.output_refs.len(),
-            });
-            payload["summary"] = serde_json::Value::String(output.summary);
-            payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
-            payload["error"] = serde_json::Value::String(error);
-            payload
-        }
-        TaskStatus::Killed => {
-            let mut payload = base("failed", "killed");
-            payload["failure_stage"] = serde_json::Value::String("cancellation".to_string());
-            payload["error_code"] = serde_json::Value::String("agent_killed".to_string());
-            payload["fallback_mode"] =
-                serde_json::Value::String("mainline_or_reassign".to_string());
-            payload["error"] = serde_json::Value::String("代理任务被终止".to_string());
-            payload
-        }
-        TaskStatus::Pending => base("pending", "pending"),
-        TaskStatus::Running => base("running", "running"),
-    }
-}
-
-fn child_agent_output_from_thread(thread: &ExecutionThread) -> Option<ChildAgentOutput> {
-    thread
-        .message_history
-        .iter()
-        .rev()
-        .find(|message| message.role.trim().eq_ignore_ascii_case("assistant"))
-        .and_then(|message| message.content.as_deref())
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(|content| {
-            let (final_text, truncated) = truncate_for_agent_spawn_final_text(content);
-            ChildAgentOutput {
-                summary: truncate_for_agent_spawn_summary(content),
-                final_text,
-                truncated,
-            }
-        })
-}
-
-fn child_agent_output(output_refs: &[String]) -> ChildAgentOutput {
-    let raw = output_refs
-        .iter()
-        .rev()
-        .find_map(|output| child_agent_final_text(output).or_else(|| non_empty_text(output)))
-        .unwrap_or_else(|| "代理未返回可展示输出".to_string());
-    let (final_text, truncated) = truncate_for_agent_spawn_final_text(&raw);
-    ChildAgentOutput {
-        summary: truncate_for_agent_spawn_summary(&raw),
-        final_text,
-        truncated,
-    }
-}
-
-fn child_agent_final_text(output: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<serde_json::Value>(output).ok()?;
-    let blocks = parsed.get("blocks")?.as_array()?;
-    blocks.iter().rev().find_map(|block| {
-        let block_type = block.get("type").and_then(|value| value.as_str())?;
-        if block_type != "text" {
-            return None;
-        }
-        block
-            .get("content")
-            .and_then(|value| value.as_str())
-            .and_then(non_empty_text)
-    })
-}
-
-fn non_empty_text(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn truncate_for_agent_spawn_summary(value: &str) -> String {
-    truncate_for_agent_spawn_text(value, AGENT_SPAWN_SUMMARY_MAX_CHARS).0
-}
-
-fn truncate_for_agent_spawn_final_text(value: &str) -> (String, bool) {
-    truncate_for_agent_spawn_text(value, AGENT_SPAWN_FINAL_TEXT_MAX_CHARS)
-}
-
-fn truncate_for_agent_spawn_text(value: &str, max_chars: usize) -> (String, bool) {
-    let trimmed = value.trim();
-    if trimmed.chars().count() <= max_chars {
-        return (trimmed.to_string(), false);
-    }
-    let mut output = trimmed.chars().take(max_chars).collect::<String>();
-    output.push('…');
-    (output, true)
-}
-
-fn agent_unavailable_failure(error: &str) -> bool {
-    public_task_failure_is_degraded(error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6334,36 +6123,6 @@ mod tests {
     }
 
     #[test]
-    fn child_agent_output_extracts_final_text_and_marks_truncation() {
-        let long_final_text = "结果".repeat(4000);
-        let output_refs = vec![
-            serde_json::json!({
-                "blocks": [
-                    {
-                        "type": "tool_call",
-                        "content": "shell_exec: ok"
-                    },
-                    {
-                        "type": "text",
-                        "content": long_final_text
-                    }
-                ]
-            })
-            .to_string(),
-        ];
-
-        let output = child_agent_output(&output_refs);
-
-        assert!(output.summary.chars().count() <= AGENT_SPAWN_SUMMARY_MAX_CHARS + 1);
-        assert_eq!(
-            output.final_text.chars().count(),
-            AGENT_SPAWN_FINAL_TEXT_MAX_CHARS + 1
-        );
-        assert!(output.truncated);
-        assert!(output.final_text.starts_with("结果结果"));
-    }
-
-    #[test]
     fn agent_wait_returns_completed_agent_final_text() {
         let task_store = TaskStore::new();
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
@@ -6392,7 +6151,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-child"],
@@ -6431,7 +6189,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({}),
         );
@@ -6473,7 +6230,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": [missing_child_id.as_str()],
@@ -6510,7 +6266,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": [child.task_id.as_str()],
@@ -6522,7 +6277,7 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(900));
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("agent_wait timeout should be json");
-        assert_eq!(parsed["status"].as_str(), Some("timeout"));
+        assert_eq!(parsed["status"].as_str(), Some("timed_out"));
         assert_eq!(parsed["timed_out"].as_bool(), Some(true));
         assert_eq!(
             parsed["pending_task_ids"],
@@ -6551,7 +6306,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({"task_ids": [child.task_id.as_str()]}),
         );
@@ -6575,64 +6329,163 @@ mod tests {
         );
     }
 
+    fn completed_output_ref(final_text: &str) -> String {
+        serde_json::json!({
+            "blocks": [
+                {"type": "text", "content": "我先看一下相关文件。"},
+                {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "id": "call-shell",
+                        "name": "shell_exec",
+                        "arguments": {"command": "cargo test -p demo"},
+                        "status": "success",
+                        "result": serde_json::json!({"exit_code": 0}).to_string(),
+                    }
+                },
+                {"type": "text", "content": final_text},
+            ]
+        })
+        .to_string()
+    }
+
     #[test]
-    fn agent_wait_prefers_thread_transcript_over_task_output_refs() {
-        let task_store = TaskStore::new();
+    fn agent_wait_reads_final_answer_committed_when_child_finishes_during_wait() {
+        let task_store = std::sync::Arc::new(TaskStore::new());
         let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
-        let mut child = test_task(
-            "task-agent-wait-thread-child",
+        let child = test_task(
+            "task-agent-wait-late-child",
             "task-agent-wait-root",
-            Some(TaskId::new("task-agent-wait-root")),
+            Some(parent.task_id.clone()),
         );
-        child.status = TaskStatus::Completed;
-        child.title = "代码审查".to_string();
-        child.goal = "审查实现并汇报".to_string();
-        child.executor_binding = Some(TaskExecutorBinding::for_role("reviewer"));
-        child.output_refs = vec!["旧 Task output，不应覆盖 thread transcript。".to_string()];
-        let child_id = child.task_id.clone();
-        task_store.insert_task(child).expect("子任务应插入");
-        let session_threads = vec![ExecutionThread {
-            thread_id: magi_core::ThreadId::new("thread-agent-wait-reviewer"),
-            session_id: SessionId::new("session-agent-wait-thread"),
-            mission_id: parent.mission_id.clone(),
-            role_id: "reviewer".to_string(),
-            worker_instance_id: magi_core::WorkerId::new("worker-agent-wait-reviewer"),
-            status: magi_session_store::ExecutionThreadStatus::Idle,
-            created_at: UtcMillis(1),
-            last_used_at: UtcMillis(2),
-            observed_context_window_tokens: None,
-            handled_task_ids: vec![child_id],
-            message_history: vec![magi_session_store::ThreadChatMessage {
-                role: "assistant".to_string(),
-                content: Some("代理完成：agent_wait 读取 thread transcript。".to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            }],
-        }];
+        task_store
+            .insert_task(parent.clone())
+            .expect("父任务应插入");
+        task_store.insert_task(child.clone()).expect("子任务应插入");
+        let finisher = {
+            let task_store = std::sync::Arc::clone(&task_store);
+            let child_id = child.task_id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                task_store
+                    .complete_task(
+                        &child_id,
+                        magi_core::TaskCompletionAttempt {
+                            output_refs: vec![completed_output_ref("审查结论：实现正确。")],
+                            final_response: Some("审查结论：实现正确。".to_string()),
+                            evidence: Vec::new(),
+                        },
+                    )
+                    .expect("子任务应完成");
+            })
+        };
 
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &session_threads,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({"task_ids": [child.task_id.as_str()], "timeout_ms": 5000}),
+        );
+        finisher.join().expect("完成线程应结束");
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(
+            parsed["results"][0]["result"]["final_text"].as_str(),
+            Some("审查结论：实现正确。"),
+            "等待期间完成的代理必须返回最终答复，而不是中间过程文字"
+        );
+        assert_eq!(
+            parsed["results"][0]["activity"]["commands"][0]["command"].as_str(),
+            Some("cargo test -p demo")
+        );
+        assert_eq!(parsed["model_budgeted"].as_bool(), Some(true));
+        assert!(parsed["results"][0].get("summary").is_none());
+    }
+
+    #[test]
+    fn agent_wait_any_mode_returns_first_finished_child_and_keeps_others_pending() {
+        let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-any", "task-agent-wait-any", None);
+        let mut finished = test_task(
+            "task-agent-wait-any-done",
+            "task-agent-wait-any",
+            Some(parent.task_id.clone()),
+        );
+        finished.status = TaskStatus::Completed;
+        finished.output_refs = vec![completed_output_ref("第一个结论")];
+        let running = test_task(
+            "task-agent-wait-any-running",
+            "task-agent-wait-any",
+            Some(parent.task_id.clone()),
+        );
+        task_store.insert_task(finished.clone()).expect("应插入");
+        task_store.insert_task(running.clone()).expect("应插入");
+
+        let started = std::time::Instant::now();
+        let (payload, _) = execute_agent_wait(
+            &task_store,
+            &parent,
             BuiltinToolName::AgentWait,
             &serde_json::json!({
-                "task_ids": ["task-agent-wait-thread-child"],
+                "task_ids": [finished.task_id.as_str(), running.task_id.as_str()],
+                "timeout_ms": 30000,
+                "mode": "any",
+            }),
+        );
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["all_terminal"].as_bool(), Some(false));
+        assert_eq!(parsed["completed_count"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["pending_task_ids"],
+            serde_json::json!([running.task_id.as_str()])
+        );
+        assert_eq!(parsed["results"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn agent_wait_timeout_still_returns_results_of_finished_children() {
+        let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-partial", "task-agent-wait-partial", None);
+        let mut finished = test_task(
+            "task-agent-wait-partial-done",
+            "task-agent-wait-partial",
+            Some(parent.task_id.clone()),
+        );
+        finished.status = TaskStatus::Failed;
+        finished.output_refs = vec!["测试失败：断言不匹配".to_string()];
+        let running = test_task(
+            "task-agent-wait-partial-running",
+            "task-agent-wait-partial",
+            Some(parent.task_id.clone()),
+        );
+        task_store.insert_task(finished.clone()).expect("应插入");
+        task_store.insert_task(running.clone()).expect("应插入");
+
+        let (payload, _) = execute_agent_wait(
+            &task_store,
+            &parent,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": [finished.task_id.as_str(), running.task_id.as_str()],
                 "timeout_ms": 1000,
             }),
         );
 
-        assert_eq!(status, ExecutionResultStatus::Succeeded);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&payload).expect("agent_wait result should be json");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
+        assert_eq!(parsed["status"].as_str(), Some("timed_out"));
+        assert_eq!(parsed["failed_count"].as_u64(), Some(1));
         assert_eq!(
-            parsed["results"][0]["result"]["final_text"].as_str(),
-            Some("代理完成：agent_wait 读取 thread transcript。")
+            parsed["results"][0]["child_task_id"].as_str(),
+            Some(finished.task_id.as_str())
         );
-        assert!(
-            !payload.contains("旧 Task output"),
-            "agent_wait 必须以 thread transcript 作为子代理结果权威"
+        assert_eq!(
+            parsed["results"][0]["error"].as_str(),
+            Some("测试失败：断言不匹配")
         );
     }
 
@@ -6681,7 +6534,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-foreign-child"],
@@ -6716,7 +6568,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-same-parent-foreign-scope"],
@@ -6751,7 +6602,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-workspace-mismatch"],
@@ -6785,7 +6635,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-unavailable"],
@@ -6841,7 +6690,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-real-failure"],
@@ -6889,7 +6737,6 @@ mod tests {
         let (payload, status) = execute_agent_wait(
             &task_store,
             &parent,
-            &[],
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-redacted-failure"],
@@ -7291,7 +7138,6 @@ mod tests {
                     task_store: &task_store,
                     conversation_registry: &registry,
                     session_id: &session_id,
-                    session_threads: &[],
                 },
                 &parent,
                 BuiltinToolName::AgentWait,
@@ -7407,27 +7253,5 @@ mod tests {
             Some(TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR)
         );
         assert!(!worker_result[0].0.contains("tool is not visible"));
-    }
-
-    #[test]
-    fn agent_unavailable_failure_is_degradable() {
-        assert!(agent_unavailable_failure(
-            "代理当前不可用，主线需要改派或接管。"
-        ));
-        assert!(agent_unavailable_failure(
-            "agent_unavailable: no matching worker"
-        ));
-        assert!(agent_unavailable_failure(
-            "模型配置不可用: model bridge client 未配置"
-        ));
-        assert!(!agent_unavailable_failure(
-            "LLM invocation failed (round 0): provider transport failed: timed out"
-        ));
-        assert!(!agent_unavailable_failure(
-            "dispatch spawn_blocking panicked: runtime worker crashed"
-        ));
-        assert!(!agent_unavailable_failure(
-            "工具执行失败，任务不能标记完成：file_write: denied"
-        ));
     }
 }

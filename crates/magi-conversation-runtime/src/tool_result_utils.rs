@@ -11,6 +11,9 @@ pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
     "安全防护要求确认该操作，授权后将继续当前调用";
 /// 模型可见的单个工具结果上限。完整结果仍由审计、UI 和恢复状态保存。
 pub const MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES: usize = 12 * 1024;
+/// 自行分配过展示预算的结果（顶层 `model_budgeted: true`，例如 agent_wait 回执）
+/// 的硬上限；在此范围内原样交给模型，不再做通用截断。
+pub const MODEL_BUDGETED_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
 /// 模型视图中历史工具结果总预算的下限。
 ///
 /// 单条结果上限只能阻止一个大文件拖垮请求；长时间的只读探索会累积很多
@@ -421,6 +424,12 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
     if result.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
         return result.to_string();
     }
+    if result.len() <= MODEL_BUDGETED_TOOL_RESULT_MAX_BYTES
+        && serde_json::from_str::<Value>(result)
+            .is_ok_and(|parsed| parsed.get("model_budgeted").and_then(Value::as_bool) == Some(true))
+    {
+        return result.to_string();
+    }
 
     let original_bytes = result.len();
     let mut envelope = Map::new();
@@ -690,6 +699,28 @@ mod tests {
         assert_eq!(
             tool_result_execution_status(r#"{"status":"succeeded"}"#),
             ExecutionResultStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn self_budgeted_results_pass_through_up_to_hard_limit() {
+        let body = "结论".repeat(5_000);
+        let budgeted = serde_json::json!({"model_budgeted": true, "text": body}).to_string();
+        assert!(budgeted.len() > MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        assert_eq!(
+            model_visible_tool_result(&budgeted, ExecutionResultStatus::Succeeded),
+            budgeted
+        );
+        let unbudgeted = serde_json::json!({"text": body}).to_string();
+        assert_ne!(
+            model_visible_tool_result(&unbudgeted, ExecutionResultStatus::Succeeded),
+            unbudgeted
+        );
+        let oversized =
+            serde_json::json!({"model_budgeted": true, "text": "x".repeat(70_000)}).to_string();
+        assert!(
+            model_visible_tool_result(&oversized, ExecutionResultStatus::Succeeded).len()
+                < oversized.len()
         );
     }
 

@@ -29,7 +29,7 @@ Goal 目标工具：
   - 如果返回 `status=degraded`，说明代理当前不可用；你必须继续推进，优先改派其他可用角色，或者由主线基于已有上下文直接完成，不要因为单个代理不可用而停止任务。
   - 每个代理角色同一时刻最多运行 5 个活跃实例；不设置会话级代理总数下限或额外总人数上限。达到角色上限时，工具会返回 `role`、`active_role_agent_count` 与 `max_active_agents_per_role`，先用 `agent_wait` 收集该角色已运行代理，再继续创建同角色实例。
   - 不同角色的实例容量彼此独立；同一轮调用多次 `agent_spawn` 时，可用容量内的代理会并发执行。
-- `agent_wait(task_ids, timeout_ms?)`：等待一个或多个代理进入终态，并把代理最终答复返回给主线。
+- `agent_wait(task_ids, timeout_ms?, mode?)`：等待一个或多个代理结束（mode=all 默认等全部，any 等任一），返回已结束代理的结构化回执。
   - `task_ids` 必须来自 `agent_spawn` 返回的 `child_task_id`。
   - 只有下一步依赖代理结果时才调用；如果还有不依赖代理结果的主线工作，可以先继续推进。
   - 不要在必要代理尚未完成时给用户最终答复。
@@ -54,8 +54,8 @@ Goal 目标工具：
 
 代理结果处理：
 1. `agent_spawn` 只表示代理已创建；它不是代理最终答复。你必须保存返回的 `child_task_id`。
-2. `agent_wait` 返回的 `results[]` 才是代理对主线的回执。你必须读取 `assignment.goal`、`status`、`child_status`、`result.final_text`、`error` 与 `instruction`。
-3. `child_status=completed` 时，把 `result.final_text` 当作该代理的最终答复；先判断它是否满足 `assignment.goal`，再合入主线结论。
+2. `agent_wait` 返回的 `results[]` 才是代理对主线的回执，只包含已结束的代理。你必须读取 `assignment.goal`、`status`、`child_status`、`result.final_text`、`activity`、`error` 与 `instruction`。
+3. `child_status=completed` 时，把 `result.final_text` 当作该代理的最终答复；先判断它是否满足 `assignment.goal`，并用 `activity`（运行时记录的实际命令、退出码和改动文件）核实其自述，例如代理声称测试通过但没有对应命令或退出码非零时，不能直接采信。
 4. 同一轮多个代理返回后，先按任务标题整理“结论 / 证据 / 风险 / 缺口”，消除重复内容；若结果冲突，说明冲突点并优先基于证据更充分的一方继续验证。
 5. `status=degraded` 表示代理不可用但主线仍可继续。此时优先改派其他合适角色；如果任务足够简单或已有上下文足以完成，则由主线直接推进，不要把 degraded 当作整体失败。
 6. `status=failed` 只表示该代理任务失败。你应判断失败是否阻断用户目标：能补救就重派或改派，不能补救才向用户说明真实阻塞。

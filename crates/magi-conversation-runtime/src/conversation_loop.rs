@@ -104,6 +104,8 @@ const DISCOVERY_WRAP_UP_ROUNDS: usize = 8;
 const DISCOVERY_MAX_ROUNDS: usize = 12;
 const DISCOVERY_WRAP_UP_TOOL_CALLS: usize = 40;
 const DISCOVERY_MAX_TOOL_CALLS: usize = 64;
+/// 模型在完成合同未满足时给出最终答复后，最多追加的纠正提示次数（各类纠正共享）。
+const COMPLETION_RECOVERY_MAX_ATTEMPTS: usize = 4;
 
 pub struct ConversationLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
@@ -1252,6 +1254,7 @@ fn run_conversation_loop_inner(
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
     let mut empty_response_recovery_attempts = 0usize;
+    let mut completion_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut stream_interruption_non_stream_recovery_attempted = false;
     let mut context_budget_recheck_required = false;
@@ -2504,76 +2507,42 @@ fn run_conversation_loop_inner(
         }
 
         if parsed.tool_calls.is_empty() {
-            if !required_tool_chain_is_complete(
+            // 模型给出最终答复但完成合同未满足时追加一次纠正提示。所有纠正共享同一个
+            // 次数上限；超过上限就结束循环，由循环后的合同检查以明确原因收口。
+            let completion_recovery_prompt = if !required_tool_chain_is_complete(
                 &required_tool_chain,
                 &completed_required_tool_names,
             ) {
-                messages.push(assistant_response_message.clone());
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(required_tool_chain_recovery_prompt(
-                        &required_tool_chain,
-                        &completed_required_tool_names,
-                    )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                continue;
-            }
-            if let Some(missing_tool) = missing_required_evidence_tool(task, &completion_evidence) {
+                Some(required_tool_chain_recovery_prompt(
+                    &required_tool_chain,
+                    &completed_required_tool_names,
+                ))
+            } else if let Some(missing_tool) =
+                missing_required_evidence_tool(task, &completion_evidence)
+            {
                 evidence_recovery_tool = Some(missing_tool);
-                messages.push(assistant_response_message.clone());
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(required_evidence_recovery_prompt(
-                        task,
-                        &completion_evidence,
-                    )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                continue;
-            }
-            if let Some(recovery_prompt) =
+                Some(required_evidence_recovery_prompt(
+                    task,
+                    &completion_evidence,
+                ))
+            } else if let Some(recovery_prompt) =
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
+                Some(recovery_prompt)
+            } else if owns_active_plan() {
+                plan_store.render_execution_follow_up_prompt()
+            } else {
+                None
+            };
+            if let Some(recovery_prompt) = completion_recovery_prompt {
+                if completion_recovery_attempts >= COMPLETION_RECOVERY_MAX_ATTEMPTS {
+                    break;
+                }
+                completion_recovery_attempts += 1;
                 messages.push(assistant_response_message.clone());
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                continue;
-            }
-            if let Some(recovery_prompt) = agent_result_absorption_recovery_prompt(
-                parsed.content.as_deref().unwrap_or(""),
-                &tool_call_records,
-            ) {
-                messages.push(assistant_response_message.clone());
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(recovery_prompt),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                continue;
-            }
-            if owns_active_plan()
-                && let Some(follow_up_prompt) = plan_store.render_execution_follow_up_prompt()
-            {
-                messages.push(assistant_response_message.clone());
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(follow_up_prompt),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -3378,209 +3347,6 @@ fn agent_coordination_recovery_prompt(
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentWaitResultSignal {
-    child_task_id: String,
-    title: Option<String>,
-    role: Option<String>,
-    status: Option<String>,
-    child_status: Option<String>,
-    final_text: Option<String>,
-    summary: Option<String>,
-    error: Option<String>,
-}
-
-fn agent_result_absorption_recovery_prompt(
-    final_content: &str,
-    tool_call_records: &[serde_json::Value],
-) -> Option<String> {
-    let signals = collected_agent_wait_result_signals(tool_call_records);
-    if signals.is_empty() {
-        return None;
-    }
-    let missing = signals
-        .iter()
-        .filter(|signal| !agent_wait_result_is_covered(final_content, signal))
-        .map(|signal| {
-            signal
-                .title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or(signal.child_task_id.as_str())
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "你已经通过 agent_wait 收集代理结果，但最终答复没有明确吸收这些代理结果：{}。请重新答复：必须逐项读取 results[].assignment.goal、status、child_status、result.final_text、error；用代理标题或职责明确引用来源，合并结论、证据、风险和缺口后再给最终答复。",
-        missing.join(", ")
-    ))
-}
-
-fn collected_agent_wait_result_signals(
-    tool_call_records: &[serde_json::Value],
-) -> Vec<AgentWaitResultSignal> {
-    let mut signals = Vec::new();
-    for record in tool_call_records {
-        let Some(tool_call) = record.get("toolCall") else {
-            continue;
-        };
-        let Some(tool_name) = tool_call.get("name").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if canonical_tool_call_name(tool_name) != "agent_wait" {
-            continue;
-        }
-        let Some(result_text) = tool_call.get("result").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Ok(result_payload) = serde_json::from_str::<serde_json::Value>(result_text) else {
-            continue;
-        };
-        if result_payload
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(results) = result_payload
-            .get("results")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for result in results {
-            let Some(child_task_id) = result
-                .get("child_task_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned)
-            else {
-                continue;
-            };
-            let title = result
-                .get("assignment")
-                .and_then(|assignment| assignment.get("title"))
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| result.get("title").and_then(serde_json::Value::as_str))
-                .and_then(non_empty_owned);
-            let role = result
-                .get("role")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            let status = result
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            let child_status = result
-                .get("child_status")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            let final_text = result
-                .get("result")
-                .and_then(|result| result.get("final_text"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            let summary = result
-                .get("summary")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            let error = result
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .and_then(non_empty_owned);
-            if title.is_none() && final_text.is_none() && summary.is_none() && error.is_none() {
-                continue;
-            }
-            signals.push(AgentWaitResultSignal {
-                child_task_id,
-                title,
-                role,
-                status,
-                child_status,
-                final_text,
-                summary,
-                error,
-            });
-        }
-    }
-    signals
-}
-
-fn agent_wait_result_is_covered(final_content: &str, signal: &AgentWaitResultSignal) -> bool {
-    let normalized_final = normalize_absorption_text(final_content);
-    if normalized_final.is_empty() {
-        return false;
-    }
-    let mut anchors = Vec::new();
-    anchors.push(signal.child_task_id.as_str());
-    if let Some(title) = signal.title.as_deref() {
-        anchors.push(title);
-    }
-    if let Some(final_text) = signal.final_text.as_deref() {
-        anchors.extend(agent_result_text_anchors(final_text));
-    }
-    if let Some(summary) = signal.summary.as_deref() {
-        anchors.extend(agent_result_text_anchors(summary));
-    }
-    if let Some(error) = signal.error.as_deref() {
-        anchors.extend(agent_result_text_anchors(error));
-    }
-    let has_anchor = anchors.into_iter().any(|anchor| {
-        let normalized_anchor = normalize_absorption_text(anchor);
-        normalized_anchor.chars().count() >= 4 && normalized_final.contains(&normalized_anchor)
-    });
-    if has_anchor {
-        return true;
-    }
-
-    let failed_or_degraded = signal
-        .status
-        .as_deref()
-        .is_some_and(|status| matches!(status, "failed" | "degraded"))
-        || signal
-            .child_status
-            .as_deref()
-            .is_some_and(|status| matches!(status, "failed" | "killed"));
-    failed_or_degraded
-        && [
-            "失败",
-            "不可用",
-            "降级",
-            "改派",
-            "接管",
-            "failed",
-            "degraded",
-        ]
-        .iter()
-        .any(|marker| normalized_final.contains(marker))
-}
-
-fn agent_result_text_anchors(value: &str) -> Vec<&str> {
-    value
-        .split(['\n', '。', '；', ';', '.', '!', '！', '?', '？'])
-        .map(str::trim)
-        .filter(|part| part.chars().count() >= 8)
-        .take(3)
-        .collect()
-}
-
-fn normalize_absorption_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn non_empty_owned(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BTreeSet<String> {
     let mut collected = BTreeSet::new();
     for record in tool_call_records {
@@ -3615,25 +3381,26 @@ fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BT
             }
             continue;
         }
-        if result_payload
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
         let Some(results) = result_payload
             .get("results")
             .and_then(serde_json::Value::as_array)
         else {
             continue;
         };
+        // 回执只包含已结束的代理；即使本次等待超时，其中的结果也已经交给模型。
         for result in results {
-            if let Some(child_task_id) = result
-                .get("child_task_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+            let finished = matches!(
+                result
+                    .get("child_status")
+                    .and_then(serde_json::Value::as_str),
+                Some("completed" | "failed" | "killed")
+            );
+            if finished
+                && let Some(child_task_id) = result
+                    .get("child_task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
             {
                 collected.insert(child_task_id.to_string());
             }
@@ -4521,6 +4288,7 @@ mod tests {
     }
     struct StaticTaskFinalModelBridgeClient {
         content: &'static str,
+        invocations: AtomicUsize,
     }
     struct RetryEventTaskModelBridgeClient;
     struct RecordingImageTaskModelBridgeClient {
@@ -5977,6 +5745,7 @@ mod tests {
             &self,
             _request: ModelInvocationRequest,
         ) -> Result<ModelResponse, BridgeClientError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
             Ok(model_response(serde_json::json!({
                 "content": self.content,
                 "finish_reason": "stop"
@@ -7270,6 +7039,7 @@ mod tests {
 
         let client = StaticTaskFinalModelBridgeClient {
             content: "流程图已生成，继续任务已完成。",
+            invocations: AtomicUsize::new(0),
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
@@ -7735,10 +7505,22 @@ mod tests {
     }
 
     fn run_static_task_final(task: &Task, content: &'static str) -> TaskOutcome {
+        run_static_task_final_with_children(task, content, &[]).0
+    }
+
+    /// 模型每轮都给出同一段最终答复；返回任务结局与模型调用次数。
+    fn run_static_task_final_with_children(
+        task: &Task,
+        content: &'static str,
+        children: &[Task],
+    ) -> (TaskOutcome, usize) {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let task_store = TaskStore::new();
         task_store.insert_task(task.clone()).expect("任务应插入");
+        for child in children {
+            task_store.insert_task(child.clone()).expect("子任务应插入");
+        }
         let worker_id = WorkerId::new(format!("worker-{}", task.task_id));
         let lease = task_store
             .grant_lease(
@@ -7750,7 +7532,10 @@ mod tests {
             )
             .expect("lease should be granted");
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
-        let client = StaticTaskFinalModelBridgeClient { content };
+        let client = StaticTaskFinalModelBridgeClient {
+            content,
+            invocations: AtomicUsize::new(0),
+        };
         let session_id = SessionId::new(format!("session-{}", task.task_id));
         let workspace_id = Some(WorkspaceId::new(format!("workspace-{}", task.task_id)));
         session_store
@@ -7807,7 +7592,7 @@ mod tests {
             execution_group_id: None,
             persist_session_state: None,
         });
-        outcome
+        (outcome, client.invocations.load(Ordering::SeqCst))
     }
 
     #[test]
@@ -8082,88 +7867,46 @@ mod tests {
             .expect("completed child without agent_wait should block final answer");
         assert!(missing_wait_prompt.contains("尚未通过 agent_wait 收集"));
 
+        // 超时的等待只返回已结束代理的回执；这些回执已经交给模型，算作已收集。
         let timed_out_wait_record = serde_json::json!({
             "type": "tool_call",
             "toolCall": {
                 "name": "agent_wait",
                 "result": serde_json::json!({
                     "tool": "agent_wait",
-                    "status": "timeout",
+                    "status": "timed_out",
                     "timed_out": true,
-                    "results": [{ "child_task_id": child.task_id.to_string() }]
+                    "pending_task_ids": ["task-other-running"],
+                    "results": [{
+                        "child_task_id": child.task_id.to_string(),
+                        "child_status": "completed"
+                    }]
                 }).to_string()
             }
         });
         assert!(
             agent_coordination_recovery_prompt(&root, &task_store, &[timed_out_wait_record])
-                .is_some(),
-            "timeout wait 不能算作已收集终态结果"
-        );
-
-        let completed_wait_record = serde_json::json!({
-            "type": "tool_call",
-            "toolCall": {
-                "name": "agent_wait",
-                "result": serde_json::json!({
-                    "tool": "agent_wait",
-                    "status": "succeeded",
-                    "timed_out": false,
-                    "results": [{ "child_task_id": child.task_id.to_string() }]
-                }).to_string()
-            }
-        });
-        assert!(
-            agent_coordination_recovery_prompt(&root, &task_store, &[completed_wait_record])
                 .is_none(),
-            "所有代理终态都被 agent_wait 收集后才能允许最终答复"
+            "超时等待中已结束代理的回执应算作已收集"
         );
     }
 
     #[test]
-    fn agent_wait_results_must_be_explicitly_absorbed_before_final_answer() {
-        let wait_record = serde_json::json!({
-            "type": "tool_call",
-            "toolCall": {
-                "name": "agent_wait",
-                "result": serde_json::json!({
-                    "tool": "agent_wait",
-                    "status": "succeeded",
-                    "timed_out": false,
-                    "results": [{
-                        "child_task_id": "task-agent-login-review",
-                        "status": "succeeded",
-                        "child_status": "completed",
-                        "role": "reviewer",
-                        "assignment": {
-                            "title": "登录流程审查代理",
-                            "goal": "检查登录流程风险"
-                        },
-                        "result": {
-                            "final_text": "登录流程缺少失败重试提示，需要补充错误态与重试入口。",
-                            "truncated": false
-                        },
-                        "summary": "登录流程缺少失败重试提示"
-                    }]
-                }).to_string()
-            }
-        });
+    fn final_answer_with_unfinished_agent_stops_after_bounded_corrections() {
+        let root = make_task_loop_test_task("task-unwaited-agent-root");
+        let mut child = make_task_loop_test_task("task-unwaited-agent-child");
+        child.root_task_id = root.task_id.clone();
+        child.parent_task_id = Some(root.task_id.clone());
+        child.status = TaskStatus::Running;
 
-        let missing = agent_result_absorption_recovery_prompt(
-            "已经完成检查，整体没有明显问题。",
-            std::slice::from_ref(&wait_record),
-        )
-        .expect("没有吸收代理结果时必须阻止最终答复");
-        assert!(missing.contains("登录流程审查代理"));
-        assert!(missing.contains("agent_wait"));
+        let (outcome, invocations) =
+            run_static_task_final_with_children(&root, "不等代理了，直接给结论。", &[child]);
 
         assert!(
-            agent_result_absorption_recovery_prompt(
-                "根据登录流程审查代理的结果：登录流程缺少失败重试提示，需要补充错误态与重试入口。",
-                &[wait_record],
-            )
-            .is_none(),
-            "明确引用代理标题和结论后允许最终答复"
+            matches!(outcome, TaskOutcome::Failed { ref error } if error.contains("仍有代理未进入终态")),
+            "超过纠正上限后应以未等待代理的原因结束：{outcome:?}"
         );
+        assert_eq!(invocations, COMPLETION_RECOVERY_MAX_ATTEMPTS + 1);
     }
 
     #[test]

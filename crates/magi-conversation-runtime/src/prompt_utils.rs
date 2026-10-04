@@ -190,7 +190,7 @@ const ROOT_MULTI_AGENT_MODE_RULE_AUTO: &str = "\
 多代理模式（当前模式：auto；root coordinator 必须遵守）：\n\
 1. 协作能力由当前任务 TaskPolicy 决定。请根据任务边界、并行收益、独立复核价值和当前容量自主判断是否派发；1-3 步即可完成的工作不要为组队而组队。\n\
 2. 用户明确要求 subagent、子代理、多代理、并行角色或指定代理角色时，视为本轮协作要求，必须通过 agent_spawn 创建真实代理；只要决定协作，也必须提供最小充分的结构化 context_package。capabilities 可省略，目标 role 已知时优先省略，由服务端按角色默认能力补齐；不要为了查询已知角色能力先调用 tool_catalog，不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
-3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到终态，并在最终答复中明确吸收结果。\n\
+3. 多个互相独立的工作单元应在同一轮发起多次 agent_spawn；需要结果时使用 agent_wait 汇总。所有已创建代理都必须等待到结束或主动 agent_cancel，并在最终答复中整合其结果。\n\
 4. 每个角色、会话和全局都有运行容量限制。agent_spawn 返回 queued 时保留 child_task_id，等待资源恢复后继续 agent_wait；rejected 表示没有创建任务，必须根据错误阶段修正请求。\n\
 5. 收到 `agent_spawn`、`agent_send`、`agent_wait` 定义就可以直接调用；这些工具就是当前模型可直接调用的代理工具。`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。context_package 必须直接传 JSON 对象。\n\
 6. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";

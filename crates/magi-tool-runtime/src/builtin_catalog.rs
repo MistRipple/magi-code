@@ -1068,7 +1068,7 @@ impl BuiltinToolName {
                 # 返回结果处理\n\
                 - 返回 `status=started` 时，记录 `child_task_id`，后续通过 `agent_wait` 等待和收集结果\n\
                 - 不要在依赖代理结果的情况下直接给最终答复；必须先调用 `agent_wait`\n\
-                - agent_wait 返回 `child_status=completed` 时，`result.final_text` 是该代理的最终答复，`assignment.goal` 是你派给它的原始目标\n\
+                - agent_wait 返回 `child_status=completed` 时，`result.final_text` 是该代理的最终答复，`assignment.goal` 是你派给它的原始目标，`activity` 是运行时记录的实际执行事实\n\
                 - 同一轮多个代理返回后，先按任务合并结论、证据、风险与缺口，再生成主线最终答复；不要把多个代理输出原样拼贴给用户\n\
                 - 返回 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
                 - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
@@ -1080,14 +1080,17 @@ impl BuiltinToolName {
                 "取消当前任务直接派发、尚未结束的代理：终止该代理及其子树，释放其进程、浏览器租约和并发名额。用于代理方向错误、已不再需要或长时间无进展的情况；取消后该代理在 agent_wait 中返回 child_status=killed。"
             }
             Self::AgentWait => {
-                "等待一个或多个已派发代理进入终态，并把代理最终答复作为结构化结果返回给主线。用于收集 agent_spawn 创建的代理结果；不要用轮询式重复调用，只有当下一步依赖代理结果时才调用。\n\n\
+                "等待一个或多个已派发代理结束，并返回每个已结束代理的结构化回执。用于收集 agent_spawn 创建的代理结果；只有下一步依赖代理结果时才调用，不要轮询式重复调用。\n\n\
                 # 参数\n\
                 - task_ids：agent_spawn 返回的 child_task_id 列表\n\
-                - timeout_ms：可选等待时长，默认 300000，范围 1000-1800000\n\n\
+                - timeout_ms：可选等待时长，默认 300000，范围 1000-1800000\n\
+                - mode：all（默认）等全部结束；any 在任一代理结束时返回\n\n\
                 # 返回结果处理\n\
-                - `results[].child_status=completed`：读取 `results[].result.final_text` 并对照 `assignment.goal` 汇总\n\
-                - `results[].child_status=failed/killed`：判断是否可改派或由主线接管，不要自动把单个代理失败当作整体失败\n\
-                - `timed_out=true`：说明至少一个代理仍未完成；可以继续做不依赖该代理的工作，或稍后再次等待"
+                - `results[]` 只包含已结束的代理，返回即视为已收集；`pending_task_ids` 是仍在运行的代理\n\
+                - `result.final_text` 是代理最终答复，对照 `assignment.goal` 判断是否达成；`activity` 是运行时记录的执行事实（实际运行的命令与退出码、改动文件、工具失败次数），用它核实代理的自述\n\
+                - `child_status=failed/killed`：判断是否改派或由主线接管，不要把单个代理失败当作整体失败\n\
+                - `status=timed_out`：可先处理已返回的结果和不依赖未结束代理的工作，需要时再等待，或用 agent_cancel 取消不再需要的代理\n\
+                - `status=attention_required`：先处理 runtime_signals（如代理的上下文请求）再继续等待"
             }
             Self::ContextSearch => {
                 "按需检索当前 session 的用户/助手可见消息、同一执行链任务输出与证据，以及当前 AgentContextPackage 引用。只返回引用、预览与 token 估算；需要正文时继续调用 context_read。"
@@ -1821,6 +1824,11 @@ impl BuiltinToolName {
                     "timeout_ms": {
                         "type": "integer",
                         "description": "可选等待时长，默认 300000，范围 1000-1800000"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["all", "any"],
+                        "description": "all（默认）等全部代理结束；any 在任一代理结束时返回，便于先处理已完成的结果"
                     }
                 },
                 "required": ["task_ids"]
