@@ -516,6 +516,7 @@ impl SessionTurnRequestDto {
             "skillName": trimmed_non_empty(normalized.skill_name.as_deref()),
             "locale": trimmed_non_empty(normalized.locale.as_deref()),
             "goalMode": normalized.goal_mode,
+            "resume": normalized.resume,
             "command": normalized.command,
             "images": normalized.images,
             "contextReferences": context_references,
@@ -530,11 +531,6 @@ impl SessionTurnRequestDto {
             "expectedTurnId": normalized.expected_turn_id(),
             "replaceTurnId": normalized.replace_turn_id(),
         });
-        let mut canonical_request = canonical_request;
-        // 只在显式恢复时写入指纹，普通请求的指纹与引入该字段前保持一致。
-        if normalized.resume {
-            canonical_request["resume"] = serde_json::Value::Bool(true);
-        }
         let bytes = serde_json::to_vec(&canonical_request)
             .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
         let digest = Sha256::digest(bytes);
@@ -546,8 +542,7 @@ impl SessionTurnRequestDto {
 #[serde(rename_all = "snake_case")]
 pub enum SessionTurnRouteDto {
     Chat,
-    /// 带工具的主线执行。旧版本持久化的排队轮次可能记录为 `task`，任务路由已并入执行路由。
-    #[serde(alias = "task")]
+    /// 带工具的主线执行。
     Execute,
     Continue,
     Steer,

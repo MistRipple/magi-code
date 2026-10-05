@@ -1696,8 +1696,8 @@ export interface SessionPlanDto {
   language: string;
   state: PlanState;
   items: PlanItemDto[];
+  /** 当前正在执行各计划项的任务；任务结束后绑定移除。 */
   taskBindings: Record<string, string>;
-  taskStatuses: Record<string, 'pending' | 'running' | 'completed' | 'failed' | 'killed'>;
   updatedAt: number;
 }
 

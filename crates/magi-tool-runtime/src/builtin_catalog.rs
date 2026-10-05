@@ -1769,7 +1769,7 @@ impl BuiltinToolName {
                             "expected_output": { "type": "string", "minLength": 1, "description": "子代理最终必须交付的结果形态和验收标准。" },
                             "references": {
                                 "type": "array",
-                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。引用必须指向真实事实：会话消息用 turn:<entry_id>，任务输出用 task:<task_id>:output:<n>，文件用工作区内存在的路径；不存在的引用会在派发前被拒绝。本轮用户原始请求由运行时自动附上。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"path:Cargo.toml\",\"title\":\"配置文件\"}。",
+                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。引用必须指向真实事实：会话消息用 turn:<entry_id>，任务输出用 task:<task_id>:output:<n>，文件用工作区内存在的路径；不存在的引用会在派发前被拒绝。本轮用户原始请求由运行时自动附上。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"Cargo.toml\",\"title\":\"配置文件\"}。",
                                 "items": {
                                     "type": "object",
                                     "properties": {

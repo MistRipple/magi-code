@@ -1,6 +1,6 @@
 # Magi Harness 改造计划（主线 → 子代理 → 汇报）
 
-- 文档状态：已完成（H8-3 暂缓，原因见 H8 表）
+- 文档状态：执行中（H10）
 - 来源：2026-10-04 对 harness 的派发、执行、汇报和整体结构四路审查，关键结论已回到源码核实
 - 工程原则：沿用“稳定性与业务流程修复计划”的公共约定——从源头修复，不保留双链路、兼容分支和补丁式兜底；删除路径后清理调用方、协议字段和测试；每项补能复现问题的测试
 - 编号：H 组按执行顺序排列；同组内的子项可以分开提交
@@ -73,13 +73,29 @@
 | --- | --- | --- |
 | H8-1 | `magi-worker-runtime` / `magi-orchestrator` 中的执行循环、review/verify/repair 状态机、`verification_runner`、`local_worker_executor` 只被测试调用 | 删除，并清理只为它们存在的类型和测试 |
 | H8-2 | `magi-mission-metrics` 只写不读，与 usage-authority 重复记账 | 删除 crate 及写入点 |
-| H8-3 | `SessionPlan.task_statuses` 镜像 TaskStore 状态 | 暂缓：SessionPlan 持久化格式带 deny_unknown_fields，删字段需迁移；“已绑定计划但尚未写入 TaskStore”的任务应视为活跃还是不活跃需先定义；session-store 不能依赖 TaskStore，需由调用方注入状态查询（约 27 处）。状态目前由 daemon 状态回调单向同步 |
+| H8-3 | `SessionPlan.task_statuses` 镜像 TaskStore 状态 | 删除镜像字段；`task_bindings` 只表示“当前正在执行该项的任务”，任务进入终态时由状态回调移除绑定，存在绑定即表示进行中 |
 
 ## H9 重启恢复
 
 | 编号 | 问题 | 改造 | 验收 |
 | --- | --- | --- | --- |
 | H9-1 | worktree “占用中”标记原样恢复，启动时不核对，主线 Git 写操作可能被永久拒绝 | 启动时按 TaskStore 中仍在运行的任务核对占用，释放失效占用 | 重启后主线 Git 写操作不再被已失效的子代理占用阻塞 |
+
+## H10 删除旧版本兼容
+
+用户决定不再兼容旧版本数据与协议：持久化状态和协议只接受最新格式，不保留迁移、别名、旧字段回退与旧文件转换。
+
+| 编号 | 范围 | 内容 |
+| --- | --- | --- |
+| H10-1 | 本轮新增 | 删除 `task` 路由别名与历史映射、请求指纹的特殊处理、文件引用 `path:` 前缀、agent_spawn 旧 `context` 字段的专门拒绝 |
+| H10-2 | 任务模型与持久化 | 删除 Task/绑定上的旧字段与迁移函数、TaskStore 旧 checkpoint 读取、daemon 持久化的 v1→v2 布局迁移、旧来源归档/孤儿事件隔离、整本账本与 Goal 状态迁移、session-store 的 v1 会话转换、thread 迁移输入 |
+| H10-3 | 设置与模型配置 | 删除加载时的响应别名清理、旧 provider 推断与回写、旧 orchestrator 字段 |
+| H10-4 | 浏览器、快照、事件读模型 | 删除 serde 别名、缺失 content_hash 补算、旧 ledger 字段与多字段名读取 |
+| H10-5 | API 与技能/MCP | 删除旧图片用量补造、旧引擎条目清理、MCP serverId 回退、技能 binding 多种写法、角色/代理运行的双命名读取 |
+| H10-6 | 前端 | 删除旧 localStorage 键清理、事件 payload 的 snake/camel 双读、旧消息与旧补丁形状回退 |
+| H10-7 | 工作区注册表 | 注册时总是写入 `root_path_ref` 并改为必填，删除加载补齐 |
+
+保留：异常退出遗留的浏览器会话清理（不属于版本兼容）；已过期/吊销的 MCP 令牌没有原文属于当前语义，只删除“旧版本”文案。
 
 ## 进度
 
@@ -92,5 +108,6 @@
 | H5 | 已完成 | 见 git log（H5） |
 | H6 | 已完成 | 见 git log（H6） |
 | H7 | 已完成 | 见 git log（H7） |
-| H8 | H8-1、H8-2 已完成；H8-3 暂缓（见下） | 见 git log（H8） |
+| H8 | 已完成 | 见 git log（H8） |
 | H9 | 已完成 | 见 git log（H9） |
+| H10 | 执行中 | |

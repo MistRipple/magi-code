@@ -1124,10 +1124,10 @@ pub struct SessionPlan {
     #[serde(default)]
     pub state: PlanState,
     pub items: Vec<PlanItem>,
+    /// 当前正在执行某个计划项的任务。任务状态的唯一事实源是 TaskStore；任务进入终态时
+    /// 由状态回调移除绑定，因此“存在绑定”即表示该任务仍在执行。
     #[serde(default)]
     pub task_bindings: HashMap<TaskId, magi_core::PlanItemId>,
-    #[serde(default)]
-    pub task_statuses: HashMap<TaskId, magi_core::TaskStatus>,
     pub updated_at: UtcMillis,
 }
 

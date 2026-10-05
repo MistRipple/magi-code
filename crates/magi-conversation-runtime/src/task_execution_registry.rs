@@ -1465,7 +1465,6 @@ mod tests {
                         magi_core::PlanItemStatus::InProgress,
                     )],
                     task_bindings: HashMap::new(),
-                    task_statuses: HashMap::new(),
                     updated_at: now,
                 },
                 Some(0),
@@ -1522,7 +1521,6 @@ mod tests {
         );
         let plan_after = plan_store.snapshot().expect("计划应保留");
         assert_eq!(plan_after.task_bindings, plan_before.task_bindings);
-        assert_eq!(plan_after.task_statuses, plan_before.task_statuses);
     }
 
     #[test]

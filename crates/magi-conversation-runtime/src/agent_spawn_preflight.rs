@@ -39,7 +39,6 @@ const AGENT_SPAWN_FIELDS: &[&str] = &[
     "display_name",
     "goal",
     "context_package",
-    "context",
     "working_dir",
     "parallelism_group",
     "inherit_skill",
@@ -151,13 +150,6 @@ pub(crate) fn preflight_agent_spawn(
             "invalid_arguments",
             format!("agent_spawn 不支持字段 {unknown}"),
             "请移除未知字段，并按当前 agent_spawn Schema 重新提交。",
-        ));
-    }
-    if object.contains_key("context") {
-        return Err(AgentSpawnPreflightError::input(
-            "legacy_context_rejected",
-            "agent_spawn 不再接受 context 字符串，请使用结构化 context_package",
-            "请移除 context，并按 Schema 传入 context_package 对象。",
         ));
     }
 
@@ -837,8 +829,7 @@ fn validate_context_references(
                 })
                 .contains(&reference.source_ref),
             AgentContextReferenceKind::File => {
-                let raw = reference.source_ref.trim();
-                let path = PathBuf::from(raw.strip_prefix("path:").unwrap_or(raw));
+                let path = PathBuf::from(reference.source_ref.trim());
                 let path = match workspace_root {
                     Some(root) if path.is_relative() => root.join(path),
                     _ => path,
@@ -1252,7 +1243,6 @@ mod tests {
         let valid = package_with_references(serde_json::json!([
             {"kind": "task_output", "title": "根任务输出", "source_ref": "task:task-root-ref:output:0", "preview": ""},
             {"kind": "file", "title": "源码", "source_ref": "present.rs", "preview": ""},
-            {"kind": "file", "title": "源码", "source_ref": "path:present.rs", "preview": ""},
             {"kind": "knowledge", "title": "知识", "source_ref": "kb:anything", "preview": ""},
         ]));
         validate_context_references(
@@ -1299,8 +1289,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_agent_spawn_context_is_rejected_before_runtime_mutation() {
-        let session_id = SessionId::new("session-legacy-agent-context");
+    fn unknown_agent_spawn_field_is_rejected_before_runtime_mutation() {
+        let session_id = SessionId::new("session-unknown-agent-field");
         let session_store = SessionStore::default();
         let task_store = TaskStore::new();
         let execution_registry = TaskExecutionRegistry::default();
@@ -1353,9 +1343,9 @@ mod tests {
             now: UtcMillis(2),
             sequence: 1,
         })
-        .expect_err("旧版 context 字符串必须在创建 child task 前拒绝");
+        .expect_err("未知字段必须在创建 child task 前拒绝");
 
-        assert_eq!(error.error_code, "legacy_context_rejected");
+        assert_eq!(error.error_code, "invalid_arguments");
         assert!(task_store.all_tasks().is_empty());
         assert!(session_store.runtime_sidecar(&session_id).is_none());
         assert!(

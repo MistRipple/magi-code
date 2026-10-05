@@ -5230,7 +5230,6 @@ mod tests {
                     PlanItemStatus::InProgress,
                 )],
                 task_bindings: HashMap::new(),
-                task_statuses: HashMap::new(),
                 updated_at: now,
             }],
             thread_registry: vec![ExecutionThread {

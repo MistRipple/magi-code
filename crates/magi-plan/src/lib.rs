@@ -95,28 +95,13 @@ impl PlanStore {
                     .collect()
             })
             .unwrap_or_default();
-        let retained_task_ids = task_bindings.keys().cloned().collect::<HashSet<_>>();
-        let mut task_statuses: HashMap<TaskId, TaskStatus> = current
-            .as_ref()
-            .map(|plan| {
-                plan.task_statuses
-                    .iter()
-                    .filter(|(task_id, _)| retained_task_ids.contains(*task_id))
-                    .map(|(task_id, status)| (task_id.clone(), *status))
-                    .collect()
-            })
-            .unwrap_or_default();
         if let Some(task_id) = task_id
             && let Some(item_id) = items
                 .iter()
                 .find(|item| item.status == PlanItemStatus::InProgress)
                 .map(|item| item.item_id.clone())
         {
-            let binding_changed = task_bindings.get(task_id) != Some(&item_id);
             task_bindings.insert(task_id.clone(), item_id);
-            if binding_changed {
-                task_statuses.insert(task_id.clone(), TaskStatus::Pending);
-            }
         }
         let plan = SessionPlan {
             plan_id,
@@ -135,7 +120,6 @@ impl PlanStore {
             state,
             items,
             task_bindings,
-            task_statuses,
             updated_at: UtcMillis::now(),
         };
         self.session_store
@@ -247,8 +231,7 @@ impl PlanStore {
         }
         let original = plan.clone();
         let expected_revision = plan.revision;
-        plan.task_bindings.insert(task_id.clone(), item_id);
-        plan.task_statuses.insert(task_id, TaskStatus::Pending);
+        plan.task_bindings.insert(task_id, item_id);
         self.session_store
             .upsert_plan(&self.session_id, plan, Some(expected_revision))
             .map(|updated| Some((original, updated)))
@@ -260,7 +243,6 @@ impl PlanStore {
             return Ok(false);
         };
         let removed = plan.task_bindings.remove(task_id).is_some();
-        plan.task_statuses.remove(task_id);
         if !removed {
             return Ok(false);
         }
@@ -334,7 +316,13 @@ impl PlanStore {
             return Ok(None);
         };
         let expected_revision = plan.revision;
-        plan.task_statuses.insert(task_id.clone(), status);
+        // 任务结束后不再占用计划项；任务状态本身只保存在 TaskStore。
+        if matches!(
+            status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+        ) {
+            plan.task_bindings.remove(task_id);
+        }
         if authority == PlanTaskAuthority::PhaseOwner
             && let Some(item) = plan.items.iter_mut().find(|item| item.item_id == item_id)
             && item.status != PlanItemStatus::Blocked
@@ -652,12 +640,11 @@ fn validate_status_transitions(
                     current_item.item_id.to_string(),
                 ));
             }
-            if current.task_bindings.iter().any(|(task_id, item_id)| {
-                item_id == &current_item.item_id
-                    && current.task_statuses.get(task_id).is_none_or(|status| {
-                        matches!(status, TaskStatus::Pending | TaskStatus::Running)
-                    })
-            }) {
+            if current
+                .task_bindings
+                .values()
+                .any(|item_id| item_id == &current_item.item_id)
+            {
                 return Err(PlanUpdateError::CannotRemoveBoundItem(
                     current_item.item_id.to_string(),
                 ));
@@ -1189,9 +1176,9 @@ mod tests {
             PlanItemStatus::Completed
         );
         assert_eq!(after_root_completion.state, PlanState::Completed);
-        assert_eq!(
-            after_root_completion.task_statuses.get(&child_task_id),
-            Some(&TaskStatus::Failed)
+        assert!(
+            !after_root_completion.task_bindings.contains_key(&child_task_id),
+            "结束的任务不再占用计划项"
         );
     }
 
@@ -1424,7 +1411,6 @@ mod tests {
         assert!(store.unbind_task(&task_id).expect("task should unbind"));
         let plan = store.snapshot().expect("plan should remain");
         assert!(!plan.task_bindings.contains_key(&task_id));
-        assert!(!plan.task_statuses.contains_key(&task_id));
     }
 
     #[test]

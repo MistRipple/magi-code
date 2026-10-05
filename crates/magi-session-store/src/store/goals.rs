@@ -10,7 +10,7 @@ use crate::models::{
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
-    TaskStatus, ThreadId, UtcMillis,
+    ThreadId, UtcMillis,
 };
 
 const BLOCKED_TURN_THRESHOLD: u32 = 3;
@@ -576,9 +576,8 @@ impl SessionStore {
                     message: "goal plan still contains unfinished or blocked work".to_string(),
                 });
             }
-            if plan.task_statuses.iter().any(|(task_id, status)| {
+            if plan.task_bindings.keys().any(|task_id| {
                 task_id.as_str() != turn_id
-                    && matches!(status, TaskStatus::Pending | TaskStatus::Running)
                     && task_is_active_in_session_execution(&state, session_id, task_id)
             }) {
                 return Err(DomainError::InvalidState {
@@ -1509,7 +1508,6 @@ mod tests {
                 PlanItemStatus::InProgress,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         store
@@ -1588,10 +1586,6 @@ mod tests {
             task_bindings: std::collections::HashMap::from([
                 (own_task_id.clone(), item_id.clone()),
                 (other_task_id.clone(), item_id),
-            ]),
-            task_statuses: std::collections::HashMap::from([
-                (own_task_id.clone(), TaskStatus::Running),
-                (other_task_id.clone(), TaskStatus::Running),
             ]),
             updated_at: UtcMillis::now(),
         };
@@ -1684,7 +1678,6 @@ mod tests {
                 PlanItemStatus::Completed,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         store
@@ -1752,7 +1745,6 @@ mod tests {
                 PlanItemStatus::InProgress,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         store
@@ -1847,7 +1839,6 @@ mod tests {
                         PlanItemStatus::InProgress,
                     )],
                     task_bindings: std::collections::HashMap::new(),
-                    task_statuses: std::collections::HashMap::new(),
                     updated_at: UtcMillis::now(),
                 },
                 Some(0),
@@ -1965,7 +1956,6 @@ mod tests {
                         PlanItemStatus::InProgress,
                     )],
                     task_bindings: std::collections::HashMap::new(),
-                    task_statuses: std::collections::HashMap::new(),
                     updated_at: UtcMillis::now(),
                 },
                 Some(0),
@@ -2067,7 +2057,6 @@ mod tests {
                 PlanItemStatus::InProgress,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         let active_plan = store
@@ -2174,7 +2163,6 @@ mod tests {
                 PlanItemStatus::InProgress,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         assert!(
@@ -2226,7 +2214,6 @@ mod tests {
                 PlanItemStatus::InProgress,
             )],
             task_bindings: std::collections::HashMap::new(),
-            task_statuses: std::collections::HashMap::new(),
             updated_at: UtcMillis::now(),
         };
         store
@@ -2289,7 +2276,6 @@ mod tests {
                         PlanItemStatus::InProgress,
                     )],
                     task_bindings: std::collections::HashMap::new(),
-                    task_statuses: std::collections::HashMap::new(),
                     updated_at: UtcMillis::now(),
                 },
                 Some(0),

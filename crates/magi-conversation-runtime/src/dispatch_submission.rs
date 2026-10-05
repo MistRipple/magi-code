@@ -3717,10 +3717,6 @@ mod tests {
             restored_plan.task_bindings,
             plan_before_binding.task_bindings
         );
-        assert_eq!(
-            restored_plan.task_statuses,
-            plan_before_binding.task_statuses
-        );
         assert_eq!(restored_plan.revision, plan_after_binding.revision);
         assert!(restored_plan.revision > plan_before_binding.revision);
     }

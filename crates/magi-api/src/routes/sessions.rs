@@ -1928,8 +1928,7 @@ fn canonical_turn_replay_response(
                 .and_then(|item| item.metadata.get("route").and_then(Value::as_str))
         })
         .map(|route| match route {
-            // 历史轮次可能记录为 task 路由；任务路由已与执行路由合并。
-            "execute" | "task" => SessionTurnRouteDto::Execute,
+            "execute" => SessionTurnRouteDto::Execute,
             "continue" => SessionTurnRouteDto::Continue,
             "steer" => SessionTurnRouteDto::Steer,
             _ => SessionTurnRouteDto::Chat,
