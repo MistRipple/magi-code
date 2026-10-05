@@ -1027,26 +1027,15 @@ impl DaemonRuntime {
             state_repository.load_workspace_recovery_sidecars()?,
         ));
 
-        state_repository.migrate_legacy_state_layout(&workspace_roots)?;
+        state_repository.verify_state_layout(&workspace_roots)?;
         let (session_durable, session_sidecars) =
             state_repository.load_session_projections(&workspace_roots)?;
-        let accepted_submissions = state_repository.load_accepted_submissions()?;
         let session_store = Arc::new(
             SessionStore::from_persisted_parts(session_durable, session_sidecars).map_err(
                 |error| DaemonError::internal(format!("恢复 session canonical turn 失败: {error}")),
             )?,
         );
         session_store.install_canonical_event_writer(Arc::new(state_repository.clone()));
-        session_store
-            .restore_session_acceptance_records(
-                accepted_submissions
-                    .into_iter()
-                    .filter(|record| !record.session_checkpointed)
-                    .map(|record| record.session),
-            )
-            .map_err(|error| {
-                DaemonError::internal(format!("恢复 accepted session 事实失败: {error}"))
-            })?;
         session_store.set_unavailable_sessions(state_repository.unavailable_sessions());
         state_repository.validate_session_event_log_coverage(&session_store.durable_state())?;
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
@@ -1807,8 +1796,6 @@ impl DaemonRuntime {
                 .map_err(|error| {
                     DaemonError::internal(format!("恢复 accepted task 失败: {error}"))
                 })?;
-        } else {
-            accepted_submission_repository.prune_accepted_submissions()?;
         }
         // LlmTaskDispatcher 的 context 摘要与 prompt 注入共用该 ContextBudget。max_memory ≥ 一批
         // session-memory 的 slice 数（=5），否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
@@ -3610,55 +3597,6 @@ done
                 .expect("ledger mtime should remain"),
             ledger_modified,
             "恢复已有账本不应重复重写"
-        );
-    }
-
-    #[test]
-    fn restore_persists_authoritative_path_ref_for_legacy_workspace_state() {
-        let state_root = temp_state_root("legacy-workspace-path");
-        let workspace_root = state_root.join("legacy-workspace");
-        fs::create_dir_all(&workspace_root).expect("legacy workspace should exist");
-        fs::write(
-            state_root.join("workspaces.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "active_workspace_id": "legacy-workspace",
-                "workspaces": [{
-                    "workspaceId": "legacy-workspace",
-                    "name": null,
-                    "rootPath": workspace_root.to_string_lossy(),
-                    "worktreeRoot": null,
-                    "status": "Registered",
-                    "createdAt": 1,
-                    "updatedAt": 1
-                }],
-                "worktree_allocations": [],
-                "snapshots": []
-            }))
-            .expect("legacy workspace state should serialize"),
-        )
-        .expect("legacy workspace state should persist");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-
-        let runtime = DaemonRuntime::restore(&config).expect("legacy workspace should restore");
-
-        let restored_workspace = runtime
-            .workspace_store
-            .workspaces()
-            .into_iter()
-            .find(|workspace| workspace.workspace_id.as_str() == "legacy-workspace")
-            .expect("legacy workspace should remain registered");
-        assert_eq!(restored_workspace.native_root_path(), workspace_root);
-
-        let persisted: serde_json::Value = serde_json::from_slice(
-            &fs::read(state_root.join("workspaces.json"))
-                .expect("normalized workspace state should be readable"),
-        )
-        .expect("normalized workspace state should deserialize");
-        assert!(
-            persisted["workspaces"][0]["rootPathRef"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("mhp1:")),
-            "daemon restore must persist the authoritative host path reference"
         );
     }
 

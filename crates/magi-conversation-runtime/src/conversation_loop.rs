@@ -268,10 +268,10 @@ pub(crate) fn append_thread_messages_checkpoint(
     persist_session_state: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,
 ) -> Result<(), String> {
-    // 新 Turn 一旦存在 canonical item，provider/tool 回调只触发 projection 重建；
-    // 没有 canonical 历史的 thread 才允许一次性使用迁移输入。
+    // thread 一旦存在 canonical item，provider/tool 回调只触发 projection 重建；
+    // 没有 canonical 历史的 thread（新建的代理任务 thread）用这些消息初始化历史。
     session_store
-        .rebuild_thread_message_projection_with_migration_input(
+        .rebuild_thread_message_projection_with_initial_messages(
             thread_id,
             messages,
             UtcMillis::now(),

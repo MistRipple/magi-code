@@ -1,7 +1,5 @@
 use super::config::DaemonError;
 use super::session_event_log::SessionConversationProjection;
-#[cfg(test)]
-use magi_core::TaskId;
 use magi_core::{DomainError, DomainResult, SessionId, Task};
 use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
@@ -20,7 +18,6 @@ use std::{
 };
 use tracing::warn;
 
-const ACCEPTED_SUBMISSION_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
@@ -37,7 +34,6 @@ pub(crate) struct StateRepository {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AcceptedSubmissionRecord {
     pub session: SessionAcceptanceRecord,
-    #[serde(default)]
     pub task: Option<Task>,
     pub session_checkpointed: bool,
     pub task_checkpointed: bool,
@@ -47,22 +43,6 @@ pub(crate) struct AcceptedSubmissionRecord {
 impl PartialEq for AcceptedSubmissionRecord {
     fn eq(&self, other: &Self) -> bool {
         serde_json::to_vec(self).ok() == serde_json::to_vec(other).ok()
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AcceptedSubmissionJournal {
-    schema_version: u32,
-    records: Vec<AcceptedSubmissionRecord>,
-}
-
-impl Default for AcceptedSubmissionJournal {
-    fn default() -> Self {
-        Self {
-            schema_version: ACCEPTED_SUBMISSION_JOURNAL_SCHEMA_VERSION,
-            records: Vec::new(),
-        }
     }
 }
 
@@ -172,89 +152,6 @@ struct StateLayoutMarker {
     version: u32,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StateLayoutMigration {
-    source_version: u32,
-    target_version: u32,
-}
-
-/// 旧版在删除会话时没有把同一会话的 canonical event 目录纳入删除事务。
-///
-/// v2 已提交状态里，这类目录不再代表可恢复会话，但也不能静默删除：迁移修复会把
-/// 原目录整体移到 `migrations/legacy-v1/orphan-session-events`，并以这份记录说明
-/// 为什么它不参与当前会话恢复。
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyOrphanEventQuarantineRecord {
-    schema_version: u32,
-    session_id: magi_core::SessionId,
-    reason: String,
-    archived_at: magi_core::UtcMillis,
-    source_event_root: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyOrphanEventQuarantineMarker {
-    schema_version: u32,
-}
-
-/// 迁移阶段的完整输入快照。它在删除任何旧布局或未标记布局前先原子写入，
-/// 因此进程可以在迁移任意一步退出后从同一份快照继续，不会再次猜测数据来源。
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StateLayoutMigrationStaging {
-    source_version: u32,
-    target_version: u32,
-    durable: SessionDurableState,
-    sidecars: SessionExecutionSidecarStoreState,
-    task_checkpoint: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct UnmarkedSessionProjectionSnapshot {
-    durable: SessionDurableState,
-    #[serde(default)]
-    sidecar: Option<SessionRuntimeSidecar>,
-}
-
-#[derive(Clone, Debug)]
-struct UnmarkedSessionProjection {
-    path: PathBuf,
-    durable: SessionDurableState,
-    sidecar: Option<SessionRuntimeSidecar>,
-}
-
-#[derive(Clone, Debug)]
-struct LegacyStatePaths {
-    global_sessions: PathBuf,
-    session_sidecars: PathBuf,
-    task_store: PathBuf,
-    workspace_sessions: Vec<(String, PathBuf)>,
-}
-
-impl LegacyStatePaths {
-    fn existing_paths(&self) -> Vec<PathBuf> {
-        let mut paths = [
-            self.global_sessions.clone(),
-            self.session_sidecars.clone(),
-            self.task_store.clone(),
-        ]
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect::<Vec<_>>();
-        paths.extend(
-            self.workspace_sessions
-                .iter()
-                .map(|(_, path)| path)
-                .filter(|path| path.exists())
-                .cloned(),
-        );
-        paths
-    }
-}
-
 impl StateRepository {
     pub(crate) fn new(state_root: PathBuf) -> Self {
         Self {
@@ -273,14 +170,14 @@ impl StateRepository {
         sidecars: &SessionExecutionSidecarStoreState,
     ) -> Result<(), DaemonError> {
         let workspace_roots = self.workspace_projection_roots()?;
-        self.save_session_projection_parts(durable, sidecars, &workspace_roots, true, None, false)
+        self.save_session_projection_parts(durable, sidecars, &workspace_roots, None, false)
     }
 
     /// 只提交指定 session 的 durable projection。
     ///
     /// canonical event 已经按 session 独立落盘；sidecar flush 只需更新发生过
     /// 运行态变更的 session 文件，并维护全局 current/meta 文件。完整 snapshot
-    /// 仍由 `save_session_projection_state` 保留给启动迁移、关机和显式一致性操作。
+    /// 仍由 `save_session_projection_state` 保留给关机和显式一致性操作。
     pub(crate) fn save_session_projection_state_for_sessions(
         &self,
         durable: &SessionDurableState,
@@ -293,7 +190,6 @@ impl StateRepository {
             durable,
             sidecars,
             &workspace_roots,
-            true,
             Some(&changed),
             false,
         )
@@ -307,14 +203,7 @@ impl StateRepository {
         workspace_roots: &HashMap<String, PathBuf>,
     ) -> Result<(), DaemonError> {
         let changed = session_ids.iter().cloned().collect::<HashSet<_>>();
-        self.save_session_projection_parts(
-            durable,
-            sidecars,
-            workspace_roots,
-            true,
-            Some(&changed),
-            true,
-        )
+        self.save_session_projection_parts(durable, sidecars, workspace_roots, Some(&changed), true)
     }
 
     /// 持久化导航状态时只提交当前指针，以及缺失的目标会话 projection。
@@ -446,39 +335,7 @@ impl StateRepository {
         Ok(())
     }
 
-    /// v1 -> v2 converter 的唯一事件初始化入口。正常 v2 checkpoint 禁止调用。
-    fn initialize_session_events(&self, durable: &SessionDurableState) -> Result<(), DaemonError> {
-        let mut turns_by_session = HashMap::<SessionId, Vec<_>>::new();
-        for turn in &durable.canonical_turns {
-            turns_by_session
-                .entry(turn.session_id.clone())
-                .or_default()
-                .push(turn.clone());
-        }
-        for session in &durable.sessions {
-            let turns = turns_by_session
-                .remove(&session.session_id)
-                .unwrap_or_default();
-            let mutations = Self::initial_canonical_mutations(turns);
-            if mutations.is_empty() {
-                continue;
-            }
-            self.append_canonical_turn_transaction(&session.session_id, &mutations)
-                .map_err(|error| {
-                    DaemonError::internal(format!(
-                        "初始化迁移 canonical 事件失败 {}: {error}",
-                        session.session_id
-                    ))
-                })?;
-        }
-        if !turns_by_session.is_empty() {
-            return Err(DaemonError::internal(
-                "迁移 canonical turn 引用了不存在的 session".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
+    /// 把 projection 中的 canonical turn 快照转换为事件日志的初始写入序列。
     fn initial_canonical_mutations(
         mut turns: Vec<magi_session_store::CanonicalTurn>,
     ) -> Vec<CanonicalTurnMutation> {
@@ -599,19 +456,6 @@ impl StateRepository {
     pub(crate) fn load_session_projections(
         &self,
         workspace_roots: &[(String, PathBuf)],
-    ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
-        self.load_session_projections_inner(workspace_roots, true)
-    }
-
-    /// 仅供已识别到旧布局重写的恢复事务读取 v2 projection。
-    ///
-    /// 该阶段允许 current 指针暂时引用尚待导入的旧 session；调用方必须在
-    /// 写入任何新状态前通过 `merge_current_session_id` 把它收敛为真实存在的
-    /// session。普通启动永远走公开入口并保持严格校验。
-    fn load_session_projections_inner(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-        validate_current: bool,
     ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
         self.recover_session_projection_transaction(workspace_roots)?;
         self.restore_quarantined_session_events(workspace_roots)?;
@@ -976,8 +820,7 @@ impl StateRepository {
         }) {
             durable.current_session_id = None;
         }
-        if validate_current
-            && let Some(current_session_id) = durable.current_session_id.as_ref()
+        if let Some(current_session_id) = durable.current_session_id.as_ref()
             && !durable
                 .sessions
                 .iter()
@@ -1097,8 +940,8 @@ impl StateRepository {
     }
 
     /// 校验事件目录都有已恢复的 session 归属。首次 accepted 持久化可能在事件写入后、
-    /// projection 写入前崩溃；此时 accepted journal 会先把 session 恢复进内存，再调用
-    /// 本方法确认该孤立目录确实有 WAL 归属。
+    /// projection 写入前崩溃；此时事件中的 accepted 事实会先把 session 恢复进内存，再调用
+    /// 本方法确认该目录确实有归属。
     ///
     /// 没有任何归属的事件目录（典型来源：用户删除了工作区目录，其下会话的 projection 随之消失，
     /// 事件日志却留在全局 `session-events`）**不阻止启动**：整目录移到 `orphaned-session-events/`
@@ -1265,1028 +1108,40 @@ impl StateRepository {
         Ok(roots)
     }
 
-    pub(crate) fn migrate_legacy_state_layout(
+    /// 启动时恢复中断的 session projection 事务，并校验 state layout 版本标记。
+    ///
+    /// 只接受当前版本布局：标记版本不一致直接拒绝启动；没有标记的 state 目录视为
+    /// 全新状态并写入当前版本标记。
+    pub(crate) fn verify_state_layout(
         &self,
         workspace_roots: &[(String, PathBuf)],
     ) -> Result<(), DaemonError> {
         self.recover_session_projection_transaction(workspace_roots)?;
-        let layout_path = self.state_root.join("state-layout.json");
-        let migration_path = self.state_root.join("state-layout-migration.json");
-        let staging_path = self.state_layout_migration_staging_path();
-        let legacy = self.legacy_state_paths(workspace_roots);
-        let legacy_paths = legacy.existing_paths();
-
+        let layout_path = self.state_layout_marker_path();
         if layout_path.exists() {
-            let marker: StateLayoutMarker = self.read_json_strict(&layout_path)?;
-            if marker.version != STATE_LAYOUT_VERSION {
-                return Err(DaemonError::internal(format!(
-                    "不支持的 state layout 版本: {}",
-                    marker.version
-                )));
-            }
-            if migration_path.exists() {
-                self.remove_legacy_sources(&legacy)?;
-                self.remove_file_if_exists(&migration_path)?;
-                self.remove_file_if_exists(&staging_path)?;
-                return Ok(());
-            }
-            if !legacy_paths.is_empty() {
-                self.reconcile_reintroduced_legacy_state(workspace_roots, &legacy)?;
-            }
-            self.quarantine_legacy_orphan_event_logs(workspace_roots)?;
-            return Ok(());
+            return self.validate_state_layout_marker(&layout_path);
         }
-
-        let resuming = migration_path.exists();
-        if resuming {
-            let migration: StateLayoutMigration = self.read_json_strict(&migration_path)?;
-            if migration.source_version != 1 || migration.target_version != STATE_LAYOUT_VERSION {
-                return Err(DaemonError::internal(
-                    "state layout migration 标记版本不合法".to_string(),
-                ));
-            }
-        }
-
-        let has_unmarked_new_layout = if resuming && !staging_path.exists() {
-            // 旧版本没有 staging 快照。其迁移标记只表示“从旧布局重做”，
-            // 因而目录中的半成品不能再被当作事实来源。
-            self.clear_uncommitted_new_layout(workspace_roots)?;
-            false
-        } else {
-            self.new_layout_exists(workspace_roots)
-        };
-        if legacy_paths.is_empty() && !has_unmarked_new_layout && !resuming {
-            self.write_json_atomically(
-                layout_path,
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )?;
-            return Ok(());
-        }
-
-        let staging = if resuming && staging_path.exists() {
-            let mut staging: StateLayoutMigrationStaging = self.read_json_strict(&staging_path)?;
-            if staging.source_version != 1 || staging.target_version != STATE_LAYOUT_VERSION {
-                return Err(DaemonError::internal(
-                    "state layout migration staging 版本不合法".to_string(),
-                ));
-            }
-            // 迁移 staging 可能由旧实现生成：旧实现从 HashMap 合并 task/lease
-            // 后没有保持 checkpoint 的 canonical ID 顺序。恢复 projection 会
-            // 按 canonical 顺序返回，二者若直接比较会把纯顺序差异误判为数据损坏。
-            // 在继续迁移前统一 staging 表示，确保中断恢复与首次迁移走同一合同。
-            if let Some(task_checkpoint) = staging.task_checkpoint.as_mut() {
-                *task_checkpoint =
-                    TaskStore::restore_legacy_checkpoint(task_checkpoint)?.checkpoint();
-            }
-            staging
-        } else {
-            let (durable, sidecars) = if legacy_paths.is_empty() {
-                self.build_unmarked_session_state(workspace_roots, has_unmarked_new_layout)?
-            } else {
-                let mut durable = self.load_legacy_session_state(&legacy)?;
-                let mut sidecars = if legacy.session_sidecars.exists() {
-                    self.read_json_strict(&legacy.session_sidecars)?
-                } else {
-                    SessionExecutionSidecarStoreState::default()
-                };
-                let projections = if has_unmarked_new_layout {
-                    self.read_unmarked_session_projections(workspace_roots)?
-                } else {
-                    Vec::new()
-                };
-                Self::retain_reachable_legacy_sidecars(&mut sidecars, &durable, &projections);
-                if has_unmarked_new_layout {
-                    self.merge_unmarked_session_projections(
-                        &mut durable,
-                        &mut sidecars,
-                        &projections,
-                    )?;
-                }
-                let legacy_store = SessionStore::convert_v1_persisted_parts(durable, sidecars)
-                    .map_err(|error| {
-                        DaemonError::internal(format!("迁移旧 session 状态失败: {error}"))
-                    })?;
-                let mut durable = legacy_store.durable_state();
-                let sidecars = legacy_store.execution_sidecar_store_state();
-                if has_unmarked_new_layout {
-                    let (current, notifications) =
-                        self.read_unmarked_session_metadata(workspace_roots)?;
-                    self.merge_unmarked_notifications(&mut durable, notifications)?;
-                    self.merge_current_session_id(&mut durable, current)?;
-                }
-                (durable, sidecars)
-            };
-            let task_checkpoint = self.merge_task_checkpoint(&legacy, has_unmarked_new_layout)?;
-            let staging = StateLayoutMigrationStaging {
-                source_version: 1,
-                target_version: STATE_LAYOUT_VERSION,
-                durable,
-                sidecars,
-                task_checkpoint,
-            };
-            self.write_json_atomically(staging_path.clone(), &staging)?;
-            staging
-        };
-
-        if !resuming {
-            self.archive_legacy_sources(&legacy)?;
-            self.write_json_atomically(
-                migration_path.clone(),
-                &StateLayoutMigration {
-                    source_version: 1,
-                    target_version: STATE_LAYOUT_VERSION,
-                },
-            )?;
-        }
-
-        self.clear_uncommitted_new_layout(workspace_roots)?;
-        self.initialize_session_events(&staging.durable)?;
-        let workspace_root_map = workspace_roots.iter().cloned().collect::<HashMap<_, _>>();
-        self.save_session_projection_parts(
-            &staging.durable,
-            &staging.sidecars,
-            &workspace_root_map,
-            false,
-            None,
-            false,
-        )?;
-
-        if let Some(value) = staging.task_checkpoint.as_ref() {
-            let task_store = TaskStore::restore_legacy_checkpoint(value)?;
-            let snapshot = task_store.snapshot();
-            self.checkpoint_task_store_snapshot_inner(&snapshot, false)?;
-        }
-
-        self.validate_migrated_layout(
-            workspace_roots,
-            &staging.durable,
-            staging.task_checkpoint.as_ref(),
-        )?;
         self.write_json_atomically(
             layout_path,
             &StateLayoutMarker {
                 version: STATE_LAYOUT_VERSION,
             },
-        )?;
-        self.remove_legacy_sources(&legacy)?;
-        self.remove_file_if_exists(&migration_path)?;
-        self.remove_file_if_exists(&staging_path)?;
-        Ok(())
+        )
     }
 
-    /// 修复 2026-09-01 之前已提交 v2 状态中遗留的 canonical event 目录。
-    ///
-    /// 旧删除实现会移除 projection 却保留 event 目录。不能仅按目录名复活这些会话，
-    /// 否则用户已删除的历史会重新出现在列表中；也不能直接删除，避免丢失可诊断事实。
-    /// 只有同时满足以下条件才隔离：
-    ///
-    /// - 当前任一 projection 都不拥有该 session；
-    /// - event 中没有 accepted 恢复事实（这类日志可能是发送崩溃窗口，必须恢复）；
-    /// - 旧布局归档明确包含该 session，证明它来自迁移前的历史数据。
-    ///
-    /// 其他组合均按未知状态损坏拒绝启动，防止该修复掩盖真实数据丢失。
-    fn quarantine_legacy_orphan_event_logs(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<(), DaemonError> {
-        let marker_path = self.legacy_orphan_event_quarantine_marker_path();
-        if marker_path.exists() {
-            let marker: LegacyOrphanEventQuarantineMarker = self.read_json_strict(&marker_path)?;
-            if marker.schema_version != 1 {
-                return Err(DaemonError::internal(format!(
-                    "legacy orphan event 隔离标记版本不支持: {}",
-                    marker.schema_version
-                )));
-            }
-            return Ok(());
-        }
-
-        let event_parent = self.state_root.join("session-events");
-        if !event_parent.exists() {
-            self.write_json_atomically(
-                marker_path,
-                &LegacyOrphanEventQuarantineMarker { schema_version: 1 },
-            )?;
-            return Ok(());
-        }
-
-        let live_session_ids = self.read_committed_session_projection_ids(workspace_roots)?;
-        let archived_legacy_session_ids = self.archived_legacy_session_ids()?;
-        let quarantine_root = self
-            .state_root
-            .join("migrations")
-            .join("legacy-v1")
-            .join("orphan-session-events");
-
-        let mut event_roots = fs::read_dir(&event_parent)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        event_roots.sort();
-        for event_root in event_roots {
-            if !event_root.is_dir() {
-                return Err(DaemonError::internal(format!(
-                    "canonical event 根目录包含非 session 目录: {}",
-                    event_root.display()
-                )));
-            }
-            let session_id = SessionConversationProjection::read_session_id_from_root(&event_root)?;
-            if self.session_event_root(&session_id) != event_root {
-                return Err(DaemonError::internal(format!(
-                    "canonical event 目录与 session 归属不一致: {}",
-                    event_root.display()
-                )));
-            }
-            if live_session_ids.contains(&session_id) {
-                continue;
-            }
-            let event_projection = SessionConversationProjection::load(&event_root, &session_id)?;
-            if !event_projection.accepted_submissions().is_empty() {
-                // accepted 事实就是 projection 缺失时的恢复依据，交由常规恢复流程处理。
-                continue;
-            }
-            if !archived_legacy_session_ids.contains(&session_id) {
-                return Err(DaemonError::internal(format!(
-                    "canonical event 目录没有当前 session、accepted WAL 或旧布局归档归属: {}",
-                    event_root.display()
-                )));
-            }
-
-            fs::create_dir_all(&quarantine_root)?;
-            let encoded = Self::session_projection_file_name(&session_id)
-                .trim_end_matches(".json")
-                .to_string();
-            let target = quarantine_root.join(format!("{encoded}.events"));
-            if target.exists() {
-                return Err(DaemonError::internal(format!(
-                    "canonical event 隔离目录已存在，拒绝覆盖: {}",
-                    target.display()
-                )));
-            }
-            let record = LegacyOrphanEventQuarantineRecord {
-                schema_version: 1,
-                session_id: session_id.clone(),
-                reason: "legacy_session_deletion_left_unowned_canonical_events".to_string(),
-                archived_at: magi_core::UtcMillis::now(),
-                source_event_root: format!("session-events/{encoded}"),
-            };
-            // 先落盘隔离说明，再原子移动目录。若进程在移动前退出，下次会重试同一
-            // session；若已移动，原始 event 数据仍完整保留在确定的目标目录中。
-            self.write_json_atomically(quarantine_root.join(format!("{encoded}.json")), &record)?;
-            fs::rename(&event_root, &target)?;
-            Self::sync_parent_directory(&event_root);
-            Self::sync_parent_directory(&target);
-        }
-        self.write_json_atomically(
-            marker_path,
-            &LegacyOrphanEventQuarantineMarker { schema_version: 1 },
-        )?;
-        Ok(())
+    fn state_layout_marker_path(&self) -> PathBuf {
+        self.state_root.join("state-layout.json")
     }
 
-    fn read_committed_session_projection_ids(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<HashSet<SessionId>, DaemonError> {
-        // 这里只需要已提交 projection 的身份集合，不能重新调用完整恢复入口。
-        // 完整恢复会重放全部 canonical event；迁移清理和运行时恢复随后还会再次
-        // 读取同一批数据，正是启动阻塞的根因。
-        #[derive(serde::Deserialize)]
-        struct ProjectionIdentity {
-            durable: DurableIdentity,
-        }
-        #[derive(serde::Deserialize)]
-        struct DurableIdentity {
-            sessions: Vec<SessionIdentity>,
-        }
-        #[derive(serde::Deserialize)]
-        struct SessionIdentity {
-            #[serde(rename = "sessionId")]
-            session_id: SessionId,
-            #[serde(rename = "workspaceId")]
-            workspace_id: Option<String>,
-        }
-
-        let mut roots = vec![(String::new(), self.state_root.clone())];
-        roots.extend(workspace_roots.iter().cloned());
-        let mut paths_by_session = HashMap::<SessionId, PathBuf>::new();
-        let mut session_ids = HashSet::new();
-        for (workspace_id, workspace_root) in roots {
-            let projection_root = if workspace_id.is_empty() {
-                self.session_projection_root()
-            } else {
-                workspace_root.join(".magi").join("session-projections")
-            };
-            if !projection_root.exists() {
-                continue;
-            }
-            for entry in fs::read_dir(&projection_root)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                    continue;
-                }
-                let content = fs::read_to_string(&path)?;
-                let identity: ProjectionIdentity =
-                    serde_json::from_str(&content).map_err(|error| {
-                        DaemonError::internal(format!(
-                            "解析 session projection 身份失败 {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                if identity.durable.sessions.len() != 1 {
-                    return Err(DaemonError::internal(format!(
-                        "session projection 身份必须只包含一个 session: {}",
-                        path.display()
-                    )));
-                }
-                let session = &identity.durable.sessions[0];
-                match (workspace_id.is_empty(), session.workspace_id.as_deref()) {
-                    (true, Some(actual_workspace_id)) => {
-                        return Err(DaemonError::internal(format!(
-                            "全局 session projection 包含 workspace 归属: {} ({actual_workspace_id})",
-                            path.display()
-                        )));
-                    }
-                    (false, Some(actual_workspace_id)) if actual_workspace_id == workspace_id => {}
-                    (false, actual_workspace_id) => {
-                        return Err(DaemonError::internal(format!(
-                            "workspace session projection 身份与扫描根不一致: expected={workspace_id}, actual={} ({})",
-                            actual_workspace_id.unwrap_or("<none>"),
-                            path.display()
-                        )));
-                    }
-                    (true, None) => {}
-                }
-                let session_id = session.session_id.clone();
-                if let Some(previous_path) = paths_by_session.get(&session_id) {
-                    return Err(DaemonError::internal(format!(
-                        "session {} 存在重复 projection，拒绝自动去重: {} 与 {}",
-                        session_id,
-                        previous_path.display(),
-                        path.display()
-                    )));
-                }
-                paths_by_session.insert(session_id.clone(), path);
-                session_ids.insert(session_id);
-            }
-        }
-        Ok(session_ids)
-    }
-
-    fn archived_legacy_session_ids(&self) -> Result<HashSet<SessionId>, DaemonError> {
-        let archive_root = self
-            .state_root
-            .join("migrations")
-            .join("legacy-v1")
-            .join("archive");
-        if !archive_root.exists() {
-            return Ok(HashSet::new());
-        }
-        let mut paths = vec![archive_root.join("sessions.json")];
-        let workspace_root = archive_root.join("workspaces");
-        if workspace_root.exists() {
-            for entry in fs::read_dir(workspace_root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    paths.push(entry.path().join("sessions.json"));
-                }
-            }
-        }
-        let mut session_ids = HashSet::new();
-        for path in paths {
-            if !path.exists() {
-                continue;
-            }
-            let state = self.read_legacy_session_file(&path)?;
-            session_ids.extend(state.sessions.into_iter().map(|session| session.session_id));
-        }
-        Ok(session_ids)
-    }
-
-    fn legacy_orphan_event_quarantine_marker_path(&self) -> PathBuf {
-        self.state_root
-            .join("migrations")
-            .join("legacy-v1")
-            .join("orphan-event-quarantine.json")
-    }
-
-    /// v2 已提交后，旧版本进程仍可能在退出前把最后一次快照写回旧路径。
-    ///
-    /// 这些文件不能直接删除：空快照可以安全清理，新的 session 事实必须并入
-    /// canonical projection，已有 session 的冲突则必须停止启动并保留原文件，
-    /// 不能用旧布局覆盖 v2 的事件权威。该路径是一次性状态恢复，不是运行期
-    /// 双写或兼容存储。
-    fn reconcile_reintroduced_legacy_state(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-        legacy: &LegacyStatePaths,
-    ) -> Result<(), DaemonError> {
-        // v2 current 可能暂时指向仍停留在旧快照中的 session。先读取 projection
-        // 事实，再由本恢复事务在导入后统一校正 current；常规启动仍使用严格入口。
-        let (mut durable, mut sidecars) =
-            self.load_session_projections_inner(workspace_roots, false)?;
-        let legacy_durable = self.load_legacy_session_state(legacy)?;
-        let legacy_sidecars = if legacy.session_sidecars.exists() {
-            self.read_json_strict(&legacy.session_sidecars)?
-        } else {
-            SessionExecutionSidecarStoreState::default()
-        };
-        let legacy_store =
-            SessionStore::convert_v1_persisted_parts(legacy_durable, legacy_sidecars).map_err(
-                |error| DaemonError::internal(format!("恢复旧 session 状态失败: {error}")),
-            )?;
-        let normalized_durable = legacy_store.durable_state();
-        let normalized_sidecars = legacy_store.execution_sidecar_store_state();
-        let canonical_ids = durable
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<HashSet<_>>();
-        let mut imported = SessionDurableState::default();
-
-        for session in &normalized_durable.sessions {
-            let session_id = session.session_id.clone();
-            let candidate = normalized_durable.durable_state_for_session(&session_id);
-            if canonical_ids.contains(&session_id) {
-                let existing = durable.durable_state_for_session(&session_id);
-                let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
-                    == serde_json::to_value(&candidate).map_err(DaemonError::from)?;
-                if !same {
-                    return Err(DaemonError::internal(format!(
-                        "state layout v2 与旧布局存在冲突 session，保留旧文件待处理: {session_id}"
-                    )));
-                }
-            } else {
-                imported.append_state_without_current(candidate);
-            }
-        }
-
-        let imported_ids = imported
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<HashSet<_>>();
-        for candidate in normalized_sidecars.runtime_sidecars {
-            let session_id = candidate.session_id.clone();
-            let existing = sidecars.runtime_sidecar(&session_id);
-            if !canonical_ids.contains(&session_id) && !imported_ids.contains(&session_id) {
-                return Err(DaemonError::internal(format!(
-                    "旧布局 sidecar 没有 session 归属，保留旧文件待处理: {session_id}"
-                )));
-            }
-            match existing {
-                None => sidecars.upsert_runtime_sidecar(candidate),
-                Some(existing) => {
-                    let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
-                        == serde_json::to_value(&candidate).map_err(DaemonError::from)?;
-                    if same {
-                        continue;
-                    }
-                    if candidate.updated_at.0 > existing.updated_at.0 {
-                        sidecars.upsert_runtime_sidecar(candidate);
-                    } else if candidate.updated_at.0 == existing.updated_at.0 {
-                        return Err(DaemonError::internal(format!(
-                            "state layout v2 与旧布局存在冲突 sidecar，保留旧文件待处理: {session_id}"
-                        )));
-                    }
-                }
-            }
-        }
-
-        if !imported.sessions.is_empty() {
-            self.initialize_session_events(&imported)?;
-            durable.append_state_without_current(imported);
-        }
-        self.merge_current_session_id(&mut durable, normalized_durable.current_session_id)?;
-        self.merge_unmarked_notifications(
-            &mut durable,
-            normalized_durable
-                .notifications
-                .into_iter()
-                .filter(|notification| notification.session_id.is_none())
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(DaemonError::from)?,
-        )?;
-        self.save_session_projection_parts(
-            &durable,
-            &sidecars,
-            &workspace_roots.iter().cloned().collect::<HashMap<_, _>>(),
-            false,
-            None,
-            false,
-        )?;
-
-        if legacy.task_store.exists() {
-            let legacy_snapshot =
-                TaskStore::restore_legacy_checkpoint(&self.read_json_strict(&legacy.task_store)?)?
-                    .snapshot();
-            let merged_snapshot = match TaskStore::restore_from_projection_directory(
-                &self.task_store_projection_path(),
-            )? {
-                Some(current) => self.merge_task_snapshots(current.snapshot(), legacy_snapshot)?,
-                None => legacy_snapshot,
-            };
-            self.checkpoint_task_store_snapshot_inner(&merged_snapshot, false)?;
-        }
-
-        self.archive_reintroduced_legacy_sources(legacy)?;
-        self.remove_legacy_sources(legacy)?;
-        Ok(())
-    }
-
-    fn archive_reintroduced_legacy_sources(
-        &self,
-        legacy: &LegacyStatePaths,
-    ) -> Result<(), DaemonError> {
-        let parent = self
-            .state_root
-            .join("migrations")
-            .join("legacy-v1")
-            .join("reintroduced");
-        fs::create_dir_all(&parent)?;
-        let mut index = 0_u32;
-        let archive_root = loop {
-            let suffix = if index == 0 {
-                String::new()
-            } else {
-                format!("-{index}")
-            };
-            let path = parent.join(format!("{}{}", magi_core::UtcMillis::now().0, suffix));
-            match fs::create_dir(&path) {
-                Ok(()) => break path,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    index = index.saturating_add(1);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        for (source, relative) in [
-            (&legacy.global_sessions, PathBuf::from("sessions.json")),
-            (
-                &legacy.session_sidecars,
-                PathBuf::from("session-sidecars.json"),
-            ),
-            (&legacy.task_store, PathBuf::from("task-store.json")),
-        ] {
-            if source.exists() {
-                Self::archive_legacy_source(source, &archive_root.join(relative))?;
-            }
-        }
-        for (workspace_id, source) in &legacy.workspace_sessions {
-            if !source.exists() {
-                continue;
-            }
-            let workspace_dir =
-                Self::session_projection_file_name(&magi_core::SessionId::new(workspace_id))
-                    .trim_end_matches(".json")
-                    .to_string();
-            Self::archive_legacy_source(
-                source,
-                &archive_root
-                    .join("workspaces")
-                    .join(workspace_dir)
-                    .join("sessions.json"),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn state_layout_migration_staging_path(&self) -> PathBuf {
-        self.state_root.join("state-layout-migration-staging.json")
-    }
-
-    fn build_unmarked_session_state(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-        has_unmarked_new_layout: bool,
-    ) -> Result<(SessionDurableState, SessionExecutionSidecarStoreState), DaemonError> {
-        if !has_unmarked_new_layout {
-            return Ok((
-                SessionDurableState::default(),
-                SessionExecutionSidecarStoreState::default(),
-            ));
-        }
-        let projections = self.read_unmarked_session_projections(workspace_roots)?;
-        let mut durable = SessionDurableState::default();
-        let mut sidecars = SessionExecutionSidecarStoreState::default();
-        self.merge_unmarked_session_projections(&mut durable, &mut sidecars, &projections)?;
-        let (current, notifications) = self.read_unmarked_session_metadata(workspace_roots)?;
-        self.merge_unmarked_notifications(&mut durable, notifications)?;
-        self.merge_current_session_id(&mut durable, current)?;
-        Ok((durable, sidecars))
-    }
-
-    fn retain_reachable_legacy_sidecars(
-        sidecars: &mut SessionExecutionSidecarStoreState,
-        durable: &SessionDurableState,
-        projections: &[UnmarkedSessionProjection],
-    ) {
-        let mut reachable = durable
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<HashSet<_>>();
-        reachable.extend(
-            projections
-                .iter()
-                .filter_map(|projection| projection.durable.sessions.first())
-                .map(|session| session.session_id.clone()),
-        );
-        sidecars
-            .runtime_sidecars
-            .retain(|sidecar| reachable.contains(&sidecar.session_id));
-    }
-
-    fn read_unmarked_session_projections(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<Vec<UnmarkedSessionProjection>, DaemonError> {
-        let mut roots = vec![self.session_projection_root()];
-        roots.extend(
-            workspace_roots
-                .iter()
-                .map(|(_, root)| root.join(".magi").join("session-projections")),
-        );
-        let mut by_session = HashMap::<SessionId, UnmarkedSessionProjection>::new();
-        for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            for entry in fs::read_dir(&root)? {
-                let entry = entry?;
-                let path = entry.path();
-                if !entry.file_type()?.is_file()
-                    || path.extension().and_then(|extension| extension.to_str()) != Some("json")
-                {
-                    continue;
-                }
-                let content = fs::read_to_string(&path)?;
-                let parsed: UnmarkedSessionProjectionSnapshot = serde_json::from_str(&content)
-                    .map_err(|error| {
-                        DaemonError::internal(format!(
-                            "解析未标记 session projection 失败 {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                let snapshot = SessionProjectionSnapshot {
-                    canonical_event_seq: 0,
-                    durable: parsed.durable.clone(),
-                    sidecar: parsed.sidecar.clone(),
-                };
-                let session_id = Self::validate_session_projection(&snapshot, &path)?;
-                let candidate = UnmarkedSessionProjection {
-                    path: path.clone(),
-                    durable: parsed.durable,
-                    sidecar: parsed.sidecar,
-                };
-                if let Some(previous) = by_session.get(&session_id) {
-                    let same_durable = serde_json::to_value(&previous.durable)
-                        .map_err(DaemonError::from)?
-                        == serde_json::to_value(&candidate.durable).map_err(DaemonError::from)?;
-                    let same_sidecar = serde_json::to_value(&previous.sidecar)
-                        .map_err(DaemonError::from)?
-                        == serde_json::to_value(&candidate.sidecar).map_err(DaemonError::from)?;
-                    if !same_durable || !same_sidecar {
-                        return Err(DaemonError::internal(format!(
-                            "未标记 session projection 包含冲突 session {}: {} 与 {}",
-                            session_id,
-                            previous.path.display(),
-                            path.display()
-                        )));
-                    }
-                    continue;
-                }
-                by_session.insert(session_id, candidate);
-            }
-        }
-        Ok(by_session.into_values().collect())
-    }
-
-    fn read_unmarked_session_metadata(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<(Option<SessionId>, Vec<serde_json::Value>), DaemonError> {
-        let current_path = self.state_root.join("session-current.json");
-        let current = if current_path.exists() {
-            Some(self.read_json_strict(&current_path)?)
-        } else {
-            None
-        };
-        let mut notifications = Vec::new();
-        let mut metadata_paths = vec![self.state_root.join("session-app-meta.json")];
-        metadata_paths.extend(
-            workspace_roots
-                .iter()
-                .map(|(_, root)| root.join(".magi").join("session-workspace-meta.json")),
-        );
-        for path in metadata_paths {
-            if !path.exists() {
-                continue;
-            }
-            let meta: SessionDurableState = self.read_json_strict(&path)?;
-            notifications.extend(
-                meta.notifications
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(DaemonError::from)?,
-            );
-        }
-        Ok((current.flatten(), notifications))
-    }
-
-    fn merge_unmarked_session_projections(
-        &self,
-        durable: &mut SessionDurableState,
-        sidecars: &mut SessionExecutionSidecarStoreState,
-        projections: &[UnmarkedSessionProjection],
-    ) -> Result<(), DaemonError> {
-        for projection in projections {
-            let session_id = projection
-                .durable
-                .sessions
-                .first()
-                .expect("validated session projection must contain one session")
-                .session_id
-                .clone();
-            let existing = durable.durable_state_for_session(&session_id);
-            let selected = if existing.sessions.is_empty() {
-                projection.durable.clone()
-            } else {
-                let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
-                    == serde_json::to_value(&projection.durable).map_err(DaemonError::from)?;
-                if same {
-                    existing
-                } else {
-                    let existing_updated = existing.sessions[0].updated_at.0;
-                    let candidate_updated = projection.durable.sessions[0].updated_at.0;
-                    match candidate_updated.cmp(&existing_updated) {
-                        std::cmp::Ordering::Greater => projection.durable.clone(),
-                        std::cmp::Ordering::Less => existing,
-                        std::cmp::Ordering::Equal => {
-                            return Err(DaemonError::internal(format!(
-                                "session {} 新旧布局更新时间相同但事实冲突",
-                                session_id
-                            )));
-                        }
-                    }
-                }
-            };
-            Self::replace_session_facts(durable, &session_id, selected);
-
-            if let Some(candidate) = projection.sidecar.clone() {
-                match sidecars.runtime_sidecar(&session_id) {
-                    None => sidecars.upsert_runtime_sidecar(candidate),
-                    Some(existing) => {
-                        let same = serde_json::to_value(&existing).map_err(DaemonError::from)?
-                            == serde_json::to_value(&candidate).map_err(DaemonError::from)?;
-                        if same {
-                            continue;
-                        }
-                        if candidate.updated_at.0 > existing.updated_at.0 {
-                            sidecars.upsert_runtime_sidecar(candidate);
-                        } else if candidate.updated_at.0 == existing.updated_at.0 {
-                            return Err(DaemonError::internal(format!(
-                                "session {} 新旧 sidecar 更新时间相同但事实冲突",
-                                session_id
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn replace_session_facts(
-        durable: &mut SessionDurableState,
-        session_id: &SessionId,
-        selected: SessionDurableState,
-    ) {
-        durable
-            .sessions
-            .retain(|session| &session.session_id != session_id);
-        durable
-            .timeline
-            .retain(|entry| &entry.session_id != session_id);
-        durable
-            .canonical_turns
-            .retain(|turn| &turn.session_id != session_id);
-        durable
-            .notifications
-            .retain(|notification| notification.session_id.as_ref() != Some(session_id));
-        durable.goals.retain(|goal| &goal.session_id != session_id);
-        durable.plans.retain(|plan| &plan.session_id != session_id);
-        let removed_thread_ids = durable
-            .thread_registry
-            .iter()
-            .filter(|thread| &thread.session_id == session_id)
-            .map(|thread| thread.thread_id.clone())
-            .collect::<HashSet<_>>();
-        durable
-            .thread_registry
-            .retain(|thread| &thread.session_id != session_id);
-        let selected_thread_ids = selected
-            .thread_registry
-            .iter()
-            .map(|thread| thread.thread_id.clone())
-            .collect::<HashSet<_>>();
-        durable.thread_context_checkpoints.retain(|checkpoint| {
-            !removed_thread_ids.contains(&checkpoint.thread_id)
-                && !selected_thread_ids.contains(&checkpoint.thread_id)
-        });
-        durable.append_state_without_current(selected);
-    }
-
-    fn merge_unmarked_notifications(
-        &self,
-        durable: &mut SessionDurableState,
-        incoming: Vec<serde_json::Value>,
-    ) -> Result<(), DaemonError> {
-        for value in incoming {
-            let notification: magi_session_store::NotificationRecord =
-                serde_json::from_value(value).map_err(DaemonError::from)?;
-            if let Some(existing) = durable
-                .notifications
-                .iter_mut()
-                .find(|existing| existing.notification_id == notification.notification_id)
-            {
-                let existing_value = serde_json::to_value(&*existing).map_err(DaemonError::from)?;
-                let incoming_value =
-                    serde_json::to_value(&notification).map_err(DaemonError::from)?;
-                if existing_value == incoming_value {
-                    continue;
-                }
-                if notification.created_at.0 > existing.created_at.0 {
-                    *existing = notification;
-                } else if notification.created_at.0 == existing.created_at.0 {
-                    return Err(DaemonError::internal(format!(
-                        "notification {} 新旧布局创建时间相同但事实冲突",
-                        notification.notification_id
-                    )));
-                }
-            } else {
-                durable.notifications.push(notification);
-            }
-        }
-        Ok(())
-    }
-
-    fn merge_current_session_id(
-        &self,
-        durable: &mut SessionDurableState,
-        incoming: Option<SessionId>,
-    ) -> Result<(), DaemonError> {
-        let Some(incoming) = incoming else {
-            return Ok(());
-        };
-        if !durable
-            .sessions
-            .iter()
-            .any(|session| session.session_id == incoming)
-        {
+    fn validate_state_layout_marker(&self, layout_path: &Path) -> Result<(), DaemonError> {
+        let marker: StateLayoutMarker = self.read_json_strict(layout_path)?;
+        if marker.version != STATE_LAYOUT_VERSION {
             return Err(DaemonError::internal(format!(
-                "未标记 session current 指向不存在的 session: {incoming}"
+                "不支持的 state layout 版本: {}",
+                marker.version
             )));
         }
-        let Some(existing) = durable.current_session_id.clone() else {
-            durable.current_session_id = Some(incoming);
-            return Ok(());
-        };
-        if existing == incoming {
-            return Ok(());
-        }
-        let updated_at = |session_id: &SessionId| {
-            durable
-                .sessions
-                .iter()
-                .find(|session| &session.session_id == session_id)
-                .map(|session| session.updated_at.0)
-                .unwrap_or(0)
-        };
-        match updated_at(&incoming).cmp(&updated_at(&existing)) {
-            std::cmp::Ordering::Greater => durable.current_session_id = Some(incoming),
-            std::cmp::Ordering::Equal => {
-                return Err(DaemonError::internal(format!(
-                    "新旧布局 current session 冲突: {existing} 与 {incoming}"
-                )));
-            }
-            std::cmp::Ordering::Less => {}
-        }
         Ok(())
-    }
-
-    fn merge_task_checkpoint(
-        &self,
-        legacy: &LegacyStatePaths,
-        has_unmarked_new_layout: bool,
-    ) -> Result<Option<serde_json::Value>, DaemonError> {
-        let legacy_snapshot = if legacy.task_store.exists() {
-            Some(
-                TaskStore::restore_legacy_checkpoint(&self.read_json_strict(&legacy.task_store)?)?
-                    .snapshot(),
-            )
-        } else {
-            None
-        };
-        let new_snapshot = if has_unmarked_new_layout {
-            TaskStore::restore_unmarked_projection_directory_for_migration(
-                &self.task_store_projection_path(),
-            )?
-            .map(|store| store.snapshot())
-        } else {
-            None
-        };
-        let Some(snapshot) = (match (legacy_snapshot, new_snapshot) {
-            (None, None) => None,
-            (Some(snapshot), None) | (None, Some(snapshot)) => Some(snapshot),
-            (Some(legacy), Some(candidate)) => Some(self.merge_task_snapshots(legacy, candidate)?),
-        }) else {
-            return Ok(None);
-        };
-        let value = serde_json::json!({
-            "tasks": snapshot.tasks,
-            "leases": snapshot.leases,
-        });
-        TaskStore::restore_legacy_checkpoint(&value)?;
-        Ok(Some(value))
-    }
-
-    fn merge_task_snapshots(
-        &self,
-        legacy: TaskStoreSnapshot,
-        candidate: TaskStoreSnapshot,
-    ) -> Result<TaskStoreSnapshot, DaemonError> {
-        let mut tasks = legacy
-            .tasks
-            .into_iter()
-            .map(|task| (task.task_id.clone(), task))
-            .collect::<HashMap<_, _>>();
-        for task in candidate.tasks {
-            match tasks.get(&task.task_id) {
-                None => {
-                    tasks.insert(task.task_id.clone(), task);
-                }
-                Some(existing) => {
-                    let same = serde_json::to_value(existing).map_err(DaemonError::from)?
-                        == serde_json::to_value(&task).map_err(DaemonError::from)?;
-                    if same {
-                        continue;
-                    }
-                    if task.updated_at.0 > existing.updated_at.0 {
-                        tasks.insert(task.task_id.clone(), task);
-                    } else if task.updated_at.0 == existing.updated_at.0 {
-                        return Err(DaemonError::internal(format!(
-                            "新旧 task 更新时间相同但事实冲突: {}",
-                            task.task_id
-                        )));
-                    }
-                }
-            }
-        }
-        let mut leases = legacy
-            .leases
-            .into_iter()
-            .map(|lease| (lease.lease_id.clone(), lease))
-            .collect::<HashMap<_, _>>();
-        for lease in candidate.leases {
-            match leases.get(&lease.lease_id) {
-                None => {
-                    leases.insert(lease.lease_id.clone(), lease);
-                }
-                Some(existing) => {
-                    let same = serde_json::to_value(existing).map_err(DaemonError::from)?
-                        == serde_json::to_value(&lease).map_err(DaemonError::from)?;
-                    if same {
-                        continue;
-                    }
-                    if lease.heartbeat_at.0 > existing.heartbeat_at.0 {
-                        leases.insert(lease.lease_id.clone(), lease);
-                    } else if lease.heartbeat_at.0 == existing.heartbeat_at.0 {
-                        return Err(DaemonError::internal(format!(
-                            "新旧 lease heartbeat 相同但事实冲突: {}",
-                            lease.lease_id
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(TaskStoreSnapshot {
-            tasks: {
-                let mut tasks = tasks.into_values().collect::<Vec<_>>();
-                tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
-                tasks
-            },
-            leases: {
-                let mut leases = leases.into_values().collect::<Vec<_>>();
-                leases.sort_by(|left, right| left.lease_id.as_str().cmp(right.lease_id.as_str()));
-                leases
-            },
-            changed_root_ids: Vec::new(),
-        })
     }
 
     fn session_projection_transaction_path(&self) -> PathBuf {
@@ -2433,267 +1288,6 @@ impl StateRepository {
             Err(error) => return Err(error.into()),
         }
         Ok(())
-    }
-
-    fn legacy_state_paths(&self, workspace_roots: &[(String, PathBuf)]) -> LegacyStatePaths {
-        LegacyStatePaths {
-            global_sessions: self.state_root.join("sessions.json"),
-            session_sidecars: self.state_root.join("session-sidecars.json"),
-            task_store: self.state_root.join("task-store.json"),
-            workspace_sessions: workspace_roots
-                .iter()
-                .map(|(workspace_id, root)| {
-                    (
-                        workspace_id.clone(),
-                        root.join(".magi").join("sessions.json"),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    fn load_legacy_session_state(
-        &self,
-        legacy: &LegacyStatePaths,
-    ) -> Result<SessionDurableState, DaemonError> {
-        let mut merged = if legacy.global_sessions.exists() {
-            self.read_legacy_session_file(&legacy.global_sessions)?
-        } else {
-            SessionDurableState::default()
-        };
-        let mut session_ids = merged
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<HashSet<_>>();
-
-        for (workspace_id, path) in &legacy.workspace_sessions {
-            if !path.exists() {
-                continue;
-            }
-            let state = self.read_legacy_session_file(path)?;
-            if let Some(session) = state
-                .sessions
-                .iter()
-                .find(|session| session.workspace_id.as_deref() != Some(workspace_id.as_str()))
-            {
-                return Err(DaemonError::internal(format!(
-                    "旧 workspace session 文件包含错误归属 {}: {}",
-                    session.session_id,
-                    path.display()
-                )));
-            }
-            if let Some(duplicate) = state
-                .sessions
-                .iter()
-                .find(|session| !session_ids.insert(session.session_id.clone()))
-            {
-                return Err(DaemonError::internal(format!(
-                    "旧布局包含重复 session {}: {}",
-                    duplicate.session_id,
-                    path.display()
-                )));
-            }
-            if let (Some(current), Some(incoming)) = (
-                merged.current_session_id.as_ref(),
-                state.current_session_id.as_ref(),
-            ) && current != incoming
-            {
-                return Err(DaemonError::internal(format!(
-                    "旧布局包含冲突的 current session: {current} 与 {incoming}"
-                )));
-            }
-            merged.append_state(state);
-        }
-        Ok(merged)
-    }
-
-    fn read_legacy_session_file(&self, path: &Path) -> Result<SessionDurableState, DaemonError> {
-        let content = fs::read_to_string(path)?;
-        let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
-            DaemonError::internal(format!(
-                "解析旧 session 状态失败 {}: {error}",
-                path.display()
-            ))
-        })?;
-        migrate_session_goal_state(&mut value);
-        serde_json::from_value(value).map_err(|error| {
-            DaemonError::internal(format!(
-                "迁移旧 session schema 失败 {}: {error}",
-                path.display()
-            ))
-        })
-    }
-
-    fn validate_migrated_layout(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-        expected_sessions: &SessionDurableState,
-        expected_task_checkpoint: Option<&serde_json::Value>,
-    ) -> Result<(), DaemonError> {
-        let verifier = StateRepository::new(self.state_root.clone());
-        let (actual_sessions, _) = verifier.load_session_projections(workspace_roots)?;
-        let mut expected_ids = expected_sessions
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<Vec<_>>();
-        let mut actual_ids = actual_sessions
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<Vec<_>>();
-        expected_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        actual_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        if expected_ids != actual_ids
-            || expected_sessions.current_session_id != actual_sessions.current_session_id
-        {
-            return Err(DaemonError::internal(
-                "迁移后的 session 索引或 current 指针校验失败".to_string(),
-            ));
-        }
-        for session_id in &expected_ids {
-            let expected = expected_sessions.durable_state_for_session(session_id);
-            let actual = actual_sessions.durable_state_for_session(session_id);
-            if serde_json::to_value(expected).map_err(DaemonError::from)?
-                != serde_json::to_value(actual).map_err(DaemonError::from)?
-            {
-                return Err(DaemonError::internal(format!(
-                    "迁移后的 session projection 校验失败: {session_id}"
-                )));
-            }
-        }
-
-        if let Some(expected) = expected_task_checkpoint {
-            let restored =
-                TaskStore::restore_from_projection_directory(&self.task_store_projection_path())?
-                    .ok_or_else(|| DaemonError::internal("迁移后的 task store 为空".to_string()))?;
-            if &restored.checkpoint() != expected {
-                return Err(DaemonError::internal(
-                    "迁移后的 task store checkpoint 校验失败".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn new_layout_exists(&self, workspace_roots: &[(String, PathBuf)]) -> bool {
-        self.session_projection_root().exists()
-            || self.state_root.join("session-events").exists()
-            || self.state_root.join("session-current.json").exists()
-            || self.state_root.join("session-app-meta.json").exists()
-            || self.task_store_projection_path().exists()
-            || workspace_roots.iter().any(|(_, root)| {
-                root.join(".magi").join("session-projections").exists()
-                    || root
-                        .join(".magi")
-                        .join("session-workspace-meta.json")
-                        .exists()
-            })
-    }
-
-    fn clear_uncommitted_new_layout(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<(), DaemonError> {
-        for path in [
-            self.session_projection_root(),
-            self.state_root.join("session-events"),
-            self.task_store_projection_path(),
-        ] {
-            self.remove_dir_if_exists(&path)?;
-        }
-        for path in [
-            self.state_root.join("session-current.json"),
-            self.state_root.join("session-app-meta.json"),
-        ] {
-            self.remove_file_if_exists(&path)?;
-        }
-        for (_, root) in workspace_roots {
-            self.remove_dir_if_exists(&root.join(".magi").join("session-projections"))?;
-            self.remove_file_if_exists(&root.join(".magi").join("session-workspace-meta.json"))?;
-        }
-        *self
-            .session_projection_cache
-            .lock()
-            .expect("session projection cache lock poisoned") = SessionProjectionCache::default();
-        self.session_event_cache
-            .lock()
-            .expect("session event cache lock poisoned")
-            .clear();
-        self.event_accepted_submissions
-            .lock()
-            .expect("event accepted submission cache lock poisoned")
-            .clear();
-        Ok(())
-    }
-
-    fn archive_legacy_sources(&self, legacy: &LegacyStatePaths) -> Result<(), DaemonError> {
-        let archive_root = self
-            .state_root
-            .join("migrations")
-            .join("legacy-v1")
-            .join("archive");
-        for (source, relative) in [
-            (&legacy.global_sessions, PathBuf::from("sessions.json")),
-            (
-                &legacy.session_sidecars,
-                PathBuf::from("session-sidecars.json"),
-            ),
-            (&legacy.task_store, PathBuf::from("task-store.json")),
-        ] {
-            if source.exists() {
-                Self::archive_legacy_source(source, &archive_root.join(relative))?;
-            }
-        }
-        for (workspace_id, source) in &legacy.workspace_sessions {
-            if !source.exists() {
-                continue;
-            }
-            let workspace_dir =
-                Self::session_projection_file_name(&magi_core::SessionId::new(workspace_id))
-                    .trim_end_matches(".json")
-                    .to_string();
-            Self::archive_legacy_source(
-                source,
-                &archive_root
-                    .join("workspaces")
-                    .join(workspace_dir)
-                    .join("sessions.json"),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn archive_legacy_source(source: &Path, target: &Path) -> Result<(), DaemonError> {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        magi_core::fs_atomic::write_atomic(target, fs::read(source)?)?;
-        Ok(())
-    }
-
-    fn remove_legacy_sources(&self, legacy: &LegacyStatePaths) -> Result<(), DaemonError> {
-        for path in legacy.existing_paths() {
-            self.remove_file_if_exists(&path)?;
-        }
-        Ok(())
-    }
-
-    fn remove_file_if_exists(&self, path: &Path) -> Result<(), DaemonError> {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn remove_dir_if_exists(&self, path: &Path) -> Result<(), DaemonError> {
-        match fs::remove_dir_all(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
     }
 
     fn read_json_strict<T>(&self, path: &Path) -> Result<T, DaemonError>
@@ -2934,7 +1528,6 @@ impl StateRepository {
         durable: &SessionDurableState,
         sidecars: &SessionExecutionSidecarStoreState,
         workspace_roots: &HashMap<String, PathBuf>,
-        mark_layout: bool,
         changed_session_ids: Option<&HashSet<SessionId>>,
         partial_snapshot: bool,
     ) -> Result<(), DaemonError> {
@@ -3221,37 +1814,6 @@ impl StateRepository {
             });
         }
 
-        // 这里仅收敛旧版本 accepted journal。新请求的 accepted 事实已经和 canonical
-        // event 写入同一个 event segment，不再经过该文件。
-        let accepted_path = self.accepted_submissions_path();
-        let mut accepted = self.read_accepted_submission_journal_strict(&accepted_path)?;
-        for record in &mut accepted.records {
-            record.session_checkpointed = if partial_snapshot {
-                changed_session_ids.is_some_and(|session_ids| {
-                    session_ids.contains(&record.session.session.session_id)
-                })
-            } else {
-                true
-            };
-        }
-        accepted
-            .records
-            .retain(|record| !(record.session_checkpointed && record.task_checkpointed));
-        if accepted.records.is_empty() {
-            if accepted_path.exists() {
-                removals.push(SessionProjectionRemoval {
-                    path: accepted_path,
-                    kind: SessionProjectionRemovalKind::File,
-                });
-            }
-        } else {
-            let content = serde_json::to_string_pretty(&accepted).map_err(DaemonError::from)?;
-            writes.push(SessionProjectionWrite {
-                path: accepted_path,
-                content,
-            });
-        }
-
         let transaction = SessionProjectionTransaction {
             schema_version: SESSION_PROJECTION_TRANSACTION_SCHEMA_VERSION,
             transaction_id: format!("session-projection-{}", magi_core::UtcMillis::now().0),
@@ -3259,9 +1821,7 @@ impl StateRepository {
             removals,
         };
         self.commit_session_projection_transaction_locked(&transaction, workspace_roots)?;
-        if mark_layout {
-            self.ensure_state_layout_marker_locked()?;
-        }
+        self.ensure_state_layout_marker_locked()?;
 
         next_cache.pending_removals.clear();
         next_cache.pending_event_removals.clear();
@@ -3286,21 +1846,9 @@ impl StateRepository {
     }
 
     fn ensure_state_layout_marker_locked(&self) -> Result<(), DaemonError> {
-        let layout_path = self.state_root.join("state-layout.json");
+        let layout_path = self.state_layout_marker_path();
         if layout_path.exists() {
-            let marker: StateLayoutMarker = self.read_json_strict(&layout_path)?;
-            if marker.version != STATE_LAYOUT_VERSION {
-                return Err(DaemonError::internal(format!(
-                    "不支持的 state layout 版本: {}",
-                    marker.version
-                )));
-            }
-            return Ok(());
-        }
-        if self.state_root.join("state-layout-migration.json").exists() {
-            return Err(DaemonError::internal(
-                "state layout migration 尚未完成，拒绝提交 v2 状态".to_string(),
-            ));
+            return self.validate_state_layout_marker(&layout_path);
         }
         self.write_json_atomically_locked(
             layout_path,
@@ -3322,18 +1870,17 @@ impl StateRepository {
         format!("{encoded}.json")
     }
 
-    pub(crate) fn accepted_submissions_path(&self) -> PathBuf {
-        self.state_root.join("accepted-submissions.json")
-    }
-
     pub(crate) fn task_store_projection_path(&self) -> PathBuf {
         self.state_root.join("task-store-projections")
     }
 
+    /// 返回 canonical 事件中尚未完全收敛的 accepted 事实。
+    ///
+    /// accepted 事实与 canonical event 写在同一个事件事务里，session 侧在事件提交时即已
+    /// durable；这里只按已提交的 task manifest 判断 task 侧是否已经 checkpoint。
     pub(crate) fn load_accepted_submissions(
         &self,
     ) -> Result<Vec<AcceptedSubmissionRecord>, DaemonError> {
-        let path = self.accepted_submissions_path();
         let _write_guard = self
             .write_lock
             .lock()
@@ -3341,32 +1888,16 @@ impl StateRepository {
         let committed_generation =
             TaskStore::committed_projection_generation(&self.task_store_projection_path())?
                 .unwrap_or(0);
-        let mut journal = self.read_accepted_submission_journal_strict(&path)?;
-        let event_records = self
+        let mut records = self
             .event_accepted_submissions
             .lock()
             .expect("event accepted submission cache lock poisoned")
             .clone();
-        let mut records = Vec::with_capacity(event_records.len() + journal.records.len());
-        let mut seen = HashSet::new();
-        for record in event_records.into_iter().chain(journal.records.drain(..)) {
-            let key = format!(
-                "{}\u{0}{}",
-                record.session.session.session_id, record.session.canonical_turn.turn_id
-            );
-            if seen.insert(key) {
-                records.push(record);
-            }
-        }
-        let mut reconciled = false;
         for record in &mut records {
             // Conversation acceptance 没有 Task projection；其 canonical event 本身
             // 已经是完整 durable 事实，不能等待不存在的 task manifest。
             let Some(task) = record.task.as_ref() else {
-                if !record.task_checkpointed {
-                    record.task_checkpointed = true;
-                    reconciled = true;
-                }
+                record.task_checkpointed = true;
                 continue;
             };
             if !record.task_checkpointed
@@ -3377,110 +1908,14 @@ impl StateRepository {
                     )?)
             {
                 record.task_checkpointed = true;
-                reconciled = true;
             }
-        }
-        if reconciled {
-            let mut journal_state = self.read_accepted_submission_journal_strict(&path)?;
-            for record in &records {
-                if record.task_checkpointed
-                    && let Some(candidate) = journal_state.records.iter_mut().find(|candidate| {
-                        candidate.session.session.session_id == record.session.session.session_id
-                            && candidate.session.canonical_turn.turn_id
-                                == record.session.canonical_turn.turn_id
-                    })
-                {
-                    candidate.task_checkpointed = true;
-                }
-            }
-            self.finish_accepted_submission_journal_locked(path, journal_state)?;
         }
         records.retain(|record| !(record.session_checkpointed && record.task_checkpointed));
         Ok(records)
     }
 
-    #[cfg(test)]
-    pub(crate) fn save_accepted_submission(
-        &self,
-        session_store: &SessionStore,
-        session_id: &magi_core::SessionId,
-        turn_id: &str,
-        task_store: &TaskStore,
-        root_task_id: &TaskId,
-    ) -> Result<(), DaemonError> {
-        let session = session_store
-            .session_acceptance_record(session_id, turn_id)
-            .ok_or_else(|| DaemonError::internal("构造 accepted session journal 失败"))?;
-        let task = task_store
-            .get_task(root_task_id)
-            .ok_or_else(|| DaemonError::internal("构造 accepted task journal 失败"))?;
-        self.save_accepted_submission_record(session_id, &session, &task)
-    }
-
-    #[cfg(test)]
-    fn save_accepted_submission_record(
-        &self,
-        session_id: &SessionId,
-        session: &SessionAcceptanceRecord,
-        task: &Task,
-    ) -> Result<(), DaemonError> {
-        let _write_guard = self
-            .write_lock
-            .lock()
-            .expect("state repository write lock poisoned");
-        self.save_accepted_submission_record_locked(session_id, session, task)
-    }
-
-    #[cfg(test)]
-    fn save_accepted_submission_record_locked(
-        &self,
-        session_id: &SessionId,
-        session: &SessionAcceptanceRecord,
-        task: &Task,
-    ) -> Result<(), DaemonError> {
-        if session.session.session_id != *session_id
-            || session.canonical_turn.session_id != *session_id
-        {
-            return Err(DaemonError::internal(format!(
-                "accepted session journal 归属不一致: {}",
-                session_id
-            )));
-        }
-        let path = self.accepted_submissions_path();
-        let task_projection_generation_at_acceptance =
-            TaskStore::committed_projection_generation(&self.task_store_projection_path())?
-                .unwrap_or(0);
-        let mut journal = self.read_accepted_submission_journal_strict(&path)?;
-        journal.records.retain(|record| {
-            !(record.session.session.session_id == *session_id
-                && record.session.canonical_turn.turn_id == session.canonical_turn.turn_id)
-        });
-        journal.records.push(AcceptedSubmissionRecord {
-            session: session.clone(),
-            task: Some(task.clone()),
-            session_checkpointed: false,
-            task_checkpointed: false,
-            task_projection_generation_at_acceptance,
-        });
-        journal.records.sort_by(|left, right| {
-            left.session
-                .canonical_turn
-                .accepted_at
-                .0
-                .cmp(&right.session.canonical_turn.accepted_at.0)
-                .then_with(|| {
-                    left.session
-                        .canonical_turn
-                        .turn_id
-                        .cmp(&right.session.canonical_turn.turn_id)
-                })
-        });
-        self.write_json_atomically_locked(path, &journal)
-    }
-
-    /// 在同一个 repository 写锁内提交 task manifest 并收敛 accepted WAL。
-    /// manifest 是 task projection 的唯一提交点；提交后所有更早接纳的 task（包括已删除
-    /// 的 task）都已被该完整快照覆盖，因此不得再按 task 是否仍存在来决定 WAL 状态。
+    /// 在 repository 写锁内提交 task manifest。manifest 是 task projection 的唯一提交点；
+    /// 提交后所有更早接纳的 task（包括已删除的 task）都已被该完整快照覆盖。
     pub(crate) fn checkpoint_task_store(
         &self,
         task_store: &TaskStore,
@@ -3493,91 +1928,15 @@ impl StateRepository {
         &self,
         snapshot: &TaskStoreSnapshot,
     ) -> Result<usize, DaemonError> {
-        self.checkpoint_task_store_snapshot_inner(snapshot, true)
-    }
-
-    fn checkpoint_task_store_snapshot_inner(
-        &self,
-        snapshot: &TaskStoreSnapshot,
-        mark_layout: bool,
-    ) -> Result<usize, DaemonError> {
-        let path = self.accepted_submissions_path();
         let _write_guard = self
             .write_lock
             .lock()
             .expect("state repository write lock poisoned");
-        let mut journal = self.read_accepted_submission_journal_strict(&path)?;
-        if mark_layout {
-            self.ensure_state_layout_marker_locked()?;
-        }
-        let projection_count = TaskStore::checkpoint_snapshot_to_projection_directory(
+        self.ensure_state_layout_marker_locked()?;
+        Ok(TaskStore::checkpoint_snapshot_to_projection_directory(
             snapshot,
             &self.task_store_projection_path(),
-        )?;
-        for record in &mut journal.records {
-            record.task_checkpointed = true;
-        }
-        if let Err(error) = self.finish_accepted_submission_journal_locked(path, journal) {
-            // task projection 的 manifest 已经是提交点。WAL 收尾只是清理动作，
-            // 失败时保留 WAL，下一次启动会依据已提交 manifest 重新收敛，不能把
-            // 已经 durable 的 task mutation 伪装成失败并阻止内存提交。
-            warn!(
-                ?error,
-                "task checkpoint 已提交，但 accepted WAL 收尾失败，将在下次恢复时重试"
-            );
-        }
-        Ok(projection_count)
-    }
-
-    pub(crate) fn prune_accepted_submissions(&self) -> Result<(), DaemonError> {
-        let path = self.accepted_submissions_path();
-        let _write_guard = self
-            .write_lock
-            .lock()
-            .expect("state repository write lock poisoned");
-        let journal = self.read_accepted_submission_journal_strict(&path)?;
-        self.finish_accepted_submission_journal_locked(path, journal)
-    }
-
-    fn read_accepted_submission_journal_strict(
-        &self,
-        path: &Path,
-    ) -> Result<AcceptedSubmissionJournal, DaemonError> {
-        if !path.exists() {
-            return Ok(AcceptedSubmissionJournal::default());
-        }
-        let content = fs::read_to_string(path)?;
-        let journal: AcceptedSubmissionJournal =
-            serde_json::from_str(&content).map_err(|error| {
-                DaemonError::internal(format!(
-                    "accepted submission journal 损坏，拒绝继续启动或覆盖 {}: {error}",
-                    path.display()
-                ))
-            })?;
-        if journal.schema_version != ACCEPTED_SUBMISSION_JOURNAL_SCHEMA_VERSION {
-            return Err(DaemonError::internal(format!(
-                "accepted submission journal schemaVersion 不受支持 {}: {}",
-                path.display(),
-                journal.schema_version
-            )));
-        }
-        Ok(journal)
-    }
-
-    fn finish_accepted_submission_journal_locked(
-        &self,
-        path: PathBuf,
-        mut journal: AcceptedSubmissionJournal,
-    ) -> Result<(), DaemonError> {
-        journal
-            .records
-            .retain(|record| !(record.session_checkpointed && record.task_checkpointed));
-        if journal.records.is_empty() {
-            Self::remove_file_durable(&path)?;
-        } else {
-            self.write_json_atomically_locked(path, &journal)?;
-        }
-        Ok(())
+        )?)
     }
 
     pub(crate) fn session_projection_root(&self) -> PathBuf {
@@ -3667,7 +2026,6 @@ impl StateRepository {
     }
 
     pub(crate) fn load_audit_usage_ledger(&self) -> Result<AuditUsageLedgerSnapshot, DaemonError> {
-        self.migrate_whole_file_audit_usage_ledger()?;
         AuditUsageLedgerSnapshot::load_from_dir(
             &self.audit_usage_ledger_path(),
             magi_core::UtcMillis::now(),
@@ -3678,42 +2036,6 @@ impl StateRepository {
                 self.audit_usage_ledger_path().display()
             ))
         })
-    }
-
-    /// 一次性迁移：把旧版整本重写的 `audit-usage-ledger.json` 先写入暂存目录，
-    /// 原子改名为段目录后再删除旧文件。段目录只由这次改名产生，且账本加载先于任何
-    /// 新写入，所以旧文件与段目录并存只可能是改名后、删除前崩溃，此时完成删除即可。
-    fn migrate_whole_file_audit_usage_ledger(&self) -> Result<(), DaemonError> {
-        let legacy_path = self.state_root.join("audit-usage-ledger.json");
-        if !legacy_path.exists() {
-            return Ok(());
-        }
-        let segment_dir = self.audit_usage_ledger_path();
-        if segment_dir.exists() {
-            fs::remove_file(&legacy_path)?;
-            return Ok(());
-        }
-        let legacy: AuditUsageLedgerSnapshot = self.read_json_strict(&legacy_path)?;
-        legacy
-            .validate_schema()
-            .map_err(|error| DaemonError::internal(error.to_string()))?;
-        let legacy = legacy.normalize();
-        let staging_dir = self.state_root.join("audit-usage-ledger.migrating");
-        if staging_dir.exists() {
-            fs::remove_dir_all(&staging_dir)?;
-        }
-        if let Some(append) = legacy
-            .append_after(0)
-            .map_err(|error| DaemonError::internal(error.to_string()))?
-        {
-            AuditUsageLedgerSnapshot::append_to_dir(&staging_dir, &append)
-                .map_err(|error| DaemonError::internal(error.to_string()))?;
-        } else {
-            fs::create_dir_all(&staging_dir)?;
-        }
-        fs::rename(&staging_dir, &segment_dir)?;
-        fs::remove_file(&legacy_path)?;
-        Ok(())
     }
 
     pub(crate) fn knowledge_state_path(&self) -> PathBuf {
@@ -4048,9 +2370,6 @@ impl RuntimeSidecarPersistence {
                 self.persist_session_snapshot_incremental(durable, sidecars, session_ids)
             },
         )?;
-        if let Err(error) = self.state_repository.prune_accepted_submissions() {
-            warn!(?error, "刷新运行时 sidecar 后清理 accepted journal 失败");
-        }
         let workspace_recovery_sidecars_flushed =
             self.workspace_store.flush_recovery_sidecars_with(|state| {
                 self.state_repository
@@ -4075,127 +2394,6 @@ impl RuntimeSidecarPersistence {
     }
 }
 
-/// 仅用于 v1 -> v2 一次性迁移；v2 运行时不再接受这些旧 goal 字段。
-fn migrate_session_goal_state(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object
-        .entry("current_session_id")
-        .or_insert(serde_json::Value::Null);
-    for key in [
-        "sessions",
-        "timeline",
-        "canonical_turns",
-        "notifications",
-        "goals",
-        "thread_registry",
-        "thread_context_checkpoints",
-    ] {
-        object
-            .entry(key)
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    }
-    if !object.contains_key("plans") {
-        let plans = object
-            .remove("todo_lists")
-            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-        object.insert("plans".to_string(), plans);
-    } else {
-        object.remove("todo_lists");
-    }
-    let latest = {
-        let Some(goals) = object
-            .get_mut("goals")
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            return;
-        };
-        let mut latest = HashMap::<String, (u64, String, bool, bool)>::new();
-        for goal in goals.iter_mut() {
-            let Some(goal) = goal.as_object_mut() else {
-                continue;
-            };
-            goal.remove("consecutiveFailureTurns");
-            let Some(session_id) = goal.get("sessionId").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(goal_id) = goal.get("goalId").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let updated_at = goal
-                .get("updatedAt")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default();
-            let status = goal
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let cleared = status == "cleared";
-            let unfinished = matches!(
-                status,
-                "active" | "paused" | "blocked" | "usage_limited" | "budget_limited"
-            );
-            let entry = latest.entry(session_id.to_string()).or_insert((
-                updated_at,
-                goal_id.to_string(),
-                cleared,
-                unfinished,
-            ));
-            if updated_at > entry.0 || (updated_at == entry.0 && goal_id > entry.1.as_str()) {
-                *entry = (updated_at, goal_id.to_string(), cleared, unfinished);
-            }
-        }
-        goals.retain(|goal| {
-            let Some(goal) = goal.as_object() else {
-                return false;
-            };
-            let Some(session_id) = goal.get("sessionId").and_then(serde_json::Value::as_str) else {
-                return false;
-            };
-            let Some(goal_id) = goal.get("goalId").and_then(serde_json::Value::as_str) else {
-                return false;
-            };
-            latest
-                .get(session_id)
-                .is_some_and(|(_, latest_goal_id, cleared, _)| {
-                    !cleared && latest_goal_id == goal_id
-                })
-        });
-        latest
-    };
-
-    for plans_key in ["plans"] {
-        let Some(plans) = object
-            .get_mut(plans_key)
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            continue;
-        };
-        plans.retain_mut(|plan| {
-            let Some(plan) = plan.as_object_mut() else {
-                return false;
-            };
-            let Some(session_id) = plan.get("sessionId").and_then(serde_json::Value::as_str) else {
-                return false;
-            };
-            let Some((_, goal_id, cleared, unfinished)) = latest.get(session_id) else {
-                return true;
-            };
-            if *cleared {
-                return false;
-            }
-            if *unfinished || plan.get("goalId").is_some() {
-                plan.insert(
-                    "goalId".to_string(),
-                    serde_json::Value::String(goal_id.clone()),
-                );
-            }
-            true
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4211,46 +2409,7 @@ mod tests {
         SessionPlan, SessionRecord, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntry,
         TimelineEntryKind,
     };
-    use std::{collections::HashMap, thread};
-
-    #[test]
-    fn whole_file_audit_usage_ledger_migrates_to_segments_once() {
-        let state_root = unique_temp_dir("magi-ledger-migration");
-        let repository = StateRepository::new(state_root.clone());
-        let mut legacy = AuditUsageLedgerSnapshot::default();
-        let mut usage = magi_event_bus::EventEnvelope::usage(
-            magi_core::EventId::new("usage-legacy"),
-            "model.usage.recorded",
-            serde_json::json!({}),
-        );
-        usage.sequence = 41;
-        legacy.record_event(&usage);
-        fs::write(
-            state_root.join("audit-usage-ledger.json"),
-            serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-
-        let migrated = repository
-            .load_audit_usage_ledger()
-            .expect("migrate ledger");
-        assert_eq!(migrated.usage_count(), 1);
-        assert_eq!(migrated.next_sequence, 42);
-        assert!(!state_root.join("audit-usage-ledger.json").exists());
-        assert!(repository.audit_usage_ledger_path().is_dir());
-        assert!(!state_root.join("audit-usage-ledger.migrating").exists());
-
-        // 改名后、删除旧文件前崩溃：再次加载只完成删除，以段目录为准。
-        fs::write(
-            state_root.join("audit-usage-ledger.json"),
-            serde_json::to_vec(&AuditUsageLedgerSnapshot::default()).unwrap(),
-        )
-        .unwrap();
-        let reloaded = repository.load_audit_usage_ledger().expect("reload ledger");
-        assert_eq!(reloaded.usage_count(), 1);
-        assert!(!state_root.join("audit-usage-ledger.json").exists());
-        let _ = fs::remove_dir_all(state_root);
-    }
+    use std::collections::HashMap;
 
     #[test]
     fn semantic_json_comparison_accepts_numeric_representation_changes() {
@@ -4330,10 +2489,25 @@ mod tests {
         (session_store, turn_id, task_id)
     }
 
+    /// 测试夹具：把内存 SessionStore 已有的 canonical turn 写成事件日志。
+    fn initialize_test_session_events(repository: &StateRepository, durable: &SessionDurableState) {
+        let mut turns_by_session = HashMap::<SessionId, Vec<_>>::new();
+        for turn in &durable.canonical_turns {
+            turns_by_session
+                .entry(turn.session_id.clone())
+                .or_default()
+                .push(turn.clone());
+        }
+        for (session_id, turns) in turns_by_session {
+            let mutations = StateRepository::initial_canonical_mutations(turns);
+            repository
+                .append_canonical_turn_transaction(&session_id, &mutations)
+                .expect("test canonical events should initialize");
+        }
+    }
+
     fn install_test_event_authority(repository: &StateRepository, session_store: &SessionStore) {
-        repository
-            .initialize_session_events(&session_store.durable_state())
-            .expect("test canonical events should initialize");
+        initialize_test_session_events(repository, &session_store.durable_state());
         session_store.install_canonical_event_writer(Arc::new(repository.clone()));
     }
 
@@ -4365,289 +2539,6 @@ mod tests {
             created_at: UtcMillis(accepted_at),
             updated_at: UtcMillis(accepted_at),
         }
-    }
-
-    #[test]
-    fn accepted_journal_is_retained_until_all_recovery_facts_are_durable() {
-        let state_root = unique_temp_dir("magi-accepted-journal-retention");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, turn_id, task_id) =
-            accepted_session_store("accepted-journal-retention", None, 10);
-        install_test_event_authority(&repository, &session_store);
-        let task_store = TaskStore::new();
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id.clone(), 10))
-            .expect("accepted task should insert");
-
-        repository
-            .save_accepted_submission(
-                &session_store,
-                &SessionId::new("accepted-journal-retention"),
-                &turn_id,
-                &task_store,
-                &task_id,
-            )
-            .expect("accepted journal should save");
-        repository
-            .prune_accepted_submissions()
-            .expect("retention check should succeed before checkpoints");
-        assert!(repository.accepted_submissions_path().exists());
-
-        repository
-            .save_session_projection_state(
-                &session_store.durable_state(),
-                &session_store.execution_sidecar_store_state(),
-            )
-            .expect("session projection should save");
-        repository
-            .checkpoint_task_store(&task_store)
-            .expect("task checkpoint should save");
-        assert!(!repository.accepted_submissions_path().exists());
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn workspace_accepted_journal_uses_workspace_session_checkpoint() {
-        let state_root = unique_temp_dir("magi-accepted-journal-workspace");
-        let workspace_root = unique_temp_dir("magi-accepted-journal-workspace-root");
-        let repository = StateRepository::new(state_root.clone());
-        let workspace_store = WorkspaceStore::new();
-        let workspace_id = WorkspaceId::new("workspace-accepted-journal");
-        workspace_store
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
-            )
-            .expect("workspace should register");
-        repository
-            .save_workspace_durable_state(&workspace_store.durable_state())
-            .expect("workspace registry should persist");
-        let (session_store, turn_id, task_id) = accepted_session_store(
-            "accepted-journal-workspace",
-            Some(workspace_id.as_str()),
-            20,
-        );
-        install_test_event_authority(&repository, &session_store);
-        let session_id = SessionId::new("accepted-journal-workspace");
-        let task_store = TaskStore::new();
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id.clone(), 20))
-            .expect("accepted task should insert");
-
-        repository
-            .save_accepted_submission(&session_store, &session_id, &turn_id, &task_store, &task_id)
-            .expect("workspace accepted journal should save");
-        repository
-            .save_session_projection_state(
-                &session_store.durable_state(),
-                &session_store.execution_sidecar_store_state(),
-            )
-            .expect("workspace session projection should save");
-        repository
-            .checkpoint_task_store(&task_store)
-            .expect("workspace task checkpoint should save");
-        assert!(!repository.accepted_submissions_path().exists());
-
-        let _ = fs::remove_dir_all(state_root);
-        let _ = fs::remove_dir_all(workspace_root);
-    }
-
-    #[test]
-    fn committed_task_manifest_checkpoints_deleted_wal_task_without_resurrection() {
-        let state_root = unique_temp_dir("magi-accepted-deleted-task");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, turn_id, task_id) =
-            accepted_session_store("accepted-deleted-task", None, 25);
-        let session_id = SessionId::new("accepted-deleted-task");
-        let task_store = TaskStore::new();
-        install_test_event_authority(&repository, &session_store);
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id.clone(), 25))
-            .expect("accepted task should insert");
-        repository
-            .save_accepted_submission(&session_store, &session_id, &turn_id, &task_store, &task_id)
-            .expect("accepted WAL should save");
-        repository
-            .save_session_projection_state(
-                &session_store.durable_state(),
-                &session_store.execution_sidecar_store_state(),
-            )
-            .expect("session side should checkpoint");
-        task_store
-            .remove_task(&task_id)
-            .expect("task delete should mutate the in-memory snapshot")
-            .expect("accepted task should exist before deletion");
-
-        task_store
-            .checkpoint_to_projection_directory(&repository.task_store_projection_path())
-            .expect("empty task manifest should commit");
-
-        let recovered = StateRepository::new(state_root.clone())
-            .load_accepted_submissions()
-            .expect("manifest generation should reconcile WAL after a crash");
-        assert!(recovered.is_empty());
-        assert!(!repository.accepted_submissions_path().exists());
-        let restored =
-            TaskStore::restore_from_projection_directory(&repository.task_store_projection_path())
-                .expect("empty committed task store should restore")
-                .expect("manifest should represent an initialized empty store");
-        assert!(restored.get_task(&task_id).is_none());
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn accepted_task_after_current_manifest_remains_replayable() {
-        let state_root = unique_temp_dir("magi-accepted-after-manifest");
-        let repository = StateRepository::new(state_root.clone());
-        let task_store = TaskStore::new();
-        task_store
-            .checkpoint_to_projection_directory(&repository.task_store_projection_path())
-            .expect("baseline manifest should commit");
-        let (session_store, turn_id, task_id) =
-            accepted_session_store("accepted-after-manifest", None, 26);
-        let session_id = SessionId::new("accepted-after-manifest");
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id.clone(), 26))
-            .expect("accepted task should insert");
-        repository
-            .save_accepted_submission(&session_store, &session_id, &turn_id, &task_store, &task_id)
-            .expect("accepted WAL should save after baseline manifest");
-
-        let recovered = StateRepository::new(state_root.clone())
-            .load_accepted_submissions()
-            .expect("WAL should load");
-        assert_eq!(recovered.len(), 1);
-        assert!(!recovered[0].task_checkpointed);
-        assert_eq!(
-            recovered[0]
-                .task
-                .as_ref()
-                .expect("task acceptance should include task")
-                .task_id,
-            task_id
-        );
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn accepted_wal_written_after_manifest_does_not_replay_an_already_projected_task() {
-        let state_root = unique_temp_dir("magi-accepted-after-including-manifest");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, turn_id, task_id) =
-            accepted_session_store("accepted-after-including-manifest", None, 27);
-        let session_id = SessionId::new("accepted-after-including-manifest");
-        let task_store = TaskStore::new();
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id.clone(), 27))
-            .expect("accepted task should insert");
-
-        repository
-            .checkpoint_task_store(&task_store)
-            .expect("manifest containing accepted task should commit first");
-        repository
-            .save_accepted_submission(&session_store, &session_id, &turn_id, &task_store, &task_id)
-            .expect("late accepted WAL should save at the committed generation");
-
-        let recovered = StateRepository::new(state_root.clone())
-            .load_accepted_submissions()
-            .expect("late WAL should reconcile against persisted task membership");
-        assert_eq!(recovered.len(), 1);
-        assert!(recovered[0].task_checkpointed);
-        assert_eq!(
-            recovered[0]
-                .task
-                .as_ref()
-                .expect("task acceptance should include task")
-                .task_id,
-            task_id
-        );
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn concurrent_accepted_journal_writes_keep_both_records() {
-        let state_root = unique_temp_dir("magi-accepted-journal-concurrent");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store_a, turn_id_a, task_id_a) =
-            accepted_session_store("accepted-journal-concurrent-a", None, 30);
-        let (session_store_b, turn_id_b, task_id_b) =
-            accepted_session_store("accepted-journal-concurrent-b", None, 31);
-        let task_store_a = TaskStore::new();
-        task_store_a
-            .insert_task_without_checkpoint(accepted_task(task_id_a.clone(), 30))
-            .expect("accepted task A should insert");
-        let task_store_b = TaskStore::new();
-        task_store_b
-            .insert_task_without_checkpoint(accepted_task(task_id_b.clone(), 31))
-            .expect("accepted task B should insert");
-        let repository_a = repository.clone();
-        let repository_b = repository.clone();
-
-        thread::scope(|scope| {
-            let first = scope.spawn(move || {
-                repository_a.save_accepted_submission(
-                    &session_store_a,
-                    &SessionId::new("accepted-journal-concurrent-a"),
-                    &turn_id_a,
-                    &task_store_a,
-                    &task_id_a,
-                )
-            });
-            let second = scope.spawn(move || {
-                repository_b.save_accepted_submission(
-                    &session_store_b,
-                    &SessionId::new("accepted-journal-concurrent-b"),
-                    &turn_id_b,
-                    &task_store_b,
-                    &task_id_b,
-                )
-            });
-            first
-                .join()
-                .expect("first journal write should not panic")
-                .expect("first journal write should succeed");
-            second
-                .join()
-                .expect("second journal write should not panic")
-                .expect("second journal write should succeed");
-        });
-
-        let records = repository
-            .load_accepted_submissions()
-            .expect("accepted journal should load");
-        assert_eq!(records.len(), 2, "并发 accepted 写入不能丢失任一恢复记录");
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn corrupted_accepted_journal_is_rejected_without_backup_or_empty_state_recovery() {
-        let state_root = unique_temp_dir("magi-accepted-journal-corrupted");
-        let repository = StateRepository::new(state_root.clone());
-        let path = repository.accepted_submissions_path();
-        fs::write(&path, br#"{"records":["#).expect("corrupted journal should write");
-
-        let error = repository
-            .load_accepted_submissions()
-            .expect_err("corrupted accepted journal must reject recovery");
-        assert!(error.to_string().contains("journal 损坏"));
-        assert!(path.exists(), "损坏 journal 必须原地保留以便诊断和恢复");
-        assert!(
-            !path
-                .with_file_name("accepted-submissions.json.stale")
-                .exists()
-        );
-
-        fs::write(&path, b"{}").expect("missing journal schema fixture should write");
-        repository
-            .load_accepted_submissions()
-            .expect_err("缺少 records 的 journal 不能静默解释为空状态");
-
-        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -4774,18 +2665,6 @@ mod tests {
         fs::copy(&canonical_path, &duplicate_path).expect("matching duplicate should copy");
         let canonical_content = fs::read(&canonical_path).expect("canonical projection bytes");
         let duplicate_content = fs::read(&duplicate_path).expect("duplicate projection bytes");
-
-        let error = repository
-            .read_committed_session_projection_ids(&[(
-                "duplicate-root".to_string(),
-                duplicate_root.clone(),
-            )])
-            .expect_err("duplicate projection must reject migration discovery");
-        assert!(
-            error
-                .to_string()
-                .contains("全局 session projection 包含 workspace 归属")
-        );
 
         // 恢复时多余副本只让它自己被忽略：会话从规范副本恢复，两份文件都原样保留。
         let (restored, _) = repository
@@ -5868,8 +3747,6 @@ mod tests {
                 .join(StateRepository::session_projection_file_name(&session_id))
                 .exists()
         );
-        assert!(!repository.accepted_submissions_path().exists());
-
         let restored_repository = StateRepository::new(state_root.clone());
         let (durable, sidecars) = restored_repository
             .load_session_projections(&[])
@@ -6069,94 +3946,30 @@ mod tests {
     }
 
     #[test]
-    fn committed_v2_layout_quarantines_proven_legacy_orphan_event_log() {
-        let state_root = unique_temp_dir("magi-layout-legacy-event-quarantine");
-        let repository = StateRepository::new(state_root.clone());
-        let (legacy_store, _, _) = accepted_session_store("legacy-orphan-event", None, 58);
-        let session_id = SessionId::new("legacy-orphan-event");
+    fn state_layout_only_accepts_the_current_marked_layout() {
+        let fresh_root = unique_temp_dir("magi-layout-fresh");
+        let fresh = StateRepository::new(fresh_root.clone());
+        fresh
+            .verify_state_layout(&[])
+            .expect("fresh state root should accept the current layout");
+        assert!(fresh_root.join("state-layout.json").exists());
+        fresh
+            .verify_state_layout(&[])
+            .expect("marked current layout should verify again");
 
-        // 模拟旧迁移已将历史 turn 转成 canonical event，随后旧删除路径只删除了
-        // projection。archive 是该 session 来自旧布局且已经不在当前索引中的证据。
-        repository
-            .initialize_session_events(&legacy_store.durable_state())
-            .expect("legacy canonical event should initialize");
-        repository
-            .write_json_atomically(
-                state_root.join("migrations/legacy-v1/archive/sessions.json"),
-                &legacy_store.durable_state(),
-            )
-            .expect("legacy source archive should persist");
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout.json"),
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("committed v2 marker should persist");
+        let old_version_root = unique_temp_dir("magi-layout-old-version");
+        fs::write(
+            old_version_root.join("state-layout.json"),
+            r#"{"version":1}"#,
+        )
+        .expect("old marker should write");
+        StateRepository::new(old_version_root.clone())
+            .verify_state_layout(&[])
+            .expect_err("unsupported layout version must be rejected");
 
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("proven legacy orphan should be quarantined without resurrection");
-
-        let encoded = StateRepository::session_projection_file_name(&session_id)
-            .trim_end_matches(".json")
-            .to_string();
-        let quarantine_root = state_root.join("migrations/legacy-v1/orphan-session-events");
-        assert!(!repository.session_event_root(&session_id).exists());
-        assert!(quarantine_root.join(format!("{encoded}.events")).exists());
-        let record: LegacyOrphanEventQuarantineRecord = repository
-            .read_json_strict(&quarantine_root.join(format!("{encoded}.json")))
-            .expect("quarantine record should be readable");
-        assert_eq!(record.session_id, session_id);
-        assert_eq!(
-            record.reason,
-            "legacy_session_deletion_left_unowned_canonical_events"
-        );
-
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("quarantined event must not recreate deleted session");
-        assert!(restored.sessions.is_empty());
-        repository
-            .validate_session_event_log_coverage(&restored)
-            .expect("remaining event roots should all have live ownership");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("legacy orphan cleanup should be idempotent");
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn committed_v2_layout_rejects_unproven_orphan_event_log() {
-        let state_root = unique_temp_dir("magi-layout-unknown-event-orphan");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, _, _) = accepted_session_store("unknown-event-orphan", None, 59);
-        let session_id = SessionId::new("unknown-event-orphan");
-        repository
-            .initialize_session_events(&session_store.durable_state())
-            .expect("event fixture should initialize");
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout.json"),
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("committed v2 marker should persist");
-
-        let error = repository
-            .migrate_legacy_state_layout(&[])
-            .expect_err("unproven event orphan must remain a startup error");
-        assert!(
-            error
-                .to_string()
-                .contains("没有当前 session、accepted WAL 或旧布局归档归属")
-        );
-        assert!(repository.session_event_root(&session_id).exists());
-
-        let _ = fs::remove_dir_all(state_root);
+        for root in [fresh_root, old_version_root] {
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -6190,7 +4003,7 @@ mod tests {
             .expect("committed v2 marker should persist");
 
         repository
-            .migrate_legacy_state_layout(&[])
+            .verify_state_layout(&[])
             .expect("accepted event-only crash window must remain recoverable");
         assert!(repository.session_event_root(&session_id).exists());
         let (restored, _) = StateRepository::new(state_root.clone())
@@ -6198,452 +4011,6 @@ mod tests {
             .expect("accepted event should restore the missing session projection");
         assert_eq!(restored.sessions.len(), 1);
         assert_eq!(restored.sessions[0].session_id, session_id);
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn legacy_layout_migrates_once_and_archives_sources() {
-        let state_root = unique_temp_dir("magi-state-layout-migration");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, _, task_id) =
-            accepted_session_store("legacy-layout-migration", None, 60);
-        let task_store = TaskStore::new();
-        task_store
-            .insert_task_without_checkpoint(accepted_task(task_id, 60))
-            .expect("accepted task should insert");
-        let mut legacy_sidecars = session_store.execution_sidecar_store_state();
-        let mut orphan_sidecar = legacy_sidecars
-            .runtime_sidecars
-            .first()
-            .cloned()
-            .expect("accepted session should have a sidecar");
-        orphan_sidecar.session_id = SessionId::new("legacy-layout-orphan-sidecar");
-        orphan_sidecar.ownership.session_id = None;
-        if let Some(chain) = orphan_sidecar.active_execution_chain.as_mut() {
-            chain.session_id = orphan_sidecar.session_id.clone();
-        }
-        legacy_sidecars.upsert_runtime_sidecar(orphan_sidecar);
-
-        repository
-            .write_json_atomically(
-                state_root.join("sessions.json"),
-                &session_store.durable_state(),
-            )
-            .expect("legacy sessions should persist");
-        repository
-            .write_json_atomically(state_root.join("session-sidecars.json"), &legacy_sidecars)
-            .expect("legacy sidecars should persist");
-        repository
-            .write_json_atomically(state_root.join("task-store.json"), &task_store.checkpoint())
-            .expect("legacy task checkpoint should persist");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("legacy layout should migrate");
-        assert!(state_root.join("state-layout.json").exists());
-        assert!(!state_root.join("sessions.json").exists());
-        assert!(!state_root.join("session-sidecars.json").exists());
-        assert!(!state_root.join("task-store.json").exists());
-        assert!(
-            state_root
-                .join("migrations/legacy-v1/archive/sessions.json")
-                .exists()
-        );
-        assert!(
-            repository
-                .session_event_root(&SessionId::new("legacy-layout-migration"))
-                .exists()
-        );
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("migrated sessions should restore");
-        assert_eq!(restored.sessions.len(), 1);
-        let (_, restored_sidecars) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("migrated sidecars should restore");
-        assert!(restored_sidecars
-            .runtime_sidecars
-            .iter()
-            .all(|sidecar| sidecar.session_id != SessionId::new("legacy-layout-orphan-sidecar")));
-        assert!(
-            TaskStore::restore_from_projection_directory(&repository.task_store_projection_path())
-                .expect("migrated task projections should read")
-                .is_some()
-        );
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("committed migration should be idempotent");
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn legacy_layout_reconstructs_superseded_turn_event_path() {
-        let state_root = unique_temp_dir("magi-state-layout-superseded-turn");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, _, _) = accepted_session_store("legacy-superseded-turn", None, 65);
-        let mut durable = session_store.durable_state();
-        let turn = durable
-            .canonical_turns
-            .first_mut()
-            .expect("accepted session should contain canonical turn");
-        turn.status = magi_session_store::CanonicalTurnStatus::Superseded;
-        turn.completed_at = Some(UtcMillis(66));
-
-        repository
-            .write_json_atomically(state_root.join("sessions.json"), &durable)
-            .expect("legacy sessions should persist");
-        let loaded = repository
-            .load_legacy_session_state(&repository.legacy_state_paths(&[]))
-            .expect("legacy session should load");
-        assert_eq!(
-            loaded.canonical_turns[0].status,
-            magi_session_store::CanonicalTurnStatus::Superseded
-        );
-        let converted = SessionStore::convert_v1_persisted_parts(
-            loaded.clone(),
-            SessionExecutionSidecarStoreState::default(),
-        )
-        .expect("legacy session should convert");
-        assert_eq!(
-            converted
-                .durable_state()
-                .canonical_turns
-                .iter()
-                .find(|turn| turn.turn_id == "turn-legacy-superseded-turn-65")
-                .expect("original converted turn should remain")
-                .status,
-            magi_session_store::CanonicalTurnStatus::Superseded
-        );
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("superseded turn should migrate through Cancelled");
-
-        let event_projection = SessionConversationProjection::load(
-            &repository.session_event_root(&SessionId::new("legacy-superseded-turn")),
-            &SessionId::new("legacy-superseded-turn"),
-        )
-        .expect("migrated event projection should load");
-        assert_eq!(
-            event_projection
-                .canonical_turns()
-                .iter()
-                .find(|turn| turn.turn_id == "turn-legacy-superseded-turn-65")
-                .expect("original superseded turn should remain")
-                .status,
-            magi_session_store::CanonicalTurnStatus::Superseded
-        );
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("migrated superseded turn should restore");
-        assert_eq!(
-            restored
-                .canonical_turns
-                .iter()
-                .find(|turn| turn.turn_id == "turn-legacy-superseded-turn-65")
-                .expect("original superseded turn should restore")
-                .status,
-            magi_session_store::CanonicalTurnStatus::Superseded
-        );
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn workspace_legacy_layout_migrates_to_its_registered_root() {
-        let state_root = unique_temp_dir("magi-workspace-layout-migration");
-        let workspace_root = unique_temp_dir("magi-workspace-layout-migration-root");
-        let repository = StateRepository::new(state_root.clone());
-        let workspace_id = WorkspaceId::new("workspace-layout-migration");
-        let workspace_store = WorkspaceStore::new();
-        workspace_store
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
-            )
-            .expect("workspace should register");
-        repository
-            .save_workspace_durable_state(&workspace_store.durable_state())
-            .expect("workspace registry should persist");
-        let (session_store, _, _) =
-            accepted_session_store("workspace-layout-session", Some(workspace_id.as_str()), 61);
-        repository
-            .write_json_atomically(
-                workspace_root.join(".magi/sessions.json"),
-                &session_store.durable_state(),
-            )
-            .expect("workspace legacy sessions should persist");
-        repository
-            .write_json_atomically(
-                state_root.join("session-sidecars.json"),
-                &session_store.execution_sidecar_store_state(),
-            )
-            .expect("legacy sidecars should persist");
-        let workspace_roots = vec![(workspace_id.to_string(), workspace_root.clone())];
-
-        repository
-            .migrate_legacy_state_layout(&workspace_roots)
-            .expect("workspace legacy layout should migrate");
-
-        assert!(!workspace_root.join(".magi/sessions.json").exists());
-        assert!(
-            workspace_root
-                .join(".magi/session-projections/workspace-layout-session.json")
-                .exists()
-        );
-        assert!(
-            state_root
-                .join("migrations/legacy-v1/archive/workspaces/workspace-layout-migration/sessions.json")
-                .exists()
-        );
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&workspace_roots)
-            .expect("workspace migrated session should restore");
-        assert_eq!(restored.sessions.len(), 1);
-        assert_eq!(
-            restored.sessions[0].workspace_id.as_deref(),
-            Some(workspace_id.as_str())
-        );
-
-        let _ = fs::remove_dir_all(state_root);
-        let _ = fs::remove_dir_all(workspace_root);
-    }
-
-    #[test]
-    fn interrupted_layout_migration_restarts_from_legacy_authority() {
-        let state_root = unique_temp_dir("magi-layout-migration-resume");
-        let repository = StateRepository::new(state_root.clone());
-        let (session_store, _, _) = accepted_session_store("layout-migration-resume", None, 62);
-        repository
-            .write_json_atomically(
-                state_root.join("sessions.json"),
-                &session_store.durable_state(),
-            )
-            .expect("legacy sessions should persist");
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout-migration.json"),
-                &StateLayoutMigration {
-                    source_version: 1,
-                    target_version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("migration marker should persist");
-        fs::create_dir_all(repository.session_projection_root())
-            .expect("partial projection root should create");
-        fs::write(
-            repository.session_projection_root().join("partial.json"),
-            b"partial",
-        )
-        .expect("partial migration output should write");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("interrupted migration should restart from legacy source");
-
-        assert!(state_root.join("state-layout.json").exists());
-        assert!(!state_root.join("state-layout-migration.json").exists());
-        assert!(
-            !repository
-                .session_projection_root()
-                .join("partial.json")
-                .exists()
-        );
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("resumed migration should restore");
-        assert_eq!(restored.sessions.len(), 1);
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn committed_v2_layout_cleans_empty_reintroduced_legacy_files() {
-        let state_root = unique_temp_dir("magi-layout-v2-cleans-empty-legacy");
-        let repository = StateRepository::new(state_root.clone());
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout.json"),
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("v2 marker should persist");
-        fs::write(state_root.join("sessions.json"), b"{}")
-            .expect("unexpected legacy file should write");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("empty legacy snapshot should be reconciled after v2 commit");
-        assert!(!state_root.join("sessions.json").exists());
-        assert!(
-            state_root
-                .join("migrations/legacy-v1/reintroduced")
-                .read_dir()
-                .expect("reintroduced archive directory should exist")
-                .next()
-                .is_some()
-        );
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn committed_v2_layout_imports_reintroduced_session_once() {
-        let state_root = unique_temp_dir("magi-layout-v2-imports-legacy-session");
-        let repository = StateRepository::new(state_root.clone());
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout.json"),
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("v2 marker should persist");
-        let (legacy_store, _, _) = accepted_session_store("reintroduced-session", None, 90);
-        repository
-            .write_json_atomically(
-                state_root.join("sessions.json"),
-                &legacy_store.durable_state(),
-            )
-            .expect("reintroduced legacy session should write");
-        repository
-            .write_json_atomically(
-                state_root.join("session-sidecars.json"),
-                &legacy_store.execution_sidecar_store_state(),
-            )
-            .expect("reintroduced legacy sidecar should write");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("new legacy session should be imported into v2");
-        let (restored, sidecars) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("imported v2 session should restore");
-        assert_eq!(restored.sessions.len(), 1);
-        assert_eq!(
-            restored.canonical_turns.len(),
-            legacy_store.durable_state().canonical_turns.len() + 1,
-            "v1 converter must preserve the unlinked timeline fact exactly once"
-        );
-        assert_eq!(sidecars.runtime_sidecars.len(), 1);
-        assert!(!state_root.join("sessions.json").exists());
-        assert!(
-            state_root
-                .join("migrations/legacy-v1/reintroduced")
-                .read_dir()
-                .expect("reintroduced archive directory should exist")
-                .next()
-                .is_some()
-        );
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("reconciled layout should be idempotent");
-        let (restored_again, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("idempotent v2 session should restore");
-        assert_eq!(restored_again.sessions.len(), 1);
-        assert_eq!(restored_again.canonical_turns.len(), 2);
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn committed_v2_layout_preserves_conflicting_reintroduced_session() {
-        let state_root = unique_temp_dir("magi-layout-v2-preserves-conflict");
-        let repository = StateRepository::new(state_root.clone());
-        let (canonical_store, _, _) = accepted_session_store("conflicting-session", None, 91);
-        install_test_event_authority(&repository, &canonical_store);
-        repository
-            .save_session_projection_state(
-                &canonical_store.durable_state(),
-                &canonical_store.execution_sidecar_store_state(),
-            )
-            .expect("canonical v2 session should persist");
-        repository
-            .write_json_atomically(
-                state_root.join("state-layout.json"),
-                &StateLayoutMarker {
-                    version: STATE_LAYOUT_VERSION,
-                },
-            )
-            .expect("v2 marker should persist");
-
-        let (legacy_store, _, _) = accepted_session_store("conflicting-session", None, 91);
-        let mut conflicting = legacy_store.durable_state();
-        conflicting.sessions[0].title = "different legacy fact".to_string();
-        repository
-            .write_json_atomically(state_root.join("sessions.json"), &conflicting)
-            .expect("conflicting legacy session should write");
-
-        let error = repository
-            .migrate_legacy_state_layout(&[])
-            .expect_err("conflicting reintroduced session must stop recovery");
-        assert!(error.to_string().contains("存在冲突 session"));
-        assert!(state_root.join("sessions.json").exists());
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("canonical v2 state must remain readable");
-        assert_eq!(restored.sessions[0].title, "accepted journal test");
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn mixed_legacy_and_unmarked_new_layout_is_merged_without_data_loss() {
-        let state_root = unique_temp_dir("magi-state-layout-conflict");
-        let repository = StateRepository::new(state_root.clone());
-        let (legacy_store, _, _) = accepted_session_store("legacy-layout-session", None, 63);
-        let (new_store, _, _) = accepted_session_store("unmarked-layout-session", None, 64);
-        repository
-            .write_json_atomically(
-                state_root.join("sessions.json"),
-                &legacy_store.durable_state(),
-            )
-            .expect("legacy session file should persist");
-        fs::create_dir_all(repository.session_projection_root())
-            .expect("new projection directory should exist");
-        let new_session_id = SessionId::new("unmarked-layout-session");
-        repository
-            .write_json_atomically(
-                repository.session_projection_root().join(
-                    StateRepository::session_projection_file_name(&new_session_id),
-                ),
-                &serde_json::json!({
-                    "durable": new_store
-                        .durable_state()
-                        .durable_state_for_session(&new_session_id),
-                    "sidecar": null,
-                }),
-            )
-            .expect("unmarked session projection should persist");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect("mixed layouts should be merged into one committed layout");
-        let (restored, _) = StateRepository::new(state_root.clone())
-            .load_session_projections(&[])
-            .expect("merged layout should restore");
-        assert_eq!(restored.sessions.len(), 2);
-        assert!(!state_root.join("sessions.json").exists());
-        assert!(state_root.join("state-layout.json").exists());
-
-        let _ = fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn corrupt_legacy_session_state_stops_migration() {
-        let state_root = unique_temp_dir("magi-state-layout-corrupt");
-        let repository = StateRepository::new(state_root.clone());
-        fs::write(state_root.join("sessions.json"), b"{not-json")
-            .expect("corrupt legacy file should exist");
-
-        repository
-            .migrate_legacy_state_layout(&[])
-            .expect_err("corrupt legacy state must not become an empty migration");
-        assert!(state_root.join("sessions.json").exists());
-        assert!(!state_root.join("state-layout.json").exists());
 
         let _ = fs::remove_dir_all(state_root);
     }

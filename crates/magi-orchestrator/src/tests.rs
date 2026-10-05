@@ -115,9 +115,6 @@ fn task_store_remove_mission_removes_tasks_leases_and_checkpoints_once() {
     assert!(task_store.get_tasks_by_mission(&mission_id).is_empty());
     assert!(task_store.get_task(&root_task_id).is_none());
     assert!(task_store.get_task(&child_task_id).is_none());
-    assert_eq!(
-        task_store.checkpoint()["leases"].as_array().unwrap().len(),
-        0
-    );
+    assert!(task_store.snapshot().leases.is_empty());
     assert_eq!(checkpoint_count.load(Ordering::SeqCst), 1);
 }

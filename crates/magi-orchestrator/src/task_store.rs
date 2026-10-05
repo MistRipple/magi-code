@@ -49,23 +49,9 @@ pub enum TaskLeaseState {
     Revoked,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct TaskStoreCheckpoint {
-    #[serde(default)]
     tasks: Vec<Task>,
-    #[serde(default)]
-    leases: Vec<TaskLease>,
-}
-
-/// 旧版 v2 在引入 generation manifest 前写入的单 root 投影。
-///
-/// 该类型只允许在 state layout 一次性迁移边界使用；正常恢复必须经过 manifest。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UnmarkedTaskRootProjection {
-    #[serde(default)]
-    tasks: Vec<Task>,
-    #[serde(default)]
     leases: Vec<TaskLease>,
 }
 
@@ -84,10 +70,8 @@ struct TaskProjectionManifestRoot {
     file_name: String,
     /// 该 root 文件实际来自哪个 generation。新的 generation 可以通过硬链接
     /// 复用内容不变的 root，因此它不一定等于 manifest 的 generation。
-    #[serde(default)]
     generation: u64,
     /// 不包含 generation 字段的 root 业务事实指纹，用于 checkpoint 增量复用。
-    #[serde(default)]
     content_hash: String,
 }
 
@@ -1908,17 +1892,6 @@ impl TaskStore {
     // Checkpoint / Restore
     // ------------------------------------------------------------------
 
-    /// Serialize all tasks and leases to a JSON value for checkpointing.
-    pub fn checkpoint(&self) -> serde_json::Value {
-        let snapshot = self.snapshot_locked_with_mutation_guard();
-        Self::validate_snapshot(&snapshot)
-            .expect("TaskStore checkpoint cannot serialize an invalid lease/task contract");
-        serde_json::json!({
-            "tasks": snapshot.tasks,
-            "leases": snapshot.leases,
-        })
-    }
-
     fn snapshot_locked_with_mutation_guard(&self) -> TaskStoreSnapshot {
         let _mutation_guard = self
             .mutation_lock
@@ -1929,20 +1902,6 @@ impl TaskStore {
 
     pub fn snapshot(&self) -> TaskStoreSnapshot {
         self.snapshot_locked_with_mutation_guard()
-    }
-
-    /// 仅供 v1 -> v2 一次性布局迁移读取旧的全量 checkpoint。
-    ///
-    /// v2 正常恢复不得调用此入口，避免旧字段默认值和迁移逻辑进入正常启动路径。
-    pub fn restore_legacy_checkpoint(data: &serde_json::Value) -> io::Result<Self> {
-        let mut checkpoint: TaskStoreCheckpoint = serde_json::from_value(data.clone())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        for task in &mut checkpoint.tasks {
-            task.migrate_persisted_completion_contract();
-            task.migrate_persisted_goal_mode();
-        }
-        Self::normalize_legacy_checkpoint(&mut checkpoint)?;
-        Self::restore_checked(checkpoint)
     }
 
     // ------------------------------------------------------------------
@@ -2118,7 +2077,6 @@ impl TaskStore {
                 let source_identity = Self::reuse_projection_file_if_unchanged(
                     source.as_deref(),
                     &destination,
-                    projection,
                     previous_root,
                     &content_hash,
                 )?;
@@ -2185,46 +2143,17 @@ impl TaskStore {
     fn reuse_projection_file_if_unchanged(
         source: Option<&Path>,
         destination: &Path,
-        projection: &TaskRootProjection,
         previous_root: Option<&TaskProjectionManifestRoot>,
         content_hash: &str,
     ) -> io::Result<Option<(u64, String)>> {
-        let Some(source) = source else {
+        let (Some(source), Some(previous_root)) = (source, previous_root) else {
             return Ok(None);
         };
-        let expected_hash = previous_root
-            .map(|root| root.content_hash.trim())
-            .filter(|hash| !hash.is_empty());
-        if expected_hash == Some(content_hash) {
-            if fs::hard_link(source, destination).is_ok() {
-                return Ok(Some((
-                    previous_root
-                        .map(|root| root.generation)
-                        .unwrap_or(projection.generation),
-                    content_hash.to_string(),
-                )));
-            }
+        if previous_root.content_hash != content_hash || fs::hard_link(source, destination).is_err()
+        {
             return Ok(None);
         }
-
-        // 旧 manifest 尚未带 content_hash 时只做一次兼容性比较；后续 checkpoint
-        // 会写入指纹，避免每次状态变更都重新解析所有历史 root 文件。
-        let existing = match fs::read(source) {
-            Ok(existing) => existing,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let previous: TaskRootProjection = Self::deserialize_projection_strict(&existing)?;
-        let same_content = previous.schema_version == projection.schema_version
-            && previous.root_task_id == projection.root_task_id
-            && serde_json::to_value(&previous.tasks).map_err(io::Error::other)?
-                == serde_json::to_value(&projection.tasks).map_err(io::Error::other)?
-            && serde_json::to_value(&previous.leases).map_err(io::Error::other)?
-                == serde_json::to_value(&projection.leases).map_err(io::Error::other)?;
-        if !same_content || fs::hard_link(source, destination).is_err() {
-            return Ok(None);
-        }
-        Ok(Some((previous.generation, content_hash.to_string())))
+        Ok(Some((previous_root.generation, content_hash.to_string())))
     }
 
     fn projection_content_hash(projection: &TaskRootProjection) -> io::Result<String> {
@@ -2278,8 +2207,8 @@ impl TaskStore {
             }
             let content = fs::read(generation_dir.join(&root.file_name))?;
             let projection = Self::deserialize_projection_strict(&content)?;
-            let content_hash_matches = root.content_hash.trim().is_empty()
-                || Self::projection_content_hash(&projection)? == root.content_hash;
+            let content_hash_matches =
+                Self::projection_content_hash(&projection)? == root.content_hash;
             if projection.schema_version != TASK_PROJECTION_SCHEMA_VERSION
                 || root.generation == 0
                 || projection.generation != root.generation
@@ -2312,75 +2241,6 @@ impl TaskStore {
         }
 
         let checkpoint = Self::validate_projection_set(&projections)?;
-        Ok(Some(Self::restore_checked(checkpoint)?))
-    }
-
-    /// 读取 generation manifest 之前的旧版 root 投影，仅供一次性 state layout 迁移使用。
-    ///
-    /// 旧目录中的每个 JSON 文件都是一个 root 的完整 `{tasks, leases}` 快照。相同
-    /// task/lease 在多个文件中重复出现时必须字节级一致；任何冲突都拒绝迁移，避免
-    /// 在两个不确定快照之间静默选错。
-    pub fn restore_unmarked_projection_directory_for_migration(
-        dir: &Path,
-    ) -> io::Result<Option<Self>> {
-        if !dir.exists() {
-            return Ok(None);
-        }
-        if dir.join(TASK_PROJECTION_MANIFEST_FILE).exists() {
-            return Self::restore_from_projection_directory(dir);
-        }
-
-        let mut tasks = HashMap::<TaskId, Task>::new();
-        let mut leases = HashMap::<LeaseId, TaskLease>::new();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_file()
-                || path.extension().and_then(|extension| extension.to_str()) != Some("json")
-            {
-                continue;
-            }
-            let content = fs::read(&path)?;
-            let projection: UnmarkedTaskRootProjection =
-                serde_json::from_slice(&content).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "解析未标记 task projection 失败 {}: {error}",
-                            path.display()
-                        ),
-                    )
-                })?;
-            for task in projection.tasks {
-                let task_id = task.task_id.clone();
-                if let Some(existing) = tasks.insert(task_id.clone(), task.clone())
-                    && serde_json::to_value(&existing)? != serde_json::to_value(&task)?
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("未标记 task projection 包含冲突 task: {task_id}"),
-                    ));
-                }
-            }
-            for lease in projection.leases {
-                let lease_id = lease.lease_id.clone();
-                if let Some(existing) = leases.insert(lease_id.clone(), lease.clone())
-                    && serde_json::to_value(&existing)? != serde_json::to_value(&lease)?
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("未标记 task projection 包含冲突 lease: {lease_id}"),
-                    ));
-                }
-            }
-        }
-
-        let checkpoint = TaskStoreCheckpoint {
-            tasks: tasks.into_values().collect(),
-            leases: leases.into_values().collect(),
-        };
-        let mut checkpoint = checkpoint;
-        Self::normalize_legacy_checkpoint(&mut checkpoint)?;
         Ok(Some(Self::restore_checked(checkpoint)?))
     }
 
@@ -2451,73 +2311,8 @@ impl TaskStore {
         Ok(store)
     }
 
-    /// 将旧布局中的租约收敛到当前任务图合同后再恢复。
-    ///
-    /// 旧版删除任务时可能只删除了任务事实，保留了已经结束的历史租约。这样的
-    /// 租约不再具备恢复价值，也无法重建已经不存在的任务，因此在一次性迁移边界
-    /// 丢弃。活跃租约仍然必须能完整验证，避免把可能尚未完成的执行静默变成历史。
-    fn normalize_legacy_checkpoint(checkpoint: &mut TaskStoreCheckpoint) -> io::Result<()> {
-        let tasks_by_id = checkpoint
-            .tasks
-            .iter()
-            .map(|task| (task.task_id.clone(), task))
-            .collect::<HashMap<_, _>>();
-        let mut invalid_active_lease = None;
-        checkpoint.leases.retain(|lease| {
-            let owner_is_verifiable = tasks_by_id
-                .get(&lease.task_id)
-                .zip(tasks_by_id.get(&lease.root_task_id))
-                .is_some_and(|(task, root)| {
-                    root.task_id == root.root_task_id
-                        && task.root_task_id == lease.root_task_id
-                        && task.mission_id == root.mission_id
-                        && (lease.lease_status != TaskLeaseState::Active
-                            || task.status == TaskStatus::Running)
-                });
-            if owner_is_verifiable {
-                return true;
-            }
-            if lease.lease_status == TaskLeaseState::Active {
-                invalid_active_lease = Some(lease.lease_id.clone());
-                return true;
-            }
-            false
-        });
-        if let Some(lease_id) = invalid_active_lease {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("旧 checkpoint 包含无法验证的活跃租约，拒绝迁移: {lease_id}"),
-            ));
-        }
-        Ok(())
-    }
-
     fn deserialize_projection_strict(content: &[u8]) -> io::Result<TaskRootProjection> {
-        let value: serde_json::Value = serde_json::from_slice(content).map_err(|error| {
-            Self::invalid_projection(format!("解析 task projection 失败: {error}"))
-        })?;
-        let tasks = value
-            .as_object()
-            .and_then(|projection| projection.get("tasks"))
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| Self::invalid_projection("task projection 缺少 tasks 数组"))?;
-        for task in tasks {
-            let task = task
-                .as_object()
-                .ok_or_else(|| Self::invalid_projection("task projection 包含非对象 task"))?;
-            for field in [
-                "completion_contract",
-                "recovery_checkpoint",
-                "runtime_payload",
-            ] {
-                if !task.contains_key(field) {
-                    return Err(Self::invalid_projection(format!(
-                        "task projection 的 task 缺少 v2 必填字段: {field}"
-                    )));
-                }
-            }
-        }
-        serde_json::from_value(value).map_err(|error| {
+        serde_json::from_slice(content).map_err(|error| {
             Self::invalid_projection(format!("解析 task projection 失败: {error}"))
         })
     }
@@ -2575,7 +2370,7 @@ impl TaskStore {
             checkpoint.leases.extend(projection.leases.iter().cloned());
         }
         // Projection 文件按 root 分组存储，恢复时不能依赖 manifest 的 root 顺序。
-        // 全量 checkpoint 的公共表示始终按稳定 ID 排序，确保迁移校验和后续
+        // 全量 checkpoint 的公共表示始终按稳定 ID 排序，确保 checkpoint 比较和后续
         // 重启恢复比较的是同一份 canonical 表示，而不是 HashMap/分组遍历顺序。
         checkpoint
             .tasks
@@ -2721,14 +2516,6 @@ impl TaskStore {
                 "task projection manifest 版本或 generation 不合法",
             ));
         }
-        let mut manifest = manifest;
-        // 兼容 generation manifest 引入前已经写入的 root 条目：旧 manifest 没有
-        // root generation，旧文件本身使用顶层 generation。
-        for root in &mut manifest.roots {
-            if root.generation == 0 {
-                root.generation = manifest.generation;
-            }
-        }
         Ok(manifest)
     }
 
@@ -2826,9 +2613,7 @@ fn is_terminal_status(status: TaskStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{
-        TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding, TaskKind,
-    };
+    use magi_core::{TaskCompletionEvidence, TaskEvidenceRequirement, TaskKind};
     use serde_json::json;
     use std::sync::{Arc, Barrier, Mutex};
 
@@ -3561,121 +3346,6 @@ mod tests {
         assert_eq!(persisted.evidence_refs.len(), 1);
     }
 
-    #[test]
-    fn restore_migrates_legacy_completion_requirements_and_rejects_corrupt_tasks() {
-        let mut task_value =
-            serde_json::to_value(task("task-legacy", TaskStatus::Running)).expect("任务应可序列化");
-        task_value["root_task_id"] = json!("task-legacy");
-        task_value["executor_binding"] = json!({
-            "target_role": "coordinator",
-            "required_evidence_tools": ["diagram_render"],
-            "resumes_turn_id": "turn-legacy",
-            "required_tool_chain": ["get_goal", "update_plan"]
-        });
-
-        let restored = TaskStore::restore_legacy_checkpoint(&json!({
-            "tasks": [task_value],
-            "leases": []
-        }))
-        .expect("旧 checkpoint 应完成一次性迁移");
-        let restored_task = restored
-            .get_task(&TaskId::new("task-legacy"))
-            .expect("迁移后的任务应存在");
-        assert_eq!(
-            restored_task.completion_contract.evidence_requirements,
-            vec![TaskEvidenceRequirement::successful_tool_call(
-                "diagram_render"
-            )]
-        );
-        assert_eq!(
-            restored_task.executor_binding,
-            Some(
-                TaskExecutorBinding::for_role("coordinator")
-                    .with_required_tool_chain(vec![
-                        "get_goal".to_string(),
-                        "update_plan".to_string()
-                    ])
-                    .with_goal_mode(true)
-            )
-        );
-
-        let error = match TaskStore::restore_legacy_checkpoint(&json!({
-            "tasks": [{"task_id": 123}],
-            "leases": []
-        })) {
-            Ok(_) => panic!("损坏 checkpoint 不能静默恢复为空任务列表"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn restore_legacy_checkpoint_discards_terminal_orphan_leases() {
-        let root = rooted_task("root-legacy-lease", "root-legacy-lease");
-        let now = UtcMillis::now();
-        let valid_lease = TaskLease {
-            lease_id: LeaseId::new("lease-valid-history"),
-            task_id: root.task_id.clone(),
-            root_task_id: root.root_task_id.clone(),
-            worker_id: WorkerId::new("worker-history"),
-            role: "executor".to_string(),
-            granted_at: now,
-            expires_at: now,
-            heartbeat_at: now,
-            lease_status: TaskLeaseState::Completed,
-        };
-        let orphan_lease = TaskLease {
-            lease_id: LeaseId::new("lease-orphan-history"),
-            task_id: TaskId::new("task-deleted-by-legacy-store"),
-            root_task_id: TaskId::new("root-deleted-by-legacy-store"),
-            worker_id: WorkerId::new("worker-history"),
-            role: "executor".to_string(),
-            granted_at: now,
-            expires_at: now,
-            heartbeat_at: now,
-            lease_status: TaskLeaseState::Revoked,
-        };
-
-        let restored = TaskStore::restore_legacy_checkpoint(&json!({
-            "tasks": [root],
-            "leases": [valid_lease, orphan_lease]
-        }))
-        .expect("旧布局中的终态孤儿租约应在迁移边界被清理");
-
-        let snapshot = restored.snapshot();
-        assert_eq!(snapshot.tasks.len(), 1);
-        assert_eq!(snapshot.leases.len(), 1);
-        assert_eq!(
-            snapshot.leases[0].lease_id,
-            LeaseId::new("lease-valid-history")
-        );
-    }
-
-    #[test]
-    fn restore_legacy_checkpoint_rejects_unverifiable_active_leases() {
-        let now = UtcMillis::now();
-        let active_orphan = TaskLease {
-            lease_id: LeaseId::new("lease-active-orphan"),
-            task_id: TaskId::new("task-missing-during-migration"),
-            root_task_id: TaskId::new("root-missing-during-migration"),
-            worker_id: WorkerId::new("worker-history"),
-            role: "executor".to_string(),
-            granted_at: now,
-            expires_at: now,
-            heartbeat_at: now,
-            lease_status: TaskLeaseState::Active,
-        };
-
-        let error = match TaskStore::restore_legacy_checkpoint(&json!({
-            "tasks": [],
-            "leases": [active_orphan]
-        })) {
-            Ok(_) => panic!("无法验证的活跃租约不能在迁移时静默丢弃"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    }
-
     fn rooted_task(root_task_id: &str, task_id: &str) -> Task {
         let mut value = task(task_id, TaskStatus::Running);
         value.root_task_id = TaskId::new(root_task_id);
@@ -3795,7 +3465,11 @@ mod tests {
             .insert_task(rooted_task("root-a", "z-child"))
             .expect("child z should insert");
 
-        let expected = store.checkpoint();
+        let canonical = |store: &TaskStore| {
+            let snapshot = store.snapshot();
+            json!({ "tasks": snapshot.tasks, "leases": snapshot.leases })
+        };
+        let expected = canonical(&store);
         store
             .checkpoint_to_projection_directory(&projection_dir)
             .expect("projection checkpoint should commit");
@@ -3803,7 +3477,7 @@ mod tests {
         let restored = TaskStore::restore_from_projection_directory(&projection_dir)
             .expect("projection should restore")
             .expect("projection should contain a store");
-        assert_eq!(restored.checkpoint(), expected);
+        assert_eq!(canonical(&restored), expected);
     }
 
     #[test]
@@ -4380,7 +4054,7 @@ mod tests {
         assert_eq!(
             TaskStore::restore_from_projection_directory(missing_task_field_dir.path())
                 .err()
-                .expect("missing v2 task fields must fail")
+                .expect("missing required task fields must fail")
                 .kind(),
             io::ErrorKind::InvalidData
         );

@@ -2795,10 +2795,6 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
             .contains("request-no-subscriber-recovery"),
         "canonical event acceptance must be durable before any SSE subscriber is present"
     );
-    assert!(
-        !state_root.join("accepted-submissions.json").exists(),
-        "new accepted submissions must not create the legacy journal"
-    );
 
     drop(app);
     drop(runtime);
@@ -3516,10 +3512,6 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
     assert!(
         event_payload.contains("request-workspace-two-isolated"),
         "workspace accepted facts must be in the canonical event transaction"
-    );
-    assert!(
-        !state_root.join("accepted-submissions.json").exists(),
-        "new workspace submissions must not create the legacy journal"
     );
 }
 

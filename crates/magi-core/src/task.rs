@@ -218,15 +218,9 @@ pub enum PlanState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanItem {
-    #[serde(default = "empty_plan_item_id")]
     pub item_id: PlanItemId,
-    #[serde(alias = "content")]
     pub title: String,
     pub status: PlanItemStatus,
-}
-
-fn empty_plan_item_id() -> PlanItemId {
-    PlanItemId::new("")
 }
 
 impl PlanItem {
@@ -751,12 +745,6 @@ pub struct TaskExecutorBinding {
     /// 目标模式任务必须由执行器统一注入并验证 Goal/Plan 生命周期。
     #[serde(default)]
     pub goal_mode: bool,
-    /// 旧版本持久化字段，仅用于一次性载入迁移，不参与新任务执行。
-    #[serde(default, skip_serializing, rename = "required_evidence_tools")]
-    legacy_required_evidence_tools: Vec<String>,
-    /// 旧版本持久化字段，仅用于兼容已落盘的历史任务结构。
-    #[serde(default, skip_serializing, rename = "resumes_turn_id")]
-    legacy_resumes_turn_id: Option<String>,
 }
 
 impl TaskExecutorBinding {
@@ -867,9 +855,7 @@ pub struct Task {
     pub required_children: Vec<TaskId>,
     pub policy_snapshot: Option<TaskPolicy>,
     pub executor_binding: Option<TaskExecutorBinding>,
-    #[serde(default)]
     pub completion_contract: TaskCompletionContract,
-    #[serde(default)]
     pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
@@ -879,7 +865,6 @@ pub struct Task {
     pub evidence_refs: Vec<String>,
     pub retry_count: u32,
     /// 任务系统 — L11：运行变体的专用负载。
-    #[serde(default)]
     pub runtime_payload: TaskRuntimePayload,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
@@ -972,40 +957,6 @@ impl Task {
 
     pub fn recovery_checkpoint(&self) -> Option<&TaskRecoveryCheckpoint> {
         self.recovery_checkpoint.as_ref()
-    }
-
-    /// 把旧版绑定中的完成约束提升为新的任务完成合同。
-    ///
-    /// 仅在 TaskStore 从历史 checkpoint 载入时调用一次；新执行路径不再读取旧字段。
-    pub fn migrate_persisted_completion_contract(&mut self) {
-        if self.completion_contract.evidence_requirements.is_empty()
-            && let Some(binding) = self.executor_binding.as_mut()
-        {
-            let legacy_requirements = std::mem::take(&mut binding.legacy_required_evidence_tools);
-            self.completion_contract.evidence_requirements = legacy_requirements
-                .into_iter()
-                .map(TaskEvidenceRequirement::successful_tool_call)
-                .collect();
-            binding.legacy_resumes_turn_id = None;
-        }
-    }
-
-    /// 将旧 checkpoint 中已经声明 Goal 生命周期工具链的任务迁移到显式目标模式。
-    ///
-    /// 旧版本没有持久化 `goal_mode`，但 Goal 工具链是唯一允许出现 `get_goal` 的
-    /// 主线执行契约，因此这里只做一次确定性的结构迁移，后续执行不再检查任务文本。
-    pub fn migrate_persisted_goal_mode(&mut self) {
-        if self.is_goal_mode()
-            || !self
-                .required_tool_chain()
-                .iter()
-                .any(|tool| tool == "get_goal")
-        {
-            return;
-        }
-        if let Some(binding) = self.executor_binding.as_mut() {
-            binding.goal_mode = true;
-        }
     }
 
     pub fn plan_item_id(&self) -> Option<&PlanItemId> {

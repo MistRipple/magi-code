@@ -33,9 +33,9 @@ state_root/audit-usage-ledger/
 | `StateRepository` | `audit_usage_ledger_path()` 返回段目录；`load_audit_usage_ledger()` 从段目录加载。 |
 | 设置 `reset_stats` | 改为发布 `usage.stats.reset` 后刷盘。 |
 
-### 1.4 一次性数据迁移
+### 1.4 只接受分段格式
 
-已有安装存在 `state_root/audit-usage-ledger.json`。`StateRepository::load_audit_usage_ledger` 在段目录不存在、旧文件存在时，把旧文件内容写成第一个段，确认落盘后删除旧文件。迁移完成后只存在段目录这一种格式，运行路径不读取旧文件。
+持久化账本只有段目录这一种格式。`StateRepository::load_audit_usage_ledger` 只从段目录加载，不做旧格式迁移，也不识别任何旧版账本文件。
 
 ## 2. 会话 canonical 事件日志（P2-5）
 
@@ -61,5 +61,5 @@ state_root/session-events/<session>/
 
 ## 3. 验证
 
-- 账本：分段追加只写增量、跨段轮转、残行截断、非末段损坏拒绝、保留删除、旧文件迁移、重置标记后的统计口径。
+- 账本：分段追加只写增量、跨段轮转、残行截断、非末段损坏拒绝、保留删除、重置标记后的统计口径。
 - 事件日志：达到阈值后生成检查点并删除被覆盖事务；从检查点加载结果与全量重放一致；截断中途崩溃（遗留被覆盖事务）仍能加载；跨边界事务被拒绝。

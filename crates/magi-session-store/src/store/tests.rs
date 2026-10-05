@@ -194,91 +194,6 @@ fn test_active_chain(
     }
 }
 
-fn acceptance_record(
-    session_id: &SessionId,
-    turn_id: &str,
-    accepted_at: u64,
-    chain_ref: &str,
-) -> (SessionStore, SessionAcceptanceRecord) {
-    let store = SessionStore::new();
-    store
-        .create_session(session_id.clone(), "accepted restore test")
-        .expect("session should be creatable");
-    let turn = test_turn(turn_id, "accepted", accepted_at);
-    let mut chain = test_active_chain(session_id, chain_ref, Some(turn));
-    chain.dispatch_context.accepted_at = UtcMillis(accepted_at);
-    store
-        .accept_active_execution_chain_with_timeline_entry(
-            session_id.clone(),
-            TimelineEntryInput::new(
-                chain.dispatch_context.entry_id.clone(),
-                TimelineEntryKind::UserMessage,
-                format!("message for {turn_id}"),
-                UtcMillis(accepted_at),
-            ),
-            chain,
-        )
-        .expect("accepted turn should be stored");
-    let record = store
-        .session_acceptance_record(session_id, turn_id)
-        .expect("accepted record should be reconstructable");
-    (store, record)
-}
-
-#[test]
-fn restore_acceptance_records_prefers_newest_turn_and_preserves_terminal_state() {
-    let session_id = SessionId::new("session-accepted-restore-order");
-    let (_old_source, old_record) =
-        acceptance_record(&session_id, "turn-old", 10, "chain-accepted-restore-old");
-    let (_new_source, new_record) =
-        acceptance_record(&session_id, "turn-new", 20, "chain-accepted-restore-new");
-
-    let restored = SessionStore::new();
-    let restored_count = restored
-        .restore_session_acceptance_records([new_record.clone(), old_record.clone()])
-        .expect("accepted records should restore");
-    assert_eq!(restored_count, 2);
-    assert_eq!(
-        restored
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .map(|turn| turn.turn_id),
-        Some("turn-new".to_string())
-    );
-    assert_eq!(
-        restored.canonical_turns_for_session(&session_id).len(),
-        2,
-        "多个 accepted journal 不能因 session 只有一个 current turn 而丢失历史 canonical turn"
-    );
-
-    let (terminal_source, accepted_record) = acceptance_record(
-        &SessionId::new("session-accepted-restore-terminal"),
-        "turn-terminal",
-        30,
-        "chain-accepted-restore-terminal",
-    );
-    let terminal_session_id = SessionId::new("session-accepted-restore-terminal");
-    terminal_source
-        .set_current_turn_status_for_test(&terminal_session_id, Some("turn-terminal"), "completed")
-        .expect("source turn should become terminal");
-    let terminal_target = SessionStore::from_persisted_parts(
-        terminal_source.durable_state(),
-        terminal_source.execution_sidecar_store_state(),
-    )
-    .expect("终态会话的持久化恢复应成功");
-    terminal_target
-        .restore_session_acceptance_records([accepted_record])
-        .expect("terminal accepted record should restore idempotently");
-    assert_eq!(
-        terminal_target
-            .runtime_sidecar(&terminal_session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .map(|turn| turn.status),
-        Some("completed".to_string()),
-        "旧 accepted journal 不能覆盖已经持久化的终态 Turn"
-    );
-}
-
 fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
     ActiveExecutionTurnItem {
         item_id: item_id.to_string(),
@@ -1343,158 +1258,7 @@ fn v2_store_rejects_legacy_todo_list_payload() {
         }]),
     );
     serde_json::from_value::<SessionDurableState>(payload)
-        .expect_err("v2 正常恢复不得接受 todo_lists；转换只允许发生在 v1 迁移边界");
-}
-
-#[test]
-fn v1_migration_uses_newer_sidecar_snapshot_for_conflicting_turn() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-v1-conflicting-turn");
-    let turn_id = "turn-v1-conflicting";
-    store
-        .create_session(session_id.clone(), "v1 conflicting turn")
-        .expect("session should be creatable");
-
-    let mut seed_turn = test_turn(turn_id, "interrupted", 10);
-    seed_turn.completed_at = Some(UtcMillis(20));
-    seed_turn.items = (0..8)
-        .map(|index| {
-            let mut item = test_turn_item(&format!("item-{index}"), &format!("旧事实 {index}"));
-            item.item_seq = index + 1;
-            item
-        })
-        .collect();
-    accept_test_turn(&store, &session_id, seed_turn);
-
-    let mut durable = store.durable_state();
-    let canonical = durable
-        .canonical_turns
-        .iter_mut()
-        .find(|turn| turn.session_id == session_id && turn.turn_id == turn_id)
-        .expect("canonical turn should exist");
-    canonical.status = CanonicalTurnStatus::Interrupted;
-    canonical.completed_at = Some(UtcMillis(20));
-    for item in &mut canonical.items {
-        item.updated_at = UtcMillis(20);
-    }
-
-    let mut sidecars = store.execution_sidecar_store_state();
-    let sidecar = sidecars
-        .runtime_sidecars
-        .iter_mut()
-        .find(|sidecar| sidecar.session_id == session_id)
-        .expect("sidecar should exist");
-    sidecar.updated_at = UtcMillis(40);
-    let current_turn = sidecar
-        .current_turn
-        .as_mut()
-        .expect("current turn should exist");
-    current_turn.status = "failed".to_string();
-    current_turn.completed_at = Some(UtcMillis(30));
-    for index in 8..11 {
-        let mut item = test_turn_item(&format!("item-{index}"), &format!("新工具结果 {index}"));
-        item.item_seq = index + 1;
-        current_turn.items.push(item);
-    }
-    current_turn.normalize();
-
-    let restored = SessionStore::convert_v1_persisted_parts(durable, sidecars)
-        .expect("v1 migration should resolve conflicting snapshots");
-    let restored_turn = restored
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .find(|turn| turn.turn_id == turn_id)
-        .expect("conflicting turn should remain");
-    assert_eq!(restored_turn.status, CanonicalTurnStatus::Failed);
-    assert_eq!(restored_turn.items.len(), 11);
-    assert!(
-        restored_turn
-            .items
-            .iter()
-            .any(|item| item.item_id == "item-10")
-    );
-    let restored_sidecar_turn = restored
-        .runtime_sidecar(&session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .expect("sidecar current turn should remain");
-    assert_eq!(restored_sidecar_turn.status, "failed");
-    assert_eq!(restored_sidecar_turn.items.len(), 11);
-    assert_eq!(
-        restored_sidecar_turn
-            .items
-            .iter()
-            .map(|item| item.item_id.as_str())
-            .collect::<Vec<_>>(),
-        restored_turn
-            .items
-            .iter()
-            .map(|item| item.item_id.as_str())
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn v1_migration_preserves_sidecar_only_items_when_canonical_is_newer() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-v1-canonical-newer");
-    let turn_id = "turn-v1-canonical-newer";
-    store
-        .create_session(session_id.clone(), "v1 canonical newer")
-        .expect("session should be creatable");
-
-    let mut seed_turn = test_turn(turn_id, "completed", 10);
-    seed_turn.completed_at = Some(UtcMillis(100));
-    let mut canonical_item = test_turn_item("item-canonical", "权威最新正文");
-    canonical_item.item_seq = 1;
-    seed_turn.items = vec![canonical_item];
-    accept_test_turn(&store, &session_id, seed_turn);
-
-    let mut durable = store.durable_state();
-    let canonical = durable
-        .canonical_turns
-        .iter_mut()
-        .find(|turn| turn.session_id == session_id && turn.turn_id == turn_id)
-        .expect("canonical turn should exist");
-    canonical.status = CanonicalTurnStatus::Completed;
-    canonical.completed_at = Some(UtcMillis(100));
-    for item in &mut canonical.items {
-        item.updated_at = UtcMillis(100);
-    }
-
-    let mut sidecars = store.execution_sidecar_store_state();
-    let sidecar = sidecars
-        .runtime_sidecars
-        .iter_mut()
-        .find(|sidecar| sidecar.session_id == session_id)
-        .expect("sidecar should exist");
-    sidecar.updated_at = UtcMillis(40);
-    let current_turn = sidecar
-        .current_turn
-        .as_mut()
-        .expect("current turn should exist");
-    current_turn.status = "running".to_string();
-    current_turn.completed_at = None;
-    let mut sidecar_only_item = test_turn_item("item-sidecar-only", "旧快照也包含的工具结果");
-    sidecar_only_item.item_seq = 2;
-    current_turn.items.push(sidecar_only_item);
-    current_turn.normalize();
-
-    let restored = SessionStore::convert_v1_persisted_parts(durable, sidecars)
-        .expect("v1 migration should preserve both facts");
-    let restored_turn = restored
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .find(|turn| turn.turn_id == turn_id)
-        .expect("canonical turn should remain");
-    assert_eq!(restored_turn.status, CanonicalTurnStatus::Completed);
-    assert_eq!(restored_turn.completed_at, Some(UtcMillis(100)));
-    assert_eq!(restored_turn.items.len(), 2);
-    assert!(
-        restored_turn
-            .items
-            .iter()
-            .any(|item| item.item_id == "item-sidecar-only")
-    );
+        .expect_err("持久化状态只接受当前格式，不得接受旧 todo_lists");
 }
 
 #[test]
@@ -6378,8 +6142,16 @@ fn rename_and_delete_hand_the_persistence_callback_only_the_affected_sessions_hi
     store
         .create_session(other_id.clone(), "other")
         .expect("other session should create");
-    accept_test_turn(&store, &target_id, test_turn("turn-slice-target", "completed", 10));
-    accept_test_turn(&store, &other_id, test_turn("turn-slice-other", "completed", 20));
+    accept_test_turn(
+        &store,
+        &target_id,
+        test_turn("turn-slice-target", "completed", 10),
+    );
+    accept_test_turn(
+        &store,
+        &other_id,
+        test_turn("turn-slice-other", "completed", 20),
+    );
     store
         .select_current_session(&target_id)
         .expect("target should be current");

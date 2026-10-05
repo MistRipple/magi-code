@@ -8,7 +8,7 @@ use crate::models::{
     SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionPlan, SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState,
     ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
-    ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    ThreadModelProviderContext, ThreadVisibility, TimelineEntry,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanState,
@@ -1527,77 +1527,12 @@ fn validate_sidecar_turn_identity_prefix(
     Ok(())
 }
 
-fn migration_status_rank(status: CanonicalTurnStatus) -> u8 {
-    if status.is_terminal() { 2 } else { 1 }
-}
-
 fn canonical_turn_progress_rank(status: CanonicalTurnStatus) -> u8 {
     match status {
         CanonicalTurnStatus::Pending => 0,
         CanonicalTurnStatus::Running => 1,
         _ => 2,
     }
-}
-
-fn migration_canonical_turn_key(turn: &CanonicalTurn) -> (u64, u8, usize) {
-    let latest_item_update = turn
-        .items
-        .iter()
-        .map(|item| item.updated_at.0)
-        .max()
-        .unwrap_or(turn.accepted_at.0);
-    (
-        latest_item_update
-            .max(turn.completed_at.map_or(0, |completed_at| completed_at.0))
-            .max(turn.accepted_at.0),
-        migration_status_rank(turn.status),
-        turn.items.len(),
-    )
-}
-
-fn migration_active_turn_key(
-    turn: &ActiveExecutionTurn,
-    sidecar_updated_at: UtcMillis,
-) -> (u64, u8, usize) {
-    (
-        sidecar_updated_at
-            .0
-            .max(turn.completed_at.map_or(0, |completed_at| completed_at.0))
-            .max(turn.accepted_at.0),
-        canonical_current_turn_status(&turn.status)
-            .map(migration_status_rank)
-            .unwrap_or_default(),
-        turn.items.len(),
-    )
-}
-
-/// 旧布局中 canonical 与 sidecar 是两份独立快照，迁移时可能各自包含对方没有的
-/// item。迁移边界保留两边的 item，再由较新的快照决定同一 item 的正文和终态，
-/// 避免把较晚写入的工具结果静默丢掉。v2 正常运行不允许走这条路径。
-fn merge_v1_turn_facts(mut preferred: CanonicalTurn, supplemental: CanonicalTurn) -> CanonicalTurn {
-    let mut item_ids = HashSet::new();
-    preferred
-        .items
-        .retain(|item| item_ids.insert(item.item_id.clone()));
-    for item in supplemental.items {
-        if item_ids.insert(item.item_id.clone()) {
-            preferred.items.push(item);
-        }
-    }
-    preferred.items.sort_by(|left, right| {
-        left.item_seq
-            .cmp(&right.item_seq)
-            .then_with(|| left.item_id.cmp(&right.item_id))
-    });
-    for (index, item) in preferred.items.iter_mut().enumerate() {
-        item.item_seq = index + 1;
-        item.turn_seq = preferred.turn_seq;
-    }
-    for (key, value) in supplemental.metadata {
-        preferred.metadata.entry(key).or_insert(value);
-    }
-    preferred.normalize();
-    preferred
 }
 
 fn replace_active_turn_from_canonical(
@@ -1683,228 +1618,6 @@ fn canonical_turn_is_ahead_of_active(
         };
         canonical_item.status.is_terminal() && !active_item_status.is_terminal()
     })
-}
-
-/// v1 -> v2 converter 专用入口。正常 v2 恢复不得从 timeline/sidecar 反向补事实。
-pub(super) fn convert_v1_conversation_facts(state: &mut SessionStoreState) -> DomainResult<()> {
-    let mut legacy_turns = Vec::<(SessionId, ActiveExecutionTurn, UtcMillis)>::new();
-    let mut seen_turns = HashSet::new();
-    for sidecar in &state.execution_sidecar_store.runtime_sidecars {
-        if !state
-            .sessions
-            .iter()
-            .any(|session| session.session_id == sidecar.session_id)
-        {
-            return Err(DomainError::InvalidState {
-                message: format!(
-                    "legacy sidecar 引用了不存在的 session {}",
-                    sidecar.session_id
-                ),
-            });
-        }
-        for turn in [
-            sidecar.current_turn.as_ref(),
-            sidecar
-                .active_execution_chain
-                .as_ref()
-                .and_then(|chain| chain.current_turn.as_ref()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let key = (sidecar.session_id.clone(), turn.turn_id.clone());
-            if let Some(existing) = legacy_turns.iter_mut().find(|(session_id, existing, _)| {
-                *session_id == sidecar.session_id && existing.turn_id == turn.turn_id
-            }) {
-                if migration_active_turn_key(turn, sidecar.updated_at)
-                    > migration_active_turn_key(&existing.1, existing.2)
-                {
-                    existing.1 = turn.clone();
-                    existing.2 = sidecar.updated_at;
-                }
-            } else if seen_turns.insert(key) {
-                legacy_turns.push((sidecar.session_id.clone(), turn.clone(), sidecar.updated_at));
-            }
-        }
-    }
-    for (session_id, turn, sidecar_updated_at) in legacy_turns {
-        let incoming = current_turn_to_canonical_turn(&session_id, &turn)?;
-        if let Some(existing) = state
-            .canonical_turns
-            .iter_mut()
-            .find(|existing| existing.session_id == session_id && existing.turn_id == turn.turn_id)
-        {
-            let sidecar_is_newer = migration_active_turn_key(&turn, sidecar_updated_at)
-                > migration_canonical_turn_key(existing);
-            let canonical = existing.clone();
-            *existing = if sidecar_is_newer {
-                merge_v1_turn_facts(incoming, canonical)
-            } else {
-                merge_v1_turn_facts(canonical, incoming)
-            };
-        } else {
-            state.canonical_turns.push(incoming);
-        }
-    }
-
-    let mut timeline = state
-        .timeline
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.kind,
-                TimelineEntryKind::UserMessage | TimelineEntryKind::AssistantMessage
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    timeline.sort_by(|left, right| {
-        left.occurred_at
-            .0
-            .cmp(&right.occurred_at.0)
-            .then_with(|| left.entry_id.cmp(&right.entry_id))
-    });
-    let mut matched_items = HashSet::<(SessionId, String)>::new();
-    for entry in timeline {
-        let expected_kind = match entry.kind {
-            TimelineEntryKind::UserMessage => CanonicalTurnItemKind::UserMessage,
-            TimelineEntryKind::AssistantMessage => CanonicalTurnItemKind::AssistantText,
-            _ => unreachable!("timeline filter only retains conversation entries"),
-        };
-        let direct_match = state.canonical_turns.iter_mut().find_map(|turn| {
-            if turn.session_id != entry.session_id {
-                return None;
-            }
-            turn.items.iter_mut().find(|item| {
-                item.metadata.get("timelineEntryId").and_then(Value::as_str)
-                    == Some(entry.entry_id.as_str())
-            })
-        });
-        if let Some(item) = direct_match {
-            matched_items.insert((entry.session_id.clone(), item.item_id.clone()));
-            continue;
-        }
-        let content_match = state.canonical_turns.iter_mut().find_map(|turn| {
-            if turn.session_id != entry.session_id {
-                return None;
-            }
-            turn.items.iter_mut().find(|item| {
-                item.kind == expected_kind
-                    && item.content.as_deref() == Some(entry.message.as_str())
-                    && !matched_items.contains(&(entry.session_id.clone(), item.item_id.clone()))
-            })
-        });
-        if let Some(item) = content_match {
-            item.metadata.insert(
-                "timelineEntryId".to_string(),
-                Value::String(entry.entry_id.clone()),
-            );
-            matched_items.insert((entry.session_id.clone(), item.item_id.clone()));
-            continue;
-        }
-
-        let source_thread_id = state
-            .thread_registry
-            .iter()
-            .find(|thread| {
-                thread.session_id == entry.session_id && thread.role_id == ORCHESTRATOR_ROLE_ID
-            })
-            .map(|thread| thread.thread_id.clone())
-            .unwrap_or_else(|| ThreadId::new(format!("thread-orchestrator-{}", entry.session_id)));
-        let turn_id = format!("legacy-turn:{}", entry.entry_id);
-        let item = CanonicalTurnItem {
-            session_id: entry.session_id.clone(),
-            turn_id: turn_id.clone(),
-            turn_seq: 0,
-            item_id: format!("legacy-item:{}", entry.entry_id),
-            item_seq: 1,
-            kind: expected_kind,
-            created_at: entry.occurred_at,
-            status: CanonicalTurnItemStatus::Completed,
-            item_version: Some(1),
-            updated_at: entry.occurred_at,
-            title: None,
-            content: Some(entry.message),
-            blocks: Vec::new(),
-            tool: None,
-            worker: None,
-            source_thread_id,
-            visibility: CanonicalTurnVisibility::default(),
-            metadata: HashMap::from([
-                ("timelineEntryId".to_string(), Value::String(entry.entry_id)),
-                ("legacyMigration".to_string(), Value::Bool(true)),
-            ]),
-        };
-        state.canonical_turns.push(CanonicalTurn {
-            session_id: entry.session_id,
-            turn_id,
-            turn_seq: 0,
-            accepted_at: entry.occurred_at,
-            completed_at: Some(entry.occurred_at),
-            status: CanonicalTurnStatus::Completed,
-            response_duration_ms: Some(0),
-            usage: None,
-            items: vec![item],
-            metadata: HashMap::from([("legacyMigration".to_string(), Value::Bool(true))]),
-        });
-    }
-
-    for session in &state.sessions {
-        let mut indexes = state
-            .canonical_turns
-            .iter()
-            .enumerate()
-            .filter(|(_, turn)| turn.session_id == session.session_id)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        indexes.sort_by(|left, right| {
-            let left = &state.canonical_turns[*left];
-            let right = &state.canonical_turns[*right];
-            left.accepted_at
-                .0
-                .cmp(&right.accepted_at.0)
-                .then_with(|| left.turn_id.cmp(&right.turn_id))
-        });
-        for (offset, index) in indexes.into_iter().enumerate() {
-            let turn = &mut state.canonical_turns[index];
-            turn.turn_seq = offset as u64 + 1;
-            for item in &mut turn.items {
-                item.turn_seq = turn.turn_seq;
-            }
-        }
-        if let Some(sidecar) = state
-            .execution_sidecar_store
-            .runtime_sidecars
-            .iter_mut()
-            .find(|sidecar| sidecar.session_id == session.session_id)
-        {
-            if let Some(turn) = sidecar.current_turn.as_mut()
-                && let Some(canonical) = state.canonical_turns.iter().find(|canonical| {
-                    canonical.session_id == session.session_id && canonical.turn_id == turn.turn_id
-                })
-            {
-                replace_active_turn_from_canonical(canonical, turn);
-            }
-            if let Some(turn) = sidecar
-                .active_execution_chain
-                .as_mut()
-                .and_then(|chain| chain.current_turn.as_mut())
-                && let Some(canonical) = state.canonical_turns.iter().find(|canonical| {
-                    canonical.session_id == session.session_id && canonical.turn_id == turn.turn_id
-                })
-            {
-                replace_active_turn_from_canonical(canonical, turn);
-            }
-        }
-    }
-    state.canonical_turns.sort_by(|left, right| {
-        left.session_id
-            .as_str()
-            .cmp(right.session_id.as_str())
-            .then_with(|| left.turn_seq.cmp(&right.turn_seq))
-            .then_with(|| left.turn_id.cmp(&right.turn_id))
-    });
-    Ok(())
 }
 
 pub(super) fn reconcile_terminal_goal_continuations(state: &mut SessionStoreState) {
@@ -2741,7 +2454,7 @@ impl SessionStore {
     ///
     /// ThreadChatMessage 只是读取投影，不能再作为 Provider/工具路径的独立事实源。
     /// 只有当当前 session 存在属于该 thread 的 canonical item 时才替换 transcript；
-    /// 没有 canonical 历史的 thread 保留原值，交由明确的迁移/恢复路径处理。
+    /// 没有 canonical 历史的 thread 保留原值。
     pub fn rebuild_thread_message_projection(
         &self,
         thread_id: &ThreadId,
@@ -2922,9 +2635,9 @@ impl SessionStore {
         if projected.is_empty() {
             return Ok(0);
         }
-        // 迁移中的旧 thread 可能已经有一段没有 canonical 对应物的历史，恢复流程也可能在
-        // 历史里插入 canonical 没有的消息。合并必须幂等：同一份 projection 无论重建多少
-        // 次，历史都不能再增长（流式输出期间每个 token 都会触发一次重建）。
+        // thread 历史可能包含没有 canonical 对应物的消息（代理任务的初始输入、恢复流程
+        // 插入的中断工具结果）。合并必须幂等：同一份 projection 无论重建多少次，历史都
+        // 不能再增长（流式输出期间每个 token 都会触发一次重建）。
         let projected = merge_thread_history_with_projection(&thread.message_history, projected);
         let target = state
             .thread_registry
@@ -2946,17 +2659,20 @@ impl SessionStore {
         Ok(if changed { 1 } else { 0 })
     }
 
-    /// 重建 projection；仅对没有任何 canonical item 的 thread 使用一次性迁移
-    /// 输入。新 Turn 一旦有 canonical 事实，传入的迁移输入会被忽略，避免
-    /// Provider/工具回调重新建立第二份事实源。
-    pub fn rebuild_thread_message_projection_with_migration_input(
+    /// 重建 projection；thread 尚无任何 canonical item 时，用调用方给出的消息
+    /// 初始化 thread 历史。
+    ///
+    /// 代理任务 thread 的任务输入不进入 canonical Turn，新建 thread 的第一条
+    /// 历史只能由这里写入。thread 一旦有 canonical 事实，传入的消息会被忽略，
+    /// 避免 Provider/工具回调重新建立第二份事实源。
+    pub fn rebuild_thread_message_projection_with_initial_messages(
         &self,
         thread_id: &ThreadId,
-        migration_messages: Vec<ThreadChatMessage>,
+        initial_messages: Vec<ThreadChatMessage>,
         now: UtcMillis,
     ) -> DomainResult<usize> {
         let projected = self.rebuild_thread_message_projection(thread_id, now)?;
-        if projected > 0 || migration_messages.is_empty() {
+        if projected > 0 || initial_messages.is_empty() {
             return Ok(projected);
         }
         let mut state = self
@@ -2977,7 +2693,7 @@ impl SessionStore {
             .find(|thread| &thread.thread_id == thread_id)
             .ok_or(DomainError::NotFound { entity: "thread" })?;
         let session_id = thread.session_id.clone();
-        thread.message_history.extend(migration_messages);
+        thread.message_history.extend(initial_messages);
         thread.last_used_at = now;
         drop(state);
         self.mark_sidecar_dirty_for_session(
