@@ -1147,3 +1147,39 @@ test("P1-12 右栏浏览器宿主是唯一的 tabId 键控列表，保留页面�
     /\.right-pane-browser-tab-host--background \{ transform: translate3d\(-20000px, 0, 0\)/u,
   );
 });
+
+test("代理光标由 Renderer 覆盖层绘制：Main 不向页面注入元素，坐标按实际缩放换算", () => {
+  const start = source.indexOf("  private setAgentCursor(");
+  const end = source.indexOf("  private promote(surfaceId: string): void {", start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.doesNotMatch(body, /Runtime\.evaluate|createIsolatedWorld|enqueueCdp|document\./u);
+  assert.match(body, /record\.viewportLifecycle\.applied\?\.scale \?\? 1/u);
+  assert.match(body, /displayX: position\.x === null \? null : position\.x \* scale/u);
+  assert.doesNotMatch(source, /magi-agent-cursor|AGENT_CURSOR_SVG|cursorExecutionContextId/u);
+});
+
+test("代理光标在输入投递前于同一 Surface lane 内更新，导航不再重建光标", () => {
+  const laneUpdate = source.indexOf(
+    "agentCursorActionForInput(method, input)",
+  );
+  const send = source.indexOf("const command = this.sendSurfaceCdpCommand(", laneUpdate);
+  assert.ok(laneUpdate >= 0 && send > laneUpdate, "光标更新必须早于输入投递");
+  const finishLoad = source.indexOf('webContents.on("did-finish-load"');
+  const titleUpdated = source.indexOf('webContents.on("page-title-updated"', finishLoad);
+  assert.ok(finishLoad >= 0 && titleUpdated > finishLoad);
+  assert.doesNotMatch(source.slice(finishLoad, titleUpdated), /setAgentCursor/u);
+});
+
+test("浏览器内容槽上方挂载 Magi 光标覆盖层，并随接管或控制撤销隐藏", () => {
+  const normalizedBrowserTab = normalizeSourceWhitespace(browserTabSource);
+  assert.match(
+    normalizedBrowserTab,
+    /<AgentCursorOverlay anchorName=\{surfaceAnchorName\} signal=\{agentCursorSignal\} hostVisible=\{surfaceSlotVisible && browserReady\} \/>/u,
+  );
+  assert.match(normalizedBrowserTab, /point: agentCursorPoint\(event\.displayX, event\.displayY\)/u);
+  assert.match(
+    normalizedBrowserTab,
+    /function clearAgentControl\(\): void \{ agentControlling = false; agentCursorSignal = \{ sequence: \+\+agentCursorSequence, visible: false/u,
+  );
+});

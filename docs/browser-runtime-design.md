@@ -180,6 +180,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | Renderer 挂载 | 右栏把当前作用域的浏览器 Tab 与保留页面合并为**同一个按 `tabId` 键控的宿主列表**；不在当前作用域或当前不可见的保留页面离屏挂载（`translate3d(-20000px, 0, 0)`，保持真实布局尺寸以维持 guest 注册），会话切换只改变可见性，不卸载重建 `<webview>`。存在保留页面时右栏列即使折叠也保持后台挂载 |
 | 驱动路径 | 内容槽绑定有效时直接复用；否则只做后台物化（`ensureBrowserSurfaceInBackground`），等待 Renderer 依据快照注册离屏宿主，不附带激活意图 |
 | 释放 | 页面移出保留集合后回到 §4.2 的普通生命周期：不在当前作用域即卸载当前窗口 guest，Authority 逻辑 Tab/URL 保留 |
+| 代理光标 | Main 是光标位置与动作的唯一来源：在输入投递前于同一 Surface lane 内更新，按实际生效的设备画布 `scale` 换算为内容槽坐标并随 `agent_cursor` 事件发布。Renderer 用锚定内容槽的 Top Layer 覆盖层（`pointer-events: none`）绘制 Magi 光标、动作名牌、点击波纹和受控描边；页面 DOM 不注入任何元素，截图不包含光标，导航不打断光标。用户接管、控制撤销、Primary 切换或页面崩溃时光标隐藏 |
 
 ## 5. 导航、控制与恢复
 

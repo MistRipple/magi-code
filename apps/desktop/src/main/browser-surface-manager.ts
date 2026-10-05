@@ -43,6 +43,7 @@ import {
   decideBrowserPopup,
   type BrowserPopupBlockReason,
 } from "./browser-popup-policy.js";
+import { agentCursorActionForInput } from "./browser-agent-cursor.js";
 import {
   fitBrowserViewportScale,
   type BrowserDisplaySize,
@@ -132,6 +133,9 @@ export type BrowserSurfaceEvent =
       x: number | null;
       y: number | null;
       action: string | null;
+      /** 内容槽 CSS 坐标，供 Renderer 绘制覆盖层光标。 */
+      displayX: number | null;
+      displayY: number | null;
     }
   | {
       type: "cdp_event";
@@ -217,7 +221,6 @@ interface BrowserSurfaceRecord {
     y: number | null;
     action: string | null;
   };
-  cursorExecutionContextId: number | null;
   cdpLane: Promise<void>;
   viewportLifecycle: ViewportCommitLifecycle;
   debuggerListenersInstalled: boolean;
@@ -433,9 +436,6 @@ export interface BrowserDisplaySizeInput extends ReleasedBrowserWebviewInput {
 // 固定资产只用于隔离世界中的可视化指针，不读取或修改页面的光标样式。
 // 指针沿用 Codex 的低存在感视觉：灰紫色主体、柔和浅色描边和圆润转角，
 // 让它在浅色页面上清晰可见，但不会像黑色系统光标一样抢占内容注意力。
-const AGENT_CURSOR_SVG =
-  "<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26' viewBox='0 0 26 26'><path d='M5.05 3.55c-.77-.28-1.53.36-1.33 1.18l4.19 16.55c.28 1.1 1.74 1.34 2.28.32l3.7-6.95c.11-.21.28-.39.48-.51l6.35-3.61c1.16-.66.98-2.38-.3-2.79L5.05 3.55Z' fill='#4e4d66' stroke='#d5d5d9' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/></svg>";
-const AGENT_CURSOR_ASSET = `data:image/svg+xml,${encodeURIComponent(AGENT_CURSOR_SVG)}`;
 const ALLOWED_WORKER_CDP_METHODS = new Set([
   "DOM.getDocument",
   "DOM.querySelector",
@@ -848,7 +848,6 @@ export class BrowserSurfaceManager {
       automationInputDepth: 0,
       agentControlled: false,
       cursor: { visible: false, x: null, y: null, action: null },
-      cursorExecutionContextId: null,
       cdpLane: Promise.resolve(),
       viewportLifecycle: {
         nextRevision: 0,
@@ -1430,6 +1429,23 @@ export class BrowserSurfaceManager {
             // 失败并交给上层使用新的 binding 重试，不能把旧 DOM 操作投递到新页。
             this.recordForBinding(binding);
             const lease = debuggerLease(sessionId);
+            // 光标在输入真正投递前更新：与排队输入同序，用户先看到光标移向
+            // 目标，再看到页面响应。
+            if (injectsInput && record.agentControlled) {
+              const input = params as {
+                type?: string;
+                x?: number;
+                y?: number;
+                button?: string;
+              };
+              this.setAgentCursor(
+                record,
+                true,
+                typeof input.x === "number" ? input.x : record.cursor.x,
+                typeof input.y === "number" ? input.y : record.cursor.y,
+                agentCursorActionForInput(method, input),
+              );
+            }
             if (method === "Page.captureScreenshot") {
               await this.waitForCompositorFrame(
                 record,
@@ -1483,32 +1499,6 @@ export class BrowserSurfaceManager {
           method.startsWith("Input."),
       });
       if (result === NATIVE_DIALOG_OPENED_RESULT) return result;
-      if (injectsInput && record.agentControlled) {
-        const input = params as { type?: string; x?: number; y?: number };
-        // 一个完整点击包含 pressed/released 两个事件，但视觉反馈只在
-        // pressed 时触发一次；released 仍更新指针位置，避免一次点击出现
-        // 两个连续波纹。
-        const action =
-          method === "Input.insertText"
-            ? "type"
-            : input.type === "mousePressed"
-              ? "click"
-              : input.type === "mouseWheel"
-                ? "scroll"
-                : "move";
-        // 等待代理指针完成注入再返回输入命令，保证调用方紧接着截图时
-        // 能看到与刚刚执行的动作一致的指针位置和点击反馈。
-        await this.setAgentCursor(
-          record,
-          true,
-          typeof input.x === "number" ? input.x : record.cursor.x,
-          typeof input.y === "number" ? input.y : record.cursor.y,
-          action,
-        ).catch(() => undefined);
-        this.assertRenderableBinding(binding, {
-          allowNavigationAdvance: true,
-        });
-      }
       return result;
     } finally {
       if (injectsInput && !inputCompletionTracked) releaseInput();
@@ -1908,13 +1898,13 @@ export class BrowserSurfaceManager {
         if (!this.isViewportCommitInputCurrent(record, commit)) continue;
         commit.resolve();
         if (record.agentControlled) {
-          void this.setAgentCursor(
+          this.setAgentCursor(
             record,
             true,
             record.cursor.x,
             record.cursor.y,
             record.cursor.action,
-          ).catch(() => undefined);
+          );
         }
         return;
       } catch (error) {
@@ -2115,23 +2105,13 @@ export class BrowserSurfaceManager {
     const record = this.requireRecord(surfaceId);
     record.agentControlled = control.mode === "agent";
     if (!record.agentControlled) this.setAgentRetained(tabId, false);
-    // 控制权变更只更新宿主状态；光标绘制依赖页面文档树，不能占用该 Tab
-    // 的命令队列。新建 about:blank 尚未完成首帧时 Page.getFrameTree 会等待
-    // 到文档建立，若在这里等待会把后续 navigate/viewport 一并锁死。
-    void this.setAgentCursor(
+    this.setAgentCursor(
       record,
       record.agentControlled,
       record.cursor.x,
       record.cursor.y,
       record.cursor.action ?? "move",
-    ).catch((error) => {
-      if (!record.closed) {
-        console.warn("[BrowserSurfaceManager] Agent 光标更新失败", {
-          surfaceId: record.surfaceId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    });
+    );
   }
 
   async startInspect(binding: BrowserSurfaceBinding): Promise<void> {
@@ -2753,9 +2733,13 @@ export class BrowserSurfaceManager {
     record: BrowserSurfaceRecord,
   ): { x: number; y: number } | null {
     const width =
-      record.viewport.mode === "fixed" ? record.viewport.width : 320;
+      record.viewport.mode === "fixed"
+        ? record.viewport.width
+        : (record.displaySize?.width ?? 320);
     const height =
-      record.viewport.mode === "fixed" ? record.viewport.height : 240;
+      record.viewport.mode === "fixed"
+        ? record.viewport.height
+        : (record.displaySize?.height ?? 240);
     const inset = 18;
     const clamp = (value: number, limit: number): number =>
       Math.max(0, Math.min(Math.max(0, limit - inset), value));
@@ -2782,9 +2766,7 @@ export class BrowserSurfaceManager {
     for (const record of this.#surfaces.values()) {
       if (record.closed || !record.agentControlled) continue;
       record.agentControlled = false;
-      void this.setAgentCursor(record, false, null, null, null).catch(
-        () => undefined,
-      );
+      this.setAgentCursor(record, false, null, null, null);
     }
   }
 
@@ -3246,7 +3228,6 @@ export class BrowserSurfaceManager {
       record.pageUrl = targetUrl;
       if (kind !== "in-page") record.pageTitle = "";
     }
-    record.cursorExecutionContextId = null;
     this.invalidateViewportCommit(record, "navigation");
     this.stopInspectForLifecycle(record, "navigation");
     this.stopAnnotationCaptureForLifecycle(record, "navigation");
@@ -4775,14 +4756,6 @@ export class BrowserSurfaceManager {
           });
         }
       });
-      if (record.closed || !record.agentControlled) return;
-      void this.setAgentCursor(
-        record,
-        true,
-        record.cursor.x,
-        record.cursor.y,
-        record.cursor.action,
-      ).catch(() => undefined);
     });
     webContents.on("page-title-updated", (_event, title) => {
       if (!isCurrentGuest()) return;
@@ -5049,9 +5022,7 @@ export class BrowserSurfaceManager {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
     this.setAgentRetained(record.tabId, false);
-    void this.setAgentCursor(record, false, null, null, null).catch(
-      () => undefined,
-    );
+    this.setAgentCursor(record, false, null, null, null);
     this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
   }
 
@@ -5437,7 +5408,6 @@ export class BrowserSurfaceManager {
     record.inspectResourcesEnabled = false;
     record.cdpSessionIds.clear();
     record.blockedCdpSessionIds.clear();
-    record.cursorExecutionContextId = null;
     record.viewportLifecycle.deviceMetricsOverrideActive = false;
     record.viewportLifecycle.applied = null;
   }
@@ -5798,13 +5768,18 @@ export class BrowserSurfaceManager {
     };
   }
 
-  private async setAgentCursor(
+  /**
+   * 代理光标是宿主侧的展示状态：Main 记录页面 CSS 坐标，按当前实际生效的设备
+   * 画布缩放换算成内容槽坐标后发布，由 Renderer 在 `<webview>` 上方绘制。
+   * 页面 DOM 不注入任何元素，截图也不包含光标；导航不会打断光标。
+   */
+  private setAgentCursor(
     record: BrowserSurfaceRecord,
     visible: boolean,
     x: number | null,
     y: number | null,
     action: string | null,
-  ): Promise<void> {
+  ): void {
     const contents = record.contents;
     if (record.closed || !contents || contents.isDestroyed()) return;
     const position =
@@ -5812,135 +5787,19 @@ export class BrowserSurfaceManager {
         ? (this.initialAgentCursorPosition(record) ?? { x: null, y: null })
         : { x, y };
     record.cursor = { visible, ...position, action };
+    // 固定设备视口由 Chromium 按 scale 缩放并贴齐内容槽左上角；响应式视口
+    // 的页面 CSS 像素与内容槽像素一致。以实际下发的 scale 为准，不重新推算。
+    const scale = record.viewportLifecycle.applied?.scale ?? 1;
     this.#onEvent({
       type: "agent_cursor",
       binding: this.binding(record),
       visible,
       x: position.x,
       y: position.y,
+      displayX: position.x === null ? null : position.x * scale,
+      displayY: position.y === null ? null : position.y * scale,
       action,
     });
-    const update = async ({ track, debuggerLease }: SurfaceLaneContext) => {
-      const currentContents = record.contents;
-      if (
-        record.closed ||
-        !currentContents ||
-        currentContents.isDestroyed() ||
-        !this.isContentSlotBound(record)
-      )
-        return;
-      // Page.getFrameTree 对尚未建立首个文档的 WebContents 不会返回。首个
-      // 文档由 materialize 统一完成；导航期间则由 did-finish-load 重新应用
-      // 最新状态，不能把页面命令队列绑定到绘制光标的 CDP 请求。
-      if (
-        record.priming ||
-        currentContents.isLoadingMainFrame() ||
-        !currentContents.getURL()
-      )
-        return;
-      try {
-        if (!currentContents.debugger.isAttached()) return;
-        const lease = debuggerLease();
-        if (record.cursorExecutionContextId === null) {
-          const frameTree = (await this.sendSurfaceCdpCommand(
-            record,
-            "Page.getFrameTree",
-            {},
-            CURSOR_CDP_COMMAND_TIMEOUT_MS,
-            lease,
-            track,
-          )) as {
-            frameTree?: { frame?: { id?: string } };
-          };
-          if (!this.isContentSlotBound(record)) return;
-          const frameId = frameTree.frameTree?.frame?.id;
-          if (!frameId) return;
-          const world = (await this.sendSurfaceCdpCommand(
-            record,
-            "Page.createIsolatedWorld",
-            {
-              frameId,
-              worldName: "magi-agent-cursor",
-              grantUniveralAccess: false,
-            },
-            CURSOR_CDP_COMMAND_TIMEOUT_MS,
-            lease,
-            track,
-          )) as { executionContextId?: number };
-          if (!this.isContentSlotBound(record)) return;
-          if (!world.executionContextId) return;
-          record.cursorExecutionContextId = world.executionContextId;
-        }
-        await this.sendSurfaceCdpCommand(
-          record,
-          "Runtime.evaluate",
-          {
-            contextId: record.cursorExecutionContextId,
-            returnByValue: true,
-            expression: `(() => {
-            const state = ${JSON.stringify({ visible, ...position, action })};
-            const cursorAsset = ${JSON.stringify(AGENT_CURSOR_ASSET)};
-            const hostStyle = 'position:fixed;z-index:2147483647;pointer-events:none;width:26px;height:26px;overflow:visible;transform:translate(-3px,-3px);transition:left 60ms linear,top 60ms linear;display:none;will-change:left,top;';
-            let host = document.querySelector('[data-magi-agent-cursor="true"]');
-            if (!(host instanceof HTMLElement) || !host.isConnected) {
-              host = document.createElement('div');
-              host.dataset.magiAgentCursor = 'true';
-              host.setAttribute('aria-hidden', 'true');
-              (document.documentElement || document.body)?.append(host);
-            }
-            if (!(host instanceof HTMLElement)) return true;
-            host.style.cssText = hostStyle;
-            let image = host.querySelector('[data-magi-agent-cursor-image="true"], img');
-            if (!(image instanceof HTMLImageElement)) {
-              image = document.createElement('img');
-              image.dataset.magiAgentCursorImage = 'true';
-              image.alt = '';
-              image.draggable = false;
-              image.style.cssText = 'position:absolute;left:0;top:0;width:26px;height:26px;display:block;pointer-events:none;filter:drop-shadow(0 1px 1.5px rgba(11,13,28,.42));';
-              host.append(image);
-            }
-            image.src = cursorAsset;
-            const hasPosition = Number.isFinite(state.x) && Number.isFinite(state.y);
-            const shouldShow = state.visible && hasPosition;
-            host.style.display = shouldShow ? 'block' : 'none';
-            if (shouldShow && state.x !== null && state.y !== null) {
-              host.style.left = state.x + 'px';
-              host.style.top = state.y + 'px';
-            }
-            const pulse = host.querySelector('[data-magi-agent-cursor-pulse]');
-            if (!shouldShow) {
-              pulse?.remove();
-            } else if (state.action === 'click') {
-              pulse?.remove();
-              const clickPulse = document.createElement('span');
-              clickPulse.dataset.magiAgentCursorPulse = 'true';
-              clickPulse.style.cssText = 'position:absolute;left:-10px;top:-10px;width:28px;height:28px;box-sizing:border-box;border:1px solid rgba(213,213,217,.72);background:rgba(213,213,217,.10);border-radius:50%;pointer-events:none;opacity:.7;transform:scale(.42);transition:opacity 360ms cubic-bezier(.2,.7,.3,1),transform 360ms cubic-bezier(.2,.7,.3,1);';
-              host.insertBefore(clickPulse, image);
-              requestAnimationFrame(() => {
-                clickPulse.style.opacity = '0';
-                clickPulse.style.transform = 'scale(1.08)';
-              });
-              window.setTimeout(() => clickPulse.remove(), 400);
-            }
-            return true;
-            })()`,
-          },
-          CURSOR_CDP_COMMAND_TIMEOUT_MS,
-          lease,
-          track,
-        );
-        if (!this.isContentSlotBound(record)) return;
-        // Runtime.evaluate 返回只代表 DOM 已更新，不代表 Chromium 已经
-        // 完成下一帧合成。等待一个渲染帧，保证紧跟在输入动作后的截图
-        // 能看到代理指针和点击反馈，而不是捕获到更新前的 compositor frame。
-        await new Promise<void>((resolve) => setTimeout(resolve, 16));
-        if (!this.isContentSlotBound(record)) return;
-      } catch {
-        // 导航会清理 isolated world；did-finish-load 会按最新状态重建它。
-        record.cursorExecutionContextId = null;
-      }
-    };
-    await this.enqueueCdp(record, update);
   }
 
   private promote(surfaceId: string): void {
@@ -5960,9 +5819,7 @@ export class BrowserSurfaceManager {
       this.stopAnnotationCaptureForLifecycle(previous, "surface-not-primary");
       if (previous.agentControlled) {
         previous.agentControlled = false;
-        void this.setAgentCursor(previous, false, null, null, null).catch(
-          () => undefined,
-        );
+        this.setAgentCursor(previous, false, null, null, null);
       }
     }
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);

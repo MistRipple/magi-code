@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
+  import AgentCursorOverlay, { type AgentCursorSignal } from './AgentCursorOverlay.svelte';
+  import { agentCursorPoint, normalizeAgentCursorAction } from '../../lib/agent-cursor';
   import { i18n } from '../../stores/i18n.svelte';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
   import {
@@ -90,6 +92,10 @@
     state?: string;
     /** agent_cursor：Agent 是否持有该 Surface 的控制权（虚拟光标可见）。 */
     visible?: boolean;
+    /** agent_cursor：Main 换算好的内容槽 CSS 坐标与动作。 */
+    displayX?: number | null;
+    displayY?: number | null;
+    action?: string | null;
     receivedBytes?: number;
     totalBytes?: number | null;
     error?: string;
@@ -167,6 +173,12 @@
   // （可见 = Agent 持有该 Surface 的控制权）。用户接管、控制权撤销、Surface 失去 Primary 时，
   // Desktop 会发出对应事件，在下面清除它。
   let agentControlling = $state(false);
+  // 光标覆盖层逐条消费 agent_cursor 事件；序号让同一位置的连续点击也能重新触发反馈。
+  let agentCursorSignal = $state<AgentCursorSignal | null>(null);
+  let agentCursorSequence = 0;
+  let surfaceSlotWidth = $state(0);
+  let surfaceSlotHeight = $state(0);
+  const surfaceSlotVisible = $derived(!backgroundHost && surfaceSlotWidth > 0 && surfaceSlotHeight > 0);
   let sessionError = $state('');
   let actionError = $state('');
   let busy = $state(false);
@@ -713,15 +725,15 @@
     if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
     const value = source as Record<string, unknown>;
     const attributes = stringAttributes(value.attributes);
-    const selectedBrowserSessionId = value.browser_session_id ?? value.browserSessionId;
+    const selectedBrowserSessionId = value.browser_session_id;
     const backendDomNodeId = value.backend_node_id ?? value.backend_dom_node_id;
     const domNodeId = value.node_id ?? value.dom_node_id;
-    const frameId = value.frame_id ?? value.frameId;
-    const nodeName = value.node_name ?? value.nodeName;
+    const frameId = value.frame_id;
+    const nodeName = value.node_name;
     const url = value.page_url ?? value.url;
     const title = value.page_title ?? value.title;
-    const outerHtml = value.outer_html ?? value.outerHtml;
-    const outerHtmlTruncated = value.outer_html_truncated ?? value.outerHtmlTruncated;
+    const outerHtml = value.outer_html;
+    const outerHtmlTruncated = value.outer_html_truncated;
     const boundsValue = value.bounds;
     const normalizedBackendDomNodeId = normalizeOptionalDomNodeId(backendDomNodeId);
     const normalizedDomNodeId = normalizeOptionalDomNodeId(domNodeId);
@@ -1333,6 +1345,11 @@
     };
   }
 
+  function clearAgentControl(): void {
+    agentControlling = false;
+    agentCursorSignal = { sequence: ++agentCursorSequence, visible: false, point: null, action: null };
+  }
+
   function handleDesktopBrowserEvent(value: unknown): void {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return;
     const event = value as DesktopBrowserEvent;
@@ -1356,7 +1373,7 @@
     ) {
       clearNodeInspection();
       cancelAnnotationCreation();
-      agentControlling = false;
+      clearAgentControl();
       if (event.type === 'page_crashed') {
         pageError = event.reason?.trim() || event.diagnostic?.trim() || i18n.t('browser.error.pageLoadFailed');
         browserLoading = false;
@@ -1390,6 +1407,12 @@
 
     if (event.type === 'agent_cursor') {
       agentControlling = event.visible === true;
+      agentCursorSignal = {
+        sequence: ++agentCursorSequence,
+        visible: agentControlling,
+        point: agentCursorPoint(event.displayX, event.displayY),
+        action: normalizeAgentCursorAction(event.action),
+      };
       return;
     }
 
@@ -1443,7 +1466,7 @@
       // 这里仅结束当前 Inspect 状态，保留对话框中的节点引用直到用户
       // 主动移除，或页面/Tab 生命周期明确使其失效。
       clearNodeInspection(true);
-      agentControlling = false;
+      clearAgentControl();
       return;
     }
     if (event.type === 'loading_changed') {
@@ -1891,6 +1914,8 @@
 
   <div
     bind:this={browserSurfaceSlot}
+    bind:clientWidth={surfaceSlotWidth}
+    bind:clientHeight={surfaceSlotHeight}
     class="browser-surface-slot"
     style:anchor-name={surfaceAnchorName}
     data-browser-tab-id={tabId}
@@ -1906,6 +1931,7 @@
         webpreferences="focusOnNavigation=no"
         aria-label={i18n.t('browser.viewport.label')}
       ></webview>
+      <AgentCursorOverlay anchorName={surfaceAnchorName} signal={agentCursorSignal} hostVisible={surfaceSlotVisible && browserReady} />
       {#if !browserReady}
         <div class="browser-placeholder browser-placeholder-overlay" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
       {/if}
