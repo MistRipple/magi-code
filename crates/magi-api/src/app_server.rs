@@ -2447,6 +2447,11 @@ mod tests {
             Arc::new(GovernanceService::default()),
         );
         let session_id = SessionId::new("session-app-server-queue-replay");
+        // 排队消息总是属于已存在的会话；重放和首次提交走同一套会话作用域校验。
+        state
+            .session_store
+            .create_session(session_id.clone(), "排队重放会话")
+            .expect("排队会话应创建");
         let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
             "sessionId": session_id,
             "scope": "personal",

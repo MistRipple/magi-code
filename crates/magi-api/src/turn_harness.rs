@@ -5183,12 +5183,11 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        let expected_turn_status = if decision == "allow_once" {
-            CanonicalTurnStatus::Completed
-        } else if decision == "cancel" {
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        let expected_turn_status = if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
-            CanonicalTurnStatus::Failed
+            CanonicalTurnStatus::Completed
         };
         assert_eq!(turn.status, expected_turn_status);
         if decision == "allow_once" {
@@ -5202,13 +5201,13 @@ done
                 content
             );
         } else {
-            assert!(
-                matches!(
-                    task.status,
-                    magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
-                ),
-                "后台进程审批未放行后任务必须失败或终止，实际为 {:?}",
-                task.status
+            assert_eq!(
+                task.status,
+                if decision == "cancel" {
+                    magi_core::TaskStatus::Killed
+                } else {
+                    magi_core::TaskStatus::Completed
+                }
             );
             assert!(!target.exists(), "后台进程审批未放行不得产生文件副作用");
         }
@@ -5225,7 +5224,7 @@ done
         assert_eq!(approval_resolved, matches!(decision, "allow_once" | "deny"));
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if decision == "allow_once" { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         record_process_approval_matrix_row(
             case_name,
@@ -5982,22 +5981,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         assert_eq!(
@@ -6007,7 +6003,7 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -6040,19 +6036,15 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
-                },
-                "task_status": if allowed {
                     "completed"
-                } else if decision == "cancel" {
+                },
+                "task_status": if decision == "cancel" {
                     "killed"
                 } else {
-                    "failed"
+                    "completed"
                 },
                 "side_effect": if allowed { "remote_branch_pushed" } else { "remote_unchanged" },
             }),
@@ -6276,22 +6268,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         assert_eq!(
@@ -6306,7 +6295,7 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -6339,19 +6328,15 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
-                },
-                "task_status": if allowed {
                     "completed"
-                } else if decision == "cancel" {
+                },
+                "task_status": if decision == "cancel" {
                     "killed"
                 } else {
-                    "failed"
+                    "completed"
                 },
                 "side_effect": if allowed {
                     "workspace_fast_forward_applied"
@@ -6586,22 +6571,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         assert_eq!(
@@ -6616,7 +6598,7 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -6649,19 +6631,15 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
-                },
-                "task_status": if allowed {
                     "completed"
-                } else if decision == "cancel" {
+                },
+                "task_status": if decision == "cancel" {
                     "killed"
                 } else {
-                    "failed"
+                    "completed"
                 },
                 "side_effect": if allowed {
                     "workspace_fast_forward_merge_applied"
@@ -6894,22 +6872,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         let worktree_paths = git_worktree_paths(&workspace_root);
@@ -6928,7 +6903,7 @@ done
         }
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -6961,19 +6936,15 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
-                },
-                "task_status": if allowed {
                     "completed"
-                } else if decision == "cancel" {
+                },
+                "task_status": if decision == "cancel" {
                     "killed"
                 } else {
-                    "failed"
+                    "completed"
                 },
                 "side_effect": if allowed {
                     "managed_worktree_created"
@@ -7280,22 +7251,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         assert_eq!(
@@ -7310,7 +7278,7 @@ done
         assert_eq!(remove_path.exists(), !allowed);
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -7343,19 +7311,15 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
-                },
-                "task_status": if allowed {
                     "completed"
-                } else if decision == "cancel" {
+                },
+                "task_status": if decision == "cancel" {
                     "killed"
                 } else {
-                    "failed"
+                    "completed"
                 },
                 "side_effect": if allowed {
                     "managed_worktree_removed"
@@ -7959,14 +7923,15 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(
             !git_branch_exists(&workspace_root, "approval-denied"),
             "拒绝 Git 分支创建后不得产生真实分支副作用"
         );
         assert_eq!(current_git_branch(&workspace_root), "main");
-        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
         assert_eq!(
             harness
                 .events_for(&session_id)
@@ -7994,8 +7959,8 @@ done
                 "approval_requested": true,
                 "approval_resolved": true,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "branch_unchanged",
             }),
             &turn,
@@ -8070,22 +8035,30 @@ done
             .await;
         assert_eq!(
             turn.status,
+            // 过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
             if lifecycle == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
-        assert!(matches!(
-            task.status,
-            magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
-        ));
+        if lifecycle == "cancel" {
+            assert!(matches!(
+                task.status,
+                magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
+            ));
+        } else {
+            assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        }
         assert!(
             !git_branch_exists(&workspace_root, &branch),
             "Git 创建分支未完成审批时不得产生真实分支副作用"
         );
         assert_eq!(current_git_branch(&workspace_root), "main");
-        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(
+            non_classifier_provider_request_count(&harness),
+            if lifecycle == "cancel" { 1 } else { 2 }
+        );
         assert_eq!(
             harness
                 .events_for(&session_id)
@@ -8114,8 +8087,8 @@ done
                 "approval_requested": true,
                 "approval_resolved": false,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if lifecycle == "cancel" { "cancelled" } else { "failed" },
-                "task_status": "failed_or_killed",
+                "turn_status": if lifecycle == "cancel" { "cancelled" } else { "completed" },
+                "task_status": if lifecycle == "cancel" { "failed_or_killed" } else { "completed" },
                 "side_effect": "branch_unchanged",
             }),
             &turn,
@@ -8362,22 +8335,19 @@ done
         let allowed = decision == "allow_once";
         assert_eq!(
             turn.status,
-            if allowed {
-                CanonicalTurnStatus::Completed
-            } else if decision == "cancel" {
+            // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+            if decision == "cancel" {
                 CanonicalTurnStatus::Cancelled
             } else {
-                CanonicalTurnStatus::Failed
+                CanonicalTurnStatus::Completed
             }
         );
         assert_eq!(
             task.status,
-            if allowed {
-                magi_core::TaskStatus::Completed
-            } else if decision == "cancel" {
+            if decision == "cancel" {
                 magi_core::TaskStatus::Killed
             } else {
-                magi_core::TaskStatus::Failed
+                magi_core::TaskStatus::Completed
             }
         );
         assert_eq!(
@@ -8388,7 +8358,7 @@ done
         assert_eq!(current_git_branch(&workspace_root), "main");
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            if allowed { 2 } else { 1 }
+            if decision == "cancel" { 1 } else { 2 }
         );
         assert_eq!(
             harness
@@ -8421,14 +8391,12 @@ done
                 "approval_requested": true,
                 "approval_resolved": matches!(decision, "allow_once" | "deny"),
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": if allowed {
-                    "completed"
-                } else if decision == "cancel" {
+                "turn_status": if decision == "cancel" {
                     "cancelled"
                 } else {
-                    "failed"
+                    "completed"
                 },
-                "task_status": if allowed { "completed" } else { "failed" },
+                "task_status": if decision == "cancel" { "killed" } else { "completed" },
                 "side_effect": if allowed { "branch_deleted" } else { "branch_unchanged" },
             }),
             &turn,
@@ -8674,11 +8642,12 @@ done
         let second_turn = harness
             .wait_for_terminal(&session_id, &second_turn_id)
             .await;
-        assert_eq!(second_turn.status, CanonicalTurnStatus::Failed);
+        // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
         let second_provider_requests =
             non_classifier_provider_request_count(&harness) - second_provider_requests_before;
-        assert_eq!(second_provider_requests, 1);
+        assert_eq!(second_provider_requests, 2);
         record_git_approval_matrix_row(
             &second_turn,
             "cross_turn",
@@ -8688,8 +8657,8 @@ done
             true,
             true,
             second_provider_requests,
-            "failed",
-            "failed",
+            "completed",
+            "completed",
             "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
@@ -8805,7 +8774,8 @@ done
         let second_turn = harness
             .wait_for_terminal(&second_session_id, &second_turn_id)
             .await;
-        assert_eq!(second_turn.status, CanonicalTurnStatus::Failed);
+        // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
         assert_eq!(current_git_branch(&workspace_root), "approval-target");
         let second_provider_requests =
             non_classifier_provider_request_count(&harness) - second_provider_requests_before;
@@ -8818,15 +8788,15 @@ done
             true,
             true,
             second_provider_requests,
-            "failed",
-            "failed",
+            "completed",
+            "completed",
             "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
-    async fn restricted_profile_git_branch_switch_denial_preserves_branch_and_fails_turn() {
+    async fn restricted_profile_git_branch_switch_denial_preserves_branch_and_completes_turn() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("deny", "Git 分支审批拒绝验收");
         harness.provider.set_tool_then_completed(
@@ -8867,8 +8837,9 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert_eq!(
             current_git_branch(&workspace_root),
             "main",
@@ -8886,8 +8857,8 @@ done
         }));
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
-            "拒绝 Git mutation 后不得再次请求 Provider"
+            2,
+            "拒绝或过期的结果交给模型后只再请求一次以完成本轮"
         );
         assert_eq!(
             harness
@@ -8914,8 +8885,8 @@ done
             true,
             true,
             non_classifier_provider_request_count(&harness),
-            "failed",
-            "failed",
+            "completed",
+            "completed",
             "branch_unchanged",
         );
         let _ = fs::remove_dir_all(workspace_root);
@@ -9315,7 +9286,7 @@ done
     }
 
     #[tokio::test]
-    async fn restricted_profile_approval_denial_fails_without_repeating_write_tool() {
+    async fn restricted_profile_approval_denial_returns_to_model_without_side_effect() {
         let harness = MagiTurnHarness::new_task("不会执行被拒绝写入");
         let workspace_root = tempfile::tempdir().expect("approval workspace should create");
         let workspace_id = magi_core::WorkspaceId::new("harness-approval-deny-workspace");
@@ -9379,8 +9350,9 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(!target.exists(), "用户拒绝后不得产生写入副作用");
         assert!(
             turn.items.iter().any(|item| {
@@ -9397,8 +9369,8 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
-            "拒绝不可重试的写工具后不得再次请求 Provider"
+            2,
+            "拒绝或过期的结果交给模型后只再请求一次以完成本轮"
         );
         assert!(
             harness
@@ -9420,8 +9392,8 @@ done
                 "approval_requested": true,
                 "approval_resolved": true,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "write_blocked",
             }),
             &turn,
@@ -9646,8 +9618,8 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
-            "审批过期后不得重复请求 Provider"
+            2,
+            "拒绝或过期的结果交给模型后只再请求一次以完成本轮"
         );
         record_turn_permission_matrix_row(
             serde_json::json!({
@@ -9660,8 +9632,8 @@ done
                 "approval_requested": true,
                 "approval_resolved": false,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "write_blocked",
             }),
             &turn,
@@ -9732,13 +9704,14 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(target.exists(), "拒绝 file_remove 后目标文件必须保留");
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
-            "拒绝 file_remove 后不得重复请求 Provider"
+            2,
+            "拒绝或过期的结果交给模型后只再请求一次以完成本轮"
         );
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
@@ -9761,8 +9734,8 @@ done
                 "approval_requested": true,
                 "approval_resolved": true,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "file_preserved",
             }),
             &turn,
