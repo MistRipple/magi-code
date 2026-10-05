@@ -128,9 +128,7 @@ pub struct BrowserDurableTab {
     #[serde(default)]
     pub order: u32,
     pub lifecycle: BrowserTabLifecycle,
-    #[serde(alias = "url")]
     pub canonical_url: String,
-    #[serde(alias = "title")]
     pub page_title: String,
     pub display_label: Option<String>,
     pub navigation_revision: u64,

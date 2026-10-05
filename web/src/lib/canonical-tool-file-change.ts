@@ -66,7 +66,7 @@ export function buildCanonicalToolFileChangeBlocks(input: FileChangeProjectionIn
   }
 
   if (input.toolName === 'file_write') {
-    const content = firstString(args.content, args.text, args.data);
+    const content = firstString(args.content);
     const created = readBoolean(result?.created) ?? false;
     const additions = content ? countPatchLines(content) : 0;
     return [fileChangeBlock(input, 0, {
@@ -93,7 +93,7 @@ export function buildCanonicalToolFileChangeBlocks(input: FileChangeProjectionIn
 
 function buildApplyPatchFileChangeBlocks(input: FileChangeProjectionInput): ContentBlock[] {
   const args = coerceToolArgumentsRecord(input.arguments);
-  const patchText = firstString(args.patch, args.input, args.text);
+  const patchText = firstString(args.patch);
   const operations = parseApplyPatchOperations(patchText);
   if (operations.length === 0) {
     const target = resolveToolCardTarget({
@@ -147,16 +147,16 @@ function textPatchesFromFilePatchArgs(args: Record<string, unknown>): TextPatch[
         && !Array.isArray(patch)
       ))
       .map((patch) => ({
-        oldText: firstString(patch.old_string, patch.old),
-        newText: firstString(patch.new_string, patch.new),
+        oldText: firstString(patch.old_string),
+        newText: firstString(patch.new_string),
       }))
       .filter((patch) => patch.oldText || patch.newText)
     : [];
   if (patches.length > 0) {
     return patches;
   }
-  const oldText = firstString(args.old_string, args.old);
-  const newText = firstString(args.new_string, args.new);
+  const oldText = firstString(args.old_string);
+  const newText = firstString(args.new_string);
   return oldText || newText ? [{ oldText, newText }] : [];
 }
 

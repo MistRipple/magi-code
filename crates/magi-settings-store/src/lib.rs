@@ -8,6 +8,8 @@ use std::sync::{Arc, RwLock};
 
 const SESSION_SECTION_PREFIX: &str = "__session__:";
 pub const ORCHESTRATOR_SESSION_DEFAULTS_SECTION: &str = "orchestratorSessionDefaults";
+/// 设置响应 DTO 的投影字段名，不是持久化 section；写入这些名字会被丢弃，
+/// 防止响应别名反向成为第二份设置事实。
 const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "workerConfigs",
     "orchestratorConfig",
@@ -18,8 +20,6 @@ const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "registryEngines",
     "registryAgents",
 ];
-pub const DEPRECATED_MODEL_CONFIG_FIELDS: &[&str] =
-    &["provider", "openaiProtocol", "protocolEndpoint"];
 
 #[derive(Debug)]
 pub struct SettingsStore {
@@ -89,11 +89,7 @@ impl SettingsStore {
         }
         let content = fs::read_to_string(path)?;
         match serde_json::from_str::<HashMap<String, Value>>(&content) {
-            Ok(mut data) => {
-                let changed = canonicalize_settings_sections(&mut data);
-                if changed {
-                    Self::save_sections(path, &data)?;
-                }
+            Ok(data) => {
                 *self.sections.write().unwrap() = data;
                 self.revision.fetch_add(1, Ordering::AcqRel);
             }
@@ -346,24 +342,8 @@ impl SettingsStore {
         })
     }
 
-    fn extract_id_str<'a>(item: &'a Value, primary_field: &str) -> Option<&'a str> {
-        if let Some(s) = item.get(primary_field).and_then(|v| v.as_str()) {
-            return Some(s);
-        }
-        if let Some(s) = item.get("id").and_then(|v| v.as_str()) {
-            return Some(s);
-        }
-        if let Some(s) = item.get("serverId").and_then(|v| v.as_str()) {
-            return Some(s);
-        }
-        if let Some(s) = item.get("repositoryId").and_then(|v| v.as_str()) {
-            return Some(s);
-        }
-        if let Some(s) = item.get("engineId").and_then(|v| v.as_str()) {
-            return Some(s);
-        }
-
-        None
+    fn extract_id_str<'a>(item: &'a Value, id_field: &str) -> Option<&'a str> {
+        item.get(id_field).and_then(Value::as_str)
     }
 
     pub fn snapshot(&self) -> HashMap<String, Value> {
@@ -381,52 +361,16 @@ impl SettingsStore {
     }
 }
 
-fn canonicalize_settings_sections(sections: &mut HashMap<String, Value>) -> bool {
-    let mut changed = false;
-    for section in PUBLIC_RESPONSE_ALIAS_SECTIONS {
-        changed |= sections.remove(*section).is_some();
-    }
-    for (section, value) in sections.iter_mut() {
-        changed |= canonicalize_settings_section_value(section, value);
-    }
-    changed
-}
-
 fn is_public_response_alias_section(section: &str) -> bool {
     PUBLIC_RESPONSE_ALIAS_SECTIONS.contains(&section)
 }
 
-fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool {
-    if section == "orchestrator" {
-        return canonicalize_global_orchestrator_section(value);
-    }
+fn canonicalize_settings_section_value(section: &str, value: &mut Value) {
     if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION {
-        return canonicalize_session_orchestrator_section(value, false);
+        canonicalize_session_orchestrator_section(value, false);
+    } else if is_session_section_key(section) && section.ends_with(":orchestrator") {
+        canonicalize_session_orchestrator_section(value, true);
     }
-    if is_session_section_key(section) && section.ends_with(":orchestrator") {
-        return canonicalize_session_orchestrator_section(value, true);
-    }
-    if section == "auxiliary"
-        || section == "imageGeneration"
-        || (is_session_section_key(section) && section.ends_with(":auxiliary"))
-    {
-        return canonicalize_model_config(value);
-    }
-    match section {
-        "workers" => normalize_workers_section(value),
-        "engines" => normalize_engines_section(value),
-        _ => false,
-    }
-}
-
-fn canonicalize_global_orchestrator_section(value: &mut Value) -> bool {
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    let mut changed = object.remove("model").is_some();
-    changed |= object.remove("reasoningEffort").is_some();
-    changed |= canonicalize_model_config(value);
-    changed
 }
 
 /// 会话级编排模型覆盖。
@@ -438,110 +382,14 @@ fn canonicalize_global_orchestrator_section(value: &mut Value) -> bool {
 /// `allow_engine_binding` 区分两种 section：会话级覆盖允许引擎绑定；
 /// `ORCHESTRATOR_SESSION_DEFAULTS_SECTION`（新会话默认值）不允许——引擎绑定是
 /// 会话级事实，不得成为跨会话默认值。
-fn canonicalize_session_orchestrator_section(
-    value: &mut Value,
-    allow_engine_binding: bool,
-) -> bool {
+fn canonicalize_session_orchestrator_section(value: &mut Value, allow_engine_binding: bool) {
     let Some(object) = value.as_object_mut() else {
-        return false;
+        return;
     };
-    let mut changed = false;
     object.retain(|key, _| {
-        let keep = matches!(key.as_str(), "model" | "reasoningEffort")
-            || (allow_engine_binding && key == "engineId");
-        if !keep {
-            changed = true;
-        }
-        keep
+        matches!(key.as_str(), "model" | "reasoningEffort")
+            || (allow_engine_binding && key == "engineId")
     });
-    changed
-}
-
-fn normalize_workers_section(value: &mut Value) -> bool {
-    let Some(workers) = value.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    for config in workers.values_mut() {
-        changed |= canonicalize_model_config(config);
-    }
-    changed
-}
-
-fn normalize_engines_section(value: &mut Value) -> bool {
-    let Some(engines) = value.as_array_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    for engine in engines {
-        if let Some(llm) = engine.get_mut("llm") {
-            changed |= canonicalize_model_config(llm);
-        }
-    }
-    changed
-}
-
-fn canonicalize_model_config(value: &mut Value) -> bool {
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    let has_connection_fields = [
-        "baseUrl",
-        "apiKey",
-        "model",
-        "urlMode",
-        "provider",
-        "openaiProtocol",
-        "protocolEndpoint",
-    ]
-    .iter()
-    .any(|field| object.contains_key(*field));
-    if has_connection_fields && !object.contains_key("apiProtocol") {
-        let legacy_provider_is_anthropic = object
-            .get("provider")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("anthropic"));
-        let endpoint_is_anthropic = object
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .is_some_and(is_explicit_anthropic_endpoint)
-            || object
-                .get("protocolEndpoint")
-                .and_then(Value::as_str)
-                .is_some_and(is_explicit_anthropic_endpoint);
-        object.insert(
-            "apiProtocol".to_string(),
-            Value::String(
-                if legacy_provider_is_anthropic || endpoint_is_anthropic {
-                    "anthropic_messages"
-                } else {
-                    "openai_chat"
-                }
-                .to_string(),
-            ),
-        );
-        changed = true;
-    }
-    changed | remove_deprecated_model_fields(value)
-}
-
-fn is_explicit_anthropic_endpoint(value: &str) -> bool {
-    let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
-    normalized.contains("api.anthropic.com")
-        || normalized.ends_with("/anthropic")
-        || normalized.ends_with("/messages")
-}
-
-fn remove_deprecated_model_fields(value: &mut Value) -> bool {
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    for field in DEPRECATED_MODEL_CONFIG_FIELDS {
-        changed |= object.remove(*field).is_some();
-    }
-    changed
 }
 
 fn session_section_key(session_id: &SessionId, section: &str) -> String {
@@ -681,7 +529,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://old.example.com/v1",
-                    "model": "model-old",
+                    "apiProtocol": "openai_chat",
                 }),
             )
             .unwrap();
@@ -692,7 +540,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://new.example.com/v1",
-                    "model": "model-new",
+                    "apiProtocol": "openai_chat",
                 }),
             )
             .unwrap();
@@ -761,119 +609,6 @@ mod tests {
         store2.load_from_disk().unwrap();
         assert_eq!(store2.get_section("engines"), json!([]));
         assert_eq!(store2.get_section("config"), json!({}));
-    }
-
-    #[test]
-    fn load_from_disk_canonicalizes_model_sections_and_public_aliases() {
-        let dir = std::env::temp_dir().join(format!(
-            "magi-settings-test-canonicalize-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("settings.json");
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&json!({
-                "orchestrator": {
-                    "provider": "anthropic",
-                    "openaiProtocol": "responses",
-                    "protocolEndpoint": "/v1/responses",
-                    "baseUrl": "https://api.example.com",
-                    "model": "main",
-                    "reasoningEffort": "high"
-                },
-                "workers": {
-                    "reviewer": {
-                        "provider": "openai",
-                        "baseUrl": "https://api.example.com",
-                        "model": "worker"
-                    }
-                },
-                "engines": [{
-                    "id": "reviewer",
-                    "llm": {
-                        "provider": "openai",
-                        "baseUrl": "https://api.example.com",
-                        "model": "worker"
-                    }
-                }],
-                "orchestratorConfig": { "model": "alias-main" },
-                "workerConfigs": { "alias-worker": { "model": "alias" } },
-                "registryEngines": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let store = SettingsStore::with_persistence_path(path.clone());
-        store.load_from_disk().unwrap();
-
-        assert!(store.get_section("orchestrator").get("provider").is_none());
-        assert_eq!(
-            store.get_section("orchestrator")["apiProtocol"],
-            json!("anthropic_messages")
-        );
-        assert!(
-            store
-                .get_section("orchestrator")
-                .get("openaiProtocol")
-                .is_none()
-        );
-        assert!(
-            store.get_section("workers")["reviewer"]
-                .get("provider")
-                .is_none()
-        );
-        assert_eq!(
-            store.get_section("workers")["reviewer"]["apiProtocol"],
-            json!("openai_chat")
-        );
-        assert!(
-            store.get_section("engines")[0]["llm"]
-                .get("provider")
-                .is_none()
-        );
-        assert_eq!(
-            store.get_section("engines")[0]["llm"]["apiProtocol"],
-            json!("openai_chat")
-        );
-        assert_eq!(store.get_section("orchestratorConfig"), Value::Null);
-        assert_eq!(store.get_section("workerConfigs"), Value::Null);
-        assert_eq!(store.get_section("registryEngines"), Value::Null);
-
-        let persisted: HashMap<String, Value> =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(!persisted.contains_key("orchestratorConfig"));
-        assert!(!persisted.contains_key("workerConfigs"));
-        assert!(!persisted.contains_key("registryEngines"));
-        assert!(
-            persisted["orchestrator"]
-                .as_object()
-                .unwrap()
-                .get("provider")
-                .is_none()
-        );
-        assert_eq!(
-            persisted["orchestrator"]["apiProtocol"],
-            json!("anthropic_messages")
-        );
-        assert!(
-            persisted["orchestrator"]
-                .as_object()
-                .unwrap()
-                .get("model")
-                .is_none()
-        );
-        assert!(
-            persisted["orchestrator"]
-                .as_object()
-                .unwrap()
-                .get("reasoningEffort")
-                .is_none()
-        );
     }
 
     #[test]
@@ -976,7 +711,6 @@ mod tests {
                 &json!({
                     "id": "reviewer",
                     "llm": {
-                        "provider": "openai",
                         "model": "old-worker"
                     }
                 }),
@@ -1013,23 +747,6 @@ mod tests {
         let engines = engines.as_array().expect("engines should be array");
         assert_eq!(engines.len(), 1);
         assert_eq!(engines[0]["llm"]["model"], json!("current-worker"));
-        assert_eq!(engines[0]["llm"]["apiProtocol"], json!("openai_chat"));
-        assert!(engines[0]["llm"].get("provider").is_none());
-    }
-
-    #[test]
-    fn migration_does_not_infer_protocol_from_model_name() {
-        let mut sections = HashMap::from([(
-            "auxiliary".to_string(),
-            json!({
-                "baseUrl": "https://gateway.example.com/v1",
-                "model": "claude-sonnet",
-                "urlMode": "standard"
-            }),
-        )]);
-
-        assert!(canonicalize_settings_sections(&mut sections));
-        assert_eq!(sections["auxiliary"]["apiProtocol"], json!("openai_chat"));
     }
 
     #[test]

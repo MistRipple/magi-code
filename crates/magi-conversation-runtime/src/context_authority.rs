@@ -467,9 +467,9 @@ impl<'a> ContextAuthority<'a> {
                 phase = request.phase,
                 original_count,
                 original_tokens,
-                last_context_window_tokens = usage_observation
+                last_projected_request_tokens = usage_observation
                     .as_ref()
-                    .map(|observation| observation.context_window_tokens),
+                    .map(|observation| observation.projected_request_tokens),
                 "thread 历史未达到上下文压缩阈值"
             );
             return PreparedThreadHistory {
@@ -1134,10 +1134,6 @@ impl<'a> ContextAuthority<'a> {
         let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
         if let Some(object) = payload.as_object_mut() {
             object.insert(
-                "projected_request_tokens".to_string(),
-                (request_tokens as u64).into(),
-            );
-            object.insert(
                 "context_window_limit_tokens".to_string(),
                 context_window_tokens.into(),
             );
@@ -1176,7 +1172,6 @@ impl<'a> ContextAuthority<'a> {
                         "pre_compaction_projected_request_tokens".to_string(),
                         (*tokens_used).into(),
                     );
-                    object.insert("token_limit".to_string(), (*token_limit).into());
                     object.insert("threshold_tokens".to_string(), (*threshold_tokens).into());
                     object.insert(
                         "target_history_tokens".to_string(),
@@ -1206,17 +1201,15 @@ impl<'a> ContextAuthority<'a> {
             }
             ThreadHistoryCompactionDecision::EstimatedPrefill {
                 estimated_tokens,
-                token_limit,
                 threshold_tokens,
                 target_history_tokens,
+                ..
             } => {
                 if let Some(object) = payload.as_object_mut() {
                     object.insert(
                         "estimated_prefill_tokens".to_string(),
                         (*estimated_tokens as u64).into(),
                     );
-                    object.insert("context_window_tokens".to_string(), (*token_limit).into());
-                    object.insert("token_limit".to_string(), (*token_limit).into());
                     object.insert(
                         "threshold_tokens".to_string(),
                         (*threshold_tokens as u64).into(),
@@ -1782,13 +1775,7 @@ pub(crate) fn thread_history_compaction_decision(
         return None;
     }
     let observed_tokens = usage_observation
-        .map(|observation| {
-            if observation.projected_request_tokens > 0 {
-                observation.projected_request_tokens
-            } else {
-                observation.context_window_tokens
-            }
-        })
+        .map(|observation| observation.projected_request_tokens)
         .unwrap_or_default();
     if observed_tokens >= threshold_tokens {
         return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {

@@ -406,7 +406,7 @@ impl McpServiceRuntime {
         };
         let audit = McpAuditLog::load(path.with_file_name("mcp-audit.jsonl"));
         let tokens = Arc::new(TokenStore::from_records(persisted.tokens));
-        // 原文只保留仍然有效的令牌；旧版本创建的令牌没有原文，保持「无法查看」。
+        // 原文只保留仍然有效的令牌；没有原文的令牌保持「无法查看」，只能重新生成。
         let now = now_ms();
         let active_ids = tokens
             .records()
@@ -1121,7 +1121,7 @@ impl McpServiceRuntime {
         Ok(issued)
     }
 
-    /// 令牌原文（重新查看 / 复制）。已吊销、已过期、或创建于旧版本而没有原文的令牌返回 `None`。
+    /// 令牌原文（重新查看 / 复制）。已吊销、已过期或没有保存原文的令牌返回 `None`。
     pub(crate) fn token_secret(&self, token_id: &str) -> Option<String> {
         let now = now_ms();
         let active = self
@@ -1745,22 +1745,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_created_before_secrets_were_kept_cannot_be_viewed_but_can_be_rotated() {
+    async fn a_token_without_saved_secret_cannot_be_viewed_but_can_be_rotated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-server.json");
         let state = state();
         let runtime = McpServiceRuntime::load(path.clone());
         let issued = runtime.issue_token(request()).await.unwrap();
-        // 模拟旧版本：没有原文文件。
+        // 原文文件缺失：令牌仍有效，但没有可查看的原文。
         std::fs::remove_file(dir.path().join(SECRETS_FILE)).unwrap();
 
-        let legacy = McpServiceRuntime::load(path);
+        let restarted = McpServiceRuntime::load(path);
         let token_id = issued.record.token_id.clone();
-        assert!(!legacy.token_has_secret(&token_id));
-        assert!(legacy.token_secret(&token_id).is_none());
-        let (_, fresh) = legacy.rotate_token(&state, &token_id).await.unwrap();
+        assert!(!restarted.token_has_secret(&token_id));
+        assert!(restarted.token_secret(&token_id).is_none());
+        let (_, fresh) = restarted.rotate_token(&state, &token_id).await.unwrap();
         assert_ne!(fresh, issued.secret);
-        assert_eq!(legacy.token_secret(&token_id), Some(fresh));
+        assert_eq!(restarted.token_secret(&token_id), Some(fresh));
     }
 
     #[test]

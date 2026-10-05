@@ -30,7 +30,7 @@ pub fn routes() -> Router<ApiState> {
 struct WorkspaceDto {
     workspace_id: String,
     root_path: String,
-    root_path_ref: Option<String>,
+    root_path_ref: String,
     name: Option<String>,
     is_active: bool,
 }

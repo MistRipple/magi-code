@@ -43,10 +43,10 @@ assert.match(agentApi, /\/rotate`/, 'agent-api 缺少重新生成');
 assert.match(agentApi, /method: 'PATCH', body: request/, 'agent-api 缺少编辑令牌');
 assert.match(agentApi, /config-snippets\$\{suffix\}/, '配置片段需要支持按令牌取');
 
-// ── 令牌可重新查看 / 编辑 / 重新生成；旧令牌没有原文时只能重新生成 ─────────────
+// ── 令牌可重新查看 / 编辑 / 重新生成；没有原文的令牌只能重新生成 ─────────────
 assert.match(section, /getMcpServerTokenSecret\(token\.tokenId\)/);
 assert.match(section, /token\.hasSecret/);
-assert.match(section, /data-mcp-token-legacy/);
+assert.match(section, /data-mcp-token-no-secret/);
 assert.match(section, /rotateMcpServerToken\(token\.tokenId\)/);
 assert.match(section, /window\.confirm\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
 // 编辑：高风险档要确认；升到高风险档时网络一并关闭；工作区不可改

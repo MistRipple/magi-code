@@ -10,7 +10,6 @@ pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
     entry
         .get("id")
         .and_then(Value::as_str)
-        .or_else(|| entry.get("serverId").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
@@ -19,18 +18,10 @@ pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
     if entry.get("server").is_some() || entry.get("updates").is_some() {
         return None;
     }
+    let server_id = mcp_server_entry_id(entry)?.to_string();
     let mut object = entry.as_object().cloned()?;
-    let server_id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| object.get("serverId").and_then(Value::as_str))
-        .or_else(|| entry.get("serverId").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
 
     object.insert("id".to_string(), serde_json::json!(server_id));
-    object.insert("serverId".to_string(), serde_json::json!(server_id));
     if object
         .get("name")
         .and_then(Value::as_str)
@@ -70,7 +61,7 @@ pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Valu
     }
     validate_requested_transport(request)?;
     let normalized = normalize_mcp_server_snapshot_entry(request)
-        .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("MCP server id 不能为空".to_string()))?;
     let transport = normalized
         .get("type")
         .and_then(Value::as_str)
@@ -333,7 +324,7 @@ mod tests {
         .expect("stdio MCP server should normalize");
 
         assert_eq!(entry["id"], serde_json::json!("stdio-server"));
-        assert_eq!(entry["serverId"], serde_json::json!("stdio-server"));
+        assert!(entry.get("serverId").is_none());
         assert_eq!(entry["command"], serde_json::json!("npx"));
         assert_eq!(entry["type"], serde_json::json!("stdio"));
         assert!(entry.get("url").is_none());
@@ -366,7 +357,7 @@ mod tests {
     #[test]
     fn snapshot_normalization_infers_http_transport_from_url() {
         let entry = normalize_mcp_server_snapshot_entry(&serde_json::json!({
-            "serverId": " legacy ",
+            "id": " remote ",
             "url": " https://example.test/mcp ",
             "workspace_id": "workspace-old",
             "workspace_path": "/tmp/old",
@@ -374,9 +365,8 @@ mod tests {
         }))
         .expect("entry with id should remain visible");
 
-        assert_eq!(entry["id"], serde_json::json!("legacy"));
-        assert_eq!(entry["serverId"], serde_json::json!("legacy"));
-        assert_eq!(entry["name"], serde_json::json!("legacy"));
+        assert_eq!(entry["id"], serde_json::json!("remote"));
+        assert_eq!(entry["name"], serde_json::json!("remote"));
         assert_eq!(entry["type"], serde_json::json!("streamable-http"));
         assert!(entry.get("command").is_none());
         assert_eq!(entry["url"], serde_json::json!("https://example.test/mcp"));
@@ -391,7 +381,7 @@ mod tests {
             assert!(
                 normalize_mcp_server_snapshot_entry(&serde_json::json!({
                     wrapper: {
-                        "serverId": "legacy",
+                        "id": "wrapped",
                         "command": "npx"
                     }
                 }))
@@ -404,7 +394,7 @@ mod tests {
     #[test]
     fn config_builder_uses_same_normalization() {
         let config = build_mcp_config_from_entry(&serde_json::json!({
-            "serverId": "stdio-server",
+            "id": "stdio-server",
             "command": " npx ",
             "args": ["-y", "@modelcontextprotocol/server-filesystem"],
             "workingDirectory": " /tmp ",

@@ -475,7 +475,7 @@
     if (needsConfirm) allowNetwork = false;
   });
 
-  // 默认选一个能直接填进配置的客户端（旧版本创建的令牌没有原文）。
+  // 默认选一个能直接填进配置的客户端（没有原文的令牌无法填入）。
   $effect(() => {
     if (connectTokenId && !connectTokens.some((token) => token.tokenId === connectTokenId)) {
       connectTokenId = '';
@@ -497,7 +497,7 @@
   // 选中的公网令牌失效（吊销、过期）或不存在时，回到一个可用的。
   $effect(() => {
     if (!remoteTokens.some((token) => token.tokenId === quickAddTokenId)) {
-      // 优先选能直接复制的令牌（旧版本创建的令牌没有原文）。
+      // 优先选能直接复制的令牌（没有原文的令牌无法复制）。
       quickAddTokenId = (remoteTokens.find((token) => token.hasSecret) ?? remoteTokens[0])?.tokenId ?? '';
     }
   });
@@ -658,7 +658,7 @@
             </select>
           </label>
           {#if quickAddToken && !quickAddToken.hasSecret}
-            <p class="meta" data-mcp-quick-add-legacy="1">{i18n.t('mcpServer.snippets.legacyHint')}</p>
+            <p class="meta" data-mcp-quick-add-no-secret="1">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
           {:else if quickAddSnippets?.remoteJson}
             {@const secretValue = authorizationOf(quickAddSnippets)}
             <div class="snippet">
@@ -897,7 +897,7 @@
                 </div>
                 <code class="secret" data-mcp-token-secret="1">{viewingSecret}</code>
               {:else}
-                <p class="meta" data-mcp-token-legacy="1">{i18n.t('mcpServer.token.noSecret')}</p>
+                <p class="meta" data-mcp-token-no-secret="1">{i18n.t('mcpServer.token.noSecret')}</p>
               {/if}
               {#if viewingSnippets}
                 <p class="meta">{i18n.t('mcpServer.snippets.perClientHint', { name: viewingSnippets.serverName })}</p>
@@ -1071,7 +1071,7 @@
         </select>
       </label>
       {#if connectTokens.some((token) => !token.hasSecret)}
-        <p class="meta">{i18n.t('mcpServer.snippets.legacyHint')}</p>
+        <p class="meta">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
       {/if}
     {/if}
     {#if !snippets}

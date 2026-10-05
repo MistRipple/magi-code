@@ -81,7 +81,7 @@ struct TokenDto {
     revoked_at_ms: Option<u64>,
     last_used_at_ms: Option<u64>,
     active: bool,
-    /// 是否可以重新查看原文（旧版本创建的令牌没有保存原文，只能重新生成）。
+    /// 是否可以重新查看原文（没有保存原文的令牌只能重新生成）。
     has_secret: bool,
 }
 
@@ -556,7 +556,7 @@ async fn view_secret(
     let record = find_token(&state, &token_id)?;
     let secret = state.mcp_service.token_secret(&token_id).ok_or_else(|| {
         ApiError::Conflict(
-            "该令牌没有保存原文（创建于旧版本、已吊销或已过期），请重新生成".to_string(),
+            "该令牌没有可查看的原文（未保存、已吊销或已过期），请重新生成".to_string(),
         )
     })?;
     audit_management(&state, &record, "token.view_secret", None);

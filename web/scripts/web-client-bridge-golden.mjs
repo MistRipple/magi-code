@@ -796,7 +796,7 @@ function modelRetryRuntimeEnvelope(phase, sequence = 3) {
 function contextUsageEnvelope() {
   return {
     event_id: 'event-session-context-usage-streaming',
-    event_type: 'session.context.usage.updated',
+    event_type: 'session.context.pressure.updated',
     category: 'domain',
     occurred_at: ACCEPTED_AT + 2,
     sequence: 3,
@@ -809,13 +809,13 @@ function contextUsageEnvelope() {
       call_id: 'call-context-streaming',
       resolved_model: 'gpt-5.6',
       phase: 'streaming',
-      accuracy: 'estimated',
-      token_used: 24_000,
+      measurement: 'estimated',
+      projected_request_tokens: 24_000,
       remaining_tokens: 248_000,
-      token_limit: 272_000,
+      context_window_limit_tokens: 272_000,
       usage_ratio: 24_000 / 272_000,
-      warning_level: 'normal',
-      updated_at: ACCEPTED_AT + 2,
+      pressure_level: 'normal',
+      observed_at: ACCEPTED_AT + 2,
     },
   };
 }
@@ -1251,6 +1251,7 @@ await withGoldenViteServer(async (server) => {
       turnId: TURN_ID,
       callId: 'call-context-streaming',
       resolvedModel: 'gpt-5.6',
+      pressureLevel: 'normal',
     },
     '运行中上下文用量必须通过 SSE 立即进入当前会话 runtime state',
   );

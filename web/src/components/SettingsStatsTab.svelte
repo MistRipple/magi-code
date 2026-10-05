@@ -43,7 +43,6 @@
   }>();
 
   type Perspective = 'role' | 'engine';
-  const LEGACY_IMAGE_MODEL = '__legacy_image_generation__';
   let perspective = $state<Perspective>('engine');
   let selectedKey = $state<string | null>(null);
 
@@ -67,12 +66,6 @@
     return getWorkerDisplayName(worker);
   }
 
-  function modelDisplayLabel(model: string): string {
-    return model === LEGACY_IMAGE_MODEL
-      ? i18n.t('settings.stats.legacyImageModel')
-      : model;
-  }
-
   function formatList(items: string[]): string {
     return new Intl.ListFormat(i18n.locale, { style: 'short', type: 'conjunction' }).format(items);
   }
@@ -84,12 +77,12 @@
     }
     const resolvedModels = Array.isArray(stats?.resolvedModels) ? stats.resolvedModels : [];
     if (resolvedModels.length === 1) {
-      return i18n.t('settings.stats.usedModel', { model: modelDisplayLabel(resolvedModels[0]) });
+      return i18n.t('settings.stats.usedModel', { model: resolvedModels[0] });
     }
     if (resolvedModels.length > 1) {
       return i18n.t('settings.stats.usedModels', {
         count: resolvedModels.length,
-        models: resolvedModels.map(modelDisplayLabel).join(' · '),
+        models: resolvedModels.join(' · '),
       });
     }
     return i18n.t('settings.stats.unknownModel');
@@ -261,7 +254,7 @@
           key,
           rowKind: 'engine',
           resolvedModel: bucket.resolvedModel,
-          label: modelDisplayLabel(bucket.resolvedModel),
+          label: bucket.resolvedModel,
           subLabel: sourceLabels.length > 0
             ? i18n.t('settings.stats.modelUsedBy', { roles: formatList(sourceLabels) })
             : i18n.t('settings.stats.recordedUsage'),
@@ -393,10 +386,9 @@
   }
 
   function bindingModelLabel(binding: AgentExecutionStatsItem): string {
-    const model = binding.resolvedModel?.trim()
+    return binding.resolvedModel?.trim()
       || binding.declaredModelSpec?.trim()
       || i18n.t('settings.stats.unknownModel');
-    return modelDisplayLabel(model);
   }
 
   function aggregateUsageBreakdown(

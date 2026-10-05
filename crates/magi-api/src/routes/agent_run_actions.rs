@@ -462,12 +462,12 @@ async fn restart_task(
         EventId::unique("event-task-restart"),
         "task.restart.requested",
         json!({
-            "taskId": task_id,
-            "oldRootTaskId": task.root_task_id.to_string(),
-            "newRootTaskId": accepted.root_task_id.to_string(),
-            "sessionId": accepted.session_id.to_string(),
-            "workspaceId": scope.workspace_id().map(|id| id.to_string()),
-            "requestedAt": now.0,
+            "task_id": task_id,
+            "old_root_task_id": task.root_task_id.to_string(),
+            "new_root_task_id": accepted.root_task_id.to_string(),
+            "session_id": accepted.session_id.to_string(),
+            "workspace_id": scope.workspace_id().map(|id| id.to_string()),
+            "requested_at": now.0,
         }),
     )
     .with_context(EventContext {
@@ -531,11 +531,11 @@ async fn archive_task(
         event_id.clone(),
         "task.archive.requested",
         json!({
-            "taskId": task_id,
-            "rootTaskId": root_task.task_id.to_string(),
-            "sessionId": session_id.to_string(),
-            "workspaceId": scope.workspace_id().map(|id| id.to_string()),
-            "requestedAt": now.0,
+            "task_id": task_id,
+            "root_task_id": root_task.task_id.to_string(),
+            "session_id": session_id.to_string(),
+            "workspace_id": scope.workspace_id().map(|id| id.to_string()),
+            "requested_at": now.0,
         }),
     )
     .with_context(EventContext {

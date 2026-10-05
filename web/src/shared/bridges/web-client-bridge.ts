@@ -794,8 +794,7 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
     }
     return runtimeTaskMap.has(taskId) ? taskId : '';
   };
-  rootTaskId = trackableRootTaskId(activeRuntimeSession?.root_task_id)
-    || trackableRootTaskId(activeRuntimeSession?.rootTaskId);
+  rootTaskId = trackableRootTaskId(activeRuntimeSession?.root_task_id);
   const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
   const activity = asBridgeRecord(overview?.activity);
   const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
@@ -847,8 +846,8 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
     const event = recentEvents[index];
     const eventPayload = asBridgeRecord(event.payload);
     const eventSessionId = trimBridgeString(event.session_id) || trimBridgeString(eventPayload?.session_id);
-    const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id) || trimBridgeString(eventPayload?.taskId);
-    const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id) || trimBridgeString(eventPayload?.missionId);
+    const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id);
+    const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id);
     if (expectedSessionId) {
       const belongsToExpectedSession = eventSessionId === expectedSessionId
         || (eventTaskId && sessionTaskIds.includes(eventTaskId))
@@ -857,7 +856,7 @@ export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload,
         continue;
       }
     }
-    const eventRootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
+    const eventRootTaskId = trimBridgeString(eventPayload?.root_task_id);
     const trackableEventRootTaskId = trackableRootTaskId(eventRootTaskId);
     if (trackableEventRootTaskId) {
       rootTaskId = trackableEventRootTaskId;
@@ -1408,21 +1407,9 @@ function parseCanonicalTurnEventFromRustEvent(
   try {
     return parseCanonicalTurnEventPayload({
       ...payload,
-      canonical_event_id: payload.canonical_event_id
-        ?? payload.canonicalEventId
-        ?? payload.eventId
-        ?? payload.event_id
-        ?? event.event_id,
-      canonical_event_seq: payload.canonical_event_seq
-        ?? payload.canonicalEventSeq
-        ?? payload.eventSeq
-        ?? payload.event_seq
-        ?? event.sequence,
-      canonical_occurred_at: payload.canonical_occurred_at
-        ?? payload.canonicalOccurredAt
-        ?? payload.occurredAt
-        ?? payload.occurred_at
-        ?? event.occurred_at,
+      canonical_event_id: event.event_id,
+      canonical_event_seq: event.sequence,
+      canonical_occurred_at: event.occurred_at,
     });
   } catch (error) {
     setCanonicalTimelineError(error);
@@ -1505,32 +1492,31 @@ function emitCanonicalTurnEventFromRustEvent(event: RustEventEnvelope): Canonica
   return canonicalEvent;
 }
 
-function rustEventPayloadString(event: RustEventEnvelope, snakeKey: string, camelKey: string): string {
-  return trimBridgeString(event.payload?.[snakeKey])
-    || trimBridgeString(event.payload?.[camelKey]);
+function rustEventPayloadString(event: RustEventEnvelope, key: string): string {
+  return trimBridgeString(event.payload?.[key]);
 }
 
 function rustEventWorkspaceId(event: RustEventEnvelope): string {
   return trimBridgeString(event.workspace_id)
-    || rustEventPayloadString(event, 'workspace_id', 'workspaceId');
+    || rustEventPayloadString(event, 'workspace_id');
 }
 
 function rustEventWorkspacePath(event: RustEventEnvelope): string {
-  return rustEventPayloadString(event, 'workspace_path', 'workspacePath');
+  return rustEventPayloadString(event, 'workspace_path');
 }
 
 function rustEventSessionId(event: RustEventEnvelope): string {
   return trimBridgeString(event.session_id)
-    || rustEventPayloadString(event, 'session_id', 'sessionId');
+    || rustEventPayloadString(event, 'session_id');
 }
 
 function rustEventTaskId(event: RustEventEnvelope): string {
   return trimBridgeString(event.task_id)
-    || rustEventPayloadString(event, 'task_id', 'taskId');
+    || rustEventPayloadString(event, 'task_id');
 }
 
 function rustEventRequestId(event: RustEventEnvelope): string {
-  return rustEventPayloadString(event, 'request_id', 'requestId');
+  return rustEventPayloadString(event, 'request_id');
 }
 
 function terminalTurnIdentity(
@@ -1584,9 +1570,9 @@ function activeDraftSubmissionMatchesAcceptedEvent(
 
 function rustTaskEventRootTaskIds(event: RustEventEnvelope): string[] {
   const candidates = [
-    rustEventPayloadString(event, 'root_task_id', 'rootTaskId'),
-    rustEventPayloadString(event, 'old_root_task_id', 'oldRootTaskId'),
-    rustEventPayloadString(event, 'new_root_task_id', 'newRootTaskId'),
+    rustEventPayloadString(event, 'root_task_id'),
+    rustEventPayloadString(event, 'old_root_task_id'),
+    rustEventPayloadString(event, 'new_root_task_id'),
   ];
   return Array.from(new Set(candidates.filter((value) => value.length > 0)));
 }
@@ -1731,28 +1717,24 @@ const TURN_TERMINAL_EVENTS = new Set([
 
 function readFiniteEventNumber(
   payload: Record<string, unknown>,
-  snakeKey: string,
-  camelKey: string,
+  key: string,
 ): number | undefined {
-  const value = payload[snakeKey] ?? payload[camelKey];
+  const value = payload[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
   const payload = event.payload;
   if (!payload) return;
-  const tokenUsed = readFiniteEventNumber(payload, 'projected_request_tokens', 'projectedRequestTokens')
-    ?? readFiniteEventNumber(payload, 'token_used', 'tokenUsed');
-  const tokenLimit = readFiniteEventNumber(payload, 'context_window_limit_tokens', 'contextWindowLimitTokens')
-    ?? readFiniteEventNumber(payload, 'context_window_tokens', 'contextWindowTokens')
-    ?? readFiniteEventNumber(payload, 'token_limit', 'tokenLimit');
-  const remainingTokens = readFiniteEventNumber(payload, 'remaining_tokens', 'remainingTokens');
-  const usageRatio = readFiniteEventNumber(payload, 'usage_ratio', 'usageRatio');
+  const tokenUsed = readFiniteEventNumber(payload, 'projected_request_tokens');
+  const tokenLimit = readFiniteEventNumber(payload, 'context_window_limit_tokens');
+  const remainingTokens = readFiniteEventNumber(payload, 'remaining_tokens');
+  const usageRatio = readFiniteEventNumber(payload, 'usage_ratio');
   if (tokenUsed === undefined || tokenLimit === undefined || tokenLimit <= 0) return;
 
-  const updatedAt = readFiniteEventNumber(payload, 'updated_at', 'updatedAt')
+  const updatedAt = readFiniteEventNumber(payload, 'observed_at')
     ?? (typeof event.occurred_at === 'number' ? event.occurred_at : Date.now());
-  const measurement = trimBridgeString(payload.measurement ?? payload.accuracy) === 'authoritative'
+  const measurement = trimBridgeString(payload.measurement) === 'authoritative'
     ? 'authoritative'
     : 'estimated';
   const current = messagesState.orchestratorRuntimeState;
@@ -1774,7 +1756,7 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     return;
   }
 
-  const warningLevelValue = trimBridgeString(payload.warning_level ?? payload.warningLevel);
+  const warningLevelValue = trimBridgeString(payload.pressure_level);
   const warningLevel = (
     warningLevelValue === 'normal'
     || warningLevelValue === 'notice'
@@ -1797,26 +1779,26 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     eventSequence: nextEventSequence,
     projectedRequestTokens: Math.max(0, Math.floor(tokenUsed)),
     ...(trimBridgeString(payload.phase) ? { phase: trimBridgeString(payload.phase) } : {}),
-    ...(trimBridgeString(payload.turn_id ?? payload.turnId)
-      ? { turnId: trimBridgeString(payload.turn_id ?? payload.turnId) }
+    ...(trimBridgeString(payload.turn_id)
+      ? { turnId: trimBridgeString(payload.turn_id) }
       : {}),
-    ...(trimBridgeString(payload.call_id ?? payload.callId)
-      ? { callId: trimBridgeString(payload.call_id ?? payload.callId) }
+    ...(trimBridgeString(payload.call_id)
+      ? { callId: trimBridgeString(payload.call_id) }
       : {}),
-    ...(trimBridgeString(payload.resolved_model ?? payload.resolvedModel)
-      ? { resolvedModel: trimBridgeString(payload.resolved_model ?? payload.resolvedModel) }
+    ...(trimBridgeString(payload.resolved_model)
+      ? { resolvedModel: trimBridgeString(payload.resolved_model) }
       : {}),
-    ...(readFiniteEventNumber(payload, 'provider_context_tokens', 'providerContextTokens') != null
-      ? { providerContextTokens: readFiniteEventNumber(payload, 'provider_context_tokens', 'providerContextTokens') }
+    ...(readFiniteEventNumber(payload, 'provider_context_tokens') != null
+      ? { providerContextTokens: readFiniteEventNumber(payload, 'provider_context_tokens') }
       : {}),
-    ...(readFiniteEventNumber(payload, 'proactive_threshold_tokens', 'proactiveThresholdTokens') != null
-      ? { proactiveThresholdTokens: readFiniteEventNumber(payload, 'proactive_threshold_tokens', 'proactiveThresholdTokens') }
+    ...(readFiniteEventNumber(payload, 'proactive_threshold_tokens') != null
+      ? { proactiveThresholdTokens: readFiniteEventNumber(payload, 'proactive_threshold_tokens') }
       : {}),
-    ...(readFiniteEventNumber(payload, 'hard_request_limit_tokens', 'hardRequestLimitTokens') != null
-      ? { hardRequestLimitTokens: readFiniteEventNumber(payload, 'hard_request_limit_tokens', 'hardRequestLimitTokens') }
+    ...(readFiniteEventNumber(payload, 'hard_request_limit_tokens') != null
+      ? { hardRequestLimitTokens: readFiniteEventNumber(payload, 'hard_request_limit_tokens') }
       : {}),
-    ...(trimBridgeString(payload.pressure_level ?? payload.pressureLevel)
-      ? { pressureLevel: trimBridgeString(payload.pressure_level ?? payload.pressureLevel) }
+    ...(trimBridgeString(payload.pressure_level)
+      ? { pressureLevel: trimBridgeString(payload.pressure_level) }
       : {}),
   };
   const eventAt = Math.max(
@@ -1844,31 +1826,24 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
 function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
   const payload = event.payload;
   if (!payload) return;
-  const compactedTokenEstimate = readFiniteEventNumber(
-    payload,
-    'compacted_token_estimate',
-    'compactedTokenEstimate',
-  );
-  const tokenLimit = readFiniteEventNumber(payload, 'token_limit', 'tokenLimit')
+  const compactedTokenEstimate = readFiniteEventNumber(payload, 'compacted_token_estimate');
+  const tokenLimit = readFiniteEventNumber(payload, 'context_window_limit_tokens')
     ?? messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState?.tokenLimit;
   if (compactedTokenEstimate === undefined || tokenLimit === undefined) return;
-  const requestTokenEstimate = readFiniteEventNumber(
-    payload,
-    'request_token_estimate',
-    'requestTokenEstimate',
-  ) ?? compactedTokenEstimate;
+  const requestTokenEstimate = readFiniteEventNumber(payload, 'request_token_estimate')
+    ?? compactedTokenEstimate;
+  const compactedAt = readFiniteEventNumber(payload, 'compacted_at');
   applyContextBudgetRuntimeEvent({
     ...event,
     payload: {
       ...payload,
-      token_used: requestTokenEstimate,
-      token_limit: tokenLimit,
+      projected_request_tokens: requestTokenEstimate,
+      context_window_limit_tokens: tokenLimit,
       remaining_tokens: Math.max(0, tokenLimit - requestTokenEstimate),
       usage_ratio: tokenLimit > 0 ? requestTokenEstimate / tokenLimit : 0,
       phase: 'compacted',
-      accuracy: 'estimated',
-      updated_at: readFiniteEventNumber(payload, 'compacted_at', 'compactedAt')
-        ?? event.occurred_at,
+      measurement: 'estimated',
+      observed_at: compactedAt ?? event.occurred_at,
     },
   });
   const state = messagesState.orchestratorRuntimeState;
@@ -1880,25 +1855,13 @@ function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
       ...(state.runtimeSnapshot ?? {}),
       budgetState: {
         ...budget,
-        lastCompactionAt: readFiniteEventNumber(payload, 'compacted_at', 'compactedAt'),
+        lastCompactionAt: compactedAt,
         lastCompactionReason: trimBridgeString(payload.reason) || undefined,
-        originalTokenEstimate: readFiniteEventNumber(
-          payload,
-          'original_token_estimate',
-          'originalTokenEstimate',
-        ),
+        originalTokenEstimate: readFiniteEventNumber(payload, 'original_token_estimate'),
         compactedTokenEstimate,
         requestTokenEstimate,
-        originalMessageCount: readFiniteEventNumber(
-          payload,
-          'original_message_count',
-          'originalMessageCount',
-        ),
-        compactedMessageCount: readFiniteEventNumber(
-          payload,
-          'compacted_message_count',
-          'compactedMessageCount',
-        ),
+        originalMessageCount: readFiniteEventNumber(payload, 'original_message_count'),
+        compactedMessageCount: readFiniteEventNumber(payload, 'compacted_message_count'),
       },
     },
   });
@@ -1965,10 +1928,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       && Boolean(acceptedPayload?.session_summary);
     if (hasAcceptedDirectoryIncrement && acceptedPayload) {
       const acceptedSessionId = trimBridgeString(acceptedPayload.session_id)
-        || trimBridgeString(acceptedPayload.sessionId)
         || trimBridgeString(event.session_id);
       const acceptedWorkspaceId = trimBridgeString(acceptedPayload.workspace_id)
-        || trimBridgeString(acceptedPayload.workspaceId)
         || trimBridgeString(event.workspace_id)
         || currentWorkspaceId;
       if (acceptedSessionId) {
@@ -1984,9 +1945,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
             : 0,
           acceptedAt: typeof acceptedPayload.accepted_at === 'number' && Number.isFinite(acceptedPayload.accepted_at)
             ? Math.floor(acceptedPayload.accepted_at)
-            : typeof acceptedPayload.acceptedAt === 'number' && Number.isFinite(acceptedPayload.acceptedAt)
-              ? Math.floor(acceptedPayload.acceptedAt)
-              : undefined,
+            : undefined,
         });
       }
     }
@@ -2044,7 +2003,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     });
   }
 
-  if (eventType === 'session.context.pressure.updated' || eventType === 'session.context.usage.updated') {
+  if (eventType === 'session.context.pressure.updated') {
     applyContextBudgetRuntimeEvent(event);
     return;
   }
@@ -2058,8 +2017,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (eventType === 'model.retry.runtime' && event.payload) {
-    const messageId = trimBridgeString(event.payload.message_id)
-      || trimBridgeString(event.payload.messageId);
+    const messageId = trimBridgeString(event.payload.message_id);
     const phase = trimBridgeString(event.payload.phase);
     if (messageId && (phase === 'scheduled' || phase === 'attempt_started' || phase === 'settled')) {
       const attempt = typeof event.payload.attempt === 'number' && Number.isFinite(event.payload.attempt)
@@ -2067,14 +2025,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         : 0;
       const maxAttempts = typeof event.payload.max_attempts === 'number' && Number.isFinite(event.payload.max_attempts)
         ? Math.floor(event.payload.max_attempts)
-        : typeof event.payload.maxAttempts === 'number' && Number.isFinite(event.payload.maxAttempts)
-          ? Math.floor(event.payload.maxAttempts)
-          : 0;
+        : 0;
       const delayMs = typeof event.payload.delay_ms === 'number' && Number.isFinite(event.payload.delay_ms)
         ? Math.max(0, Math.floor(event.payload.delay_ms))
-        : typeof event.payload.delayMs === 'number' && Number.isFinite(event.payload.delayMs)
-          ? Math.max(0, Math.floor(event.payload.delayMs))
-          : undefined;
+        : undefined;
       emitDataMessage('llmRetryRuntime', {
         messageId,
         phase,
@@ -2107,8 +2061,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
     const plan = event.payload.plan;
     if (sessionId && eventType === 'session.plan.cleared') {
-      const eventPlanId = trimBridgeString(event.payload.plan_id)
-        || trimBridgeString(event.payload.planId);
+      const eventPlanId = trimBridgeString(event.payload.plan_id);
       const eventRevision = typeof event.payload.revision === 'number'
         ? event.payload.revision
         : null;
@@ -2135,15 +2088,12 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'session.turn.task.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
-      || trimBridgeString(event.payload.sessionId)
       || trimBridgeString(event.session_id);
     const acceptedWorkspaceId = trimBridgeString(event.payload.workspace_id)
-      || trimBridgeString(event.payload.workspaceId)
       || trimBridgeString(event.workspace_id)
       || currentWorkspaceId;
     const acceptedRequestId = rustEventRequestId(event);
-    const acceptedCreatedSession = event.payload.created_session === true
-      || event.payload.createdSession === true;
+    const acceptedCreatedSession = event.payload.created_session === true;
     const acceptedMatchesCurrentSession = Boolean(
       acceptedSessionId && currentSessionId === acceptedSessionId,
     );
@@ -2178,10 +2128,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
           : 0,
         acceptedAt: typeof event.payload.accepted_at === 'number' && Number.isFinite(event.payload.accepted_at)
           ? Math.floor(event.payload.accepted_at)
-          : typeof event.payload.acceptedAt === 'number' && Number.isFinite(event.payload.acceptedAt)
-            ? Math.floor(event.payload.acceptedAt)
-            : undefined,
-        sessionSummary: event.payload.session_summary ?? event.payload.sessionSummary ?? null,
+          : undefined,
+        sessionSummary: event.payload.session_summary ?? null,
         createdSession: acceptedCreatedSession,
         route: event.payload.route ?? 'task',
         submissionContext: acceptedMatchesDraftSubmission ? acceptedSubmissionContext : null,
@@ -2229,38 +2177,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
-  if (eventType === 'session.action.accepted' && event.payload) {
-    const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
-    const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
-      || trimBridgeString(event.payload.actionTaskId);
-    const acceptedRootTaskId = trimBridgeString(event.payload.root_task_id)
-      || trimBridgeString(event.payload.rootTaskId);
-
-    if (acceptedSessionId) {
-      if (!currentSessionId || currentSessionId === acceptedSessionId) {
-        if (acceptedActionTaskId) {
-          setCurrentInterruptTaskId(acceptedActionTaskId);
-        }
-        if (acceptedRootTaskId) {
-          initAgentRunTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId, currentWorkspacePath);
-        }
-      }
-    }
-  }
-
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
     const canonicalTerminal = emitCanonicalTurnEventFromRustEvent(event);
     const hasCanonicalTerminal = Boolean(
       canonicalTerminal && isCanonicalTerminalEvent(canonicalTerminal),
     );
     const terminalIdentity = terminalTurnIdentity(event, canonicalTerminal);
-    const terminalErrorCode = trimBridgeString(event.payload?.error_code)
-      || trimBridgeString(event.payload?.errorCode);
+    const terminalErrorCode = trimBridgeString(event.payload?.error_code);
     const terminalPublicMessage = trimBridgeString(event.payload?.public_message)
-      || trimBridgeString(event.payload?.publicMessage)
       || trimBridgeString(event.payload?.error);
-    const terminalFailureDetail = trimBridgeString(event.payload?.failure_detail)
-      || trimBridgeString(event.payload?.failureDetail);
+    const terminalFailureDetail = trimBridgeString(event.payload?.failure_detail);
     if (eventType === 'session.turn.queue_failed' && (terminalFailureDetail || terminalPublicMessage)) {
       emitBridgeErrorToast(
         i18n.t('bridge.action.sendMessage'),
@@ -2328,14 +2254,14 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
     if (eventType === 'task.status.changed' && event.payload) {
       emitDataMessage('taskStatusChanged', {
-        taskId: event.payload.task_id ?? event.payload.taskId ?? '',
-        rootTaskId: event.payload.root_task_id ?? event.payload.rootTaskId ?? '',
+        taskId: event.payload.task_id ?? '',
+        rootTaskId: event.payload.root_task_id ?? '',
         title: event.payload.title ?? '',
-        newStatus: event.payload.new_status ?? event.payload.status ?? '',
+        newStatus: event.payload.new_status ?? '',
         oldStatus: event.payload.old_status ?? '',
         kind: event.payload.kind ?? '',
-        failureDetail: event.payload.failure_detail ?? event.payload.failureDetail ?? '',
-        failureStage: event.payload.failure_stage ?? event.payload.failureStage ?? '',
+        failureDetail: event.payload.failure_detail ?? '',
+        failureStage: event.payload.failure_stage ?? '',
       });
     }
   }
@@ -2350,7 +2276,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType.startsWith('message.') && event.payload) {
     emitDataMessage('messageCreated', {
-      sessionId: event.payload.session_id ?? event.payload.sessionId ?? '',
+      sessionId: event.payload.session_id ?? '',
       role: event.payload.role ?? '',
       content: event.payload.content ?? '',
     });

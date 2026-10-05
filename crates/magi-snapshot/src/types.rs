@@ -44,7 +44,6 @@ pub enum BaselinePatchEntry {
 #[serde(rename_all = "camelCase")]
 pub struct SymlinkInfo {
     pub target: String,
-    #[serde(default)]
     pub target_kind: SymlinkTargetKind,
 }
 
@@ -69,7 +68,6 @@ pub struct FileMeta {
     pub size: u64,
     pub mime: Option<String>,
     pub blob_hash: Option<String>,
-    #[serde(default)]
     pub content_hash: Option<String>,
     pub mtime_ms: Option<u64>,
     pub symlink: Option<SymlinkInfo>,
@@ -118,18 +116,4 @@ pub struct PendingChange {
     pub tail_summary: Option<String>,
     pub unified_diff: Option<String>,
     pub timestamp_ms: u64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SymlinkInfo, SymlinkTargetKind};
-
-    #[test]
-    fn symlink_info_defaults_missing_target_kind_for_existing_indexes() {
-        let info: SymlinkInfo =
-            serde_json::from_str(r#"{"target":"real.txt"}"#).expect("legacy symlink json");
-
-        assert_eq!(info.target, "real.txt");
-        assert_eq!(info.target_kind, SymlinkTargetKind::Unknown);
-    }
 }

@@ -1,4 +1,3 @@
-use crate::blob_store::write_atomic;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::types::ChangeEvent;
 use std::fs::{self, File, OpenOptions};
@@ -73,15 +72,6 @@ impl ChangeLog {
             }
         }
         Ok(events)
-    }
-
-    pub(crate) fn rewrite(path: &Path, events: &[ChangeEvent]) -> SnapshotResult<()> {
-        let mut payload = Vec::new();
-        for event in events {
-            payload.extend(serde_json::to_vec(event)?);
-            payload.push(b'\n');
-        }
-        write_atomic(path, &payload)
     }
 
     pub fn path(&self) -> &Path {

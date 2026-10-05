@@ -1444,7 +1444,7 @@ impl MagiTurnHarness {
                         .get("turn_id")
                         .and_then(serde_json::Value::as_str)
                         == Some(turn_id)
-                    && event.payload.get("delta").is_some()
+                    && event.payload.get("stream_delta").is_some()
             }) {
                 if let Some(event) = events.iter().find(|event| {
                     event.event_type == "session.turn.item"
@@ -1453,7 +1453,7 @@ impl MagiTurnHarness {
                             .get("turn_id")
                             .and_then(serde_json::Value::as_str)
                             == Some(turn_id)
-                        && event.payload.get("delta").is_some()
+                        && event.payload.get("stream_delta").is_some()
                 }) {
                     self.provider.timing.mark_first_stream_event(event.sequence);
                 }
@@ -11371,7 +11371,7 @@ done
                 .all(|pair| pair[0].sequence < pair[1].sequence)
         );
         assert!(session_events.iter().any(|event| {
-            event.event_type == "session.turn.item" && event.payload.get("delta").is_some()
+            event.event_type == "session.turn.item" && event.payload.get("stream_delta").is_some()
         }));
         assert!(session_events.iter().any(|event| {
             event.event_type == "session.turn.item"

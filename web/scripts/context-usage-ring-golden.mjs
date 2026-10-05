@@ -26,7 +26,7 @@ assert.doesNotMatch(
 );
 assert.match(
   bridgeSource,
-  /eventType === 'session\.context\.usage\.updated'[\s\S]*?applyContextBudgetRuntimeEvent\(event\)/,
+  /eventType === 'session\.context\.pressure\.updated'[\s\S]*?applyContextBudgetRuntimeEvent\(event\)/,
   'SSE 必须即时投射运行中上下文预算事件',
 );
 assert.match(
@@ -345,7 +345,6 @@ await withGoldenViteServer(async (server) => {
                 original_token_estimate: 180_000,
                 compacted_token_estimate: 36_000,
                 context_window_tokens: 245_000,
-                token_limit: 272_000,
                 threshold_tokens: 244_800,
                 resolved_model: 'gpt-5-codex',
                 compacted_at: 1_780_000_000_002,

@@ -453,7 +453,7 @@ pub fn publish_context_usage_update(
         checkpoint_generation,
         observed_at: UtcMillis::now().0,
     });
-    let updated_at = UtcMillis::now();
+    let observed_at = UtcMillis::now();
     let payload = serde_json::json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
@@ -465,13 +465,9 @@ pub fn publish_context_usage_update(
         "binding_revision": snapshot.model.binding_revision,
         "phase": phase,
         "measurement": accuracy,
-        "accuracy": accuracy,
         "projected_request_tokens": snapshot.projected_request_tokens,
-        "token_used": snapshot.projected_request_tokens,
         "provider_context_tokens": snapshot.provider_context_tokens,
-        "context_window_tokens": snapshot.context_window_tokens,
         "context_window_limit_tokens": snapshot.context_window_tokens,
-        "token_limit": snapshot.context_window_tokens,
         "remaining_tokens": remaining_tokens,
         "response_reserve_tokens": snapshot.response_reserve_tokens,
         "recovery_buffer_tokens": snapshot.recovery_buffer_tokens,
@@ -480,10 +476,8 @@ pub fn publish_context_usage_update(
         "checkpoint_generation": snapshot.checkpoint_generation,
         "source_role": "orchestrator",
         "pressure_level": snapshot.pressure_level.as_str(),
-        "warning_level": snapshot.pressure_level.as_str(),
         "usage_ratio": snapshot.projected_request_tokens as f64 / snapshot.context_window_tokens as f64,
-        "updated_at": updated_at.0,
-        "observed_at": updated_at.0,
+        "observed_at": observed_at.0,
     });
     let _ = event_bus.publish(
         EventEnvelope::usage(
@@ -916,12 +910,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["phase"], json!("prefill"));
-        assert_eq!(events[0].payload["accuracy"], json!("estimated"));
-        assert_eq!(events[0].payload["token_used"], json!(1_000));
-        assert_eq!(events[0].payload["context_window_tokens"], json!(256_000));
+        assert_eq!(events[0].payload["measurement"], json!("estimated"));
+        assert_eq!(events[0].payload["projected_request_tokens"], json!(1_000));
+        assert_eq!(
+            events[0].payload["context_window_limit_tokens"],
+            json!(256_000)
+        );
         assert_eq!(events[1].payload["phase"], json!("streaming"));
-        assert_eq!(events[1].payload["accuracy"], json!("estimated"));
-        assert!(events[1].payload["token_used"].as_u64().unwrap_or_default() > 1_000);
+        assert_eq!(events[1].payload["measurement"], json!("estimated"));
+        assert!(
+            events[1].payload["projected_request_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 1_000
+        );
         assert_eq!(events[1].payload["call_id"], json!("call-context-runtime"));
         assert_eq!(events[1].payload["turn_id"], json!("turn-context-runtime"));
     }
@@ -1062,7 +1064,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://example.test",
-                    "provider": "openai-compatible",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-success-call-key"
                 }),
             )
@@ -1126,9 +1128,9 @@ mod tests {
                 .to_string()
                 .contains("secret-success-call-key")
         );
-        assert_eq!(context_event.payload["accuracy"], json!("authoritative"));
+        assert_eq!(context_event.payload["measurement"], json!("authoritative"));
         assert_eq!(context_event.payload["phase"], json!("completed"));
-        assert_eq!(context_event.payload["token_used"], json!(3));
+        assert_eq!(context_event.payload["projected_request_tokens"], json!(3));
         assert_eq!(
             context_event.payload["resolved_model"],
             json!("gpt-session-test")
@@ -1185,9 +1187,8 @@ mod tests {
             .into_iter()
             .find(|event| event.event_type == "session.context.pressure.updated")
             .expect("固定窗口必须写入 authoritative pressure 事件");
-        assert_eq!(event.payload["context_window_tokens"], json!(256_000));
         assert_eq!(event.payload["context_window_limit_tokens"], json!(256_000));
-        assert_eq!(event.payload["token_used"], json!(42));
+        assert_eq!(event.payload["projected_request_tokens"], json!(42));
     }
 
     struct SuccessfulAuxiliaryClient;
@@ -1226,7 +1227,7 @@ mod tests {
                 "auxiliary",
                 json!({
                     "baseUrl": "https://auxiliary.example.test/v1",
-                    "provider": "openai-compatible",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-auxiliary-success-key",
                     "model": "auxiliary-success-model"
                 }),
@@ -1295,7 +1296,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://orchestrator.example.test/v1",
-                    "provider": "openai-compatible",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-orchestrator-key"
                 }),
             )
@@ -1356,7 +1357,7 @@ mod tests {
                 "auxiliary",
                 json!({
                     "baseUrl": "https://example.test",
-                    "provider": "openai-compatible",
+                    "apiProtocol": "openai_chat",
                     "model": "auxiliary-no-usage-model"
                 }),
             )
@@ -1403,6 +1404,7 @@ mod tests {
                 "imageGeneration",
                 json!({
                     "baseUrl": "https://images.example.test/v1",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-image-key",
                     "model": "gpt-image-test"
                 }),
@@ -1466,7 +1468,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://example.test",
-                    "provider": "openai-compatible",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-failed-call-key"
                 }),
             )
@@ -1538,7 +1540,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://example.test",
-                    "provider": "openai-compatible"
+                    "apiProtocol": "openai_chat"
                 }),
             )
             .unwrap();

@@ -1371,13 +1371,6 @@ fn publish_session_turn_item_stream_event_raw(
         "stream_delta": stream_update.delta,
         "stream_content_length": stream_update.content_length,
         "stream_reset": stream_update.reset,
-        // 对外协议使用 camelCase；保留现有 snake_case 字段供旧事件回放解析器读取，
-        // 两组字段在同一次事实事件中始终表达同一版本和长度。
-        "itemVersion": item_version,
-        "baseContentLength": stream_update.base_content_length,
-        "contentLength": stream_update.content_length,
-        "delta": stream_update.delta,
-        "reset": stream_update.reset,
     });
     if first_frame {
         payload
@@ -2040,11 +2033,22 @@ mod tests {
             Value::from(1_u64)
         );
         assert_eq!(first_payload["canonical_item_version"], Value::from(1_u64));
-        assert_eq!(first_payload["itemVersion"], Value::from(1_u64));
-        assert_eq!(first_payload["baseContentLength"], Value::from(0_u64));
-        assert_eq!(first_payload["contentLength"], Value::from(1_u64));
-        assert_eq!(first_payload["delta"], Value::String("你".to_string()));
-        assert_eq!(first_payload["reset"], Value::Bool(false));
+        assert_eq!(
+            first_payload["stream_delta"],
+            Value::String("你".to_string())
+        );
+        for camel_field in [
+            "itemVersion",
+            "baseContentLength",
+            "contentLength",
+            "delta",
+            "reset",
+        ] {
+            assert!(
+                first_payload.get(camel_field).is_none(),
+                "stream payload 只使用 snake_case 字段: {camel_field}"
+            );
+        }
         assert_eq!(
             first_payload["stream_base_content_length"],
             Value::from(0_u64)
@@ -2074,14 +2078,6 @@ mod tests {
             second_payload["canonical_item_version"],
             Value::from(stored_version)
         );
-        assert_eq!(second_payload["itemVersion"], Value::from(stored_version));
-        assert_eq!(second_payload["baseContentLength"], Value::from(1_u64));
-        assert_eq!(
-            second_payload["contentLength"],
-            Value::from(second_content.chars().count() as u64)
-        );
-        assert_eq!(second_payload["delta"], second_payload["stream_delta"]);
-        assert_eq!(second_payload["reset"], Value::Bool(false));
         assert_eq!(
             second_payload["stream_base_content_length"],
             Value::from(1_u64)

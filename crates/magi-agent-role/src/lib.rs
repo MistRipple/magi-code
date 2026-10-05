@@ -94,7 +94,7 @@ pub struct AgentRole {
     pub ownerships: Vec<String>,
     #[serde(default)]
     pub insight_preferences: Vec<String>,
-    /// 角色允许激活的能力。为空时仅用于旧版内置角色，按 capability registry 的角色范围推导。
+    /// 角色允许激活的能力。内置角色与用户角色都必须显式声明。
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -410,18 +410,16 @@ impl AgentRoleRegistry {
         role_id: &str,
     ) -> Vec<ProfessionalCapabilitySummary> {
         let snapshot = self.current_snapshot();
-        if let Some(role) = snapshot.roles.get(role_id)
-            && !role.capabilities.is_empty()
-        {
-            let allowed = role.capabilities.iter().collect::<HashSet<_>>();
-            return snapshot
-                .capabilities
-                .summaries()
-                .into_iter()
-                .filter(|capability| allowed.contains(&capability.id))
-                .collect();
-        }
-        snapshot.capabilities.summaries_for_role(role_id)
+        let Some(role) = snapshot.roles.get(role_id) else {
+            return Vec::new();
+        };
+        let allowed = role.capabilities.iter().collect::<HashSet<_>>();
+        snapshot
+            .capabilities
+            .summaries()
+            .into_iter()
+            .filter(|capability| allowed.contains(&capability.id))
+            .collect()
     }
 
     pub fn capability_summaries(&self) -> Vec<ProfessionalCapabilitySummary> {
@@ -451,15 +449,7 @@ impl AgentRoleRegistry {
         if capability_ids.is_empty() {
             return Err("代理任务必须至少激活一项专业能力".to_string());
         }
-        let allowed: HashSet<String> = if role.capabilities.is_empty() {
-            snapshot
-                .capabilities
-                .ids_for_role(role_id)
-                .into_iter()
-                .collect()
-        } else {
-            role.capabilities.iter().cloned().collect()
-        };
+        let allowed: HashSet<String> = role.capabilities.iter().cloned().collect();
         let mut normalized = Vec::new();
         let mut seen = HashSet::new();
         for raw_id in capability_ids {

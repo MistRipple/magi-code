@@ -282,12 +282,12 @@ function normalizeCanonicalBlocks(value: unknown): unknown[] | null | undefined 
 function normalizeCanonicalTurnStreamUpdate(
   record: Record<string, unknown>,
 ): CanonicalTurnStreamUpdate | undefined {
-  const itemId = readString(record, 'canonicalItemId', 'canonical_item_id');
-  const itemVersion = readNumber(record, 'itemVersion', 'canonicalItemVersion', 'canonical_item_version');
-  const itemStatus = readItemStatus(readString(record, 'canonicalItemStatus', 'canonical_item_status'));
-  const baseContentLength = readNumber(record, 'baseContentLength', 'streamBaseContentLength', 'stream_base_content_length');
-  const delta = readRawString(record, 'streamDelta', 'stream_delta');
-  const contentLength = readNumber(record, 'contentLength', 'streamContentLength', 'stream_content_length');
+  const itemId = readString(record, 'canonical_item_id');
+  const itemVersion = readNumber(record, 'canonical_item_version');
+  const itemStatus = readItemStatus(readString(record, 'canonical_item_status'));
+  const baseContentLength = readNumber(record, 'stream_base_content_length');
+  const delta = readRawString(record, 'stream_delta');
+  const contentLength = readNumber(record, 'stream_content_length');
   if (!itemId || itemVersion === undefined || !itemStatus || baseContentLength === undefined || delta === undefined || contentLength === undefined) {
     return undefined;
   }
@@ -298,7 +298,7 @@ function normalizeCanonicalTurnStreamUpdate(
     baseContentLength,
     delta,
     contentLength,
-    reset: readBoolean(record, false, 'streamReset', 'stream_reset'),
+    reset: readBoolean(record, false, 'stream_reset'),
   };
 }
 
@@ -471,19 +471,12 @@ export function normalizeCanonicalTurnStrict(
 }
 
 const CANONICAL_STREAM_FIELD_NAMES = [
-  'canonicalItemId',
   'canonical_item_id',
-  'canonicalItemVersion',
   'canonical_item_version',
-  'canonicalItemStatus',
   'canonical_item_status',
-  'streamBaseContentLength',
   'stream_base_content_length',
-  'streamDelta',
   'stream_delta',
-  'streamContentLength',
   'stream_content_length',
-  'streamReset',
   'stream_reset',
 ] as const;
 
@@ -494,31 +487,25 @@ export function parseCanonicalTurnEventPayload(
   if (!record) {
     return undefined;
   }
-  const schemaVersion = readString(record, 'canonical_schema_version', 'canonicalSchemaVersion', 'schemaVersion', 'schema_version');
+  const schemaVersion = readString(record, 'canonical_schema_version');
   if (schemaVersion !== CANONICAL_TURN_SCHEMA_VERSION) {
     return undefined;
   }
-  const rawTurn = record.canonical_turn ?? record.canonicalTurn ?? record.turn;
-  const rawItem = record.canonical_item ?? record.canonicalItem ?? record.item;
+  const rawTurn = record.canonical_turn;
+  const rawItem = record.canonical_item;
   const turn = rawTurn === undefined || rawTurn === null
     ? undefined
     : normalizeCanonicalTurnStrict(rawTurn);
   const item = rawItem === undefined || rawItem === null
     ? undefined
     : normalizeCanonicalTurnItemStrict(rawItem);
-  const kind = readEventKind(readString(record, 'canonical_event_kind', 'canonicalEventKind', 'kind'));
-  const sessionId = turn?.sessionId || item?.sessionId || readString(record, 'sessionId', 'session_id');
-  const turnId = turn?.turnId || item?.turnId || readString(record, 'turnId', 'turn_id');
-  const turnSeq = turn?.turnSeq ?? item?.turnSeq ?? readNumber(record, 'turnSeq', 'turn_seq');
-  const eventId = readString(record, 'canonicalEventId', 'canonical_event_id', 'eventId', 'event_id');
-  const eventSeq = readNumber(record, 'canonicalEventSeq', 'canonical_event_seq', 'eventSeq', 'event_seq');
-  const occurredAt = readNumber(
-    record,
-    'canonicalOccurredAt',
-    'canonical_occurred_at',
-    'occurredAt',
-    'occurred_at',
-  );
+  const kind = readEventKind(readString(record, 'canonical_event_kind'));
+  const sessionId = turn?.sessionId || item?.sessionId || readString(record, 'session_id');
+  const turnId = turn?.turnId || item?.turnId || readString(record, 'turn_id');
+  const turnSeq = turn?.turnSeq ?? item?.turnSeq ?? readNumber(record, 'turn_seq');
+  const eventId = readString(record, 'canonical_event_id');
+  const eventSeq = readNumber(record, 'canonical_event_seq');
+  const occurredAt = readNumber(record, 'canonical_occurred_at');
   if (!kind) {
     return undefined;
   }

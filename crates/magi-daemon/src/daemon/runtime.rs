@@ -383,9 +383,8 @@ fn external_mcp_server_catalog_snapshot(
     ExternalMcpServerCatalogEntry,
     Vec<ExternalMcpToolCatalogEntry>,
 )> {
-    let server_id = read_json_string(entry, &["id", "serverId", "name"])?;
-    let name =
-        read_json_string(entry, &["name", "serverName"]).unwrap_or_else(|| server_id.clone());
+    let server_id = mcp_server_entry_id(entry)?.to_string();
+    let name = read_json_string(entry, &["name"]).unwrap_or_else(|| server_id.clone());
     let enabled = entry
         .get("enabled")
         .and_then(serde_json::Value::as_bool)
@@ -567,15 +566,13 @@ impl McpBridgeClient for SettingsBackedMcpBridgeClient {
 }
 
 fn mcp_entry_matches_target(entry: &serde_json::Value, target: &str) -> bool {
-    ["id", "serverId", "name", "serverName"]
-        .iter()
-        .any(|field| {
-            entry
-                .get(*field)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .is_some_and(|value| value == target)
-        })
+    ["id", "name"].iter().any(|field| {
+        entry
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| value == target)
+    })
 }
 
 fn mcp_config_unavailable_error(message: String) -> BridgeClientError {

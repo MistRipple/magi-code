@@ -178,7 +178,6 @@ impl BrowserTabLifecycle {
 pub struct BrowserViewport {
     pub width: u32,
     pub height: u32,
-    #[serde(alias = "deviceScaleFactorMillis")]
     pub device_scale_factor_millis: u32,
     #[serde(default)]
     pub device_type: BrowserDeviceType,
@@ -199,7 +198,6 @@ impl Default for BrowserViewport {
 #[serde(rename_all = "snake_case")]
 pub enum BrowserDeviceType {
     #[default]
-    #[serde(alias = "tablet")]
     Desktop,
     Mobile,
 }
@@ -397,33 +395,20 @@ pub enum BrowserAnnotationAnchor {
 pub struct BrowserElementAnnotationAnchor {
     pub url: String,
     pub origin: Option<String>,
-    #[serde(alias = "framePath")]
     pub frame_path: Vec<String>,
     pub viewport: BrowserViewport,
-    #[serde(alias = "scrollX")]
     pub scroll_x: f64,
-    #[serde(alias = "scrollY")]
     pub scroll_y: f64,
-    #[serde(alias = "testId")]
     pub test_id: Option<String>,
-    #[serde(alias = "stableId")]
     pub stable_id: Option<String>,
-    #[serde(alias = "ariaRole")]
     pub aria_role: Option<String>,
-    #[serde(alias = "ariaName")]
     pub aria_name: Option<String>,
-    #[serde(alias = "tagName")]
     pub tag_name: String,
-    #[serde(alias = "textExcerpt")]
     pub text_excerpt: Option<String>,
-    #[serde(alias = "cssPath")]
     pub css_path: String,
-    #[serde(alias = "ancestorFingerprint")]
     pub ancestor_fingerprint: String,
-    #[serde(alias = "domFingerprint")]
     pub dom_fingerprint: String,
     pub bounding_box: BrowserNormalizedRect,
-    #[serde(alias = "snapshotRevision")]
     pub snapshot_revision: u64,
 }
 
@@ -432,12 +417,9 @@ pub struct BrowserRegionAnnotationAnchor {
     pub url: String,
     pub origin: Option<String>,
     pub viewport: BrowserViewport,
-    #[serde(alias = "scrollX")]
     pub scroll_x: f64,
-    #[serde(alias = "scrollY")]
     pub scroll_y: f64,
     pub rect: BrowserNormalizedRect,
-    #[serde(alias = "snapshotRevision")]
     pub snapshot_revision: u64,
 }
 

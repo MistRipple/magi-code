@@ -5,15 +5,13 @@
 //! 请求协议的**唯一事实源**是模型配置中的 `apiProtocol`。模型名称和 URL 只描述
 //! 模型身份与地址，不参与协议路由，避免同一聚合网关切换模型时改变请求结构。
 //!
-//! `provider` 字段不再参与路由决策，仅作为统计/展示标签，由 `apiProtocol` 派生。
-//! 配置输入不再接受 `provider` / `openaiProtocol` / `protocolEndpoint`，避免多个字段
-//! 同时表达协议。
+//! provider 标签只用于统计/展示，由 `apiProtocol` 派生。模型配置写入入口只接受
+//! [`MODEL_CONFIG_FIELDS`] 中的字段，未知字段一律拒绝。
 
 use magi_bridge_client::{
     EndpointUrlMode, HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
 };
 use magi_core::SessionId;
-use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use regex::Regex;
 use serde::Serialize;
@@ -252,7 +250,6 @@ impl NormalizedModelConfig {
     /// 防止运行时重新根据模型名或地址猜测协议。完全空的 section 仅用于表达“未配置”，
     /// 不会构造客户端。
     pub fn from_settings_value(value: &Value) -> Result<Self, String> {
-        reject_deprecated_model_config_fields(value)?;
         let url_mode_label =
             string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
         let has_connection_fields = ["baseUrl", "apiKey", "model", "urlMode", "apiProtocol"]
@@ -562,16 +559,31 @@ pub fn resolve_vision_execution_config(
     NormalizedModelConfig::from_settings_value(&raw).map(Some)
 }
 
-pub fn reject_deprecated_model_config_fields(value: &Value) -> Result<(), String> {
+/// 模型配置对象的当前 schema 字段。
+pub const MODEL_CONFIG_FIELDS: &[&str] = &[
+    "baseUrl",
+    "apiKey",
+    "model",
+    "urlMode",
+    "apiProtocol",
+    "reasoningEffort",
+    "contextWindowTokens",
+    "textModelRules",
+];
+
+/// 模型配置写入入口的严格 schema 校验：只接受 [`MODEL_CONFIG_FIELDS`]。
+pub fn reject_unknown_model_config_fields(value: &Value) -> Result<(), String> {
     let Some(object) = value.as_object() else {
         return Ok(());
     };
-    for field in DEPRECATED_MODEL_CONFIG_FIELDS {
-        if object.contains_key(*field) {
-            return Err(format!(
-                "模型配置字段 {field} 已废弃，请使用 baseUrl/apiKey/model/urlMode/apiProtocol/reasoningEffort"
-            ));
-        }
+    if let Some(field) = object
+        .keys()
+        .find(|field| !MODEL_CONFIG_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "模型配置不支持字段 {field}，可用字段：{}",
+            MODEL_CONFIG_FIELDS.join("/")
+        ));
     }
     Ok(())
 }
@@ -1089,21 +1101,34 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_model_config_fields_are_rejected() {
-        for field in DEPRECATED_MODEL_CONFIG_FIELDS {
-            let mut config = json!({
-                "baseUrl": "https://api.deepseek.com/v1",
-                "apiKey": "sk-test",
-                "model": "deepseek-chat",
-                "urlMode": "standard",
-                "apiProtocol": "openai_chat"
-            });
-            config[field] = json!("deprecated");
+    fn unknown_model_config_fields_are_rejected() {
+        let config = json!({
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat",
+            "unexpected": "value"
+        });
 
-            let error = NormalizedModelConfig::from_settings_value(&config)
-                .expect_err("废弃模型配置字段必须被拒绝");
-            assert!(error.contains(field), "错误信息应指出被拒绝字段: {error}");
-        }
+        let error = reject_unknown_model_config_fields(&config)
+            .expect_err("模型配置写入入口必须拒绝 schema 之外的字段");
+        assert!(
+            error.contains("unexpected"),
+            "错误信息应指出被拒绝字段: {error}"
+        );
+
+        reject_unknown_model_config_fields(&json!({
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat",
+            "reasoningEffort": "high",
+            "contextWindowTokens": 128000,
+            "textModelRules": []
+        }))
+        .expect("当前 schema 字段必须被接受");
     }
 
     #[test]
@@ -1168,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_llm_config_drops_legacy_protocol_field() {
+    fn usage_llm_config_derives_provider_from_api_protocol() {
         let config = model_config(json!({
             "baseUrl": "https://example.test/v1",
             "model": "gpt-test",

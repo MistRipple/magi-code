@@ -163,7 +163,7 @@ pub fn ledger_dto(status: AuditUsageLedgerStatus) -> AuditUsageLedgerDto {
 /// 为每个会话投影上下文压力快照。
 ///
 /// 窗口和 projected token 优先使用事件中绑定模型的快照，不能用当前活动模型
-/// 覆盖历史调用。旧 ledger 没有新字段时才使用旧字段做一次读取迁移。
+/// 覆盖历史调用。
 fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
     for session in &mut runtime_read_model.details.sessions {
         let Some(observation) = session.usage_observation.as_ref() else {
@@ -174,11 +174,7 @@ fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
         let context_window = observation
             .context_window_limit_tokens
             .unwrap_or_else(|| resolve_context_window(resolved_model).max(1) as u64);
-        let projected_tokens = if observation.projected_request_tokens > 0 {
-            observation.projected_request_tokens
-        } else {
-            observation.context_window_tokens
-        };
+        let projected_tokens = observation.projected_request_tokens;
         let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
         let remaining_tokens = context_window.saturating_sub(projected_tokens);
         session.budget = Some(SessionRuntimeBudgetEntry {
@@ -225,11 +221,7 @@ pub fn apply_configured_model_context_windows(
                 resolved_model,
             ) as u64
         });
-        let projected_tokens = if observation.projected_request_tokens > 0 {
-            observation.projected_request_tokens
-        } else {
-            observation.context_window_tokens
-        };
+        let projected_tokens = observation.projected_request_tokens;
         let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
         let remaining_tokens = context_window.saturating_sub(projected_tokens);
         session.budget = Some(SessionRuntimeBudgetEntry {
@@ -2252,7 +2244,7 @@ mod tests {
         input.details.sessions.push(SessionRuntimeSummaryEntry {
             session_id: "session-budget".to_string(),
             usage_observation: Some(SessionRuntimeUsageObservation {
-                context_window_tokens: 136_000,
+                projected_request_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
@@ -2342,7 +2334,7 @@ mod tests {
         input.details.sessions.push(SessionRuntimeSummaryEntry {
             session_id: session_id.to_string(),
             usage_observation: Some(SessionRuntimeUsageObservation {
-                context_window_tokens: 64_000,
+                projected_request_tokens: 64_000,
                 resolved_model: Some("gpt-5.6-luna".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
@@ -2375,7 +2367,7 @@ mod tests {
         input.details.sessions.push(SessionRuntimeSummaryEntry {
             session_id: "session-live".to_string(),
             usage_observation: Some(SessionRuntimeUsageObservation {
-                context_window_tokens: 136_000,
+                projected_request_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(2)),
                 ..SessionRuntimeUsageObservation::default()
@@ -2387,7 +2379,7 @@ mod tests {
         ledger_observations.insert(
             "session-restored".to_string(),
             SessionRuntimeUsageObservation {
-                context_window_tokens: 68_000,
+                projected_request_tokens: 68_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
@@ -2397,7 +2389,7 @@ mod tests {
         ledger_observations.insert(
             "session-live".to_string(),
             SessionRuntimeUsageObservation {
-                context_window_tokens: 1_000,
+                projected_request_tokens: 1_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()

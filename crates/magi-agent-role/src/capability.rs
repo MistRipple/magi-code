@@ -107,24 +107,6 @@ impl ProfessionalCapabilityRegistry {
             .collect()
     }
 
-    pub fn summaries_for_role(&self, role_id: &str) -> Vec<ProfessionalCapabilitySummary> {
-        let mut capabilities = self
-            .capabilities
-            .values()
-            .filter(|capability| capability.supports_role(role_id))
-            .map(ProfessionalCapability::summary)
-            .collect::<Vec<_>>();
-        capabilities.sort_by(|left, right| left.id.cmp(&right.id));
-        capabilities
-    }
-
-    pub fn ids_for_role(&self, role_id: &str) -> Vec<String> {
-        self.summaries_for_role(role_id)
-            .into_iter()
-            .map(|capability| capability.id)
-            .collect()
-    }
-
     pub fn validate_ids_for_role(
         &self,
         role_id: &str,

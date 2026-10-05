@@ -443,12 +443,7 @@ fn agent_model_bindings_for_state(state: &ApiState) -> HashMap<String, AgentMode
     let model_by_engine_id = engines
         .into_iter()
         .filter_map(|engine| {
-            let engine_id = engine
-                .get("id")
-                .or_else(|| engine.get("engineId"))?
-                .as_str()?
-                .trim()
-                .to_string();
+            let engine_id = engine.get("id")?.as_str()?.trim().to_string();
             if engine_id.is_empty() {
                 return None;
             }
@@ -609,12 +604,8 @@ fn text_from_structured_output(value: &serde_json::Value) -> Option<String> {
         .or_else(|| {
             value
                 .get("result")
-                .and_then(|result| {
-                    result
-                        .get("final_text")
-                        .or_else(|| result.get("finalText"))
-                        .and_then(|value| value.as_str())
-                })
+                .and_then(|result| result.get("final_text"))
+                .and_then(|value| value.as_str())
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .map(ToString::to_string)
@@ -1337,6 +1328,7 @@ mod tests {
                         "displayName": "GLM-5.1",
                         "llm": {
                             "baseUrl": "http://localhost:8317/",
+                            "apiProtocol": "openai_chat",
                             "apiKey": "test-key",
                             "model": "glm-5.1"
                         }

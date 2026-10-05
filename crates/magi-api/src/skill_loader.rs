@@ -125,23 +125,16 @@ fn normalize_custom_tool_entries(entries: &mut Vec<Value>) {
     });
 }
 
-fn normalize_token(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !matches!(ch, '_' | '-' | ' '))
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn read_string_field<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str))
+fn read_string_field<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
 
 fn parse_bridge_kind(value: &str) -> Option<BridgeBindingKind> {
-    match normalize_token(value).as_str() {
+    match value {
         "model" => Some(BridgeBindingKind::Model),
         "mcp" => Some(BridgeBindingKind::Mcp),
         _ => None,
@@ -149,13 +142,18 @@ fn parse_bridge_kind(value: &str) -> Option<BridgeBindingKind> {
 }
 
 fn parse_dispatch_action(value: &str) -> Option<BridgeDispatchAction> {
-    match normalize_token(value).as_str() {
-        "modelprompt" | "prompt" => Some(BridgeDispatchAction::ModelPrompt),
-        "mcptoolcall" | "toolcall" | "call" => Some(BridgeDispatchAction::McpToolCall),
+    match value {
+        "model_prompt" => Some(BridgeDispatchAction::ModelPrompt),
+        "mcp_tool_call" => Some(BridgeDispatchAction::McpToolCall),
         _ => None,
     }
 }
 
+/// 解析 Skill `config.json` 的 `custom_tool_bindings`。
+///
+/// 字段名与 `allowed_tools` 一致使用 snake_case：`tool_name`、`bridge_target`、
+/// `binding_id`、`description`、`bridge_kind`（`model` / `mcp`）、
+/// `dispatch_action`（`model_prompt` / `mcp_tool_call`）。
 fn parse_custom_tool_bindings(value: &Value) -> Vec<CustomToolBinding> {
     let Some(entries) = value.as_array() else {
         return Vec::new();
@@ -165,28 +163,18 @@ fn parse_custom_tool_bindings(value: &Value) -> Vec<CustomToolBinding> {
         .iter()
         .filter_map(|entry| {
             let object = entry.as_object()?;
-            let tool_name = read_string_field(object, &["tool_name", "toolName", "name"])?;
-            let bridge_target = read_string_field(
-                object,
-                &["bridge_target", "bridgeTarget", "target", "serverId"],
-            )?
-            .to_string();
-            let binding_id = read_string_field(object, &["binding_id", "bindingId"])
+            let tool_name = read_string_field(object, "tool_name")?;
+            let bridge_target = read_string_field(object, "bridge_target")?.to_string();
+            let binding_id = read_string_field(object, "binding_id")
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("{tool_name}:{bridge_target}"));
-            let description = read_string_field(object, &["description"])
+            let description = read_string_field(object, "description")
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| tool_name.to_string());
-            let bridge_kind = object
-                .get("bridge_kind")
-                .or_else(|| object.get("bridgeKind"))
-                .and_then(Value::as_str)
+            let bridge_kind = read_string_field(object, "bridge_kind")
                 .and_then(parse_bridge_kind)
                 .unwrap_or(BridgeBindingKind::Mcp);
-            let dispatch_action = object
-                .get("dispatch_action")
-                .or_else(|| object.get("dispatchAction"))
-                .and_then(Value::as_str)
+            let dispatch_action = read_string_field(object, "dispatch_action")
                 .and_then(parse_dispatch_action)
                 .unwrap_or(match bridge_kind {
                     BridgeBindingKind::Model => BridgeDispatchAction::ModelPrompt,
@@ -297,11 +285,7 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                             }
                         }
                     }
-                    if let Some(bindings) = parsed
-                        .get("custom_tool_bindings")
-                        .or_else(|| parsed.get("customToolBindings"))
-                        .or_else(|| parsed.get("customTools"))
-                    {
+                    if let Some(bindings) = parsed.get("custom_tool_bindings") {
                         custom_tool_bindings = parse_custom_tool_bindings(bindings);
                     }
                 }
@@ -586,12 +570,12 @@ mod tests {
                         "bridge_target": "openai"
                     },
                     {
-                        "bindingId": "anthropic-reviewer",
-                        "toolName": "mcp.review",
+                        "binding_id": "anthropic-reviewer",
+                        "tool_name": "mcp.review",
                         "description": "调用 MCP 进行审查",
-                        "bridgeKind": "mcp",
-                        "dispatchAction": "mcp_tool_call",
-                        "bridgeTarget": "review-server"
+                        "bridge_kind": "mcp",
+                        "dispatch_action": "mcp_tool_call",
+                        "bridge_target": "review-server"
                     }
                 ]
             })

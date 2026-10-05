@@ -5088,6 +5088,7 @@ mod tests {
                 "auxiliary",
                 serde_json::json!({
                     "baseUrl": "https://example.test",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "secret-auxiliary-test-key",
                     "model": "auxiliary-test-model"
                 }),

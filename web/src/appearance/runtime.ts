@@ -28,11 +28,6 @@ let initialized = false;
 export async function initializeAppearanceRuntime(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  try {
-    window.localStorage.removeItem('magi-web-theme-preference');
-  } catch {
-    // 外观权威状态已迁移至 daemon，本地存储不可用不影响主题加载。
-  }
   mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
   mediaQuery.addEventListener('change', handleSystemModeChange);
   window.addEventListener('magi:appearanceChanged', handleAppearanceChanged);

@@ -754,13 +754,13 @@ export function handleUnifiedData(standard: StandardMessage) {
         });
       }
       const canonicalEvent = parseCanonicalTurnEventPayload({
-        schemaVersion: payload.canonicalSchemaVersion,
-        canonicalEventKind: payload.canonicalEventKind,
-        canonicalEventId: payload.canonicalEventId,
-        canonicalEventSeq: payload.canonicalEventSeq,
-        canonicalOccurredAt: payload.canonicalOccurredAt,
-        canonicalTurn: payload.canonicalTurn,
-        canonicalItem: payload.canonicalItem,
+        canonical_schema_version: payload.canonicalSchemaVersion,
+        canonical_event_kind: payload.canonicalEventKind,
+        canonical_event_id: payload.canonicalEventId,
+        canonical_event_seq: payload.canonicalEventSeq,
+        canonical_occurred_at: payload.canonicalOccurredAt,
+        canonical_turn: payload.canonicalTurn,
+        canonical_item: payload.canonicalItem,
       });
       if (
         canonicalEvent

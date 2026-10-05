@@ -8,7 +8,8 @@ use crate::dto::{
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
-    build_mcp_config_from_entry, mcp_server_entry_enabled, normalize_mcp_server_snapshot_entry,
+    build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
+    normalize_mcp_server_snapshot_entry,
 };
 use crate::routes::settings::{
     load_registry_engines, registered_role_template_ids, resolve_registry_agents,
@@ -2854,9 +2855,9 @@ impl ApiState {
         .map(Some)
     }
 
-    /// 清理旧版本遗留的孤儿 Browser Session。
+    /// 清理孤儿 Browser Session。
     ///
-    /// Browser Authority 的持久化状态可能早于对应 Magi 会话被删除或归档，
+    /// 异常退出等情况下，Browser Authority 的持久化状态可能早于对应 Magi 会话被删除或归档，
     /// 这些状态不能继续参与恢复和全局 Tab 容量计算。只保留当前 SessionStore
     /// 中仍为 Active 的 Magi 会话，所有其他打开状态一次性转为 Closed。
     pub fn reconcile_browser_sessions_with_session_store(&self) -> Result<usize, ApiError> {
@@ -3352,12 +3353,7 @@ impl ApiState {
             return;
         };
         for entry in arr.iter_mut() {
-            let Some(server_id) = entry
-                .get("id")
-                .and_then(|v| v.as_str())
-                .or_else(|| entry.get("serverId").and_then(|v| v.as_str()))
-                .map(str::to_string)
-            else {
+            let Some(server_id) = mcp_server_entry_id(entry).map(str::to_string) else {
                 continue;
             };
             let enabled = mcp_server_entry_enabled(entry);

@@ -4345,7 +4345,7 @@ mod tests {
     fn thread_history_compaction_uses_last_context_window_usage_as_authority() {
         let history = repeated_thread_history(40, 1_000);
         let low_usage = SessionRuntimeUsageObservation {
-            context_window_tokens: 20_000,
+            projected_request_tokens: 20_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(1)),
             ..SessionRuntimeUsageObservation::default()
@@ -4355,7 +4355,7 @@ mod tests {
         );
 
         let high_usage = SessionRuntimeUsageObservation {
-            context_window_tokens: 245_000,
+            projected_request_tokens: 245_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(2)),
             ..SessionRuntimeUsageObservation::default()
@@ -4419,7 +4419,7 @@ mod tests {
     fn thread_history_compaction_keeps_estimated_guard_after_prior_compaction() {
         let huge_history = repeated_thread_history(1_000, 1_000);
         let low_usage_after_compaction = SessionRuntimeUsageObservation {
-            context_window_tokens: 20_000,
+            projected_request_tokens: 20_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(3)),
             ..SessionRuntimeUsageObservation::default()
@@ -4833,10 +4833,13 @@ mod tests {
             compacted_event.payload["context_window_limit_tokens"],
             serde_json::json!(256_000)
         );
-        assert_eq!(
-            compacted_event.payload["context_window_tokens"],
-            serde_json::json!(256_000),
-            "压缩事件中的 context_window_tokens 必须是模型窗口，不得写入 prefill 估算"
+        assert!(
+            compacted_event
+                .payload
+                .get("context_window_tokens")
+                .is_none()
+                && compacted_event.payload.get("token_limit").is_none(),
+            "压缩事件只用 context_window_limit_tokens 表达模型窗口"
         );
         assert!(
             compacted_event.payload["request_token_estimate"]

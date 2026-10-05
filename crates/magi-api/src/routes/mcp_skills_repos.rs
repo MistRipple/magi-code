@@ -955,7 +955,7 @@ async fn add_mcp_server(
     let normalized = normalize_mcp_server_entry(&request)?;
     let server_id = mcp_server_entry_id(&normalized)
         .map(str::to_string)
-        .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("MCP server id 不能为空".to_string()))?;
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized)

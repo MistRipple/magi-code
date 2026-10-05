@@ -205,12 +205,8 @@ function bridgeRecordValue(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function bridgePayloadString(
-  payload: Record<string, unknown>,
-  snakeKey: string,
-  camelKey: string,
-): string {
-  return bridgeStringValue(payload[snakeKey]) || bridgeStringValue(payload[camelKey]);
+function bridgePayloadString(payload: Record<string, unknown>, key: string): string {
+  return bridgeStringValue(payload[key]);
 }
 
 function taskEventRootTaskIds(message: ClientBridgeMessage): Set<string> {
@@ -218,9 +214,9 @@ function taskEventRootTaskIds(message: ClientBridgeMessage): Set<string> {
   const values = [
     ...(Array.isArray(message.rootTaskIds) ? message.rootTaskIds.map(bridgeStringValue) : []),
     bridgeStringValue(message.rootTaskId),
-    bridgePayloadString(payload, 'root_task_id', 'rootTaskId'),
-    bridgePayloadString(payload, 'old_root_task_id', 'oldRootTaskId'),
-    bridgePayloadString(payload, 'new_root_task_id', 'newRootTaskId'),
+    bridgePayloadString(payload, 'root_task_id'),
+    bridgePayloadString(payload, 'old_root_task_id'),
+    bridgePayloadString(payload, 'new_root_task_id'),
   ].filter(Boolean);
   return new Set(values);
 }
@@ -231,13 +227,13 @@ function taskEventMatchesState(
 ): boolean {
   const payload = bridgeRecordValue(message.payload);
   const eventWorkspaceId = bridgeStringValue(message.workspaceId)
-    || bridgePayloadString(payload, 'workspace_id', 'workspaceId');
+    || bridgePayloadString(payload, 'workspace_id');
   if (eventWorkspaceId && state.workspaceId && eventWorkspaceId !== state.workspaceId) {
     return false;
   }
 
   const eventSessionId = bridgeStringValue(message.sessionId)
-    || bridgePayloadString(payload, 'session_id', 'sessionId');
+    || bridgePayloadString(payload, 'session_id');
   if (eventSessionId && eventSessionId !== state.sessionId) {
     return false;
   }

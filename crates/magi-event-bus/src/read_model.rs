@@ -331,12 +331,8 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
 /// `projected_request_tokens` 是下一次请求的预测上下文占用，
 /// `provider_context_tokens` 只表示 provider 返回的当前请求锚点，
 /// `context_window_limit_tokens` 是该次调用绑定模型的窗口上限。三者不能混用。
-/// `context_window_tokens` 仅保留为读取旧 ledger 的数据迁移字段，新事件不会再写入。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeUsageObservation {
-    /// 旧 ledger 的字段；新代码统一读取 projected_request_tokens。
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub context_window_tokens: u64,
     /// provider 返回的当前请求上下文 token。
     pub provider_context_tokens: Option<u64>,
     /// 包含当前请求和附件的下一次请求预测 token。
@@ -363,10 +359,6 @@ pub struct SessionRuntimeUsageObservation {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub call_id: Option<String>,
-}
-
-fn is_zero(value: &u64) -> bool {
-    *value == 0
 }
 
 /// 会话上下文预算快照,由 `magi-api` 装配 DTO 时填充。
@@ -399,7 +391,6 @@ pub struct SessionRuntimeContextCompactionEntry {
     pub compacted_token_estimate: u64,
     pub request_token_estimate: Option<u64>,
     pub context_window_tokens: Option<u64>,
-    pub token_limit: Option<u64>,
     pub threshold_tokens: Option<u64>,
     pub resolved_model: Option<String>,
     pub compacted_at: Option<UtcMillis>,
@@ -2142,24 +2133,13 @@ fn infer_task_status(event: &EventEnvelope) -> Option<String> {
 }
 
 fn event_task_id(event: &EventEnvelope) -> Option<String> {
-    event
-        .task_id
-        .as_ref()
-        .map(ToString::to_string)
-        .or_else(|| {
-            event
-                .payload
-                .get("task_id")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            event
-                .payload
-                .get("taskId")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
+    event.task_id.as_ref().map(ToString::to_string).or_else(|| {
+        event
+            .payload
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+    })
 }
 
 fn event_mission_id(event: &EventEnvelope) -> Option<String> {
@@ -2171,13 +2151,6 @@ fn event_mission_id(event: &EventEnvelope) -> Option<String> {
             event
                 .payload
                 .get("mission_id")
-                .and_then(|value| value.as_str())
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            event
-                .payload
-                .get("missionId")
                 .and_then(|value| value.as_str())
                 .map(ToString::to_string)
         })
@@ -2348,10 +2321,7 @@ fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
 /// payload 是 camelCase 序列化的 `UsageCallRecordInput` 或压力快照；event bus
 /// 只保留事件中已经给出的 provider 锚点、预测 token 和模型身份，不推导窗口或告警级别。
 fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeUsageObservation> {
-    if matches!(
-        event.event_type.as_str(),
-        "session.context.pressure.updated" | "session.context.usage.updated"
-    ) {
+    if event.event_type == "session.context.pressure.updated" {
         return pressure_observation_from_payload(&event.payload, Some(event.occurred_at));
     }
     usage_observation_from_payload(&event.event_type, &event.payload)
@@ -2370,12 +2340,7 @@ fn pressure_observation_from_payload(
     }
     let projected_request_tokens = payload
         .get("projected_request_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            payload
-                .get("token_used")
-                .and_then(serde_json::Value::as_u64)
-        })?;
+        .and_then(serde_json::Value::as_u64)?;
     if projected_request_tokens == 0 {
         return None;
     }
@@ -2385,18 +2350,12 @@ fn pressure_observation_from_payload(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
     Some(SessionRuntimeUsageObservation {
-        context_window_tokens: payload
-            .get("token_used")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(projected_request_tokens),
         provider_context_tokens: payload
             .get("provider_context_tokens")
             .and_then(serde_json::Value::as_u64),
         projected_request_tokens,
         context_window_limit_tokens: payload
-            .get("context_window_tokens")
-            .or_else(|| payload.get("context_window_limit_tokens"))
-            .or_else(|| payload.get("token_limit"))
+            .get("context_window_limit_tokens")
             .and_then(serde_json::Value::as_u64),
         model_provider: payload
             .get("model_provider")
@@ -2420,7 +2379,6 @@ fn pressure_observation_from_payload(
             .and_then(serde_json::Value::as_u64),
         pressure_level: payload
             .get("pressure_level")
-            .or_else(|| payload.get("warning_level"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         checkpoint_generation: payload
@@ -2429,13 +2387,11 @@ fn pressure_observation_from_payload(
         resolved_model,
         observed_at: payload
             .get("observed_at")
-            .or_else(|| payload.get("updated_at"))
             .and_then(serde_json::Value::as_u64)
             .map(UtcMillis)
             .or(fallback_observed_at),
         measurement: payload
             .get("measurement")
-            .or_else(|| payload.get("accuracy"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         phase: payload
@@ -2444,17 +2400,14 @@ fn pressure_observation_from_payload(
             .map(str::to_string),
         thread_id: payload
             .get("thread_id")
-            .or_else(|| payload.get("threadId"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         turn_id: payload
             .get("turn_id")
-            .or_else(|| payload.get("turnId"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         call_id: payload
             .get("call_id")
-            .or_else(|| payload.get("callId"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
     })
@@ -2512,10 +2465,6 @@ fn context_compaction_from_event(
             .and_then(serde_json::Value::as_u64),
         context_window_tokens: payload
             .get("context_window_limit_tokens")
-            .or_else(|| payload.get("context_window_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        token_limit: payload
-            .get("token_limit")
             .and_then(serde_json::Value::as_u64),
         threshold_tokens: payload
             .get("threshold_tokens")
@@ -2554,19 +2503,12 @@ fn usage_observation_from_payload(
             return None;
         }
         return Some(SessionRuntimeUsageObservation {
-            context_window_tokens: payload
-                .get("request_token_estimate")
-                .and_then(serde_json::Value::as_u64)?,
             provider_context_tokens: None,
             projected_request_tokens: payload
-                .get("projected_request_tokens")
-                .or_else(|| payload.get("request_token_estimate"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
+                .get("request_token_estimate")
+                .and_then(serde_json::Value::as_u64)?,
             context_window_limit_tokens: payload
                 .get("context_window_limit_tokens")
-                .or_else(|| payload.get("context_window_tokens"))
-                .or_else(|| payload.get("token_limit"))
                 .and_then(serde_json::Value::as_u64),
             model_provider: payload
                 .get("model_provider")
@@ -2584,11 +2526,9 @@ fn usage_observation_from_payload(
                 .and_then(serde_json::Value::as_u64),
             proactive_threshold_tokens: payload
                 .get("proactive_threshold_tokens")
-                .or_else(|| payload.get("threshold_tokens"))
                 .and_then(serde_json::Value::as_u64),
             hard_request_limit_tokens: payload
                 .get("hard_request_limit_tokens")
-                .or_else(|| payload.get("token_limit"))
                 .and_then(serde_json::Value::as_u64),
             pressure_level: payload
                 .get("pressure_level")
@@ -2633,8 +2573,8 @@ fn usage_observation_from_payload(
     }
     let usage = payload.get("usage")?;
     let usage = serde_json::from_value::<UsageTokenInput>(usage.clone()).ok()?;
-    let context_window_tokens = provider_context_tokens_from_usage(&usage);
-    if context_window_tokens == 0 {
+    let provider_context_tokens = provider_context_tokens_from_usage(&usage);
+    if provider_context_tokens == 0 {
         return None;
     }
     let resolved_model = payload
@@ -2647,9 +2587,8 @@ fn usage_observation_from_payload(
         .and_then(serde_json::Value::as_u64)
         .map(UtcMillis);
     Some(SessionRuntimeUsageObservation {
-        context_window_tokens,
-        provider_context_tokens: Some(context_window_tokens),
-        projected_request_tokens: context_window_tokens,
+        provider_context_tokens: Some(provider_context_tokens),
+        projected_request_tokens: provider_context_tokens,
         context_window_limit_tokens: payload
             .get("contextWindowTokens")
             .and_then(serde_json::Value::as_u64),
@@ -3447,7 +3386,7 @@ mod tests {
 
         // 当前上下文只统计 provider 的输入锚点；completion 不属于下一请求的上下文，
         // 已计入 input 的 cache read 也不能重复累加。
-        assert_eq!(observation.context_window_tokens, 12_000);
+        assert_eq!(observation.projected_request_tokens, 12_000);
         assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_000)));
         // event-bus 不计算窗口/告警,budget 留给 magi-api 装配。
@@ -3458,13 +3397,13 @@ mod tests {
     fn live_context_usage_event_updates_session_observation_before_turn_completion() {
         let mut context_event = EventEnvelope::domain(
             EventId::new("event-live-context-usage"),
-            "session.context.usage.updated",
+            "session.context.pressure.updated",
             json!({
-                "token_used": 24_000,
+                "projected_request_tokens": 24_000,
                 "resolved_model": "gpt-5-codex",
-                "accuracy": "estimated",
+                "measurement": "estimated",
                 "phase": "streaming",
-                "updated_at": 1_700_000_000_100_u64
+                "observed_at": 1_700_000_000_100_u64
             }),
         )
         .with_context(EventContext {
@@ -3481,7 +3420,7 @@ mod tests {
             .find(|entry| entry.session_id == "session-live-context")
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("live context observation should exist");
-        assert_eq!(observation.context_window_tokens, 24_000);
+        assert_eq!(observation.projected_request_tokens, 24_000);
         assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_100)));
         assert_eq!(observation.measurement.as_deref(), Some("estimated"));
@@ -3520,7 +3459,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("usage observation should be recorded");
 
-        assert_eq!(observation.context_window_tokens, 12_000);
+        assert_eq!(observation.projected_request_tokens, 12_000);
     }
 
     #[test]
@@ -3557,7 +3496,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("Anthropic cache usage should be recorded");
 
-        assert_eq!(observation.context_window_tokens, 5_800);
+        assert_eq!(observation.projected_request_tokens, 5_800);
     }
 
     #[test]
@@ -3573,8 +3512,7 @@ mod tests {
                 "original_token_estimate": 180_000,
                 "compacted_token_estimate": 36_000,
                 "request_token_estimate": 48_000,
-                "context_window_tokens": 245_000,
-                "token_limit": 272_000,
+                "context_window_limit_tokens": 245_000,
                 "threshold_tokens": 244_800,
                 "resolved_model": "gpt-5-codex",
                 "thread_scope": "mainline",
@@ -3604,7 +3542,6 @@ mod tests {
         assert_eq!(compaction.compacted_token_estimate, 36_000);
         assert_eq!(compaction.request_token_estimate, Some(48_000));
         assert_eq!(compaction.context_window_tokens, Some(245_000));
-        assert_eq!(compaction.token_limit, Some(272_000));
         assert_eq!(compaction.threshold_tokens, Some(244_800));
         assert_eq!(compaction.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(compaction.compacted_at, Some(UtcMillis(1_700_000_000_002)));
@@ -3615,7 +3552,7 @@ mod tests {
             .find(|entry| entry.session_id == "session-compacted")
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("compaction should immediately update context usage");
-        assert_eq!(observation.context_window_tokens, 48_000);
+        assert_eq!(observation.projected_request_tokens, 48_000);
         assert_eq!(observation.measurement.as_deref(), Some("estimated"));
         assert_eq!(observation.phase.as_deref(), Some("compacted"));
     }
@@ -3702,7 +3639,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("orchestrator usage observation should be retained");
 
-        assert_eq!(observation.context_window_tokens, 20_000);
+        assert_eq!(observation.projected_request_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 
@@ -3774,7 +3711,7 @@ mod tests {
             .get("session-a")
             .expect("session-a observation should be present");
         // timestamp 700 wins；上下文压力只取 20_000 input，不混入 completion token。
-        assert_eq!(observation.context_window_tokens, 20_000);
+        assert_eq!(observation.projected_request_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 
@@ -3790,7 +3727,10 @@ mod tests {
             let single = latest_usage_observation_for_session(&entries, session_id)
                 .expect("session should have an observation");
             let expected = full.get(session_id).expect("full replay has the session");
-            assert_eq!(single.context_window_tokens, expected.context_window_tokens);
+            assert_eq!(
+                single.projected_request_tokens,
+                expected.projected_request_tokens
+            );
             assert_eq!(single.observed_at, expected.observed_at);
         }
         assert!(latest_usage_observation_for_session(&entries, "session-missing").is_none());
@@ -3829,7 +3769,7 @@ mod tests {
         let observation = observations
             .get("session-compaction-ledger")
             .expect("compaction estimate should survive ledger restore");
-        assert_eq!(observation.context_window_tokens, 7_200);
+        assert_eq!(observation.projected_request_tokens, 7_200);
         assert_eq!(observation.measurement.as_deref(), Some("estimated"));
         assert_eq!(observation.phase.as_deref(), Some("compacted"));
     }
@@ -3846,7 +3786,7 @@ mod tests {
             .get("session-a")
             .expect("session-a observation should be present");
 
-        assert_eq!(observation.context_window_tokens, 7_000);
+        assert_eq!(observation.projected_request_tokens, 7_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(1_783_502_851_661)));
     }
 
@@ -3866,7 +3806,7 @@ mod tests {
             .get("session-a")
             .expect("orchestrator observation should be present");
 
-        assert_eq!(observation.context_window_tokens, 20_000);
+        assert_eq!(observation.projected_request_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 }

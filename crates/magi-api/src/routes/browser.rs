@@ -1191,8 +1191,8 @@ async fn create_session(
     let workspace_id = scope.workspace_id();
     ensure_browser_ui_ready(&state)?;
 
-    // Browser Session 与 Magi Session 同生命周期。桌面端长期运行时，旧版本或
-    // 异常退出可能留下不再属于 SessionStore 的逻辑 Tab；在新建浏览器会话前
+    // Browser Session 与 Magi Session 同生命周期。桌面端长期运行时，异常退出
+    // 可能留下不再属于 SessionStore 的逻辑 Tab；在新建浏览器会话前
     // 先执行一次权威收口，避免这些孤儿资源继续占用全局页面容量。
     let reconciled_browser_sessions = state.reconcile_browser_sessions_with_session_store()?;
     if reconciled_browser_sessions > 0 {
@@ -1418,7 +1418,7 @@ fn ensure_app_home_tab(
         if existing.lifecycle != BrowserTabLifecycle::Closed {
             return Ok(existing);
         }
-        // 应用级主页使用固定逻辑 id。清理或旧版本恢复可能留下 Closed 行，
+        // 应用级主页使用固定逻辑 id。孤儿清理或异常退出后的恢复可能留下 Closed 行，
         // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
         // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
         // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。

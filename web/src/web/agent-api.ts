@@ -43,24 +43,10 @@ import {
 
 
 export const RUNTIME_BASE_URL_STORAGE_KEY = 'magi-runtime-base-url';
-const LEGACY_AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
 const AGENT_PROBE_TIMEOUT_MS = 1500;
 let cachedWorkspaceSummaries: AgentWorkspaceSummary[] = [];
 
 export const RUNTIME_CONNECTION_EVENT = 'magi-runtime-connection';
-
-function clearLegacyAgentRuntimeStorage(): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-  try {
-    window.localStorage.removeItem(LEGACY_AGENT_BASE_URL_STORAGE_KEY);
-  } catch (error) {
-    console.warn(`[agent-api] 清理旧运行态 localStorage 失败(${LEGACY_AGENT_BASE_URL_STORAGE_KEY})`, error);
-  }
-}
-
-clearLegacyAgentRuntimeStorage();
 
 export interface AgentConnectionEventDetail {
   status: 'connected' | 'recovering';
@@ -200,12 +186,10 @@ function normalizeSettingsSectionConfig(value: unknown): Record<string, unknown>
 }
 
 function normalizeMcpServerConfig(server: Record<string, unknown>): Record<string, unknown> {
-  const serverId = typeof server.id === 'string' && server.id.trim()
-    ? server.id.trim()
-    : (typeof server.serverId === 'string' ? server.serverId.trim() : '');
+  const serverId = typeof server.id === 'string' ? server.id.trim() : '';
   return {
     ...server,
-    ...(serverId ? { id: serverId, serverId } : {}),
+    ...(serverId ? { id: serverId } : {}),
   };
 }
 
@@ -3561,7 +3545,7 @@ export async function addAgentMcpServer(server: Record<string, unknown>): Promis
 export async function updateAgentMcpServer(serverId: string, updates: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postGlobalJson<Record<string, unknown>>(
     '/api/settings/mcp/update',
-    normalizeMcpServerConfig({ ...updates, id: serverId, serverId }),
+    normalizeMcpServerConfig({ ...updates, id: serverId }),
     'update mcp server',
   );
 }
@@ -3802,7 +3786,7 @@ export interface McpServerToken {
   revokedAtMs: number | null;
   lastUsedAtMs: number | null;
   active: boolean;
-  /** 是否可以重新查看原文（旧版本创建的令牌只能重新生成）。 */
+  /** 是否可以重新查看原文（没有保存原文的令牌只能重新生成）。 */
   hasSecret: boolean;
 }
 

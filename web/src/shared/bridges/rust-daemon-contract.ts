@@ -210,7 +210,6 @@ interface RustSessionRuntimeSummary {
 }
 
 interface RustSessionRuntimeUsageObservation {
-  context_window_tokens?: number;
   provider_context_tokens?: number | null;
   projected_request_tokens?: number;
   context_window_limit_tokens?: number | null;
@@ -247,7 +246,6 @@ interface RustSessionRuntimeContextCompaction {
   original_token_estimate?: number;
   compacted_token_estimate?: number;
   context_window_tokens?: number | null;
-  token_limit?: number | null;
   threshold_tokens?: number | null;
   resolved_model?: string | null;
   compacted_at?: number | null;
@@ -583,9 +581,6 @@ function normalizeRuntimeUsageObservation(raw: unknown): RustSessionRuntimeUsage
   const record = normalizeObjectRecord(raw);
   if (!record) return undefined;
   return {
-    context_window_tokens: typeof record.context_window_tokens === 'number'
-      ? Math.floor(record.context_window_tokens)
-      : undefined,
     provider_context_tokens: typeof record.provider_context_tokens === 'number'
       ? Math.floor(record.provider_context_tokens)
       : undefined,
@@ -651,7 +646,6 @@ function normalizeRuntimeContextCompaction(raw: unknown): RustSessionRuntimeCont
     context_window_tokens: typeof record.context_window_tokens === 'number'
       ? Math.floor(record.context_window_tokens)
       : undefined,
-    token_limit: typeof record.token_limit === 'number' ? Math.floor(record.token_limit) : undefined,
     threshold_tokens: typeof record.threshold_tokens === 'number'
       ? Math.floor(record.threshold_tokens)
       : undefined,

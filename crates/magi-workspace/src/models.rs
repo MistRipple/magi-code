@@ -11,8 +11,7 @@ pub struct WorkspaceRecord {
     pub workspace_id: WorkspaceId,
     pub name: Option<String>,
     pub root_path: AbsolutePath,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_path_ref: Option<String>,
+    pub root_path_ref: String,
     pub worktree_root: Option<AbsolutePath>,
     pub status: WorkspaceLifecycleStatus,
     pub created_at: UtcMillis,
@@ -21,23 +20,9 @@ pub struct WorkspaceRecord {
 
 impl WorkspaceRecord {
     pub fn native_root_path(&self) -> PathBuf {
-        self.root_path_ref
-            .as_deref()
-            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+        magi_core::HostPath::from_path_ref(&self.root_path_ref)
             .map(magi_core::HostPath::into_path_buf)
-            .unwrap_or_else(|| PathBuf::from(self.root_path.as_str()))
-    }
-
-    pub(crate) fn normalize_persisted_host_path(&mut self) {
-        let host_path = self
-            .root_path_ref
-            .as_deref()
-            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
-            .unwrap_or_else(|| {
-                magi_core::HostPath::from_path(PathBuf::from(self.root_path.as_str()))
-            });
-        self.root_path = AbsolutePath::new(host_path.display_string());
-        self.root_path_ref = Some(host_path.to_path_ref().as_str().to_string());
+            .unwrap_or_else(|_| PathBuf::from(self.root_path.as_str()))
     }
 }
 
@@ -297,12 +282,9 @@ pub struct WorkspaceDurableState {
 
 impl WorkspaceStoreState {
     pub fn from_persisted_parts(
-        mut durable_state: WorkspaceDurableState,
+        durable_state: WorkspaceDurableState,
         recovery_sidecar_store: WorkspaceRecoverySidecarStoreState,
     ) -> Self {
-        for workspace in &mut durable_state.workspaces {
-            workspace.normalize_persisted_host_path();
-        }
         Self {
             active_workspace_id: durable_state.active_workspace_id,
             workspaces: durable_state.workspaces,

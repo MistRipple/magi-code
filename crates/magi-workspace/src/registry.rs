@@ -150,7 +150,7 @@ impl WorkspaceStore {
         workspace_id: WorkspaceId,
         root_path: AbsolutePath,
     ) -> DomainResult<WorkspaceRecord> {
-        self.register_with_path_ref(workspace_id, root_path, None)
+        self.register_native_path(workspace_id, PathBuf::from(root_path.as_str()))
     }
 
     pub fn register_native_path(
@@ -161,14 +161,14 @@ impl WorkspaceStore {
         let host_path = magi_core::HostPath::from_path(root_path);
         let display_path = AbsolutePath::new(host_path.display_string());
         let root_path_ref = host_path.to_path_ref().as_str().to_string();
-        self.register_with_path_ref(workspace_id, display_path, Some(root_path_ref))
+        self.register_with_path_ref(workspace_id, display_path, root_path_ref)
     }
 
     fn register_with_path_ref(
         &self,
         workspace_id: WorkspaceId,
         root_path: AbsolutePath,
-        root_path_ref: Option<String>,
+        root_path_ref: String,
     ) -> DomainResult<WorkspaceRecord> {
         let mut state = self.write_state();
         if state
@@ -180,11 +180,9 @@ impl WorkspaceStore {
                 entity: "workspace",
             });
         }
-        let native_root_path = root_path_ref
-            .as_deref()
-            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+        let native_root_path = magi_core::HostPath::from_path_ref(&root_path_ref)
             .map(magi_core::HostPath::into_path_buf)
-            .unwrap_or_else(|| PathBuf::from(root_path.as_str()));
+            .unwrap_or_else(|_| PathBuf::from(root_path.as_str()));
         if state
             .workspaces
             .iter()
@@ -326,43 +324,7 @@ mod tests {
             .register_native_path(workspace_id, root.clone())
             .expect("native workspace should register");
 
-        assert!(
-            workspace
-                .root_path_ref
-                .as_deref()
-                .is_some_and(|value| value.starts_with("mhp1:"))
-        );
-        assert_eq!(workspace.native_root_path(), root);
-    }
-
-    #[test]
-    fn persisted_legacy_workspace_is_upgraded_to_authoritative_path_ref() {
-        let store = WorkspaceStore::new();
-        let workspace_id = WorkspaceId::new("workspace-legacy-path");
-        let root = std::env::temp_dir().join("magi-legacy-workspace");
-        store
-            .register_native_path(workspace_id.clone(), root.clone())
-            .expect("native workspace should register");
-
-        let mut durable_state = store.durable_state();
-        durable_state.workspaces[0].root_path_ref = None;
-        let restored = WorkspaceStore::from_persisted_parts(
-            durable_state,
-            WorkspaceRecoverySidecarStoreState::default(),
-        );
-        let workspace = restored
-            .workspaces()
-            .into_iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .expect("legacy workspace should restore");
-
-        assert!(
-            workspace
-                .root_path_ref
-                .as_deref()
-                .is_some_and(|value| value.starts_with("mhp1:")),
-            "legacy workspace must be upgraded before tool execution"
-        );
+        assert!(workspace.root_path_ref.starts_with("mhp1:"));
         assert_eq!(workspace.native_root_path(), root);
     }
 
@@ -630,6 +592,7 @@ mod tests {
                 "workspaceId": "workspace-canonical-record",
                 "name": "canonical workspace",
                 "rootPath": "/Users/xie/code/canonical",
+                "rootPathRef": "mhp1:canonical",
                 "worktreeRoot": null,
                 "status": "Registered",
                 "createdAt": 1,

@@ -16,11 +16,7 @@ use magi_event_bus::{
     AuditUsageLedgerEntry, EventContext, EventEnvelope, USAGE_STATS_RESET_EVENT_TYPE,
 };
 use magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION;
-use magi_usage_authority::{
-    ExecutionBindingIdentity, LlmConfig, UrlMode, UsageAuthority, UsageCallIdentity,
-    UsageCallRecordInput, UsageCallStatus, UsageModelSnapshot, UsagePhase, UsageSourceRole,
-    UsageTokenInput, UsageTotals,
-};
+use magi_usage_authority::{UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -33,7 +29,7 @@ use crate::{
     model_config::{
         DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW,
         NormalizedModelConfig, VISION_MODEL_SECTION, builtin_text_model_rule_catalog,
-        merge_orchestrator_session_override, reject_deprecated_model_config_fields,
+        merge_orchestrator_session_override, reject_unknown_model_config_fields,
         resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
         validate_vision_model_settings,
     },
@@ -67,7 +63,7 @@ fn model_settings_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
     let config = scoped_settings_section_request(request)?;
-    reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
+    reject_unknown_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     Ok(config)
 }
@@ -95,7 +91,6 @@ pub(super) fn orchestrator_session_override_request(
     request: &serde_json::Value,
 ) -> Result<Value, ApiError> {
     let config = unwrap_settings_section_request(request)?;
-    reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
             "会话主模型配置必须是对象".to_string(),
@@ -469,31 +464,40 @@ fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Op
         .map(ToOwned::to_owned)
 }
 
-fn reject_deprecated_scope_query_fields(query: &HashMap<String, String>) -> Result<(), ApiError> {
-    for key in [
-        "session_id",
-        "workspace_id",
-        "workspace_path",
-        "access_profile",
-    ] {
-        if query.contains_key(key) {
-            return Err(ApiError::InvalidInput(format!(
-                "{key} 已废弃，请使用 camelCase 查询字段"
-            )));
-        }
+/// `GET /settings/bootstrap` 的查询参数 schema；其他查询字段一律拒绝。
+const SETTINGS_BOOTSTRAP_QUERY_FIELDS: &[&str] = &[
+    "scope",
+    "sessionId",
+    "workspaceId",
+    "workspacePath",
+    "accessProfile",
+    "bootstrapScope",
+];
+
+fn reject_unknown_settings_bootstrap_query_fields(
+    query: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    if let Some(key) = query
+        .keys()
+        .find(|key| !SETTINGS_BOOTSTRAP_QUERY_FIELDS.contains(&key.as_str()))
+    {
+        return Err(ApiError::InvalidInput(format!("设置查询不支持字段 {key}")));
     }
     Ok(())
 }
 
-fn reject_deprecated_scope_body_fields(request: &Value) -> Result<(), ApiError> {
-    for key in ["session_id", "workspace_id", "workspace_path"] {
-        if request.get(key).is_some() {
-            return Err(ApiError::InvalidInput(format!(
-                "{key} 已废弃，请使用 camelCase scope 字段"
-            )));
-        }
-    }
-    Ok(())
+/// `POST /settings/orchestrator/session/save` 的请求体 schema。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OrchestratorSessionConfigRequest {
+    scope: crate::dto::SessionScopeKindDto,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    config: Value,
 }
 
 fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile {
@@ -514,6 +518,7 @@ struct FetchModelsRequest {
 fn parse_fetch_models_config(
     request: FetchModelsRequest,
 ) -> Result<(NormalizedModelConfig, String), ApiError> {
+    reject_unknown_model_config_fields(&request.config).map_err(ApiError::InvalidInput)?;
     let config = NormalizedModelConfig::from_settings_value(&request.config)
         .map_err(ApiError::InvalidInput)?;
     config.require_base_url().map_err(ApiError::InvalidInput)?;
@@ -569,6 +574,7 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request)?;
+    reject_unknown_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let normalized =
         NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
@@ -856,10 +862,6 @@ fn is_chatgpt_web_engine(entry: &Value) -> bool {
 }
 
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
-    // 注册表里只有 HTTP 引擎：Web 条目（含旧版本发现写入的）一律丢弃，读不出来就当不存在。
-    if is_chatgpt_web_engine(entry) {
-        return None;
-    }
     let engine_id = entry
         .get("id")
         .and_then(Value::as_str)
@@ -1107,7 +1109,7 @@ async fn settings_bootstrap(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_deprecated_scope_query_fields(&query)?;
+    reject_unknown_settings_bootstrap_query_fields(&query)?;
     let hydrate_mcp_servers = query
         .get("bootstrapScope")
         .map(|value| value.trim())
@@ -1281,7 +1283,7 @@ async fn save_worker_config(
         (worker_id, worker_config)
     {
         let worker_config = without_scope_binding_fields(worker_config.clone());
-        reject_deprecated_model_config_fields(&worker_config).map_err(ApiError::InvalidInput)?;
+        reject_unknown_model_config_fields(&worker_config).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(&worker_config)
             .map_err(ApiError::InvalidInput)?;
         let mut workers = state
@@ -1297,7 +1299,15 @@ async fn save_worker_config(
             .map_err(settings_persistence_error)?;
         (Some(worker_id.to_string()), worker_config)
     } else {
-        let workers = model_settings_section_request(&request)?;
+        let workers = scoped_settings_section_request(&request)?;
+        let Some(worker_configs) = workers.as_object() else {
+            return Err(ApiError::InvalidInput("workers 配置必须是对象".to_string()));
+        };
+        for worker_config in worker_configs.values() {
+            reject_unknown_model_config_fields(worker_config).map_err(ApiError::InvalidInput)?;
+            NormalizedModelConfig::from_settings_value(worker_config)
+                .map_err(ApiError::InvalidInput)?;
+        }
         state
             .settings_store
             .set_section("workers", workers.clone())
@@ -1349,31 +1359,22 @@ async fn save_orchestrator_session_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_deprecated_scope_body_fields(&request)?;
-    let session_id = request.get("sessionId").and_then(Value::as_str);
-    let requested_scope = serde_json::from_value::<crate::dto::SessionScopeKindDto>(
-        request.get("scope").cloned().unwrap_or(Value::Null),
-    )
-    .map_err(ApiError::invalid_request_body)?;
-    let workspace_id = request.get("workspaceId").and_then(Value::as_str);
-    let workspace_path = request.get("workspacePath").and_then(Value::as_str);
+    let request = serde_json::from_value::<OrchestratorSessionConfigRequest>(request)
+        .map_err(ApiError::invalid_request_body)?;
     let scope = session_scope::require_session_request_scope(
         &state,
-        session_id,
-        requested_scope,
-        workspace_id,
-        workspace_path,
+        request.session_id.as_deref(),
+        request.scope,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
     )?;
-    let override_config = save_orchestrator_session_override_for_session(
-        &state,
-        &scope.session_id,
-        request.get("config").unwrap_or(&request),
-    )?
-    .unwrap_or_else(|| {
-        state
-            .settings_store
-            .get_session_section(&scope.session_id, "orchestrator")
-    });
+    let override_config =
+        save_orchestrator_session_override_for_session(&state, &scope.session_id, &request.config)?
+            .unwrap_or_else(|| {
+                state
+                    .settings_store
+                    .get_session_section(&scope.session_id, "orchestrator")
+            });
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
     strip_orchestrator_session_owned_fields(&mut effective_config);
@@ -1684,8 +1685,8 @@ fn role_error(error: magi_agent_role::AgentRoleError) -> ApiError {
     }
 }
 
-fn strict_string_field(value: &Value, names: &[&str], label: &str) -> Result<String, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+fn strict_string_field(value: &Value, name: &str, label: &str) -> Result<String, ApiError> {
+    let Some(raw) = value.get(name) else {
         return Ok(String::new());
     };
     let Some(raw) = raw.as_str() else {
@@ -1696,10 +1697,10 @@ fn strict_string_field(value: &Value, names: &[&str], label: &str) -> Result<Str
 
 fn strict_string_list_field(
     value: &Value,
-    names: &[&str],
+    name: &str,
     label: &str,
 ) -> Result<Vec<String>, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+    let Some(raw) = value.get(name) else {
         return Ok(Vec::new());
     };
     let Some(items) = raw.as_array() else {
@@ -1707,13 +1708,9 @@ fn strict_string_list_field(
     };
     let mut values = Vec::with_capacity(items.len());
     for item in items {
-        let value = if let Some(value) = item.as_str() {
-            value.trim().to_string()
-        } else if let Some(value) = item.get("id").and_then(Value::as_str) {
-            value.trim().to_string()
-        } else {
+        let Some(value) = item.as_str().map(|value| value.trim().to_string()) else {
             return Err(ApiError::InvalidInput(format!(
-                "{label} 的每个元素必须是字符串或带 id 的能力对象"
+                "{label} 的每个元素必须是字符串"
             )));
         };
         if !value.is_empty() {
@@ -1723,8 +1720,8 @@ fn strict_string_list_field(
     Ok(values)
 }
 
-fn strict_object_field(value: &Value, names: &[&str], label: &str) -> Result<Value, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+fn strict_object_field(value: &Value, name: &str, label: &str) -> Result<Value, ApiError> {
+    let Some(raw) = value.get(name) else {
         return Ok(json!({}));
     };
     if !raw.is_object() {
@@ -1735,10 +1732,10 @@ fn strict_object_field(value: &Value, names: &[&str], label: &str) -> Result<Val
 
 fn strict_optional_u32_field(
     value: &Value,
-    names: &[&str],
+    name: &str,
     label: &str,
 ) -> Result<Option<u32>, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+    let Some(raw) = value.get(name) else {
         return Ok(None);
     };
     if raw.is_null() {
@@ -1754,13 +1751,8 @@ fn strict_optional_u32_field(
     Ok(Some(number))
 }
 
-fn strict_u32_field(
-    value: &Value,
-    names: &[&str],
-    default: u32,
-    label: &str,
-) -> Result<u32, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+fn strict_u32_field(value: &Value, name: &str, default: u32, label: &str) -> Result<u32, ApiError> {
+    let Some(raw) = value.get(name) else {
         return Ok(default);
     };
     let Some(number) = raw.as_u64() else {
@@ -1769,13 +1761,8 @@ fn strict_u32_field(
     u32::try_from(number).map_err(|_| ApiError::InvalidInput(format!("{label} 超出允许范围")))
 }
 
-fn strict_u64_field(
-    value: &Value,
-    names: &[&str],
-    default: u64,
-    label: &str,
-) -> Result<u64, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+fn strict_u64_field(value: &Value, name: &str, default: u64, label: &str) -> Result<u64, ApiError> {
+    let Some(raw) = value.get(name) else {
         return Ok(default);
     };
     raw.as_u64()
@@ -1784,10 +1771,10 @@ fn strict_u64_field(
 
 fn strict_optional_u64_field(
     value: &Value,
-    names: &[&str],
+    name: &str,
     label: &str,
 ) -> Result<Option<u64>, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+    let Some(raw) = value.get(name) else {
         return Ok(None);
     };
     if raw.is_null() {
@@ -1800,10 +1787,10 @@ fn strict_optional_u64_field(
 
 fn strict_optional_string_field(
     value: &Value,
-    names: &[&str],
+    name: &str,
     label: &str,
 ) -> Result<Option<String>, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+    let Some(raw) = value.get(name) else {
         return Ok(None);
     };
     if raw.is_null() {
@@ -1817,11 +1804,11 @@ fn strict_optional_string_field(
 
 fn strict_bool_field(
     value: &Value,
-    names: &[&str],
+    name: &str,
     default: bool,
     label: &str,
 ) -> Result<bool, ApiError> {
-    let Some(raw) = names.iter().find_map(|name| value.get(*name)) else {
+    let Some(raw) = value.get(name) else {
         return Ok(default);
     };
     raw.as_bool()
@@ -1829,65 +1816,47 @@ fn strict_bool_field(
 }
 
 fn role_from_value(value: &Value) -> Result<magi_agent_role::AgentRole, ApiError> {
-    let id = strict_string_field(value, &["id", "templateId", "template_id"], "角色 id")?;
+    let id = strict_string_field(value, "id", "角色 id")?;
     let supported_kinds_value = value
         .get("supportedKinds")
-        .or_else(|| value.get("supported_kinds"))
         .cloned()
         .unwrap_or_else(|| json!(["local_agent"]));
     let supported_kinds = serde_json::from_value(supported_kinds_value)
         .map_err(|error| ApiError::InvalidInput(format!("supportedKinds 无效: {error}")))?;
-    let profile = strict_object_field(value, &["profile"], "profile")?;
-    let default_ui = strict_object_field(value, &["defaultUI", "default_ui"], "defaultUI")?;
-    let parallelism_limit = strict_optional_u32_field(
-        value,
-        &["parallelismLimit", "parallelism_limit"],
-        "parallelismLimit",
-    )?;
-    let coordinator_mode = strict_bool_field(
-        value,
-        &["coordinatorMode", "coordinator_mode"],
-        false,
-        "coordinatorMode",
-    )?;
-    let version = strict_u32_field(value, &["version"], 1, "version")?;
-    let role_revision =
-        strict_u64_field(value, &["roleRevision", "role_revision"], 1, "roleRevision")?;
+    let profile = strict_object_field(value, "profile", "profile")?;
+    let default_ui = strict_object_field(value, "defaultUI", "defaultUI")?;
+    let parallelism_limit =
+        strict_optional_u32_field(value, "parallelismLimit", "parallelismLimit")?;
+    let coordinator_mode = strict_bool_field(value, "coordinatorMode", false, "coordinatorMode")?;
+    let version = strict_u32_field(value, "version", 1, "version")?;
+    let role_revision = strict_u64_field(value, "roleRevision", 1, "roleRevision")?;
     magi_agent_role::normalize_role(magi_agent_role::AgentRole {
         id,
-        system_prompt: strict_string_field(
-            value,
-            &["systemPrompt", "system_prompt"],
-            "systemPrompt",
-        )?,
-        display_name: strict_string_field(value, &["displayName", "display_name"], "displayName")?,
-        description: strict_string_field(value, &["description"], "description")?,
+        system_prompt: strict_string_field(value, "systemPrompt", "systemPrompt")?,
+        display_name: strict_string_field(value, "displayName", "displayName")?,
+        description: strict_string_field(value, "description", "description")?,
         supported_kinds,
         parallelism_limit,
         coordinator_mode,
         version,
         role_revision,
-        role: strict_string_field(&profile, &["role"], "profile.role")?,
-        focus: strict_string_list_field(&profile, &["focus"], "profile.focus")?,
-        constraints: strict_string_list_field(&profile, &["constraints"], "profile.constraints")?,
+        role: strict_string_field(&profile, "role", "profile.role")?,
+        focus: strict_string_list_field(&profile, "focus", "profile.focus")?,
+        constraints: strict_string_list_field(&profile, "constraints", "profile.constraints")?,
         output_preferences: strict_string_list_field(
             &profile,
-            &["outputPreferences", "output_preferences"],
+            "outputPreferences",
             "profile.outputPreferences",
         )?,
-        ownerships: strict_string_list_field(value, &["ownerships"], "ownerships")?,
+        ownerships: strict_string_list_field(value, "ownerships", "ownerships")?,
         insight_preferences: strict_string_list_field(
             value,
-            &["insightPreferences", "insight_preferences"],
+            "insightPreferences",
             "insightPreferences",
         )?,
-        capabilities: strict_string_list_field(value, &["capabilities"], "capabilities")?,
-        color_token: strict_string_field(
-            &default_ui,
-            &["colorToken", "color_token"],
-            "defaultUI.colorToken",
-        )?,
-        icon: strict_string_field(&default_ui, &["icon"], "defaultUI.icon")?,
+        capabilities: strict_string_list_field(value, "capabilities", "capabilities")?,
+        color_token: strict_string_field(&default_ui, "colorToken", "defaultUI.colorToken")?,
+        icon: strict_string_field(&default_ui, "icon", "defaultUI.icon")?,
     })
     .map_err(ApiError::InvalidInput)
 }
@@ -1914,13 +1883,12 @@ async fn upsert_role(
         .role_configuration_lock
         .lock()
         .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
-    let role_value = request.get("role").unwrap_or(&request);
+    let role_value = request
+        .get("role")
+        .ok_or_else(|| ApiError::InvalidInput("角色配置必须放在 role 字段中".to_string()))?;
     let role = role_from_value(role_value)?;
-    let expected = strict_optional_u64_field(
-        &request,
-        &["expectedRoleRevision", "expected_role_revision"],
-        "expectedRoleRevision",
-    )?;
+    let expected =
+        strict_optional_u64_field(&request, "expectedRoleRevision", "expectedRoleRevision")?;
     let saved = state
         .agent_role_registry
         .save_user_role(role, expected)
@@ -1936,7 +1904,7 @@ async fn delete_role(
         .role_configuration_lock
         .lock()
         .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
-    let role_id = strict_string_field(&request, &["templateId", "id"], "角色 ID")?;
+    let role_id = strict_string_field(&request, "templateId", "角色 ID")?;
     magi_agent_role::validate_role_id(&role_id).map_err(ApiError::InvalidInput)?;
     let role = state
         .agent_role_registry
@@ -1948,11 +1916,8 @@ async fn delete_role(
             role_id
         )));
     }
-    let expected = strict_optional_u64_field(
-        &request,
-        &["expectedRoleRevision", "expected_role_revision"],
-        "expectedRoleRevision",
-    )?;
+    let expected =
+        strict_optional_u64_field(&request, "expectedRoleRevision", "expectedRoleRevision")?;
     if expected != Some(role.role_revision) {
         return Err(ApiError::Conflict(format!(
             "角色 {} 已被其他窗口修改，请刷新后重试",
@@ -2168,7 +2133,7 @@ async fn import_role(
             "conflict 只支持 reject、overwrite、rename".to_string(),
         ));
     }
-    let new_id = strict_optional_string_field(&request, &["newId", "new_id"], "newId")?;
+    let new_id = strict_optional_string_field(&request, "newId", "newId")?;
     if conflict == "rename" {
         role.id = new_id
             .filter(|value| !value.is_empty())
@@ -2250,7 +2215,7 @@ async fn upsert_engine(
         ));
     }
     if let Some(llm) = request.get("llm") {
-        reject_deprecated_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
+        reject_unknown_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(llm).map_err(ApiError::InvalidInput)?;
     }
     let normalized = normalize_engine_entry(&request)
@@ -2493,18 +2458,6 @@ fn usage_authority_from_usage_entries(usage_entries: &[AuditUsageLedgerEntry]) -
     let entries =
         &usage_entries[usage_entries.partition_point(|entry| entry.sequence <= reset_through)..];
     let mut authority = UsageAuthority::new();
-    let mut recorded_image_call_ids = HashSet::new();
-    for entry in entries {
-        if entry.event_type != "model.usage.recorded" {
-            continue;
-        }
-        if let Ok(input) = serde_json::from_value::<UsageCallRecordInput>(entry.payload.clone())
-            && input.execution_binding.role == UsageSourceRole::ImageGeneration
-        {
-            recorded_image_call_ids.insert(input.call_identity.call_id);
-        }
-    }
-
     for entry in entries {
         if entry.event_type != "model.usage.recorded" {
             continue;
@@ -2527,98 +2480,7 @@ fn usage_authority_from_usage_entries(usage_entries: &[AuditUsageLedgerEntry]) -
         authority.append_call_record(input);
     }
 
-    for entry in entries {
-        let payload = &entry.payload;
-        let is_image_tool = entry.event_type == "tool.usage.recorded"
-            && payload
-                .get("tool_name")
-                .or_else(|| payload.get("toolName"))
-                .and_then(Value::as_str)
-                == Some("image_generate");
-        let succeeded = payload
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| {
-                status.eq_ignore_ascii_case("succeeded") || status.eq_ignore_ascii_case("success")
-            });
-        if !is_image_tool || !succeeded {
-            continue;
-        }
-        let Some(call_id) = payload
-            .get("tool_call_id")
-            .or_else(|| payload.get("toolCallId"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if recorded_image_call_ids.contains(call_id) {
-            continue;
-        }
-        let Some(session_id) = payload
-            .get("session_id")
-            .or_else(|| payload.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        authority.append_call_record(legacy_image_usage_record(
-            call_id,
-            session_id,
-            entry.occurred_at.0,
-        ));
-    }
     authority
-}
-
-fn legacy_image_usage_record(
-    call_id: &str,
-    session_id: &str,
-    timestamp: u64,
-) -> UsageCallRecordInput {
-    UsageCallRecordInput {
-        workspace_id: Some("all".to_string()),
-        session_id: session_id.to_string(),
-        turn_id: None,
-        dispatch_wave_id: None,
-        assignment_id: None,
-        event_id: Some(format!("legacy-image-model-usage:{call_id}")),
-        timestamp: Some(timestamp),
-        execution_binding: ExecutionBindingIdentity {
-            template_id: "imageGeneration".to_string(),
-            engine_id: "imageGeneration".to_string(),
-            binding_revision: 0,
-            role: UsageSourceRole::ImageGeneration,
-        },
-        model_config: LlmConfig {
-            provider: "legacy".to_string(),
-            model: "__legacy_image_generation__".to_string(),
-            base_url: "https://legacy-image-usage.invalid".to_string(),
-            api_key: None,
-            account_fingerprint: None,
-            url_mode: UrlMode::Full,
-            reasoning_effort: None,
-        },
-        call_identity: UsageCallIdentity {
-            call_id: call_id.to_string(),
-            parent_call_id: None,
-            source: UsageSourceRole::ImageGeneration,
-            phase: UsagePhase::Execution,
-        },
-        usage: UsageTokenInput {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: Some(0),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            cache_read_included_in_input: false,
-        },
-        status: UsageCallStatus::Success,
-        error_code: None,
-    }
 }
 
 fn usage_binding_item_json(
@@ -4020,7 +3882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_scope_rejects_deprecated_snake_case_fields() {
+    async fn settings_scope_rejects_fields_outside_schema() {
         let bootstrap_result = settings_bootstrap(
             State(test_state()),
             Query(HashMap::from([(
@@ -4029,36 +3891,23 @@ mod tests {
             )])),
         )
         .await;
-        assert_deprecated_scope_field_error(bootstrap_result, "session_id");
-
-        let access_profile_result = settings_bootstrap(
-            State(test_state()),
-            Query(HashMap::from([(
-                "access_profile".to_string(),
-                "full_access".to_string(),
-            )])),
-        )
-        .await;
-        assert_deprecated_scope_field_error(access_profile_result, "access_profile");
+        match bootstrap_result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains("session_id"), "{message}");
+            }
+            other => panic!("expected unknown query field error, got {other:?}"),
+        }
 
         let session_save_result = save_orchestrator_session_config(
             State(test_state()),
-            Json(json!({ "session_id": "session-old" })),
+            Json(json!({ "scope": "personal", "session_id": "session-old", "config": {} })),
         )
         .await;
-        assert_deprecated_scope_field_error(session_save_result, "session_id");
-    }
-
-    fn assert_deprecated_scope_field_error<T: std::fmt::Debug>(
-        result: Result<Json<T>, ApiError>,
-        expected_field: &str,
-    ) {
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert!(message.contains(expected_field), "{message}");
-                assert!(message.contains("已废弃"), "{message}");
+        match session_save_result {
+            Err(ApiError::InvalidRequestBody(message)) => {
+                assert!(message.contains("session_id"), "{message}");
             }
-            other => panic!("expected deprecated scope field error, got {other:?}"),
+            other => panic!("expected unknown body field error, got {other:?}"),
         }
     }
 
@@ -4113,80 +3962,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_bootstrap_removes_deprecated_model_provider_fields() {
-        let state = test_state();
-        state
-            .settings_store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "provider": "anthropic",
-                    "baseUrl": "https://api.anthropic.com",
-                    "model": "claude-sonnet-test",
-                    "urlMode": "standard"
-                }),
-            )
-            .unwrap();
-        state
-            .settings_store
-            .set_section(
-                "workers",
-                json!({
-                    "sonnet-worker": {
-                        "provider": "anthropic",
-                        "baseUrl": "https://api.anthropic.com",
-                        "model": "claude-worker-test",
-                        "urlMode": "standard"
-                    }
-                }),
-            )
-            .unwrap();
-        state
-            .settings_store
-            .set_section(
-                "engines",
-                json!([{
-                    "id": "sonnet-worker",
-                    "displayName": "Sonnet Worker",
-                    "llm": {
-                        "provider": "anthropic",
-                        "baseUrl": "https://api.anthropic.com",
-                        "model": "claude-worker-test",
-                        "urlMode": "standard"
-                    }
-                }]),
-            )
-            .unwrap();
-
-        let bootstrap = settings_bootstrap(
-            State(state),
-            Query(HashMap::from([(
-                "scope".to_string(),
-                "personal".to_string(),
-            )])),
-        )
-        .await
-        .expect("settings bootstrap should build")
-        .0;
-
-        assert!(bootstrap["orchestratorConfig"].get("provider").is_none());
-        assert!(
-            bootstrap["workerConfigs"]["sonnet-worker"]
-                .get("provider")
-                .is_none()
-        );
-        assert!(
-            bootstrap["registryEngines"][0]["llm"]
-                .get("provider")
-                .is_none()
-        );
-        assert_eq!(
-            bootstrap["workerConfigs"]["sonnet-worker"]["model"],
-            json!("claude-worker-test")
-        );
-    }
-
-    #[tokio::test]
     async fn settings_bootstrap_ignores_persisted_public_alias_sections() {
         let state = test_state();
         state
@@ -4196,8 +3971,8 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.current.example/v1",
                     "apiKey": "sk-current",
-                    "model": "current-main",
-                    "urlMode": "standard"
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
                 }),
             )
             .unwrap();
@@ -4280,7 +4055,7 @@ mod tests {
                 "workers",
                 json!({
                     "sonnet-worker": {
-                        "provider": "anthropic",
+                        "apiProtocol": "anthropic_messages",
                         "baseUrl": "https://api.anthropic.com",
                         "model": "claude-worker-test",
                         "urlMode": "standard"
@@ -4296,7 +4071,7 @@ mod tests {
                     "id": "sonnet-worker",
                     "displayName": "Sonnet Worker",
                     "llm": {
-                        "provider": "openai",
+                        "apiProtocol": "openai_chat",
                         "baseUrl": "https://api.openai.com",
                         "model": "stale-openai-model",
                         "urlMode": "standard"
@@ -4320,13 +4095,11 @@ mod tests {
             bootstrap["registryEngines"][0]["llm"]["model"],
             json!("claude-worker-test")
         );
-        assert!(
-            bootstrap["registryEngines"][0]["llm"]
-                .get("provider")
-                .is_none()
+        assert_eq!(
+            bootstrap["registryEngines"][0]["llm"]["apiProtocol"],
+            json!("anthropic_messages")
         );
         let persisted_engines = state.settings_store.get_section("engines");
-        assert!(persisted_engines[0]["llm"].get("provider").is_none());
         assert_eq!(
             persisted_engines[0]["llm"]["model"],
             json!("stale-openai-model")
@@ -4358,17 +4131,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_engine_entry_drops_web_engines_and_keeps_http_engines() {
-        // 注册表里只有 HTTP 引擎；Web 条目（含旧版本发现写入的）一律丢弃。
-        assert!(
-            normalize_engine_entry(&json!({
-                "id": "chatgpt-web/default",
-                "displayName": "GPT-5 (Web)",
-                "apiProtocol": "chatgpt_web",
-                "origin": { "kind": "web" }
-            }))
-            .is_none()
-        );
+    fn normalize_engine_entry_keeps_http_engines() {
         let http = normalize_engine_entry(&json!({
             "id": "engine-http",
             "displayName": "HTTP",
@@ -4937,16 +4700,18 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_filters_mcp_servers_without_id() {
         let state = test_state();
-        state.settings_store.set_section(
-            "mcpServers",
-            json!([
-                { "name": "broken", "command": "npx", "enabled": false },
-                { "server": { "serverId": "wrapped-server", "command": "npx", "enabled": false } },
-                { "id": "valid-server", "command": "npx", "enabled": false },
-                "invalid-entry"
-            ]),
-        )
-        .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "mcpServers",
+                json!([
+                    { "name": "broken", "command": "npx", "enabled": false },
+                    { "server": { "id": "wrapped-server", "command": "npx", "enabled": false } },
+                    { "id": "valid-server", "command": "npx", "enabled": false },
+                    "invalid-entry"
+                ]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(
             State(state),
@@ -4968,9 +4733,11 @@ mod tests {
                 .all(|server| server["id"].as_str().is_some_and(|id| !id.is_empty())),
             "bootstrap must not expose MCP server entries without id"
         );
-        assert!(servers.iter().any(|server| {
-            server["id"] == json!("valid-server") && server["serverId"] == json!("valid-server")
-        }));
+        assert!(
+            servers
+                .iter()
+                .any(|server| { server["id"] == json!("valid-server") })
+        );
         assert!(
             servers.iter().all(|server| {
                 server["enabled"] == json!(false)
@@ -5166,7 +4933,7 @@ mod tests {
     fn scoped_settings_section_request_strips_all_scope_binding_fields() {
         let cleaned = scoped_settings_section_request(&json!({
             "config": {
-                "provider": "openai",
+                "model": "gpt-test",
                 "workspaceId": "workspace-a",
                 "workspace_id": "workspace-b",
                 "workspacePath": "/tmp/a",
@@ -5177,7 +4944,7 @@ mod tests {
         }))
         .expect("config wrapper should be accepted");
 
-        assert_eq!(cleaned["provider"], json!("openai"));
+        assert_eq!(cleaned["model"], json!("gpt-test"));
         for key in [
             "workspaceId",
             "workspace_id",
@@ -5211,20 +4978,20 @@ mod tests {
     }
 
     #[test]
-    fn model_settings_section_request_rejects_deprecated_provider_field() {
+    fn model_settings_section_request_rejects_unknown_fields() {
         let error = model_settings_section_request(&json!({
             "config": {
-                "provider": "openai",
+                "unexpected": "openai",
                 "baseUrl": "https://api.example.com/v1",
                 "apiKey": "sk-test",
                 "model": "gpt-test"
             }
         }))
-        .expect_err("模型配置保存入口必须拒绝 provider 输入字段");
+        .expect_err("模型配置保存入口必须拒绝 schema 之外的字段");
 
         match error {
             ApiError::InvalidInput(message) => {
-                assert!(message.contains("provider"));
+                assert!(message.contains("unexpected"));
             }
             other => panic!("expected invalid input, got {other:?}"),
         }
@@ -5482,8 +5249,7 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
-                    "model": "global-main-model",
-                    "reasoningEffort": "medium"
+                    "apiProtocol": "openai_chat"
                 }),
             )
             .unwrap();
@@ -5573,8 +5339,7 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
-                    "model": "global-main-model",
-                    "reasoningEffort": "medium"
+                    "apiProtocol": "openai_chat"
                 }),
             )
             .unwrap();
@@ -5986,6 +5751,7 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://api.example.com/v1",
+                    "apiProtocol": "openai_chat",
                     "apiKey": "sk-global",
                     "urlMode": "standard"
                 }),
@@ -6020,8 +5786,7 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
-                    "model": "global-main-model",
-                    "reasoningEffort": "medium"
+                    "apiProtocol": "openai_chat"
                 }),
             )
             .unwrap();
@@ -6141,21 +5906,21 @@ mod tests {
     }
 
     #[test]
-    fn fetch_models_config_rejects_deprecated_model_provider_field() {
+    fn fetch_models_config_rejects_unknown_model_config_fields() {
         let error = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
-                "provider": "openai",
+                "unexpected": "openai",
                 "baseUrl": "http://127.0.0.1:8320/v1",
                 "apiKey": "test-key",
                 "urlMode": "standard"
             }),
             target: "orch".to_string(),
         })
-        .expect_err("fetch models config should reject deprecated provider input");
+        .expect_err("fetch models config should reject fields outside the schema");
 
         match error {
             ApiError::InvalidInput(message) => {
-                assert!(message.contains("provider"));
+                assert!(message.contains("unexpected"));
             }
             other => panic!("expected invalid input, got {other:?}"),
         }
@@ -6318,43 +6083,6 @@ mod tests {
             json!("gpt-image-test")
         );
         assert_eq!(payload["models"][0]["totals"]["llmCallCount"], json!(1));
-    }
-
-    #[tokio::test]
-    async fn execution_stats_keeps_legacy_successful_image_calls_without_model_attribution() {
-        let state = test_state();
-        state.event_bus.publish(
-            EventEnvelope::usage(
-                EventId::new("tool-usage-image-legacy"),
-                "tool.usage.recorded",
-                json!({
-                    "tool_name": "image_generate",
-                    "tool_call_id": "legacy-image-call",
-                    "session_id": "session-image-legacy",
-                    "workspace_id": "workspace-image-legacy",
-                    "status": "Succeeded"
-                }),
-            )
-            .with_context(EventContext {
-                workspace_id: Some(WorkspaceId::new("workspace-image-legacy")),
-                session_id: Some(SessionId::new("session-image-legacy")),
-                ..EventContext::default()
-            }),
-        );
-
-        let payload = execution_stats(State(state))
-            .await
-            .expect("legacy image stats should build")
-            .0;
-
-        assert_eq!(payload["totals"]["llmCallCount"], json!(1));
-        assert_eq!(payload["totals"]["totalTokens"], json!(0));
-        assert_eq!(payload["items"][0]["role"], json!("image_generation"));
-        assert_eq!(payload["items"][0]["llmCallCount"], json!(1));
-        assert_eq!(
-            payload["models"][0]["resolvedModel"],
-            json!("__legacy_image_generation__")
-        );
     }
 
     #[tokio::test]
