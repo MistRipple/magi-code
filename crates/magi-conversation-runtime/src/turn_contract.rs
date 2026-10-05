@@ -104,15 +104,12 @@ impl TurnRecord {
         }
     }
 
-    /// 从 canonical Turn 提取稳定身份。缺少 requestId/attemptId 的旧事实不会
-    /// 被伪造为可重放身份，调用方必须在迁移边界补齐这些字段后再接纳。
+    /// 从 canonical Turn 提取稳定身份。缺少 requestId/attemptId/requestFingerprint
+    /// 的 Turn 不会被伪造为可重放身份。
     pub fn from_canonical(turn: &CanonicalTurn, event_sequence: u64) -> Option<Self> {
-        let request_id = canonical_turn_metadata_string(turn, "requestId")
-            .or_else(|| canonical_turn_metadata_string(turn, "request_id"))?;
-        let attempt_id = canonical_turn_metadata_string(turn, "attemptId")
-            .or_else(|| canonical_turn_metadata_string(turn, "attempt_id"))?;
-        let request_fingerprint = canonical_turn_metadata_string(turn, "requestFingerprint")
-            .or_else(|| canonical_turn_metadata_string(turn, "request_fingerprint"))?;
+        let request_id = canonical_turn_metadata_string(turn, "requestId")?;
+        let attempt_id = canonical_turn_metadata_string(turn, "attemptId")?;
+        let request_fingerprint = canonical_turn_metadata_string(turn, "requestFingerprint")?;
         let execution_profile = canonical_execution_profile(turn)?;
         let status = match turn.status {
             magi_session_store::CanonicalTurnStatus::Pending => CoordinatorTurnStatus::Accepted,

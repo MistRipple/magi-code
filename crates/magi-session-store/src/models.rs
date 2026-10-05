@@ -32,7 +32,7 @@ pub struct SessionRecord {
     pub last_completed_at: Option<UtcMillis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_viewed_at: Option<UtcMillis>,
-    /// 会话类型。缺省为用户会话，旧数据无需迁移。
+    /// 会话类型。用户会话序列化时省略该字段，反序列化时缺省为用户会话。
     #[serde(default, skip_serializing_if = "SessionKind::is_user")]
     pub kind: SessionKind,
 }
@@ -567,14 +567,13 @@ impl ActiveExecutionTurn {
 /// 提取一个 Active Turn 的稳定请求身份。
 ///
 /// requestId 属于 Turn 的关联身份，不应只依赖某个可被事件 shell 省略的 item。
-/// 用户消息 item 优先；同一 item 内优先结构化字段，再读取两种历史 metadata 命名。
+/// 用户消息 item 优先；同一 item 内优先结构化字段，再读取 metadata `requestId`。
 /// 其余 item 仅作为无用户消息 Turn（例如 goal continuation）的合法来源。
 pub fn active_execution_turn_request_id(turn: &ActiveExecutionTurn) -> Option<String> {
     fn item_request_id(item: &ActiveExecutionTurnItem) -> Option<String> {
         item.request_id
             .as_deref()
             .or_else(|| item.metadata.get("requestId").and_then(Value::as_str))
-            .or_else(|| item.metadata.get("request_id").and_then(Value::as_str))
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)

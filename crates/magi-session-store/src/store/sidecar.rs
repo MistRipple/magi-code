@@ -3547,13 +3547,11 @@ impl SessionStore {
                             && (existing
                                 .metadata
                                 .get("requestId")
-                                .or_else(|| existing.metadata.get("request_id"))
                                 .and_then(serde_json::Value::as_str)
                                 == Some(request_id)
                                 || existing.items.iter().any(|item| {
                                     item.metadata
                                         .get("requestId")
-                                        .or_else(|| item.metadata.get("request_id"))
                                         .and_then(serde_json::Value::as_str)
                                         == Some(request_id)
                                 }))

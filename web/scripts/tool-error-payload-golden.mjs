@@ -17,11 +17,11 @@ await withGoldenViteServer(async (server) => {
   assert.equal(
     toolErrors.isStructuredToolErrorPayload({
       status: 'rejected',
-      errorCode: 'tool_policy_rejected',
+      error_code: 'tool_policy_rejected',
       message: 'blocked',
     }),
     true,
-    'rejected payload with errorCode should be treated as structured error',
+    'rejected payload with error_code should be treated as structured error',
   );
 
   assert.equal(

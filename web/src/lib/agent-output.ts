@@ -49,7 +49,7 @@ function textFromStructuredOutputRef(value: unknown): string {
   const result = record.result && typeof record.result === 'object' && !Array.isArray(record.result)
     ? record.result as Record<string, unknown>
     : null;
-  return normalizeText(result?.final_text ?? result?.finalText);
+  return normalizeText(result?.final_text);
 }
 
 function parseOutputRef(ref: string): string {

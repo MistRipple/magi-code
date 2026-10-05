@@ -10,8 +10,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SKILLS_CONFIG_SECTION: &str = "skillsConfig";
-const TOP_LEVEL_CUSTOM_TOOLS_SECTION: &str = "customTools";
-const TOP_LEVEL_INSTRUCTION_SKILLS_SECTION: &str = "skills";
 
 pub fn read_skill_instruction(dir_path: &Path) -> String {
     read_available_skill_instruction(dir_path).unwrap_or_default()
@@ -84,7 +82,6 @@ fn normalize_instruction_skill_entries(entries: &mut Vec<Value>) {
         let Some(object) = entry.as_object_mut() else {
             return false;
         };
-        object.remove("skillName");
         let Some(skill_id) = object
             .get("skillId")
             .and_then(Value::as_str)
@@ -116,7 +113,6 @@ fn normalize_custom_tool_entries(entries: &mut Vec<Value>) {
         let Some(object) = entry.as_object_mut() else {
             return false;
         };
-        object.remove("toolName");
         object
             .get("name")
             .and_then(Value::as_str)
@@ -200,8 +196,6 @@ fn canonical_skills_config_from_snapshot(
         .remove(SKILLS_CONFIG_SECTION)
         .map(normalize_skills_config_value)
         .unwrap_or_default();
-    snapshot.remove(TOP_LEVEL_CUSTOM_TOOLS_SECTION);
-    snapshot.remove(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION);
     normalize_skills_config_entries(&mut config);
     config
 }
@@ -230,25 +224,7 @@ pub fn save_skills_config_object(
         .remove(SKILLS_CONFIG_SECTION)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    store.apply_section_changes(
-        [(SKILLS_CONFIG_SECTION.to_string(), Value::Object(canonical))],
-        [
-            TOP_LEVEL_INSTRUCTION_SKILLS_SECTION.to_string(),
-            TOP_LEVEL_CUSTOM_TOOLS_SECTION.to_string(),
-        ],
-    )
-}
-
-fn canonicalize_skills_config_store(store: &SettingsStore) -> Result<(), std::io::Error> {
-    let canonical = skills_config_object(store);
-    let current = store.get_section(SKILLS_CONFIG_SECTION);
-    let needs_update = current.as_object() != Some(&canonical)
-        || store.get(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION).is_some()
-        || store.get(TOP_LEVEL_CUSTOM_TOOLS_SECTION).is_some();
-    if needs_update {
-        save_skills_config_object(store, canonical)?;
-    }
-    Ok(())
+    store.set_section(SKILLS_CONFIG_SECTION, Value::Object(canonical))
 }
 
 fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistry {
@@ -332,11 +308,8 @@ pub fn load_skills_into_registry(store: &SettingsStore) -> SkillRegistry {
     build_skill_registry_from_config(&config)
 }
 
-pub fn build_skill_runtime_from_settings(
-    store: &SettingsStore,
-) -> Result<SkillRuntime, std::io::Error> {
-    canonicalize_skills_config_store(store)?;
-    Ok(SkillRuntime::new(load_skills_into_registry(store)))
+pub fn build_skill_runtime_from_settings(store: &SettingsStore) -> SkillRuntime {
+    SkillRuntime::new(load_skills_into_registry(store))
 }
 
 pub fn reload_skill_runtime_from_settings(skill_runtime: &SkillRuntime, store: &SettingsStore) {
@@ -389,7 +362,7 @@ mod tests {
             )
             .unwrap();
 
-        let runtime = build_skill_runtime_from_settings(&store).unwrap();
+        let runtime = build_skill_runtime_from_settings(&store);
         let plan = runtime.build_tool_runtime_plan(SkillSelection {
             skill_ids: vec!["prompt-only".to_string()],
             requested_tools: Vec::new(),
@@ -400,43 +373,6 @@ mod tests {
             "未声明 allowed_tools 的 instruction Skill 不应创建标准工具白名单"
         );
         std::fs::remove_dir_all(&skill_dir).expect("skill dir should be removed");
-    }
-
-    #[test]
-    fn normalize_skills_config_sections_discards_obsolete_top_level_sections() {
-        let skill_dir = make_local_skill_dir(
-            "obsolete-top-level",
-            "# 合并测试\n\n请输出 obsolete-skill。\n",
-        );
-        let mut snapshot = HashMap::from([
-            (
-                "skills".to_string(),
-                serde_json::json!([
-                    {
-                        "skillId": "obsolete-skill",
-                        "name": "obsolete-skill",
-                        "directoryPath": skill_dir.to_string_lossy().to_string()
-                    }
-                ]),
-            ),
-            (
-                "customTools".to_string(),
-                serde_json::json!([
-                    {
-                        "name": "obsolete-tool",
-                        "bindingId": "obsolete-tool"
-                    }
-                ]),
-            ),
-        ]);
-
-        normalize_skills_config_sections(&mut snapshot);
-
-        assert!(!snapshot.contains_key("skills"));
-        assert!(!snapshot.contains_key("customTools"));
-        assert_eq!(snapshot["skillsConfig"], serde_json::json!({}));
-
-        std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
     }
 
     #[test]
@@ -622,35 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_runtime_from_settings_does_not_load_obsolete_top_level_sections() {
-        let skill_dir = make_local_skill_dir(
-            "runtime-build",
-            "# Runtime build\n\n请输出 runtime-build。\n",
-        );
-        let store = SettingsStore::new();
-        store
-            .set_section(
-                "skills",
-                serde_json::json!([
-                    {
-                        "skillId": "runtime-skill",
-                        "name": "runtime-skill",
-                        "directoryPath": skill_dir.to_string_lossy().to_string()
-                    }
-                ]),
-            )
-            .unwrap();
-
-        let runtime = build_skill_runtime_from_settings(&store).unwrap();
-        let registry = runtime.registry();
-        assert!(registry.get("runtime-skill").is_none());
-        assert!(store.get("skills").is_none());
-        assert!(store.get("skillsConfig").is_some());
-
-        std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
-    }
-
-    #[test]
     fn reload_skill_runtime_from_settings_replaces_existing_registry() {
         let first_dir = make_local_skill_dir("reload-first", "# First\n\n请输出 first-skill。\n");
         let second_dir =
@@ -672,7 +579,7 @@ mod tests {
             )
             .unwrap();
 
-        let runtime = build_skill_runtime_from_settings(&store).unwrap();
+        let runtime = build_skill_runtime_from_settings(&store);
         assert!(runtime.registry().get("first-skill").is_some());
 
         store
@@ -700,46 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn save_skills_config_object_removes_obsolete_sections_without_loading_them() {
-        let store = SettingsStore::new();
-        store
-            .set_section(
-                "skills",
-                serde_json::json!([{ "skillId": "obsolete-skill" }]),
-            )
-            .unwrap();
-        store
-            .set_section(
-                "customTools",
-                serde_json::json!([{ "name": "obsolete-tool" }]),
-            )
-            .unwrap();
-
-        save_skills_config_object(
-            &store,
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "saved-skill",
-                        "name": "saved-skill"
-                    }
-                ]
-            })
-            .as_object()
-            .cloned()
-            .expect("skills config should be an object"),
-        )
-        .unwrap();
-
-        assert!(store.get("skills").is_none());
-        assert!(store.get("customTools").is_none());
-        assert_eq!(
-            store.get_section("skillsConfig")["instructionSkills"][0]["skillId"],
-            serde_json::json!("saved-skill")
-        );
-    }
-
-    #[test]
     fn save_skills_config_object_strips_scope_binding_fields() {
         let store = SettingsStore::new();
 
@@ -747,29 +614,27 @@ mod tests {
             &store,
             serde_json::json!({
                 "workspaceId": "workspace-old",
-                "workspace_path": "/tmp/old",
+                "workspacePath": "/tmp/old",
                 "sessionId": "session-old",
                 "instructionSkills": [
                     {
                         "skillId": "saved-skill",
-                        "skillName": "legacy-saved-skill",
                         "workspaceId": "workspace-old",
-                        "session_id": "session-old"
+                        "sessionId": "session-old"
                     },
                     {
-                        "skillName": "legacy-skill-name-only"
+                        "name": "skill-without-id"
                     },
                     "invalid-instruction-skill"
                 ],
                 "customTools": [
                     {
                         "name": "saved-tool",
-                        "toolName": "legacy-saved-tool",
                         "workspacePath": "/tmp/old",
                         "sessionId": "session-old"
                     },
                     {
-                        "toolName": "legacy-tool-name-only"
+                        "bindingId": "tool-without-name"
                     },
                     "invalid-custom-tool"
                 ]
@@ -781,17 +646,11 @@ mod tests {
         .unwrap();
 
         let saved = store.get_section("skillsConfig");
-        for key in [
-            "workspaceId",
-            "workspace_path",
-            "sessionId",
-            "workspacePath",
-            "session_id",
-        ] {
+        for key in ["workspaceId", "workspacePath", "sessionId"] {
             assert!(saved.get(key).is_none());
         }
         assert!(saved["instructionSkills"][0].get("workspaceId").is_none());
-        assert!(saved["instructionSkills"][0].get("session_id").is_none());
+        assert!(saved["instructionSkills"][0].get("sessionId").is_none());
         assert_eq!(
             saved["instructionSkills"]
                 .as_array()
@@ -807,7 +666,6 @@ mod tests {
             saved["instructionSkills"][0]["name"],
             serde_json::json!("saved-skill")
         );
-        assert!(saved["instructionSkills"][0].get("skillName").is_none());
         assert_eq!(
             saved["customTools"]
                 .as_array()
@@ -819,7 +677,6 @@ mod tests {
             saved["customTools"][0]["name"],
             serde_json::json!("saved-tool")
         );
-        assert!(saved["customTools"][0].get("toolName").is_none());
         assert!(saved["customTools"][0].get("workspacePath").is_none());
         assert!(saved["customTools"][0].get("sessionId").is_none());
     }

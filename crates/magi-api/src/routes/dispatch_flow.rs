@@ -267,9 +267,7 @@ pub(super) fn initial_session_orchestrator_config(
         return Ok(None);
     }
     if let Some(config) = config {
-        let explicit = super::settings::orchestrator_session_override_request(
-            &serde_json::json!({ "config": config }),
-        )?;
+        let explicit = super::settings::orchestrator_session_override_request(config)?;
         magi_conversation_runtime::model_config::merge_orchestrator_session_override(
             &mut initial,
             &explicit,

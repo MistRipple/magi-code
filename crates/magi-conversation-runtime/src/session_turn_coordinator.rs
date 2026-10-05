@@ -721,24 +721,16 @@ impl SessionTurnCoordinator {
             return None;
         }
 
-        let request_id = crate::turn_contract::canonical_turn_metadata_string(turn, "requestId")
-            .or_else(|| crate::turn_contract::canonical_turn_metadata_string(turn, "request_id"));
+        let request_id = crate::turn_contract::canonical_turn_metadata_string(turn, "requestId");
         let Some(request_id) = request_id else {
             // 历史 Turn 没有幂等身份时仍可由 SessionStore 展示，但不能被 Coordinator
             // 当作可安全恢复的请求。
             return None;
         };
         let request_fingerprint =
-            crate::turn_contract::canonical_turn_metadata_string(turn, "requestFingerprint")
-                .or_else(|| {
-                    crate::turn_contract::canonical_turn_metadata_string(
-                        turn,
-                        "request_fingerprint",
-                    )
-                })?;
+            crate::turn_contract::canonical_turn_metadata_string(turn, "requestFingerprint")?;
         let profile = crate::turn_contract::canonical_execution_profile(turn)?;
-        let attempt_id = crate::turn_contract::canonical_turn_metadata_string(turn, "attemptId")
-            .or_else(|| crate::turn_contract::canonical_turn_metadata_string(turn, "attempt_id"))?;
+        let attempt_id = crate::turn_contract::canonical_turn_metadata_string(turn, "attemptId")?;
         let admission = TurnAdmission {
             turn_id: turn.turn_id.clone(),
             request_id,

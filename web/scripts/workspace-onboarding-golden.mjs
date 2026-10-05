@@ -222,7 +222,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /resolveSessionRunningState\(\{[\s\S]*?isRunning: session\.isRunning[\s\S]*?runningTaskCount: session\.runningTaskCount/,
+  /resolveSessionRunningState\(\{[\s\S]*?isRunning: session\.isRunning/,
   '侧栏运行灯必须以目录接口返回的显式 isRunning 为权威值，不能被残留任务数抬回运行中',
 );
 assert.match(

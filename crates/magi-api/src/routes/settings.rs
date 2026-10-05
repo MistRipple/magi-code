@@ -30,33 +30,17 @@ use crate::{
         DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW,
         NormalizedModelConfig, VISION_MODEL_SECTION, builtin_text_model_rule_catalog,
         merge_orchestrator_session_override, reject_unknown_model_config_fields,
-        resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
-        validate_vision_model_settings,
+        resolve_orchestrator_model_config, validate_vision_model_settings,
     },
     scope_binding::without_scope_binding_fields,
     state::ApiState,
 };
 
-fn unwrap_settings_section_request(
-    request: &serde_json::Value,
-) -> Result<serde_json::Value, ApiError> {
-    if request.get("data").is_some() {
-        return Err(ApiError::InvalidInput(
-            "data 设置包装已废弃，请使用 config 或直接提交设置对象".to_string(),
-        ));
-    }
-    Ok(request
-        .get("config")
-        .cloned()
-        .unwrap_or_else(|| request.clone()))
-}
-
+/// 设置 section 保存请求体就是设置对象本身（不包裹 config/data）。
 fn scoped_settings_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    Ok(without_scope_binding_fields(
-        unwrap_settings_section_request(request)?,
-    ))
+    Ok(without_scope_binding_fields(request.clone()))
 }
 
 fn model_settings_section_request(
@@ -71,7 +55,7 @@ fn model_settings_section_request(
 fn orchestrator_connection_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let mut config = model_settings_section_request(request)?;
+    let config = model_settings_section_request(request)?;
     // GPT Web 只能作为会话级 `engines[*]` + `engineId` 绑定使用，不能写进
     // 全局 orchestrator。否则新会话会继承一个没有 HTTP 连接、也没有临时对话
     // 所属关系的 Web 配置，破坏 A22/A26 的单向会话边界。
@@ -80,17 +64,19 @@ fn orchestrator_connection_section_request(
             "GPT Web 只能在空白 Magi 会话中作为会话级模型选择，不能保存为全局主模型".to_string(),
         ));
     }
-    if let Some(map) = config.as_object_mut() {
-        map.remove("model");
-        map.remove("reasoningEffort");
+    // 主模型与推理强度归会话所有，全局 orchestrator 只保存连接配置。
+    if let Some(field) = ["model", "reasoningEffort"]
+        .into_iter()
+        .find(|field| config.get(*field).is_some())
+    {
+        return Err(ApiError::InvalidInput(format!(
+            "全局主模型连接配置不接受字段 {field}，主模型由会话选择"
+        )));
     }
     Ok(config)
 }
 
-pub(super) fn orchestrator_session_override_request(
-    request: &serde_json::Value,
-) -> Result<Value, ApiError> {
-    let config = unwrap_settings_section_request(request)?;
+pub(super) fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiError> {
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
             "会话主模型配置必须是对象".to_string(),
@@ -186,9 +172,7 @@ pub(super) fn orchestrator_session_defaults(state: &ApiState) -> Value {
     let stored = state
         .settings_store
         .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
-    let request = json!({ "config": stored });
-    let mut defaults =
-        orchestrator_session_override_request(&request).unwrap_or_else(|_| json!({}));
+    let mut defaults = orchestrator_session_override_request(&stored).unwrap_or_else(|_| json!({}));
     ensure_session_reasoning_effort(&mut defaults);
     defaults
 }
@@ -236,9 +220,8 @@ fn ensure_orchestrator_session_defaults_from_models(
     state
         .settings_store
         .update_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION, |stored| {
-            let request = json!({ "config": stored.clone() });
             let mut defaults =
-                orchestrator_session_override_request(&request).unwrap_or_else(|_| json!({}));
+                orchestrator_session_override_request(stored).unwrap_or_else(|_| json!({}));
             ensure_session_reasoning_effort(&mut defaults);
             let fields = defaults
                 .as_object_mut()
@@ -284,8 +267,7 @@ fn save_orchestrator_session_override_for_session_with_policy(
     config: &Value,
     allow_new_session_initial_web_binding: bool,
 ) -> Result<Option<Value>, ApiError> {
-    let request = json!({ "config": config });
-    let override_config = orchestrator_session_override_request(&request)?;
+    let override_config = orchestrator_session_override_request(config)?;
     let Some(override_fields) = override_config.as_object() else {
         return Ok(None);
     };
@@ -371,9 +353,9 @@ fn save_orchestrator_session_override_for_session_with_policy(
             )),
             "session.configuration.updated",
             json!({
-                "sessionId": session_id.to_string(),
-                "workspaceId": workspace_id.as_ref().map(ToString::to_string),
-                "orchestratorSessionConfig": next_config.clone(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "orchestrator_session_config": next_config.clone(),
             }),
         )
         .with_context(EventContext {
@@ -572,8 +554,7 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
     models
 }
 
-fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
-    let config = unwrap_settings_section_request(&request)?;
+fn parse_connection_probe_config(config: Value) -> Result<NormalizedModelConfig, ApiError> {
     reject_unknown_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let normalized =
         NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
@@ -1147,7 +1128,6 @@ async fn settings_bootstrap(
                 .get("orchestratorConfig")
                 .cloned()
                 .unwrap_or(Value::Null);
-            strip_orchestrator_session_owned_fields(&mut effective_orchestrator_config);
             let session_orchestrator_config =
                 resolved_orchestrator_session_config(&state, session_id);
             merge_orchestrator_session_override(
@@ -1172,7 +1152,6 @@ async fn settings_bootstrap(
                 .get("orchestratorConfig")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            strip_orchestrator_session_owned_fields(&mut effective_orchestrator_config);
             merge_orchestrator_session_override(
                 &mut effective_orchestrator_config,
                 &session_defaults,
@@ -1340,7 +1319,11 @@ async fn test_worker_connection(
     State(_state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    probe_connection_response(request).await
+    let config = request
+        .get("config")
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("worker 连接测试缺少 config".to_string()))?;
+    probe_connection_response(config).await
 }
 
 async fn save_orchestrator_config(
@@ -1377,7 +1360,6 @@ async fn save_orchestrator_session_config(
             });
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
-    strip_orchestrator_session_owned_fields(&mut effective_config);
     merge_orchestrator_session_override(&mut effective_config, &override_config);
     Ok(Json(serde_json::json!({
         "saved": true,
@@ -1426,9 +1408,8 @@ async fn save_model_context_window(
 
 async fn test_orchestrator_connection(
     State(_state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
+    Json(config): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = unwrap_settings_section_request(&request)?;
     let normalized =
         NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
@@ -2202,11 +2183,6 @@ async fn upsert_engine(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if request.get("engine").is_some() || request.get("engineId").is_some() {
-        return Err(ApiError::InvalidInput(
-            "引擎配置必须使用顶层 id/displayName/llm 字段".to_string(),
-        ));
-    }
     if is_chatgpt_web_engine(&request) {
         // GPT Web 入口由登录状态自动提供（固定的 `chatgpt-web/default`），不写入引擎注册表：
         // 注册表里的条目都是 HTTP 引擎，Web 不是第二种“模型”。
@@ -2281,11 +2257,6 @@ async fn upsert_agent(
         .role_configuration_lock
         .lock()
         .map_err(|_| ApiError::InternalAssemblyError("角色配置事务锁已损坏".to_string()))?;
-    if request.get("agent").is_some() || request.get("modelSource").is_some() {
-        return Err(ApiError::InvalidInput(
-            "角色绑定必须使用顶层 templateId/engineId 字段".to_string(),
-        ));
-    }
     let template_ids = template_ids_for_registry(state.agent_role_registry.as_ref());
     let order_map = template_order_map_for_registry(state.agent_role_registry.as_ref());
     let normalized = normalize_agent_override_entry(&request, &template_ids, &order_map)
@@ -3079,12 +3050,10 @@ mod tests {
         let result = test_orchestrator_connection(
             State(test_state()),
             Json(json!({
-                "config": {
-                    "baseUrl": base_url,
-                    "apiKey": "test-key",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat"
-                }
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             })),
         )
         .await;
@@ -3221,13 +3190,11 @@ mod tests {
         let result = test_orchestrator_connection(
             State(test_state()),
             Json(json!({
-                "config": {
-                    "baseUrl": base_url,
-                    "apiKey": "test-key",
-                    "model": "gpt-test",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat"
-                }
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "model": "gpt-test",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             })),
         )
         .await;
@@ -3258,13 +3225,11 @@ mod tests {
         let result = test_image_generation_connection(
             State(test_state()),
             Json(json!({
-                "config": {
-                    "baseUrl": base_url,
-                    "apiKey": "test-image-key",
-                    "model": "gpt-image-test",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat"
-                }
+                "baseUrl": base_url,
+                "apiKey": "test-image-key",
+                "model": "gpt-image-test",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             })),
         )
         .await
@@ -4153,79 +4118,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_engine_upsert_rejects_legacy_engine_wrappers() {
-        let state = test_state();
-        let result = upsert_engine(
-            State(state.clone()),
-            Json(json!({
-                "engine": {
-                    "id": "legacy-wrapper",
-                    "llm": {}
-                }
-            })),
-        )
-        .await;
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert!(message.contains("顶层 id/displayName/llm"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
-
-        let result = upsert_engine(
-            State(state),
-            Json(json!({
-                "engineId": "legacy-engine-id",
-                "llm": {}
-            })),
-        )
-        .await;
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert!(message.contains("顶层 id/displayName/llm"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn registry_agent_upsert_rejects_legacy_wrapper_and_model_source() {
-        let state = test_state();
-        let result = upsert_agent(
-            State(state.clone()),
-            Json(json!({
-                "agent": {
-                    "templateId": "reviewer",
-                    "engineId": ""
-                }
-            })),
-        )
-        .await;
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert!(message.contains("顶层 templateId/engineId"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
-
-        let result = upsert_agent(
-            State(state),
-            Json(json!({
-                "templateId": "reviewer",
-                "modelSource": "engine",
-                "engineId": ""
-            })),
-        )
-        .await;
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert!(message.contains("顶层 templateId/engineId"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn role_upsert_lists_user_role_and_persists_markdown() {
         let directory = tempfile::tempdir().expect("角色目录应创建");
         let state = role_test_state(directory.path());
@@ -4932,27 +4824,15 @@ mod tests {
     #[test]
     fn scoped_settings_section_request_strips_all_scope_binding_fields() {
         let cleaned = scoped_settings_section_request(&json!({
-            "config": {
-                "model": "gpt-test",
-                "workspaceId": "workspace-a",
-                "workspace_id": "workspace-b",
-                "workspacePath": "/tmp/a",
-                "workspace_path": "/tmp/b",
-                "sessionId": "session-a",
-                "session_id": "session-b"
-            }
+            "model": "gpt-test",
+            "workspaceId": "workspace-a",
+            "workspacePath": "/tmp/a",
+            "sessionId": "session-a"
         }))
         .expect("config wrapper should be accepted");
 
         assert_eq!(cleaned["model"], json!("gpt-test"));
-        for key in [
-            "workspaceId",
-            "workspace_id",
-            "workspacePath",
-            "workspace_path",
-            "sessionId",
-            "session_id",
-        ] {
+        for key in ["workspaceId", "workspacePath", "sessionId"] {
             assert!(
                 cleaned.get(key).is_none(),
                 "{key} should not be persisted in settings sections"
@@ -4961,31 +4841,12 @@ mod tests {
     }
 
     #[test]
-    fn scoped_settings_section_request_rejects_deprecated_data_wrapper() {
-        let error = scoped_settings_section_request(&json!({
-            "data": {
-                "baseUrl": "https://api.example.com/v1"
-            }
-        }))
-        .expect_err("data wrapper must not remain a settings input path");
-
-        match error {
-            ApiError::InvalidInput(message) => {
-                assert!(message.contains("data"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn model_settings_section_request_rejects_unknown_fields() {
         let error = model_settings_section_request(&json!({
-            "config": {
-                "unexpected": "openai",
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-test",
-                "model": "gpt-test"
-            }
+            "unexpected": "openai",
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "sk-test",
+            "model": "gpt-test"
         }))
         .expect_err("模型配置保存入口必须拒绝 schema 之外的字段");
 
@@ -5003,16 +4864,12 @@ mod tests {
         let response = save_orchestrator_config(
             State(state.clone()),
             Json(json!({
-                "config": {
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-global",
-                    "model": "global-main-model",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat",
-                    "reasoningEffort": "high",
-                    "sessionId": "session-a",
-                    "workspaceId": "workspace-a"
-                }
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-global",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat",
+                "sessionId": "session-a",
+                "workspaceId": "workspace-a"
             })),
         )
         .await
@@ -5034,6 +4891,23 @@ mod tests {
                 .is_null(),
             "全局连接保存接口不得写会话模型覆盖"
         );
+
+        for field in ["model", "reasoningEffort"] {
+            let mut config = json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-global",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
+            });
+            config[field] = json!("high");
+            let error = save_orchestrator_config(State(state.clone()), Json(config))
+                .await
+                .expect_err("全局连接配置不得携带会话级模型字段");
+            match error {
+                ApiError::InvalidInput(message) => assert!(message.contains(field), "{message}"),
+                other => panic!("expected invalid input, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -5042,10 +4916,8 @@ mod tests {
         let error = save_orchestrator_config(
             State(state.clone()),
             Json(json!({
-                "config": {
-                    "apiProtocol": "chatgpt_web",
-                    "model": "gpt-5"
-                }
+                "apiProtocol": "chatgpt_web",
+                "model": "gpt-5"
             })),
         )
         .await
@@ -5069,15 +4941,13 @@ mod tests {
         let response = save_image_generation_config(
             State(state.clone()),
             Json(json!({
-                "config": {
-                    "baseUrl": "https://cpa.example.com/v1",
-                    "apiKey": "sk-image",
-                    "model": "gpt-image-1",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat",
-                    "reasoningEffort": "high",
-                    "workspaceId": "workspace-ignored"
-                }
+                "baseUrl": "https://cpa.example.com/v1",
+                "apiKey": "sk-image",
+                "model": "gpt-image-1",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat",
+                "reasoningEffort": "high",
+                "workspaceId": "workspace-ignored"
             })),
         )
         .await
@@ -5309,7 +5179,7 @@ mod tests {
             Some("workspace-session-model".to_string())
         );
         assert_eq!(
-            configuration_event.payload["orchestratorSessionConfig"]["model"],
+            configuration_event.payload["orchestrator_session_config"]["model"],
             json!("session-main-model")
         );
         assert_eq!(
@@ -5374,7 +5244,7 @@ mod tests {
             .expect("personal session configuration should publish");
         assert_eq!(event.session_id.as_ref(), Some(&session_id));
         assert!(event.workspace_id.is_none());
-        assert!(event.payload["workspaceId"].is_null());
+        assert!(event.payload["workspace_id"].is_null());
     }
 
     #[tokio::test]

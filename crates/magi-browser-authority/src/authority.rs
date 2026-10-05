@@ -125,7 +125,6 @@ pub struct BrowserDurableState {
 pub struct BrowserDurableTab {
     pub tab_id: BrowserTabId,
     pub browser_session_id: BrowserSessionId,
-    #[serde(default)]
     pub order: u32,
     pub lifecycle: BrowserTabLifecycle,
     pub canonical_url: String,
@@ -133,9 +132,7 @@ pub struct BrowserDurableTab {
     pub display_label: Option<String>,
     pub navigation_revision: u64,
     /// Authority 分配的快照 revision。它属于 element_ref 失效协议，必须跨 daemon 重启持久化。
-    #[serde(default)]
     pub snapshot_revision: u64,
-    #[serde(default)]
     pub annotation_sequence: u64,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,

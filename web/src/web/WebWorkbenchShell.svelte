@@ -821,7 +821,7 @@ import {
   function browserSessionIdsForAuthorityEvent(detail: BrowserAuthorityEventDetail): string[] {
     const payload = detail.payload;
     const ids = new Set<string>();
-    const directSessionId = payload?.browser_session_id ?? payload?.browserSessionId;
+    const directSessionId = payload?.browser_session_id;
     if (typeof directSessionId === 'string' && directSessionId.trim()) {
       ids.add(directSessionId.trim());
     }
@@ -1171,7 +1171,6 @@ import {
   function isSessionRunning(workspaceId: string, session: Session): boolean {
     return resolveSessionRunningState({
       isRunning: session.isRunning,
-      runningTaskCount: session.runningTaskCount,
       isCurrentSession: session.id === currentSessionId,
       isCurrentWorkspace: workspaceId === selectedWorkspaceId,
       isPersonalScope: !workspaceId,

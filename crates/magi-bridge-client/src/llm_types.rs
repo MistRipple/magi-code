@@ -259,15 +259,8 @@ pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolR
 
 fn parse_image_source(value: Option<&Value>) -> Option<ImageSource> {
     let object = value?.as_object()?;
-    let kind = object
-        .get("type")
-        .or_else(|| object.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("base64");
-    let media_type = object
-        .get("media_type")
-        .or_else(|| object.get("mediaType"))
-        .and_then(Value::as_str)?;
+    let kind = object.get("type").and_then(Value::as_str)?;
+    let media_type = object.get("media_type").and_then(Value::as_str)?;
     let data = object.get("data").and_then(Value::as_str)?;
     if kind != "base64" || !media_type.starts_with("image/") || data.trim().is_empty() {
         return None;

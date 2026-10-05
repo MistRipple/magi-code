@@ -143,7 +143,7 @@
         : undefined,
       startupMessage: readString(terminalPayload?.startup_message),
       locked: readBool(terminalPayload?.locked),
-      returnCode: readNullableInt(terminalPayload?.return_code) ?? readNullableInt(terminalPayload?.exit_code),
+      returnCode: readNullableInt(terminalPayload?.exit_code),
       accepted: readBool(terminalPayload?.accepted),
       killed: readBool(terminalPayload?.killed),
       releasedLock: readBool(terminalPayload?.released_lock),

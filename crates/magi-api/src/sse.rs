@@ -379,7 +379,6 @@ fn event_session_id(event: &EventEnvelope) -> Option<SessionId> {
         event
             .payload
             .get("session_id")
-            .or_else(|| event.payload.get("sessionId"))
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|session_id| !session_id.is_empty())
@@ -409,7 +408,6 @@ fn event_payload_workspace_id(event: &EventEnvelope) -> Option<&str> {
     event
         .payload
         .get("workspace_id")
-        .or_else(|| event.payload.get("workspaceId"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|workspace_id| !workspace_id.is_empty())

@@ -179,7 +179,6 @@ pub struct BrowserViewport {
     pub width: u32,
     pub height: u32,
     pub device_scale_factor_millis: u32,
-    #[serde(default)]
     pub device_type: BrowserDeviceType,
 }
 
@@ -428,7 +427,6 @@ pub struct BrowserAnnotation {
     pub annotation_id: BrowserAnnotationId,
     pub browser_session_id: BrowserSessionId,
     pub tab_id: BrowserTabId,
-    #[serde(default)]
     pub sequence: u64,
     pub author: BrowserAnnotationAuthor,
     pub kind: BrowserAnnotationKind,

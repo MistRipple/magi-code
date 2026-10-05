@@ -255,9 +255,7 @@ fn append_openai_content_block_message(
 fn openai_reasoning_content(
     context: &crate::types::ModelProviderContext,
 ) -> Option<(&'static str, String)> {
-    if context.provider == "openai_chat"
-        && matches!(context.kind.as_str(), "reasoning" | "reasoning_content")
-    {
+    if context.provider == "openai_chat" && context.kind == "reasoning" {
         return ["reasoning_content", "reasoning_text", "reasoning"]
             .into_iter()
             .find_map(|field| {
@@ -268,7 +266,7 @@ fn openai_reasoning_content(
             });
     }
     if context.provider != "openai_responses"
-        || !matches!(context.kind.as_str(), "reasoning" | "response_output_item")
+        || context.kind != "response_output_item"
         || context.data["type"].as_str() != Some("reasoning")
     {
         return None;
@@ -502,7 +500,7 @@ mod tests {
                 LlmContentBlock::ProviderContext {
                     context: crate::types::ModelProviderContext {
                         provider: "openai_chat".to_string(),
-                        kind: "reasoning_content".to_string(),
+                        kind: "reasoning".to_string(),
                         data: json!({"reasoning_content": "先分析再调用工具"}),
                     },
                 },
@@ -521,14 +519,14 @@ mod tests {
     }
 
     #[test]
-    fn openai_assistant_message_migrates_responses_reasoning_context() {
+    fn openai_assistant_message_converts_responses_reasoning_context() {
         let messages = vec![LlmMessage {
             role: "assistant".to_string(),
             content: LlmMessageContent::Blocks(vec![
                 LlmContentBlock::ProviderContext {
                     context: crate::types::ModelProviderContext {
                         provider: "openai_responses".to_string(),
-                        kind: "reasoning".to_string(),
+                        kind: "response_output_item".to_string(),
                         data: json!({
                             "type": "reasoning",
                             "content": [{"type": "reasoning_text", "text": "迁移现有推理上下文"}]
@@ -536,7 +534,7 @@ mod tests {
                     },
                 },
                 LlmContentBlock::ToolUse {
-                    id: "call_legacy".to_string(),
+                    id: "call_responses".to_string(),
                     name: "file_read".to_string(),
                     input: json!({"path": "README.md"}),
                 },

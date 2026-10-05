@@ -484,15 +484,15 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     };
   }
 
+  /** 全局 orchestrator 只保存连接配置；主模型与推理强度归会话所有。 */
   function buildOrchestratorConnectionConfigPayload(
     config: InteractiveModelFormConfig,
-  ): BaseModelConfigPayload {
+  ): Omit<BaseModelConfigPayload, "model"> {
     return {
       baseUrl: config.baseUrl,
       urlMode: config.urlMode,
       apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
-      model: "",
     };
   }
 
@@ -2635,11 +2635,25 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     );
   }
 
+  /** MCP 写入只提交配置字段；连接状态等运行态投影不属于设置 schema。 */
+  function mcpServerConfigPayload(server: MCPServer): Record<string, unknown> {
+    const base = {
+      id: server.id,
+      name: server.name,
+      type: server.type,
+      enabled: server.enabled,
+      ...(server.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: server.requestTimeoutMs }),
+    };
+    return server.type === "streamable-http"
+      ? { ...base, url: server.url || "", headers: server.headers || {} }
+      : { ...base, command: server.command || "", args: server.args || [], env: server.env || {} };
+  }
+
   async function toggleMCPServer(serverId: string, enabled: boolean) {
     const server = mcpServers.find((s) => s.id === serverId);
     if (server) {
       try {
-        await updateAgentMcpServer(serverId, { ...server, enabled: !enabled });
+        await updateAgentMcpServer(serverId, { ...mcpServerConfigPayload(server), enabled: !enabled });
         const payload = await fetchCurrentSettingsBootstrap();
         if (payload) {
           applyMcpServersPayload(payload.mcpServers);

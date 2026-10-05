@@ -3192,7 +3192,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "model": "global-model",
                     "apiProtocol": "openai_chat",
                 }),
             )
@@ -5283,10 +5282,8 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "model": "gpt-5.5",
                     "urlMode": "standard",
                     "apiProtocol": "openai_chat",
-                    "reasoningEffort": "xhigh",
                 }),
             )
             .unwrap();
@@ -5485,10 +5482,8 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "model": "global-default-model",
                     "urlMode": "standard",
                     "apiProtocol": "openai_chat",
-                    "reasoningEffort": "medium",
                 }),
             )
             .unwrap();
@@ -5648,7 +5643,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-old",
-                    "model": "model-old",
                     "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),

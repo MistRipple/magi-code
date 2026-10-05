@@ -2619,17 +2619,15 @@ async function readAgentErrorPayload(
   try {
     const payload = await response.json() as {
       error_code?: string;
-      code?: string;
       message?: string;
-      error?: string;
       detail?: string;
     };
     const errorCode = typeof payload.error_code === 'string' && payload.error_code.trim()
       ? payload.error_code.trim()
-      : (typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim() : undefined);
+      : undefined;
     const message = typeof payload.message === 'string' && payload.message.trim()
       ? payload.message.trim()
-      : (typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : undefined);
+      : undefined;
     const detail = typeof payload.detail === 'string' && payload.detail.trim()
       ? payload.detail.trim()
       : undefined;

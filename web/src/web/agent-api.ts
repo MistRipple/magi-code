@@ -739,25 +739,19 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
+        // daemon 所有非 2xx 响应都是 ErrorResponseDto：error_code / message / detail。
         const payload = await response.json() as {
-          error?: string;
           message?: string;
           error_code?: string;
-          code?: string;
           detail?: string;
           conflict_kind?: string;
           active_turn_id?: string;
         };
-        if (typeof payload?.error === 'string' && payload.error.trim()) {
-          backendError = payload.error.trim();
-        } else if (typeof payload?.message === 'string' && payload.message.trim()) {
+        if (typeof payload?.message === 'string' && payload.message.trim()) {
           backendError = payload.message.trim();
         }
-        const rawErrorCode = typeof payload?.error_code === 'string' && payload.error_code.trim()
-          ? payload.error_code.trim()
-          : (typeof payload?.code === 'string' && payload.code.trim() ? payload.code.trim() : '');
-        if (rawErrorCode) {
-          backendErrorCode = rawErrorCode;
+        if (typeof payload?.error_code === 'string' && payload.error_code.trim()) {
+          backendErrorCode = payload.error_code.trim();
         }
         backendDetail = typeof payload?.detail === 'string' && payload.detail.trim()
           ? payload.detail.trim()

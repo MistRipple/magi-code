@@ -55,11 +55,7 @@ export function parseToolPayloadRecord(content: unknown): Record<string, unknown
 export function toolPayloadErrorCode(content: unknown): string {
   const payload = parseToolPayloadRecord(content);
   if (!payload) return '';
-  return (
-    readString(payload.error_code)
-    || readString(payload.errorCode)
-    || readString(payload.code)
-  ).toLowerCase();
+  return readString(payload.error_code).toLowerCase();
 }
 
 export function toolPayloadStatus(content: unknown): string {
@@ -71,7 +67,7 @@ export function toolPayloadStatus(content: unknown): string {
 export function toolPayloadRestrictionKind(content: unknown): ToolPolicyRestrictionKind | '' {
   const payload = parseToolPayloadRecord(content);
   if (!payload) return '';
-  const kind = readString(payload.restriction_kind) || readString(payload.restrictionKind);
+  const kind = readString(payload.restriction_kind);
   return ['approval_required', 'read_only', 'path_scope', 'tool_scope', 'policy'].includes(kind)
     ? kind as ToolPolicyRestrictionKind
     : '';
@@ -90,11 +86,9 @@ export function parseToolApprovalPayload(content: unknown): ToolApprovalPayload 
   const approval = payload.approval && typeof payload.approval === 'object' && !Array.isArray(payload.approval)
     ? payload.approval as Record<string, unknown>
     : {};
-  const approvalId = readString(approval.approvalId)
-    || readString(approval.approval_id)
-    || readString(payload.approval_id)
-    || readString(payload.approvalId);
-  const sessionId = readString(approval.sessionId) || readString(approval.session_id);
+  // `approval` 是 PendingToolApproval 的 camelCase 序列化。
+  const approvalId = readString(approval.approvalId);
+  const sessionId = readString(approval.sessionId);
   if (!approvalId || !sessionId) {
     return null;
   }
@@ -110,10 +104,10 @@ export function parseToolApprovalPayload(content: unknown): ToolApprovalPayload 
   return {
     approvalId,
     sessionId,
-    taskId: readString(approval.taskId) || readString(approval.task_id),
-    turnId: readString(approval.turnId) || readString(approval.turn_id),
-    toolCallId: readString(approval.toolCallId) || readString(approval.tool_call_id),
-    toolName: readString(approval.toolName) || readString(approval.tool_name) || readString(payload.tool),
+    taskId: readString(approval.taskId),
+    turnId: readString(approval.turnId),
+    toolCallId: readString(approval.toolCallId),
+    toolName: readString(approval.toolName),
     reason: readString(approval.reason) || readString(payload.error),
     requestedAt,
     agent,

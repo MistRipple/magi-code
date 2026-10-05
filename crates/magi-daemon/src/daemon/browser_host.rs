@@ -1440,8 +1440,7 @@ fn request_id_for_turn(turn: &ActiveExecutionTurn) -> String {
         .find_map(|item| {
             item.request_id.clone().or_else(|| {
                 item.metadata
-                    .get("request_id")
-                    .or_else(|| item.metadata.get("requestId"))
+                    .get("requestId")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })

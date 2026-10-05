@@ -287,9 +287,7 @@ fn replayable_response_output_item(context: &ModelProviderContext) -> Option<&Va
         return None;
     }
     let item_type = context.data["type"].as_str()?;
-    let is_current_raw_item = context.kind == RESPONSE_OUTPUT_ITEM_CONTEXT_KIND;
-    let is_legacy_reasoning_item = context.kind == "reasoning" && item_type == "reasoning";
-    (is_current_raw_item || is_legacy_reasoning_item)
+    (context.kind == RESPONSE_OUTPUT_ITEM_CONTEXT_KIND)
         .then_some(&context.data)
         .filter(|_| matches!(item_type, "message" | "reasoning" | "function_call"))
 }

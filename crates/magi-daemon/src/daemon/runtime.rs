@@ -1363,9 +1363,7 @@ impl DaemonRuntime {
             tracing::warn!(%error, "内置 Skill 安装失败");
         }
         let app_skill_runtime = Arc::new(
-            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store).map_err(
-                |error| DaemonError::internal(format!("规范化 Skill 设置失败: {error}")),
-            )?,
+            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
         );
         let external_tool_catalog_provider = build_external_tool_catalog_provider(
             settings_store.clone(),

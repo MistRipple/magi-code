@@ -4241,9 +4241,9 @@ async fn mark_session_viewed(
             )),
             "session.viewed",
             json!({
-                "sessionId": session_id.as_str(),
-                "workspaceId": workspace_id.as_ref().map(WorkspaceId::as_str),
-                "hasUnreadCompletion": session.has_unread_completion(),
+                "session_id": session_id.as_str(),
+                "workspace_id": workspace_id.as_ref().map(WorkspaceId::as_str),
+                "has_unread_completion": session.has_unread_completion(),
             }),
         )
         .with_context(EventContext {

@@ -7,7 +7,6 @@ export interface SessionActivityState {
 
 export interface SessionRunningStateInput {
   isRunning?: boolean;
-  runningTaskCount?: number;
   isCurrentSession: boolean;
   isCurrentWorkspace: boolean;
   isPersonalScope: boolean;
@@ -16,17 +15,14 @@ export interface SessionRunningStateInput {
 }
 
 /**
- * 会话目录运行态的唯一前端解析规则：后端明确值优先，任务数量只作旧
- * 数据兼容，最后才允许当前页面的本地处理中状态参与草稿态显示。
+ * 会话目录运行态的唯一前端解析规则：后端 isRunning 优先；目录尚未返回该会话
+ * （草稿态）时才允许当前页面的本地处理中状态参与显示。
  */
 export function resolveSessionRunningState(
   state: SessionRunningStateInput,
 ): boolean {
   if (typeof state.isRunning === 'boolean') {
     return state.isRunning;
-  }
-  if (typeof state.runningTaskCount === 'number' && state.runningTaskCount > 0) {
-    return true;
   }
   if (!state.isCurrentSession || !state.isProcessing) {
     return false;

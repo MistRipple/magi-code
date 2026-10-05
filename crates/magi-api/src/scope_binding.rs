@@ -1,13 +1,7 @@
 use serde_json::{Map, Value};
 
-pub(crate) const SCOPE_BINDING_FIELDS: [&str; 6] = [
-    "workspaceId",
-    "workspace_id",
-    "workspacePath",
-    "workspace_path",
-    "sessionId",
-    "session_id",
-];
+/// 请求体与设置条目中的 scope 绑定字段（只有 camelCase 形状）。
+pub(crate) const SCOPE_BINDING_FIELDS: [&str; 3] = ["workspaceId", "workspacePath", "sessionId"];
 
 pub(crate) fn strip_scope_binding_fields(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {

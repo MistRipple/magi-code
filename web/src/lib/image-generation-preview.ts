@@ -35,11 +35,7 @@ export function parseImageGenerationPreview(
   if (!payload || payload.status !== 'succeeded') return null;
 
   const path = typeof payload.path === 'string' ? payload.path.trim() : '';
-  const mime = typeof payload.media_type === 'string'
-    ? payload.media_type.trim()
-    : typeof payload.mediaType === 'string'
-      ? payload.mediaType.trim()
-      : '';
+  const mime = typeof payload.media_type === 'string' ? payload.media_type.trim() : '';
   if (!path || !mime.startsWith('image/')) return null;
 
   return {

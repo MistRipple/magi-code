@@ -222,7 +222,7 @@ fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
 }
 
 #[test]
-fn active_turn_request_id_prefers_root_user_item_and_supports_metadata_names() {
+fn active_turn_request_id_prefers_root_user_item() {
     let mut turn = test_turn("turn-request-identity", "running", 10);
     let mut assistant_item = test_turn_item("assistant-request", "assistant");
     assistant_item.kind = "assistant_stream".to_string();
@@ -232,7 +232,7 @@ fn active_turn_request_id_prefers_root_user_item_and_supports_metadata_names() {
     user_item.item_seq = 1;
     user_item
         .metadata
-        .insert("request_id".to_string(), json!(" user-request-id "));
+        .insert("requestId".to_string(), json!(" user-request-id "));
     turn.items = vec![assistant_item, user_item];
 
     assert_eq!(

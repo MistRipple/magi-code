@@ -1,10 +1,24 @@
-use crate::{errors::ApiError, scope_binding::strip_scope_binding_fields_from_map};
+use crate::errors::ApiError;
 use magi_bridge_client::{HttpMcpServerConfig, McpServerConfig, McpServerConnectionConfig};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 const MCP_TRANSPORT_STDIO: &str = "stdio";
 const MCP_TRANSPORT_STREAMABLE_HTTP: &str = "streamable-http";
+/// MCP server 配置条目的当前 schema；写入请求出现其他字段一律拒绝。
+const MCP_SERVER_ENTRY_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "type",
+    "enabled",
+    "command",
+    "args",
+    "env",
+    "workingDirectory",
+    "url",
+    "headers",
+    "requestTimeoutMs",
+];
 
 pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
     entry
@@ -15,9 +29,6 @@ pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
 }
 
 pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
-    if entry.get("server").is_some() || entry.get("updates").is_some() {
-        return None;
-    }
     let server_id = mcp_server_entry_id(entry)?.to_string();
     let mut object = entry.as_object().cloned()?;
 
@@ -49,17 +60,11 @@ pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
             object.remove("headers");
         }
     }
-    strip_scope_binding_fields_from_map(&mut object);
     Some(Value::Object(object))
 }
 
 pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Value, ApiError> {
-    if request.get("server").is_some() || request.get("updates").is_some() {
-        return Err(ApiError::InvalidInput(
-            "MCP server 配置必须作为顶层对象提交，不能包裹在 server/updates 中".to_string(),
-        ));
-    }
-    validate_requested_transport(request)?;
+    validate_mcp_server_request_schema(request)?;
     let normalized = normalize_mcp_server_snapshot_entry(request)
         .ok_or_else(|| ApiError::InvalidInput("MCP server id 不能为空".to_string()))?;
     let transport = normalized
@@ -167,42 +172,38 @@ pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConnectionC
 }
 
 fn canonical_mcp_transport(object: &serde_json::Map<String, Value>) -> &'static str {
-    let requested = object
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        requested.as_str(),
-        "http" | "streamable-http" | "streamable_http"
-    ) || (requested.is_empty()
-        && object
-            .get("url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| !url.trim().is_empty()))
-    {
+    if object.get("type").and_then(Value::as_str) == Some(MCP_TRANSPORT_STREAMABLE_HTTP) {
         MCP_TRANSPORT_STREAMABLE_HTTP
     } else {
         MCP_TRANSPORT_STDIO
     }
 }
 
-fn validate_requested_transport(request: &Value) -> Result<(), ApiError> {
+fn validate_mcp_server_request_schema(request: &Value) -> Result<(), ApiError> {
     let Some(object) = request.as_object() else {
-        return Ok(());
+        return Err(ApiError::InvalidInput(
+            "MCP server 配置必须是对象".to_string(),
+        ));
     };
-    if let Some(requested) = object.get("type").and_then(Value::as_str) {
-        let requested = requested.trim().to_ascii_lowercase();
-        if !requested.is_empty()
-            && !matches!(
-                requested.as_str(),
-                "stdio" | "http" | "streamable-http" | "streamable_http"
-            )
-        {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !MCP_SERVER_ENTRY_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ApiError::InvalidInput(format!(
+            "MCP server 配置不支持字段 {field}"
+        )));
+    }
+    match object.get("type").and_then(Value::as_str) {
+        Some(MCP_TRANSPORT_STDIO | MCP_TRANSPORT_STREAMABLE_HTTP) => {}
+        Some(other) => {
             return Err(ApiError::InvalidInput(format!(
-                "不支持的 MCP transport 类型: {requested}"
+                "不支持的 MCP transport 类型: {other}"
             )));
+        }
+        None => {
+            return Err(ApiError::InvalidInput(
+                "MCP server 配置缺少 type（stdio 或 streamable-http）".to_string(),
+            ));
         }
     }
     if let Some(headers) = object.get("headers") {
@@ -265,7 +266,7 @@ mod tests {
     fn request_normalization_accepts_url_only_http_server() {
         let entry = normalize_mcp_server_request_entry(&serde_json::json!({
             "id": "remote-server",
-            "type": "http",
+            "type": "streamable-http",
             "url": " https://example.test/mcp ",
             "headers": {
                 "Authorization": "Bearer test"
@@ -287,7 +288,7 @@ mod tests {
     fn request_normalization_rejects_invalid_http_url() {
         let error = normalize_mcp_server_request_entry(&serde_json::json!({
             "id": "remote-server",
-            "type": "http",
+            "type": "streamable-http",
             "url": "file:///tmp/mcp"
         }))
         .expect_err("HTTP MCP should reject non-HTTP URL schemes");
@@ -316,10 +317,8 @@ mod tests {
     fn request_normalization_canonicalizes_stdio_server() {
         let entry = normalize_mcp_server_request_entry(&serde_json::json!({
             "id": "stdio-server",
-            "command": " npx ",
-            "workspaceId": "workspace-old",
-            "workspacePath": "/tmp/old",
-            "sessionId": "session-old"
+            "type": "stdio",
+            "command": " npx "
         }))
         .expect("stdio MCP server should normalize");
 
@@ -329,39 +328,51 @@ mod tests {
         assert_eq!(entry["type"], serde_json::json!("stdio"));
         assert!(entry.get("url").is_none());
         assert!(entry.get("headers").is_none());
-        assert!(entry.get("workspaceId").is_none());
-        assert!(entry.get("workspacePath").is_none());
-        assert!(entry.get("sessionId").is_none());
     }
 
     #[test]
-    fn request_normalization_rejects_wrapped_server_payloads() {
-        for wrapper in ["server", "updates"] {
-            let error = normalize_mcp_server_request_entry(&serde_json::json!({
-                wrapper: {
+    fn request_normalization_rejects_fields_outside_schema() {
+        for (request, field) in [
+            (
+                serde_json::json!({
                     "id": "stdio-server",
-                    "command": "npx"
-                }
-            }))
-            .expect_err("MCP server request wrappers must not remain accepted");
-
+                    "type": "stdio",
+                    "command": "npx",
+                    "connected": true
+                }),
+                "connected",
+            ),
+            (
+                serde_json::json!({ "server": { "id": "stdio-server", "command": "npx" } }),
+                "server",
+            ),
+        ] {
+            let error = normalize_mcp_server_request_entry(&request)
+                .expect_err("MCP server 写入只接受当前 schema 字段");
             match error {
-                ApiError::InvalidInput(message) => {
-                    assert!(message.contains("server/updates"));
-                }
+                ApiError::InvalidInput(message) => assert!(message.contains(field), "{message}"),
                 other => panic!("unexpected error: {other:?}"),
             }
         }
     }
 
     #[test]
-    fn snapshot_normalization_infers_http_transport_from_url() {
+    fn request_normalization_requires_canonical_transport_type() {
+        for request in [
+            serde_json::json!({ "id": "remote", "type": "http", "url": "https://example.test/mcp" }),
+            serde_json::json!({ "id": "stdio-server", "command": "npx" }),
+        ] {
+            normalize_mcp_server_request_entry(&request)
+                .expect_err("MCP transport 只接受 stdio / streamable-http");
+        }
+    }
+
+    #[test]
+    fn snapshot_normalization_trims_http_entry() {
         let entry = normalize_mcp_server_snapshot_entry(&serde_json::json!({
             "id": " remote ",
-            "url": " https://example.test/mcp ",
-            "workspace_id": "workspace-old",
-            "workspace_path": "/tmp/old",
-            "session_id": "session-old"
+            "type": "streamable-http",
+            "url": " https://example.test/mcp "
         }))
         .expect("entry with id should remain visible");
 
@@ -370,25 +381,6 @@ mod tests {
         assert_eq!(entry["type"], serde_json::json!("streamable-http"));
         assert!(entry.get("command").is_none());
         assert_eq!(entry["url"], serde_json::json!("https://example.test/mcp"));
-        assert!(entry.get("workspace_id").is_none());
-        assert!(entry.get("workspace_path").is_none());
-        assert!(entry.get("session_id").is_none());
-    }
-
-    #[test]
-    fn snapshot_normalization_filters_wrapped_server_payloads() {
-        for wrapper in ["server", "updates"] {
-            assert!(
-                normalize_mcp_server_snapshot_entry(&serde_json::json!({
-                    wrapper: {
-                        "id": "wrapped",
-                        "command": "npx"
-                    }
-                }))
-                .is_none(),
-                "{wrapper} wrapper must not be restored from persisted MCP settings"
-            );
-        }
     }
 
     #[test]

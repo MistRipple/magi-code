@@ -4811,32 +4811,11 @@ impl ApiState {
 }
 
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
-    for key in [
-        "orchestrator",
-        "auxiliary",
-        "imageGeneration",
-        "safeguardConfig",
-    ] {
-        if let Some(value) = snapshot.get_mut(key) {
-            strip_scope_binding_fields(value);
-            if key == "orchestrator" {
-                strip_orchestrator_session_owned_fields(value);
-            }
-        }
-    }
     skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     normalize_safeguard_config_section(snapshot);
-}
-
-fn strip_orchestrator_session_owned_fields(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.remove("model");
-    object.remove("reasoningEffort");
 }
 
 fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
@@ -5109,12 +5088,11 @@ fn seed_user_rules_config(snapshot: &mut HashMap<String, serde_json::Value>) {
     );
 }
 
-fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json::Value {
-    strip_scope_binding_fields(&mut value);
-    match value {
-        serde_json::Value::String(user_rules) => serde_json::json!({ "userRules": user_rules }),
-        serde_json::Value::Object(_) => value,
-        _ => serde_json::json!({}),
+fn normalize_user_rules_config_value(value: serde_json::Value) -> serde_json::Value {
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({})
     }
 }
 

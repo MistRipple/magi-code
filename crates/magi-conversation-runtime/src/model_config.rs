@@ -664,7 +664,6 @@ pub fn resolve_orchestrator_model_config(
             .map_err(|error| format!("引擎 {engine_id} 的模型配置无效：{error}"));
     }
     let mut config = settings_store.get_section("orchestrator");
-    strip_orchestrator_session_owned_fields(&mut config);
     merge_orchestrator_session_override(&mut config, &defaults);
     merge_orchestrator_session_override(&mut config, &session_override);
     ensure_orchestrator_reasoning_effort(&mut config);
@@ -756,13 +755,6 @@ pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
             "reasoningEffort".to_string(),
             serde_json::Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
         );
-    }
-}
-
-pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
-    if let serde_json::Value::Object(base_map) = base {
-        base_map.remove("model");
-        base_map.remove("reasoningEffort");
     }
 }
 
@@ -989,7 +981,6 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "model": "global-model",
                     "apiProtocol": "openai_chat",
                 }),
             )

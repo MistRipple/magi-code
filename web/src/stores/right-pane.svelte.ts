@@ -14,7 +14,6 @@
  */
 
 import type { BrowserSessionSnapshot } from '../web/agent-api';
-import { isWebModelBrowserSession } from '../shared/web-model';
 
 export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'webSession';
 
@@ -1506,23 +1505,6 @@ export function synchronizeWebModelAppSession(
   if (!normalizedSessionId || !homeHost?.tabId) {
     if (rightPaneState.appTabs.length > 0) clearWebModelTab();
     return;
-  }
-  // 旧版曾把应用级会话快照误投影进当前会话的 `perSession`。应用级 Browser
-  // Tab 从产品上不允许出现在会话面板里；在收到权威 app 投影时一次性清理
-  // 这类进程内残留，避免用户看到多个同名“ChatGPT”标签，也避免旧标签继续
-  // 驱动同一个 guest。正常路径不会命中，但这是必要的运行时收敛而不是兼容
-  // 第二套状态源。
-  for (const pane of Object.values(rightPaneState.perSession)) {
-    const filtered = pane.openTabs.filter((tab) => {
-      if (tab.kind !== 'browser') return true;
-      const browserSessionId = (tab.payload as BrowserTabPayload).browserSessionId;
-      return !isWebModelBrowserSession(browserSessionId);
-    });
-    if (filtered.length === pane.openTabs.length) continue;
-    pane.openTabs = filtered;
-    if (pane.activeTabId && !filtered.some((tab) => tab.id === pane.activeTabId)) {
-      pane.activeTabId = filtered[0]?.id ?? null;
-    }
   }
   const tab = ensureWebModelTab(normalizedSessionId, homeHost);
   if (hosts) updateWebModelTabHosts(tab, hosts);

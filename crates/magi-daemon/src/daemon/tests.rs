@@ -3622,7 +3622,6 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
             "config": {
                 "baseUrl": "https://api.example.com/v1",
                 "apiKey": "sk-real-test",
-                "model": "global-main-model",
                 "urlMode": "standard",
                 "apiProtocol": "openai_chat",
                 "sessionId": "session-scoped-should-not-save",

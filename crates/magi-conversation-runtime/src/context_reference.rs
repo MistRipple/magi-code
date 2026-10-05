@@ -375,23 +375,19 @@ pub fn browser_node_selection_input_refs(selections: &[serde_json::Value]) -> Ve
                 .unwrap_or("unknown");
             let browser_session_id = selection
                 .get("browserSessionId")
-                .or_else(|| selection.get("browser_session_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let navigation_revision = selection
                 .get("navigationRevision")
-                .or_else(|| selection.get("navigation_revision"))
                 .and_then(Value::as_u64)
                 .map(|revision| revision.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             let node_name = selection
                 .get("nodeName")
-                .or_else(|| selection.get("node_name"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let dom_node_id = selection
                 .get("domNodeId")
-                .or_else(|| selection.get("dom_node_id"))
                 .and_then(Value::as_u64)
                 .map(|node_id| node_id.to_string())
                 .unwrap_or_else(|| "unknown".to_string());

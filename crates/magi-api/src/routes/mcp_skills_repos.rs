@@ -119,11 +119,6 @@ fn persist_instruction_skills(
 fn normalize_instruction_skill_entry(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    if request.get("skill").is_some() || request.get("updates").is_some() {
-        return Err(ApiError::InvalidInput(
-            "Skill 安装请求必须使用顶层 skillId，不能包裹在 skill/updates 中".to_string(),
-        ));
-    }
     let skill_id = request
         .get("skillId")
         .and_then(|value| value.as_str())
@@ -827,18 +822,10 @@ fn normalize_repository_entry(
     request: &serde_json::Value,
     allow_updates: bool,
 ) -> Result<serde_json::Value, ApiError> {
-    if request.get("repository").is_some() {
-        return Err(ApiError::InvalidInput(
-            "仓库配置必须使用顶层 url/repositoryId，不能包裹在 repository 中".to_string(),
-        ));
-    }
-    if request.get("updates").is_some() && !allow_updates {
-        return Err(ApiError::InvalidInput(
-            "新增仓库必须使用顶层 url，不能包裹在 updates 中".to_string(),
-        ));
-    }
     let mut entry = request.as_object().cloned().unwrap_or_default();
-    if let Some(updates) = request.get("updates").and_then(|value| value.as_object()) {
+    if allow_updates
+        && let Some(updates) = request.get("updates").and_then(|value| value.as_object())
+    {
         for (key, value) in updates {
             entry.insert(key.clone(), value.clone());
         }
@@ -2048,11 +2035,6 @@ async fn save_skills_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if request.get("config").is_some() || request.get("data").is_some() {
-        return Err(ApiError::InvalidInput(
-            "skillsConfig 必须作为顶层对象提交，不能包裹在 config/data 中".to_string(),
-        ));
-    }
     let config = request
         .as_object()
         .cloned()
@@ -2098,11 +2080,6 @@ async fn add_custom_tool(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if request.get("tool").is_some() {
-        return Err(ApiError::InvalidInput(
-            "自定义工具必须作为顶层对象提交，不能包裹在 tool 中".to_string(),
-        ));
-    }
     let mut entry = request.as_object().cloned().unwrap_or_default();
     strip_scope_binding_fields_from_map(&mut entry);
     let tool_name = entry
@@ -3170,6 +3147,7 @@ mod tests {
             serde_json::json!({
                 "id": "server-preserve-env",
                 "name": "server-preserve-env",
+                "type": "stdio",
                 "command": "node",
                 "env": {
                     "TOKEN": "new-secret-token",
@@ -3201,7 +3179,7 @@ mod tests {
             serde_json::json!({
                 "id": "http-server",
                 "name": "http-server",
-                "type": "http",
+                "type": "streamable-http",
                 "url": "https://example.test/mcp",
                 "headers": {
                     "Authorization": "Bearer secret"
@@ -3328,71 +3306,39 @@ done
     }
 
     #[tokio::test]
-    async fn mcp_server_save_strips_workspace_session_scope_fields() {
-        let state = test_state();
-        let app = Router::new().merge(routes()).with_state(state.clone());
-
-        let body = post_json(
-            app,
-            "/settings/mcp/add",
-            serde_json::json!({
-                "id": "server-scope-clean",
-                "name": "server-scope-clean",
-                "command": "node",
-                "enabled": false,
-                "workspaceId": "workspace-old",
-                "workspacePath": "/tmp/old",
-                "sessionId": "session-old"
-            }),
-        )
-        .await;
-
-        assert_eq!(body["added"], true);
-        let stored = stored_mcp_server_entry(&state, "server-scope-clean")
-            .expect("added server should remain stored");
-        for key in ["workspaceId", "workspacePath", "sessionId"] {
-            assert!(
-                stored.get(key).is_none(),
-                "MCP server settings are global and must not persist {key}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn mcp_server_save_rejects_wrapped_requests() {
-        for (path, wrapper) in [
-            ("/settings/mcp/add", "server"),
-            ("/settings/mcp/add", "updates"),
-            ("/settings/mcp/update", "server"),
-            ("/settings/mcp/update", "updates"),
+    async fn mcp_server_save_rejects_fields_outside_schema() {
+        for (path, request, field) in [
+            (
+                "/settings/mcp/add",
+                serde_json::json!({
+                    "id": "server-scope",
+                    "name": "server-scope",
+                    "type": "stdio",
+                    "command": "node",
+                    "workspaceId": "workspace-old"
+                }),
+                "workspaceId",
+            ),
+            (
+                "/settings/mcp/update",
+                serde_json::json!({ "server": { "id": "wrapped-server", "command": "node" } }),
+                "server",
+            ),
         ] {
             let app = Router::new().merge(routes()).with_state(test_state());
 
-            let (status, body) = post_json_with_status(
-                app,
-                path,
-                serde_json::json!({
-                    wrapper: {
-                        "id": "wrapped-server",
-                        "command": "node"
-                    }
-                }),
-            )
-            .await;
+            let (status, body) = post_json_with_status(app, path, request).await;
 
             assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
             assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("不能包裹在 server/updates 中"),
+                body["message"].as_str().unwrap_or_default().contains(field),
                 "unexpected body: {body}"
             );
         }
     }
 
     #[tokio::test]
-    async fn mcp_server_list_filters_legacy_wrapped_entries() {
+    async fn mcp_server_list_drops_entries_without_id() {
         let state = test_state();
         state
             .settings_store
@@ -3442,7 +3388,7 @@ done
             serde_json::json!({
                 "url": "https://github.com/example/skills",
                 "workspaceId": "workspace-old",
-                "workspace_path": "/tmp/old",
+                "workspacePath": "/tmp/old",
                 "sessionId": "session-old"
             }),
         )
@@ -3454,7 +3400,7 @@ done
     }
 
     #[tokio::test]
-    async fn repository_add_rejects_wrapped_requests() {
+    async fn repository_add_requires_top_level_url() {
         for payload in [
             serde_json::json!({
                 "repository": {
@@ -3475,8 +3421,7 @@ done
             assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
             let message = body["message"].as_str().unwrap_or_default();
             assert!(
-                message.contains("不能包裹在 repository 中")
-                    || message.contains("不能包裹在 updates 中"),
+                message.contains("repositoryId 或 url 不能为空"),
                 "unexpected body: {body}"
             );
         }
@@ -3524,7 +3469,7 @@ done
                         "repositoryId": "legacy-repo",
                         "url": "https://github.com/example/skills",
                         "workspaceId": "workspace-old",
-                        "workspace_path": "/tmp/old",
+                        "workspacePath": "/tmp/old",
                         "sessionId": "session-old"
                     }
                 ]),
@@ -3545,7 +3490,7 @@ done
         let normalized = normalize_instruction_skill_entry(&serde_json::json!({
             "skillId": "example/skill",
             "workspaceId": "workspace-old",
-            "workspace_path": "/tmp/old",
+            "workspacePath": "/tmp/old",
             "sessionId": "session-old"
         }))
         .expect("skill should normalize");
@@ -3593,17 +3538,16 @@ done
             "/settings/skills/config/save",
             serde_json::json!({
                 "workspaceId": "workspace-old",
-                "workspace_path": "/tmp/old",
+                "workspacePath": "/tmp/old",
                 "sessionId": "session-old",
                 "instructionSkills": [
                     {
                         "skillId": "example/skill",
-                        "skillName": "legacy-skill-name",
                         "workspaceId": "workspace-old",
-                        "session_id": "session-old"
+                        "sessionId": "session-old"
                     },
                     {
-                        "skillName": "legacy-skill-name-only"
+                        "name": "skill-without-id"
                     }
                 ],
                 "customTools": [
@@ -3630,7 +3574,6 @@ done
             stored["instructionSkills"][0]["skillId"],
             serde_json::json!("example/skill")
         );
-        assert!(stored["instructionSkills"][0].get("skillName").is_none());
     }
 
     #[tokio::test]
@@ -3728,38 +3671,6 @@ done
             state.settings_store.get_section("skillsConfig")["instructionSkills"][0]["enabled"],
             serde_json::json!(true)
         );
-    }
-
-    #[tokio::test]
-    async fn skills_config_save_rejects_config_data_wrappers() {
-        for wrapper in ["config", "data"] {
-            let state = test_state();
-            let app = Router::new().merge(routes()).with_state(state);
-
-            let (status, body) = post_json_with_status(
-                app,
-                "/settings/skills/config/save",
-                serde_json::json!({
-                    wrapper: {
-                        "instructionSkills": [
-                            {
-                                "skillId": "wrapped-skill"
-                            }
-                        ]
-                    }
-                }),
-            )
-            .await;
-
-            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
-            assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("不能包裹在 config/data 中"),
-                "unexpected body: {body}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -3895,7 +3806,7 @@ done
             serde_json::json!({
                 "name": "example-tool",
                 "workspaceId": "workspace-old",
-                "workspace_path": "/tmp/old",
+                "workspacePath": "/tmp/old",
                 "sessionId": "session-old"
             }),
         )
@@ -3909,31 +3820,6 @@ done
             serde_json::json!("example-tool")
         );
         assert!(stored["customTools"][0].get("toolName").is_none());
-    }
-
-    #[tokio::test]
-    async fn custom_tool_add_rejects_tool_wrapper() {
-        let app = Router::new().merge(routes()).with_state(test_state());
-
-        let (status, body) = post_json_with_status(
-            app,
-            "/settings/skills/custom-tool/add",
-            serde_json::json!({
-                "tool": {
-                    "name": "example-tool"
-                }
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("不能包裹在 tool 中"),
-            "unexpected body: {body}"
-        );
     }
 
     #[tokio::test]
