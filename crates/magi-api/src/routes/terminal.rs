@@ -119,9 +119,9 @@ fn resolve_terminal_binding(
         session_scope::SessionScope::Personal => {
             state.personal_session_execution_root(&session_id)?
         }
-        session_scope::SessionScope::Workspace(binding) => {
-            std::path::PathBuf::from(&binding.workspace_path)
-        }
+        session_scope::SessionScope::Workspace(binding) => state
+            .session_isolation_root(&session_id)
+            .unwrap_or_else(|| std::path::PathBuf::from(&binding.workspace_path)),
     };
     Ok(TerminalBinding {
         terminal_tab_id: terminal_tab_id.to_string(),

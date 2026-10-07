@@ -1,0 +1,15 @@
+[package]
+name = "magi-session-isolation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-snapshot = { path = "../magi-snapshot" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

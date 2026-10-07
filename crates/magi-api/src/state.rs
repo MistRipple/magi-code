@@ -1278,6 +1278,8 @@ pub struct ApiState {
     pub git_service: Arc<magi_git::GitService>,
     /// 主对话 session 与代码/Git 上下文的正交绑定，不承载 conversation fork 或任务分支。
     pub session_code_contexts: magi_git::SessionCodeContextRegistry,
+    /// 运行在隔离工作副本里的会话。隔离会话不占用主工作区的执行租约，也没有主工作区的 Git 上下文。
+    pub session_isolations: magi_session_isolation::SessionIsolationRegistry,
     /// turn/worker 与 Git mutation 的 workspace 级 lease 协调器，消除“检查后立即竞态”。
     pub workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
     pub governance: Arc<GovernanceService>,
@@ -2063,6 +2065,7 @@ impl ApiState {
             workspace_registry,
             git_service: Arc::new(magi_git::GitService::new()),
             session_code_contexts: magi_git::SessionCodeContextRegistry::default(),
+            session_isolations: magi_session_isolation::SessionIsolationRegistry::default(),
             workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
             governance,
             knowledge_store: Arc::new(KnowledgeStore::new()),
@@ -2139,8 +2142,29 @@ impl ApiState {
         session_id: &SessionId,
         workspace_root: &Path,
     ) -> Option<Arc<SnapshotSession>> {
+        let workspace_root = self.snapshot_root_for_session(session_id, workspace_root);
         self.snapshot_manager
-            .get_session_for_workspace(session_id.as_str(), workspace_root)
+            .get_session_for_workspace(session_id.as_str(), &workspace_root)
+    }
+
+    /// 隔离会话的变更账本建立在隔离副本上；调用方按习惯传入主工作区路径时在这里换成副本路径，
+    /// 这样变更面板、MCP、Git 面板等所有按「会话 + 工作区」取账本的入口都自然指向副本。
+    pub(crate) fn snapshot_root_for_session(
+        &self,
+        session_id: &SessionId,
+        workspace_root: &Path,
+    ) -> PathBuf {
+        let Some(isolation) = self.session_isolations.get(session_id.as_str()) else {
+            return workspace_root.to_path_buf();
+        };
+        let canonical = std::fs::canonicalize(workspace_root).ok();
+        if workspace_root == isolation.source_root
+            || canonical.as_deref() == Some(isolation.source_root.as_path())
+        {
+            isolation.root
+        } else {
+            workspace_root.to_path_buf()
+        }
     }
 
     pub(crate) async fn ensure_snapshot_session(
@@ -2151,11 +2175,9 @@ impl ApiState {
         if let Some(session) = self.snapshot_session(session_id, workspace_root) {
             return Ok(session);
         }
+        let workspace_root = self.snapshot_root_for_session(session_id, workspace_root);
         self.snapshot_manager
-            .start_session(
-                session_id.as_str().to_string(),
-                workspace_root.to_path_buf(),
-            )
+            .start_session(session_id.as_str().to_string(), workspace_root)
             .await
             .map_err(|error| ApiError::internal_assembly("启动会话快照账本失败", error))
     }
@@ -2181,6 +2203,10 @@ impl ApiState {
                 .reconcile_async()
                 .await
                 .map_err(|error| ApiError::internal_assembly("刷新磁盘变更状态失败", error))?;
+        }
+        // 隔离副本有自己独立的 Git 状态，不与主工作区的 branch/HEAD 对齐。
+        if self.session_isolations.contains(session_id.as_str()) {
+            return Ok(snapshot);
         }
 
         let Some(existing_context) = self.session_code_contexts.get(session_id.as_str()) else {
@@ -3433,6 +3459,7 @@ impl ApiState {
 
     pub fn with_runtime_persistence(mut self, persistence: Arc<RuntimeStatePersistence>) -> Self {
         if let Some(state_root) = persistence.state_root() {
+            self.restore_session_isolations_from(state_root);
             let path = state_root.join("session-git-contexts.json");
             match fs::read(&path) {
                 Ok(bytes) => {
@@ -3710,6 +3737,10 @@ impl ApiState {
         let Some(workspace_id) = workspace_id else {
             return Ok(None);
         };
+        // 隔离会话在自己的副本里运行：没有主工作区的 Git 上下文，也不需要执行租约。
+        if self.session_isolations.contains(session_id.as_str()) {
+            return Ok(None);
+        }
         let workspace_root = self
             .workspace_root_path(&Some(workspace_id.clone()))
             .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
@@ -4427,7 +4458,7 @@ impl ApiState {
         .await
     }
 
-    async fn lock_session_change_sync(
+    pub(crate) async fn lock_session_change_sync(
         &self,
         session_id: &SessionId,
     ) -> tokio::sync::OwnedMutexGuard<()> {
@@ -4710,6 +4741,7 @@ impl ApiState {
         self.remove_browser_artifacts_for_session(session_id);
         self.terminal_sessions
             .close_for_session(session_id.as_str());
+        self.cleanup_session_isolation(session_id).await;
         self.cleanup_session_git_resources(session_id).await;
         self.settings_store
             .remove_session(session_id)
@@ -6793,6 +6825,68 @@ mod tests {
                 .expect("app session must survive close")
                 .lifecycle,
             BrowserSessionLifecycle::Ready
+        );
+    }
+
+    #[test]
+    fn session_isolation_round_trips_through_runtime_persistence_and_drops_missing_copies() {
+        let root = tempfile::tempdir().expect("state root");
+        let alive_copy = tempfile::tempdir().expect("isolated copy");
+        let persistence = || {
+            Arc::new(RuntimeStatePersistence::new(
+                root.path(),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ))
+        };
+        let new_state = || {
+            ApiState::new(
+                "magi-test",
+                Arc::new(InMemoryEventBus::new(32)),
+                Arc::new(SessionStore::default()),
+                Arc::new(WorkspaceStore::default()),
+                Arc::new(GovernanceService::default()),
+            )
+            .with_runtime_persistence(persistence())
+        };
+        let isolation = |session: &str, copy: &Path| magi_session_isolation::SessionIsolation {
+            session_id: session.to_string(),
+            workspace_id: "workspace-isolation-persist".to_string(),
+            source_root: PathBuf::from("/repo"),
+            root: copy.to_path_buf(),
+            origin: magi_session_isolation::IsolationOrigin::Manual,
+            strategy: magi_session_isolation::CloneStrategy::Clone,
+            linked_dirs: Vec::new(),
+            git_available: true,
+            created_at_ms: 1,
+        };
+        let state = new_state();
+        state
+            .session_isolations
+            .insert(isolation("alive-session", alive_copy.path()));
+        state
+            .session_isolations
+            .insert(isolation("gone-session", Path::new("/definitely/not/here")));
+        state
+            .persist_session_isolations()
+            .expect("persist session isolations");
+
+        let reloaded = new_state();
+        assert!(reloaded.session_isolations.contains("alive-session"));
+        assert!(
+            !reloaded.session_isolations.contains("gone-session"),
+            "副本目录已经不存在的会话回到主工作区运行"
+        );
+        assert_eq!(
+            reloaded
+                .snapshot_root_for_session(&SessionId::new("alive-session"), Path::new("/repo")),
+            alive_copy.path(),
+            "隔离会话的变更账本取副本路径"
+        );
+        assert_eq!(
+            reloaded
+                .snapshot_root_for_session(&SessionId::new("other-session"), Path::new("/repo")),
+            Path::new("/repo")
         );
     }
 

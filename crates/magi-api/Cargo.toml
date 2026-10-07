@@ -37,6 +37,7 @@ magi-orchestrator = { path = "../magi-orchestrator" }
 magi-process = { path = "../magi-process" }
 magi-session-store = { path = "../magi-session-store" }
 magi-settings-store = { path = "../magi-settings-store" }
+magi-session-isolation = { path = "../magi-session-isolation" }
 magi-snapshot = { path = "../magi-snapshot" }
 magi-plan = { path = "../magi-plan" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }

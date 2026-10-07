@@ -34,6 +34,7 @@ members = [
   "crates/magi-plan",
   "crates/magi-project-memory",
   "crates/magi-snapshot",
+  "crates/magi-session-isolation",
 ]
 
 [workspace.package]

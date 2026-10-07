@@ -384,10 +384,35 @@ async fn approve_change(
         None,
     )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    let snapshot = require_snapshot_session(&state, &scope, true).await?;
-    snapshot
-        .approve(&[rel])
-        .map_err(|e| ApiError::internal_assembly("approve 变更失败", e))?;
+    if state.session_isolation(&session_id).is_some() {
+        // 隔离会话的「批准」就是把这个改动合并回主工作区；与主工作区冲突的文件要到合并面板里决定。
+        let outcome = state
+            .isolation_merge_apply(
+                &session_id,
+                magi_session_isolation::MergeSelection {
+                    paths: Some(vec![rel.clone()]),
+                    resolutions: Default::default(),
+                },
+            )
+            .await?;
+        if let Some(failure) = outcome.failed.first() {
+            return Err(ApiError::InvalidInput(format!(
+                "合并到主工作区失败：{}",
+                failure.error
+            )));
+        }
+        if !outcome.unresolved.is_empty() {
+            return Err(ApiError::conflict(
+                "该文件与主工作区的改动冲突，请在合并面板里选择保留哪一边",
+                &rel,
+            ));
+        }
+    } else {
+        let snapshot = require_snapshot_session(&state, &scope, true).await?;
+        snapshot
+            .approve(&[rel])
+            .map_err(|e| ApiError::internal_assembly("approve 变更失败", e))?;
+    }
     Ok(Json(serde_json::json!({
         "approved": true,
         "filePath": request.file_path,
@@ -454,6 +479,36 @@ async fn approve_all_changes(
         request.workspace_path.as_deref(),
         None,
     )?;
+    if state.session_isolation(&session_id).is_some() {
+        // 隔离会话的「全部批准」合并所有没有冲突的改动；有冲突的留在副本里，由合并面板处理。
+        let outcome = state
+            .isolation_merge_apply(
+                &session_id,
+                magi_session_isolation::MergeSelection::default(),
+            )
+            .await?;
+        if let Some(failure) = outcome.failed.first() {
+            return Err(ApiError::InvalidInput(format!(
+                "合并到主工作区失败：{}",
+                failure.error
+            )));
+        }
+        let approved_files: Vec<String> = outcome
+            .applied
+            .iter()
+            .chain(outcome.already_applied.iter())
+            .cloned()
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "approved": outcome.unresolved.is_empty(),
+            "approvedFiles": approved_files,
+            "unresolvedFiles": outcome.unresolved,
+            "sessionId": scope.session_id.as_str(),
+            "workspaceId": scope.workspace_id.as_str(),
+            "workspacePath": workspace_path_string(&scope.workspace_root),
+            "executionGroupId": scope.execution_group_id,
+        })));
+    }
     let snapshot = require_snapshot_session(&state, &scope, true).await?;
     let pending = snapshot
         .pending_changes()

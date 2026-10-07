@@ -671,6 +671,17 @@ impl SnapshotSession {
     /// 基础策略是 baseline vs current 的差集（add / modify / delete）；若同一 blob_hash 同时
     /// 出现在一条 `Deleted` 与一条 `Added` 中，则配对折叠成 `Renamed`，并由 `old_path` 指回
     /// 原 baseline 路径，确保 rename 不再被前端误解为删除 + 新增。
+    /// 该路径在 baseline 中的元信息；不存在表示 baseline 里没有这个文件。
+    ///
+    /// 隔离副本合并回主工作区时用它作为三方比较的共同祖先。
+    pub fn baseline_meta(&self, path: &str) -> Option<FileMeta> {
+        self.baseline
+            .read()
+            .expect("baseline poisoned")
+            .get(path)
+            .cloned()
+    }
+
     pub fn pending_changes(&self) -> SnapshotResult<Vec<PendingChange>> {
         let baseline = self.baseline.read().expect("baseline poisoned");
         let current = self.current.read().expect("current poisoned");

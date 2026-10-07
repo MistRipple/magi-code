@@ -8802,6 +8802,294 @@ done
         let _ = fs::remove_dir_all(workspace_root);
     }
 
+    fn register_plain_workspace(
+        harness: &MagiTurnHarness,
+        label: &str,
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, magi_core::WorkspaceId) {
+        let workspace_root = tempfile::tempdir().expect("workspace should create");
+        for (path, content) in files {
+            fs::write(workspace_root.path().join(path), content).expect("fixture file");
+        }
+        let workspace_id = magi_core::WorkspaceId::new(format!("harness-isolation-{label}"));
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("workspace should register");
+        (workspace_root, workspace_id)
+    }
+
+    fn create_workspace_session(
+        harness: &MagiTurnHarness,
+        workspace_id: &magi_core::WorkspaceId,
+        session: &str,
+    ) -> SessionId {
+        let session_id = SessionId::new(session);
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                session,
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        session_id
+    }
+
+    #[tokio::test]
+    async fn isolated_session_works_in_its_own_copy_until_the_user_merges() {
+        let harness = MagiTurnHarness::new_task("隔离副本完成");
+        let (workspace_root, workspace_id) =
+            register_plain_workspace(&harness, "merge", &[("a.txt", "original")]);
+        let session_id =
+            create_workspace_session(&harness, &workspace_id, "isolated-merge-session");
+        let isolation = harness
+            .state
+            .enable_session_isolation(
+                &session_id,
+                &workspace_id,
+                magi_session_isolation::IsolationOrigin::Manual,
+            )
+            .await
+            .expect("手动启用隔离副本");
+        assert_ne!(isolation.root, workspace_root.path());
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("a.txt")).unwrap(),
+            "original"
+        );
+
+        // 命令用相对路径：cwd 必须是隔离副本，而不是主工作区。
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({ "command": "printf changed > a.txt && printf created > b.txt" })
+                .to_string(),
+            "隔离副本里已修改",
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 修改文件",
+                "harness-isolation-merge",
+                "harness-isolation-merge-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("隔离会话的 Turn 应被接纳");
+        let turn_id = response.turn_id.clone().expect("应有 Turn");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+
+        // 主工作区原封不动，改动都在副本里。
+        assert_eq!(
+            fs::read_to_string(workspace_root.path().join("a.txt")).unwrap(),
+            "original"
+        );
+        assert!(!workspace_root.path().join("b.txt").exists());
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("a.txt")).unwrap(),
+            "changed"
+        );
+        // 隔离会话没有主工作区的 Git 上下文，也不占执行租约。
+        assert!(
+            harness
+                .state
+                .session_code_contexts
+                .get(session_id.as_str())
+                .is_none()
+        );
+
+        let plan = harness
+            .state
+            .isolation_merge_plan(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(plan.entries.len(), 2, "{plan:?}");
+        assert_eq!(plan.count(magi_session_isolation::MergeState::Clean), 2);
+
+        let outcome = harness
+            .state
+            .isolation_merge_apply(
+                &session_id,
+                magi_session_isolation::MergeSelection::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.applied.len(), 2, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(workspace_root.path().join("a.txt")).unwrap(),
+            "changed"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.path().join("b.txt")).unwrap(),
+            "created"
+        );
+        assert!(
+            harness
+                .state
+                .isolation_merge_plan(&session_id)
+                .await
+                .unwrap()
+                .entries
+                .is_empty(),
+            "合并后基线推进，不再有待合并改动"
+        );
+
+        harness
+            .state
+            .discard_session_isolation(&session_id)
+            .await
+            .expect("丢弃隔离副本");
+        assert!(harness.state.session_isolation(&session_id).is_none());
+        assert!(!isolation.root.exists(), "副本目录应被删除");
+        assert!(
+            workspace_root.path().join("b.txt").exists(),
+            "丢弃副本不影响已合并的主工作区"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_session_is_isolated_automatically_when_the_workspace_is_busy() {
+        let harness = MagiTurnHarness::new_task("自动隔离完成");
+        let (workspace_root, workspace_id) =
+            register_plain_workspace(&harness, "contention", &[("a.txt", "original")]);
+        let busy = create_workspace_session(&harness, &workspace_id, "contention-busy-session");
+        let second = create_workspace_session(&harness, &workspace_id, "contention-second-session");
+        // busy 会话在主工作区里有一轮仍在运行。
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &harness.state.session_store,
+            harness.state.turn_coordinator(),
+            &busy,
+            "turn-busy",
+            1,
+            magi_core::UtcMillis(1_777_000_000_100),
+            "running",
+            "另一个会话正在执行",
+        );
+
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({ "command": "printf second > a.txt" }).to_string(),
+            "第二个会话已完成",
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &second,
+                &workspace_id,
+                workspace_root.path(),
+                "调用 shell_exec 修改文件",
+                "harness-isolation-contention",
+                "harness-isolation-contention-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("第二个会话的 Turn 应被接纳");
+        let turn_id = response.turn_id.clone().expect("应有 Turn");
+        let turn = harness.wait_for_terminal(&second, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+
+        let isolation = harness
+            .state
+            .session_isolation(&second)
+            .expect("工作区被占用时第二个会话应被自动隔离");
+        assert_eq!(
+            isolation.origin,
+            magi_session_isolation::IsolationOrigin::Contention {
+                blocking_session_id: busy.as_str().to_string()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.path().join("a.txt")).unwrap(),
+            "original",
+            "自动隔离的会话不能碰主工作区"
+        );
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("a.txt")).unwrap(),
+            "second"
+        );
+        assert!(
+            harness.state.session_isolation(&busy).is_none(),
+            "正在执行的会话不受影响"
+        );
+        let _ = fs::remove_dir_all(isolation.root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn git_workspace_contention_isolates_instead_of_waiting_for_the_repository_lease() {
+        let (harness, workspace_id, workspace_root, second) =
+            prepare_git_approval_case("isolate-git", "Git 工作区被占用时自动隔离");
+        let busy = create_workspace_session(&harness, &workspace_id, "git-contention-busy-session");
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &harness.state.session_store,
+            harness.state.turn_coordinator(),
+            &busy,
+            "turn-git-busy",
+            1,
+            magi_core::UtcMillis(1_777_000_000_200),
+            "running",
+            "另一个会话正在执行",
+        );
+        let git_common_dir = workspace_root.join(".git");
+        harness
+            .state
+            .workspace_git_coordinator
+            .begin_execution(busy.as_str(), &git_common_dir)
+            .expect("busy 会话占着仓库租约");
+
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({ "command": "printf isolated > notes.txt && git status --short" })
+                .to_string(),
+            "隔离副本里的 Git 可用",
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &second,
+                &workspace_id,
+                &workspace_root,
+                "调用 shell_exec 写文件并查看 git 状态",
+                "harness-isolation-git",
+                "harness-isolation-git-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .expect("Turn 应被接纳");
+        let turn_id = response.turn_id.clone().expect("应有 Turn");
+        // 不需要等 busy 会话释放仓库：隔离后直接完成。
+        let turn = harness.wait_for_terminal(&second, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+
+        let isolation = harness
+            .state
+            .session_isolation(&second)
+            .expect("应被自动隔离");
+        assert!(
+            isolation.git_available,
+            "独立的 .git 目录会一起复制，副本里 Git 可用"
+        );
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("notes.txt")).unwrap(),
+            "isolated"
+        );
+        assert!(!workspace_root.join("notes.txt").exists());
+        assert!(
+            !harness
+                .state
+                .workspace_git_coordinator
+                .session_holds_execution(second.as_str(), &git_common_dir),
+            "隔离会话不占用主工作区的仓库租约"
+        );
+        harness
+            .state
+            .workspace_git_coordinator
+            .end_execution(busy.as_str());
+        let _ = fs::remove_dir_all(isolation.root.parent().unwrap());
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
     async fn ask_user_question_is_cancelled_when_the_turn_is_interrupted() {
         let (harness, workspace_id, workspace_root, session_id) =

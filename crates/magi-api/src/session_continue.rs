@@ -893,7 +893,7 @@ where
     let execution_root = if workspace_id.is_none() {
         Some(state.personal_session_execution_root(session_id)?)
     } else {
-        None
+        state.session_isolation_root(session_id)
     };
     state
         .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)

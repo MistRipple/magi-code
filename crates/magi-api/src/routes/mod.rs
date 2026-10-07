@@ -10,6 +10,7 @@ mod knowledge;
 mod mcp_server;
 mod mcp_skills_repos;
 mod messages;
+mod session_isolation;
 mod session_scope;
 pub(crate) mod sessions;
 pub(crate) mod settings;
@@ -291,6 +292,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(crate::app_server::routes())
         .merge(workspace_vcs::routes())
         .merge(sessions::routes())
+        .merge(session_isolation::routes())
         .merge(goals::routes())
         .merge(knowledge::routes())
         .merge(settings::routes())

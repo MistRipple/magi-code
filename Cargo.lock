@@ -1159,6 +1159,7 @@ dependencies = [
  "magi-process",
  "magi-runtime-state",
  "magi-safety-gate",
+ "magi-session-isolation",
  "magi-session-store",
  "magi-settings-store",
  "magi-skill-runtime",
@@ -1518,6 +1519,19 @@ version = "3.0.52"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magi-session-isolation"
+version = "3.0.52"
+dependencies = [
+ "magi-snapshot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -73,6 +73,9 @@ branch/merge/delete/worktree mutation。外部终端不服从进程内 lease，�
 session；这保留用户当前 dirty 文件。若未来要求多个主 session 同时写入，应升级为
 session 专属 branch + worktree，不能允许它们并行共享 live worktree。
 
+多个会话需要同时在同一个工作区执行时，不必排队等待：会话可以运行在隔离工作副本里，彼此没有共享的
+worktree，也就不需要这把租约。机制、触发条件和合并语义见 [会话隔离工作副本](session-isolation.md)。
+
 ### 2.4 子代理
 
 子代理从父 `SessionGitContext.base_head` 派生，不读取“当下可能已变化”的全局 workspace：

@@ -177,11 +177,11 @@ pub(super) async fn accept_goal_continuation_task_submission(
     execution_goal: String,
     accepted_at: UtcMillis,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
-    let execution_root = if workspace_id.is_none() {
-        Some(state.personal_session_execution_root_path(&session_id))
-    } else {
-        None
-    };
+    // 目标续跑同样要避开正在使用主工作区的其它会话：能自动隔离就隔离，不能就在主工作区排队。
+    state
+        .isolate_on_workspace_contention(&session_id, &workspace_id, true)
+        .await;
+    let execution_root = state.session_execution_root_override(&session_id, &workspace_id);
     let entry_id = format!(
         "timeline-goal-continuation-{}-{}",
         session_id, accepted_at.0
@@ -309,14 +309,20 @@ async fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
-    let execution_root = workspace_id
-        .as_ref()
-        .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
-        .or(if workspace_id.is_none() {
-            Some(state.personal_session_execution_root_path(&session_id))
-        } else {
-            None
-        });
+    // 同一工作区里已有会话在主工作区执行时，这一轮自动改在隔离副本里运行，互不等待、互不覆盖。
+    state
+        .isolate_on_workspace_contention(&session_id, &workspace_id, use_tools)
+        .await;
+    let execution_root = state.session_isolation_root(&session_id).or_else(|| {
+        workspace_id
+            .as_ref()
+            .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
+            .or(if workspace_id.is_none() {
+                Some(state.personal_session_execution_root_path(&session_id))
+            } else {
+                None
+            })
+    });
     let browser_annotation_refs = match resolve_browser_annotation_context(
         state,
         &session_id,
