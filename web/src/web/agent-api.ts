@@ -18,6 +18,7 @@ import type {
   SessionToolApprovalResponseDto,
   SessionToolApprovalsResponseDto,
   SessionUserQuestionResponseDto,
+  SkillDetailDto,
   SessionUserQuestionsResponseDto,
   UserQuestionResponseDto,
   ToolApprovalDecision,
@@ -3640,6 +3641,18 @@ export async function refreshAgentRepository(repositoryId: string): Promise<Reco
 export async function loadAgentSkillLibrary(): Promise<SkillsLibraryResponseDto> {
   const response = await getTransport().request(agentUrl('/api/settings/skills/library'));
   return await parseAgentJson<SkillsLibraryResponseDto>(response, 'load skill library');
+}
+
+export async function getAgentSkillDetail(skillId: string): Promise<SkillDetailDto> {
+  const normalized = skillId.trim();
+  if (!normalized) {
+    throw new AgentApiError(400, 'skillId 不能为空', 'load skill detail');
+  }
+  const response = await getTransport().request(
+    agentUrl('/api/settings/skills/detail', new URLSearchParams({ skillId: normalized }).toString()),
+    { cache: 'no-store' },
+  );
+  return await parseAgentJson<SkillDetailDto>(response, 'load skill detail');
 }
 
 export async function installAgentSkill(skillId: string): Promise<Record<string, unknown>> {

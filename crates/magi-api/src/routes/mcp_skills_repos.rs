@@ -57,10 +57,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/skills/library", get(list_skills))
         .route("/settings/skills/install", post(install_skill))
         .route("/settings/skills/install-local", post(install_local_skill))
-        .route(
-            "/settings/skills/instruction-preview",
-            get(get_instruction_skill_preview),
-        )
+        .route("/settings/skills/detail", get(get_instruction_skill_detail))
         .route(
             "/settings/skills/scan-local",
             post(scan_local_skill_directory),
@@ -2604,7 +2601,52 @@ fn skill_cache_error(action: &'static str, path: &Path, error: impl Display) -> 
     ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string())
 }
 
-async fn get_instruction_skill_preview(
+/// Skill 详情：说明文件全文与目录里的文件清单，供设置页“查看详情”展示。
+/// 只返回相对路径与大小，不暴露本机绝对路径。
+const SKILL_DETAIL_MAX_INSTRUCTION_BYTES: usize = 256 * 1024;
+const SKILL_DETAIL_MAX_FILES: usize = 60;
+const SKILL_DETAIL_MAX_DEPTH: usize = 3;
+
+fn skill_detail_file_list(root: &Path) -> Vec<serde_json::Value> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if out.len() >= SKILL_DETAIL_MAX_FILES {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth < SKILL_DETAIL_MAX_DEPTH {
+                    walk(root, &path, depth + 1, out);
+                }
+            } else if file_type.is_file()
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                out.push((relative.to_string_lossy().replace('\\', "/"), size));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, root, 1, &mut files);
+    files
+        .into_iter()
+        .map(|(path, size)| serde_json::json!({ "path": path, "size": size }))
+        .collect()
+}
+
+async fn get_instruction_skill_detail(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -2624,11 +2666,29 @@ async fn get_instruction_skill_preview(
         .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
     let instruction = skill_loader::read_available_skill_instruction(&dir)
         .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
-    let preview: String = instruction.chars().take(200).collect();
+    let instruction_file = ["prompt.md", "SKILL.md", "README.md"]
+        .into_iter()
+        .find(|name| dir.join(name).is_file())
+        .unwrap_or("SKILL.md");
+    let total_bytes = instruction.len();
+    let truncated = total_bytes > SKILL_DETAIL_MAX_INSTRUCTION_BYTES;
+    let instruction = if truncated {
+        let mut end = SKILL_DETAIL_MAX_INSTRUCTION_BYTES;
+        while !instruction.is_char_boundary(end) {
+            end -= 1;
+        }
+        instruction[..end].to_string()
+    } else {
+        instruction
+    };
 
     Ok(Json(serde_json::json!({
         "skillId": skill_id,
-        "preview": preview,
+        "instructionFile": instruction_file,
+        "instruction": instruction,
+        "instructionBytes": total_bytes,
+        "truncated": truncated,
+        "files": skill_detail_file_list(&dir),
     })))
 }
 
@@ -3665,7 +3725,7 @@ done
     }
 
     #[tokio::test]
-    async fn instruction_skill_preview_rejects_unavailable_source() {
+    async fn instruction_skill_detail_rejects_unavailable_source() {
         let state = test_state();
         let missing_dir =
             std::env::temp_dir().join(format!("magi-missing-skill-{}", epoch_ms_now()));
@@ -3685,7 +3745,7 @@ done
             )
             .unwrap();
 
-        let error = get_instruction_skill_preview(
+        let error = get_instruction_skill_detail(
             State(state),
             Query(HashMap::from([(
                 "skillId".to_string(),
@@ -3697,6 +3757,53 @@ done
 
         assert_eq!(error.message(), "技能源不可用，请重新导入该 Skill");
         assert!(!error.message().contains("magi-missing-skill"));
+    }
+
+    #[tokio::test]
+    async fn instruction_skill_detail_returns_full_instruction_and_relative_file_list() {
+        let state = test_state();
+        let dir = std::env::temp_dir().join(format!("magi-skill-detail-{}", epoch_ms_now()));
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: demo\ndescription: 演示\n---\n# 演示\n{}", "正文。".repeat(200)),
+        )
+        .unwrap();
+        std::fs::write(dir.join("scripts/run.sh"), "echo ok\n").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        state
+            .settings_store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [{
+                        "skillId": "demo-skill",
+                        "name": "demo",
+                        "directoryPath": dir.to_string_lossy().to_string()
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let Json(detail) = get_instruction_skill_detail(
+            State(state),
+            Query(HashMap::from([("skillId".to_string(), "demo-skill".to_string())])),
+        )
+        .await
+        .expect("detail should load");
+
+        assert_eq!(detail["instructionFile"], "SKILL.md");
+        assert_eq!(detail["truncated"], false);
+        assert!(detail["instruction"].as_str().unwrap().contains("# 演示"));
+        let files: Vec<&str> = detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(files, ["SKILL.md", "scripts/run.sh"], "只列相对路径，隐藏文件不列");
+        assert!(!detail.to_string().contains("magi-skill-detail"), "不得暴露本机绝对路径");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -3722,7 +3829,7 @@ done
             "unexpected body: {update_body}"
         );
 
-        let preview_error = get_instruction_skill_preview(
+        let preview_error = get_instruction_skill_detail(
             State(test_state()),
             Query(HashMap::from([(
                 "skillName".to_string(),
@@ -3730,7 +3837,7 @@ done
             )])),
         )
         .await
-        .expect_err("legacy preview key should be rejected");
+        .expect_err("legacy detail key should be rejected");
         assert_eq!(preview_error.message(), "skillId 不能为空");
     }
 

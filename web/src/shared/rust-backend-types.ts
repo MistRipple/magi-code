@@ -251,6 +251,16 @@ export interface SessionToolApprovalsResponseDto {
   pendingApprovals: PendingToolApprovalDto[];
 }
 
+/** 设置页“查看 Skill 详情”：说明文件全文与目录里的相对文件清单（不含本机绝对路径）。 */
+export interface SkillDetailDto {
+  skillId: string;
+  instructionFile: string;
+  instruction: string;
+  instructionBytes: number;
+  truncated: boolean;
+  files: Array<{ path: string; size: number }>;
+}
+
 /** 模型通过 `ask_user_question` 向用户提出的一道选择题。“其他”由界面固定追加，不在 options 里。 */
 export interface UserQuestionDto {
   question: string;

@@ -3,6 +3,10 @@
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
+  import MarkdownContent from './MarkdownContent.svelte';
+  import { getAgentSkillDetail } from '../web/agent-api';
+  import { formatSkillFileSize, splitSkillInstruction } from '../lib/skill-instruction';
+  import type { SkillDetailDto } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
   import {
     getBuiltinToolFallbackLabel,
@@ -137,6 +141,37 @@
     if (skill.updateStatus === 'source_missing' || skill.updateStatus === 'source_removed') return 'error';
     if (skill.updateStatus === 'local_modified') return 'modified';
     return 'success';
+  }
+
+  // Skill 详情：行内展开，首次展开时按需读取说明文件全文与文件清单。
+  type SkillDetailState =
+    | { status: 'loading' }
+    | { status: 'error'; message: string }
+    | { status: 'ready'; detail: SkillDetailDto };
+  let skillExpandedId = $state<string | null>(null);
+  let skillDetails = $state<Record<string, SkillDetailState>>({});
+  let skillRawView = $state<Record<string, boolean>>({});
+
+  async function loadSkillDetail(skillId: string): Promise<void> {
+    skillDetails[skillId] = { status: 'loading' };
+    try {
+      skillDetails[skillId] = { status: 'ready', detail: await getAgentSkillDetail(skillId) };
+    } catch (error) {
+      skillDetails[skillId] = {
+        status: 'error',
+        message: error instanceof Error ? error.message : i18n.t('settings.tools.skillDetailLoadFailed'),
+      };
+    }
+  }
+
+  function toggleSkillDetail(skillId: string): void {
+    if (skillExpandedId === skillId) {
+      skillExpandedId = null;
+      return;
+    }
+    skillExpandedId = skillId;
+    // 说明文件可能在磁盘上被改过：每次展开都重新读取，不缓存陈旧内容。
+    void loadSkillDetail(skillId);
   }
 
   function formatSkillCheckedAt(value: number): string {
@@ -1001,7 +1036,8 @@
               </div>
             {:else}
               <div class="skill-list">
-              {#each skills as skill}
+              {#each skills as skill (skill.skillId)}
+                <div class="skill-item">
                 <div class="skill-row" class:disabled={skill.source !== 'custom' && skill.enabled === false}>
                   <div class="skill-avatar">
                     <Icon name={skill.origin === 'local' ? 'folder' : 'tools'} size={13} />
@@ -1057,7 +1093,71 @@
                     {#if skillUpdatingIds.has(skill.skillId)}
                       <span class="skill-row-progress"><Icon name="refresh" size={13} /></span>
                     {/if}
+                    <button
+                      type="button"
+                      class="btn-icon btn-icon--sm mcp-expand-button skill-detail-toggle"
+                      title={i18n.t('settings.tools.skillDetail')}
+                      aria-label={i18n.t('settings.tools.skillDetail')}
+                      aria-expanded={skillExpandedId === skill.skillId}
+                      onclick={() => toggleSkillDetail(skill.skillId)}
+                    >
+                      <span class="mcp-expand-icon" class:expanded={skillExpandedId === skill.skillId}>
+                        <Icon name="chevronDown" size={14} />
+                      </span>
+                    </button>
                   </div>
+                </div>
+
+                {#if skillExpandedId === skill.skillId}
+                  {@const state = skillDetails[skill.skillId]}
+                  <div class="skill-detail">
+                    {#if !state || state.status === 'loading'}
+                      <div class="skill-detail-note">{i18n.t('settings.tools.loading')}</div>
+                    {:else if state.status === 'error'}
+                      <div class="skill-detail-note skill-detail-note--error" role="alert">{state.message}</div>
+                    {:else}
+                      {@const parts = splitSkillInstruction(state.detail.instruction)}
+                      <div class="skill-detail-head">
+                        <div class="skill-detail-title">
+                          <span class="skill-detail-file">{state.detail.instructionFile}</span>
+                          <span class="skill-detail-size">{formatSkillFileSize(state.detail.instructionBytes)}</span>
+                        </div>
+                        <div class="skill-detail-tabs" role="tablist">
+                          <button type="button" role="tab" class="skill-detail-tab" class:active={!skillRawView[skill.skillId]} aria-selected={!skillRawView[skill.skillId]} onclick={() => (skillRawView[skill.skillId] = false)}>{i18n.t('settings.tools.skillDetailRendered')}</button>
+                          <button type="button" role="tab" class="skill-detail-tab" class:active={Boolean(skillRawView[skill.skillId])} aria-selected={Boolean(skillRawView[skill.skillId])} onclick={() => (skillRawView[skill.skillId] = true)}>{i18n.t('settings.tools.skillDetailRaw')}</button>
+                        </div>
+                      </div>
+                      {#if parts.meta.length > 0 && !skillRawView[skill.skillId]}
+                        <dl class="skill-detail-meta">
+                          {#each parts.meta as item (item.key)}
+                            <dt>{item.key}</dt>
+                            <dd title={item.value}>{item.value}</dd>
+                          {/each}
+                        </dl>
+                      {/if}
+                      <div class="skill-detail-body">
+                        {#if skillRawView[skill.skillId]}
+                          <pre class="skill-detail-raw">{state.detail.instruction}</pre>
+                        {:else}
+                          <MarkdownContent content={parts.body} isStreaming={false} />
+                        {/if}
+                      </div>
+                      {#if state.detail.truncated}
+                        <div class="skill-detail-note">{i18n.t('settings.tools.skillDetailTruncated')}</div>
+                      {/if}
+                      {#if state.detail.files.length > 0}
+                        <div class="skill-detail-files">
+                          <div class="skill-detail-files-title">{i18n.t('settings.tools.skillDetailFiles', { count: state.detail.files.length })}</div>
+                          <ul>
+                            {#each state.detail.files as file (file.path)}
+                              <li><code title={file.path}>{file.path}</code><span>{formatSkillFileSize(file.size)}</span></li>
+                            {/each}
+                          </ul>
+                        </div>
+                      {/if}
+                    {/if}
+                  </div>
+                {/if}
                 </div>
               {/each}
               </div>
@@ -2030,9 +2130,9 @@
     gap: 10px;
     min-height: 64px;
     padding: 9px 12px;
-    border-bottom: 1px solid var(--border);
   }
-  .skill-row:last-child { border-bottom: 0; }
+  .skill-item { border-bottom: 1px solid var(--border); }
+  .skill-item:last-child { border-bottom: 0; }
   .skill-row:hover { background: rgba(var(--foreground-rgb), 0.025); }
   .skill-row.disabled .skill-avatar {
     background: var(--surface-3);
@@ -2068,6 +2168,41 @@
   .skill-action-btn.primary { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
   .skill-action-btn.danger:hover { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.08); }
   .skill-action-btn:disabled { opacity: 0.45; cursor: wait; }
+  .skill-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 12px 12px 52px;
+    border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+    background: color-mix(in srgb, var(--surface-2, var(--surface-1)) 55%, transparent);
+  }
+  .skill-detail-note { color: var(--foreground-muted); font-size: 12px; }
+  .skill-detail-note--error { color: var(--error); }
+  .skill-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .skill-detail-title { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .skill-detail-file { font-family: var(--font-mono, monospace); font-size: 12px; font-weight: 600; color: var(--foreground); }
+  .skill-detail-size { font-size: 11px; color: var(--foreground-muted); }
+  .skill-detail-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: color-mix(in srgb, var(--foreground) 6%, transparent); }
+  .skill-detail-tab { padding: 1px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+  .skill-detail-meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; font-size: 12px; }
+  .skill-detail-meta dt { color: var(--foreground-muted); }
+  .skill-detail-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
+  .skill-detail-body {
+    max-height: 360px;
+    overflow: auto;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-1);
+    font-size: 13px;
+  }
+  .skill-detail-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.55; color: var(--foreground); }
+  .skill-detail-files-title { margin-bottom: 4px; font-size: 11px; font-weight: 600; color: var(--foreground-muted); }
+  .skill-detail-files ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow: auto; }
+  .skill-detail-files li { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+  .skill-detail-files code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
+  .skill-detail-files li span { flex: 0 0 auto; color: var(--foreground-muted); }
   .skill-row-progress { display: inline-flex; color: var(--primary); animation: spin 0.9s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
