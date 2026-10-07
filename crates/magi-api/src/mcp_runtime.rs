@@ -786,6 +786,8 @@ impl McpServiceRuntime {
                 .is_err()
             {
                 running.task.abort();
+                // abort 只请求取消；等待任务退出，确保重新绑定前监听端口已释放。
+                let _ = running.task.await;
             }
         }
     }
@@ -1949,7 +1951,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(status.network.enabled, "命名隧道开着时重启后应恢复");
+        assert!(status.network.enabled, "命名隧道开着时重启后应恢复：{status:?}");
         assert_eq!(
             status.network.mcp_url.as_deref(),
             Some("https://mcp.example.com/mcp")
@@ -2193,7 +2195,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let status = second.status().await;
-        assert!(status.direct.listening, "重启后应按上次配置恢复监听");
+        assert!(
+            status.direct.listening,
+            "重启后应按上次配置恢复监听：{status:?}"
+        );
         assert_eq!(status.direct.public_hosts, ["203.0.113.5"]);
         assert_eq!(
             call_with_host(&status.url.clone().unwrap(), "203.0.113.5", &remote.secret).await,
