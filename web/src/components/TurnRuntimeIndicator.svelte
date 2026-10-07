@@ -3,6 +3,8 @@
   import { formatElapsed } from '../lib/utils';
   import { messagesState } from '../stores/messages.svelte';
   import { webModelTurnStage } from '../stores/web-model-runtime.svelte';
+  import { getWorkspaceWait } from '../stores/workspace-wait-store.svelte';
+  import { resolveCurrentSessionTitle } from '../lib/session-title';
 
   interface Props {
     elapsedSeconds: number;
@@ -26,7 +28,28 @@
   const webStage = $derived(
     ownerSessionId ? webModelTurnStage(ownerSessionId) : null,
   );
-  const stageLabel = $derived(webStage ? i18n.t('webModel.turnStage.generating') : '');
+  // 这一轮在排队等别的会话用完工作区：优先说明在等谁，比「正在生成」更有信息量。
+  const workspaceWait = $derived(ownerSessionId ? getWorkspaceWait(ownerSessionId) : null);
+  const blockingTitle = $derived(
+    workspaceWait?.blockingSessionIds[0]
+      ? resolveCurrentSessionTitle({
+          sessionId: workspaceWait.blockingSessionIds[0],
+          workspaceId: messagesState.currentWorkspaceId,
+          workspacePath: messagesState.currentWorkspacePath,
+          workspaceSessions: messagesState.workspaceSessionProjection,
+          workspaceSessionProjections: messagesState.workspaceSessionProjections,
+          personalSessions: messagesState.personalSessionProjection.sessions,
+        })
+      : '',
+  );
+  const stageLabel = $derived.by(() => {
+    if (workspaceWait) {
+      return blockingTitle
+        ? i18n.t('isolation.wait.for', { session: blockingTitle })
+        : i18n.t('isolation.wait.generic');
+    }
+    return webStage ? i18n.t('webModel.turnStage.generating') : '';
+  });
 </script>
 
 <div class="turn-runtime-indicator" aria-label={i18n.t('runtimeState.status.running')} role="status">

@@ -3909,12 +3909,12 @@ impl ApiState {
         git_common_dir: &std::path::Path,
     ) -> Result<(), ApiError> {
         let mut announced = false;
-        loop {
+        let result = loop {
             match self
                 .workspace_git_coordinator
                 .begin_execution(session_id.as_str(), git_common_dir)
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => break Ok(()),
                 Err(
                     error @ (magi_git::GitCoordinationError::ExecutionActive { .. }
                     | magi_git::GitCoordinationError::MutationActive { .. }),
@@ -3927,27 +3927,75 @@ impl ApiState {
                     if !turn_is_starting {
                         self.workspace_git_coordinator
                             .cancel_waiter(session_id.as_str());
-                        return Err(ApiError::Conflict(error.to_string()));
+                        break Err(ApiError::Conflict(error.to_string()));
                     }
                     self.workspace_git_coordinator
                         .register_waiter(session_id.as_str(), git_common_dir);
                     if !announced {
                         announced = true;
+                        let blocking: Vec<String> = match &error {
+                            magi_git::GitCoordinationError::ExecutionActive {
+                                active_session_ids,
+                                ..
+                            } => active_session_ids.clone(),
+                            _ => Vec::new(),
+                        };
                         tracing::info!(
                             session_id = %session_id,
                             reason = %error,
                             "repository 正被其它 session 执行，本轮排队等待"
                         );
+                        self.publish_session_workspace_wait(session_id, true, &blocking);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
                 Err(error) => {
                     self.workspace_git_coordinator
                         .cancel_waiter(session_id.as_str());
-                    return Err(ApiError::Conflict(error.to_string()));
+                    break Err(ApiError::Conflict(error.to_string()));
                 }
             }
+        };
+        if announced {
+            self.publish_session_workspace_wait(session_id, false, &[]);
         }
+        result
+    }
+
+    /// 会话的这一轮开始 / 结束等待别的会话释放工作区。前端据此在运行指示里说明「正在等谁」，
+    /// 而不是让用户对着一个没有输出的「运行中」干等。
+    fn publish_session_workspace_wait(
+        &self,
+        session_id: &SessionId,
+        waiting: bool,
+        blocking_session_ids: &[String],
+    ) {
+        let event_name = if waiting {
+            "session.workspace.waiting"
+        } else {
+            "session.workspace.ready"
+        };
+        let workspace_id = self
+            .session_store
+            .session(session_id)
+            .and_then(|session| session.workspace_id)
+            .map(WorkspaceId::new);
+        let _ = self.event_bus.publish(
+            EventEnvelope::domain(
+                magi_core::EventId::unique(format!("{event_name}-{session_id}")),
+                event_name,
+                serde_json::json!({
+                    "session_id": session_id,
+                    "workspace_id": workspace_id,
+                    "blocking_session_ids": blocking_session_ids,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id,
+                ..EventContext::default()
+            }),
+        );
     }
 
     fn publish_session_git_fast_forward(

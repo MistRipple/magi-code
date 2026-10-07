@@ -184,6 +184,10 @@ import { refreshPendingChangesProjection } from '../../lib/pending-changes-refre
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 import { syncUserQuestions } from '../../stores/user-question-store.svelte';
 import { syncSessionIsolations } from '../../stores/session-isolation-store.svelte';
+import {
+  clearWorkspaceWaiting,
+  markWorkspaceWaiting,
+} from '../../stores/workspace-wait-store.svelte';
 import { MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -1952,6 +1956,26 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       }).catch((error) => {
         console.warn('[web-client-bridge] 隔离副本变化后刷新变更列表失败:', error);
       });
+    }
+    return;
+  }
+
+  // 这一轮在等别的会话用完工作区：运行指示据此说明在等谁。任何会话的事件都要记录，
+  // 切换到该会话时才看得到。
+  if (eventType === 'session.workspace.waiting' || eventType === 'session.workspace.ready') {
+    const waitingSessionId = trimBridgeString(event.payload?.session_id)
+      || trimBridgeString(event.session_id);
+    if (waitingSessionId) {
+      if (eventType === 'session.workspace.waiting') {
+        const blocking = Array.isArray(event.payload?.blocking_session_ids)
+          ? event.payload.blocking_session_ids.filter(
+              (value: unknown): value is string => typeof value === 'string' && value.trim() !== '',
+            )
+          : [];
+        markWorkspaceWaiting(waitingSessionId, blocking);
+      } else {
+        clearWorkspaceWaiting(waitingSessionId);
+      }
     }
     return;
   }

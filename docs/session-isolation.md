@@ -65,6 +65,12 @@
 - 执行过程中也允许合并，长时间运行的目标可以边做边合并；丢弃副本要求会话空闲，且副本里有未合并改动时
   必须显式确认。
 
+## 共享模式下的等待
+
+没有隔离、又抢不到仓库执行租约的那一轮（例如会话有未处理变更、无法自动隔离）会排队等待，不会失败。
+等待开始 / 结束时 daemon 发 `session.workspace.waiting`（带占用工作区的会话）/ `session.workspace.ready`，
+运行指示据此显示「正在等待会话「X」用完工作区…」，而不是一个没有输出的「运行中」。
+
 ## 接口
 
 `GET /session/isolations`、`GET /session/isolation`、`POST /session/isolation/{enable,discard,merge-plan,merge}`。

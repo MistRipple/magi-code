@@ -54,6 +54,8 @@ await withGoldenViteServer(async (server) => {
   const bridge = await read('../src/shared/bridges/web-client-bridge.ts');
   assert.match(bridge, /session\.isolation\.changed/);
   assert.match(bridge, /session\.isolation\.merged/);
+  assert.match(bridge, /session\.workspace\.waiting/);
+  assert.match(bridge, /session\.workspace\.ready/);
   const input = await read('../src/components/InputArea.svelte');
   assert.match(input, /<SessionIsolationChip/);
   const edits = await read('../src/components/EditsPanel.svelte');
@@ -70,6 +72,7 @@ await withGoldenViteServer(async (server) => {
     '../src/components/IsolationBanner.svelte',
     '../src/components/IsolationMergeDialog.svelte',
     '../src/components/EditsPanel.svelte',
+    '../src/components/TurnRuntimeIndicator.svelte',
     '../src/web/WebWorkbenchShell.svelte',
     '../src/lib/isolation-merge.ts',
   ]) {

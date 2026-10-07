@@ -3297,5 +3297,7 @@
   "isolation.merge.failed": "合并失败",
   "isolation.merge.partialFailed": "有 {count} 个文件合并失败：{detail}",
   "edits.isolated.approveAll": "合并全部",
-  "edits.isolated.approveAllTitle": "把没有冲突的改动合并到主工作区"
+  "edits.isolated.approveAllTitle": "把没有冲突的改动合并到主工作区",
+  "isolation.wait.for": "正在等待会话「{session}」用完工作区…",
+  "isolation.wait.generic": "正在等待其它会话用完工作区…"
 }

@@ -8727,10 +8727,27 @@ done
                 .is_some_and(|turn| !turn.status.is_terminal()),
             "仓库被其它会话占用时，新一轮应排队等待而不是直接失败"
         );
+        // 等待期间界面要能说明「正在等谁」。
+        let waiting = harness
+            .events_for(&session_id)
+            .into_iter()
+            .find(|event| event.event_type == "session.workspace.waiting")
+            .expect("开始排队时应发布 session.workspace.waiting");
+        assert_eq!(
+            waiting.payload["blocking_session_ids"],
+            serde_json::json!(["other-session"])
+        );
 
         coordinator.end_execution("other-session");
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert!(
+            harness
+                .events_for(&session_id)
+                .iter()
+                .any(|event| event.event_type == "session.workspace.ready"),
+            "拿到仓库后应发布 session.workspace.ready"
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 

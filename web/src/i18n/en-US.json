@@ -3297,5 +3297,7 @@
   "isolation.merge.failed": "Merge failed",
   "isolation.merge.partialFailed": "{count} files failed to merge: {detail}",
   "edits.isolated.approveAll": "Merge all",
-  "edits.isolated.approveAllTitle": "Merge all changes without conflicts into the workspace"
+  "edits.isolated.approveAllTitle": "Merge all changes without conflicts into the workspace",
+  "isolation.wait.for": "Waiting for \"{session}\" to finish with the workspace…",
+  "isolation.wait.generic": "Waiting for another session to finish with the workspace…"
 }
