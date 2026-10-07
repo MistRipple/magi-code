@@ -273,6 +273,23 @@ await withGoldenViteServer(async (server) => {
   // 幂等：同 kind 同 key 只激活既有视图。
   rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
   assert.equal(rightPane.rightPaneState.appTabs.length, 1);
+  // Tab 条顺序：GPT Web 排在它显示那一刻最后一个 Tab 之后，之后新开的 Tab 继续往右叠加。
+  rightPane.synchronizeWebModelAppSession(null, null);
+  rightPane.activateRightPaneSession('workspace-order', 'session-order');
+  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
+  rightPane.openCodeTab('session-order', '/tmp/first.txt', { label: 'first', workspaceId: 'workspace-order' });
+  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
+  rightPane.openCodeTab('session-order', '/tmp/second.txt', { label: 'second', workspaceId: 'workspace-order' });
+  rightPane.openCodeTab('session-order', '/tmp/third.txt', { label: 'third', workspaceId: 'workspace-order' });
+  const orderScope = rightPane.rightPaneState.activeScopeKey;
+  const labels = () => rightPane
+    .orderPaneTabsForDisplay(rightPane.getRightPaneState(orderScope).openTabs, rightPane.rightPaneState.appTabs)
+    .map((tab) => tab.kind === 'webSession' ? 'web' : tab.label);
+  assert.deepEqual(labels(), ['first', 'web', 'second', 'third']);
+  // 隐藏后重新显示：位置重新固定在当时最后一个 Tab 之后。
+  rightPane.hideWebModelTabView();
+  rightPane.activateWebModelTab();
+  assert.deepEqual(labels(), ['first', 'second', 'third', 'web']);
   // 应用级会话消失时释放视图指针。
   rightPane.synchronizeWebModelAppSession(null, null);
   assert.equal(rightPane.rightPaneState.appTabs.length, 0);

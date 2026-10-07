@@ -769,7 +769,10 @@
   }
 
   .user-plain-content {
-    white-space: pre-wrap;
+    /* MarkdownContent owns paragraph/line-break rendering. Keeping pre-wrap on
+       this wrapper makes Svelte's structural whitespace after the renderer
+       become a visible blank line inside the user bubble. */
+    white-space: normal;
     overflow-wrap: anywhere;
   }
 
@@ -789,14 +792,18 @@
     text-decoration: underline;
   }
 
+  /* 时间与操作按钮浮在气泡正下方：脱离文档流，悬停时不占位，不推动下面的消息。 */
   .user-time {
-    align-self: flex-end;
-    width: auto;
+    position: absolute;
+    right: var(--space-4);
+    top: calc(100% - var(--space-3) + 2px);
+    z-index: 2;
     height: 22px;
-    flex: 0 0 22px;
+    padding: 0 6px;
+    border-radius: var(--radius-sm);
+    background: var(--background);
     font-size: var(--text-xs);
     color: var(--foreground-muted);
-    margin-top: var(--space-1);
     display: flex;
     align-items: center;
     justify-content: flex-end;

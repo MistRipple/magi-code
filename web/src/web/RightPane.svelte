@@ -44,6 +44,7 @@
     openTerminalTab,
     openWebModelTab,
     hideWebModelTabView,
+    orderPaneTabsForDisplay,
     activateWebModelTab,
   } from '../stores/right-pane.svelte';
   import {
@@ -170,7 +171,7 @@
   const visibleAppTabs = $derived(
     appPaneTabs.filter((tab) => !(tab.payload as WebModelTabPayload).viewHidden),
   );
-  const visiblePaneTabs = $derived([...openTabs, ...visibleAppTabs]);
+  const visiblePaneTabs = $derived(orderPaneTabsForDisplay(openTabs, visibleAppTabs));
   const effectiveActiveTabId = $derived(
     rightPaneState.activeAppTabId ?? paneState.activeTabId,
   );

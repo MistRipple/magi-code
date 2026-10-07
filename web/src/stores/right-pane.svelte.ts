@@ -106,6 +106,12 @@ export interface WebModelTabPayload {
   /** 视图幂等键；应用级视图全局单例，同 key 重复打开只激活既有视图。 */
   viewId: string;
   /**
+   * Tab 条里排在它前面的那个 Tab：视图显示出来的那一刻，当前作用域最后一个 Tab 的 id
+   * （`null` 表示当时没有其他 Tab，排最前）。之后新开的 Tab 按打开顺序排在它右边；锚点 Tab
+   * 已关闭或不在当前作用域时排到最后。只影响展示顺序。
+   */
+  anchorTabId?: string | null;
+  /**
    * 视图是否被用户显式隐藏。
    *
    * 关闭按钮只置 true：视图从 Tab 条移除，但组件与 guest 保持挂载，
@@ -1455,7 +1461,7 @@ export function openWebModelTab(
   homeHost: WebModelHost,
 ): RightPaneTab {
   const tab = ensureWebModelTab(browserSessionId, homeHost);
-  (tab.payload as WebModelTabPayload).viewHidden = false;
+  revealWebModelTab(tab);
   rightPaneState.activeAppTabId = tab.id;
   return tab;
 }
@@ -1474,8 +1480,18 @@ export function hideWebModelTabView(): void {
 export function showWebModelTabView(): void {
   const tab = appWebModelTab();
   if (!tab) return;
-  (tab.payload as WebModelTabPayload).viewHidden = false;
+  revealWebModelTab(tab);
   rightPaneState.activeAppTabId = tab.id;
+}
+
+/** 让视图出现在 Tab 条：从隐藏变为显示时，把位置固定在当前最后一个 Tab 之后。 */
+function revealWebModelTab(tab: RightPaneTab): void {
+  const payload = tab.payload as WebModelTabPayload;
+  if (payload.viewHidden) {
+    const tabs = getRightPaneState(rightPaneState.activeScopeKey).openTabs;
+    payload.anchorTabId = tabs.length > 0 ? tabs[tabs.length - 1].id : null;
+  }
+  payload.viewHidden = false;
 }
 
 /** 应用级会话消失（退出登录 / 清除 Web 数据 / 会话关闭）时释放视图指针。 */
@@ -1555,7 +1571,7 @@ function updateWebModelTabHosts(tab: RightPaneTab, hosts: readonly WebModelHost[
 export function activateWebModelTab(): void {
   const tab = appWebModelTab();
   if (!tab) return;
-  (tab.payload as WebModelTabPayload).viewHidden = false;
+  revealWebModelTab(tab);
   rightPaneState.activeAppTabId = tab.id;
   tab.lastActivatedAt = now();
 }
@@ -1591,4 +1607,26 @@ export function clearRightPaneSession(
     rightPaneState.activeWorkspaceId = '';
     rightPaneState.activeSessionId = '';
   }
+}
+
+/**
+ * Tab 条的展示顺序：会话级 Tab 按打开顺序，GPT Web 视图插在它显示时最后一个 Tab 之后，
+ * 之后新开的 Tab 继续往右叠加。
+ */
+export function orderPaneTabsForDisplay(
+  openTabs: readonly RightPaneTab[],
+  appTabs: readonly RightPaneTab[],
+): RightPaneTab[] {
+  const result = [...openTabs];
+  for (const appTab of appTabs) {
+    const anchor = (appTab.payload as WebModelTabPayload).anchorTabId;
+    if (anchor === null) {
+      result.unshift(appTab);
+      continue;
+    }
+    const index = anchor === undefined ? -1 : result.findIndex((tab) => tab.id === anchor);
+    if (index < 0) result.push(appTab);
+    else result.splice(index + 1, 0, appTab);
+  }
+  return result;
 }
