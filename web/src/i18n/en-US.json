@@ -2098,6 +2098,7 @@
   "toolCall.userQuestion.ended": "Not answered (the turn was stopped)",
   "toolCall.userQuestion.skipped": "You chose not to answer",
   "toolCall.userQuestion.other": "Other",
+  "userQuestion.moreWaiting": "{count} more waiting",
   "userQuestion.keyHint": "Number keys to choose · Enter to confirm",
   "userQuestion.title": "Your choice is needed",
   "userQuestion.multiHint": "Select all that apply",

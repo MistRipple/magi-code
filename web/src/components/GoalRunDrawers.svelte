@@ -22,6 +22,12 @@
   import { readStoredAccessProfile } from '../shared/access-profile';
   import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
+  interface Props {
+    /** 当前显示的抽屉数（目标 + 计划），供上层计算排队、提问卡的叠层层级。 */
+    count?: number;
+  }
+  let { count = $bindable(0) }: Props = $props();
+
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
@@ -45,6 +51,9 @@
 
   const goalState = $derived(getGoalState(currentSessionId, currentWorkspaceId));
   const currentGoal = $derived<SessionGoalDto | null>(goalState.response?.goal ?? null);
+  // 叠层层级（紧挨输入框为 1）：目标抽屉最贴近输入框，计划抽屉在它上面。
+  const goalDockLevel = 1;
+  const planDockLevel = $derived(1 + (currentGoal ? 1 : 0));
   const currentPlan = $derived<SessionPlanDto | null>(goalState.response?.plan ?? null);
   const allowedGoalActions = $derived(goalState.response?.allowedActions ?? null);
   const currentGoalTimeSeconds = $derived.by(() => {
@@ -116,6 +125,9 @@
   });
 
   const hasCurrentPlan = $derived(currentPlanItems.length > 0);
+  $effect(() => {
+    count = (currentGoal ? 1 : 0) + (hasCurrentPlan ? 1 : 0);
+  });
   const currentPlanPaused = $derived(currentPlan?.state === 'paused');
   const planSummary = $derived.by(() => buildPlanSummary(currentPlanItems));
   const currentPlanBlocked = $derived(planSummary.blocked > 0);
@@ -429,17 +441,17 @@
 {#if currentGoal || hasCurrentPlan}
 <div class="goal-run-drawers">
   {#if hasCurrentPlan}
-    <section class="run-drawer plan-panel" data-testid="plan-card" aria-label={i18n.t('goalPanel.plan.title')}>
-      <div class="run-drawer-header">
+    <section class="run-drawer plan-panel dock-card" style="--dock-level: {planDockLevel}" data-testid="plan-card" aria-label={i18n.t('goalPanel.plan.title')}>
+      <div class="run-drawer-header dock-header">
         <button
           type="button"
           class="run-drawer-toggle"
           aria-expanded={planDrawerExpanded}
           onclick={() => planDrawerExpanded = !planDrawerExpanded}
         >
-          <span class="drawer-leading-icon drawer-leading-icon--plan"><Icon name="list" size={14} /></span>
-          <span class="run-drawer-title">{i18n.t('goalPanel.plan.title')}</span>
-          <span class="run-progress-count">
+          <span class="drawer-leading-icon dock-lead" style="--dock-tone: var(--success)"><Icon name="list" size={14} /></span>
+          <span class="run-drawer-title dock-title">{i18n.t('goalPanel.plan.title')}</span>
+          <span class="run-progress-count dock-meta">
             {i18n.t('goalPanel.progress.completedCount', {
               completed: planSummary.completed,
               total: planSummary.total,
@@ -458,7 +470,7 @@
           <div class="goal-actions">
             <button
               type="button"
-              class="plan-resume-action"
+              class="plan-resume-action dock-btn dock-btn--warn"
               disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeBlockedPlan')}
@@ -471,7 +483,7 @@
           <div class="goal-actions">
             <button
               type="button"
-              class="icon-action icon-action--danger"
+              class="icon-action dock-icon-btn dock-icon-btn--danger"
               disabled={planClearLoading}
               onclick={clearPlan}
               title={i18n.t('goalPanel.action.clearPlanTitle')}
@@ -513,30 +525,31 @@
 
   {#if currentGoal}
     <section
-      class="run-drawer goal-panel goal-panel--{currentGoal.status}"
+      class="run-drawer goal-panel dock-card goal-panel--{currentGoal.status}"
+      style="--dock-level: {goalDockLevel}"
       data-testid="goal-card"
       aria-label={i18n.t('goalPanel.goal.current')}
     >
-      <div class="run-drawer-header">
+      <div class="run-drawer-header dock-header">
         <button
           type="button"
           class="run-drawer-toggle goal-drawer-toggle"
           aria-expanded={goalDrawerExpanded}
           onclick={() => goalDrawerExpanded = !goalDrawerExpanded}
         >
-          <span class="drawer-leading-icon goal-status-icon"><Icon name={goalStatusIcon(currentGoal)} size={14} /></span>
+          <span class="drawer-leading-icon goal-status-icon dock-lead" style="--dock-tone: var(--goal-tone)"><Icon name={goalStatusIcon(currentGoal)} size={14} /></span>
           <span class="goal-heading">
             <span class="goal-status-title">{goalStatusLabel(currentGoal)}</span>
             <span class="goal-objective">{currentGoal.objective}</span>
           </span>
-          <span class="goal-meta">{goalTimeLabel(currentGoalTimeSeconds)}</span>
+          <span class="goal-meta dock-meta">{goalTimeLabel(currentGoalTimeSeconds)}</span>
           <Icon name={goalDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
         </button>
         <div class="goal-actions">
           {#if goalCanEdit(currentGoal)}
             <button
               type="button"
-              class="icon-action"
+              class="icon-action dock-icon-btn"
               disabled={goalActionLoading !== null}
               onclick={startEditGoal}
               title={i18n.t('goalPanel.action.editGoalTitle')}
@@ -548,7 +561,7 @@
           {#if goalCanResume(currentGoal)}
             <button
               type="button"
-              class="icon-action"
+              class="icon-action dock-icon-btn"
               disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeGoalTitle')}
@@ -559,7 +572,7 @@
           {:else if goalCanPause(currentGoal)}
             <button
               type="button"
-              class="icon-action"
+              class="icon-action dock-icon-btn"
               disabled={goalActionLoading !== null}
               onclick={pauseGoal}
               title={i18n.t('goalPanel.action.pauseGoalTitle')}
@@ -570,7 +583,7 @@
           {/if}
           <button
             type="button"
-            class="icon-action icon-action--danger"
+            class="icon-action dock-icon-btn dock-icon-btn--danger"
             disabled={goalActionLoading !== null}
             onclick={clearGoal}
             title={i18n.t('goalPanel.action.clearGoalTitle')}
@@ -646,37 +659,23 @@
 {/if}
 
 <style>
+  /* 卡片的外形（上圆角、无下边线、缩进台阶、背景退后）由全局 .dock-card 统一提供。 */
   .goal-run-drawers {
     display: flex;
     flex-direction: column;
-    gap: 8px;
     width: 100%;
-    padding: 0 var(--space-4);
-    box-sizing: border-box;
     position: relative;
     z-index: 0;
   }
 
   .run-drawer {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
     min-width: 0;
-    padding: 10px 12px;
-    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--surface-1) 72%, var(--background));
-    box-sizing: border-box;
   }
 
   .goal-panel {
     --goal-tone: var(--primary);
     order: 3;
-    width: 100%;
-    padding: 9px 10px;
-    border-color: color-mix(in srgb, var(--goal-tone) 24%, var(--border));
     border-left: 2px solid var(--goal-tone);
-    background: color-mix(in srgb, var(--vscode-input-background) 94%, var(--background));
   }
 
   .goal-panel--paused {
@@ -757,43 +756,20 @@
     color: var(--foreground-muted);
   }
 
-  .drawer-leading-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    flex: 0 0 24px;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-    color: var(--primary);
-  }
 
   .drawer-leading-icon :global(svg) {
     color: inherit;
   }
 
-  .drawer-leading-icon--plan {
-    background: color-mix(in srgb, var(--success) 10%, transparent);
-    color: color-mix(in srgb, var(--success) 82%, var(--foreground));
-  }
 
   .run-drawer-title {
     flex: 0 0 auto;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-semibold);
-    white-space: nowrap;
   }
 
   .goal-drawer-toggle {
     min-height: 28px;
   }
 
-  .goal-status-icon {
-    background: color-mix(in srgb, var(--goal-tone) 11%, transparent);
-    color: var(--goal-tone);
-  }
 
   .goal-heading {
     display: grid;
@@ -841,9 +817,6 @@
 
   .goal-meta {
     flex: 0 0 auto;
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    white-space: nowrap;
   }
 
   .goal-actions {
@@ -853,59 +826,12 @@
     flex: 0 0 auto;
   }
 
-  .plan-resume-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-height: 26px;
-    padding: 0 8px;
-    border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--warning) 8%, transparent);
-    color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
-    font-size: var(--text-xs);
-    cursor: pointer;
-  }
 
-  .plan-resume-action:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--warning) 14%, transparent);
-  }
 
-  .plan-resume-action:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
 
-  .icon-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition:
-      background var(--transition-fast),
-      color var(--transition-fast);
-  }
 
-  .icon-action:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--surface-hover) 80%, transparent);
-    color: var(--foreground);
-  }
 
-  .icon-action--danger:hover:not(:disabled) {
-    color: var(--error);
-  }
 
-  .icon-action:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
 
   .goal-edit-form {
     display: grid;
@@ -1025,9 +951,7 @@
   }
 
   .run-progress-count {
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    white-space: nowrap;
+    flex: 0 0 auto;
   }
 
   .plan-running {
@@ -1165,11 +1089,6 @@
   }
 
   @media (max-width: 640px) {
-    .goal-run-drawers {
-      gap: 6px;
-      padding: 0 10px;
-    }
-
     .run-drawer {
       padding: 9px 10px;
     }

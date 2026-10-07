@@ -16,9 +16,13 @@
 
   interface Props {
     pending: PendingUserQuestionDto;
+    /** 除当前这个之外还在排队等回答的问题数。 */
+    remaining?: number;
+    /** 在输入框上方叠层里的层级（紧挨输入框为 1）。 */
+    level?: number;
   }
 
-  let { pending }: Props = $props();
+  let { pending, remaining = 0, level = 1 }: Props = $props();
 
   // 同一个问题只在挂载时初始化一次草稿；新问题由上层按 questionId 重建本组件。
   // svelte-ignore state_referenced_locally
@@ -119,13 +123,16 @@
 <!-- 模型向用户提出的选择题：贴在输入框上沿，回答后这一轮继续。键盘快捷键只在焦点位于面板内时生效。 -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <section
-  class="user-question"
+  class="user-question dock-card"
+  style="--dock-level: {level}"
   role="group"
   aria-label={i18n.t('userQuestion.title')}
   data-user-question-id={pending.questionId}
   onkeydown={handleKeydown}
 >
-  <header class="uq-head">
+  <header class="uq-head dock-header">
+    <span class="dock-lead"><Icon name="question" size={14} /></span>
+    <span class="dock-title">{i18n.t('userQuestion.title')}</span>
     {#if questions.length > 1}
       <div class="uq-steps" role="tablist">
         {#each questions as item, index (index)}
@@ -143,9 +150,12 @@
           </button>
         {/each}
       </div>
-      <span class="uq-progress">{activeIndex + 1} / {questions.length}</span>
+      <span class="uq-progress dock-meta">{activeIndex + 1} / {questions.length}</span>
     {:else}
-      <span class="uq-badge"><Icon name="question" size={12} />{active.header}</span>
+      <span class="uq-badge">{active.header}</span>
+    {/if}
+    {#if remaining > 0}
+      <span class="uq-queued dock-meta">{i18n.t('userQuestion.moreWaiting', { count: remaining })}</span>
     {/if}
   </header>
 
@@ -213,15 +223,15 @@
   {/if}
 
   <footer class="uq-foot">
-    <span class="uq-keyhint">{i18n.t('userQuestion.keyHint')}</span>
+    <span class="uq-keyhint dock-meta">{i18n.t('userQuestion.keyHint')}</span>
     <span class="uq-spacer"></span>
-    <button type="button" class="uq-button" disabled={submitting} onclick={() => void skip()}>
+    <button type="button" class="uq-button dock-btn" disabled={submitting} onclick={() => void skip()}>
       {i18n.t('userQuestion.skip')}
     </button>
     {#if !isLast}
       <button
         type="button"
-        class="uq-button uq-button--primary"
+        class="uq-button dock-btn dock-btn--primary"
         disabled={submitting || !isUserQuestionAnswered(draft)}
         onclick={advance}
       >
@@ -230,7 +240,7 @@
     {:else}
       <button
         type="button"
-        class="uq-button uq-button--primary"
+        class="uq-button dock-btn dock-btn--primary"
         disabled={submitting || !allAnswered}
         onclick={() => void submit()}
       >
@@ -241,22 +251,13 @@
 </section>
 
 <style>
-  /* 贴在输入框上沿的卡片：比输入框窄一圈，只有上圆角，下沿盖住输入框的上边框，视觉上与输入框相连。 */
+  /* 叠层的外形（上圆角、无下边线、缩进台阶、背景退后）由全局 .dock-card 统一提供。 */
   .user-question {
-    position: relative;
     z-index: 1;
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
-    width: calc(100% - var(--space-6, 24px) * 2);
-    margin: 0 auto -1px;
-    padding: var(--space-3) var(--space-3) var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
-    border-bottom: 0;
-    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
-    background: var(--vscode-input-background);
-    box-shadow: 0 -6px 18px -12px rgba(0, 0, 0, 0.35);
-    max-height: min(52vh, 420px);
+    /* 窗口较矮、又有其他面板叠在上面时，不能把消息区挤没：限高并在卡片内部滚动。 */
+    max-height: min(46vh, 420px);
     overflow-y: auto;
     flex: 0 0 auto;
     animation: uq-rise 160ms ease-out;
@@ -276,17 +277,13 @@
   }
 
   .uq-head {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding-inline: var(--space-1);
+    flex-wrap: wrap;
   }
 
   .uq-badge {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    padding: 2px var(--space-2);
+    padding: 1px var(--space-2);
     border-radius: 999px;
     background: var(--primary-muted);
     color: var(--primary);
@@ -336,10 +333,14 @@
     color: var(--foreground);
   }
 
-  .uq-progress {
+  .uq-queued {
     margin-left: auto;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
+  }
+
+  .uq-progress {
+    margin-left: auto;
     font-variant-numeric: tabular-nums;
   }
 
@@ -347,15 +348,14 @@
     display: flex;
     align-items: baseline;
     gap: var(--space-2);
-    padding-inline: var(--space-1);
   }
 
   .uq-question {
     margin: 0;
     color: var(--foreground);
-    font-size: var(--text-base);
+    font-size: var(--text-sm);
     font-weight: 600;
-    line-height: 1.5;
+    line-height: 1.45;
     overflow-wrap: anywhere;
   }
 
@@ -378,9 +378,10 @@
   .uq-option {
     display: flex;
     align-items: flex-start;
-    gap: var(--space-3);
+    align-items: center;
+    gap: var(--space-2);
     width: 100%;
-    padding: var(--space-2) var(--space-3);
+    padding: 4px var(--space-2);
     border: 1px solid transparent;
     border-radius: var(--radius-md);
     background: transparent;
@@ -415,14 +416,14 @@
   .uq-other {
     flex-direction: column;
     align-items: stretch;
-    gap: var(--space-2);
+    gap: 2px;
     cursor: default;
   }
 
   .uq-other-toggle {
     display: flex;
-    align-items: flex-start;
-    gap: var(--space-3);
+    align-items: center;
+    gap: var(--space-2);
     width: 100%;
     padding: 0;
     border: 0;
@@ -438,9 +439,8 @@
     flex: 0 0 auto;
     align-items: center;
     justify-content: center;
-    width: 16px;
-    height: 16px;
-    margin-top: 2px;
+    width: 14px;
+    height: 14px;
     border: 1.5px solid color-mix(in srgb, var(--foreground-muted) 70%, transparent);
     border-radius: 50%;
     color: var(--primary-foreground, #fff);
@@ -459,14 +459,16 @@
   .uq-text {
     display: flex;
     flex: 1 1 auto;
-    flex-direction: column;
-    gap: 2px;
+    flex-flow: row wrap;
+    align-items: baseline;
+    column-gap: var(--space-2);
+    row-gap: 0;
     min-width: 0;
   }
 
   .uq-label {
     font-size: var(--text-sm);
-    line-height: 1.45;
+    line-height: 1.5;
     overflow-wrap: anywhere;
   }
 
@@ -497,7 +499,7 @@
 
   .uq-other-input {
     align-self: flex-end;
-    width: calc(100% - 16px - var(--space-3));
+    width: calc(100% - 14px - var(--space-2));
     padding: var(--space-1) 0;
     border: 0;
     border-bottom: 1px solid color-mix(in srgb, var(--primary) 55%, transparent);
@@ -515,57 +517,20 @@
   .uq-error {
     color: var(--error);
     font-size: var(--text-xs);
-    padding-inline: var(--space-1);
   }
 
   .uq-foot {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    padding-inline: var(--space-1);
-  }
-
-  .uq-keyhint {
-    color: var(--foreground-muted);
-    font-size: 11px;
-    opacity: 0.85;
   }
 
   .uq-spacer {
     flex: 1;
   }
 
-  .uq-button {
-    min-height: 28px;
-    padding: 0 var(--space-3);
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
 
-  .uq-button:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-    color: var(--foreground);
-  }
 
-  .uq-button--primary {
-    padding: 0 var(--space-4);
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-    font-weight: 600;
-  }
 
-  .uq-button--primary:hover:not(:disabled) {
-    background: var(--primary-hover, var(--primary));
-    color: var(--primary-foreground, #fff);
-  }
 
-  .uq-button:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
 </style>

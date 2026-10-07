@@ -15,7 +15,6 @@
   import ConversationApprovalTray from './ConversationApprovalTray.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
-  import GoalRunDrawers from './GoalRunDrawers.svelte';
   import ActiveAgentCenter from './ActiveAgentCenter.svelte';
   import { parseToolApprovalPayload } from '../lib/tool-error-payload';
   import {
@@ -111,8 +110,6 @@
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
     <ConversationApprovalTray approvals={unanchoredApprovals} />
   </div>
-
-  <GoalRunDrawers />
 
   <!-- 输入区域 -->
   <InputArea />

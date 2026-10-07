@@ -2098,6 +2098,7 @@
   "toolCall.userQuestion.ended": "问题没有得到回答（这一轮已停止）",
   "toolCall.userQuestion.skipped": "你选择了不回答",
   "toolCall.userQuestion.other": "其他",
+  "userQuestion.moreWaiting": "还有 {count} 个待回答",
   "userQuestion.keyHint": "数字键选择 · Enter 确认",
   "userQuestion.title": "需要你的选择",
   "userQuestion.multiHint": "可多选",

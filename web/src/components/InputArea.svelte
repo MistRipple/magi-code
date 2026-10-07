@@ -29,6 +29,7 @@
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
   import UserQuestionPanel from './UserQuestionPanel.svelte';
+  import GoalRunDrawers from './GoalRunDrawers.svelte';
   import { userQuestionState } from '../stores/user-question-store.svelte';
   import Modal from './Modal.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
@@ -127,6 +128,11 @@
     userQuestionState.sessionId === (messagesState.currentSessionId?.trim() || '')
       ? userQuestionState.pending[0] ?? null
       : null,
+  );
+  const pendingUserQuestionCount = $derived(
+    userQuestionState.sessionId === (messagesState.currentSessionId?.trim() || '')
+      ? userQuestionState.pending.length
+      : 0,
   );
   const reasoningOptions: Array<{
     value: ReasoningEffort;
@@ -418,6 +424,10 @@
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
+  // 叠层层级：紧挨输入框的是 1，离得越远越大（越窄）。自下而上：目标、计划、排队、提问。
+  let drawersCount = $state(0);
+  const queueDockLevel = $derived(drawersCount + 1);
+  const questionDockLevel = $derived(drawersCount + (queuedMessages.length > 0 ? 1 : 0) + 1);
   const MAX_INPUT_CHARS = 10000;
   let inputTextareaEl = $state<HTMLDivElement | null>(null);
   let isComposing = $state(false);
@@ -2489,30 +2499,32 @@
   }
 </script>
 
-<div class="ia-container" class:has-user-question={Boolean(pendingUserQuestion)}>
-  <!-- 模型向用户提出的选择题：贴在输入框上沿，比输入框窄一圈，像从输入框里“拉出”的一张卡。 -->
+<div class="ia-container">
+  <!-- 停靠叠层，自上而下：提问卡片、排队面板、计划抽屉、目标抽屉，最后是输入框；越靠近输入框的卡片越宽。样式见全局 .dock-card。 -->
+  <!-- 模型向用户提出的选择题：叠层最上方、最窄的一张卡。 -->
   {#if pendingUserQuestion}
     {#key pendingUserQuestion.questionId}
-      <UserQuestionPanel pending={pendingUserQuestion} />
+      <UserQuestionPanel pending={pendingUserQuestion} remaining={pendingUserQuestionCount - 1} level={questionDockLevel} />
     {/key}
   {/if}
   {#if queuedMessages.length > 0}
-    <div class="ia-queue-panel">
-      <div class="ia-queue-header">
-        <span class="ia-queue-header-title">
+    <div class="ia-queue-panel dock-card" style="--dock-level: {queueDockLevel}">
+      <div class="ia-queue-header dock-header">
+        <span class="dock-lead" style="--dock-tone: var(--foreground-muted)"><Icon name="hourglass" size={13} /></span>
+        <span class="ia-queue-header-title dock-title">
           {i18n.t('input.queue.header', { count: queuedMessages.length })}
         </span>
       </div>
       <div class="ia-queue-list">
         {#each queuedMessages as queued (queued.id)}
           {@const guideAvailable = canGuideQueuedMessage(queued)}
-          <div class="ia-queue-item">
+          <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
             <div class="ia-queue-actions">
               <button
                 type="button"
-                class="ia-queue-action ia-queue-guide"
+                class="ia-queue-action ia-queue-guide dock-btn"
                 disabled={!guideAvailable}
                 onclick={() => guideQueuedMessage(queued.id)}
                 title={guideQueuedMessageTitle(queued)}
@@ -2523,7 +2535,7 @@
               </button>
               <button
                 type="button"
-                class="ia-queue-action"
+                class="ia-queue-action dock-icon-btn"
                 onclick={() => editQueuedMessage(queued.id)}
                 title={i18n.t('input.queue.edit')}
                 aria-label={i18n.t('input.queue.edit')}
@@ -2532,7 +2544,7 @@
               </button>
               <button
                 type="button"
-                class="ia-queue-action danger"
+                class="ia-queue-action dock-icon-btn dock-icon-btn--danger"
                 onclick={() => deleteQueuedMessage(queued.id)}
                 title={i18n.t('input.queue.delete')}
                 aria-label={i18n.t('input.queue.delete')}
@@ -2545,7 +2557,7 @@
       </div>
     </div>
   {/if}
-
+  <GoalRunDrawers bind:count={drawersCount} />
   <div class="ia-wrapper" style="min-height: {inputHeight}px">
     <!-- 拖动调整大小 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -3307,7 +3319,7 @@
   .ia-container {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: 0;
     flex-shrink: 0;
     /* 输入列随中间面板自适应铺满，仅保留基础安全留白。 */
     padding-block: var(--space-3) var(--space-4);
@@ -3320,8 +3332,9 @@
   }
 
   /* 有待回答的问题时，卡片与输入框零间距相接。 */
-  .ia-container.has-user-question {
-    gap: 0;
+  /* 叠层卡片与输入框零间隙相接；输入框的上边线保持清晰，才分得清层次。 */
+  .ia-container:has(.dock-card) .ia-wrapper {
+    border-top-color: color-mix(in srgb, var(--foreground-muted) 55%, var(--border));
   }
 
   .ia-wrapper {
@@ -4461,27 +4474,13 @@
   .ia-img-clear:hover { border-color: var(--destructive); color: var(--destructive); }
 
   .ia-queue-panel {
-    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-    border-radius: 9px;
-    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
-    display: flex;
-    flex-direction: column;
     overflow: hidden;
   }
 
-  .ia-queue-header {
-    display: flex;
-    align-items: center;
-    min-height: 27px;
-    padding: 7px 10px 6px;
-    border-bottom: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
-  }
-
   .ia-queue-header-title {
-    color: color-mix(in srgb, var(--foreground) 72%, transparent);
-    font-size: 11px;
-    font-weight: var(--font-medium);
-    line-height: 1.2;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .ia-queue-list {
@@ -4494,14 +4493,7 @@
   .ia-queue-item {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center;
     gap: 9px;
-    min-height: 35px;
-    padding: 0 10px;
-  }
-
-  .ia-queue-item + .ia-queue-item {
-    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 52%, transparent);
   }
 
   .ia-queue-index {
@@ -4512,9 +4504,9 @@
   }
 
   .ia-queue-content {
-    font-size: 12px;
+    font-size: var(--text-sm);
     line-height: 1.35;
-    color: color-mix(in srgb, var(--foreground) 80%, transparent);
+    color: color-mix(in srgb, var(--foreground) 85%, transparent);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4523,47 +4515,9 @@
   .ia-queue-actions {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 2px;
     opacity: 1;
     pointer-events: auto;
-  }
-
-  .ia-queue-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 24px;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: color 120ms ease, opacity 120ms ease;
-  }
-
-  .ia-queue-action:hover {
-    color: var(--primary);
-  }
-
-  .ia-queue-guide {
-    width: auto;
-    gap: 4px;
-    padding: 0 4px;
-  }
-
-  .ia-queue-action:disabled {
-    color: color-mix(in srgb, var(--foreground-muted) 55%, transparent);
-    cursor: not-allowed;
-    opacity: 0.62;
-  }
-
-  .ia-queue-action:disabled:hover {
-    color: color-mix(in srgb, var(--foreground-muted) 55%, transparent);
-  }
-
-  .ia-queue-action.danger:hover {
-    color: var(--error);
   }
 
   @media (max-width: 640px) {

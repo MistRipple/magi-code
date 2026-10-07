@@ -1214,8 +1214,8 @@ pre code {
 }
 
 .control-color {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border: 0;
   border-radius: var(--radius-sm);
@@ -1606,4 +1606,171 @@ body.vscode-light .hljs-params {
 /* Folder Picker Modal */
 .folder-picker-modal .modal-body {
   padding: 0;
+}
+
+
+/* ============================================
+   Dock Stack：停靠在对话输入框上方的卡片（提问、排队、目标、计划）
+   统一形态：只有上圆角、没有下边线、卡片间零间隙，像从输入框里一层层“长出来”；
+   `--dock-level`（离输入框越远越大）决定两侧缩进的台阶、背景退后的程度与边线深浅，
+   所以不管同时出现几张，都是一个整体，又分得清层次。
+   ============================================ */
+.dock-card {
+  --dock-step: 14px;
+  --dock-inset: min(calc(var(--dock-level, 1) * var(--dock-step)), 56px);
+  position: relative;
+  box-sizing: border-box;
+  width: calc(100% - var(--dock-inset) * 2);
+  margin: 0 auto;
+  border: 1px solid color-mix(in srgb, var(--border) calc(78% - var(--dock-level, 1) * 7%), transparent);
+  border-bottom: 0;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  background: color-mix(
+    in srgb,
+    var(--vscode-input-background) calc(100% - var(--dock-level, 1) * 9%),
+    var(--background)
+  );
+  /* 内部节奏统一：标题行、正文行、操作区共用同一套内边距与间距。 */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 10px 8px;
+}
+
+/* 标题行：[图标块] 标题 · 辅助信息 …… 操作 / 展开箭头 */
+.dock-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+}
+
+.dock-lead {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--dock-tone, var(--primary)) 11%, transparent);
+  color: var(--dock-tone, var(--primary));
+}
+
+.dock-lead :global(svg) {
+  color: inherit;
+}
+
+.dock-title {
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  white-space: nowrap;
+}
+
+.dock-meta {
+  color: var(--foreground-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* 条目行：队列消息、计划步骤等；行间只有一条淡淡的分隔线。 */
+.dock-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.dock-row + .dock-row {
+  border-top: 1px solid color-mix(in srgb, var(--border-subtle, var(--border)) 55%, transparent);
+}
+
+/* 文字操作：胶囊形幽灵按钮；主操作用 --primary，需要注意的用 --warn。 */
+.dock-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--foreground-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.dock-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.dock-btn--primary {
+  padding: 0 14px;
+  background: var(--primary);
+  color: var(--primary-foreground, #fff);
+  font-weight: var(--font-semibold);
+}
+
+.dock-btn--primary:hover:not(:disabled) {
+  background: var(--primary-hover, var(--primary));
+  color: var(--primary-foreground, #fff);
+}
+
+.dock-btn--warn {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
+}
+
+.dock-btn--warn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
+  color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
+}
+
+.dock-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 图标操作：22px 方形幽灵按钮，悬停出底色；危险操作悬停变红。 */
+.dock-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--foreground-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.dock-icon-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.dock-icon-btn--danger:hover:not(:disabled) {
+  color: var(--error);
+}
+
+.dock-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .dock-card {
+    --dock-step: 8px;
+  }
 }
