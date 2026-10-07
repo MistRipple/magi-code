@@ -4,6 +4,7 @@
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
+  import IsolationMergeDialog from './components/IsolationMergeDialog.svelte';
   import Icon from './components/Icon.svelte';
   import {
     addToast,
@@ -26,6 +27,7 @@
     type AgentConnectionEventDetail,
   } from './web/agent-api';
   import { synchronizeBrowserAuthority } from './web/browser-authority-coordinator';
+  import { syncSessionIsolations } from './stores/session-isolation-store.svelte';
 
   type TopTabType = 'thread' | 'edits' | 'knowledge';
 
@@ -108,6 +110,14 @@
     setCurrentTopTab(tab);
   }
 
+  // 切换会话时对齐一次隔离登记：输入区的隔离标记、变更面板的横幅都读这份投影。
+  $effect(() => {
+    if (!messagesState.bootstrapped || !messagesState.currentSessionId) return;
+    void syncSessionIsolations().catch((error) => {
+      console.warn('[App] 隔离副本状态同步失败:', error);
+    });
+  });
+
   onMount(() => {
     const focusAppRenderer = () => {
       if (window.magiDesktop?.focusApp) {
@@ -128,6 +138,10 @@
       if (detail?.status === 'connected') {
         bootstrapConnectionFailed = false;
         void synchronizeCurrentBrowserAuthority();
+        // 重连期间可能错过隔离副本的变化事件，以 daemon 的登记为准重新对齐。
+        void syncSessionIsolations().catch((error) => {
+          console.warn('[App] 隔离副本状态同步失败:', error);
+        });
         return;
       }
       if (!messagesState.bootstrapped) {
@@ -376,6 +390,7 @@
 
   <!-- Toast 通知容器 -->
   <ToastContainer />
+  <IsolationMergeDialog />
 </div>
 
 <style>

@@ -35,6 +35,7 @@
   import ContextUsageRing from './ContextUsageRing.svelte';
   import { projectSessionContextBudget } from '../lib/context-usage-ring';
   import GitContextControl from './GitContextControl.svelte';
+  import SessionIsolationChip from './SessionIsolationChip.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -2290,25 +2291,33 @@
     }
   }
 
+  /** 草稿会话先落成真实会话并切换过去；已经是真实会话则原样返回它的 ID。 */
+  async function materializeDraftSession(): Promise<string> {
+    const existing = currentSessionId?.trim() || '';
+    if (existing) return existing;
+    const workspaceId = currentWorkspaceId?.trim() || '';
+    const workspacePath = currentWorkspacePath?.trim() || '';
+    const materialized = await materializeSession(
+      workspaceId || null,
+      workspaceId ? workspacePath : undefined,
+    );
+    const sessionId = materialized.sessionId;
+    const navigation = navigateSession(workspaceId
+      ? { kind: 'session', scope: 'workspace', workspaceId, workspacePath, sessionId }
+      : { kind: 'session', scope: 'personal', sessionId });
+    if (!navigation) throw new Error(i18n.t('webModel.saved.bindFailed'));
+    await waitForSessionNavigation(navigation);
+    return sessionId;
+  }
+
   /**
    * 把已保存的 ChatGPT 对话绑定到当前（空白）会话。草稿会话先物化为真实会话并写入
    * GPT Web 引擎，再绑定；历史由 daemon 单向导入。
    */
   async function bindSavedWebConversation(conversationId: string): Promise<void> {
-    let sessionId = currentSessionId?.trim() || '';
-    if (!sessionId) {
-      const workspaceId = currentWorkspaceId?.trim() || '';
-      const workspacePath = currentWorkspacePath?.trim() || '';
-      const materialized = await materializeSession(
-        workspaceId || null,
-        workspaceId ? workspacePath : undefined,
-      );
-      sessionId = materialized.sessionId;
-      const navigation = navigateSession(workspaceId
-        ? { kind: 'session', scope: 'workspace', workspaceId, workspacePath, sessionId }
-        : { kind: 'session', scope: 'personal', sessionId });
-      if (!navigation) throw new Error(i18n.t('webModel.saved.bindFailed'));
-      await waitForSessionNavigation(navigation);
+    const wasDraft = !(currentSessionId?.trim());
+    const sessionId = await materializeDraftSession();
+    if (wasDraft) {
       const engineId = currentPickerEngineId || 'chatgpt-web/default';
       await saveAgentOrchestratorSessionConfig(
         withOrchestratorReasoningEffort(
@@ -2906,6 +2915,12 @@
           workspace={composerWorkspace}
           sessionId={persistedSessionId}
           disabled={sessionInputLocked || isInteractionBlocking}
+        />
+        <SessionIsolationChip
+          workspace={composerWorkspace}
+          sessionId={persistedSessionId}
+          disabled={sessionInputLocked || isInteractionBlocking}
+          ensureSession={materializeDraftSession}
         />
       </div>
 

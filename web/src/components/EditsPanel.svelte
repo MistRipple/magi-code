@@ -16,6 +16,8 @@
   import Icon from './Icon.svelte';
   import ChangeFileTree from './ChangeFileTree.svelte';
   import GitRepositoryPanel from './GitRepositoryPanel.svelte';
+  import IsolationBanner from './IsolationBanner.svelte';
+  import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
@@ -25,6 +27,8 @@
 
   const isWebMode = isWebAgentMode();
   const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
+  // 隔离会话里「批准」就是把改动合并回主工作区。
+  const sessionIsolated = $derived(isSessionIsolated(messagesState.currentSessionId?.trim() || ''));
 
   // ─── 按执行分组展示 ───
   // 最新执行分组 ID：取 edits 列表中最后一个有 executionGroupId 的值（后端已按 timestamp 排序）
@@ -259,6 +263,7 @@
 </script>
 
 <div class="panel-content-scrollable edits-panel">
+  <IsolationBanner />
   <GitRepositoryPanel />
   <div class="changes-section-label">{i18n.t('edits.section.pendingChanges')}</div>
   {#if edits.length === 0}
@@ -308,11 +313,11 @@
                 type="button"
                 class="group-action approve"
                 disabled={changeMutationPending}
-                title={i18n.t('edits.actions.approveAllTitle')}
+                title={sessionIsolated ? i18n.t('edits.isolated.approveAllTitle') : i18n.t('edits.actions.approveAllTitle')}
                 onclick={approveAllChanges}
               >
-                <Icon name="check" size={12} />
-                <span>{i18n.t('edits.actions.approveAll')}</span>
+                <Icon name={sessionIsolated ? 'git-merge' : 'check'} size={12} />
+                <span>{sessionIsolated ? i18n.t('edits.isolated.approveAll') : i18n.t('edits.actions.approveAll')}</span>
               </button>
               <button
                 type="button"

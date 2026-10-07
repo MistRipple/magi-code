@@ -28,6 +28,11 @@ import type {
   SkillsLibraryResponseDto,
   MessagesResponseDto,
   VersionHandshakeDto,
+  SessionIsolationListResponseDto,
+  SessionIsolationResponseDto,
+  IsolationMergePlanDto,
+  IsolationMergeOutcomeDto,
+  IsolationConflictResolutionDto,
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
@@ -2835,6 +2840,111 @@ export async function resolveAgentUserQuestion(
     bindingOverride
       ? { ...bindingOverride, sessionId: normalizedSessionId }
       : { sessionId: normalizedSessionId },
+  );
+}
+
+function isolationBinding(
+  sessionId: string,
+  binding: { workspaceId?: string; workspacePath?: string } | undefined,
+): AgentBindingOverride {
+  const workspaceId = binding?.workspaceId?.trim() || '';
+  const workspacePath = binding?.workspacePath?.trim() || '';
+  return workspaceId || workspacePath
+    ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+    : { scope: 'personal', sessionId };
+}
+
+function requireIsolationSessionId(sessionId: string, action: string): string {
+  const normalized = sessionId.trim();
+  if (!normalized) {
+    throw new AgentApiError(400, 'sessionId 不能为空', action);
+  }
+  return normalized;
+}
+
+/** 当前运行在隔离副本里的全部会话（侧栏、输入区据此标记）。 */
+export async function listAgentSessionIsolations(): Promise<SessionIsolationListResponseDto> {
+  const response = await getTransport().request(
+    agentUrl('/api/session/isolations'),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<SessionIsolationListResponseDto>(response, 'list session isolations');
+}
+
+export async function getAgentSessionIsolation(
+  sessionId: string,
+  binding?: { workspaceId?: string; workspacePath?: string },
+): Promise<SessionIsolationResponseDto> {
+  const normalized = requireIsolationSessionId(sessionId, 'load session isolation');
+  const query = buildBoundQueryWithOverride(
+    {},
+    isolationBinding(normalized, binding),
+    { includeScope: false, includeSession: true },
+  );
+  const response = await getTransport().request(
+    agentUrl('/api/session/isolation', query),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<SessionIsolationResponseDto>(response, 'load session isolation');
+}
+
+export async function enableAgentSessionIsolation(
+  sessionId: string,
+  binding?: { workspaceId?: string; workspacePath?: string },
+): Promise<SessionIsolationResponseDto> {
+  const normalized = requireIsolationSessionId(sessionId, 'enable session isolation');
+  return await postBoundJson<SessionIsolationResponseDto>(
+    '/api/session/isolation/enable',
+    {},
+    'enable session isolation',
+    isolationBinding(normalized, binding),
+  );
+}
+
+export async function discardAgentSessionIsolation(
+  sessionId: string,
+  discardChanges: boolean,
+  binding?: { workspaceId?: string; workspacePath?: string },
+): Promise<SessionIsolationResponseDto> {
+  const normalized = requireIsolationSessionId(sessionId, 'discard session isolation');
+  return await postBoundJson<SessionIsolationResponseDto>(
+    '/api/session/isolation/discard',
+    { discardChanges },
+    'discard session isolation',
+    isolationBinding(normalized, binding),
+  );
+}
+
+export async function planAgentIsolationMerge(
+  sessionId: string,
+  binding?: { workspaceId?: string; workspacePath?: string },
+): Promise<IsolationMergePlanDto> {
+  const normalized = requireIsolationSessionId(sessionId, 'plan isolation merge');
+  return await postBoundJson<IsolationMergePlanDto>(
+    '/api/session/isolation/merge-plan',
+    {},
+    'plan isolation merge',
+    isolationBinding(normalized, binding),
+  );
+}
+
+export async function applyAgentIsolationMerge(
+  sessionId: string,
+  selection: {
+    paths?: string[];
+    resolutions?: Record<string, IsolationConflictResolutionDto>;
+  },
+  binding?: { workspaceId?: string; workspacePath?: string },
+): Promise<IsolationMergeOutcomeDto> {
+  const normalized = requireIsolationSessionId(sessionId, 'apply isolation merge');
+  return await postBoundJson<IsolationMergeOutcomeDto>(
+    '/api/session/isolation/merge',
+    {
+      ...(selection.paths ? { paths: selection.paths } : {}),
+      resolutions: selection.resolutions ?? {},
+    },
+    'apply isolation merge',
+    isolationBinding(normalized, binding),
   );
 }
 

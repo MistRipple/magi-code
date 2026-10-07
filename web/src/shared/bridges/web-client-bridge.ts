@@ -183,6 +183,7 @@ import type {
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
 import { syncUserQuestions } from '../../stores/user-question-store.svelte';
+import { syncSessionIsolations } from '../../stores/session-isolation-store.svelte';
 import { MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -1925,6 +1926,33 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'model.context_window.updated') {
     refreshSettingsBootstrapForCurrentWorkspace('model_context_window_updated');
+    return;
+  }
+
+  // 会话切换到 / 离开隔离副本、或把副本的改动合并回主工作区：任何会话的变化都刷新隔离登记
+  // （侧栏、输入区据此标记），当前会话的变更列表也要重新计算。
+  if (eventType === 'session.isolation.changed' || eventType === 'session.isolation.merged') {
+    void syncSessionIsolations().catch((error) => {
+      console.warn(`[web-client-bridge] 隔离副本状态同步失败(${eventType}):`, error);
+    });
+    const isolationSessionId = trimBridgeString(event.payload?.session_id)
+      || trimBridgeString(event.session_id);
+    if (
+      isolationSessionId
+      && isolationSessionId === currentSessionId.trim()
+      && currentSessionScope === 'workspace'
+      && currentWorkspaceId
+    ) {
+      void refreshPendingChangesProjection({
+        scope: 'workspace',
+        sessionId: isolationSessionId,
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+        forceRefresh: true,
+      }).catch((error) => {
+        console.warn('[web-client-bridge] 隔离副本变化后刷新变更列表失败:', error);
+      });
+    }
     return;
   }
 

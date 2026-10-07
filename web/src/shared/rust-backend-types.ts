@@ -299,6 +299,69 @@ export interface SessionUserQuestionResponseDto {
   status: string;
 }
 
+/** 会话为什么运行在隔离副本里：用户主动选择，或提交时主工作区正被另一个会话使用而自动隔离。 */
+export type SessionIsolationOriginDto =
+  | { kind: 'manual' }
+  | { kind: 'contention'; blocking_session_id: string };
+
+export interface SessionIsolationSummaryDto {
+  sessionId: string;
+  workspaceId: string;
+  origin: SessionIsolationOriginDto;
+}
+
+export interface SessionIsolationListResponseDto {
+  isolations: SessionIsolationSummaryDto[];
+}
+
+export interface SessionIsolationDetailDto {
+  root: string;
+  sourceRoot: string;
+  origin: SessionIsolationOriginDto;
+  strategy: 'clone' | 'copy';
+  linkedDirs: string[];
+  gitAvailable: boolean;
+  createdAtMs: number;
+}
+
+export interface SessionIsolationResponseDto {
+  sessionId: string;
+  enabled: boolean;
+  isolation: SessionIsolationDetailDto | null;
+}
+
+export type IsolationMergeActionDto = 'add' | 'modify' | 'delete';
+export type IsolationMergeStateDto = 'clean' | 'already_applied' | 'conflict';
+export type IsolationConflictKindDto =
+  | 'both_added'
+  | 'both_modified'
+  | 'deleted_in_source'
+  | 'modified_in_source'
+  | 'unsupported';
+export type IsolationConflictResolutionDto = 'use_session' | 'keep_source';
+
+export interface IsolationMergeEntryDto {
+  path: string;
+  action: IsolationMergeActionDto;
+  state: IsolationMergeStateDto;
+  conflict?: IsolationConflictKindDto;
+  contentKind: string;
+  size: number;
+}
+
+export interface IsolationMergePlanDto {
+  sessionId: string;
+  entries: IsolationMergeEntryDto[];
+}
+
+export interface IsolationMergeOutcomeDto {
+  sessionId: string;
+  applied: string[];
+  alreadyApplied: string[];
+  unresolved: string[];
+  failed: Array<{ path: string; error: string }>;
+}
+
 export interface ServiceInfoDto {
   serviceName: string;
   apiVersion: string;

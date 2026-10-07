@@ -51,6 +51,7 @@
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
+  import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import {
     closeSettings,
     installShellPopoverDismiss,
@@ -3422,6 +3423,11 @@ import {
                                   aria-hidden="true"
                                 ></span>
                                 <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
+                                {#if isSessionIsolated(session.id)}
+                                  <span class="session-isolated-mark" title={i18n.t('isolation.sidebar.badge')} aria-label={i18n.t('isolation.sidebar.badge')}>
+                                    <Icon name="layers" size={11} />
+                                  </span>
+                                {/if}
                                 <span class="session-meta">
                                   <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
                                   <span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span>
@@ -4628,6 +4634,15 @@ import {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .session-isolated-mark {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    margin-right: 4px;
+    color: var(--primary);
+    opacity: 0.85;
   }
 
   .session-meta {
