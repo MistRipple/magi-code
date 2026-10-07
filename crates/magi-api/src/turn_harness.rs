@@ -8619,6 +8619,190 @@ done
     }
 
     #[tokio::test]
+    async fn ask_user_question_releases_the_repository_lease_while_waiting_and_reacquires_it_after_the_answer()
+     {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("ask-user-lease", "向用户提问期间让出仓库租约");
+        harness.provider.set_tool_then_completed(
+            "ask_user_question",
+            ask_user_question_arguments(),
+            "已按你的选择继续",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "先问我用哪种数据库，再继续",
+                "harness-ask-user-lease",
+                "harness-ask-user-lease-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("提问 Turn 应被接纳");
+        let turn_id = accepted.turn_id.clone().expect("应有 Turn");
+        let pending = wait_for_pending_user_question(&harness, &session_id).await;
+        let git_common_dir = harness
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("Git session 应有 context")
+            .git
+            .git_common_dir;
+        let coordinator = harness.state.workspace_git_coordinator.clone();
+
+        // 等用户期间不占租约：同一仓库的另一个会话可以开始执行。
+        assert!(
+            !coordinator.session_holds_execution(session_id.as_str(), &git_common_dir),
+            "等待回答期间不应占用仓库执行租约"
+        );
+        coordinator
+            .begin_execution("other-session", &git_common_dir)
+            .expect("等待回答期间，同一仓库的其它会话应能开始执行");
+
+        // 用户回答时另一个会话仍占着仓库：这一轮不能带着答案继续，必须等租约空出来。
+        harness
+            .state
+            .conversation_registry
+            .user_questions()
+            .resolve(
+                &session_id,
+                &pending.question_id,
+                magi_conversation_runtime::UserQuestionResponse::Answered {
+                    answers: vec![magi_conversation_runtime::UserQuestionAnswer {
+                        selected: vec!["Postgres".to_string()],
+                        other: None,
+                    }],
+                },
+            )
+            .expect("回答应被接受");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &turn_id)
+                .is_some_and(|turn| !turn.status.is_terminal()),
+            "仓库被其它会话占用时，回答后的这一轮应等待而不是继续执行"
+        );
+
+        coordinator.end_execution("other-session");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn turn_waits_for_a_repository_busy_with_another_session_instead_of_failing() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("repo-busy", "仓库被其它会话占用时排队");
+        harness.provider.set_completed_response("轮到我了");
+        let git_common_dir = workspace_root.join(".git");
+        let coordinator = harness.state.workspace_git_coordinator.clone();
+        coordinator
+            .begin_execution("other-session", &git_common_dir)
+            .expect("其它会话先占用仓库");
+
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "读一下项目说明",
+                "harness-repo-busy",
+                "harness-repo-busy-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("Turn 应被接纳");
+        let turn_id = accepted.turn_id.clone().expect("应有 Turn");
+
+        // 仓库被占用期间这一轮排队等待，不能变成失败的 Turn。
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &turn_id)
+                .is_some_and(|turn| !turn.status.is_terminal()),
+            "仓库被其它会话占用时，新一轮应排队等待而不是直接失败"
+        );
+
+        coordinator.end_execution("other-session");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn tool_approval_wait_releases_the_repository_lease_and_reacquires_it_before_running() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("approval-lease", "授权等待期间让出仓库租约");
+        let target = workspace_root.join("approval-lease.txt");
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command": format!("printf approved > {}", target.display())
+            })
+            .to_string(),
+            "授权后完成",
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "调用 shell_exec 执行一个命令并在审批后汇总结果",
+                "harness-approval-lease",
+                "harness-approval-lease-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("授权 Turn 应被接纳");
+        let turn_id = response.turn_id.clone().expect("应有 Turn");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        let git_common_dir = harness
+            .state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("Git session 应有 context")
+            .git
+            .git_common_dir;
+        let coordinator = harness.state.workspace_git_coordinator.clone();
+        assert!(
+            !coordinator.session_holds_execution(session_id.as_str(), &git_common_dir),
+            "等待授权期间不应占用仓库执行租约"
+        );
+        coordinator
+            .begin_execution("other-session", &git_common_dir)
+            .expect("等待授权期间，同一仓库的其它会话应能开始执行");
+
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            &workspace_root,
+            &pending.approval_id,
+            "allow_once",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !target.exists(),
+            "仓库被其它会话占用时，获批的操作不能越过租约直接执行"
+        );
+
+        coordinator.end_execution("other-session");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("授权后的写入应完成"),
+            "approved"
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn ask_user_question_is_cancelled_when_the_turn_is_interrupted() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("ask-user-stop", "向用户提问被停止");

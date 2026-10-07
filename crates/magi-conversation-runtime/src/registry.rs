@@ -29,6 +29,8 @@ pub struct ConversationRegistry {
     task_signal_ready: Condvar,
     /// 模型向用户提出的选择题（`ask_user_question`）的待处理项。
     user_questions: crate::UserQuestionRegistry,
+    /// 会话等人（授权 / 提问）期间让出仓库执行租约的钩子，由装配层注入。
+    human_wait: crate::HumanWaitGate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +57,7 @@ impl ConversationRegistry {
             task_signal_channels: Mutex::new(HashMap::new()),
             task_signal_ready: Condvar::new(),
             user_questions: crate::UserQuestionRegistry::default(),
+            human_wait: crate::HumanWaitGate::default(),
         }
     }
 
@@ -104,6 +107,10 @@ impl ConversationRegistry {
 
     pub fn user_questions(&self) -> &crate::UserQuestionRegistry {
         &self.user_questions
+    }
+
+    pub fn human_wait(&self) -> &crate::HumanWaitGate {
+        &self.human_wait
     }
 
     pub fn turn_coordinator(&self) -> &SessionTurnCoordinator {

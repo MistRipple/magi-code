@@ -2481,8 +2481,14 @@ impl ApiState {
         workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
     ) -> Self {
         self.git_service = git_service;
-        self.session_code_contexts = session_code_contexts;
-        self.workspace_git_coordinator = workspace_git_coordinator;
+        self.session_code_contexts = session_code_contexts.clone();
+        self.workspace_git_coordinator = workspace_git_coordinator.clone();
+        self.conversation_registry
+            .human_wait()
+            .set_hook(Arc::new(HumanWaitGitLeaseHook {
+                session_code_contexts,
+                coordinator: workspace_git_coordinator,
+            }));
         self
     }
 
@@ -3711,9 +3717,8 @@ impl ApiState {
         let session_key = session_id.as_str();
         let existing_context = self.session_code_contexts.get(session_key);
         if let Some(existing_context) = existing_context.as_ref() {
-            self.workspace_git_coordinator
-                .begin_execution(session_key, &existing_context.git.git_common_dir)
-                .map_err(|error| ApiError::Conflict(error.to_string()))?;
+            self.begin_session_git_execution(session_id, &existing_context.git.git_common_dir)
+                .await?;
         }
         let observation = match self.git_service.observe(&workspace_root).await {
             Ok(observation) => observation,
@@ -3837,12 +3842,9 @@ impl ApiState {
                 context.git.dirty.conflicted_paths.join(", ")
             )));
         }
-        if existing_context.is_none()
-            && let Err(error) = self
-                .workspace_git_coordinator
-                .begin_execution(session_key, &context.git.git_common_dir)
-        {
-            return Err(ApiError::Conflict(error.to_string()));
+        if existing_context.is_none() {
+            self.begin_session_git_execution(session_id, &context.git.git_common_dir)
+                .await?;
         }
         if let Err(error) = self.persist_session_git_contexts() {
             self.release_session_git_execution_lease(session_id);
@@ -3861,6 +3863,60 @@ impl ApiState {
             );
         }
         Ok(Some(context))
+    }
+
+    /// 占用 repository 的独占执行租约；仓库正被别的会话执行时排队等待，而不是让这一轮失败。
+    ///
+    /// 同一 repository 的主 session 共享 live worktree，必须串行执行。这一轮已经被接受，
+    /// 若在这里直接报冲突，用户的消息就变成一条失败的 Turn，目标续跑则会被记成运行时
+    /// 错误而受阻。只有这个会话自己确有一轮正在启动（current turn 未终态）时才排队等待；
+    /// 其它场景（例如用户手动触发的 Git 操作）保持立即失败。等待按先后顺序交接，
+    /// 轮次被取消（终态）后放弃等待。
+    async fn begin_session_git_execution(
+        &self,
+        session_id: &SessionId,
+        git_common_dir: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        let mut announced = false;
+        loop {
+            match self
+                .workspace_git_coordinator
+                .begin_execution(session_id.as_str(), git_common_dir)
+            {
+                Ok(()) => return Ok(()),
+                Err(
+                    error @ (magi_git::GitCoordinationError::ExecutionActive { .. }
+                    | magi_git::GitCoordinationError::MutationActive { .. }),
+                ) => {
+                    let turn_is_starting = matches!(
+                        self.session_store
+                            .ensure_current_turn_acceptance_available(session_id),
+                        Err(DomainError::CurrentTurnConflict { .. })
+                    );
+                    if !turn_is_starting {
+                        self.workspace_git_coordinator
+                            .cancel_waiter(session_id.as_str());
+                        return Err(ApiError::Conflict(error.to_string()));
+                    }
+                    self.workspace_git_coordinator
+                        .register_waiter(session_id.as_str(), git_common_dir);
+                    if !announced {
+                        announced = true;
+                        tracing::info!(
+                            session_id = %session_id,
+                            reason = %error,
+                            "repository 正被其它 session 执行，本轮排队等待"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(error) => {
+                    self.workspace_git_coordinator
+                        .cancel_waiter(session_id.as_str());
+                    return Err(ApiError::Conflict(error.to_string()));
+                }
+            }
+        }
     }
 
     fn publish_session_git_fast_forward(
@@ -5201,6 +5257,40 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
         .filter_map(normalize_mcp_server_snapshot_entry)
         .collect();
     *entries = normalized_entries;
+}
+
+/// 会话等人（工具授权、`ask_user_question`）时让出 repository 执行租约，人回应后再抢回。
+///
+/// 租约只用来保证同一 repository 同时只有一个主 session 在执行；等人不是执行，
+/// 不让出的话，用户思考期间同一仓库的其它会话都发不出消息。
+struct HumanWaitGitLeaseHook {
+    session_code_contexts: magi_git::SessionCodeContextRegistry,
+    coordinator: magi_git::WorkspaceGitOperationCoordinator,
+}
+
+impl magi_conversation_runtime::HumanWaitHook for HumanWaitGitLeaseHook {
+    fn suspend(&self, session_id: &SessionId) {
+        self.coordinator.end_execution(session_id.as_str());
+    }
+
+    fn try_resume(&self, session_id: &SessionId) -> bool {
+        // 没有 Git context（非 Git 工作区）的会话从未占用过租约，也就无需抢回。
+        let Some(context) = self.session_code_contexts.get(session_id.as_str()) else {
+            return true;
+        };
+        match self
+            .coordinator
+            .begin_execution(session_id.as_str(), &context.git.git_common_dir)
+        {
+            Ok(()) => true,
+            Err(_) => {
+                // 排进等待队列，保证按先后顺序交接，而不是被后来者一直抢先。
+                self.coordinator
+                    .register_waiter(session_id.as_str(), &context.git.git_common_dir);
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ pub mod execution_admission;
 pub mod execution_chain_recovery;
 pub mod external_approval;
 pub mod external_tool;
+pub mod human_wait;
 mod mailbox;
 pub mod model_config;
 pub mod model_context_window;
@@ -103,6 +104,7 @@ pub use user_question::{
     PendingUserQuestion, UserQuestion, UserQuestionAnswer, UserQuestionOption,
     UserQuestionRegistry, UserQuestionResponse,
 };
+pub use human_wait::{HumanWait, HumanWaitGate, HumanWaitHook};
 
 #[cfg(test)]
 pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {

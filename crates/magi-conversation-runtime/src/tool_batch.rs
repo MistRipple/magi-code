@@ -2647,6 +2647,16 @@ fn execute_task_tool_call(
     result
 }
 
+/// 同一会话里除 `task` 以外是否还有任务在运行：它们仍在使用工作区，
+/// 所以等人期间不能让出仓库执行租约。
+fn session_has_other_active_tasks(task_store: &TaskStore, task: &magi_core::Task) -> bool {
+    task_store.all_tasks().iter().any(|other| {
+        other.mission_id == task.mission_id
+            && other.task_id != task.task_id
+            && matches!(other.status, TaskStatus::Pending | TaskStatus::Running)
+    })
+}
+
 /// `ask_user_question`：把选择题交给用户，阻塞到用户回答、跳过，或轮次 / 任务结束。
 /// 没有超时——用户可能需要想很久；收口条件只有回答、跳过与停止。
 #[allow(clippy::too_many_arguments)]
@@ -2750,6 +2760,18 @@ fn await_user_question_answer(
         );
     };
     publish("user.question.requested", serde_json::json!({}));
+    // 等用户期间不占 repository 执行租约；回答 / 跳过后在把结果交还模型前抢回。
+    let human_wait = conversation_registry.human_wait().begin(
+        session_id,
+        !session_has_other_active_tasks(task_store, task),
+    );
+    let reacquire_execution = || {
+        human_wait.finish(|| {
+            task_store.get_task(&task.task_id).is_some_and(|current| {
+                matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+            }) && crate::tool_approval::session_turn_is_active(session_store, session_id, &turn_id)
+        })
+    };
 
     loop {
         match waiter
@@ -2757,12 +2779,18 @@ fn await_user_question_answer(
             .recv_timeout(std::time::Duration::from_millis(250))
         {
             Ok(crate::UserQuestionResponse::Answered { answers }) => {
+                if !reacquire_execution() {
+                    return cancelled("任务或对话轮次已停止，回答没有交给模型");
+                }
                 return (
                     crate::user_question::answered_result_payload(&questions, &answers).to_string(),
                     ExecutionResultStatus::Succeeded,
                 );
             }
             Ok(crate::UserQuestionResponse::Skipped) => {
+                if !reacquire_execution() {
+                    return cancelled("任务或对话轮次已停止，回答没有交给模型");
+                }
                 return (
                     serde_json::json!({
                         "tool": tool_name,
@@ -2923,6 +2951,32 @@ fn await_task_tool_approval(
         }),
     );
 
+    // 等授权期间不占 repository 执行租约；授权结果出来后在继续前抢回。
+    let human_wait = conversation_registry.human_wait().begin(
+        session_id,
+        !session_has_other_active_tasks(task_store, task),
+    );
+    let reacquire_execution = || {
+        human_wait.finish(|| {
+            task_store.get_task(&task.task_id).is_some_and(|current| {
+                matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+            }) && crate::tool_approval::session_turn_is_active(session_store, session_id, &turn_id)
+        })
+    };
+    let stopped_while_reacquiring = || {
+        (
+            serde_json::json!({
+                "tool": tool_call.function.name,
+                "status": "cancelled",
+                "error_code": "tool_approval_cancelled",
+                "error": "任务或对话轮次已停止，待授权操作未执行",
+                "approval_id": approval_id,
+            })
+            .to_string(),
+            ExecutionResultStatus::Cancelled,
+        )
+    };
+
     // 子代理等待审批时主线并不知情：通知父任务，让它的 agent_wait 立即返回
     // attention_required，而不是等到超时才发现子代理卡在审批上。
     if let Some(parent_task_id) = task.parent_task_id.as_ref() {
@@ -2981,6 +3035,9 @@ fn await_task_tool_approval(
                         ExecutionResultStatus::Cancelled,
                     ));
                 }
+                if !reacquire_execution() {
+                    return Err(stopped_while_reacquiring());
+                }
                 if let Some(on_progress) = on_progress {
                     on_progress(ToolExecutionProgress {
                         tool_call_id: ToolCallId::new(&tool_call.id),
@@ -2996,6 +3053,9 @@ fn await_task_tool_approval(
                 return Ok(());
             }
             Ok(crate::ToolApprovalDecision::Deny) => {
+                if !reacquire_execution() {
+                    return Err(stopped_while_reacquiring());
+                }
                 return Err(crate::tool_approval::rejected_tool_approval_result(
                     &tool_call.function.name,
                     &approval_id,
@@ -3004,6 +3064,9 @@ fn await_task_tool_approval(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if registry.is_expired(session_id, &approval_id) {
+                    if !reacquire_execution() {
+                        return Err(stopped_while_reacquiring());
+                    }
                     return Err(crate::tool_approval::expired_tool_approval_result(
                         &tool_call.function.name,
                         &approval_id,
@@ -3038,6 +3101,9 @@ fn await_task_tool_approval(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if registry.is_expired(session_id, &approval_id) {
+                    if !reacquire_execution() {
+                        return Err(stopped_while_reacquiring());
+                    }
                     return Err(crate::tool_approval::expired_tool_approval_result(
                         &tool_call.function.name,
                         &approval_id,

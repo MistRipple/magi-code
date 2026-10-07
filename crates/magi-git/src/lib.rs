@@ -561,6 +561,26 @@ pub struct WorkspaceGitOperationCoordinator {
 struct WorkspaceGitOperationState {
     active_executions: HashMap<String, PathBuf>,
     active_mutations: HashSet<PathBuf>,
+    /// 因仓库被占用而排队的 session，按先后顺序。只有队首能在仓库空闲时拿到租约，
+    /// 否则一个连续续跑的目标会在每轮之间抢先重新占用，其它会话永远等不到。
+    waiters: Vec<ExecutionWaiter>,
+}
+
+struct ExecutionWaiter {
+    session_id: String,
+    repository_key: PathBuf,
+    refreshed_at: std::time::Instant,
+}
+
+/// 排队者每次重试都会刷新自己；超过这个时间没刷新的视为已经放弃（对应的 future 被丢弃、
+/// 进程内任务崩溃等），不再阻挡后面的 session。
+const EXECUTION_WAITER_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl WorkspaceGitOperationState {
+    fn prune_stale_waiters(&mut self) {
+        self.waiters
+            .retain(|waiter| waiter.refreshed_at.elapsed() < EXECUTION_WAITER_STALE_AFTER);
+    }
 }
 
 pub struct GitMutationLease {
@@ -620,15 +640,65 @@ impl WorkspaceGitOperationCoordinator {
                 active_session_ids,
             });
         }
+        // 仓库空闲时也要让排在前面的等待者先拿：只有队首（或没有等待者）才能占用。
+        state.prune_stale_waiters();
+        if let Some(head) = state
+            .waiters
+            .iter()
+            .find(|waiter| same_path(&waiter.repository_key, &repository_key))
+            && head.session_id != session_id
+        {
+            return Err(GitCoordinationError::ExecutionActive {
+                repository_key,
+                active_session_ids: vec![head.session_id.clone()],
+            });
+        }
+        state
+            .waiters
+            .retain(|waiter| waiter.session_id != session_id);
         state
             .active_executions
             .insert(session_id.to_string(), repository_key);
         Ok(())
     }
 
+    /// 登记（或刷新）一个因仓库被占用而等待的 session。等待者每次重试 `begin_execution`
+    /// 失败后调用；拿到租约、`end_execution` 或超过一段时间没刷新都会自动退出队列。
+    pub fn register_waiter(&self, session_id: &str, git_common_dir: &Path) {
+        let repository_key = canonical_or_original(git_common_dir);
+        if let Ok(mut state) = self.state.lock() {
+            state.prune_stale_waiters();
+            if let Some(waiter) = state
+                .waiters
+                .iter_mut()
+                .find(|waiter| waiter.session_id == session_id)
+            {
+                waiter.refreshed_at = std::time::Instant::now();
+                return;
+            }
+            state.waiters.push(ExecutionWaiter {
+                session_id: session_id.to_string(),
+                repository_key,
+                refreshed_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    /// 放弃等待（轮次被取消等）。
+    pub fn cancel_waiter(&self, session_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .waiters
+                .retain(|waiter| waiter.session_id != session_id);
+        }
+    }
+
     pub fn end_execution(&self, session_id: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.active_executions.remove(session_id);
+            state
+                .waiters
+                .retain(|waiter| waiter.session_id != session_id);
         }
     }
 
@@ -3263,6 +3333,76 @@ mod tests {
             entry,
             GitTreeBaselineEntry::Deleted { path } if path == "deleted.txt"
         )));
+    }
+
+    #[test]
+    fn workspace_coordinator_hands_the_repository_to_waiters_in_order() {
+        let coordinator = WorkspaceGitOperationCoordinator::default();
+        let repository = PathBuf::from("/tmp/magi-git-coordinator-fairness/.git");
+        coordinator
+            .begin_execution("session-a", &repository)
+            .expect("a runs first");
+        // b、c 依次因仓库被占用而排队。
+        coordinator
+            .begin_execution("session-b", &repository)
+            .expect_err("b waits for a");
+        coordinator.register_waiter("session-b", &repository);
+        coordinator
+            .begin_execution("session-c", &repository)
+            .expect_err("c waits for a");
+        coordinator.register_waiter("session-c", &repository);
+
+        // a 结束后立刻想再占用（目标续跑）：必须排在 b、c 后面，不能抢先。
+        coordinator.end_execution("session-a");
+        coordinator
+            .begin_execution("session-a", &repository)
+            .expect_err("a must queue behind the waiters");
+        coordinator.register_waiter("session-a", &repository);
+        coordinator
+            .begin_execution("session-c", &repository)
+            .expect_err("c is not the head of the queue");
+        coordinator
+            .begin_execution("session-b", &repository)
+            .expect("b is the head and gets the repository");
+
+        coordinator.end_execution("session-b");
+        coordinator
+            .begin_execution("session-a", &repository)
+            .expect_err("c is still ahead of a");
+        coordinator
+            .begin_execution("session-c", &repository)
+            .expect("c is next");
+        coordinator.end_execution("session-c");
+        coordinator
+            .begin_execution("session-a", &repository)
+            .expect("a is last and gets it now");
+    }
+
+    #[test]
+    fn workspace_coordinator_drops_waiters_that_stopped_retrying() {
+        let coordinator = WorkspaceGitOperationCoordinator::default();
+        let repository = PathBuf::from("/tmp/magi-git-coordinator-stale/.git");
+        coordinator.register_waiter("session-gone", &repository);
+        coordinator.cancel_waiter("session-gone");
+        coordinator
+            .begin_execution("session-live", &repository)
+            .expect("cancelled waiter must not block");
+        coordinator.end_execution("session-live");
+        coordinator.register_waiter("session-gone", &repository);
+        coordinator
+            .state
+            .lock()
+            .expect("lock")
+            .waiters
+            .iter_mut()
+            .for_each(|waiter| {
+                waiter.refreshed_at = std::time::Instant::now()
+                    - EXECUTION_WAITER_STALE_AFTER
+                    - std::time::Duration::from_secs(1);
+            });
+        coordinator
+            .begin_execution("session-live", &repository)
+            .expect("stale waiter must not block");
     }
 
     #[test]
