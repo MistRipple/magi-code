@@ -1009,7 +1009,7 @@ impl MagiTurnHarness {
         tool_registry.register_default_builtins();
         let mut execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new());
         if let Some(task_store) = task_store.as_ref() {
-            execution_runtime = execution_runtime.with_task_store(Arc::clone(&task_store));
+            execution_runtime = execution_runtime.with_task_store(Arc::clone(task_store));
         }
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let completion_notifier = task_store
@@ -1135,39 +1135,6 @@ impl MagiTurnHarness {
         };
         harness.state.restore_turn_coordinator_from_session_store();
         harness
-    }
-
-    /// 返回本轮前后可观察的 Task/Runner/Snapshot/Git 运行时资源状态。
-    /// Conversation profile 必须保持四项都为零或未物化。
-    pub fn conversation_runtime_resource_state(
-        &self,
-        session_id: &SessionId,
-        workspace_root: Option<&Path>,
-    ) -> (usize, usize, bool, bool) {
-        let task_count = self
-            .state
-            .task_store()
-            .map(|store| store.all_tasks().len())
-            .unwrap_or(0);
-        let runner_count = if self.state.runner_manager().is_some() {
-            1
-        } else {
-            0
-        };
-        let snapshot_created = workspace_root
-            .and_then(|root| self.state.snapshot_session(session_id, root))
-            .is_some();
-        let git_context_created = self
-            .state
-            .session_code_contexts
-            .get(session_id.as_str())
-            .is_some();
-        (
-            task_count,
-            runner_count,
-            snapshot_created,
-            git_context_created,
-        )
     }
 
     /// 使用同一份 canonical SessionStore 构造新的进程内状态，验证 daemon 重启后的
@@ -1326,6 +1293,7 @@ impl MagiTurnHarness {
         response
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_workspace_task_with_access_profile(
         &self,
         session_id: &SessionId,
@@ -1430,11 +1398,10 @@ impl MagiTurnHarness {
                 .state
                 .session_store
                 .canonical_turn_for_session_turn_id(session_id, turn_id)
+                && turn.status.is_terminal()
             {
-                if turn.status.is_terminal() {
-                    self.provider.timing.mark_terminal_observed();
-                    return turn;
-                }
+                self.provider.timing.mark_terminal_observed();
+                return turn;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1481,15 +1448,14 @@ impl MagiTurnHarness {
                 .state
                 .task_store()
                 .and_then(|store| store.get_task(task_id))
-            {
-                if matches!(
+                && matches!(
                     task.status,
                     magi_core::TaskStatus::Completed
                         | magi_core::TaskStatus::Failed
                         | magi_core::TaskStatus::Killed
-                ) {
-                    return task;
-                }
+                )
+            {
+                return task;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1497,15 +1463,13 @@ impl MagiTurnHarness {
     }
 
     pub fn events_for(&self, session_id: &SessionId) -> Vec<EventEnvelope> {
-        let events = self
-            .state
+        self.state
             .event_bus
             .snapshot()
             .recent_events
             .into_iter()
             .filter(|event| event.session_id.as_ref() == Some(session_id))
-            .collect::<Vec<_>>();
-        events
+            .collect::<Vec<_>>()
     }
 }
 
@@ -5044,6 +5008,7 @@ done
         record_unified_permission_matrix_row(row);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_process_approval_matrix_row(
         case_name: &str,
         lifecycle: &str,
@@ -7500,6 +7465,7 @@ done
         let _ = fs::remove_dir_all(workspace_root);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_git_approval_matrix_row(
         turn: &CanonicalTurn,
         case_name: &str,
@@ -8550,6 +8516,160 @@ done
             "branch_switched_once",
         );
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    async fn wait_for_pending_user_question(
+        harness: &MagiTurnHarness,
+        session_id: &SessionId,
+    ) -> magi_conversation_runtime::PendingUserQuestion {
+        for _ in 0..300 {
+            if let Some(pending) = harness
+                .state
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(session_id)
+                .into_iter()
+                .next()
+                && harness
+                    .events_for(session_id)
+                    .iter()
+                    .any(|event| event.event_type == "user.question.requested")
+            {
+                return pending;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Turn {session_id} 未在测试窗口内产生向用户的提问");
+    }
+
+    fn ask_user_question_arguments() -> String {
+        serde_json::json!({"questions": [{
+            "question": "用哪种数据库？",
+            "header": "数据库",
+            "multiSelect": false,
+            "options": [
+                {"label": "SQLite（推荐）", "description": "零运维"},
+                {"label": "Postgres", "description": "可扩展"}
+            ]
+        }]})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_blocks_the_turn_until_the_user_answers_and_returns_the_answer_to_the_model()
+     {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("ask-user", "向用户提问验收");
+        harness.provider.set_tool_then_completed(
+            "ask_user_question",
+            ask_user_question_arguments(),
+            "已按你的选择继续",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "先问我用哪种数据库，再继续",
+                "harness-ask-user-question",
+                "harness-ask-user-question-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("提问 Turn 应被接纳");
+        let turn_id = accepted.turn_id.clone().expect("应有 Turn");
+        let pending = wait_for_pending_user_question(&harness, &session_id).await;
+        assert_eq!(pending.questions[0].header, "数据库");
+        assert_eq!(pending.questions[0].options.len(), 2);
+
+        // 等待期间这一轮不会结束。
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session_id, &turn_id)
+                .is_some_and(|turn| !turn.status.is_terminal()),
+            "没有回答之前 Turn 必须保持进行中"
+        );
+
+        harness
+            .state
+            .conversation_registry
+            .user_questions()
+            .resolve(
+                &session_id,
+                &pending.question_id,
+                magi_conversation_runtime::UserQuestionResponse::Answered {
+                    answers: vec![magi_conversation_runtime::UserQuestionAnswer {
+                        selected: vec!["Postgres".to_string()],
+                        other: None,
+                    }],
+                },
+            )
+            .expect("回答应被接受");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        // 答案作为工具结果交给了模型的下一次请求。
+        let fed_back = harness.provider.requests().iter().any(|request| {
+            format!("{request:?}").contains("answered")
+                && format!("{request:?}").contains("Postgres")
+        });
+        assert!(fed_back, "用户的回答必须作为工具结果返回给模型");
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_is_cancelled_when_the_turn_is_interrupted() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("ask-user-stop", "向用户提问被停止");
+        harness.provider.set_tool_then_completed(
+            "ask_user_question",
+            ask_user_question_arguments(),
+            "不应走到这里",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "先问我用哪种数据库，再继续",
+                "harness-ask-user-stop",
+                "harness-ask-user-stop-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .expect("提问 Turn 应被接纳");
+        let turn_id = accepted.turn_id.clone().expect("应有 Turn");
+        let pending = wait_for_pending_user_question(&harness, &session_id).await;
+
+        harness
+            .cancel_with_workspace(&session_id, Some(&workspace_id))
+            .await
+            .expect("停止应被接受");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        assert_ne!(turn.status, CanonicalTurnStatus::Completed);
+        for _ in 0..100 {
+            if harness
+                .state
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(&session_id)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            harness
+                .state
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(&session_id)
+                .is_empty(),
+            "轮次停止后待回答的问题必须被清掉：{}",
+            pending.question_id
+        );
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ pub(crate) mod test_turn_fixtures {
     ///
     /// 这些 fixture 只模拟普通 conversation Turn；Goal/Task execution chain
     /// 需要真实 Task 关联时仍应使用对应的 production acceptance API。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn seed_conversation_turn(
         store: &SessionStore,
         coordinator: &SessionTurnCoordinator,

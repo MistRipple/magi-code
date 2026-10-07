@@ -28,6 +28,8 @@
   import type { PickerWebEngineDto } from '../shared/rust-backend-types';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
+  import UserQuestionPanel from './UserQuestionPanel.svelte';
+  import { userQuestionState } from '../stores/user-question-store.svelte';
   import Modal from './Modal.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
   import { projectSessionContextBudget } from '../lib/context-usage-ring';
@@ -120,6 +122,12 @@
 
   type ReasoningEffort = OrchestratorReasoningEffort;
 
+  // 当前会话最早一个待回答的选择题；回答后下一个自然顶上来。
+  const pendingUserQuestion = $derived(
+    userQuestionState.sessionId === (messagesState.currentSessionId?.trim() || '')
+      ? userQuestionState.pending[0] ?? null
+      : null,
+  );
   const reasoningOptions: Array<{
     value: ReasoningEffort;
     labelKey: string;
@@ -2481,7 +2489,13 @@
   }
 </script>
 
-<div class="ia-container">
+<div class="ia-container" class:has-user-question={Boolean(pendingUserQuestion)}>
+  <!-- 模型向用户提出的选择题：贴在输入框上沿，比输入框窄一圈，像从输入框里“拉出”的一张卡。 -->
+  {#if pendingUserQuestion}
+    {#key pendingUserQuestion.questionId}
+      <UserQuestionPanel pending={pendingUserQuestion} />
+    {/key}
+  {/if}
   {#if queuedMessages.length > 0}
     <div class="ia-queue-panel">
       <div class="ia-queue-header">
@@ -3303,6 +3317,11 @@
     -webkit-backdrop-filter: blur(20px);
     position: relative;
     z-index: 1;
+  }
+
+  /* 有待回答的问题时，卡片与输入框零间距相接。 */
+  .ia-container.has-user-question {
+    gap: 0;
   }
 
   .ia-wrapper {

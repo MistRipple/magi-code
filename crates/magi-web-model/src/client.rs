@@ -1072,7 +1072,11 @@ mod tests {
             )
         );
         assert!(
-            !streamed.lock().unwrap().iter().any(|frame| frame.content.contains("blob:")),
+            !streamed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame.content.contains("blob:")),
             "流式阶段不能出现页面地址"
         );
         let stored = sink.stored.lock().unwrap();
@@ -1413,8 +1417,14 @@ mod tests {
         assert_eq!(second.content.as_deref(), Some("新的回答"));
         let frames = streamed.lock().unwrap();
         let (content, _) = accumulate(&frames);
-        assert_eq!(content, "新的回答", "上一轮的回答不能被当成本轮的流式输出：{frames:?}");
-        assert!(frames.iter().all(|frame| !frame.replace), "追加不需要改写帧");
+        assert_eq!(
+            content, "新的回答",
+            "上一轮的回答不能被当成本轮的流式输出：{frames:?}"
+        );
+        assert!(
+            frames.iter().all(|frame| !frame.replace),
+            "追加不需要改写帧"
+        );
     }
 
     #[tokio::test]
@@ -1459,16 +1469,28 @@ mod tests {
         let driver = FakeDriver::new("最终回答");
         driver.with_thinking("先拆解问题，再逐步推导。");
         let slots = Arc::new(WebSlotTable::new());
-        let client = client_with(driver.clone(), slots.clone(), "s1", WebModelClientConfig::default());
+        let client = client_with(
+            driver.clone(),
+            slots.clone(),
+            "s1",
+            WebModelClientConfig::default(),
+        );
         let frames = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
         client
-            .execute(request("问", vec![]), &|delta| frames.lock().unwrap().push(delta.clone()), &|| false)
+            .execute(
+                request("问", vec![]),
+                &|delta| frames.lock().unwrap().push(delta.clone()),
+                &|| false,
+            )
             .await
             .unwrap();
         let frames = frames.lock().unwrap();
         let (content, thinking) = accumulate(&frames);
         assert_eq!(content, "最终回答");
-        assert_eq!(thinking, "先拆解问题，再逐步推导。", "页面推理必须流进 thinking：{frames:?}");
+        assert_eq!(
+            thinking, "先拆解问题，再逐步推导。",
+            "页面推理必须流进 thinking：{frames:?}"
+        );
         assert!(frames.iter().all(|frame| !frame.replace));
     }
 
@@ -1476,10 +1498,19 @@ mod tests {
     async fn streaming_frames_are_increments_never_the_full_text_again() {
         let driver = FakeDriver::new("这是一段会被分成多帧发出的较长回答。");
         let slots = Arc::new(WebSlotTable::new());
-        let client = client_with(driver.clone(), slots.clone(), "s1", WebModelClientConfig::default());
+        let client = client_with(
+            driver.clone(),
+            slots.clone(),
+            "s1",
+            WebModelClientConfig::default(),
+        );
         let frames = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
         client
-            .execute(request("问", vec![]), &|delta| frames.lock().unwrap().push(delta.clone()), &|| false)
+            .execute(
+                request("问", vec![]),
+                &|delta| frames.lock().unwrap().push(delta.clone()),
+                &|| false,
+            )
             .await
             .unwrap();
         let frames = frames.lock().unwrap();
@@ -1487,7 +1518,10 @@ mod tests {
         let mut seen = String::new();
         for frame in frames.iter() {
             assert!(!frame.replace);
-            assert!(!seen.contains(&frame.content) || frame.content.is_empty(), "帧不能重复已发内容：{frames:?}");
+            assert!(
+                !seen.contains(&frame.content) || frame.content.is_empty(),
+                "帧不能重复已发内容：{frames:?}"
+            );
             seen.push_str(&frame.content);
         }
         assert_eq!(seen, "这是一段会被分成多帧发出的较长回答。");
@@ -1520,7 +1554,10 @@ mod tests {
         // 流式帧是增量：页面把文本整段改写时发一帧 replace（完整文字），之后继续照常发出，
         // 消费方累积出的内容与收口全文一致，界面不会停住到收口。
         let frames = frames.lock().unwrap();
-        assert!(frames.iter().any(|frame| frame.replace), "改写必须以 replace 帧表达");
+        assert!(
+            frames.iter().any(|frame| frame.replace),
+            "改写必须以 replace 帧表达"
+        );
         let (content, _) = accumulate(&frames);
         assert_eq!(content, "新的回答，已经重新生成完毕，这一段足够长。");
     }

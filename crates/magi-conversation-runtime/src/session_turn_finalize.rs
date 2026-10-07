@@ -594,6 +594,7 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_completed_root_task_turn_for_turn(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,

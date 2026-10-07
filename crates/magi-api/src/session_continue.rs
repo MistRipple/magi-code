@@ -725,6 +725,7 @@ pub(crate) fn persist_resumed_branch_user_input(
 ///
 /// 这使“用户输入接管中断任务”和“启动恢复 runner”属于同一个串行临界区，避免双击
 /// 恢复链接或多个窗口同时提交时把第二条输入遗留到错误执行链中。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn continue_execution_chain_with_pre_resume<T, U, F, G>(
     state: &ApiState,
     session_id: &SessionId,

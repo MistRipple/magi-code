@@ -135,17 +135,12 @@ impl SessionTurnExecutionOutput {
 ///
 /// 生产执行只使用 `Coordinator`。测试专用的 `Executor` 仅验证存储终态写回，
 /// 不参与生产执行路径。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum TurnTerminalCommitPolicy {
     #[cfg(test)]
     Executor,
+    #[default]
     Coordinator,
-}
-
-impl Default for TurnTerminalCommitPolicy {
-    fn default() -> Self {
-        Self::Coordinator
-    }
 }
 
 impl TurnTerminalCommitPolicy {
@@ -2457,6 +2452,7 @@ mod tests {
         UtcMillis(value)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn seed_task_turn(
         store: &SessionStore,
         session_id: &SessionId,

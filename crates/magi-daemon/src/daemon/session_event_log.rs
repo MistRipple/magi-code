@@ -930,9 +930,11 @@ fn checkpoint_file_name(last_event_seq: u64) -> PathBuf {
     PathBuf::from(format!("{CHECKPOINT_FILE_PREFIX}{last_event_seq:020}.json"))
 }
 
+type EventFilePaths = (Vec<PathBuf>, Vec<(u64, PathBuf)>);
+
 /// 列出事件目录中的检查点（按序号排序）与事务（`(last_event_seq, path)`，按首序号排序）。
 /// 其余文件名一律视为目录损坏。
-fn event_file_paths(event_root: &Path) -> Result<(Vec<PathBuf>, Vec<(u64, PathBuf)>), DaemonError> {
+fn event_file_paths(event_root: &Path) -> Result<EventFilePaths, DaemonError> {
     let mut checkpoints = Vec::new();
     let mut transactions = Vec::new();
     for entry in fs::read_dir(event_root)? {

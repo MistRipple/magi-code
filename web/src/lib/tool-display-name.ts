@@ -62,6 +62,7 @@ const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
   agent_apply: 'toolCall.displayName.agentApply',
   update_plan: 'toolCall.displayName.updatePlan',
   memory_write: 'toolCall.displayName.memoryWrite',
+  ask_user_question: 'toolCall.displayName.askUserQuestion',
 };
 
 export function resolveToolDisplayName(toolName: string, translations: TranslationSource): string {

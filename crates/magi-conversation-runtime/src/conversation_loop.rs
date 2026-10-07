@@ -3668,6 +3668,7 @@ fn publish_task_content_delta(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_task_stream_turn_item(
     context: TaskTurnWritebackContext<'_>,
     item_id: &str,

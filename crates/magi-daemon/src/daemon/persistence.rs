@@ -136,7 +136,7 @@ fn trim_resident_event_projections(
     if resident.len() <= MAX_RESIDENT_EVENT_PROJECTIONS {
         return;
     }
-    resident.sort_by(|left, right| right.1.cmp(&left.1));
+    resident.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (session_id, _) in resident.into_iter().skip(MAX_RESIDENT_EVENT_PROJECTIONS) {
         if let Some(projection) = cache.get_mut(&session_id) {
             projection.release_canonical_turns();
@@ -4088,12 +4088,11 @@ mod tests {
             .load_session_projections(&[])
             .expect("projections should restore");
         assert_eq!(resident_event_projections(&repository), 0);
-        assert_eq!(
+        assert!(
             repository
                 .canonical_event_next_sequence(&session_id)
                 .expect("cursor is available without resident turns")
-                > 1,
-            true
+                > 1
         );
         let session_store =
             SessionStore::from_persisted_parts(durable, sidecars).expect("store should restore");

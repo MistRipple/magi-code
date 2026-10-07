@@ -317,7 +317,7 @@ async fn verify_named_tunnel(
                 401 => respond(true, "ok", Some(code)),
                 // Cloudflare：隧道没有连接（1033）/ 源站不可达。
                 530 | 1033 => respond(false, "tunnel_not_connected", Some(code)),
-                502 | 503 | 504 => respond(false, "origin_unreachable", Some(code)),
+                502..=504 => respond(false, "origin_unreachable", Some(code)),
                 _ => respond(false, "unexpected", Some(code)),
             }
         }

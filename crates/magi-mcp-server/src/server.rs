@@ -933,7 +933,10 @@ mod tests {
             server.handle(&other, call("magi.fs.read", json!({})), 1),
         )
         .await;
-        assert!(other_call.is_err(), "其他客户端的调用应正常进入后端而不是被拒绝");
+        assert!(
+            other_call.is_err(),
+            "其他客户端的调用应正常进入后端而不是被拒绝"
+        );
 
         // 放行后名额归还，新的调用又能进入。
         backend.gate.notify_waiters();
@@ -941,6 +944,9 @@ mod tests {
             let response = task.await.unwrap().unwrap();
             assert!(!is_error(&response), "{response}");
         }
-        assert!(server.in_flight.0.lock().unwrap().is_empty(), "名额必须全部归还");
+        assert!(
+            server.in_flight.0.lock().unwrap().is_empty(),
+            "名额必须全部归还"
+        );
     }
 }

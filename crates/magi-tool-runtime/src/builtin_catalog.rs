@@ -117,6 +117,10 @@ pub enum BuiltinToolName {
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MemoryWrite,
+    // ── 向用户提问 ──
+    /// 主线遇到需要用户拍板的分叉时，向用户提出 1–4 个选择题（可多选，界面固定追加“其他”自由输入），
+    /// 等用户回答后把答案作为工具结果返回。由 orchestration 层拦截，不进入 ToolRegistry。
+    AskUserQuestion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +129,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 81] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -206,6 +210,7 @@ impl BuiltinToolName {
         Self::ContextRequest,
         Self::UpdatePlan,
         Self::MemoryWrite,
+        Self::AskUserQuestion,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -290,6 +295,7 @@ impl BuiltinToolName {
             Self::ContextRequest => "context_request",
             Self::UpdatePlan => "update_plan",
             Self::MemoryWrite => "memory_write",
+            Self::AskUserQuestion => "ask_user_question",
         }
     }
 
@@ -366,7 +372,7 @@ impl BuiltinToolName {
             | Self::ContextSearch
             | Self::ContextRead
             | Self::ContextRequest => "agent_coordination",
-            Self::UpdatePlan => "session_state",
+            Self::UpdatePlan | Self::AskUserQuestion => "session_state",
             Self::MemoryWrite => "project_memory",
         }
     }
@@ -453,6 +459,7 @@ impl BuiltinToolName {
             "context_request" => Some(Self::ContextRequest),
             "update_plan" => Some(Self::UpdatePlan),
             "memory_write" => Some(Self::MemoryWrite),
+            "ask_user_question" => Some(Self::AskUserQuestion),
             _ => None,
         }
     }
@@ -665,7 +672,8 @@ impl BuiltinToolName {
             | Self::CreateGoal
             | Self::UpdateGoal
             | Self::UpdatePlan
-            | Self::MemoryWrite => RestrictedWriteProfilePolicy::AutoAllowed,
+            | Self::MemoryWrite
+            | Self::AskUserQuestion => RestrictedWriteProfilePolicy::AutoAllowed,
             Self::BrowserClick
             | Self::BrowserType
             | Self::BrowserPress
@@ -761,6 +769,7 @@ impl BuiltinToolName {
             | Self::ContextRequest
             | Self::UpdatePlan
             | Self::MemoryWrite
+            | Self::AskUserQuestion
             | Self::BrowserNavigate
             | Self::BrowserSnapshot
             | Self::BrowserScreenshot
@@ -1130,6 +1139,23 @@ impl BuiltinToolName {
             }
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
+            }
+            Self::AskUserQuestion => {
+                "当继续执行需要用户做决定、而你无法从代码和上下文中可靠判断时，向用户提出选择题，等用户在对话框里选完再继续。用户看到的是带选项的卡片；每道题固定多一个“其他”，让用户自己输入，所以不要自己写“其他”选项。\n\n\
+                # 何时用\n\
+                - 存在几个都合理、取舍不同的方案，选错的代价大于问一次的代价（技术选型、改动范围、是否破坏兼容）\n\
+                - 需求有歧义，且不同理解会导致完全不同的实现\n\
+                - 一次可以问 1–4 个相互独立的问题，合并提问比反复打断用户好\n\n\
+                # 何时不用\n\
+                - 答案可以从代码、文档、已有对话中查到；先查，不要用提问代替调查\n\
+                - 琐碎的偏好、你有合理默认值的细节：直接选默认并说明\n\
+                - 需要用户批准某个具体操作：那是工具授权，不是提问\n\n\
+                # 写法\n\
+                - question 是完整的一句问题；header 是 12 字以内的短标签（如“数据库”“范围”）\n\
+                - 每题 2–4 个互斥的选项（multiSelect=true 时可并存），label 简短，description 说明选它的含义与代价\n\
+                - 有明确推荐时把推荐项放第一个，并在 label 末尾加“（推荐）”\n\n\
+                # 返回\n\
+                返回每道题用户选中的 label 列表；选了“其他”时给出用户输入的原文。status=skipped 表示用户没有回答，此时不要反复追问，按你的最佳判断继续并说明假设。子代理不能使用本工具。"
             }
             _ => unreachable!("浏览器工具描述已由 browser-tool.schema.json 的唯一目录提供"),
         }
@@ -1953,6 +1979,41 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["action", "file_stem"]
+            }),
+            Self::AskUserQuestion => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "要问用户的问题，1–4 个，彼此独立。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string", "minLength": 1, "description": "完整的一句问题。" },
+                                "header": { "type": "string", "minLength": 1, "maxLength": 24, "description": "显示在卡片上的短标签，12 字以内。" },
+                                "multiSelect": { "type": "boolean", "description": "是否允许多选；选项互斥时为 false。" },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "description": "候选项。不要包含“其他”，界面会自动追加。",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string", "minLength": 1, "description": "选项名称，简短。" },
+                                            "description": { "type": "string", "description": "这个选项的含义、代价或影响。" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                }
+                            },
+                            "required": ["question", "header", "multiSelect", "options"]
+                        }
+                    }
+                },
+                "required": ["questions"]
             }),
             _ => unreachable!("浏览器工具参数已由 browser-tool.schema.json 的唯一目录提供"),
         }

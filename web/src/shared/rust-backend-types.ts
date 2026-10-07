@@ -251,6 +251,44 @@ export interface SessionToolApprovalsResponseDto {
   pendingApprovals: PendingToolApprovalDto[];
 }
 
+/** 模型通过 `ask_user_question` 向用户提出的一道选择题。“其他”由界面固定追加，不在 options 里。 */
+export interface UserQuestionDto {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: Array<{ label: string; description?: string }>;
+}
+
+export interface PendingUserQuestionDto {
+  questionId: string;
+  sessionId: string;
+  taskId: string;
+  turnId: string;
+  toolCallId: string;
+  questions: UserQuestionDto[];
+  requestedAt: number;
+}
+
+export interface UserQuestionAnswerDto {
+  selected: string[];
+  other?: string;
+}
+
+export type UserQuestionResponseDto =
+  | { kind: 'answered'; answers: UserQuestionAnswerDto[] }
+  | { kind: 'skipped' };
+
+export interface SessionUserQuestionsResponseDto {
+  sessionId: string;
+  pendingQuestions: PendingUserQuestionDto[];
+}
+
+export interface SessionUserQuestionResponseDto {
+  sessionId: string;
+  questionId: string;
+  status: string;
+}
+
 export interface ServiceInfoDto {
   serviceName: string;
   apiVersion: string;

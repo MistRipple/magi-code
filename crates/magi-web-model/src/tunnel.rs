@@ -505,9 +505,7 @@ impl TunnelManager {
             TunnelClientStatus::Running { .. } | TunnelClientStatus::NotReady { .. }
         ) {
             state.status = next;
-            if state.status.is_running() {
-                state.startup_deadline = None;
-            } else if !startup_grace_active {
+            if state.status.is_running() || !startup_grace_active {
                 state.startup_deadline = None;
             }
         }
@@ -975,7 +973,6 @@ mod tests {
         config.expected_client_sha256 = Some("00".repeat(32));
         let manager = TunnelManager::new(config.clone());
         assert_eq!(manager.start().await, TunnelClientStatus::ChecksumMismatch);
-        let mut config = config;
         config.expected_client_sha256 = Some(sha256_of(&config.client_binary));
         let manager = TunnelManager::new(config);
         let status = manager.start().await;

@@ -342,6 +342,7 @@ pub enum RoleTarget<'a> {
 /// - `Ok(Some(client))`：成功解析出 client；
 /// - `Ok(None)`：目标未配置（按 target 含义视作正常的"跳过"或"继承"信号）；
 /// - `Err(msg)`：配置存在但字段非法时返回，调用方应失败，避免替代模型掩盖坏配置。
+///
 /// 顶层会话（编排者）的线程 id。
 ///
 /// 线程维度是 Web 引擎绑定键的一部分（R50）：编排者与每个子代理各用一条
@@ -1505,6 +1506,7 @@ impl LlmTaskDispatcher {
 
     /// 子代理永不直接复用主会话 live worktree：只读任务拿 detached worktree，
     /// 可写任务拿唯一临时 branch + 独立 worktree。两者都从主线工作树当前内容的快照出发。
+    #[allow(clippy::too_many_arguments)]
     fn resolve_task_execution_root(
         &self,
         task: &magi_core::Task,
@@ -1724,7 +1726,7 @@ impl LlmTaskDispatcher {
             return None;
         };
         let context = registry.get(session_id.as_str())?;
-        let Some(allocation) = context
+        let allocation = context
             .agent_worktrees
             .iter()
             .find(|worktree| {
@@ -1732,10 +1734,7 @@ impl LlmTaskDispatcher {
                     && worktree.active
                     && worktree.lease_id.as_deref() == Some(lease_id.as_str())
             })
-            .cloned()
-        else {
-            return None;
-        };
+            .cloned()?;
 
         let mut workspace_output = None;
         let mut commit_error = None;

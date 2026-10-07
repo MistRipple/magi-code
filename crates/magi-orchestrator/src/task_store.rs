@@ -1865,7 +1865,7 @@ impl TaskStore {
         let now = UtcMillis::now();
         let mut failed_count = 0usize;
         for root_task_id in &affected_roots {
-            for task_id in collect_subtree_ids_from_tasks(&tasks, &root_task_id) {
+            for task_id in collect_subtree_ids_from_tasks(&tasks, root_task_id) {
                 if let Some(task) = tasks.get_mut(&task_id)
                     && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
                 {

@@ -645,21 +645,22 @@ impl McpServiceRuntime {
             .lock()
             .expect("mcp direct lock poisoned")
             .enabled;
-        if (control.enabled || direct_enabled) && control.running.is_none() {
-            if let Err(error) = self.start_locked(state, &mut control).await {
-                tracing::warn!(%error, "MCP 服务启动失败，保持关闭");
-                if direct_enabled {
-                    self.direct
-                        .lock()
-                        .expect("mcp direct lock poisoned")
-                        .enabled = false;
-                    *self.direct_error.lock().expect("mcp direct lock poisoned") =
-                        Some(error.to_string());
-                    if control.enabled
-                        && let Err(error) = self.start_locked(state, &mut control).await
-                    {
-                        tracing::warn!(%error, "MCP 服务启动失败，保持关闭");
-                    }
+        if (control.enabled || direct_enabled)
+            && control.running.is_none()
+            && let Err(error) = self.start_locked(state, &mut control).await
+        {
+            tracing::warn!(%error, "MCP 服务启动失败，保持关闭");
+            if direct_enabled {
+                self.direct
+                    .lock()
+                    .expect("mcp direct lock poisoned")
+                    .enabled = false;
+                *self.direct_error.lock().expect("mcp direct lock poisoned") =
+                    Some(error.to_string());
+                if control.enabled
+                    && let Err(error) = self.start_locked(state, &mut control).await
+                {
+                    tracing::warn!(%error, "MCP 服务启动失败，保持关闭");
                 }
             }
         }

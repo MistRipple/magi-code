@@ -3679,7 +3679,7 @@ async fn ensure_user_control_for_ui(
     if !revoked.is_empty() {
         if let Err(error) = super::sessions::interrupt_session_turn_for_browser_takeover(
             state,
-            require_session_scope(&session)?,
+            require_session_scope(session)?,
             session.owner_workspace_id(),
         )
         .await
@@ -3709,7 +3709,7 @@ async fn ensure_user_control_for_ui(
             state,
             "browser.control.changed",
             session.owner_workspace_id(),
-            require_session_scope(&session)?,
+            require_session_scope(session)?,
             serde_json::json!({
                 "browser_session_id": session.browser_session_id,
                 "tab_id": control.tab_id,

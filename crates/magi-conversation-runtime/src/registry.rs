@@ -27,6 +27,8 @@ pub struct ConversationRegistry {
     turn_coordinator: Arc<SessionTurnCoordinator>,
     task_signal_channels: Mutex<HashMap<(SessionId, TaskId), VecDeque<RuntimeSignal>>>,
     task_signal_ready: Condvar,
+    /// 模型向用户提出的选择题（`ask_user_question`）的待处理项。
+    user_questions: crate::UserQuestionRegistry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,7 @@ impl ConversationRegistry {
             turn_coordinator,
             task_signal_channels: Mutex::new(HashMap::new()),
             task_signal_ready: Condvar::new(),
+            user_questions: crate::UserQuestionRegistry::default(),
         }
     }
 
@@ -97,6 +100,10 @@ impl ConversationRegistry {
 
     pub fn tool_approvals(&self) -> &crate::ToolApprovalRegistry {
         self.turn_coordinator.tool_approvals()
+    }
+
+    pub fn user_questions(&self) -> &crate::UserQuestionRegistry {
+        &self.user_questions
     }
 
     pub fn turn_coordinator(&self) -> &SessionTurnCoordinator {

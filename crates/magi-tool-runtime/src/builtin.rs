@@ -257,7 +257,8 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::ContextRead
             | BuiltinToolName::ContextRequest
             | BuiltinToolName::UpdatePlan
-            | BuiltinToolName::MemoryWrite => execute_orchestration_only(self.name, input),
+            | BuiltinToolName::MemoryWrite
+            | BuiltinToolName::AskUserQuestion => execute_orchestration_only(self.name, input),
         }
     }
 

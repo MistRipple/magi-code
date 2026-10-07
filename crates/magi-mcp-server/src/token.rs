@@ -511,8 +511,15 @@ mod tests {
         assert_ne!(new_secret, issued.secret);
         assert_eq!(record.profile, Profile::Edit);
         assert_eq!(record.workspace_id, "workspace-a");
-        assert!(store.authenticate(&issued.secret, 2_000).is_err(), "旧原文立即失效");
+        assert!(
+            store.authenticate(&issued.secret, 2_000).is_err(),
+            "旧原文立即失效"
+        );
         assert!(store.authenticate(&new_secret, 2_000).is_ok());
-        assert!(!serde_json::to_string(&store.records()).unwrap().contains(&new_secret));
+        assert!(
+            !serde_json::to_string(&store.records())
+                .unwrap()
+                .contains(&new_secret)
+        );
     }
 }

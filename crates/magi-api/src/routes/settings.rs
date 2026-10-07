@@ -3453,6 +3453,7 @@ mod tests {
             "context_request",
             "update_plan",
             "memory_write",
+            "ask_user_question",
         ];
         assert_eq!(
             builtin_names, expected_builtin_names,

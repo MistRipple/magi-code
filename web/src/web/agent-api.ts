@@ -17,6 +17,9 @@ import type {
   SessionInterruptResponseDto,
   SessionToolApprovalResponseDto,
   SessionToolApprovalsResponseDto,
+  SessionUserQuestionResponseDto,
+  SessionUserQuestionsResponseDto,
+  UserQuestionResponseDto,
   ToolApprovalDecision,
   SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
@@ -2781,6 +2784,53 @@ export async function resolveAgentToolApproval(
       decision,
     },
     'resolve tool approval',
+    bindingOverride
+      ? { ...bindingOverride, sessionId: normalizedSessionId }
+      : { sessionId: normalizedSessionId },
+  );
+}
+
+export async function getAgentSessionUserQuestions(
+  sessionId: string,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionUserQuestionsResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'load user questions');
+  }
+  const query = buildBoundQueryWithOverride(
+    {},
+    bindingOverride
+      ? { ...bindingOverride, sessionId: normalizedSessionId }
+      : { sessionId: normalizedSessionId },
+    { includeScope: false, includeSession: true },
+  );
+  const response = await getTransport().request(
+    agentUrl('/api/session/user-questions', query),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<SessionUserQuestionsResponseDto>(response, 'load user questions');
+}
+
+export async function resolveAgentUserQuestion(
+  sessionId: string,
+  questionId: string,
+  responsePayload: UserQuestionResponseDto,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionUserQuestionResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  const normalizedQuestionId = questionId.trim();
+  if (!normalizedSessionId || !normalizedQuestionId) {
+    throw new AgentApiError(400, 'sessionId 和 questionId 不能为空', 'resolve user question');
+  }
+  return await postBoundJson<SessionUserQuestionResponseDto>(
+    '/api/session/user-question',
+    {
+      sessionId: normalizedSessionId,
+      questionId: normalizedQuestionId,
+      response: responsePayload,
+    },
+    'resolve user question',
     bindingOverride
       ? { ...bindingOverride, sessionId: normalizedSessionId }
       : { sessionId: normalizedSessionId },

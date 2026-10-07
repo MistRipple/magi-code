@@ -175,6 +175,8 @@ pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
         // 工具与角色能力（含并不对外的那部分），对外部客户端只会造成误导。
         | T::DiagramRender
         | T::ToolCatalog
+        // 向用户提问：问题显示在 Magi 自己的对话框里，只对 Magi 的主线有意义。
+        | T::AskUserQuestion
         // 图片：依赖会话附件与模型能力。
         | T::ViewImage
         | T::ImageGenerate

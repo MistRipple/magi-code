@@ -71,6 +71,8 @@ fn merge_completion_context(
     }
 }
 
+type PublishedTerminalKey = (TaskId, String, u64, u32);
+
 /// 将 Worker 结果转换为 TaskStore durable 终态，并在提交之后投递轻量通知。
 #[derive(Clone)]
 pub struct TaskCompletionNotifier {
@@ -84,7 +86,7 @@ pub struct TaskCompletionNotifier {
     /// same durable terminal fact. Deduplicate by the committed task generation,
     /// not by optional Turn/lease context, which may be consumed by the first
     /// notification before a repeated callback arrives.
-    published_terminals: Arc<Mutex<HashSet<(TaskId, String, u64, u32)>>>,
+    published_terminals: Arc<Mutex<HashSet<PublishedTerminalKey>>>,
     observer: Arc<Mutex<Option<Observer>>>,
 }
 

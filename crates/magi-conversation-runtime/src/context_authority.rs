@@ -844,7 +844,7 @@ impl<'a> ContextAuthority<'a> {
         if compacted_tokens >= original_tokens {
             return Err("上下文压缩候选没有小于原始历史".to_string());
         }
-        return Ok(Some((current_history, raw_source_message_count)));
+        Ok(Some((current_history, raw_source_message_count)))
     }
 
     fn compact_one_pass(
@@ -944,6 +944,7 @@ impl<'a> ContextAuthority<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_compaction_summary(
         &self,
         summary_model: &CompactionModel<'a>,

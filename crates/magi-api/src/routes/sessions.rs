@@ -12,8 +12,8 @@ use magi_conversation_runtime::{
     SessionTurnCommand, SessionTurnExecutionRequest, TurnAdmission, TurnCommand,
 };
 use magi_conversation_runtime::{
-    PendingToolApproval, SessionTurnInputCommitError, SessionTurnInputError, ToolApprovalDecision,
-    UserSignal,
+    PendingToolApproval, PendingUserQuestion, SessionTurnInputCommitError, SessionTurnInputError,
+    ToolApprovalDecision, UserQuestionResponse, UserSignal,
 };
 use magi_core::{
     AccessProfile, DomainError, EventId, MissionId, SessionId, TaskCompletionContract,
@@ -69,6 +69,11 @@ pub fn routes() -> Router<ApiState> {
         .route(
             "/session/tool-approval",
             post(resolve_session_tool_approval),
+        )
+        .route("/session/user-questions", get(get_session_user_questions))
+        .route(
+            "/session/user-question",
+            post(resolve_session_user_question),
         )
         .route("/session/continue", post(continue_session))
         .route("/session/navigation", post(navigate_session))
@@ -198,6 +203,96 @@ async fn resolve_session_tool_approval(
         session_id,
         approval_id: approval_id.to_string(),
         decision: request.decision,
+        status: "resolved",
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveSessionUserQuestionRequest {
+    #[serde(flatten)]
+    scope: SessionToolApprovalScope,
+    question_id: String,
+    response: UserQuestionResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionUserQuestionsResponse {
+    session_id: SessionId,
+    pending_questions: Vec<PendingUserQuestion>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveSessionUserQuestionResponse {
+    session_id: SessionId,
+    question_id: String,
+    status: &'static str,
+}
+
+/// 模型向用户提出的待回答选择题（`ask_user_question`）。
+async fn get_session_user_questions(
+    State(state): State<ApiState>,
+    Query(scope): Query<SessionToolApprovalScope>,
+) -> Result<Json<SessionUserQuestionsResponse>, ApiError> {
+    let session_id = require_session_tool_approval_scope(&state, &scope)?;
+    Ok(Json(SessionUserQuestionsResponse {
+        pending_questions: state
+            .conversation_registry
+            .user_questions()
+            .pending_for_session(&session_id),
+        session_id,
+    }))
+}
+
+async fn resolve_session_user_question(
+    State(state): State<ApiState>,
+    Json(request): Json<ResolveSessionUserQuestionRequest>,
+) -> Result<Json<ResolveSessionUserQuestionResponse>, ApiError> {
+    let session_id = require_session_tool_approval_scope(&state, &request.scope)?;
+    let question_id = request.question_id.trim();
+    if question_id.is_empty() {
+        return Err(ApiError::InvalidInput("questionId 不能为空".to_string()));
+    }
+    let outcome = match &request.response {
+        UserQuestionResponse::Answered { .. } => "answered",
+        UserQuestionResponse::Skipped => "skipped",
+    };
+    // 回答与题目对不上是调用方的输入错误；问题已经收口（轮次结束、已回答）才是冲突。
+    let pending = state
+        .conversation_registry
+        .user_questions()
+        .resolve(&session_id, question_id, request.response)
+        .map_err(|message| {
+            if message.starts_with("这个问题已经处理过") {
+                ApiError::Conflict(message)
+            } else {
+                ApiError::InvalidInput(message)
+            }
+        })?;
+    let _ = state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::unique("event-user-question-resolved"),
+            "user.question.resolved",
+            json!({
+                "session_id": session_id,
+                "task_id": pending.task_id,
+                "turn_id": pending.turn_id,
+                "tool_call_id": pending.tool_call_id,
+                "question_id": pending.question_id,
+                "outcome": outcome,
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            task_id: Some(pending.task_id),
+            ..EventContext::default()
+        }),
+    );
+    Ok(Json(ResolveSessionUserQuestionResponse {
+        session_id,
+        question_id: question_id.to_string(),
         status: "resolved",
     }))
 }
@@ -1873,18 +1968,17 @@ async fn submit_conversation_session_turn(
     // 新会话的标题：交给辅助模型根据首条消息精修（未配置辅助模型时静默保留占位标题）。
     // 之前只有任务路线接了这一步，聊天路线（包括 GPT Web 会话）创建的会话永远叫「新会话」。
     // 已保存的 GPT Web 对话之后仍以 ChatGPT 的标题为准（见 `record_saved_web_progress`）。
-    if created_session {
-        if let Some(first_message) = request
+    if created_session
+        && let Some(first_message) = request
             .trimmed_text()
             .filter(|text| !text.trim().is_empty())
-        {
-            crate::session_title::spawn_new_session_title_refinement(
-                &state,
-                &session_id,
-                &first_message,
-                crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
-            );
-        }
+    {
+        crate::session_title::spawn_new_session_title_refinement(
+            &state,
+            &session_id,
+            &first_message,
+            crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
+        );
     }
     let session_summary = if created_session {
         state
@@ -2218,21 +2312,21 @@ fn schedule_conversation_execution(
         // canonical mutation 已经在 terminal guard 内完成；只有本次执行真正写入了
         // 当前 Turn，Coordinator 才收口同一 attempt。取消或新 Turn 先提交时，迟到
         // 的执行结果不会再次触碰 Coordinator。
-        if canonical_changed {
-            if let Err(error) = coordinator.execute_command(
+        if canonical_changed
+            && let Err(error) = coordinator.execute_command(
                 &session_id,
                 TurnCommand::Finish {
                     attempt: attempt.clone(),
                     status: terminal_status,
                 },
-            ) {
-                tracing::error!(
-                    session_id = %session_id,
-                    turn_id = %turn_id,
-                    %error,
-                    "conversation Turn Coordinator 终态收口失败"
-                );
-            }
+            )
+        {
+            tracing::error!(
+                session_id = %session_id,
+                turn_id = %turn_id,
+                %error,
+                "conversation Turn Coordinator 终态收口失败"
+            );
         }
         if let Err(error) =
             state.persist_session_state_checkpoint("session_conversation_turn_terminal")
@@ -2642,7 +2736,7 @@ pub(crate) fn record_active_goal_turn_failure(
         return;
     }
     if let Err(error) =
-        state.persist_session_projection_for_sessions(std::slice::from_ref(&session_id))
+        state.persist_session_projection_for_sessions(std::slice::from_ref(session_id))
     {
         tracing::warn!(
             session_id = %session_id,
@@ -3673,20 +3767,20 @@ async fn interrupt_session_turn(
             state
                 .turn_coordinator()
                 .close_session_turn_input(&session_id, turn_id);
-            if let Some(attempt) = coordinator_attempt.as_ref() {
-                if let Err(error) = state.turn_coordinator().execute_command(
+            if let Some(attempt) = coordinator_attempt.as_ref()
+                && let Err(error) = state.turn_coordinator().execute_command(
                     &session_id,
                     TurnCommand::Cancel {
                         attempt: attempt.clone(),
                     },
-                ) {
-                    tracing::error!(
-                        session_id = %session_id,
-                        turn_id = %attempt.turn_id,
-                        %error,
-                        "中断后 conversation Coordinator 终态收口失败"
-                    );
-                }
+                )
+            {
+                tracing::error!(
+                    session_id = %session_id,
+                    turn_id = %attempt.turn_id,
+                    %error,
+                    "中断后 conversation Coordinator 终态收口失败"
+                );
             }
         }
         if let Some(item_id) = cancelled_item_id.as_deref() {
@@ -4905,6 +4999,120 @@ mod tests {
             accepted_at,
             status,
             text,
+        );
+    }
+
+    #[tokio::test]
+    async fn user_question_route_lists_and_resolves_pending_questions() {
+        let state = test_state();
+        let session_id = SessionId::new("session-user-question-route");
+        state
+            .session_store
+            .create_session(session_id.clone(), "user question route")
+            .expect("session should be creatable");
+        let questions = magi_conversation_runtime::user_question::parse_questions(
+            &serde_json::json!({"questions":[{
+                "question": "用哪种方案？",
+                "header": "方案",
+                "multiSelect": false,
+                "options": [{"label": "A"}, {"label": "B", "description": "更稳"}]
+            }]})
+            .to_string(),
+        )
+        .expect("questions should parse");
+        let waiter = state
+            .conversation_registry
+            .user_questions()
+            .request(PendingUserQuestion {
+                question_id: "question-route-1".to_string(),
+                session_id: session_id.clone(),
+                task_id: TaskId::new("task-user-question-route"),
+                turn_id: "turn-user-question-route".to_string(),
+                tool_call_id: "call-user-question-route".to_string(),
+                questions,
+                requested_at: UtcMillis::now(),
+            });
+        let app = routes().with_state(state);
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/session/user-question")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request should build")
+        };
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/session/user-questions?sessionId={session_id}"))
+                    .body(Body::empty())
+                    .expect("list request should build"),
+            )
+            .await
+            .expect("list route should respond");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            listed["pendingQuestions"][0]["questionId"],
+            "question-route-1"
+        );
+        assert_eq!(
+            listed["pendingQuestions"][0]["questions"][0]["header"],
+            "方案"
+        );
+
+        // 回答和题目对不上：输入错误，问题仍然待处理。
+        let invalid = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "sessionId": session_id,
+                "questionId": "question-route-1",
+                "response": {"kind": "answered", "answers": [{"selected": ["不存在"]}]},
+            })))
+            .await
+            .expect("invalid answer should respond");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let answered = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "sessionId": session_id,
+                "questionId": "question-route-1",
+                "response": {"kind": "answered", "answers": [{"selected": ["B"]}]},
+            })))
+            .await
+            .expect("answer route should respond");
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert_eq!(
+            waiter
+                .response_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("runtime should receive the answer"),
+            magi_conversation_runtime::UserQuestionResponse::Answered {
+                answers: vec![magi_conversation_runtime::UserQuestionAnswer {
+                    selected: vec!["B".to_string()],
+                    other: None,
+                }]
+            }
+        );
+
+        let duplicate = app
+            .oneshot(post(serde_json::json!({
+                "sessionId": session_id,
+                "questionId": "question-route-1",
+                "response": {"kind": "skipped"},
+            })))
+            .await
+            .expect("duplicate answer should respond");
+        assert_eq!(
+            duplicate.status(),
+            StatusCode::CONFLICT,
+            "重复回答必须被确定性拒绝"
         );
     }
 

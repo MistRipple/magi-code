@@ -18,6 +18,8 @@
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
   import { parseToolIdentity } from '../lib/tool-identity';
+  import { parseUserQuestionResult } from '../shared/user-question';
+  import { isUserQuestionPending } from '../stores/user-question-store.svelte';
   import { resolveToolDisplayName } from '../lib/tool-display-name';
   import {
     formatViewImageToolOutput,
@@ -204,6 +206,7 @@
       'agent_apply': 'git-branch',
       'update_plan': 'list',
       'memory_write': 'database',
+      'ask_user_question': 'question',
     };
 
     if (iconMap[baseToolName]) {
@@ -421,15 +424,20 @@
   // 折叠态只计算卡片存在性和标题摘要；完整输入输出、图片和图表在展开后解析。
   const sanitizedInput = $derived(sanitizeToolDisplayPayload(input));
   const hasInput = $derived(
-    hasDisplayContent(sanitizedInput) || hasInternalRedactedDisplayValue(input),
+    name !== 'ask_user_question'
+      && (hasDisplayContent(sanitizedInput) || hasInternalRedactedDisplayValue(input)),
   );
   const toolApproval = $derived.by(() => (
     parseToolApprovalPayload(output)
     || parseToolApprovalPayload(error)
     || parseToolApprovalPayload(standardized?.message)
   ));
-  const outputIsStructuredError = $derived(!toolApproval && isStructuredToolErrorPayload(output));
-  const hasOutput = $derived(!toolApproval && !outputIsStructuredError && hasDisplayContent(output));
+  // 向用户提问：对话流里只展示“问了什么、用户答了什么”的摘要，不展示原始 JSON 输入输出。
+  const userQuestionSummary = $derived(
+    name === 'ask_user_question' ? parseUserQuestionResult(output) : null,
+  );
+  const outputIsStructuredError = $derived(!toolApproval && !userQuestionSummary && isStructuredToolErrorPayload(output));
+  const hasOutput = $derived(!toolApproval && !userQuestionSummary && !outputIsStructuredError && hasDisplayContent(output));
   const structuredErrorText = $derived.by(() => {
     if (!outputIsStructuredError) {
       return '';
@@ -454,7 +462,9 @@
   const outcomeUnconfirmed = $derived(status === 'unconfirmed');
   const visualStatus = $derived<VisualToolStatus>(status);
 
-  const hasContent = $derived(hasInput || hasOutput || hasError || Boolean(toolApproval));
+  const hasContent = $derived(
+    hasInput || hasOutput || hasError || Boolean(toolApproval) || Boolean(userQuestionSummary),
+  );
   // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
   // 被紧凑卡片规则吞掉；授权状态会自动展开到卡片内容区。
   const canExpand = $derived(
@@ -1115,6 +1125,35 @@
             </div>
           {/if}
 
+          {#if userQuestionSummary}
+            <div class="tool-section">
+              {#if userQuestionSummary.status === 'awaiting'}
+                <!-- 轮次被停止或会话重启后问题已不在待回答列表里：不能一直显示“等待你的回答”。 -->
+                <div class="uq-summary-note">
+                  {userQuestionSummary.questionId
+                    && !isUserQuestionPending(filePreviewScope?.sessionId || getCurrentSessionId() || '', userQuestionSummary.questionId)
+                    ? i18n.t('toolCall.userQuestion.ended')
+                    : i18n.t('toolCall.userQuestion.awaiting')}
+                </div>
+              {:else if userQuestionSummary.status === 'skipped'}
+                <div class="uq-summary-note">{i18n.t('toolCall.userQuestion.skipped')}</div>
+              {:else}
+                <ul class="uq-summary">
+                  {#each userQuestionSummary.items as item, index (index)}
+                    <li>
+                      <div class="uq-summary-question">
+                        {#if item.header}<span class="uq-summary-chip">{item.header}</span>{/if}{item.question}
+                      </div>
+                      <div class="uq-summary-answer">
+                        {[...item.selected, ...(item.other ? [`${i18n.t('toolCall.userQuestion.other')}：${item.other}`] : [])].join('、')}
+                      </div>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          {/if}
+
           {#if toolApproval}
             <div class="tool-section approval">
               <ToolApprovalAction approval={toolApproval} />
@@ -1738,5 +1777,44 @@
 
   .agent-spawn-cta-degraded {
     color: var(--warning);
+  }
+
+  .uq-summary {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .uq-summary-question {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .uq-summary-chip {
+    display: inline-block;
+    margin-right: var(--space-1);
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 10px;
+    line-height: 1.6;
+  }
+
+  .uq-summary-answer {
+    margin-top: 2px;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  .uq-summary-note {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
   }
 </style>

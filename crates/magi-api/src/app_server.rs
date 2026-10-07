@@ -892,7 +892,7 @@ async fn subscribe_events(
     };
     let canonical_recovery = (after_sequence > 0)
         .then_some(())
-        .and_then(|()| recovery_session_id.as_ref())
+        .and(recovery_session_id.as_ref())
         .and_then(|session_id| {
             canonical_recovery_event(
                 state,

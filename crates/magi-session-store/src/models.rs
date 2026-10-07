@@ -1178,6 +1178,7 @@ pub struct SessionDurableState {
     pub thread_context_checkpoints: Vec<ThreadContextCheckpoint>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn durable_state_for_session_parts(
     session_id: &SessionId,
     sessions: &[SessionRecord],

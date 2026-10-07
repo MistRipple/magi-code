@@ -136,7 +136,10 @@ mod tests {
             index += 1;
             format!("![{}](generated-images/{index}.png)", image.alt)
         });
-        assert_eq!(output, "![a](generated-images/1.png)\n\n![b](generated-images/2.png)");
+        assert_eq!(
+            output,
+            "![a](generated-images/1.png)\n\n![b](generated-images/2.png)"
+        );
     }
 
     #[test]

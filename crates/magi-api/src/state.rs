@@ -4031,10 +4031,10 @@ impl ApiState {
     ) -> Vec<SessionId> {
         let mut session_ids = Vec::new();
         for notification in self.session_store.notifications_for_context(context) {
-            if let Some(session_id) = notification.session_id {
-                if !session_ids.contains(&session_id) {
-                    session_ids.push(session_id);
-                }
+            if let Some(session_id) = notification.session_id
+                && !session_ids.contains(&session_id)
+            {
+                session_ids.push(session_id);
             }
         }
         session_ids
@@ -4337,7 +4337,7 @@ impl ApiState {
         let session_turn_guard = self.lock_session_turn(session_id).await;
         let runner_lifecycle_guard = self
             .runner_manager()
-            .map(|manager| manager.clone())
+            .cloned()
             .map(|manager| async move { manager.lock_session_lifecycle(session_id).await });
         let runner_lifecycle_guard = match runner_lifecycle_guard {
             Some(lock) => Some(lock.await),

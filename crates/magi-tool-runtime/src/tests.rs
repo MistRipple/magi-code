@@ -6756,6 +6756,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "context_request",
             "update_plan",
             "memory_write",
+            "ask_user_question",
         ],
         "public builtin specs must remain the single canonical tool surface"
     );

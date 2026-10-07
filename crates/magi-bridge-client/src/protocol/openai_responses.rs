@@ -180,7 +180,7 @@ fn append_response_input_items(
                 .iter()
                 .filter_map(response_output_item_from_context_block)
                 .filter(|item| item["type"].as_str() == Some("function_call"))
-                .filter_map(|item| response_call_id_from_item(item))
+                .filter_map(response_call_id_from_item)
                 .filter(|call_id| response_call_history.is_complete_call(call_id))
                 .collect::<std::collections::HashSet<_>>();
             let mut message_parts = Vec::new();

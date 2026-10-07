@@ -1136,9 +1136,11 @@ fn serialize_role_markdown_inner(role: &AgentRole, include_role_revision: bool) 
         .map(|kind| kind.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let role_revision = include_role_revision
-        .then(|| format!("role_revision: {}\n", role.role_revision))
-        .unwrap_or_default();
+    let role_revision = if include_role_revision {
+        format!("role_revision: {}\n", role.role_revision)
+    } else {
+        String::new()
+    };
     format!(
         "---\nid: {}\ndisplay_name: {}\ndescription: {}\nsupported_kinds: [{}]\nparallelism_limit: {}\ncoordinator_mode: {}\nversion: {}\n{}role: {}\nfocus: [{}]\nconstraints: [{}]\noutput_preferences: [{}]\nownerships: [{}]\ninsight_preferences: [{}]\ncapabilities: [{}]\ncolor_token: {}\nicon: {}\n---\n{}\n",
         role.id,

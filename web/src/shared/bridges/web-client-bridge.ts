@@ -182,6 +182,7 @@ import type {
 } from '../../types/message';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 import { syncToolApprovals } from '../../stores/tool-approval-store.svelte';
+import { syncUserQuestions } from '../../stores/user-question-store.svelte';
 import { MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -1708,6 +1709,23 @@ function refreshCurrentSessionToolApprovals(reason: string): void {
   });
 }
 
+function refreshCurrentSessionUserQuestions(reason: string): void {
+  const sessionId = currentSessionId.trim();
+  if (!sessionId) {
+    return;
+  }
+  const binding = currentSessionScope === 'workspace'
+    ? {
+        scope: 'workspace' as const,
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+      }
+    : { scope: 'personal' as const };
+  void syncUserQuestions(sessionId, binding).catch((error) => {
+    console.warn(`[web-client-bridge] 提问状态同步失败(${reason}):`, error);
+  });
+}
+
 const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
@@ -1979,6 +1997,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       return;
     }
     refreshCurrentSessionToolApprovals(eventType);
+    return;
+  }
+
+  // 模型向用户提问（ask_user_question）的出现与收口：刷新当前会话的待回答问题，
+  // 提问面板由这份投影驱动，不依赖轮询。
+  if (eventType === 'user.question.requested' || eventType === 'user.question.resolved') {
+    refreshCurrentSessionUserQuestions(eventType);
     return;
   }
 

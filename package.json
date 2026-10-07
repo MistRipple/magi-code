@@ -22,8 +22,8 @@
     "test:electron-browser-permission-matrix": "node scripts/verify-electron-browser-permission-matrix.mjs",
     "test:electron-renderer-comparison": "node scripts/derive-electron-renderer-comparison-golden.mjs",
     "test:performance-envelope": "node scripts/derive-magi-performance-envelope-golden.mjs",
-  "test:context-compaction-metrics": "node scripts/derive-magi-context-compaction-metrics-golden.mjs",
-  "test:electron-context-compaction-metrics": "node scripts/derive-electron-context-compaction-metrics-golden.mjs",
+    "test:context-compaction-metrics": "node scripts/derive-magi-context-compaction-metrics-golden.mjs",
+    "test:electron-context-compaction-metrics": "node scripts/derive-electron-context-compaction-metrics-golden.mjs",
     "test:permission-ledger": "node scripts/derive-magi-permission-ledger-golden.mjs",
     "test:trajectory-ledger": "node scripts/derive-magi-trajectory-ledger-golden.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
@@ -36,5 +36,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "overrides": {
+    "katex": "0.19.0"
   }
 }

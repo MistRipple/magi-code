@@ -107,7 +107,7 @@ pub struct ToolApprovalWaiter {
 pub enum ToolApprovalRequestOutcome {
     AlreadyAllowed,
     PreviouslyDenied,
-    Pending(ToolApprovalWaiter),
+    Pending(Box<ToolApprovalWaiter>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -233,10 +233,12 @@ impl ToolApprovalRegistry {
                 decision_tx,
             },
         );
-        Ok(ToolApprovalRequestOutcome::Pending(ToolApprovalWaiter {
-            request,
-            decision_rx,
-        }))
+        Ok(ToolApprovalRequestOutcome::Pending(Box::new(
+            ToolApprovalWaiter {
+                request,
+                decision_rx,
+            },
+        )))
     }
 
     pub fn resolve(

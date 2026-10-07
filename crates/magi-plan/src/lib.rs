@@ -1177,7 +1177,9 @@ mod tests {
         );
         assert_eq!(after_root_completion.state, PlanState::Completed);
         assert!(
-            !after_root_completion.task_bindings.contains_key(&child_task_id),
+            !after_root_completion
+                .task_bindings
+                .contains_key(&child_task_id),
             "结束的任务不再占用计划项"
         );
     }

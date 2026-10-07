@@ -751,15 +751,15 @@ fn preflight_workspace_and_git(
                 "请使用当前 workspace 内已经存在的目录。",
             ));
         }
-        if let Some(root) = workspace_root.as_ref() {
-            if !working_dir.starts_with(root) {
-                return Err(AgentSpawnPreflightError::runtime(
-                    "workspace_preflight_failed",
-                    "workspace",
-                    "agent_spawn working_dir 超出当前 workspace 边界",
-                    "请使用当前 workspace 内的目录。",
-                ));
-            }
+        if let Some(root) = workspace_root.as_ref()
+            && !working_dir.starts_with(root)
+        {
+            return Err(AgentSpawnPreflightError::runtime(
+                "workspace_preflight_failed",
+                "workspace",
+                "agent_spawn working_dir 超出当前 workspace 边界",
+                "请使用当前 workspace 内的目录。",
+            ));
         }
     }
     if let Some(context) = context {

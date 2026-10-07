@@ -2473,6 +2473,22 @@ fn execute_task_tool_call(
                 &tool_call.function.arguments,
             );
         }
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::AskUserQuestion
+        ) {
+            return await_user_question_answer(
+                event_bus,
+                conversation_registry,
+                task_store,
+                session_store,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+                on_progress,
+            );
+        }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::MemoryWrite) {
             return magi_project_memory::execute_memory_write_tool(
                 event_bus,
@@ -2629,6 +2645,165 @@ fn execute_task_tool_call(
         return approval_resume_contract_failure(&tool_call.function.name);
     }
     result
+}
+
+/// `ask_user_question`：把选择题交给用户，阻塞到用户回答、跳过，或轮次 / 任务结束。
+/// 没有超时——用户可能需要想很久；收口条件只有回答、跳过与停止。
+#[allow(clippy::too_many_arguments)]
+fn await_user_question_answer(
+    event_bus: &InMemoryEventBus,
+    conversation_registry: &ConversationRegistry,
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+) -> (String, ExecutionResultStatus) {
+    let tool_name = tool_call.function.name.as_str();
+    let failed = |code: &str, message: String| {
+        (
+            serde_json::json!({
+                "tool": tool_name,
+                "status": "failed",
+                "error_code": code,
+                "error": message,
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        )
+    };
+    let cancelled = |message: &str| {
+        (
+            serde_json::json!({
+                "tool": tool_name,
+                "status": "cancelled",
+                "error_code": "user_question_cancelled",
+                "error": message,
+            })
+            .to_string(),
+            ExecutionResultStatus::Cancelled,
+        )
+    };
+    let questions = match crate::user_question::parse_questions(&tool_call.function.arguments) {
+        Ok(questions) => questions,
+        Err(message) => return failed("ask_user_question_invalid", message),
+    };
+    let Some(turn_id) = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
+        .filter(|turn_id| {
+            crate::tool_approval::session_turn_is_active(session_store, session_id, turn_id)
+        })
+    else {
+        return cancelled("当前对话轮次已经结束，问题没有发给用户");
+    };
+    let registry = conversation_registry.user_questions();
+    let question_id = format!("user-question-{}-{}", task.task_id, tool_call.id);
+    let request = crate::PendingUserQuestion {
+        question_id: question_id.clone(),
+        session_id: session_id.clone(),
+        task_id: task.task_id.clone(),
+        turn_id: turn_id.clone(),
+        tool_call_id: tool_call.id.clone(),
+        questions: questions.clone(),
+        requested_at: UtcMillis::now(),
+    };
+    let waiter = registry.request(request.clone());
+
+    if let Some(on_progress) = on_progress {
+        on_progress(ToolExecutionProgress {
+            tool_call_id: ToolCallId::new(&tool_call.id),
+            tool_name: tool_name.to_string(),
+            payload: serde_json::json!({
+                "tool": tool_name,
+                "status": "awaiting_user_input",
+                "question_id": question_id,
+                "questions": request.questions,
+            })
+            .to_string(),
+        });
+    }
+    let publish = |event_name: &str, extra: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "session_id": session_id,
+            "workspace_id": workspace_id,
+            "task_id": task.task_id,
+            "turn_id": turn_id,
+            "tool_call_id": tool_call.id,
+            "question_id": question_id,
+        });
+        if let (Some(target), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        let _ = event_bus.publish(
+            EventEnvelope::domain(EventId::unique(event_name), event_name, payload).with_context(
+                EventContext {
+                    workspace_id: workspace_id.clone(),
+                    session_id: Some(session_id.clone()),
+                    mission_id: Some(task.mission_id.clone()),
+                    task_id: Some(task.task_id.clone()),
+                    ..EventContext::default()
+                },
+            ),
+        );
+    };
+    publish("user.question.requested", serde_json::json!({}));
+
+    loop {
+        match waiter
+            .response_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+        {
+            Ok(crate::UserQuestionResponse::Answered { answers }) => {
+                return (
+                    crate::user_question::answered_result_payload(&questions, &answers).to_string(),
+                    ExecutionResultStatus::Succeeded,
+                );
+            }
+            Ok(crate::UserQuestionResponse::Skipped) => {
+                return (
+                    serde_json::json!({
+                        "tool": tool_name,
+                        "status": "skipped",
+                        "message": "用户选择不回答这些问题。不要反复追问：按你的最佳判断继续，并在回复里说明你做的假设。",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Succeeded,
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                });
+                let turn_is_active = crate::tool_approval::session_turn_is_active(
+                    session_store,
+                    session_id,
+                    &turn_id,
+                );
+                if !task_is_active || !turn_is_active {
+                    registry.cancel(&question_id);
+                    publish(
+                        "user.question.resolved",
+                        serde_json::json!({ "outcome": "cancelled" }),
+                    );
+                    return cancelled("任务或对话轮次已停止，问题没有得到回答");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                registry.cancel(&question_id);
+                publish(
+                    "user.question.resolved",
+                    serde_json::json!({ "outcome": "cancelled" }),
+                );
+                return failed(
+                    "user_question_runtime_failed",
+                    "提问等待通道已关闭".to_string(),
+                );
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

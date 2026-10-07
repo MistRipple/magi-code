@@ -22,6 +22,7 @@
     syncToolApprovals,
     toolApprovalState,
   } from '../stores/tool-approval-store.svelte';
+  import { syncUserQuestions } from '../stores/user-question-store.svelte';
 
   interface Props {
     isTopActive?: boolean;
@@ -88,6 +89,9 @@
     if (syncKey === lastApprovalSyncKey) return;
     lastApprovalSyncKey = syncKey;
     void syncToolApprovals(sessionId, scope === 'workspace'
+      ? { scope, workspaceId, workspacePath }
+      : { scope });
+    void syncUserQuestions(sessionId, scope === 'workspace'
       ? { scope, workspaceId, workspacePath }
       : { scope });
   });

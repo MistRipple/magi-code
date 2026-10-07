@@ -475,10 +475,10 @@ impl HostWebModelPageDriver {
         for attempt in 0..=READ_STATE_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(READ_STATE_RETRY_DELAY).await;
-                if let Ok(tab_id) = self.home_tab() {
-                    if let Err(refresh) = self.refresh_primary_binding(&tab_id).await {
-                        tracing::warn!(attempt, error = %refresh.message, "只读页面命令重试前重新对齐绑定失败");
-                    }
+                if let Ok(tab_id) = self.home_tab()
+                    && let Err(refresh) = self.refresh_primary_binding(&tab_id).await
+                {
+                    tracing::warn!(attempt, error = %refresh.message, "只读页面命令重试前重新对齐绑定失败");
                 }
             }
             match self.json_command(command.clone(), failure_code).await {

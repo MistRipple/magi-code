@@ -50,6 +50,7 @@ mod turn;
 pub mod turn_contract;
 pub mod turn_stream_buffer;
 pub mod usage_recording;
+pub mod user_question;
 pub mod web_history_import;
 
 pub use builtin_tool_schema::{
@@ -98,6 +99,10 @@ pub use tool_approval::{
 pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};
 pub use turn_contract::{TaskRunRecord, TurnCommand, TurnEventEnvelope, TurnRecord};
+pub use user_question::{
+    PendingUserQuestion, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    UserQuestionRegistry, UserQuestionResponse,
+};
 
 #[cfg(test)]
 pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {

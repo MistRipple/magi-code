@@ -791,17 +791,17 @@ pub fn merge_orchestrator_session_override(
     // 引擎绑定（A22）：会话级 `engineId` 与其它字段同一条合并路径。
     // 空串是显式的「继承编排模型」，必须**删除**已有绑定，否则选择器无法把
     // 会话从 Web 引擎切回 provider 模型。
-    if let Some(engine_id) = override_map.get("engineId") {
-        if let Some(engine_id) = engine_id.as_str() {
-            let engine_id = engine_id.trim();
-            if engine_id.is_empty() {
-                base_map.remove("engineId");
-            } else {
-                base_map.insert(
-                    "engineId".to_string(),
-                    serde_json::Value::String(engine_id.to_string()),
-                );
-            }
+    if let Some(engine_id) = override_map.get("engineId")
+        && let Some(engine_id) = engine_id.as_str()
+    {
+        let engine_id = engine_id.trim();
+        if engine_id.is_empty() {
+            base_map.remove("engineId");
+        } else {
+            base_map.insert(
+                "engineId".to_string(),
+                serde_json::Value::String(engine_id.to_string()),
+            );
         }
     }
     if override_map.contains_key("reasoningEffort") {

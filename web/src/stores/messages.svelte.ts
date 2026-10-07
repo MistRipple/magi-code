@@ -47,6 +47,7 @@ import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import { shouldUseHostProxyTransport } from '../shared/transport';
 import { hasPendingToolApproval, toolApprovalState } from './tool-approval-store.svelte';
+import { hasPendingUserQuestion } from './user-question-store.svelte';
 import {
   isCanonicalTerminalStatus,
   type CanonicalTurn,
@@ -2608,6 +2609,9 @@ export function applyNotificationsStatus(rawStatus: unknown): void {
 
 export function getActiveInteractionType(): string | null {
   const currentSessionId = messagesState.currentSessionId?.trim() || '';
+  if (currentSessionId && hasPendingUserQuestion(currentSessionId)) {
+    return 'user_question';
+  }
   if (
     currentSessionId
     && toolApprovalState.sessionId === currentSessionId
