@@ -314,6 +314,10 @@ export interface SessionIsolationListResponseDto {
   isolations: SessionIsolationSummaryDto[];
 }
 
+export interface WorkspaceWaitListResponseDto {
+  waits: Array<{ sessionId: string; blockingSessionIds: string[] }>;
+}
+
 export interface SessionIsolationDetailDto {
   root: string;
   sourceRoot: string;

@@ -29,6 +29,7 @@ import type {
   MessagesResponseDto,
   VersionHandshakeDto,
   SessionIsolationListResponseDto,
+  WorkspaceWaitListResponseDto,
   SessionIsolationResponseDto,
   IsolationMergePlanDto,
   IsolationMergeOutcomeDto,
@@ -2869,6 +2870,15 @@ export async function listAgentSessionIsolations(): Promise<SessionIsolationList
     { cache: 'no-store' },
   );
   return parseAgentJson<SessionIsolationListResponseDto>(response, 'list session isolations');
+}
+
+/** 正在等别的会话用完工作区的会话；页面刷新、重连后据此还原「正在等谁」。 */
+export async function listAgentSessionWorkspaceWaits(): Promise<WorkspaceWaitListResponseDto> {
+  const response = await getTransport().request(
+    agentUrl('/api/session/workspace-waits'),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<WorkspaceWaitListResponseDto>(response, 'list session workspace waits');
 }
 
 export async function getAgentSessionIsolation(

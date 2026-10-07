@@ -8738,9 +8738,30 @@ done
             serde_json::json!(["other-session"])
         );
 
+        // 页面刷新后事件已经错过，靠快照还原「正在等谁」。
+        assert_eq!(
+            harness
+                .state
+                .session_workspace_waits
+                .lock()
+                .unwrap()
+                .get(session_id.as_str())
+                .cloned(),
+            Some(vec!["other-session".to_string()])
+        );
+
         coordinator.end_execution("other-session");
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert!(
+            harness
+                .state
+                .session_workspace_waits
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "拿到仓库后等待记录要清掉"
+        );
         assert!(
             harness
                 .events_for(&session_id)

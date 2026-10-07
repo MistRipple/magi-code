@@ -1280,6 +1280,9 @@ pub struct ApiState {
     pub session_code_contexts: magi_git::SessionCodeContextRegistry,
     /// 运行在隔离工作副本里的会话。隔离会话不占用主工作区的执行租约，也没有主工作区的 Git 上下文。
     pub session_isolations: magi_session_isolation::SessionIsolationRegistry,
+    /// 正在等别的会话用完工作区的会话（会话 → 占用工作区的会话）。事件只通知变化，
+    /// 页面刷新或重连后靠这份快照还原「正在等谁」。
+    pub session_workspace_waits: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// turn/worker 与 Git mutation 的 workspace 级 lease 协调器，消除“检查后立即竞态”。
     pub workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
     pub governance: Arc<GovernanceService>,
@@ -2066,6 +2069,7 @@ impl ApiState {
             git_service: Arc::new(magi_git::GitService::new()),
             session_code_contexts: magi_git::SessionCodeContextRegistry::default(),
             session_isolations: magi_session_isolation::SessionIsolationRegistry::default(),
+            session_workspace_waits: Arc::new(Mutex::new(HashMap::new())),
             workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
             governance,
             knowledge_store: Arc::new(KnowledgeStore::new()),
@@ -3975,6 +3979,17 @@ impl ApiState {
         } else {
             "session.workspace.ready"
         };
+        {
+            let mut waits = self
+                .session_workspace_waits
+                .lock()
+                .expect("session workspace waits lock poisoned");
+            if waiting {
+                waits.insert(session_id.as_str().to_string(), blocking_session_ids.to_vec());
+            } else {
+                waits.remove(session_id.as_str());
+            }
+        }
         let workspace_id = self
             .session_store
             .session(session_id)

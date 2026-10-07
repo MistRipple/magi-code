@@ -43,6 +43,7 @@ await withGoldenViteServer(async (server) => {
   const api = await read('../src/web/agent-api.ts');
   for (const endpoint of [
     '/api/session/isolations',
+    '/api/session/workspace-waits',
     '/api/session/isolation',
     '/api/session/isolation/enable',
     '/api/session/isolation/discard',

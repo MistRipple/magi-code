@@ -17,6 +17,7 @@ use std::collections::HashMap;
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/session/isolations", get(list_session_isolations))
+        .route("/session/workspace-waits", get(list_session_workspace_waits))
         .route("/session/isolation", get(get_session_isolation))
         .route("/session/isolation/enable", post(enable_session_isolation))
         .route(
@@ -112,6 +113,38 @@ async fn list_session_isolations(
             })
             .collect(),
     })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceWaitDto {
+    session_id: String,
+    blocking_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceWaitListResponse {
+    waits: Vec<WorkspaceWaitDto>,
+}
+
+/// 正在等别的会话用完工作区的会话；页面刷新、重连后据此还原运行指示里的「正在等谁」。
+async fn list_session_workspace_waits(
+    State(state): State<ApiState>,
+) -> Json<WorkspaceWaitListResponse> {
+    let waits = state
+        .session_workspace_waits
+        .lock()
+        .expect("session workspace waits lock poisoned");
+    let mut waits: Vec<WorkspaceWaitDto> = waits
+        .iter()
+        .map(|(session_id, blocking)| WorkspaceWaitDto {
+            session_id: session_id.clone(),
+            blocking_session_ids: blocking.clone(),
+        })
+        .collect();
+    waits.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Json(WorkspaceWaitListResponse { waits })
 }
 
 #[derive(Debug, Serialize)]
