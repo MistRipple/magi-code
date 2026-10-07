@@ -1409,6 +1409,8 @@ export interface WebConnectorStatus {
   exists: boolean;
   enabled: boolean;
   toolCount?: number | null;
+  /** ChatGPT 缓存的是创建 / 上次刷新时的工具列表；Magi 目录之后变过则为 true（需要刷新）。 */
+  toolsStale?: boolean | null;
   reason?: string | null;
 }
 

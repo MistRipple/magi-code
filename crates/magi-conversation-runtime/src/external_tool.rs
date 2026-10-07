@@ -107,29 +107,113 @@ enum ExternalTarget {
 
 /// 内置工具能否对外部调用开放。
 ///
-/// 需要 Task / 会话上下文才能执行的（协调器、目标、计划、记忆、上下文、浏览器、图片、
-/// 内部执行能力）不开放；其余公共内置工具都是“项目允许的内置工具”，由权限档与审批决定能否调用。
+/// 需要 Task / 会话 / 代理上下文才能执行的（协调器与代理、目标、计划、记忆、上下文、浏览器、
+/// 图片、内部执行能力）不开放；其余公共内置工具都是“项目允许的内置工具”，由权限档与审批决定
+/// 能否调用。
+///
+/// 这里用**穷举 `match`、没有通配分支**：新增内置工具时编译会在此失败，作者必须明确决定它
+/// 是否对 GPT Web / 外部 MCP 客户端可见。过去用黑名单，新增的 `agent_apply` 因为没人记得加进去，
+/// 就默认出现在了 ChatGPT 看到的工具列表里。
 pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
-    tool.is_public_tool_surface()
-        && tool.browser_tool_kind().is_none()
-        && internal_builtin_tool_rejection_payload(tool.as_str()).is_none()
-        && !matches!(
-            tool,
-            BuiltinToolName::AgentSpawn
-                | BuiltinToolName::AgentSend
-                | BuiltinToolName::AgentCancel
-                | BuiltinToolName::AgentWait
-                | BuiltinToolName::GetGoal
-                | BuiltinToolName::CreateGoal
-                | BuiltinToolName::UpdateGoal
-                | BuiltinToolName::ContextSearch
-                | BuiltinToolName::ContextRead
-                | BuiltinToolName::ContextRequest
-                | BuiltinToolName::UpdatePlan
-                | BuiltinToolName::MemoryWrite
-                | BuiltinToolName::ViewImage
-                | BuiltinToolName::ImageGenerate
-        )
+    if !tool.is_public_tool_surface()
+        || tool.browser_tool_kind().is_some()
+        || internal_builtin_tool_rejection_payload(tool.as_str()).is_some()
+    {
+        return false;
+    }
+    use BuiltinToolName as T;
+    match tool {
+        // 文件、搜索、代码与知识：只依赖工作区。
+        T::ApplyPatch
+        | T::FileCopy
+        | T::FileMkdir
+        | T::FileMove
+        | T::FilePatch
+        | T::FileRead
+        | T::FileRemove
+        | T::FileWrite
+        | T::SearchSemantic
+        | T::SearchText
+        | T::CodeSymbols
+        | T::DiffPreview
+        | T::KnowledgeGraphQuery
+        | T::KnowledgeQuery
+        | T::WebFetch
+        | T::WebSearch
+        // Git：只依赖工作区与仓库。
+        | T::GitBranchCreate
+        | T::GitBranchDelete
+        | T::GitBranchList
+        | T::GitBranchSwitch
+        | T::GitMerge
+        | T::GitMergePreview
+        | T::GitPull
+        | T::GitPush
+        | T::GitStatus
+        | T::GitWorktreeCreate
+        | T::GitWorktreeList
+        | T::GitWorktreeRemove
+        // 命令与进程查询：由 Exec 权限档与逐次审批约束。
+        | T::ShellExec
+        | T::ProcessInspect => true,
+        // 代理协调：只对 Magi 自己的主线与子代理有意义。
+        T::AgentSpawn
+        | T::AgentSend
+        | T::AgentCancel
+        | T::AgentWait
+        | T::AgentApply
+        // 目标、计划、记忆、上下文：绑定当前会话的运行态。
+        | T::GetGoal
+        | T::CreateGoal
+        | T::UpdateGoal
+        | T::UpdatePlan
+        | T::MemoryWrite
+        | T::ContextSearch
+        | T::ContextRead
+        | T::ContextRequest
+        // Magi 自身界面与自省：图表只在 Magi 界面渲染，`tool_catalog` 描述的是 Magi 内部的
+        // 工具与角色能力（含并不对外的那部分），对外部客户端只会造成误导。
+        | T::DiagramRender
+        | T::ToolCatalog
+        // 图片：依赖会话附件与模型能力。
+        | T::ViewImage
+        | T::ImageGenerate
+        // 运行时内部进程管理：不是公共工具面。
+        | T::ProcessLaunch
+        | T::ProcessRead
+        | T::ProcessWrite
+        | T::ProcessKill
+        | T::ProcessList
+        // 浏览器：由上面的 browser_tool_kind 提前排除；这里只为穷举。
+        | T::BrowserClick
+        | T::BrowserClickAt
+        | T::BrowserConsole
+        | T::BrowserDialog
+        | T::BrowserDrag
+        | T::BrowserEmulate
+        | T::BrowserEvaluate
+        | T::BrowserFillForm
+        | T::BrowserHeap
+        | T::BrowserHover
+        | T::BrowserLighthouse
+        | T::BrowserNavigate
+        | T::BrowserNetwork
+        | T::BrowserPerformance
+        | T::BrowserPress
+        | T::BrowserPwa
+        | T::BrowserRead
+        | T::BrowserScreenshot
+        | T::BrowserScroll
+        | T::BrowserSnapshot
+        | T::BrowserStorage
+        | T::BrowserTabs
+        | T::BrowserThirdParty
+        | T::BrowserType
+        | T::BrowserUploadFile
+        | T::BrowserViewport
+        | T::BrowserWaitFor
+        | T::BrowserWebMcp => false,
+    }
 }
 
 fn resolve_target(registry: &ToolRegistry, name: &str) -> Option<ExternalTarget> {
@@ -299,6 +383,36 @@ pub fn execute_external_tool_call(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_goal_plan_context_and_browser_tools_are_never_exposed_to_external_clients() {
+        use super::builtin_exposed_externally;
+        use magi_tool_runtime::BuiltinToolName;
+        for tool in BuiltinToolName::ALL {
+            let name = tool.as_str();
+            let session_bound = name.starts_with("agent_")
+                || name.starts_with("browser_")
+                || name.starts_with("context_")
+                || matches!(
+                    name,
+                    "get_goal"
+                        | "create_goal"
+                        | "update_goal"
+                        | "update_plan"
+                        | "memory_write"
+                        | "view_image"
+                        | "image_generate"
+                );
+            if session_bound {
+                assert!(
+                    !builtin_exposed_externally(tool),
+                    "{name} 依赖会话 / 代理上下文，不能出现在 GPT Web 与外部 MCP 客户端的工具目录里"
+                );
+            }
+        }
+        assert!(!builtin_exposed_externally(BuiltinToolName::AgentApply));
+        assert!(builtin_exposed_externally(BuiltinToolName::FileRead));
+    }
+
     use super::*;
 
     fn call<'a>(

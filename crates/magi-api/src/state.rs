@@ -3506,6 +3506,12 @@ impl ApiState {
 
     /// daemon 组装完工具运行时后调用。已显式开启的 MCP 服务在重启后恢复，
     /// 失败只保留可诊断的关闭状态，不阻塞主 daemon 启动。
+    /// 进程退出前停掉对外通道：GPT Web 的 OpenAI Tunnel 由厂商 CLI 以脱离进程的托管运行时
+    /// 持有，不在 daemon 的子进程树里，只能显式发停止命令。
+    pub async fn shutdown_external_channels(&self) {
+        self.web_model.shutdown(self).await;
+    }
+
     pub fn start_mcp_service_if_enabled(&self) {
         let state = self.clone();
         tokio::spawn(async move {

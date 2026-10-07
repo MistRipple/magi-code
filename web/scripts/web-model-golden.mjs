@@ -35,7 +35,7 @@ await withGoldenViteServer(async (server) => {
   const base = {
     usesWeb: true, projection: { mode: 'temporary', syncState: 'active', hasRemoteConversation: false },
     slotOwnerSessionId: null, sessionId: 's1', turnActive: false, runtimeFresh: true,
-    toolsAvailable: true,
+    toolsAvailable: true, workspaceRequired: false,
   };
   const pick = (patch) => banner.resolveWebSessionBanner({ ...base, ...patch });
   assert.equal(pick({ usesWeb: false }), null);
@@ -64,6 +64,14 @@ await withGoldenViteServer(async (server) => {
   const noTools = pick({ slotOwnerSessionId: 's1', toolsAvailable: false, toolsDetail: '缺凭据' });
   assert.equal(noTools.id, 'noTools');
   assert.equal(noTools.blocksSend, false, '没有项目工具不阻止纯对话');
+  const personalWorkspaceRequired = pick({ slotOwnerSessionId: 's1', workspaceRequired: true });
+  assert.equal(personalWorkspaceRequired.id, 'workspaceRequired');
+  assert.equal(personalWorkspaceRequired.blocksSend, false, '个人 GPT Web 会话仍可纯对话');
+  assert.equal(
+    pick({ slotOwnerSessionId: 's1', workspaceRequired: true, toolsAvailable: false }).id,
+    'noTools',
+    '通道未就绪时优先说明具体通道问题',
+  );
 });
 
 console.log('web model golden replay passed');

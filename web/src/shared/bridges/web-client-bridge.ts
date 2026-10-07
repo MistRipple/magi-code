@@ -3102,9 +3102,10 @@ async function ensureEventStream(
         // 服务端已跳过部分事件（客户端落后或游标过期）。随附快照只含最近窗口，
         // 被跳过的事实可能不在其中，必须和 SSE 的 event.stream.lagged 一样走完整的
         // bootstrap 恢复；恢复后游标推进到 bootstrap 水位，不会再次触发重同步。
-        console.warn('[web-client-bridge] App Server 要求重同步，切换到 bootstrap recovery', {
-          params: notification.params ?? {},
-        });
+        console.warn(
+          '[web-client-bridge] App Server 要求重同步，切换到 bootstrap recovery',
+          JSON.stringify(notification.params ?? {}),
+        );
         closeEventStream();
         scheduleRecovery('event_stream_resync_required', undefined, true);
       },
@@ -3969,7 +3970,10 @@ async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<vo
 }
 
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
-  const text = typeof input.text === 'string' ? input.text : null;
+  // contenteditable may leave a trailing blank block/line break in its DOM. Keep
+  // internal line breaks, but drop end whitespace before creating both the local
+  // optimistic bubble and the canonical request so they cannot disagree visually.
+  const text = typeof input.text === 'string' ? input.text.trimEnd() : null;
   const normalizedText = text?.trim() || '';
   const targetWorkspaceScope = resolveWorkspaceScopeFromSource(input);
   const targetWorkspaceId = targetWorkspaceScope.workspaceId;

@@ -988,11 +988,17 @@ impl HostWebModelPageDriver {
             });
         }
         if before.exists {
-            return Ok(ConnectorConfigOutcome {
-                configured: true,
-                confirmed_enabled: before.enabled,
-                reason: (!before.enabled).then(|| "connector_not_enabled".to_string()),
-            });
+            if !before.enabled {
+                return Ok(ConnectorConfigOutcome {
+                    configured: true,
+                    confirmed_enabled: false,
+                    reason: Some("connector_not_enabled".to_string()),
+                });
+            }
+            // 连接器已经存在：不重复创建，而是让 ChatGPT 重新拉取 Magi 当前的工具列表
+            //（ChatGPT 缓存创建 / 上次刷新时的列表，Magi 目录变化后不会自动同步）。
+            // 页面此时就在设置里的「插件」页（上面的回读刚把它带到这里）。
+            return self.refresh_connector_tools(name, tunnel_id).await;
         }
         self.restore(connector_directory_url()).await?;
         let mut created_reason = None;
@@ -1039,6 +1045,62 @@ impl HostWebModelPageDriver {
             } else {
                 created_reason.or_else(|| Some("connector_not_listed_after_create".to_string()))
             },
+        })
+    }
+
+    /// 在已安装连接器的详情页点「Refresh tools」。成功时 `reason` 为 `tools_refreshed`。
+    async fn refresh_connector_tools(
+        &self,
+        name: &str,
+        tunnel_id: &str,
+    ) -> Result<ConnectorConfigOutcome, WebModelError> {
+        let mut last_reason = None;
+        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
+            }
+            let value = self
+                .json_command(
+                    BrowserHostCommand::WebConfigureConnector {
+                        tab_id: self.home_tab()?,
+                        name: name.to_string(),
+                        tunnel_id: tunnel_id.to_string(),
+                    },
+                    WebModelErrorCode::WebTunnelUnavailable,
+                )
+                .await;
+            let value = match value {
+                Ok(value) => value,
+                // 点进连接器详情页会换路由，命令结果因此过期；页面已在详情页，重试即可。
+                Err(error) if is_surface_handoff(&error.message) => {
+                    last_reason = Some("connector_detail_opening".to_string());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let reason = value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            // 页面还没落在设置页，或列表还没渲染：脚本什么都没做，可以安全重试。
+            if matches!(
+                reason.as_deref(),
+                Some("connector_page_not_open") | Some("connector_not_listed")
+            ) {
+                last_reason = reason;
+                continue;
+            }
+            let refreshed = reason.as_deref() == Some("tools_refreshed");
+            return Ok(ConnectorConfigOutcome {
+                configured: true,
+                confirmed_enabled: refreshed,
+                reason,
+            });
+        }
+        Ok(ConnectorConfigOutcome {
+            configured: true,
+            confirmed_enabled: false,
+            reason: last_reason.or_else(|| Some("connector_refresh_failed".to_string())),
         })
     }
 

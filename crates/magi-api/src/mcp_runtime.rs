@@ -679,6 +679,15 @@ impl McpServiceRuntime {
         state: &ApiState,
         control: &mut Control,
     ) -> Result<(), McpRuntimeError> {
+        self.start_locked_with_listener(state, control, None).await
+    }
+
+    async fn start_locked_with_listener(
+        &self,
+        state: &ApiState,
+        control: &mut Control,
+        prebound_listener: Option<TcpListener>,
+    ) -> Result<(), McpRuntimeError> {
         if control.running.is_some() {
             return Ok(());
         }
@@ -700,9 +709,12 @@ impl McpServiceRuntime {
             port,
             reason: error.to_string(),
         };
-        let listener = TcpListener::bind((bind_ip, port))
-            .await
-            .map_err(&bind_error)?;
+        let listener = match prebound_listener {
+            Some(listener) => listener,
+            None => TcpListener::bind((bind_ip, port))
+                .await
+                .map_err(&bind_error)?,
+        };
         let addr = listener.local_addr().map_err(&bind_error)?;
         control.port = Some(addr.port());
 
@@ -929,20 +941,52 @@ impl McpServiceRuntime {
             .clone();
         let previous_port = control.port;
         let was_running = control.running.is_some();
+        let mut prebound_listener = None;
+        if was_running
+            && request.enabled
+            && let Some(port) = request.port
+            && Some(port) != previous_port
+        {
+            // 端口变更时先占住新监听地址，再停止旧服务。若新端口不可用，
+            // 原服务继续运行；若可用，保留 listener 完成切换，避免检查与绑定之间的竞态。
+            let bind_ip = parse_bind_host(&next.bind_host).map_err(McpRuntimeError::Token)?;
+            prebound_listener =
+                Some(TcpListener::bind((bind_ip, port)).await.map_err(|error| {
+                    McpRuntimeError::Bind {
+                        host: next.bind_host.clone(),
+                        port,
+                        reason: error.to_string(),
+                    }
+                })?);
+        }
         if request.enabled
             && let Some(port) = request.port
         {
             control.port = Some(port);
         }
         *self.direct.lock().expect("mcp direct lock poisoned") = next.clone();
-        if was_running || next.enabled {
+        // 关闭直连且没有其它服务模式保持启用时，监听器应直接停下。
+        // 先在同一端口重启一次再立即停止会留下一个短暂的 bind 竞态，
+        // 也没有业务收益；只有直连关闭后仍需提供本机/隧道服务时才重启。
+        let should_keep_running =
+            next.enabled || control.enabled || self.network_enabled.load(Ordering::SeqCst);
+        if was_running && !should_keep_running {
             self.stop_listeners_locked(&mut control).await;
-            if let Err(error) = self.start_locked(state, &mut control).await {
+        } else if was_running || next.enabled {
+            self.stop_listeners_locked(&mut control).await;
+            if let Err(error) = self
+                .start_locked_with_listener(state, &mut control, prebound_listener)
+                .await
+            {
                 // 回到原来的配置；原来在运行的就恢复运行。
                 *self.direct.lock().expect("mcp direct lock poisoned") = previous;
                 control.port = previous_port;
-                if was_running {
-                    let _ = self.start_locked(state, &mut control).await;
+                if was_running && let Err(restore) = self.start_locked(state, &mut control).await {
+                    // 原端口在这一瞬间被别的进程占走：原来的服务没能恢复，必须如实告诉用户，
+                    // 而不是只报新配置的错、让人以为原服务还在。
+                    return Err(McpRuntimeError::Token(format!(
+                        "{error}；并且恢复原来的监听也失败了：{restore}。请到设置里重新启用 MCP 服务"
+                    )));
                 }
                 return Err(error);
             }
@@ -1335,6 +1379,26 @@ mod tests {
     use magi_session_store::SessionStore;
     use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static NEXT_TEST_PORT: AtomicU16 = AtomicU16::new(20_000);
+
+    fn isolated_test_port() -> u16 {
+        for _ in 0..10_000 {
+            let port = NEXT_TEST_PORT.fetch_add(1, Ordering::Relaxed);
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                drop(listener);
+                return port;
+            }
+        }
+        panic!("could not find an available isolated MCP test port");
+    }
+
+    fn runtime_path_with_port(path: PathBuf) -> (PathBuf, u16) {
+        let port = isolated_test_port();
+        std::fs::write(&path, serde_json::json!({"port": port}).to_string()).unwrap();
+        (path, port)
+    }
 
     fn state() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(16));
@@ -1404,13 +1468,14 @@ mod tests {
     #[tokio::test]
     async fn tokens_port_and_switch_survive_restart_without_persisting_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp-server.json");
+        let (path, expected_port) = runtime_path_with_port(dir.path().join("mcp-server.json"));
         let state = state();
 
         let first = McpServiceRuntime::load(path.clone());
         let issued = first.issue_token(request()).await.unwrap();
         let status = first.set_enabled(&state, true).await.unwrap();
         let port = status.port.unwrap();
+        assert_eq!(port, expected_port);
         first.stop_locked(&mut *first.control.lock().await).await;
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -1806,7 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn a_named_tunnel_gives_a_fixed_address_and_is_restored_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp-server.json");
+        let (path, _) = runtime_path_with_port(dir.path().join("mcp-server.json"));
         let state = state();
         let fake = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let runtime = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake.clone());
@@ -1873,8 +1938,16 @@ mod tests {
             .await;
         let fake2 = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let restarted = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake2.clone());
-        restarted.start_if_enabled(&state).await;
-        let status = restarted.status().await;
+        // 上一个监听任务刚被中止，内核释放端口是异步的：重启时偶尔还绑不上，短暂重试。
+        let mut status = restarted.status().await;
+        for _ in 0..20 {
+            restarted.start_if_enabled(&state).await;
+            status = restarted.status().await;
+            if status.network.enabled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         assert!(status.network.enabled, "命名隧道开着时重启后应恢复");
         assert_eq!(
             status.network.mcp_url.as_deref(),
@@ -2091,7 +2164,7 @@ mod tests {
     #[tokio::test]
     async fn direct_access_survives_restart_and_closes_with_the_last_network_token() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp-server.json");
+        let (path, port) = runtime_path_with_port(dir.path().join("mcp-server.json"));
         let state = state();
         let first = McpServiceRuntime::load(path.clone());
         let remote = first
@@ -2099,7 +2172,13 @@ mod tests {
             .await
             .unwrap();
         first
-            .set_direct_access(&state, direct_request(&["203.0.113.5"]))
+            .set_direct_access(
+                &state,
+                DirectAccessRequest {
+                    port: Some(port),
+                    ..direct_request(&["203.0.113.5"])
+                },
+            )
             .await
             .unwrap();
         first.stop_locked(&mut *first.control.lock().await).await;
@@ -2135,7 +2214,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_listen_rolls_back_to_the_previous_configuration() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = McpServiceRuntime::load(dir.path().join("mcp-server.json"));
+        let (path, _) = runtime_path_with_port(dir.path().join("mcp-server.json"));
+        let runtime = McpServiceRuntime::load(path);
         let state = state();
         runtime
             .issue_token(network_request(Profile::Edit))
@@ -2174,7 +2254,14 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(wrong_ip, Err(McpRuntimeError::Bind { .. })));
-        assert!(runtime.status().await.running);
+        // 回滚会重新绑定原来的固定端口；极端情况下端口恰好被别的进程占走，此时必须报告
+        // “恢复也失败”，而不是静默地丢掉服务。两种结果都不允许“没报错但服务没了”。
+        match wrong_ip {
+            Err(McpRuntimeError::Bind { .. }) => assert!(runtime.status().await.running),
+            Err(McpRuntimeError::Token(message)) => {
+                assert!(message.contains("恢复原来的监听也失败"), "{message}");
+            }
+            other => panic!("意外结果：{other:?}"),
+        }
     }
 }

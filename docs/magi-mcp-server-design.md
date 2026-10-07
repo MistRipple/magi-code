@@ -292,6 +292,10 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 | 没有进行中的 turn / 槽位已释放 | — | 所有调用一律拒绝；已建立的连接下一条请求即失败 |
 | 权限档 | 用户创建令牌时选择（可含 `exec`） | 设置里选的连接器权限档：`read_only` / `edit` / `edit_trusted`，**没有 `exec`** |
 
+**工具列表刷新：** ChatGPT 在创建连接器时缓存工具列表，之后不会自动更新。设置页在 Magi 当前目录摘要与上次同步时的摘要不一致时显示“工具列表已过期”（`GET /api/browser/web-models/connector` 的 `toolsStale`），点“刷新 ChatGPT 工具列表”会复用 `WebConfigureConnector` 在连接器详情页点 Refresh tools，并重新记录摘要。
+
+**退出清理：** OpenAI Tunnel 由厂商 CLI 以脱离进程的托管运行时持有，不在 daemon 子进程树内。daemon 在 HTTP 服务停稳后调用 `ApiState::shutdown_external_channels` 显式停止通道；异常退出遗留的运行时在下次启动时由 `reap_leaked_clients` 回收。
+
 槽位在 turn 结束、被释放（停止 / 退出 / 切换到本地 / 清除数据 / 会话删除）时通过 `WebSlotTable::set_end_hook` 取消该槽位遗留的待审批，等待中的调用以“已取消”收口，不会补执行。
 
 ### 12.2 工具目录
@@ -299,11 +303,11 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 槽位端点向模型暴露**项目允许的全部可用工具**，不是一个手写白名单：
 
 - 静态精选名：`magi.fs.*`、`magi.search.*`、`magi.git.*`（只读）、`magi.changes.list/revert`、`magi.shell.exec`（仅非槽位客户端的 `exec` 档）；
-- 动态内置工具：`magi.<name>`，来自当前项目的内置工具注册表；
+- 动态内置工具：`magi.<namespace>.<rest>`（内部名首个下划线前为命名空间，如 `git_branch_create` → `magi.git.branch_create`，与静态名同形），来自当前项目的内置工具注册表；
 - 下游 MCP：`mcp.<model_tool_name>`；
 - Skill：`skill.<name>` handler。
 
-排除：依赖会话上下文的工具（agent / goal / plan / memory / context / browser / image）永远不暴露。下游 MCP 中非只读工具与 Skill 一律按 `Destructive` 处理，**每次都需要用户确认**。同一个目录对所有客户端按权限档过滤，Web 槽位只是没有 `exec`。
+排除：依赖会话上下文的工具（agent / goal / plan / memory / context / browser / image）以及只服务 Magi 自身的 `diagram_render`、`tool_catalog` 永远不暴露。是否暴露由 `builtin_exposed_externally` 的**穷举 `match`** 决定（无通配分支，新增内置工具必须在编译期明确选择）。下游 MCP 中非只读工具与 Skill 一律按 `Destructive` 处理，**每次都需要用户确认**。同一个目录对所有客户端按权限档过滤，Web 槽位只是没有 `exec`。
 
 ### 12.3 连接器与通道
 

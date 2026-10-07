@@ -211,7 +211,8 @@ impl Daemon {
         effective_config.port = bound_port;
 
         let runtime = DaemonRuntime::restore(&effective_config)?;
-        let api_router = runtime.router(self.config.service_name.clone())?;
+        let (api_router, api_state) =
+            runtime.router_with_state(self.config.service_name.clone())?;
         runtime.start_background_tasks();
         runtime.publish_started_event(&self.config.service_name);
 
@@ -241,6 +242,8 @@ impl Daemon {
                     }
                 })
                 .await?;
+            // HTTP 服务停稳之后，再停脱离 daemon 进程树的对外通道（GPT Web Tunnel）。
+            api_state.shutdown_external_channels().await;
             Ok(())
         });
 

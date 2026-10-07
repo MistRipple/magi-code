@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 
-use tokio::process::Command;
+use magi_process::{std_command, tokio_command};
 
 /// `runtimes connect` is a control-plane operation.  The client is expected to
 /// return after the managed runtime is created, but a broken installation must
@@ -191,6 +191,45 @@ fn parse_launch_result(output: &str) -> Result<LaunchStatus, String> {
     Err(format!(
         "tunnel_runtime_not_healthy: running={running}, healthy={healthy}, ready={ready}",
     ))
+}
+
+/// 从 `ps -axo pid=,command=` 的输出里挑出本通道泄漏的 `tunnel-client run` 进程。
+///
+/// 必须同时满足：命令里有本通道的客户端二进制路径、`run` 子命令、同一个 `--profile-dir`
+/// 与 `--profile` 名称；排除自身。任何一项对不上都不动，避免误杀别的隧道客户端。
+fn leaked_client_pids(
+    listing: &str,
+    client_binary: &Path,
+    profile_dir: &Path,
+    profile_name: &str,
+    own_pid: u32,
+) -> Vec<u32> {
+    let binary = client_binary.to_string_lossy();
+    let dir = profile_dir.to_string_lossy();
+    listing
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, command) = line.split_once(char::is_whitespace)?;
+            let pid: u32 = pid.parse().ok()?;
+            let words: Vec<&str> = command.split_whitespace().collect();
+            let executable_matches = words.first().is_some_and(|first| *first == binary);
+            let runs = words.get(1) == Some(&"run");
+            let flag_value = |flag: &str| {
+                words
+                    .iter()
+                    .position(|word| *word == flag)
+                    .and_then(|index| words.get(index + 1))
+                    .copied()
+            };
+            (pid != own_pid
+                && executable_matches
+                && runs
+                && flag_value("--profile-dir") == Some(dir.as_ref())
+                && flag_value("--profile") == Some(profile_name))
+            .then_some(pid)
+        })
+        .collect()
 }
 
 fn parse_runtime_status(output: &str, alias: &str) -> TunnelClientStatus {
@@ -480,7 +519,7 @@ impl TunnelManager {
     /// projection, so relying on an async timeout here would still allow a
     /// wedged vendor CLI to block that route forever.
     fn run_status_probe(&self) -> std::io::Result<std::process::Output> {
-        let mut command = std::process::Command::new(&self.config.client_binary);
+        let mut command = std_command(&self.config.client_binary);
         command
             .args(["runtimes", "cleanup"])
             // tunnel-client 0.0.15 的 `cleanup` / `stop` 不再接受 profile 选择器，清单是整个
@@ -555,8 +594,13 @@ impl TunnelManager {
             self.state.lock().expect("tunnel state lock").status = status.clone();
             return status;
         }
+        // 上一次 daemon 异常退出（崩溃、被强杀）时没来得及 `runtimes stop`，托管运行时会作为孤儿
+        // 继续活着：它仍在向控制面轮询、抢收 ChatGPT 的工具调用，却把调用转给已经没有监听者的旧
+        // 槽位 socket，而 `runtimes connect` 看不到它（清单里 live_runtime.found=false），
+        // 于是新起的客户端和它争抢同一个隧道，工具调用就会随机失败。启动前先回收。
+        self.reap_leaked_clients().await;
         let args = self.config.expanded_args();
-        let mut command = Command::new(&self.config.client_binary);
+        let mut command = tokio_command(&self.config.client_binary);
         command.args(&args);
         command.current_dir(&self.config.profile_dir);
         command.kill_on_drop(true);
@@ -629,6 +673,56 @@ impl TunnelManager {
         status
     }
 
+    /// 回收上一次运行泄漏下来的、属于本通道（同一客户端二进制、同一 profile 目录与名称）的
+    /// `tunnel-client run` 进程。只匹配这一个精确身份，不碰别的 tunnel-client。
+    async fn reap_leaked_clients(&self) {
+        #[cfg(unix)]
+        {
+            let config = self.config.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let Ok(listing) = std_command("ps")
+                    .args(["-axo", "pid=,command="])
+                    .stdin(Stdio::null())
+                    .output()
+                else {
+                    return;
+                };
+                let own_pid = std::process::id();
+                let pids = leaked_client_pids(
+                    &String::from_utf8_lossy(&listing.stdout),
+                    &config.client_binary,
+                    &config.profile_dir,
+                    &config.profile_name,
+                    own_pid,
+                );
+                for pid in &pids {
+                    tracing::warn!(pid, "回收上次运行泄漏的 tunnel-client 进程");
+                    let _ = std_command("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                }
+                // 给它一个体面退出的窗口；仍然活着再强制结束。
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                for pid in pids {
+                    while std::time::Instant::now() < deadline
+                        && std_command("kill")
+                            .args(["-0", &pid.to_string()])
+                            .stderr(Stdio::null())
+                            .status()
+                            .is_ok_and(|status| status.success())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let _ = std_command("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            })
+            .await;
+        }
+    }
+
     /// 前置件校验的只读投影，供 daemon 在打开本地 stdio 入口前 fail closed。
     pub fn preflight_status(&self) -> Option<TunnelClientStatus> {
         let status = self.preflight();
@@ -691,9 +785,8 @@ impl TunnelManager {
             state.managed
         };
         if should_stop {
-            let mut command = Command::new(&self.config.client_binary);
-            command
-                .args(["runtimes", "stop", &self.config.alias, "--json"]);
+            let mut command = tokio_command(&self.config.client_binary);
+            command.args(["runtimes", "stop", &self.config.alias, "--json"]);
             command.stdin(Stdio::null());
             command.stdout(Stdio::null());
             command.stderr(Stdio::null());
@@ -754,6 +847,26 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_leaked_client_of_this_channel_is_matched() {
+        let binary = Path::new("/Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client");
+        let dir = Path::new("/Users/x/.magi/web-model/tunnel-profile");
+        let listing = "\
+49775 /Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client run --profile-dir /Users/x/.magi/web-model/tunnel-profile --profile magi-web-model --log.file /tmp/a.log
+49776 /Users/x/code/Magi.app/daemon/magi-daemon-app mcp-relay --stdio --slot --endpoint /tmp/m.sock
+50001 /Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client run --profile-dir /Users/x/.magi/web-model/other-profile --profile magi-web-model
+50002 /Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client run --profile-dir /Users/x/.magi/web-model/tunnel-profile --profile someone-else
+50003 /opt/other/tunnel-client run --profile-dir /Users/x/.magi/web-model/tunnel-profile --profile magi-web-model
+50004 /Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client runtimes status magi-web-model --profile-dir /Users/x/.magi/web-model/tunnel-profile --profile magi-web-model
+60000 /Users/x/.magi/web-model/tunnel-client/v0.0.15/tunnel-client run --profile-dir /Users/x/.magi/web-model/tunnel-profile --profile magi-web-model
+";
+        assert_eq!(
+            leaked_client_pids(listing, binary, dir, "magi-web-model", 60000),
+            vec![49775],
+            "只回收同一二进制 + 同一 profile 目录/名称的 run 进程；子进程、别的隧道、别的子命令与自身都不动"
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

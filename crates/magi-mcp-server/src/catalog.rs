@@ -380,14 +380,14 @@ mod tests {
     #[test]
     fn dynamic_tools_follow_the_same_profile_filter_and_never_shadow_the_static_catalog() {
         let tools = [
-            dynamic("magi.web_search", ToolClass::Read),
+            dynamic("magi.web.search", ToolClass::Read),
             dynamic("mcp.docs.write", ToolClass::Destructive),
             dynamic("skill.deploy", ToolClass::Exec),
             // 与静态目录同名：必须被丢弃，不能替换静态工具的 schema。
             dynamic("magi.fs.read", ToolClass::Read),
         ];
         let read_only = build_catalog(Profile::ReadOnly, &AllTools, &tools);
-        assert!(names(&read_only).contains(&"magi.web_search"));
+        assert!(names(&read_only).contains(&"magi.web.search"));
         assert!(!names(&read_only).contains(&"mcp.docs.write"));
         assert!(!names(&read_only).contains(&"skill.deploy"));
 

@@ -11,4 +11,4 @@ sha2.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 magi-bridge-client = { path = "../magi-bridge-client" }
-
+magi-process = { path = "../magi-process" }

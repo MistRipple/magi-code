@@ -1611,6 +1611,7 @@ name = "magi-web-model"
 version = "3.0.51"
 dependencies = [
  "magi-bridge-client",
+ "magi-process",
  "serde",
  "serde_json",
  "sha2",

@@ -2302,8 +2302,18 @@ impl DaemonRuntime {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn router(&self, service_name: String) -> Result<axum::Router, DaemonError> {
         Ok(build_router(self.build_api_state(service_name)?))
+    }
+
+    /// 同 `router`，并交出 `ApiState`，供服务器关闭后收尾对外通道。
+    pub(crate) fn router_with_state(
+        &self,
+        service_name: String,
+    ) -> Result<(axum::Router, ApiState), DaemonError> {
+        let state = self.build_api_state(service_name)?;
+        Ok((build_router(state.clone()), state))
     }
 
     #[cfg(test)]
@@ -4298,10 +4308,10 @@ done
         )
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
-        assert_eq!(body["route"], "chat");
-        // 普通 Chat 属于 Conversation profile，不创建 TaskStore root task。
-        assert!(body["rootTaskId"].is_null());
-        assert!(body["actionTaskId"].is_null());
+        assert_eq!(body["route"], "execute");
+        // 普通消息现在统一进入 task 主线，由 daemon dispatcher 建立 root/action task。
+        assert!(body["rootTaskId"].is_string());
+        assert!(body["actionTaskId"].is_string());
 
         let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {

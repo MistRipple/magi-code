@@ -19,6 +19,7 @@
     turnActive: boolean;
     toolsAvailable: boolean | null;
     toolsDetail?: string;
+    workspaceRequired: boolean;
     /** 发送必然被 daemon 拒绝时为 true，父组件据此禁用发送。 */
     blocksSend?: boolean;
     /** 本会话持有的槽位被释放（停止 / 退出 / 重启）：父组件据此重新拉取绑定投影。 */
@@ -32,6 +33,7 @@
     turnActive,
     toolsAvailable,
     toolsDetail,
+    workspaceRequired,
     blocksSend = $bindable(false),
     onOwnershipLost,
   }: Props = $props();
@@ -79,6 +81,7 @@
     runtimeFresh,
     toolsAvailable,
     toolsDetail,
+    workspaceRequired,
   }));
 
   $effect(() => {

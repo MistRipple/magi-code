@@ -29,6 +29,11 @@ assert.match(
   /captureProcessingRequestSnapshot[\s\S]*?settleProcessingRequestSnapshot[\s\S]*?processingRequestIds/,
   'bootstrap and interrupt recovery must use an immutable request snapshot',
 );
+assert.match(
+  webClientBridgeSource,
+  /const text = typeof input\.text === 'string' \? input\.text\.trimEnd\(\) : null;/,
+  'submitted message text must drop trailing contenteditable whitespace before local and canonical projection',
+);
 assert.doesNotMatch(
   messageProtocolSource,
   /TASK_(?:STARTED|COMPLETED|FAILED)\s*=\s*['"]task_(?:started|completed|failed)['"]|task_(?:started|completed|failed)/,
@@ -1381,6 +1386,37 @@ await withGoldenViteServer(async (server) => {
     'a stale terminal bootstrap must not lift the runtime panel back to running',
   );
   messagesStore.clearRequestBinding(liveAcceptedRequestId);
+
+  const trailingWhitespaceRequestId = 'request-trailing-whitespace';
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '第一行\n第二行\n\n   ',
+    requestId: trailingWhitespaceRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === trailingWhitespaceRequestId),
+    'trailing contenteditable whitespace test must reach the session turn endpoint',
+  );
+  const trailingWhitespaceBody = capturedTurnBodies.find(
+    (body) => body.requestId === trailingWhitespaceRequestId,
+  );
+  assert.equal(
+    trailingWhitespaceBody.text,
+    '第一行\n第二行',
+    'canonical request must omit trailing contenteditable whitespace while preserving internal line breaks',
+  );
+  const localTrailingWhitespace = messagesStore
+    .getLocalTurnSubmissionRenderItems(SESSION_ID)
+    .find((item) => item.message.metadata?.requestId === trailingWhitespaceRequestId);
+  assert.equal(
+    localTrailingWhitespace?.message.content,
+    '第一行\n第二行',
+    'optimistic user bubble must use the same trimmed text as the canonical request',
+  );
+  messagesStore.clearRequestBinding(trailingWhitespaceRequestId);
 
   const canonicalTurnsBeforeLaterRound = structuredClone(turnStore.turnStoreState.reducer.turns);
   const laterRoundAccepted = deferred();

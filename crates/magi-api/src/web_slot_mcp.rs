@@ -57,6 +57,12 @@ impl AttributionResolver for SlotAttribution {
                     || AttributionRefusal("当前没有可归属的进行中的 GPT Web 对话".to_string());
                 let slots = (self.slots)().ok_or_else(refusal)?;
                 let (owner, turn) = active_turn(&slots).ok_or_else(refusal)?;
+                if owner.project_id.trim().is_empty() {
+                    return Err(AttributionRefusal(
+                        "当前 GPT Web 会话未绑定工作区，请切换到工作区会话后再使用 Magi 内置工具"
+                            .to_string(),
+                    ));
+                }
                 // 身份里的工作区必须就是槽位拥有者会话的项目，防止拿它去操作别的项目。
                 if owner.project_id != principal.workspace_id {
                     return Err(refusal());
@@ -212,6 +218,22 @@ mod tests {
         assert_eq!(slot_profile_from_setting(Some("edit")), Profile::Edit);
         assert_eq!(slot_profile_from_setting(None), Profile::Edit);
         assert_eq!(slot_profile_from_setting(Some("exec")), Profile::Edit);
+    }
+
+    #[test]
+    fn personal_web_session_gets_a_clear_workspace_requirement() {
+        let table = Arc::new(WebSlotTable::new());
+        let owner = WebSlotOwner::new("session-personal", "");
+        table
+            .claim(owner.clone(), WebConversationBinding::temporary(), "page")
+            .unwrap();
+        let _lease = table.begin_turn(&owner).unwrap();
+
+        let refusal = resolver(&table).resolve(&principal("")).unwrap_err();
+        assert_eq!(
+            refusal.0,
+            "当前 GPT Web 会话未绑定工作区，请切换到工作区会话后再使用 Magi 内置工具"
+        );
     }
 
     // ── 端到端：槽位端点 + 槽位表 + 会话 canonical ───────────────────────────────

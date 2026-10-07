@@ -1971,6 +1971,9 @@
     if (!canSelectPickerWebEngine) {
       return i18n.t('input.mainModelPicker.webLocalSessionBlocked');
     }
+    if (isPersonalSession) {
+      return i18n.t('webModel.tools.workspaceRequired');
+    }
     if (engine.tools && !engine.tools.available) {
       return i18n.t('webModel.tools.unavailable');
     }
@@ -2658,6 +2661,7 @@
       turnActive={messagesState.isProcessing}
       toolsAvailable={currentPickerWebEngine?.tools ? currentPickerWebEngine.tools.available : null}
       toolsDetail={currentPickerWebEngine?.tools?.detail}
+      workspaceRequired={isPersonalSession}
       bind:blocksSend={webSendBlocked}
       onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
     />
@@ -3059,7 +3063,7 @@
                         >
                           <span class="ia-picker-item-label">{engine.displayName || engine.id}</span>
                           <span class="ia-model-web-badge">{i18n.t('webModel.badge.fromWeb')}</span>
-                          {#if engine.tools && !engine.tools.available}
+                          {#if isPersonalSession || (engine.tools && !engine.tools.available)}
                             <span class="ia-model-tier" data-web-model-tools="off">
                               {i18n.t('webModel.tools.unavailableShort')}
                             </span>

@@ -176,6 +176,15 @@ fn builtin_tool_class(tool: BuiltinToolName) -> ToolClass {
 ///
 /// 目录直接来自工具注册表（与 Magi 自己的 agent 看到的同一份事实源），不另存一份。
 /// 静态目录（`magi.fs.*`、`magi.search.*`、`magi.git.*`、`magi.changes.*`）里已有的内置工具不重复出现。
+/// 内置工具的对外名字：首段当命名空间（`git_branch_create` → `magi.git.branch_create`），
+/// 和静态目录里的 `magi.git.status`、`magi.search.text` 同一种形状。
+fn dynamic_public_name(internal: &str) -> String {
+    match internal.split_once('_') {
+        Some((namespace, rest)) => format!("magi.{namespace}.{rest}"),
+        None => format!("magi.{internal}"),
+    }
+}
+
 fn gateway_dynamic_tools(registry: &magi_tool_runtime::ToolRegistry) -> Vec<DynamicTool> {
     let static_internal = magi_mcp_server::V1_TOOLS
         .iter()
@@ -192,7 +201,7 @@ fn gateway_dynamic_tools(registry: &magi_tool_runtime::ToolRegistry) -> Vec<Dyna
             continue;
         }
         tools.push(DynamicTool {
-            public_name: format!("magi.{}", tool.as_str()),
+            public_name: dynamic_public_name(tool.as_str()),
             internal_name: tool.as_str().to_string(),
             class: builtin_tool_class(tool),
             description: tool.description().to_string(),
@@ -925,6 +934,61 @@ fn slots_provider(
     Arc::new(move || harness.bindings())
 }
 
+/// GPT Web 连接器当前从 Magi MCP 目录可见的工具数。
+///
+/// ChatGPT 的已安装连接器行不稳定地展示工具数；此处复用槽位端点的身份和工具目录，
+/// 返回 Magi 实际通过 `tools/list` 暴露的数量。
+pub(crate) fn web_slot_tool_count(state: &ApiState) -> Option<u64> {
+    u64::try_from(web_slot_catalog(state)?.len()).ok()
+}
+
+/// GPT Web 连接器目录的指纹：工具名、描述与输入 schema 的 SHA-256（按名称排序）。
+///
+/// ChatGPT 会缓存创建 / 上次刷新时的工具列表，Magi 目录变化后不会自动同步；
+/// 记下上次推给 ChatGPT 时的指纹，就能知道它手里的列表是不是已经过期。
+pub(crate) fn web_slot_tool_digest(state: &ApiState) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut tools = web_slot_catalog(state)?;
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut hasher = Sha256::new();
+    for tool in tools {
+        hasher.update(tool.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(tool.description.as_bytes());
+        hasher.update([0]);
+        hasher.update(tool.input_schema.to_string().as_bytes());
+        hasher.update([1]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn web_slot_catalog(state: &ApiState) -> Option<Vec<magi_mcp_server::ToolDescriptor>> {
+    let harness = state.web_model.clone();
+    let auth = crate::web_slot_mcp::slot_principal_provider(
+        slots_provider(state),
+        Arc::new(move || {
+            crate::web_slot_mcp::slot_profile_from_setting(
+                harness
+                    .configured()
+                    .and_then(|config| config.tool_profile)
+                    .as_deref(),
+            )
+        }),
+    );
+    let magi_mcp_server::local_socket::SocketAuth::Principal(provider) = auth else {
+        return None;
+    };
+    let principal = provider()?;
+    let server = build_slot_mcp_server(state.clone());
+    Some(server.catalog_for(&principal))
+}
+
 fn assemble_server(
     state: ApiState,
     backend: Arc<ApiToolBackend>,
@@ -961,6 +1025,19 @@ pub(crate) fn build_slot_mcp_server(state: ApiState) -> Arc<magi_mcp_server::Mcp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dynamic_builtin_tools_share_the_namespace_shape_of_the_static_catalog() {
+        assert_eq!(
+            super::dynamic_public_name("git_branch_create"),
+            "magi.git.branch_create"
+        );
+        assert_eq!(super::dynamic_public_name("web_search"), "magi.web.search");
+        assert_eq!(
+            super::dynamic_public_name("knowledge_graph_query"),
+            "magi.knowledge.graph_query"
+        );
+    }
+
     #[test]
     fn always_approval_never_covers_destructive_or_exec_tools() {
         use crate::web_model_channel::WebApprovalMode::{Always, Ask, Deny};
@@ -1650,6 +1727,26 @@ mod tests {
         assert!(
             !exec_names.contains(&"magi.shell_exec".to_string()),
             "内部名不得作为公开名重复出现"
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_tool_digest_is_stable_for_the_same_catalog() {
+        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let first = web_slot_tool_digest(&f.state).expect("catalog digest");
+        assert_eq!(Some(first.clone()), web_slot_tool_digest(&f.state));
+        assert_eq!(first.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn web_slot_tool_count_matches_the_tools_list_catalog() {
+        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let listed_count = tool_names(&f).await.len();
+
+        assert_eq!(
+            web_slot_tool_count(&f.state),
+            u64::try_from(listed_count).ok(),
+            "connector status count must come from the same tools/list catalog"
         );
     }
 
