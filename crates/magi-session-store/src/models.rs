@@ -1611,3 +1611,14 @@ pub struct ThreadChatToolFunction {
     pub name: String,
     pub arguments: String,
 }
+
+/// 目标轮次运行时失败后的处置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalRuntimeFailureDisposition {
+    /// 还没到上限：目标保持 active，等待下一次自动续跑。`attempt` 是连续失败次数。
+    Retrying { attempt: u32 },
+    /// 连续失败达到上限，目标已受阻、计划已暂停，需要用户介入。
+    Blocked,
+    /// 失败的轮次不属于当前活跃目标，什么都没改。
+    Ignored,
+}

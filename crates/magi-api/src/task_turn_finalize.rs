@@ -413,6 +413,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
             .task_store()
             .and_then(|task_store| task_store.get_task(root_task_id))
             .is_some_and(|task| task.status == magi_core::TaskStatus::Completed);
+        let mut goal_retrying = false;
         if root_completed {
             crate::routes::sessions::record_active_goal_turn_success(
                 state,
@@ -430,14 +431,19 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 })
                 .map(|value| public_runtime_excerpt(&value, 4096))
                 .unwrap_or_else(|| runner_status.to_string());
-            crate::routes::sessions::record_active_goal_turn_failure(
+            goal_retrying = crate::routes::sessions::record_active_goal_turn_failure(
                 state,
                 session_id,
                 root_task_id.as_str(),
                 &failure_reason,
             );
         }
-        let paused_plan = if runner_status != "completed" && !root_completed && owns_active_plan {
+        // 目标会退避后自动重试时计划要保持运行，否则续跑会因计划暂停而被拦住。
+        let paused_plan = if runner_status != "completed"
+            && !root_completed
+            && owns_active_plan
+            && !goal_retrying
+        {
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
             plan_store

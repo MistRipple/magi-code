@@ -5,8 +5,8 @@ use super::{SessionStore, unique_timeline_entry_id};
 use crate::models::ActiveExecutionTurn;
 use crate::models::{
     GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase, GoalContinuationState,
-    GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal, SessionPlan,
-    SessionStoreState, TimelineEntry, TimelineEntryKind,
+    GoalResumeCheckpoint, GoalRevisionExpectation, GoalRuntimeFailureDisposition, GoalStatus,
+    SessionGoal, SessionPlan, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
@@ -14,6 +14,9 @@ use magi_core::{
 };
 
 const BLOCKED_TURN_THRESHOLD: u32 = 3;
+/// 目标的自动续跑轮次连续因运行时错误失败多少次后才进入受阻。
+const GOAL_RUNTIME_FAILURE_ATTEMPTS: u32 = 3;
+
 const MAX_GOAL_OBJECTIVE_CHARS: usize = 4_000;
 
 pub(super) fn activate_paused_plan(plan: &mut SessionPlan, now: UtcMillis) {
@@ -338,6 +341,67 @@ impl SessionStore {
             goal.updated_at = now;
         }
         Ok(goal.clone())
+    }
+
+    /// 目标轮次因运行时错误失败（模型请求超时、网络抖动、执行环境暂时不可用等）。
+    ///
+    /// 一次偶发故障不应该让几小时的目标停下来等人：连续失败不到 [`GOAL_RUNTIME_FAILURE_ATTEMPTS`]
+    /// 次时只记录并保持 active，由调用方退避后自动续跑；连续达到上限（中间没有成功轮次）才受阻。
+    /// 配置类的确定性失败（例如模型未配置）重试没有意义，直接用 [`Self::stop_goal_for_runtime_failure`]。
+    pub fn observe_goal_runtime_failure(
+        &self,
+        session_id: &SessionId,
+        goal_id: &GoalId,
+        turn_id: &str,
+        reason: impl Into<String>,
+    ) -> DomainResult<(SessionGoal, GoalRuntimeFailureDisposition)> {
+        let reason = reason.into();
+        let now = UtcMillis::now();
+        {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let goal = state
+                .goals
+                .iter_mut()
+                .find(|goal| &goal.session_id == session_id && &goal.goal_id == goal_id)
+                .ok_or(DomainError::NotFound { entity: "goal" })?;
+            if !goal_owned_by_turn(goal, turn_id) || goal.status != GoalStatus::Active {
+                return Ok((goal.clone(), GoalRuntimeFailureDisposition::Ignored));
+            }
+            let attempt = match goal.blocker.as_ref() {
+                Some(previous) if previous.blocker_key == "runtime_error" => {
+                    if previous.last_observed_turn_id == turn_id {
+                        previous.consecutive_turns
+                    } else {
+                        previous.consecutive_turns.saturating_add(1)
+                    }
+                }
+                _ => 1,
+            };
+            if attempt < GOAL_RUNTIME_FAILURE_ATTEMPTS {
+                goal.blocker = Some(GoalBlockerState {
+                    blocker_key: "runtime_error".to_string(),
+                    reason: reason.clone(),
+                    consecutive_turns: attempt,
+                    last_observed_turn_id: turn_id.to_string(),
+                });
+                goal.continuation = GoalContinuationState {
+                    phase: GoalContinuationPhase::Waiting,
+                    turn_id: None,
+                    reason: Some(reason),
+                };
+                goal.control_revision = goal.control_revision.saturating_add(1);
+                goal.updated_at = now;
+                let goal = goal.clone();
+                super::sidecar::reconcile_goal_time_used(&mut state);
+                return Ok((goal, GoalRuntimeFailureDisposition::Retrying { attempt }));
+            }
+        }
+        let blocked =
+            self.stop_goal_for_runtime_failure(session_id, goal_id, None, turn_id, reason)?;
+        Ok((blocked, GoalRuntimeFailureDisposition::Blocked))
     }
 
     pub fn stop_goal_for_runtime_failure(
@@ -1419,6 +1483,58 @@ mod tests {
                 .blocker_key,
             "runtime_error"
         );
+    }
+
+    #[test]
+    fn transient_runtime_failures_retry_before_the_goal_is_blocked() {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-goal-runtime-retry");
+        store
+            .create_session(session_id.clone(), "goal runtime retry")
+            .expect("session should be created");
+        let goal = create_test_goal(
+            &store,
+            &session_id,
+            "turn-1",
+            "完成目标",
+            AccessProfile::Restricted,
+            None,
+        );
+
+        for (turn, expected_attempt) in [("turn-1", 1), ("turn-2", 2)] {
+            // 每一轮的失败都由「拥有目标的轮次」报告；这里模拟续跑轮次接管目标归属。
+            set_test_continuation_owner(&store, &session_id, &goal.goal_id, turn);
+            let (after, disposition) = store
+                .observe_goal_runtime_failure(&session_id, &goal.goal_id, turn, "timeout")
+                .expect("failure should be observed");
+            assert_eq!(
+                after.status,
+                GoalStatus::Active,
+                "第 {expected_attempt} 次失败不应受阻"
+            );
+            assert_eq!(
+                disposition,
+                GoalRuntimeFailureDisposition::Retrying {
+                    attempt: expected_attempt
+                }
+            );
+        }
+        // 同一轮重复报告不重复计数。
+        set_test_continuation_owner(&store, &session_id, &goal.goal_id, "turn-2");
+        let (_, again) = store
+            .observe_goal_runtime_failure(&session_id, &goal.goal_id, "turn-2", "timeout")
+            .expect("duplicate report");
+        assert_eq!(
+            again,
+            GoalRuntimeFailureDisposition::Retrying { attempt: 2 }
+        );
+
+        set_test_continuation_owner(&store, &session_id, &goal.goal_id, "turn-3");
+        let (blocked, disposition) = store
+            .observe_goal_runtime_failure(&session_id, &goal.goal_id, "turn-3", "timeout")
+            .expect("third failure");
+        assert_eq!(disposition, GoalRuntimeFailureDisposition::Blocked);
+        assert_eq!(blocked.status, GoalStatus::Blocked);
     }
 
     #[test]

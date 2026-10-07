@@ -624,27 +624,44 @@ pub fn strict_goal_mode_tool_definitions_for_round(
 
 /// 校验目标模式当前轮的工具调用批次。
 ///
-/// 目标模式始终是严格的单步状态机：生命周期未完成时只能调用当前必经工具；
-/// 生命周期完成后虽然可以选择业务工具，但每轮仍然最多执行一个工具。校验必须
-/// 发生在任何工具执行之前，否则浏览器、文件和 Goal 写操作可能已经产生不可逆副作用。
+/// 目标生命周期（get_goal / create_goal / update_plan 等必经步骤）未完成时是严格的单步状态机：
+/// 只能调用当前必经工具，且每轮一个。生命周期完成后进入业务阶段，模型可以像普通任务一样
+/// 在一轮里并行调用多个工具（读文件、搜索等），否则分析类目标一并行就被拒绝并整体受阻；
+/// 唯一保留的约束是 `create_goal` / `update_goal` 这类改变目标本身状态的工具必须单独调用，
+/// 不能和其它工具混在同一批里，避免目标被收口后同批的副作用仍在执行。
+/// 校验必须发生在任何工具执行之前。
 pub fn goal_mode_tool_batch_violation(
     required_tool_chain: &[String],
     completed_required_tool_names: &[String],
     tool_calls: &[ChatToolCall],
 ) -> Option<String> {
-    if tool_calls.len() > 1 {
-        return Some(format!(
-            "严格目标模式每轮最多允许调用一个工具，实际收到 {} 个工具调用；已拒绝执行，避免批量副作用或跳过生命周期。",
-            tool_calls.len()
-        ));
-    }
-
     let next_required_tool = required_tool_chain.iter().find(|tool_name| {
         !completed_required_tool_names
             .iter()
             .any(|completed| completed == *tool_name)
-    })?;
+    });
 
+    let Some(next_required_tool) = next_required_tool else {
+        if tool_calls.len() > 1
+            && let Some(control_tool) = tool_calls
+                .iter()
+                .map(|call| canonical_tool_call_name(&call.function.name))
+                .find(|name| matches!(name.as_str(), "create_goal" | "update_goal"))
+        {
+            return Some(format!(
+                "目标控制工具 {control_tool} 必须单独调用，实际与其它 {} 个工具调用混在同一批；已拒绝执行，避免目标状态变更与其它副作用同批发生。",
+                tool_calls.len() - 1
+            ));
+        }
+        return None;
+    };
+
+    if tool_calls.len() > 1 {
+        return Some(format!(
+            "目标生命周期未完成时每轮只能调用一个工具（当前必须调用 {next_required_tool}），实际收到 {} 个工具调用；已拒绝执行，避免批量副作用或跳过生命周期。",
+            tool_calls.len()
+        ));
+    }
     if tool_calls.is_empty() {
         return None;
     }
@@ -804,8 +821,22 @@ mod tests {
                 &required,
                 &[call("shell_exec"), call("file_read")]
             )
+            .is_none(),
+            "Goal 生命周期完成后业务工具可以并行调用"
+        );
+        assert!(
+            goal_mode_tool_batch_violation(
+                &required,
+                &required,
+                &[call("update_goal"), call("file_read")]
+            )
             .is_some(),
-            "Goal 生命周期完成后仍不得批量执行工具"
+            "目标控制工具不能和其它工具混在同一批"
+        );
+        assert!(
+            goal_mode_tool_batch_violation(&required, &[], &[call("get_goal"), call("file_read")])
+                .is_some(),
+            "生命周期未完成时仍然每轮只允许一个工具"
         );
     }
 

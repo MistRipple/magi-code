@@ -817,10 +817,10 @@ fn run_session_turn_execution_with_policy(
         let stopped_goal = session_store
             .active_goal_for_execution_owner(&session_id, &turn_id)
             .map(|goal| {
-                session_store.stop_goal_for_runtime_failure(
+                // 偶发故障先自动重试，连续失败到上限才受阻（计划随之暂停）。
+                session_store.observe_goal_runtime_failure(
                     &session_id,
                     &goal.goal_id,
-                    None,
                     &turn_id,
                     "session_turn_failed",
                 )

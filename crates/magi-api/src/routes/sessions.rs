@@ -2665,6 +2665,12 @@ pub(crate) fn schedule_next_queued_regular_session_turn(
         {
             return;
         }
+        // 目标正在自动推进时，排队消息不能在两轮目标续跑之间自行插队：
+        // 用户想立刻介入应点「引导」，否则等目标结束（完成、暂停或受阻）后再按顺序发送。
+        if goal_continuation_takes_priority(&state, &session_id) {
+            schedule_goal_continuation_turn_if_idle(state, session_id, workspace_id).await;
+            return;
+        }
         if drain_next_queued_regular_session_turn(
             state.clone(),
             session_id.clone(),
@@ -2701,23 +2707,24 @@ pub(crate) fn record_active_goal_turn_success(
     }
 }
 
+/// 目标轮次失败的唯一记录入口。返回 `true` 表示目标仍然 active、会退避后自动重试，
+/// 调用方不应因这次失败暂停计划；`false` 表示目标已受阻或这一轮与目标无关。
 pub(crate) fn record_active_goal_turn_failure(
     state: &ApiState,
     session_id: &SessionId,
     turn_id: &str,
     reason: &str,
-) {
+) -> bool {
     let Some(goal) = state.session_store.active_goal(session_id) else {
-        return;
+        return false;
     };
-    let recorded = match state.session_store.stop_goal_for_runtime_failure(
+    let (recorded, disposition) = match state.session_store.observe_goal_runtime_failure(
         session_id,
         &goal.goal_id,
-        None,
         turn_id,
         reason,
     ) {
-        Ok(goal) => goal,
+        Ok(result) => result,
         Err(error) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -2725,15 +2732,11 @@ pub(crate) fn record_active_goal_turn_failure(
                 ?error,
                 "active goal failure streak update failed"
             );
-            return;
+            return false;
         }
     };
-    let stopped_by_current_turn = recorded.status == magi_session_store::GoalStatus::Blocked
-        && recorded.blocker.as_ref().is_some_and(|blocker| {
-            blocker.blocker_key == "runtime_error" && blocker.last_observed_turn_id == turn_id
-        });
-    if !stopped_by_current_turn {
-        return;
+    if disposition == magi_session_store::GoalRuntimeFailureDisposition::Ignored {
+        return false;
     }
     if let Err(error) =
         state.persist_session_projection_for_sessions(std::slice::from_ref(session_id))
@@ -2745,12 +2748,27 @@ pub(crate) fn record_active_goal_turn_failure(
             "active goal failure streak persist failed"
         );
     }
-    tracing::warn!(
-        session_id = %session_id,
-        goal_id = %goal.goal_id,
-        blocker = ?recorded.blocker,
-        "goal turn stopped after runtime failure"
-    );
+    match disposition {
+        magi_session_store::GoalRuntimeFailureDisposition::Retrying { attempt } => {
+            tracing::warn!(
+                session_id = %session_id,
+                goal_id = %goal.goal_id,
+                attempt,
+                reason,
+                "goal turn failed, will retry automatically"
+            );
+            true
+        }
+        _ => {
+            tracing::warn!(
+                session_id = %session_id,
+                goal_id = %goal.goal_id,
+                blocker = ?recorded.blocker,
+                "goal turn stopped after repeated runtime failures"
+            );
+            false
+        }
+    }
 }
 
 async fn schedule_goal_continuation_turn_if_idle(
@@ -2758,6 +2776,11 @@ async fn schedule_goal_continuation_turn_if_idle(
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) {
+    // 上一轮因运行时错误失败、正在自动重试：先退避一会儿再续跑，偶发故障（超时、网络抖动）
+    // 通常几秒后就恢复，立刻重试只会连续失败把目标送进受阻。
+    if let Some(delay) = goal_runtime_retry_backoff(&state, &session_id) {
+        tokio::time::sleep(delay).await;
+    }
     let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     let Some(goal) = state.session_store.active_goal(&session_id) else {
         return;
@@ -2777,9 +2800,6 @@ async fn schedule_goal_continuation_turn_if_idle(
         }
         return;
     }
-    if state.queued_regular_session_turn_count(&session_id) > 0 {
-        return;
-    }
     if state
         .session_store
         .ensure_current_turn_acceptance_available(&session_id)
@@ -2792,6 +2812,32 @@ async fn schedule_goal_continuation_turn_if_idle(
     {
         tracing::warn!("goal continuation turn submit failed: {error:?}");
     }
+}
+
+/// 会话有一个活跃目标且计划允许继续时，下一轮由目标续跑占用，排队消息要等目标停下来。
+fn goal_continuation_takes_priority(state: &ApiState, session_id: &SessionId) -> bool {
+    state.session_store.active_goal(session_id).is_some()
+        && plan_allows_goal_continuation(
+            magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone())
+                .snapshot()
+                .as_ref(),
+        )
+}
+
+/// 目标正处于「运行时错误后自动重试」时的退避时长：5s、10s、20s…，最长 60s。
+fn goal_runtime_retry_backoff(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Option<std::time::Duration> {
+    let goal = state.session_store.active_goal(session_id)?;
+    let blocker = goal.blocker.as_ref()?;
+    if blocker.blocker_key != "runtime_error" || blocker.consecutive_turns == 0 {
+        return None;
+    }
+    let seconds = 5u64
+        .saturating_mul(1u64 << (blocker.consecutive_turns - 1).min(4))
+        .min(60);
+    Some(std::time::Duration::from_secs(seconds))
 }
 
 fn plan_allows_goal_continuation(plan: Option<&magi_session_store::SessionPlan>) -> bool {
@@ -9017,6 +9063,107 @@ mod tests {
             goal_task.required_tool_chain(),
             ["get_goal", "create_goal", "update_plan"]
         );
+    }
+
+    #[tokio::test]
+    async fn active_goal_keeps_queued_messages_waiting_until_the_goal_stops() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-goal-queue-priority",
+            "goal-queue-priority",
+        );
+        let session_id = SessionId::new("session-goal-queue-priority");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "目标与排队",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        assert!(
+            !goal_continuation_takes_priority(&state, &session_id),
+            "没有目标时排队消息照常出队"
+        );
+        let (_, thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || {
+                    MissionId::new("mission-goal-queue-priority")
+                });
+        let goal = state
+            .session_store
+            .create_goal(
+                session_id.clone(),
+                thread_id,
+                "turn-goal-queue-priority",
+                "分析当前项目",
+                magi_core::AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        assert!(
+            goal_continuation_takes_priority(&state, &session_id),
+            "目标正在推进时，下一轮属于目标续跑，排队消息不能插队"
+        );
+        state
+            .session_store
+            .stop_goal_for_runtime_failure(
+                &session_id,
+                &goal.goal_id,
+                None,
+                "turn-goal-queue-priority",
+                "目标停下来了",
+            )
+            .expect("goal should stop");
+        assert!(
+            !goal_continuation_takes_priority(&state, &session_id),
+            "目标受阻 / 暂停后，排队消息按顺序继续发送"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_goal_runtime_failure_keeps_the_goal_active_and_backs_off() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-goal-retry", "goal-retry");
+        let session_id = SessionId::new("session-goal-retry");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "目标失败重试",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let (_, thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || {
+                    MissionId::new("mission-goal-retry")
+                });
+        let _goal = state
+            .session_store
+            .create_goal(
+                session_id.clone(),
+                thread_id,
+                "turn-goal-retry-1",
+                "分析当前项目",
+                magi_core::AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        assert_eq!(goal_runtime_retry_backoff(&state, &session_id), None);
+
+        assert!(
+            record_active_goal_turn_failure(&state, &session_id, "turn-goal-retry-1", "timeout"),
+            "第一次失败应保持目标 active 并重试"
+        );
+        assert_eq!(
+            goal_runtime_retry_backoff(&state, &session_id),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert!(state.session_store.active_goal(&session_id).is_some());
     }
 
     #[tokio::test]
