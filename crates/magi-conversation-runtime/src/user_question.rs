@@ -201,11 +201,18 @@ pub fn answered_result_payload(
         .iter()
         .zip(answers)
         .map(|(question, answer)| {
+            // `answer` 是这道题用户最终的决定（预设选项与“其他”输入合并），模型直接按它行动。
+            let mut decided: Vec<&str> = answer.selected.iter().map(String::as_str).collect();
+            if let Some(other) = answer.other.as_deref() {
+                decided.push(other);
+            }
             serde_json::json!({
                 "question": question.question,
                 "header": question.header,
+                "answer": decided,
                 "selected": answer.selected,
                 "other": answer.other,
+                "custom_answer": answer.other.is_some(),
             })
         })
         .collect();
@@ -213,6 +220,7 @@ pub fn answered_result_payload(
         "tool": "ask_user_question",
         "status": "answered",
         "answers": items,
+        "instruction": "answer 就是用户对每道题的最终决定，直接按它继续。`other`/`custom_answer` 表示用户没有选你给的选项，而是自己写了答案：这是合法的决定，要按字面采纳，哪怕它不在你给出的选项范围内；不要因此拒绝、质疑或重复追问同一个问题。",
     })
 }
 
@@ -350,6 +358,46 @@ mod tests {
             questions,
             requested_at: UtcMillis(1),
         }
+    }
+
+    #[test]
+    fn a_custom_other_answer_is_reported_as_the_users_final_decision() {
+        let questions = parse_questions(&sample_arguments()).unwrap();
+        let answers = vec![
+            UserQuestionAnswer {
+                selected: vec![],
+                other: Some("SQL Server".to_string()),
+            },
+            UserQuestionAnswer {
+                selected: vec!["macOS".to_string()],
+                other: Some("FreeBSD".to_string()),
+            },
+        ];
+        let payload = answered_result_payload(&questions, &answers);
+        assert_eq!(
+            payload["answers"][0]["answer"],
+            serde_json::json!(["SQL Server"])
+        );
+        assert_eq!(payload["answers"][0]["custom_answer"], true);
+        assert_eq!(
+            payload["answers"][1]["answer"],
+            serde_json::json!(["macOS", "FreeBSD"])
+        );
+        let preset_only = answered_result_payload(
+            &questions[..1],
+            &[UserQuestionAnswer {
+                selected: vec!["Postgres".to_string()],
+                other: None,
+            }],
+        );
+        assert_eq!(preset_only["answers"][0]["custom_answer"], false);
+        assert!(
+            payload["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("合法的决定"),
+            "必须明确告诉模型“其他”是合法决定"
+        );
     }
 
     #[test]
