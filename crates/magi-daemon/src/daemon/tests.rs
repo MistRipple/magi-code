@@ -2675,18 +2675,18 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
 
     let first_event = wait_for_event_matching(
         &mut first_receiver,
-        "first subscriber session.turn.conversation.accepted",
+        "first subscriber session.turn.task.accepted",
         |event| {
-            event.event_type == "session.turn.conversation.accepted"
+            event.event_type == "session.turn.task.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
     .await;
     let second_event = wait_for_event_matching(
         &mut second_receiver,
-        "second subscriber session.turn.conversation.accepted",
+        "second subscriber session.turn.task.accepted",
         |event| {
-            event.event_type == "session.turn.conversation.accepted"
+            event.event_type == "session.turn.task.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
@@ -2995,6 +2995,7 @@ async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicat
         "scope": "personal",
         "text": "这是一段普通对话，重启后应回放同一 Turn 且不创建任务",
         "images": [],
+        "orchestratorSessionConfig": { "engineId": "chatgpt-web/default" },
         "requestId": request_id,
         "userMessageId": user_message_id,
     });
@@ -3006,10 +3007,7 @@ async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicat
         "conversation Turn should accept: {body:?}"
     );
     assert_eq!(body["executionProfile"], "conversation");
-    assert!(
-        body["rootTaskId"].is_null(),
-        "普通 Conversation Turn 不应创建 root task: {body:?}"
-    );
+    assert!(body["rootTaskId"].is_null());
     let session_id = body["sessionId"]
         .as_str()
         .expect("conversation Turn should include session id")
@@ -3029,7 +3027,7 @@ async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicat
             .all_tasks()
             .len(),
         0,
-        "普通 Conversation Turn 接纳时不应创建 TaskStore 任务"
+        "GPT Web conversation Turn 接纳时不应创建 TaskStore 任务"
     );
 
     drop(app);
@@ -3070,7 +3068,7 @@ async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicat
             .all_tasks()
             .len(),
         0,
-        "Conversation restart replay must not create a task"
+        "conversation restart replay must not create a task"
     );
 
     let bootstrap = get_json(
@@ -3292,6 +3290,7 @@ async fn daemon_http_server_restart_replays_conversation_turn_without_task_or_du
         "scope": "personal",
         "text": "普通对话在 HTTP daemon 实例重启后回放同一 Turn",
         "images": [],
+        "orchestratorSessionConfig": { "engineId": "chatgpt-web/default" },
         "requestId": "request-http-daemon-conversation-restart",
         "userMessageId": "user-http-daemon-conversation-restart",
     });
@@ -3619,14 +3618,12 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
         app,
         "/api/settings/orchestrator/save",
         json!({
-            "config": {
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-real-test",
-                "urlMode": "standard",
-                "apiProtocol": "openai_chat",
-                "sessionId": "session-scoped-should-not-save",
-                "workspaceId": "test-workspace-001"
-            }
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "sk-real-test",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat",
+            "sessionId": "session-scoped-should-not-save",
+            "workspaceId": "test-workspace-001"
         }),
     )
     .await;

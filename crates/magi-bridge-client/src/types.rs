@@ -294,12 +294,45 @@ mod model_response_tests {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelStreamingDelta {
+    /// 这一帧**新增**的可见正文（增量，不是到目前为止的全文）；消费方自己累积。
     pub content: String,
+    /// 这一帧新增的推理文字（增量）。
     pub thinking: String,
+    /// 上游把已经给出的文字整段改写了（例如网页端重绘），无法用追加表达：此时 `content` 与
+    /// `thinking` 都是改写后的**完整**文字，消费方丢弃已累积的内容、以它为准。普通追加帧为 false。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace: bool,
     /// 上游只有工具调用增量、没有可见正文时仍必须把这一事实交给执行层。
     /// 该字段用于首个 raw tool-call chunk 的时序观测，不代表工具已经执行。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
+}
+
+impl ModelStreamingDelta {
+    /// 积压时把后一帧并入前一帧：追加帧拼接，`replace` 帧取代之前的全部内容。
+    pub fn merge(&mut self, next: ModelStreamingDelta) {
+        let mut tool_calls = std::mem::take(&mut self.tool_calls);
+        tool_calls.extend(next.tool_calls);
+        if next.replace {
+            self.content = next.content;
+            self.thinking = next.thinking;
+            self.replace = true;
+        } else {
+            self.content.push_str(&next.content);
+            self.thinking.push_str(&next.thinking);
+        }
+        self.tool_calls = tool_calls;
+    }
+
+    /// 把这一帧并入消费方累积的正文与推理文字：追加帧接在末尾，`replace` 帧整体取代。
+    pub fn accumulate_into(&self, content: &mut String, thinking: &mut String) {
+        if self.replace {
+            content.clear();
+            thinking.clear();
+        }
+        content.push_str(&self.content);
+        thinking.push_str(&self.thinking);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

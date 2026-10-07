@@ -1662,6 +1662,9 @@ fn stream_session_turn_round(
     });
     let content_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
     let thinking_buffer = std::cell::RefCell::new(TurnStreamBuffer::default());
+    // 模型客户端只发这一帧新增的文字；这里累积成到目前为止的全文，再算对外发布的增量。
+    let delta_content = std::cell::RefCell::new(String::new());
+    let delta_thinking = std::cell::RefCell::new(String::new());
     let on_delta = |delta: &ModelStreamingDelta| {
         if (!delta.content.is_empty() || !delta.thinking.is_empty() || !delta.tool_calls.is_empty())
             && !first_raw_delta_reported.replace(true)
@@ -1687,10 +1690,13 @@ fn stream_session_turn_round(
                 Some(&call_id),
             );
         }
+        let mut accumulated_content_buf = delta_content.borrow_mut();
+        let mut accumulated_thinking_buf = delta_thinking.borrow_mut();
+        delta.accumulate_into(&mut accumulated_content_buf, &mut accumulated_thinking_buf);
         if let Some(tracker) = context_usage_tracker.as_ref() {
-            tracker.observe_accumulated_output(&delta.content, &delta.thinking);
+            tracker.observe_accumulated_output(&accumulated_content_buf, &accumulated_thinking_buf);
         }
-        let accumulated_thinking = delta.thinking.as_str();
+        let accumulated_thinking = accumulated_thinking_buf.as_str();
         if accumulated_thinking.len() > last_thinking_len.get() {
             let stream_update = {
                 let previous = streamed_thinking.borrow();
@@ -1749,7 +1755,7 @@ fn stream_session_turn_round(
             }
         }
 
-        let accumulated = delta.content.as_str();
+        let accumulated = accumulated_content_buf.as_str();
         let previous = last_content_len.get();
         if accumulated.len() == previous {
             return;
@@ -2827,6 +2833,7 @@ mod tests {
                 content: "重连后完成".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -2879,6 +2886,7 @@ mod tests {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -2930,6 +2938,7 @@ mod tests {
                 content: "主模型完成".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -3037,6 +3046,7 @@ mod tests {
                 content: "主线在暂态空流后完成。".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -3488,6 +3498,7 @@ mod tests {
                 },
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -3545,6 +3556,7 @@ mod tests {
                 },
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -3818,6 +3830,7 @@ mod tests {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -3853,6 +3866,7 @@ mod tests {
                 },
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,

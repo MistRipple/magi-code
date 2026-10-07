@@ -238,13 +238,13 @@ impl BrowserWebModelBridgeClient {
                 self.slots
                     .bind_remote_conversation(&self.owner, &snapshot.conversation_id);
                 sink.record(
-                &self.identity.session_id,
-                SavedProgress {
-                    remote_conversation_id: snapshot.conversation_id,
-                    remote_title: snapshot.title,
-                    last_remote_message_id: snapshot.last_message_id,
-                    remote_updated_at: snapshot.remote_updated_at,
-                },
+                    &self.identity.session_id,
+                    SavedProgress {
+                        remote_conversation_id: snapshot.conversation_id,
+                        remote_title: snapshot.title,
+                        last_remote_message_id: snapshot.last_message_id,
+                        remote_updated_at: snapshot.remote_updated_at,
+                    },
                 )
             }
             _ => sink.mark_stale(&self.identity.session_id),
@@ -271,7 +271,8 @@ impl BrowserWebModelBridgeClient {
             let outcome = if index >= Self::MAX_IMAGES_PER_REPLY {
                 Err("单条回复的图片太多，已跳过".to_string())
             } else {
-                self.save_page_image(sink.as_ref(), &image.src, &image.alt).await
+                self.save_page_image(sink.as_ref(), &image.src, &image.alt)
+                    .await
             };
             resolved.push(match outcome {
                 Ok(path) => format!("![{}]({path})", image.alt),
@@ -301,7 +302,12 @@ impl BrowserWebModelBridgeClient {
         loop {
             let chunk = self
                 .driver
-                .read_image_chunk(&self.page_id, source, bytes.len() as u64, Self::IMAGE_CHUNK_BYTES)
+                .read_image_chunk(
+                    &self.page_id,
+                    source,
+                    bytes.len() as u64,
+                    Self::IMAGE_CHUNK_BYTES,
+                )
                 .await
                 .map_err(|error| error.message)?;
             if chunk.total > Self::MAX_IMAGE_BYTES {
@@ -450,13 +456,16 @@ impl BrowserWebModelBridgeClient {
             let mut last_assistant = String::new();
             let mut last_thinking = String::new();
             let mut stable_reads = 0u8;
-            // 已经作为增量发出去的前缀（按内容而不是字节下标记账：页面文本改写时不会在字符中间切片）。
+            // 已经作为增量发出去的全文（按内容记账：页面文本改写时不会在字符中间切片）。
             let mut emitted_assistant = String::new();
             let mut emitted_thinking = String::new();
-            // 页面文本被改写后，本轮不再发增量。
-            let mut streaming_diverged = false;
             let mut baseline_users = baseline.user_message_count;
             let mut baseline_assistants = baseline.assistant_message_count;
+            // 基线被重置（页面换代或重绘）之后，数量不再能证明「本轮回复已经出现」：页面上仍可能
+            // 是提交前的最后一条助手消息。此时再要求它的文本和提交前不同，才算本轮回复。
+            let mut baseline_reset = false;
+            // 本轮是否观察到过「正在生成」：重置基线后，回复恰好和上一条相同时靠它收口。
+            let mut saw_generating = false;
             let mut accepted = false;
             let completion_deadline = tokio::time::Instant::now() + self.config.completion_timeout;
             loop {
@@ -472,6 +481,7 @@ impl BrowserWebModelBridgeClient {
                 {
                     baseline_users = 0;
                     baseline_assistants = 0;
+                    baseline_reset = true;
                 }
                 if state.user_message_count > baseline_users {
                     accepted = true;
@@ -480,13 +490,30 @@ impl BrowserWebModelBridgeClient {
                 if state.generating && !baseline.generating {
                     accepted = true;
                 }
+                if state.generating {
+                    saw_generating = true;
+                }
                 // 页面读到的「最后一条助手消息」在本轮回复出现之前还是**上一轮**的回复。连续对话里
                 // 必须等到助手消息数量比提交前多，才把它当作本轮内容；否则上一轮的回答会被当成本轮
                 // 的流式输出写进 Magi 当前对话，甚至在本轮回复还没开始时就被当作最终结果收口。
-                let reply_started = state.assistant_message_count > baseline_assistants;
+                let reply_started = state.assistant_message_count > baseline_assistants
+                    && !(baseline_reset
+                        && !(saw_generating && !state.generating)
+                        && !baseline.assistant_text.is_empty()
+                        && state.assistant_text == baseline.assistant_text);
                 if !reply_started {
                     state.assistant_text.clear();
-                    state.thinking_text.clear();
+                    // 思考阶段先于助手消息节点出现：消息被接受之后读到的推理就是本轮的（页面只在进行中的
+                    // 回合里显示它）；还没被接受时页面上不可能有本轮的推理，读到的是上一轮残留。
+                    if !accepted {
+                        state.thinking_text.clear();
+                    }
+                }
+                // 回复完成后页面会把推理区块收起成「已思考 N 秒」，读到的推理文字变成空。已经读到并
+                // 显示出来的推理不能因此被清掉（否则会被当成整段改写，连同正文一起重置）：沿用最后
+                // 一次读到的推理。
+                if state.thinking_text.trim().is_empty() && !last_thinking.is_empty() {
+                    state.thinking_text = last_thinking.clone();
                 }
                 if !accepted && tokio::time::Instant::now() >= acceptance_deadline {
                     return Err(WebModelError::new(
@@ -497,27 +524,29 @@ impl BrowserWebModelBridgeClient {
                 // 页面图片在 Magi 里还不可用：流式阶段只发文字，图片在收口时随全文一起交付。
                 let visible_text = crate::images::strip_page_images(&state.assistant_text);
                 if state.assistant_text != last_assistant || state.thinking_text != last_thinking {
-                    // 只有页面文本是已发出内容的**延长**时才发增量。页面把已显示的文本整段改写（例如
-                    // ChatGPT 在多次工具调用之间不断重建同一条助手消息）之后，增量就和 Magi 里已经显示
-                    // 的片段对不上了：从这一刻起本轮不再发增量，避免片段错位，完整回复以收口时的全文为准。
-                    if !streaming_diverged {
-                        if visible_text.starts_with(&emitted_assistant)
-                            && state.thinking_text.starts_with(&emitted_thinking)
-                        {
-                            let content = visible_text[emitted_assistant.len()..].to_string();
-                            let thinking = state.thinking_text[emitted_thinking.len()..].to_string();
-                            if !content.is_empty() || !thinking.is_empty() {
-                                on_delta(&ModelStreamingDelta {
-                                    content,
-                                    thinking,
-                                    tool_calls: Vec::new(),
-                                });
-                            }
-                            emitted_assistant = visible_text.clone();
-                            emitted_thinking = state.thinking_text.clone();
-                        } else {
-                            streaming_diverged = true;
+                    // 流式就是增量：页面文本是已发内容的延长时只发新增的后缀；页面把已显示的文本整段
+                    // 改写（例如 ChatGPT 在多次工具调用之间不断重建同一条助手消息、或重新渲染 markdown）
+                    // 时，追加无法表达，发一帧 `replace`（携带改写后的完整文字），下游据此重置。
+                    let appended = visible_text.starts_with(&emitted_assistant)
+                        && state.thinking_text.starts_with(&emitted_thinking);
+                    let frame = if appended {
+                        ModelStreamingDelta {
+                            content: visible_text[emitted_assistant.len()..].to_string(),
+                            thinking: state.thinking_text[emitted_thinking.len()..].to_string(),
+                            ..Default::default()
                         }
+                    } else {
+                        ModelStreamingDelta {
+                            content: visible_text.clone(),
+                            thinking: state.thinking_text.clone(),
+                            replace: true,
+                            ..Default::default()
+                        }
+                    };
+                    if frame.replace || !frame.content.is_empty() || !frame.thinking.is_empty() {
+                        on_delta(&frame);
+                        emitted_assistant = visible_text.clone();
+                        emitted_thinking = state.thinking_text.clone();
                     }
                     last_assistant = state.assistant_text.clone();
                     last_thinking = state.thinking_text.clone();
@@ -665,10 +694,14 @@ mod tests {
         reply: String,
         /// 模拟真实页面：新一轮提交后，助手消息节点出现之前读到的「最后一条助手消息」仍是上一轮的。
         leak_previous_reply: std::sync::atomic::AtomicBool,
+        /// 与 `leak_previous_reply` 同时生效：页面重绘，漏出上一轮回答的同时消息计数回落到基线以下。
+        collapse_count_on_leak: std::sync::atomic::AtomicBool,
         /// 模拟页面把流式中的文本整段改写：中途读到的文本不是最终回复的前缀。
         rewrite_midstream: std::sync::atomic::AtomicBool,
         /// 页面上图片的字节；`None` 时读取图片失败。
         image: Mutex<Option<Vec<u8>>>,
+        /// 回复生成期间页面上显示的推理文字；空表示没有推理区块。
+        thinking: Mutex<String>,
     }
 
     impl FakeDriver {
@@ -677,15 +710,24 @@ mod tests {
                 page: Mutex::new(FakePage::default()),
                 reply: reply.to_string(),
                 leak_previous_reply: std::sync::atomic::AtomicBool::new(false),
+                collapse_count_on_leak: std::sync::atomic::AtomicBool::new(false),
                 rewrite_midstream: std::sync::atomic::AtomicBool::new(false),
                 image: Mutex::new(None),
+                thinking: Mutex::new(String::new()),
             })
+        }
+        fn with_thinking(&self, text: &str) {
+            *self.thinking.lock().unwrap() = text.to_string();
         }
         fn with_image(&self, bytes: Vec<u8>) {
             *self.image.lock().unwrap() = Some(bytes);
         }
         fn rewrite_midstream(&self) {
             self.rewrite_midstream
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn collapse_count_on_leak(&self) {
+            self.collapse_count_on_leak
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn leak_previous_reply(&self) {
@@ -799,6 +841,7 @@ mod tests {
                 let mut assistant_text = String::new();
                 // 本轮的助手消息节点是否已经出现在页面上（出现后才计入助手消息数）。
                 let mut reply_node_present = false;
+                let mut collapsed_count = false;
                 if let Some(step) = page.generating_steps {
                     if step < 2 {
                         generating = true;
@@ -816,6 +859,9 @@ mod tests {
                                         .load(std::sync::atomic::Ordering::SeqCst) =>
                             {
                                 assistant_text = previous;
+                                collapsed_count = self
+                                    .collapse_count_on_leak
+                                    .load(std::sync::atomic::Ordering::SeqCst);
                             }
                             _ => {
                                 reply_node_present = true;
@@ -850,6 +896,7 @@ mod tests {
                     .filter(|m| m.role == "assistant")
                     .count() as u64
                     + u64::from(reply_node_present);
+                let assistants = if collapsed_count { 1 } else { assistants };
                 Ok(TurnState {
                     login_state: if page.signed_out {
                         LoginState::SignedOut
@@ -862,7 +909,11 @@ mod tests {
                     user_message_count: users,
                     assistant_message_count: assistants,
                     assistant_text,
-                    thinking_text: String::new(),
+                    thinking_text: if generating || reply_node_present {
+                        self.thinking.lock().unwrap().clone()
+                    } else {
+                        String::new()
+                    },
                     last_message_role: page.messages.last().map(|m| m.role.clone()),
                     last_message_text: page.messages.last().map(|m| m.text.clone()),
                 })
@@ -971,7 +1022,6 @@ mod tests {
         assert_eq!(client.runtime().snapshot(None)[0].sent_messages, 1);
     }
 
-
     #[derive(Default)]
     struct RecordingImageSink {
         stored: Mutex<Vec<(String, String, crate::images::WebImage)>>,
@@ -999,22 +1049,32 @@ mod tests {
         let bytes: Vec<u8> = (0..(768 * 1024 + 10)).map(|i| (i % 251) as u8).collect();
         driver.with_image(bytes.clone());
         let sink = Arc::new(RecordingImageSink::default());
-        let client = client_with(driver.clone(), Arc::new(WebSlotTable::new()), "s1", WebModelClientConfig::default())
-            .with_image_sink(sink.clone());
-        let streamed = Mutex::new(String::new());
+        let client = client_with(
+            driver.clone(),
+            Arc::new(WebSlotTable::new()),
+            "s1",
+            WebModelClientConfig::default(),
+        )
+        .with_image_sink(sink.clone());
+        let streamed = Mutex::new(Vec::<ModelStreamingDelta>::new());
         let response = client
             .execute(
                 request("画一张图", vec![]),
-                &|delta| streamed.lock().unwrap().push_str(&delta.content),
+                &|delta| streamed.lock().unwrap().push(delta.clone()),
                 &|| false,
             )
             .await
             .expect("turn completes");
         assert_eq!(
             response.content.as_deref(),
-            Some("好的\n\n![已生成图像 1](generated-images/web-1.png)\n\n![已生成图像 2](generated-images/web-2.png)")
+            Some(
+                "好的\n\n![已生成图像 1](generated-images/web-1.png)\n\n![已生成图像 2](generated-images/web-2.png)"
+            )
         );
-        assert!(!streamed.lock().unwrap().contains("blob:"), "流式阶段不能出现页面地址");
+        assert!(
+            !streamed.lock().unwrap().iter().any(|frame| frame.content.contains("blob:")),
+            "流式阶段不能出现页面地址"
+        );
         let stored = sink.stored.lock().unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].0, "s1");
@@ -1028,8 +1088,13 @@ mod tests {
     async fn an_unreadable_image_becomes_a_note_instead_of_failing_the_turn() {
         let driver = FakeDriver::new(IMAGE_REPLY);
         let sink = Arc::new(RecordingImageSink::default());
-        let client = client_with(driver, Arc::new(WebSlotTable::new()), "s1", WebModelClientConfig::default())
-            .with_image_sink(sink.clone());
+        let client = client_with(
+            driver,
+            Arc::new(WebSlotTable::new()),
+            "s1",
+            WebModelClientConfig::default(),
+        )
+        .with_image_sink(sink.clone());
         let response = client
             .execute(request("画一张图", vec![]), &|_| {}, &|| false)
             .await
@@ -1045,7 +1110,12 @@ mod tests {
     async fn without_an_image_sink_page_images_are_dropped() {
         let driver = FakeDriver::new(IMAGE_REPLY);
         driver.with_image(vec![1, 2, 3]);
-        let client = client_with(driver, Arc::new(WebSlotTable::new()), "s1", WebModelClientConfig::default());
+        let client = client_with(
+            driver,
+            Arc::new(WebSlotTable::new()),
+            "s1",
+            WebModelClientConfig::default(),
+        );
         let response = client
             .execute(request("画一张图", vec![]), &|_| {}, &|| false)
             .await
@@ -1306,6 +1376,15 @@ mod tests {
         assert_eq!(opens, 1, "续接不得重新打开 / 新建对话");
     }
 
+    /// 按下游的方式把增量帧累积成全文。
+    fn accumulate(frames: &[ModelStreamingDelta]) -> (String, String) {
+        let (mut content, mut thinking) = (String::new(), String::new());
+        for frame in frames {
+            frame.accumulate_into(&mut content, &mut thinking);
+        }
+        (content, thinking)
+    }
+
     #[tokio::test]
     async fn a_second_turn_never_streams_the_previous_reply_as_its_own_content() {
         let driver = FakeDriver::new("新的回答");
@@ -1322,21 +1401,96 @@ mod tests {
             .unwrap();
         // 第二轮：本轮助手节点出现之前，页面上「最后一条助手消息」还是第一轮的回答。
         driver.leak_previous_reply();
-        let streamed = std::sync::Mutex::new(String::new());
+        let streamed = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
         let second = client
             .execute(
                 request("第二问", vec![]),
-                &|delta| streamed.lock().unwrap().push_str(&delta.content),
+                &|delta| streamed.lock().unwrap().push(delta.clone()),
                 &|| false,
             )
             .await
             .unwrap();
         assert_eq!(second.content.as_deref(), Some("新的回答"));
-        assert_eq!(
-            streamed.lock().unwrap().as_str(),
-            "新的回答",
-            "上一轮的回答不能被当成本轮的流式输出"
+        let frames = streamed.lock().unwrap();
+        let (content, _) = accumulate(&frames);
+        assert_eq!(content, "新的回答", "上一轮的回答不能被当成本轮的流式输出：{frames:?}");
+        assert!(frames.iter().all(|frame| !frame.replace), "追加不需要改写帧");
+    }
+
+    #[tokio::test]
+    async fn a_page_rebuild_that_resets_the_baseline_still_never_streams_the_previous_reply() {
+        let driver = FakeDriver::new("新的回答");
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(
+            driver.clone(),
+            slots.clone(),
+            "s1",
+            WebModelClientConfig::default(),
         );
+        for question in ["第一问", "第二问"] {
+            client
+                .execute(request(question, vec![]), &|_| {}, &|| false)
+                .await
+                .unwrap();
+        }
+        // 第三轮：页面重绘，消息计数回落到提交前的基线以下，同时仍显示上一轮的回答。
+        driver.leak_previous_reply();
+        driver.collapse_count_on_leak();
+        let streamed = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
+        let third = client
+            .execute(
+                request("第三问", vec![]),
+                &|delta| streamed.lock().unwrap().push(delta.clone()),
+                &|| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.content.as_deref(), Some("新的回答"));
+        let frames = streamed.lock().unwrap();
+        let (content, _) = accumulate(&frames);
+        assert_eq!(
+            content, "新的回答",
+            "基线重置后，上一轮的回答也不能被当成本轮的流式输出：{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_reasoning_streams_as_thinking_increments() {
+        let driver = FakeDriver::new("最终回答");
+        driver.with_thinking("先拆解问题，再逐步推导。");
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots.clone(), "s1", WebModelClientConfig::default());
+        let frames = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
+        client
+            .execute(request("问", vec![]), &|delta| frames.lock().unwrap().push(delta.clone()), &|| false)
+            .await
+            .unwrap();
+        let frames = frames.lock().unwrap();
+        let (content, thinking) = accumulate(&frames);
+        assert_eq!(content, "最终回答");
+        assert_eq!(thinking, "先拆解问题，再逐步推导。", "页面推理必须流进 thinking：{frames:?}");
+        assert!(frames.iter().all(|frame| !frame.replace));
+    }
+
+    #[tokio::test]
+    async fn streaming_frames_are_increments_never_the_full_text_again() {
+        let driver = FakeDriver::new("这是一段会被分成多帧发出的较长回答。");
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots.clone(), "s1", WebModelClientConfig::default());
+        let frames = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
+        client
+            .execute(request("问", vec![]), &|delta| frames.lock().unwrap().push(delta.clone()), &|| false)
+            .await
+            .unwrap();
+        let frames = frames.lock().unwrap();
+        assert!(frames.len() >= 2, "应该分成多帧：{frames:?}");
+        let mut seen = String::new();
+        for frame in frames.iter() {
+            assert!(!frame.replace);
+            assert!(!seen.contains(&frame.content) || frame.content.is_empty(), "帧不能重复已发内容：{frames:?}");
+            seen.push_str(&frame.content);
+        }
+        assert_eq!(seen, "这是一段会被分成多帧发出的较长回答。");
     }
 
     #[tokio::test]
@@ -1350,14 +1504,25 @@ mod tests {
             "s1",
             WebModelClientConfig::default(),
         );
+        let frames = std::sync::Mutex::new(Vec::<ModelStreamingDelta>::new());
         let response = client
-            .execute(request("问", vec![]), &|_| {}, &|| false)
+            .execute(
+                request("问", vec![]),
+                &|delta| frames.lock().unwrap().push(delta.clone()),
+                &|| false,
+            )
             .await
             .expect("改写中途文本不能让执行线程 panic");
         assert_eq!(
             response.content.as_deref(),
             Some("新的回答，已经重新生成完毕，这一段足够长。")
         );
+        // 流式帧是增量：页面把文本整段改写时发一帧 replace（完整文字），之后继续照常发出，
+        // 消费方累积出的内容与收口全文一致，界面不会停住到收口。
+        let frames = frames.lock().unwrap();
+        assert!(frames.iter().any(|frame| frame.replace), "改写必须以 replace 帧表达");
+        let (content, _) = accumulate(&frames);
+        assert_eq!(content, "新的回答，已经重新生成完毕，这一段足够长。");
     }
 
     #[tokio::test]
@@ -1366,12 +1531,25 @@ mod tests {
         let driver = FakeDriver::new("新对话里的回答");
         {
             let mut page = driver.page.lock().unwrap();
-            page.messages.push(WebMessage { role: "user".into(), text: "旧问".into(), remote_id: Some("u0".into()) });
-            page.messages.push(WebMessage { role: "assistant".into(), text: "旧答".into(), remote_id: Some("a0".into()) });
+            page.messages.push(WebMessage {
+                role: "user".into(),
+                text: "旧问".into(),
+                remote_id: Some("u0".into()),
+            });
+            page.messages.push(WebMessage {
+                role: "assistant".into(),
+                text: "旧答".into(),
+                remote_id: Some("a0".into()),
+            });
             page.replace_on_submit = true;
         }
         let slots = Arc::new(WebSlotTable::new());
-        let client = client_with(driver.clone(), slots.clone(), "s1", WebModelClientConfig::default());
+        let client = client_with(
+            driver.clone(),
+            slots.clone(),
+            "s1",
+            WebModelClientConfig::default(),
+        );
         let response = client
             .execute(request("新问", vec![]), &|_| {}, &|| false)
             .await

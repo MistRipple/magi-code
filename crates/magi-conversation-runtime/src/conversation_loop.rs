@@ -1654,6 +1654,9 @@ fn run_conversation_loop_inner(
         );
 
         let response = if streaming_entry_id.is_some() {
+            // 模型客户端只发这一帧新增的文字；这里累积成到目前为止的全文，再算对外发布的增量。
+            let delta_content = std::cell::RefCell::new(String::new());
+            let delta_thinking = std::cell::RefCell::new(String::new());
             let on_delta = |delta: &ModelStreamingDelta| {
                 if invocation_cancelled()
                     || turn_writeback_context
@@ -1699,8 +1702,11 @@ fn run_conversation_loop_inner(
                         "conversation response timing"
                     );
                 }
+                let mut accumulated_content = delta_content.borrow_mut();
+                let mut accumulated_thinking = delta_thinking.borrow_mut();
+                delta.accumulate_into(&mut accumulated_content, &mut accumulated_thinking);
                 if let Some(tracker) = context_usage_tracker.as_ref() {
-                    tracker.observe_accumulated_output(&delta.content, &delta.thinking);
+                    tracker.observe_accumulated_output(&accumulated_content, &accumulated_thinking);
                 }
                 if let Err(error) = publish_task_thinking_delta(
                     turn_writeback_context,
@@ -1709,7 +1715,7 @@ fn run_conversation_loop_inner(
                     &last_thinking_len,
                     &streamed_thinking,
                     &thinking_publish_gate,
-                    &delta.thinking,
+                    &accumulated_thinking,
                 ) {
                     record_task_writeback_error(turn_writeback_context, error);
                     return;
@@ -1723,7 +1729,7 @@ fn run_conversation_loop_inner(
                         streamed_content: &streamed_content,
                         streamed_visible_content: &streamed_visible_content,
                         publish_gate: &stream_publish_gate,
-                        accumulated_content: &delta.content,
+                        accumulated_content: &accumulated_content,
                     },
                 ) {
                     record_task_writeback_error(turn_writeback_context, error);
@@ -5314,12 +5320,14 @@ mod tests {
                     content: "Considering file reading approach before calling tools.".to_string(),
                     thinking: String::new(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             } else {
                 on_delta(&ModelStreamingDelta {
                     content: "最终回复：文件检查完成。".to_string(),
                     thinking: String::new(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             }
             self.invoke(request)
@@ -5445,6 +5453,7 @@ mod tests {
                     content: "Considering file reading approach".to_string(),
                     thinking: String::new(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             }
             self.invoke(request)
@@ -5556,6 +5565,7 @@ mod tests {
                 content: "子代理在暂态空响应后完成。".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -5615,6 +5625,7 @@ mod tests {
                 content: content.to_string(),
                 thinking: thinking.to_string(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             *self
                 .recovery_messages
@@ -5649,6 +5660,7 @@ mod tests {
                 content: self.content.to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -5718,6 +5730,7 @@ mod tests {
                 content: "子代理重连后完成".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -5772,6 +5785,7 @@ mod tests {
                 content: "已看到图片".to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -5815,6 +5829,7 @@ mod tests {
                     content: "工具失败后已完成可交付总结。".to_string(),
                     thinking: String::new(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             }
             self.invoke(request)
@@ -5870,6 +5885,7 @@ mod tests {
                     content: "工具失败已通过重试恢复，任务可以完成。".to_string(),
                     thinking: String::new(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             }
             self.invoke(request)
@@ -5917,6 +5933,7 @@ mod tests {
                 content: self.content.to_string(),
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }
@@ -5974,6 +5991,7 @@ mod tests {
                 },
                 thinking: String::new(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             self.invoke(request)
         }

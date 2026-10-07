@@ -443,6 +443,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -488,6 +489,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -572,6 +574,7 @@ impl HarnessModelClient {
                             content: String::new(),
                             thinking: String::new(),
                             tool_calls: vec![tool_call.clone()],
+                            ..Default::default()
                         },
                         on_delta,
                         track_timing,
@@ -619,6 +622,7 @@ impl HarnessModelClient {
                                 content: String::new(),
                                 thinking: String::new(),
                                 tool_calls: vec![tool_call.clone()],
+                                ..Default::default()
                             },
                             on_delta,
                             track_timing,
@@ -651,6 +655,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -694,6 +699,7 @@ impl HarnessModelClient {
                             content: String::new(),
                             thinking: String::new(),
                             tool_calls: vec![tool_call.clone()],
+                            ..Default::default()
                         },
                         on_delta,
                         track_timing,
@@ -738,6 +744,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -785,6 +792,7 @@ impl HarnessModelClient {
                             content: String::new(),
                             thinking: String::new(),
                             tool_calls: vec![tool_call.clone()],
+                            ..Default::default()
                         },
                         on_delta,
                         track_timing,
@@ -831,6 +839,7 @@ impl HarnessModelClient {
                         content: cumulative.clone(),
                         thinking: String::new(),
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     };
                     self.record_delta(&delta, on_delta, track_timing);
                 }
@@ -903,7 +912,7 @@ impl MagiTurnHarness {
         Self::from_parts(
             Arc::new(SessionStore::default()),
             HarnessModelClient::new(response),
-            false,
+            true,
         )
     }
 
@@ -1040,6 +1049,8 @@ impl MagiTurnHarness {
                 .clone()
                 .with_agent_spawn_preflight_runtime(AgentSpawnPreflightRuntime {
                     default_model_client: Some(Arc::new(provider.clone())),
+                    session_code_contexts: Some(session_code_contexts.clone()),
+                    git_service_configured: true,
                     ..AgentSpawnPreflightRuntime::default()
                 });
         }
@@ -1686,6 +1697,18 @@ mod tests {
             .count()
     }
 
+    fn failed_model_diagnostic_detail(turn: &CanonicalTurn) -> Option<&str> {
+        turn.items
+            .iter()
+            .find(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
+            })
+            .and_then(|item| item.metadata.get("modelFailure"))
+            .and_then(|failure| failure.get("detail"))
+            .and_then(serde_json::Value::as_str)
+    }
+
     async fn run_read_only_explicit_file_tool_case<F>(
         tool_name: &'static str,
         request_suffix: &'static str,
@@ -1754,8 +1777,8 @@ mod tests {
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            0,
-            "ReadOnly 隐藏显式 {tool_name} 后不得进入 Provider"
+            1,
+            "ReadOnly 隐藏显式 {tool_name} 仍需一次 Provider 请求以收口工具契约错误"
         );
         assert!(
             harness
@@ -1764,14 +1787,13 @@ mod tests {
                 .all(|event| event.event_type != "tool.approval.requested"),
             "ReadOnly 隐藏显式 {tool_name} 后不得发布审批请求"
         );
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
-                && item
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| content.contains(tool_name))
-        }));
+        assert!(
+            failed_model_diagnostic_detail(&turn).is_some_and(
+                |detail| detail.contains(tool_name) && detail.contains("was not exposed")
+            ),
+            "ReadOnly 显式隐藏的写工具应通过 modelFailure 诊断说明 Provider 工具契约错误；items={:#?}",
+            turn.items
+        );
         record_turn_permission_matrix_row(
             serde_json::json!({
                 "case": format!("read_only_{request_suffix}"),
@@ -4011,13 +4033,13 @@ done
         assert!(!target.exists(), "只读访问模式下写工具不得产生文件副作用");
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            0,
-            "ReadOnly 隐藏 file_write 后应在任务模型调用前直接失败，不能进入 Provider 重试循环"
+            1,
+            "ReadOnly 隐藏 file_write 后只允许一次 Provider 请求收口失败"
         );
         assert_eq!(
             harness.provider.requests().len(),
-            0,
-            "ReadOnly 隐藏 file_write 后不应进入 Provider 请求"
+            1,
+            "ReadOnly 隐藏 file_write 后不得进入 Provider 重试循环"
         );
         assert!(
             harness
@@ -4025,14 +4047,12 @@ done
                 .iter()
                 .all(|event| event.event_type != "tool.approval.requested")
         );
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.status == magi_session_store::CanonicalTurnItemStatus::Failed
-                && item.content.as_deref().is_some_and(|content| {
-                    content.contains("要求调用工具 file_write")
-                        && content.contains("当前工具面没有暴露该工具")
-                })
-        }));
+        assert!(
+            failed_model_diagnostic_detail(&turn).is_some_and(|detail| {
+                detail.contains("expected tool file_write") && detail.contains("was not exposed")
+            }),
+            "ReadOnly 隐藏 file_write 后应保留 Provider 工具契约诊断"
+        );
         record_turn_permission_matrix_row(
             serde_json::json!({
                 "case": "read_only_file_write",
@@ -4123,8 +4143,8 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&copy_harness),
-            0,
-            "ReadOnly 隐藏 file_copy 后不得进入 Provider"
+            1,
+            "ReadOnly 隐藏 file_copy 后只允许一次 Provider 请求收口失败"
         );
         assert!(
             copy_harness
@@ -4204,8 +4224,8 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&move_harness),
-            0,
-            "ReadOnly 隐藏 file_move 后不得进入 Provider"
+            1,
+            "ReadOnly 隐藏 file_move 后只允许一次 Provider 请求收口失败"
         );
         assert!(
             move_harness
@@ -4277,14 +4297,10 @@ done
             "ReadOnly file_patch 不得产生文件副作用"
         );
         assert!(
-            patch_turn.items.iter().any(|item| {
-                item.kind == CanonicalTurnItemKind::AssistantText
-                    && item.content.as_deref().is_some_and(|content| {
-                        content.contains("file_patch")
-                            && content.contains("当前工具面没有暴露该工具")
-                    })
+            failed_model_diagnostic_detail(&patch_turn).is_some_and(|detail| {
+                detail.contains("expected tool file_patch") && detail.contains("was not exposed")
             }),
-            "ReadOnly file_patch 应写回明确的 fail-closed 错误"
+            "ReadOnly file_patch 应保留 fail-closed 工具契约诊断"
         );
         record_turn_permission_matrix_row(
             serde_json::json!({
@@ -4296,7 +4312,7 @@ done
                 "lifecycle": "deny",
                 "approval_requested": false,
                 "approval_resolved": false,
-                "provider_requests": 0,
+                "provider_requests": 1,
                 "turn_status": "failed",
                 "task_status": "failed",
                 "side_effect": "write_blocked",
@@ -4320,14 +4336,10 @@ done
             .await;
         assert!(!mkdir_target.exists(), "ReadOnly file_mkdir 不得创建目录");
         assert!(
-            mkdir_turn.items.iter().any(|item| {
-                item.kind == CanonicalTurnItemKind::AssistantText
-                    && item.content.as_deref().is_some_and(|content| {
-                        content.contains("file_mkdir")
-                            && content.contains("当前工具面没有暴露该工具")
-                    })
+            failed_model_diagnostic_detail(&mkdir_turn).is_some_and(|detail| {
+                detail.contains("expected tool file_mkdir") && detail.contains("was not exposed")
             }),
-            "ReadOnly file_mkdir 应写回明确的 fail-closed 错误"
+            "ReadOnly file_mkdir 应保留 fail-closed 工具契约诊断"
         );
         record_turn_permission_matrix_row(
             serde_json::json!({
@@ -4339,7 +4351,7 @@ done
                 "lifecycle": "deny",
                 "approval_requested": false,
                 "approval_resolved": false,
-                "provider_requests": 0,
+                "provider_requests": 1,
                 "turn_status": "failed",
                 "task_status": "failed",
                 "side_effect": "write_blocked",
@@ -4369,14 +4381,10 @@ done
             "must remain"
         );
         assert!(
-            remove_turn.items.iter().any(|item| {
-                item.kind == CanonicalTurnItemKind::AssistantText
-                    && item.content.as_deref().is_some_and(|content| {
-                        content.contains("file_remove")
-                            && content.contains("当前工具面没有暴露该工具")
-                    })
+            failed_model_diagnostic_detail(&remove_turn).is_some_and(|detail| {
+                detail.contains("expected tool file_remove") && detail.contains("was not exposed")
             }),
-            "ReadOnly file_remove 应写回明确的 fail-closed 错误"
+            "ReadOnly file_remove 应保留 fail-closed 工具契约诊断"
         );
         record_turn_permission_matrix_row(
             serde_json::json!({
@@ -4388,7 +4396,7 @@ done
                 "lifecycle": "deny",
                 "approval_requested": false,
                 "approval_resolved": false,
-                "provider_requests": 0,
+                "provider_requests": 1,
                 "turn_status": "failed",
                 "task_status": "failed",
                 "side_effect": "write_blocked",
@@ -4414,12 +4422,12 @@ done
         )
         .await;
         assert!(!target.exists(), "ReadOnly apply_patch 不得创建文件");
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.content.as_deref().is_some_and(|content| {
-                    content.contains("apply_patch") && content.contains("当前工具面没有暴露该工具")
-                })
-        }));
+        assert!(
+            failed_model_diagnostic_detail(&turn).is_some_and(|detail| {
+                detail.contains("expected tool apply_patch") && detail.contains("was not exposed")
+            }),
+            "ReadOnly apply_patch 应保留 fail-closed 工具契约诊断"
+        );
         record_turn_permission_matrix_row(
             serde_json::json!({
                 "case": "read_only_apply-patch",
@@ -4430,7 +4438,7 @@ done
                 "lifecycle": "deny",
                 "approval_requested": false,
                 "approval_resolved": false,
-                "provider_requests": 0,
+                "provider_requests": 1,
                 "turn_status": "failed",
                 "task_status": "failed",
                 "side_effect": "write_blocked",
@@ -11245,8 +11253,27 @@ done
         harness
             .provider
             .set_multiple_agent_spawn_then_wait("验收子代理1；验收子代理2：子代理完成");
+        let (workspace_id, workspace_root) = register_git_workspace(&harness);
+        let session_id = SessionId::new("harness-agent-spawn-many-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "多子代理验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("多子代理 session 应创建");
+        harness
+            .state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("多子代理场景应使用 Git 隔离工作区");
         let response = harness
-            .submit_task(
+            .submit_workspace_task(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
                 "请并行派发两个子代理完成独立验收，再汇总它们的结果",
                 "harness-agent-spawn-many-request",
                 "harness-agent-spawn-many-user",
@@ -11304,6 +11331,7 @@ done
                     .as_deref()
                     .is_some_and(|content| content.contains("验收子代理2"))
         }));
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -11352,6 +11380,31 @@ done
         let session_id = SessionId::new(response.session_id.clone());
         let turn_id = response.turn_id.clone().expect("断线恢复场景应有 Turn");
         harness.wait_for_terminal(&session_id, &turn_id).await;
+
+        // canonical store 会在终态事件发布前立即更新。并行测试负载下，
+        // wait_for_terminal 可能先观察到这个短窗口，因此先等待终态事件投影，
+        // 再构造本用例要验证的重连快照。
+        let mut terminal_event_published = false;
+        for _ in 0..200 {
+            terminal_event_published = harness.events_for(&session_id).iter().any(|event| {
+                event.event_type == "session.turn.item"
+                    && event
+                        .payload
+                        .get("canonical_turn")
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("completed")
+            });
+            if terminal_event_published {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            terminal_event_published,
+            "Turn 终态提交后必须发布 completed canonical event；events={:#?}",
+            harness.events_for(&session_id)
+        );
 
         let (_initial_snapshot, receiver) = harness.state.event_bus.snapshot_and_subscribe();
         drop(receiver);
@@ -11699,18 +11752,18 @@ done
     }
 
     #[tokio::test]
-    async fn steer_routes_to_the_active_turn_and_keeps_the_same_turn_identity() {
-        let harness = MagiTurnHarness::new("不会先完成");
+    async fn task_profile_rejects_steer_without_replacing_the_active_turn() {
+        let harness = MagiTurnHarness::new_task("不会先完成");
         harness.provider.set_hold_for_cancellation();
         let initial = harness
             .submit(
                 None,
-                "请回复一句话并保持等待",
+                "请执行一个任务并保持等待",
                 "harness-steer-root-request",
                 "harness-steer-root-user",
             )
             .await
-            .expect("可引导的 Turn 应先被接纳");
+            .expect("可取消的 task Turn 应先被接纳");
         let session_id = SessionId::new(initial.session_id.clone());
         let turn_id = initial.turn_id.clone().expect("初始 Turn 应有身份");
         for _ in 0..100 {
@@ -11723,36 +11776,27 @@ done
             !harness.provider.requests().is_empty(),
             "steer 前 Provider 必须已经进入执行"
         );
-        let steered = harness
-            .steer(
+        let steer_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            harness.steer(
                 &session_id,
                 &turn_id,
                 "优先收口当前响应",
                 "harness-steer-request",
                 "harness-steer-user",
-            )
-            .await
-            .expect("steer 应通过真实 TurnService 接纳");
-        assert_eq!(steered.route, crate::dto::SessionTurnRouteDto::Steer);
-        assert_eq!(steered.steered_turn_id.as_deref(), Some(turn_id.as_str()));
-        assert_eq!(steered.turn_id.as_deref(), Some(turn_id.as_str()));
-        let current = harness
-            .state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("steer 后仍应保留同一 current Turn");
-        assert_eq!(current.turn_id, turn_id);
-        assert!(current.items.iter().any(|item| {
-            item.kind == "user_message" && item.content.as_deref() == Some("优先收口当前响应")
-        }));
+            ),
+        )
+        .await
+        .expect("任务模式 steer 必须在有限时间内返回");
+        assert!(
+            matches!(&steer_result, Err(crate::errors::ApiError::TurnConflict { conflict_kind, message, .. }) if conflict_kind == "steer_unsupported" || message.contains("任务模式不支持")),
+            "任务模式 steer 应明确拒绝: {steer_result:?}"
+        );
         harness
             .cancel(&session_id)
             .await
-            .expect("steer 场景应可取消");
-        let terminal = harness
-            .wait_for_terminal(&session_id, &current.turn_id)
-            .await;
+            .expect("任务 steer 场景应可取消");
+        let terminal = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(terminal.status, CanonicalTurnStatus::Cancelled);
     }
 

@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
  */
 
 /** 站点适配层结构版本。selector 集变化即推进，用于诊断与漂移判定。 */
-export const WEB_MODEL_SITE_REVISION = "chatgpt-web-4";
+export const WEB_MODEL_SITE_REVISION = "chatgpt-web-7";
 
 /** ChatGPT 页面的 DOM 事实（selector、命名）。集中在这里，不得散落。 */
 export const WEB_MODEL_SELECTORS = {
@@ -113,6 +113,10 @@ export const WEB_MODEL_SELECTORS = {
     // 图片回复没有 unit 包装：助手标题 h4 之后的兄弟节点里直接是图片画廊。
     "h4[data-conversation-role='assistant'] ~ div:has([data-testid='generated-image-gallery'])",
   ],
+  /** 正在生成的回合容器：思考阶段的文字只出现在它里面。 */
+  liveTurn: ["[data-talvt-turn-state='in_progress']"],
+  /** 回合里的助手 markdown 块（调用方排除带 unit key 的节点后，剩下的就是思考文字）。 */
+  liveReasoningText: "[data-markdown-text-style='assistant-message']",
   /** 隐藏推理区块：映射到 `thinking`。 */
   reasoningBlock: [
     "[data-testid='reasoning-block']",
@@ -974,7 +978,14 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     const assistants = allMatches(SELECTORS.assistantMessage, root).sort((left, right) => (
       left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
     ));
-    const reasoning = allMatches(SELECTORS.reasoningBlock, root);
+    // 思考阶段的文字：进行中的回合里、不属于任何带 unit key 的消息节点（用户消息与最终回答都带）
+    // 的助手 markdown 块。最终回答一出现，这块就被带 unit key 的助手节点取代。
+    const liveTurns = allMatches(SELECTORS.liveTurn, root);
+    const liveTurn = liveTurns.length > 0 ? liveTurns[liveTurns.length - 1] : null;
+    const liveReasoning = liveTurn
+      ? queryAll(liveTurn, SELECTORS.liveReasoningText).filter((element) => !element.closest('[data-content-search-unit-key]'))
+      : [];
+    const reasoning = liveReasoning.length > 0 ? liveReasoning : allMatches(SELECTORS.reasoningBlock, root);
     const lastAssistant = assistants.length > 0 ? assistants[assistants.length - 1] : null;
     const lastReasoning = reasoning.length > 0 ? reasoning[reasoning.length - 1] : null;
     const userSet = new Set(users);
@@ -1164,6 +1175,27 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   // 身份验证选“无需身份验证”→ 勾选风险确认 → 创建。是否真的创建成功由 daemon 回读已安装列表确认。
   const configureConnector = async ({ name, tunnel_id: tunnelId }) => {
     const fail = (reason) => ({ configured: false, confirmed_enabled: false, reason });
+    // 已安装的连接器：ChatGPT 会缓存创建 / 上次刷新时的 MCP 工具列表，Magi 的目录变化后不会自动
+    // 同步。此时（页面在设置里的「插件」页）进入该连接器的详情页，点「Refresh tools」重新拉取。
+    if (location.pathname.startsWith('/settings/')) {
+      // 点进详情页会换路由，命令结果因此被判为过期（daemon 把它当页面交接重试）；重试时页面已经
+      // 在详情页，直接找按钮，不再找列表行。
+      if (!/^\/settings\/plugins-settings\/[^/]+/u.test(location.pathname)) {
+        const entry = await waitFor(() => connectorEntry(document.body, name), 8000);
+        if (!entry) return fail('connector_not_listed');
+        press(entry);
+      }
+      const refresh = await waitFor(() => buttonWithText(document, /^(?:refresh tools|刷新工具)$/iu), 8000);
+      if (!refresh) return fail('connector_refresh_button_missing');
+      press(refresh);
+      // 刷新是站点向 Magi 的 MCP 端点重新发 tools/list；按钮在请求期间会置为不可用。
+      await sleep(400);
+      await waitFor(() => {
+        const button = buttonWithText(document, /^(?:refresh tools|刷新工具)$/iu);
+        return button && !button.disabled && button.getAttribute('aria-busy') !== 'true';
+      }, 15000);
+      return { configured: true, confirmed_enabled: true, reason: 'tools_refreshed' };
+    }
     if (!location.pathname.startsWith('/plugins')) return fail('connector_page_not_open');
     const add = await waitFor(() => buttonWithText(document, /^(?:添加|Add)$/iu), 8000);
     if (!add) return fail('connector_create_entry_missing');

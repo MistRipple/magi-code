@@ -1091,14 +1091,30 @@ fn apply_provider_stream_event(
         || accumulated_thinking.len() > *last_thinking_delta_len
         || tool_call_count > *last_tool_call_count
     {
+        // 只发这一帧新增的部分：流式就是增量，不能每帧把到目前为止的全文再发一遍。
+        let (mut content, content_rewritten) =
+            new_suffix(&accumulated_content, *last_content_delta_len);
+        let (mut thinking, thinking_rewritten) =
+            new_suffix(&accumulated_thinking, *last_thinking_delta_len);
+        let replace = content_rewritten || thinking_rewritten;
+        if replace {
+            // 改写帧两个字段都携带完整文字。
+            content = accumulated_content.clone();
+            thinking = accumulated_thinking.clone();
+        }
+        let new_tool_calls = accumulated_tool_calls
+            .get(*last_tool_call_count..)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
         *last_content_delta_len = accumulated_content.len();
         *last_thinking_delta_len = accumulated_thinking.len();
         *last_tool_call_count = tool_call_count;
         if tx
             .send(StreamMessage::Chunk(ModelStreamingDelta {
-                content: accumulated_content,
-                thinking: accumulated_thinking,
-                tool_calls: accumulated_tool_calls,
+                content,
+                thinking,
+                replace,
+                tool_calls: new_tool_calls,
             }))
             .is_err()
         {
@@ -1110,6 +1126,15 @@ fn apply_provider_stream_event(
         }
     }
     Ok(false)
+}
+
+/// `full` 相对已发送长度 `sent` 新增的后缀；若 `sent` 不落在字符边界上（上游把已发内容改写了），
+/// 退回整段并标记为改写。
+fn new_suffix(full: &str, sent: usize) -> (String, bool) {
+    match full.get(sent..) {
+        Some(suffix) => (suffix.to_string(), false),
+        None => (full.to_string(), true),
+    }
 }
 
 fn provider_stream_idle_timeout_error(stage: &str, timeout: Duration) -> BridgeClientError {
@@ -1181,7 +1206,7 @@ fn execute_streaming_http_post(
                 let mut completed_result = None;
                 while let Ok(message) = rx.try_recv() {
                     match message {
-                        StreamMessage::Chunk(next_delta) => delta = next_delta,
+                        StreamMessage::Chunk(next_delta) => delta.merge(next_delta),
                         StreamMessage::Done(result) => {
                             completed_result = Some(result);
                             break;
@@ -3989,10 +4014,10 @@ mod tests {
 
         assert!(response.is_actionable());
         let deltas = deltas.into_inner();
-        assert_eq!(deltas.last().map(String::as_str), Some("Hello"));
+        assert_eq!(deltas.concat(), "Hello", "增量帧拼起来必须是完整内容");
         assert!(
             (1..=2).contains(&deltas.len()),
-            "累计快照允许合并中间态，但必须保留最终完整内容"
+            "积压的增量允许合并成一帧，但不得丢内容"
         );
 
         let recorded = server
@@ -4005,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_coalesces_backlogged_cumulative_snapshots_before_completion() {
+    fn streaming_coalesces_backlogged_increments_without_losing_content() {
         let mut response_text = String::new();
         for _ in 0..200 {
             response_text.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"字\"}}]}\n\n");
@@ -4034,7 +4059,7 @@ mod tests {
                 },
                 &|delta| {
                     callback_count.set(callback_count.get() + 1);
-                    *latest_content.borrow_mut() = delta.content.clone();
+                    latest_content.borrow_mut().push_str(&delta.content);
                     std::thread::sleep(Duration::from_millis(10));
                 },
             )
@@ -4044,7 +4069,7 @@ mod tests {
         assert_eq!(latest_content.borrow().chars().count(), 200);
         assert!(
             callback_count.get() < 20,
-            "累计快照积压时不得逐条回放全部中间态"
+            "增量积压时应合并成少量帧，不得逐条回放"
         );
         assert!(
             started_at.elapsed() < Duration::from_millis(500),
