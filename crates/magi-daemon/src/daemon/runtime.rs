@@ -2065,6 +2065,7 @@ impl DaemonRuntime {
                 "已清理不再属于现有 Magi 会话的 Browser Session"
             );
         }
+        state.reclaim_orphan_session_isolations();
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
         magi_api::schedule_restored_session_task_dispatches(state.clone());
         super::browser_host::start_controller(&state, &self.browser_host_controller_lifecycle);

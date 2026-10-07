@@ -284,6 +284,60 @@ impl ApiState {
         Ok(())
     }
 
+    /// 启动后回收没有人再用的隔离副本，返回回收的数量：
+    ///
+    /// - 登记着、但会话已经不存在（会话在守护进程停止期间被删除）的条目；
+    /// - 目录还在、但不在登记里的副本（建立到一半崩溃、登记文件丢失）。
+    ///
+    /// 登记的清理是同步的；目录可能很大，放到后台线程里删除，不拖慢启动。
+    pub fn reclaim_orphan_session_isolations(&self) -> usize {
+        let mut stale_dirs: std::collections::BTreeSet<PathBuf> = Default::default();
+        for isolation in self.session_isolations.all() {
+            let session_id = SessionId::new(isolation.session_id.clone());
+            if self.session_store.session(&session_id).is_none() {
+                self.session_isolations.remove(&isolation.session_id);
+                stale_dirs.insert(
+                    isolation
+                        .root
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| isolation.root.clone()),
+                );
+            }
+        }
+        if let Some(state_root) = self
+            .runtime_persistence()
+            .and_then(crate::state::RuntimeStatePersistence::state_root)
+        {
+            let base = state_root.join(ISOLATIONS_DIR);
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.filter_map(Result::ok) {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if entry.path().is_dir() && !self.session_isolations.contains(&name) {
+                        stale_dirs.insert(entry.path());
+                    }
+                }
+            }
+        }
+        let reclaimed = stale_dirs.len();
+        if reclaimed > 0 {
+            if let Err(error) = self.persist_session_isolations() {
+                tracing::warn!(?error, "持久化隔离登记清理结果失败");
+            }
+            tracing::info!(count = reclaimed, "回收没有人再用的会话隔离副本");
+            std::thread::spawn(move || {
+                for dir in stale_dirs {
+                    if let Err(error) = std::fs::remove_dir_all(&dir)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(path = %dir.display(), %error, "删除孤儿隔离副本失败");
+                    }
+                }
+            });
+        }
+        reclaimed
+    }
+
     /// 会话被删除时回收隔离副本。
     pub(crate) async fn cleanup_session_isolation(&self, session_id: &SessionId) {
         let Some(isolation) = self.session_isolation(session_id) else {

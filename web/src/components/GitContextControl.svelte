@@ -14,6 +14,7 @@
     switchGitContextBranch,
     type GitContextBinding,
   } from '../stores/git-context.svelte';
+  import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import Icon from './Icon.svelte';
 
   interface Props {
@@ -39,7 +40,9 @@
   });
   const bindingKey = $derived(binding ? gitContextBindingKey(binding) : '');
   const stateMatches = $derived(Boolean(bindingKey) && gitContextState.bindingKey === bindingKey);
-  const visible = $derived(stateMatches && gitContextState.loaded && gitContextState.isRepo);
+  // 隔离会话在自己的副本里运行，这里的分支 / 状态描述的是主工作区的仓库，对它没有意义，不显示。
+  const isolated = $derived(Boolean(sessionId.trim()) && isSessionIsolated(sessionId));
+  const visible = $derived(stateMatches && gitContextState.loaded && gitContextState.isRepo && !isolated);
   const busy = $derived(gitContextState.operation !== null);
   const interactionDisabled = $derived(disabled || busy);
   const filteredBranches = $derived.by(() => {

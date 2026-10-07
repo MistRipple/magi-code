@@ -264,7 +264,10 @@
 
 <div class="panel-content-scrollable edits-panel">
   <IsolationBanner />
-  <GitRepositoryPanel />
+  <!-- 仓库面板描述的是主工作区的 Git 状态；隔离会话在自己的副本里，这里不显示。 -->
+  {#if !sessionIsolated}
+    <GitRepositoryPanel />
+  {/if}
   <div class="changes-section-label">{i18n.t('edits.section.pendingChanges')}</div>
   {#if edits.length === 0}
     <div class="empty-state">

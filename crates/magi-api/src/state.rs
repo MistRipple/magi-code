@@ -6891,6 +6891,72 @@ mod tests {
     }
 
     #[test]
+    fn orphan_session_isolations_are_reclaimed_after_restart() {
+        let root = tempfile::tempdir().expect("state root");
+        let persistence = Arc::new(RuntimeStatePersistence::new(
+            root.path(),
+            root.path().join("workspaces.json"),
+            root.path().join("knowledge.json"),
+        ));
+        let session_store = Arc::new(SessionStore::default());
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence);
+        let isolations_dir = root.path().join("session-isolations");
+        let make_copy = |session: &str| {
+            let dir = isolations_dir.join(session).join("project");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file.txt"), "x").unwrap();
+            dir
+        };
+        let register = |session: &str, copy: &Path| {
+            state
+                .session_isolations
+                .insert(magi_session_isolation::SessionIsolation {
+                    session_id: session.to_string(),
+                    workspace_id: "ws".to_string(),
+                    source_root: PathBuf::from("/repo"),
+                    root: copy.to_path_buf(),
+                    origin: magi_session_isolation::IsolationOrigin::Manual,
+                    strategy: magi_session_isolation::CloneStrategy::Clone,
+                    linked_dirs: Vec::new(),
+                    git_available: false,
+                    created_at_ms: 1,
+                });
+        };
+        // 会话还在：保留。
+        session_store
+            .create_session(SessionId::new("alive-session"), "alive")
+            .unwrap();
+        let alive = make_copy("alive-session");
+        register("alive-session", &alive);
+        // 会话已经不存在：登记和目录都回收。
+        let deleted = make_copy("deleted-session");
+        register("deleted-session", &deleted);
+        // 目录在、登记里没有：当作崩溃残留回收。
+        let leftover = make_copy("leftover-session");
+
+        assert_eq!(state.reclaim_orphan_session_isolations(), 2);
+        assert!(state.session_isolations.contains("alive-session"));
+        assert!(!state.session_isolations.contains("deleted-session"));
+        // 目录在后台线程里删除。
+        for _ in 0..100 {
+            if !deleted.exists() && !leftover.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(alive.exists(), "仍在使用的副本不能被回收");
+        assert!(!deleted.exists());
+        assert!(!leftover.exists());
+    }
+
+    #[test]
     fn session_git_context_round_trips_through_runtime_persistence() {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {

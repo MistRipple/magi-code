@@ -658,14 +658,15 @@ async fn resolve_file_reveal_target(
         .is_some_and(|value| !value.is_empty())
     {
         let session_id = parse_session_id(request.session_id.as_deref())?;
-        resolve_session_change_scope_from_request(
+        let scope = resolve_session_change_scope_from_request(
             &state,
             &session_id,
             request.workspace_id.as_deref(),
             request.workspace_path.as_deref(),
             None,
-        )?
-        .workspace_root
+        )?;
+        // 隔离会话的文件在它自己的副本里，不是主工作区。
+        state.snapshot_root_for_session(&session_id, &scope.workspace_root)
     } else {
         resolve_workspace_change_scope_from_request(
             &state,
@@ -730,7 +731,8 @@ async fn get_file_content(
             query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
-        let absolute = safe_file_preview_path(&state, &scope.workspace_root, path)?;
+        let root = state.snapshot_root_for_session(&session_id, &scope.workspace_root);
+        let absolute = safe_file_preview_path(&state, &root, path)?;
         (absolute, session_scope_binding(&scope))
     } else {
         let scope = resolve_workspace_change_scope_from_request(
@@ -805,7 +807,8 @@ async fn get_file_raw(
             query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
-        safe_file_preview_path(&state, &scope.workspace_root, path)?
+        let root = state.snapshot_root_for_session(&session_id, &scope.workspace_root);
+        safe_file_preview_path(&state, &root, path)?
     } else {
         let scope = resolve_workspace_change_scope_from_request(
             &state,

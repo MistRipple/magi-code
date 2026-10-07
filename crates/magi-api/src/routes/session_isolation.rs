@@ -348,6 +348,27 @@ mod tests {
 
         // 在副本里改文件，再通过 HTTP 预览并合并。
         std::fs::write(copy.join("a.txt"), "changed").unwrap();
+        // 文件预览按会话取副本里的版本，而不是主工作区里的。
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!(
+                "/api/files/content?sessionId={session_id}&workspaceId={workspace_id}&filePath=a.txt"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["content"], "changed");
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/api/files/content?workspaceId={workspace_id}&filePath=a.txt"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["content"], "original", "工作区级预览仍读主工作区");
         let (status, body) = call(
             &state,
             "POST",
