@@ -962,8 +962,8 @@ async function main() {
         JSON.stringify({ browserExecutionId: appServer.browserExecutionId, turnId: appServer.turn?.result?.turnId }),
       );
       check(
-        `${profile.name} Turn 固化为 conversation profile`,
-        appServer.turn?.result?.executionProfile === "conversation",
+        `${profile.name} Turn 固化为 task profile`,
+        appServer.turn?.result?.executionProfile === "task",
         JSON.stringify(appServer.turn),
       );
       const snapshot = appServer.browsers?.find((browserTool) => browserTool.case === "read_snapshot")?.response;
@@ -1035,8 +1035,8 @@ async function main() {
       check(`${profile.name} session/read 返回同一 Turn`, canonical.turn?.turnId === turnId, JSON.stringify(canonical.read));
       check(`${profile.name} canonical Turn 终态为 completed`, canonical.turn?.status === "completed", JSON.stringify(canonical.turn));
       check(
-        `${profile.name} canonical Turn profile 为 conversation`,
-        canonical.turn?.metadata?.executionProfile === "conversation",
+        `${profile.name} canonical Turn profile 为 task`,
+        canonical.turn?.metadata?.executionProfile === "task",
         JSON.stringify(canonical.turn?.metadata),
       );
       const providerRequestCount = providerRequestCountForUserText(
@@ -1305,7 +1305,7 @@ async function main() {
     check(
       "workspace-bound Turn receipt 保留 workspace/session 身份",
       workspaceAppServer.turn?.result?.sessionId === workspace.sessionId
-        && workspaceAppServer.turn?.result?.executionProfile === "conversation",
+        && workspaceAppServer.turn?.result?.executionProfile === "task",
       JSON.stringify(workspaceAppServer.turn),
     );
     const workspaceResponses = new Map(workspaceAppServer.browsers.map((entry) => [entry.case, entry.response]));
@@ -1344,7 +1344,7 @@ async function main() {
     check(
       "workspace-bound canonical Turn identity/profile/terminal 一致",
       workspaceCanonical.turn?.turnId === workspaceTurnId
-        && workspaceCanonical.turn?.metadata?.executionProfile === "conversation"
+        && workspaceCanonical.turn?.metadata?.executionProfile === "task"
         && workspaceTerminal.sessionId === workspace.sessionId
         && Number.isSafeInteger(workspaceTerminal.stages.canonical_terminal_published.first.eventSequence),
       JSON.stringify({ turn: workspaceCanonical.turn, terminal: workspaceTerminal }),

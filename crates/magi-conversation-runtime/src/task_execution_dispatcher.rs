@@ -359,6 +359,17 @@ pub struct WebModelResolutionContext {
     pub project_id: String,
 }
 
+fn web_project_id_for_session(
+    session_store: &SessionStore,
+    session_id: Option<&SessionId>,
+) -> String {
+    session_id
+        .and_then(|id| session_store.session(id))
+        .and_then(|session| session.workspace_id)
+        .filter(|workspace_id| !workspace_id.trim().is_empty())
+        .unwrap_or_default()
+}
+
 pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
@@ -2202,15 +2213,7 @@ impl LlmTaskDispatcher {
             .map(|factory| WebModelResolutionContext {
                 factory: Arc::clone(factory),
                 thread_id: thread_id.to_string(),
-                project_id: session_id
-                    .and_then(|id| self.session_store.session(id))
-                    .and_then(|session| session.workspace_id)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        session_id
-                            .map(|id| id.as_str().to_string())
-                            .unwrap_or_default()
-                    }),
+                project_id: web_project_id_for_session(&self.session_store, session_id),
             })
     }
 
@@ -3252,6 +3255,34 @@ mod tests {
             specs[0].binding.remote_conversation_id.as_deref(),
             Some("conv-9")
         );
+    }
+
+    #[test]
+    fn gpt_web_tool_scope_uses_only_the_session_workspace() {
+        let store = SessionStore::default();
+        let personal_session_id = SessionId::new("session-personal-web");
+        store
+            .create_session_for_workspace(personal_session_id.clone(), "personal GPT Web", None)
+            .unwrap();
+        let workspace_session_id = SessionId::new("session-workspace-web");
+        store
+            .create_session_for_workspace(
+                workspace_session_id.clone(),
+                "workspace GPT Web",
+                Some("workspace-project".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            web_project_id_for_session(&store, Some(&personal_session_id)),
+            "",
+            "个人会话不能把 session id 冒充为工作区路径根"
+        );
+        assert_eq!(
+            web_project_id_for_session(&store, Some(&workspace_session_id)),
+            "workspace-project"
+        );
+        assert_eq!(web_project_id_for_session(&store, None), "");
     }
 
     #[test]

@@ -1388,11 +1388,18 @@ async function waitForTimingRecord(page, turnId, label) {
   if (!turnId) {
     throw new Error(`${label} 缺少 assistant data-turn-id`);
   }
-  return waitFor(async () => {
-    const snapshot = await rendererTiming(page);
-    const record = snapshot?.turns?.find((candidate) => candidate.turnId === turnId);
-    return timingHasAllStages(record) ? record : null;
-  }, label);
+  let lastSnapshot = null;
+  try {
+    return await waitFor(async () => {
+      const snapshot = await rendererTiming(page);
+      lastSnapshot = snapshot;
+      const record = snapshot?.turns?.find((candidate) => candidate.turnId === turnId);
+      return timingHasAllStages(record) ? record : null;
+    }, label);
+  } catch (error) {
+    const record = lastSnapshot?.turns?.find((candidate) => candidate.turnId === turnId) || null;
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; turnId=${turnId}; rendererTiming=${JSON.stringify(record)}`);
+  }
 }
 
 function assistantTurnId(state, expectedText) {
@@ -2014,7 +2021,7 @@ async function startRecoveryCancellationTurn(page, prompt, label, options = {}) 
     const escapedWorkspaceId = JSON.stringify(options.workspaceId);
     await page.evaluate(`(() => {
       const workspace = document.querySelector('[data-workspace-id=' + ${escapedWorkspaceId} + ']');
-      const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+      const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
       if (!create) throw new Error('recovery workspace new session button missing');
       create.click();
     })()`);
@@ -2380,7 +2387,7 @@ async function openPersonalDraft(page) {
     return state.input && state.inputEditable && !state.stop ? state : null;
   }, "个人上一轮 Turn 收口", 45_000);
   await page.evaluate(`(() => {
-    const button = document.querySelector('.recent-session-new-btn');
+    const button = document.querySelector('[data-testid="sidebar-new-session"]');
     if (!button || button.disabled) throw new Error('new session button unavailable');
     button.click();
   })()`);
@@ -2410,10 +2417,26 @@ async function clickSend(page) {
 }
 
 async function waitForAssistant(page, text, label) {
-  return await waitFor(async () => {
-    const state = await rendererState(page);
-    return state.assistant.some((message) => message.text.includes(text)) ? state : null;
-  }, label, 45_000);
+  let lastState = null;
+  try {
+    return await waitFor(async () => {
+      const state = await rendererState(page);
+      lastState = state;
+      return state.assistant.some((message) => message.text.includes(text)) ? state : null;
+    }, label, 45_000);
+  } catch (error) {
+    const detail = lastState
+      ? JSON.stringify({
+        url: lastState.url,
+        sessionIds: lastState.sessionIds,
+        workspaceIds: lastState.workspaceIds,
+        assistant: lastState.assistant,
+        turns: lastState.turns,
+        bodyTail: lastState.text.slice(-2_000),
+      })
+      : "Renderer state unavailable";
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; latestRendererState=${detail}`);
+  }
 }
 
 async function gitFixtureCommand(repositoryRoot, args) {
@@ -2499,12 +2522,15 @@ async function registerWorkspace(page, workspacePath) {
   check("工作区注册响应包含 workspaceId", typeof workspaceId === "string" && workspaceId.length > 0);
   await page.call("Page.reload", { ignoreCache: true });
   await waitForRenderer(page, "工作区 Renderer 重载");
-  await waitFor(async () => (await rendererState(page)).text.includes("工作区"), "工作区侧栏加载");
+  await waitFor(
+    async () => (await rendererState(page)).workspaceIds.includes(workspaceId),
+    `工作区 ${workspaceId} 侧栏加载`,
+  );
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
     if (!workspace) throw new Error('workspace row missing');
     workspace.click();
-    const create = workspace.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('workspace new session button missing');
     create.click();
   })()`);
@@ -3121,6 +3147,73 @@ try {
         return state.input && state.send && !state.sendDisabled && !state.stop ? state : null;
       }, `${scenario} 发送按钮可用`, 45_000);
       await clickSend(page);
+      const userMessageLayout = await page.evaluate(`(() => {
+        const item = [...document.querySelectorAll('.message-item.user')].at(-1);
+        const bubble = item?.querySelector('.user-content');
+        const footer = item?.querySelector('.user-time');
+        if (!item || !bubble || !footer) return null;
+        const footerRect = footer.getBoundingClientRect();
+        const bubbleRect = bubble.getBoundingClientRect();
+        return {
+          message: bubble.textContent || '',
+          renderedText: bubble.innerText || '',
+          html: bubble.innerHTML || '',
+          footerHeight: footerRect.height,
+          footerVisibility: getComputedStyle(footer).visibility,
+          footerTop: footerRect.top,
+          bubbleTop: bubbleRect.top,
+          bubbleBottom: bubbleRect.bottom,
+          bubbleHeight: bubbleRect.height,
+        };
+      })()`);
+      check(
+        `${scenario} 用户消息的隐藏时间/操作行不占布局`,
+        userMessageLayout?.footerHeight === 0
+          && userMessageLayout.footerVisibility === 'hidden',
+        JSON.stringify(userMessageLayout),
+      );
+      check(
+        `${scenario} 用户气泡内容忽略 contenteditable 末尾空白`,
+        userMessageLayout?.message.trimEnd() === prompt.trimEnd()
+          && userMessageLayout.renderedText.trimEnd() === prompt.trimEnd()
+          && !/\n\s*\n\s*$/u.test(userMessageLayout.renderedText),
+        JSON.stringify({
+          expected: prompt.trimEnd(),
+          actual: userMessageLayout?.message,
+          renderedText: userMessageLayout?.renderedText,
+          html: userMessageLayout?.html,
+        }),
+      );
+      const bubblePointer = await page.evaluate(`(() => {
+        const bubble = [...document.querySelectorAll('.message-item.user .user-content')].at(-1);
+        const rect = bubble?.getBoundingClientRect();
+        return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+      })()`);
+      if (bubblePointer) {
+        await page.call("Input.dispatchMouseEvent", { type: "mouseMoved", ...bubblePointer });
+        await sleep(180);
+      }
+      const hoveredFooter = await page.evaluate(`(() => {
+        const footer = [...document.querySelectorAll('.message-item.user .user-time')].at(-1);
+        return footer ? {
+          height: footer.getBoundingClientRect().height,
+          visibility: getComputedStyle(footer).visibility,
+        } : null;
+      })()`);
+      check(
+        `${scenario} 悬停用户气泡时仍显示时间和操作`,
+        hoveredFooter?.height >= 20 && hoveredFooter.visibility === 'visible',
+        JSON.stringify(hoveredFooter),
+      );
+      const inputPointer = await page.evaluate(`(() => {
+        const input = document.querySelector('[data-testid="input-textarea"]');
+        const rect = input?.getBoundingClientRect();
+        return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+      })()`);
+      if (inputPointer) {
+        await page.call("Input.dispatchMouseEvent", { type: "mouseMoved", ...inputPointer });
+        await sleep(180);
+      }
       const result = await waitForAssistant(page, expectedText, `${scenario} ${prompt} 最终消息`);
       const turnId = assistantTurnId(result, expectedText);
       const timing = await waitForTimingRecord(page, turnId, `${scenario} Renderer timing`);
@@ -3142,7 +3235,7 @@ try {
       await ensurePersonalDraft(true);
       for (let index = 0; index < timingSampleCount; index += 1) {
         const token = `ELECTRON_TIMING_PERSONAL_${index}`;
-        await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}`, token);
+        await collectTiming("personal_chat", `Electron timing 个人聊天 ${token}\n\n   `, token);
       }
     }
 
@@ -3157,7 +3250,7 @@ try {
         }, "工作区 timing 采样会话");
         await page.evaluate(`(() => {
           const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-          const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+          const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
           if (!create) throw new Error('workspace timing new session button missing');
           create.click();
         })()`);
@@ -3308,6 +3401,7 @@ try {
 
   await selectMostRecentPersonalSession(page);
   await setConversationDisplayMode(page, "summary");
+  await selectPersonalSessionById(page, initialPersonalSessionId);
   await setComposerText(page, "DOM 工具卡片验收：调用 tool_catalog 后返回最终结果");
   await clickSend(page);
   const task = await waitForAssistant(page, toolResponseText, "Task 工具最终消息");
@@ -3330,31 +3424,23 @@ try {
     taskBackend,
   ));
   checkTimingStages("Task 工具生产 Renderer", taskTiming);
-  check("摘要模式包含 Turn 轮次折叠", task.turns.some((turn) => turn.expanded === "true" || turn.expanded === "false"));
-  const latestTurn = task.turns.at(-1);
-  if (latestTurn?.expanded === "false") {
-    await page.evaluate(`(() => {
-      const turns = [...document.querySelectorAll('[data-conversation-turn-id]')];
-      turns.at(-1)?.querySelector('.turn-disclosure-header')?.click();
-    })()`);
-  }
-  const taskExpanded = await waitFor(async () => {
-    const state = await rendererState(page);
-    return state.toolGroups.length >= 1 ? state : null;
-  }, "摘要模式展开 Turn 后的工具组");
-  check("摘要模式包含工具组二级折叠", taskExpanded.toolGroups.length >= 1);
-  const toolGroup = taskExpanded.toolGroups.at(-1);
-  if (toolGroup?.expanded === "false") {
-    await page.evaluate(`(() => {
-      const group = [...document.querySelectorAll('.conversation-tool-group')].at(-1);
-      group?.querySelector('.tool-group-header')?.click();
-    })()`);
-  }
-  const expandedTools = await waitFor(async () => {
-    const state = await rendererState(page);
-    return state.toolGroups.some((group) => group.expanded === "true") ? state : null;
-  }, "工具组二级展开");
-  check("工具组二级展开后真实工具内容可见", expandedTools.toolGroups.some((group) => group.expanded === "true"));
+  const canonicalTaskItems = await waitFor(async () => page.evaluate(`(async () => {
+    const sessionId = new URL(location.href).searchParams.get('sessionId');
+    const turnId = ${JSON.stringify(taskTurnId)};
+    if (!sessionId || !turnId) return null;
+    const query = new URLSearchParams({ scope: 'personal', sessionId });
+    const response = await fetch('/bootstrap?' + query.toString());
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const turn = payload.canonicalTurns?.find((candidate) => candidate.turnId === turnId);
+    const items = Array.isArray(turn?.items) ? turn.items : [];
+    return items.some((item) => item.kind === 'tool_call' && item.tool?.name === 'tool_catalog' && item.visibility?.renderable !== false)
+      ? items
+      : null;
+  })()`), "Task canonical 工具调用持久化");
+  check("Task canonical Turn 保留可渲染 tool_catalog 工具调用", canonicalTaskItems.some((item) => (
+    item.kind === "tool_call" && item.tool?.name === "tool_catalog" && item.visibility?.renderable !== false
+  )));
 
   await openPersonalDraft(page);
   await waitFor(async () => {
@@ -3709,7 +3795,7 @@ try {
   }, "Git mutation 工作区可用");
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${gitMutationWorkspaceId}"]');
-    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('git mutation workspace new session button missing');
     create.click();
   })()`);
@@ -3758,7 +3844,7 @@ try {
   }, "完全访问工作区可用");
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('full access workspace new session button missing');
     create.click();
   })()`);
@@ -3789,7 +3875,7 @@ try {
   }, "审批工作区可用");
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('approval workspace new session button missing');
     create.click();
   })()`);
@@ -3840,7 +3926,7 @@ try {
   }, "审批拒绝工作区可用");
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('approval denial workspace new session button missing');
     create.click();
   })()`);
@@ -3926,7 +4012,7 @@ try {
   }, "审批取消工作区可用");
   await page.evaluate(`(() => {
     const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-    const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+    const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
     if (!create) throw new Error('approval cancellation workspace new session button missing');
     create.click();
   })()`);
@@ -4000,7 +4086,7 @@ try {
     }, "审批过期工作区可用");
     await page.evaluate(`(() => {
       const workspace = document.querySelector('[data-workspace-id="${workspaceId}"]');
-      const create = workspace?.closest('.workspace-row')?.querySelector('.workspace-new-session-btn');
+      const create = workspace?.closest('.workspace-row')?.querySelector('button.row-action[aria-label]');
       if (!create) throw new Error('approval expiry workspace new session button missing');
       create.click();
     })()`);

@@ -30,7 +30,12 @@ pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
 
 pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
     let server_id = mcp_server_entry_id(entry)?.to_string();
-    let mut object = entry.as_object().cloned()?;
+    let source = entry.as_object()?;
+    let mut object = source
+        .iter()
+        .filter(|(key, _)| MCP_SERVER_ENTRY_FIELDS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
 
     object.insert("id".to_string(), serde_json::json!(server_id));
     if object

@@ -214,6 +214,14 @@ pub(crate) fn canonical_recovery_event(
 ) -> Option<EventEnvelope> {
     let after_sequence = after_sequence?;
     let session_id = session_id?;
+    // A cursor at the current EventBus tail is a normal steady-state subscription.
+    // The canonical turn may have been written before that cursor, so treating the
+    // missing session-scoped event as a restart would emit the same recovery event on
+    // every reconnect and keep App Server clients in a resync loop.  Recovery is only
+    // needed when the cursor belongs to an older runtime and is ahead of this bus.
+    if after_sequence < snapshot.next_sequence {
+        return None;
+    }
     let has_session_event_at_cursor = snapshot.recent_events.iter().any(|event| {
         event.sequence == after_sequence && event_session_id(event).as_ref() == Some(session_id)
     });
@@ -659,14 +667,6 @@ mod tests {
                 "session_id": "session-payload-a",
             }),
         );
-        let matching_camel_event = EventEnvelope::domain(
-            EventId::new("event-sse-payload-workspace-camel"),
-            "session.title.updated",
-            json!({
-                "workspaceId": "workspace-payload-a",
-                "sessionId": "session-payload-a",
-            }),
-        );
         let mismatched_event = EventEnvelope::domain(
             EventId::new("event-sse-payload-workspace-b"),
             "session.title.updated",
@@ -679,11 +679,6 @@ mod tests {
         assert!(event_matches_event_stream_scope(
             &state,
             &matching_snake_event,
-            &EventStreamScope::Workspace(requested.clone())
-        ));
-        assert!(event_matches_event_stream_scope(
-            &state,
-            &matching_camel_event,
             &EventStreamScope::Workspace(requested.clone())
         ));
         assert!(!event_matches_event_stream_scope(

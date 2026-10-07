@@ -158,7 +158,7 @@ fn build_local_instruction_skill_entry(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("本地 Skill 名称不可用".to_string()))?;
     let metadata = read_skill_directory_metadata(dir)?;
-    let description = read_local_skill_description(dir);
+    let description = skill_loader::read_skill_description(dir);
     Ok(serde_json::json!({
         "name": skill_name,
         "skillId": skill_name,
@@ -174,57 +174,6 @@ fn build_local_instruction_skill_entry(
         "installedAt": epoch_ms_now(),
         "updatedAt": epoch_ms_now(),
     }))
-}
-
-fn read_local_skill_description(dir: &std::path::Path) -> String {
-    let config_path = dir.join("config.json");
-    if config_path.is_file()
-        && let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(desc) = json.get("description").and_then(|v| v.as_str())
-    {
-        let desc = desc.trim();
-        if !desc.is_empty() {
-            return desc.chars().take(200).collect();
-        }
-    }
-    for filename in &["SKILL.md", "prompt.md", "README.md"] {
-        let path = dir.join(filename);
-        if path.is_file()
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            let mut lines = content.lines();
-            let first_line = lines.next();
-            if first_line.is_some_and(|line| line.trim() == "---") {
-                for line in lines.by_ref() {
-                    let trimmed = line.trim();
-                    if trimmed == "---" {
-                        break;
-                    }
-                    if let Some(description) = trimmed.strip_prefix("description:") {
-                        let description = description
-                            .trim()
-                            .trim_matches(|ch| ch == '"' || ch == '\'');
-                        if !description.is_empty() {
-                            return description.chars().take(200).collect();
-                        }
-                    }
-                }
-            } else if let Some(line) = first_line {
-                let trimmed = line.trim().trim_start_matches('#').trim();
-                if !trimmed.is_empty() && trimmed != "---" {
-                    return trimmed.chars().take(200).collect();
-                }
-            }
-            for line in lines {
-                let trimmed = line.trim().trim_start_matches('#').trim();
-                if !trimmed.is_empty() && trimmed != "---" {
-                    return trimmed.chars().take(200).collect();
-                }
-            }
-        }
-    }
-    String::new()
 }
 
 fn scan_local_instruction_skill_entries(
@@ -506,7 +455,7 @@ fn collect_repository_skills(
             skill_id: repository.skill_id(&relative_path)?,
             name: read_skill_frontmatter_value(current_dir, "name").unwrap_or(directory_name),
             description: read_skill_frontmatter_value(current_dir, "description")
-                .unwrap_or_else(|| read_local_skill_description(current_dir)),
+                .unwrap_or_else(|| skill_loader::read_skill_description(current_dir)),
             author: read_skill_frontmatter_value(current_dir, "author"),
             version: read_skill_frontmatter_value(current_dir, "version"),
             category: read_skill_frontmatter_value(current_dir, "category"),
@@ -1914,6 +1863,11 @@ async fn install_skill(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.get("skill").is_some() || request.get("updates").is_some() {
+        return Err(ApiError::InvalidInput(
+            "安装 Skill 请求不能包裹在 skill/updates 中".to_string(),
+        ));
+    }
     let normalized_request = normalize_instruction_skill_entry(&request)?;
     let skill_id = normalized_request
         .get("skillId")
@@ -2710,21 +2664,6 @@ mod tests {
             root.join("workspaces.json"),
             root.join("knowledge.json"),
         )))
-    }
-
-    #[test]
-    fn local_skill_description_reads_yaml_frontmatter_description() {
-        let dir = tempfile::tempdir().expect("temp skill dir should create");
-        std::fs::write(
-            dir.path().join("SKILL.md"),
-            "---\nname: demo-skill\ndescription: 用于验证 Skill 快捷引用\n---\n\n# Demo\n",
-        )
-        .expect("skill markdown should write");
-
-        assert_eq!(
-            read_local_skill_description(dir.path()),
-            "用于验证 Skill 快捷引用"
-        );
     }
 
     #[test]

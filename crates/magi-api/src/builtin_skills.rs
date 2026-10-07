@@ -12,13 +12,14 @@ use std::path::Path;
 use magi_settings_store::SettingsStore;
 use serde_json::{Map, Value, json};
 
-use crate::skill_loader::{save_skills_config_object, skills_config_object};
+use crate::skill_loader::{
+    read_skill_description, save_skills_config_object, skills_config_object,
+};
 
 struct BuiltinSkill {
     id: &'static str,
     /// 说明文件有改动时递增。
     version: u32,
-    description: &'static str,
     body: &'static str,
     /// 技能的 `config.json`：声明它要用的工具。带这个声明的技能被选中时，本轮带工具执行，
     /// 并且只开放声明的这些工具。
@@ -27,8 +28,7 @@ struct BuiltinSkill {
 
 const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
     id: "magi-cloudflare-tunnel",
-    version: 2,
-    description: "协助配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变",
+    version: 3,
     body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
     config: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/config.json"),
 }];
@@ -125,13 +125,16 @@ fn upsert_entry(store: &SettingsStore, skill: &BuiltinSkill, dir: &Path) -> std:
         })
         .unwrap_or_default();
     let now = magi_core::UtcMillis::now().0;
+    // 描述从已写入的 Skill 目录解析（config.json → SKILL.md front matter），
+    // 与本地 / 仓库 Skill 同一套规则，避免内置 Skill 再维护一份描述事实源。
+    let description = read_skill_description(dir);
     let mut entry = json!({
         "name": skill.id,
         "skillId": skill.id,
         "fullName": skill.id,
         "directoryPath": dir.to_string_lossy(),
         "directoryPathRef": magi_core::HostPath::from_path(dir.to_path_buf()).to_path_ref().as_str(),
-        "description": skill.description,
+        "description": description,
         "source": "local",
         "builtin": true,
         "updatedAt": now,
@@ -187,6 +190,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["skillId"], "magi-cloudflare-tunnel");
         assert_eq!(entries[0]["enabled"], true);
+        // 展示描述来自 SKILL.md 的 front matter，而不是 Rust 常量或 config.json。
+        assert_eq!(
+            entries[0]["description"],
+            "协助用户配置 Cloudflare 命名隧道，让 Magi MCP 的公网地址固定、重启后不变。"
+        );
         assert!(is_builtin(&entries[0]));
 
         // 停用是允许的，再次启动不会改回启用。
@@ -286,6 +294,10 @@ mod tests {
         let builtin = &BUILTIN_SKILLS[0];
         let parsed: Value = serde_json::from_str(builtin.config).unwrap();
         assert!(parsed["allowed_tools"].is_array());
+        assert!(
+            parsed.get("description").is_none(),
+            "描述只保留在 SKILL.md front matter 一处"
+        );
     }
 
     #[test]
@@ -293,5 +305,17 @@ mod tests {
         let body = BUILTIN_SKILLS[0].body;
         assert!(body.contains("不要截图"));
         assert!(body.contains("绝不要替用户输入账号或密码"));
+        // 令牌页必须点名禁止会读出页面内容的工具，否则令牌会进入模型上下文。
+        assert!(body.contains("不要在这一页调用 `browser_snapshot`"));
+        assert!(body.contains("`browser_read`"));
+        assert!(body.contains("`browser_screenshot`"));
+    }
+
+    #[test]
+    fn the_skill_requires_handing_browser_control_back_after_manual_steps() {
+        let body = BUILTIN_SKILLS[0].body;
+        // 用户手动操作会暂停 Agent 的浏览器控制，说明必须引导“交还控制”并给出安全的页面确认方式。
+        assert!(body.contains("交还控制"));
+        assert!(body.contains("browser_wait_for"));
     }
 }

@@ -551,6 +551,10 @@ pub(crate) async fn submit_session_turn_internal(
     state: ApiState,
     mut request: SessionTurnRequestDto,
 ) -> Result<SessionTurnResponseDto, ApiError> {
+    request.skill_name = request
+        .skill_name
+        .as_deref()
+        .and_then(|skill_name| trimmed_non_empty(Some(skill_name)).map(str::to_string));
     validate_session_turn_input(&request)?;
     request
         .validate_context_references()
@@ -6256,7 +6260,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["route"], "chat", "只带技能的普通文本仍走普通对话路由");
+        assert_eq!(body["route"], "execute", "普通文本进入当前 task 主线");
 
         let turn = state
             .session_store
@@ -8029,15 +8033,15 @@ mod tests {
         );
         assert_eq!(first_body["queued"], false);
         assert!(
-            first_body["rootTaskId"].is_null(),
-            "普通 Conversation Turn 不应创建 TaskStore root task"
+            first_body["rootTaskId"].is_string(),
+            "普通文本当前进入 task 主线，应创建 root task"
         );
         assert!(
             state
                 .session_store
                 .active_execution_chain(&session_id)
-                .is_none(),
-            "普通 Conversation Turn 不应创建 execution chain"
+                .is_some(),
+            "task 主线应持久化 execution chain"
         );
 
         for (request_id, user_message_id, text) in [
@@ -8109,12 +8113,14 @@ mod tests {
                     .any(|item| { item.item_id == "user-queue-interrupt-a" })),
             "停止后必须按 FIFO 启动队首消息"
         );
-        assert!(
-            state
-                .session_store
-                .active_execution_chain(&session_id)
-                .is_none(),
-            "队首 Conversation Turn 也不应创建 TaskRun"
+        let active_chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("队首消息现在通过 task 主线运行，应建立活动 execution chain");
+        assert_eq!(
+            active_chain.dispatch_context.trimmed_text.as_deref(),
+            Some("停止后第一条发送"),
+            "中断后应启动 FIFO 队首消息，而不是尾部或旧消息"
         );
     }
 
@@ -9097,7 +9103,7 @@ mod tests {
         assert!(task.is_goal_mode());
         assert_eq!(
             task.required_tool_chain(),
-            ["get_goal", "create_goal", "update_plan", "shell_exec"]
+            ["get_goal", "create_goal", "update_plan"]
         );
     }
 

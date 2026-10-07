@@ -29,6 +29,60 @@ pub fn read_available_skill_instruction(dir_path: &Path) -> Option<String> {
     None
 }
 
+/// 读取 Skill 的展示描述：优先 `config.json` 的 `description`，否则读取说明文件 YAML front matter
+/// 的 `description`，最后退回到第一个标题行。内置 Skill 与本地 / 仓库 Skill 共用这一处实现，
+/// 同一份 Skill 只保留一个描述事实源。
+pub fn read_skill_description(dir: &Path) -> String {
+    let config_path = dir.join("config.json");
+    if config_path.is_file()
+        && let Ok(content) = fs::read_to_string(&config_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(desc) = json.get("description").and_then(|v| v.as_str())
+    {
+        let desc = desc.trim();
+        if !desc.is_empty() {
+            return desc.chars().take(200).collect();
+        }
+    }
+    for filename in &["SKILL.md", "prompt.md", "README.md"] {
+        let path = dir.join(filename);
+        if path.is_file()
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            let mut lines = content.lines();
+            let first_line = lines.next();
+            if first_line.is_some_and(|line| line.trim() == "---") {
+                for line in lines.by_ref() {
+                    let trimmed = line.trim();
+                    if trimmed == "---" {
+                        break;
+                    }
+                    if let Some(description) = trimmed.strip_prefix("description:") {
+                        let description = description
+                            .trim()
+                            .trim_matches(|ch| ch == '"' || ch == '\'');
+                        if !description.is_empty() {
+                            return description.chars().take(200).collect();
+                        }
+                    }
+                }
+            } else if let Some(line) = first_line {
+                let trimmed = line.trim().trim_start_matches('#').trim();
+                if !trimmed.is_empty() && trimmed != "---" {
+                    return trimmed.chars().take(200).collect();
+                }
+            }
+            for line in lines {
+                let trimmed = line.trim().trim_start_matches('#').trim();
+                if !trimmed.is_empty() && trimmed != "---" {
+                    return trimmed.chars().take(200).collect();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 pub fn instruction_skill_source_available(skill: &Value) -> bool {
     let Some(dir_path) = instruction_skill_directory_path(skill) else {
         return false;
@@ -340,6 +394,29 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), skill_body)
             .expect("skill markdown should be written");
         skill_dir
+    }
+
+    #[test]
+    fn skill_description_comes_from_frontmatter_unless_config_json_overrides_it() {
+        let frontmatter_dir = make_local_skill_dir(
+            "description-frontmatter",
+            "---\nname: demo-skill\ndescription: 用于验证 Skill 快捷引用\n---\n\n# Demo\n",
+        );
+        assert_eq!(
+            read_skill_description(&frontmatter_dir),
+            "用于验证 Skill 快捷引用"
+        );
+
+        let config_dir = make_local_skill_dir("description-config", "# Demo\n");
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"description": "来自 config.json"}"#,
+        )
+        .expect("skill config should write");
+        assert_eq!(read_skill_description(&config_dir), "来自 config.json");
+
+        std::fs::remove_dir_all(&frontmatter_dir).expect("skill dir should be removed");
+        std::fs::remove_dir_all(&config_dir).expect("skill dir should be removed");
     }
 
     #[test]

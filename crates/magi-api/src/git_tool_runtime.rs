@@ -201,7 +201,7 @@ fn execute_agent_apply(
     }
     // 改动已经进入主线工作树，代理分支不再需要；删除失败只影响分支整洁度。
     let branch_deleted = worktree.branch.as_ref().is_some_and(|branch| {
-        block_on(deps.git_service.branch_delete(
+        block_on(deps.git_service.branch_delete_after_revision_apply(
             &binding.path,
             magi_git::BranchDeleteOptions {
                 branch: branch.clone(),

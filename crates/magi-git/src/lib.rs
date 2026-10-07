@@ -1345,9 +1345,31 @@ impl GitService {
         path: &Path,
         options: BranchDeleteOptions,
     ) -> Result<GitObservation, GitError> {
+        self.branch_delete_internal(path, options, true).await
+    }
+
+    /// 删除已经应用到主工作树的代理分支。应用后的工作树通常有未提交改动，
+    /// 因此这里只跳过 clean-worktree 检查，保留仓库身份、HEAD、当前分支及
+    /// worktree 占用校验；删除分支引用本身不会改动主工作树文件。
+    pub async fn branch_delete_after_revision_apply(
+        &self,
+        path: &Path,
+        options: BranchDeleteOptions,
+    ) -> Result<GitObservation, GitError> {
+        self.branch_delete_internal(path, options, false).await
+    }
+
+    async fn branch_delete_internal(
+        &self,
+        path: &Path,
+        options: BranchDeleteOptions,
+        require_clean_worktree: bool,
+    ) -> Result<GitObservation, GitError> {
         let (_guard, observation) = self.lock_and_observe(path).await?;
         enforce_precondition(&observation, &options.precondition)?;
-        require_clean(&observation, "删除分支")?;
+        if require_clean_worktree {
+            require_clean(&observation, "删除分支")?;
+        }
         validate_branch_name(&observation.worktree_path, &options.branch).await?;
         if let Some(remote) = options.remote.as_deref() {
             if !options.confirm_remote {

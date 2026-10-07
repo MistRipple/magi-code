@@ -280,7 +280,7 @@ mod tests {
         let target = managed_binary_path(dir.path());
         extract_binary_from_zip(&bytes, &target).unwrap();
         assert!(is_installed(&target));
-        let output = std::process::Command::new(&target)
+        let output = magi_process::std_command(&target)
             .arg("--version")
             .output()
             .unwrap();

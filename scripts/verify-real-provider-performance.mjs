@@ -489,8 +489,13 @@ async function submitTurn({ scenario, scope = "personal", workspaceId = null, wo
     accessProfile,
     requestId,
     userMessageId: `user-${requestId}`,
-    orchestratorSessionConfig: { model: providerModel, reasoningEffort },
   };
+  // Session model selection is immutable through /api/session/turn after the first
+  // canonical user item. Reused-session scenarios must keep the model chosen by
+  // their seed turn instead of resubmitting an override on every request.
+  if (!sessionId) {
+    request.orchestratorSessionConfig = { model: providerModel, reasoningEffort };
+  }
   const startedAt = now();
   let accepted = null;
   let acceptedAt = null;
@@ -1000,7 +1005,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack || error.message : error);
-  process.exitCode = 1;
-});
+// Node's fetch/undici pool may keep idle sockets after the daemon and provider
+// have been stopped. The evidence and cleanup work is complete at this point,
+// so terminate explicitly instead of leaving a finished verification hanging.
+main().then(
+  () => process.exit(0),
+  (error) => {
+    console.error(error instanceof Error ? error.stack || error.message : error);
+    process.exit(1);
+  },
+);
