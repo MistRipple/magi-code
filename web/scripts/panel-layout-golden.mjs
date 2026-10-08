@@ -397,7 +397,7 @@ assert.match(
 );
 assert.match(
   shellUiSource,
-  /export type ShellPopover = 'notifications' \| 'lan';[\s\S]*?installShellPopoverDismiss/,
+  /export type ShellPopover = 'notifications' \| 'lan' \| 'language';[\s\S]*?installShellPopoverDismiss/,
   '弹出面板必须共用同一份互斥状态与关闭规则',
 );
 assert.match(

@@ -96,12 +96,14 @@ assert.doesNotMatch(settingsAppearance, /\.(primary-button|secondary-button|icon
 assert.match(modelConfigForm, /ui-segmented url-mode-switch/, '模型 URL 模式必须复用全局分段控件');
 assert.match(settingsPanel, /ui-segmented mcp-transport-switch/, 'MCP 传输模式必须复用全局分段控件');
 assert.match(settingsPanel, /class="form-input"[\s\S]*?class="form-textarea"/, '设置弹窗必须显式复用全局表单控件');
-assert.match(settingsRules, /form-textarea user-rules-textarea[\s\S]*?form-input safeguard-add-input/, '规则设置必须复用全局输入和文本域');
+const settingsSafeguard = await readFile(new URL('../src/components/SettingsSafeguardTab.svelte', import.meta.url), 'utf8');
+assert.match(settingsRules, /form-textarea user-rules-textarea/, '规则设置必须复用全局文本域');
+assert.match(settingsSafeguard, /form-input safeguard-add-input/, '安全设置必须复用全局输入');
 assert.match(settingsTools, /btn btn--primary btn--sm[\s\S]*?btn-icon btn-icon--sm/, '工具设置必须复用全局按钮和图标按钮');
 assert.match(webFolderPicker, /btn btn--secondary btn--sm[\s\S]*?btn btn--primary btn--sm/, '文件夹选择器必须复用全局按钮');
 assert.match(workbenchShell, /btn btn--secondary[\s\S]*?btn btn--danger/, '工作区确认弹窗必须复用全局按钮');
 assert.doesNotMatch(
-  [settingsPanel, settingsAppearance, modelConfigForm, settingsRules, settingsTools, webFolderPicker, workbenchShell, settingsCss].join('\n'),
+  [settingsPanel, settingsAppearance, modelConfigForm, settingsRules, settingsSafeguard, settingsTools, webFolderPicker, workbenchShell, settingsCss].join('\n'),
   /apple-action-btn|(?<!header-)settings-btn|modal-btn|llm-config-input|llm-config-select|profile-textarea|btn-icon--error/,
   '设置与弹窗不得保留旧基础控件的双实现',
 );
