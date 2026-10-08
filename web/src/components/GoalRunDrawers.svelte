@@ -47,6 +47,8 @@
   let goalNoteExpanded = $state(false);
   let goalNoteOverflows = $state(false);
   let goalEvidenceExpanded = $state(false);
+  let goalEditEl = $state<HTMLTextAreaElement | null>(null);
+  let editingGoalId = '';
   let goalClockObservedAt = $state(Date.now());
 
   $effect(() => {
@@ -82,6 +84,33 @@
     Array.isArray(currentPlan?.items) ? currentPlan.items : []
   );
   const goalNote = $derived(currentGoal ? goalNoteOf(currentGoal) : null);
+  const GOAL_OBJECTIVE_MAX_CHARS = 4000;
+  const goalDraftChanged = $derived(
+    !!currentGoal && goalObjectiveDraft.trim() !== currentGoal.objective.trim(),
+  );
+  const goalDraftSavable = $derived(goalDraftChanged && goalObjectiveDraft.trim().length > 0);
+
+  // 编辑框随内容增高（有上限，超出后内部滚动）；进入编辑时聚焦并把光标放到末尾。
+  $effect(() => {
+    const el = goalEditEl;
+    if (!el) return;
+    void goalObjectiveDraft;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  });
+  $effect(() => {
+    const el = goalEditEl;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  });
+  // 目标被清除、换成别的目标、或不再允许编辑时，退出编辑态，避免把旧草稿提交到别的目标上。
+  $effect(() => {
+    if (!isEditingGoal) return;
+    if (!currentGoal || currentGoal.goalId !== editingGoalId || !goalCanEdit(currentGoal)) {
+      isEditingGoal = false;
+    }
+  });
   const goalBudgetPct = $derived(
     currentGoal ? goalBudgetPercent(currentGoal.tokensUsed, currentGoal.tokenBudget) : null,
   );
@@ -443,7 +472,12 @@
 
   function startEditGoal(): void {
     if (!currentGoal || !goalCanEdit(currentGoal)) return;
+    if (isEditingGoal) {
+      goalEditEl?.focus();
+      return;
+    }
     goalObjectiveDraft = currentGoal.objective;
+    editingGoalId = currentGoal.goalId;
     isEditingGoal = true;
     goalDrawerExpanded = true;
   }
@@ -453,9 +487,29 @@
     isEditingGoal = false;
   }
 
+  /** Enter 保存、Shift+Enter 换行、Esc 取消；输入法组词期间的回车不触发。 */
+  function handleGoalEditKeydown(event: KeyboardEvent): void {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (goalActionLoading === null) cancelEditGoal();
+      return;
+    }
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void saveGoalObjective();
+    }
+  }
+
   async function saveGoalObjective(): Promise<void> {
     const objective = goalObjectiveDraft.trim();
     if (!currentGoal || !goalCanEdit(currentGoal) || !objective) return;
+    // 没改动就直接退出编辑，不产生一次无意义的目标修订。
+    if (!goalDraftChanged) {
+      cancelEditGoal();
+      return;
+    }
     await runGoalAction('save', async () => {
       await createClient().updateCurrentGoal({
         ...goalActionRequest(),
@@ -646,6 +700,8 @@
             <button
               type="button"
               class="icon-action dock-icon-btn"
+              class:active={isEditingGoal}
+              aria-pressed={isEditingGoal}
               disabled={goalActionLoading !== null}
               onclick={startEditGoal}
               title={i18n.t('goalPanel.action.editGoalTitle')}
@@ -690,103 +746,119 @@
         </div>
       </div>
       {#if goalDrawerExpanded}
-        {#if isEditingGoal}
-          <form class="goal-edit-form" onsubmit={(event) => { event.preventDefault(); void saveGoalObjective(); }}>
-            <input
-              class="goal-edit-input"
-              bind:value={goalObjectiveDraft}
-              maxlength="4000"
-              aria-label={i18n.t('goalPanel.action.editGoalTitle')}
-            />
-            <button
-              type="submit"
-              class="goal-edit-button"
-              disabled={goalActionLoading !== null || !goalObjectiveDraft.trim()}
-            >
-              {goalActionLoading === 'save' ? i18n.t('common.loading') : i18n.t('common.save')}
-            </button>
-            <button
-              type="button"
-              class="goal-edit-button goal-edit-button--ghost"
-              disabled={goalActionLoading !== null}
-              onclick={cancelEditGoal}
-            >
-              {i18n.t('common.cancel')}
-            </button>
-          </form>
-        {:else}
-          <div class="goal-detail">
-            <p class="goal-detail-objective-text">{currentGoal.objective}</p>
-            {#if goalNote}
-              <div class="goal-note goal-note--{currentGoal.status}">
-                <p
-                  class="goal-note-text"
-                  class:clamped={goalNote.collapsible && !goalNoteExpanded}
-                  bind:this={goalNoteEl}
-                >{goalNote.text}</p>
-                {#if goalNote.collapsible && (goalNoteOverflows || goalNoteExpanded)}
-                  <button type="button" class="goal-note-toggle" onclick={() => goalNoteExpanded = !goalNoteExpanded}>
-                    {goalNoteExpanded ? i18n.t('goalPanel.note.collapse') : i18n.t('goalPanel.note.expand')}
-                  </button>
-                {/if}
-                {#if goalNote.meta}
-                  <span class="goal-note-meta">{goalNote.meta}</span>
-                {/if}
-                {#if goalNote.evidence.length > 0}
+        <div class="goal-detail">
+          {#if isEditingGoal}
+            <form class="goal-edit-form" onsubmit={(event) => { event.preventDefault(); void saveGoalObjective(); }}>
+              <textarea
+                class="goal-edit-input"
+                bind:this={goalEditEl}
+                bind:value={goalObjectiveDraft}
+                maxlength={GOAL_OBJECTIVE_MAX_CHARS}
+                rows="2"
+                readonly={goalActionLoading === 'save'}
+                placeholder={i18n.t('goalPanel.edit.placeholder')}
+                aria-label={i18n.t('goalPanel.action.editGoalTitle')}
+                onkeydown={handleGoalEditKeydown}
+              ></textarea>
+              <div class="goal-edit-footer">
+                <span class="goal-edit-hint">
+                  {i18n.t('goalPanel.edit.hint')}
+                  {#if goalObjectiveDraft.length >= GOAL_OBJECTIVE_MAX_CHARS * 0.9}
+                    · {i18n.t('goalPanel.edit.counter', { count: goalObjectiveDraft.length, max: GOAL_OBJECTIVE_MAX_CHARS })}
+                  {/if}
+                </span>
+                <span class="goal-edit-buttons">
                   <button
                     type="button"
-                    class="goal-note-toggle"
-                    aria-expanded={goalEvidenceExpanded}
-                    onclick={() => goalEvidenceExpanded = !goalEvidenceExpanded}
+                    class="goal-edit-button goal-edit-button--ghost"
+                    disabled={goalActionLoading !== null}
+                    onclick={cancelEditGoal}
                   >
-                    {i18n.t('goalPanel.note.evidenceCount', { count: goalNote.evidence.length })}
+                    {i18n.t('common.cancel')}
                   </button>
-                  {#if goalEvidenceExpanded}
-                    <ul class="goal-evidence-list">
-                      {#each goalNote.evidence as ref (ref)}
-                        <li>{ref}</li>
-                      {/each}
-                    </ul>
-                  {/if}
-                {/if}
+                  <button
+                    type="submit"
+                    class="goal-edit-button"
+                    disabled={goalActionLoading !== null || !goalDraftSavable}
+                  >
+                    {goalActionLoading === 'save' ? i18n.t('common.loading') : i18n.t('common.save')}
+                  </button>
+                </span>
               </div>
-            {/if}
-            {#if currentGoal.status === 'budget_limited'}
-              <label class="goal-budget-resume-field">
-                <span>{i18n.t('goalPanel.goal.newBudget')}</span>
-                <input
-                  type="number"
-                  min={currentGoal.tokensUsed + 1}
-                  step="1"
-                  bind:value={goalBudgetDraft}
-                />
-              </label>
-            {/if}
-            <div class="goal-metrics">
-              <span class="goal-metric">
-                <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
-                <strong>{goalTimeLabel(currentGoalTimeSeconds)}</strong>
-              </span>
-              <span class="goal-metric">
-                <span class="goal-detail-label">{i18n.t('goalPanel.goal.budget')}</span>
-                <strong>{goalBudgetLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
-                {#if goalBudgetPct !== null}
-                  <span
-                    class="goal-budget-bar"
-                    class:warn={goalBudgetPct >= 90}
-                    role="progressbar"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    aria-valuenow={goalBudgetPct}
-                  ><span style="width: {goalBudgetPct}%"></span></span>
+            </form>
+          {:else}
+            <p class="goal-detail-objective-text">{currentGoal.objective}</p>
+          {/if}
+          {#if goalNote}
+            <div class="goal-note goal-note--{currentGoal.status}">
+              <p
+                class="goal-note-text"
+                class:clamped={goalNote.collapsible && !goalNoteExpanded}
+                bind:this={goalNoteEl}
+              >{goalNote.text}</p>
+              {#if goalNote.collapsible && (goalNoteOverflows || goalNoteExpanded)}
+                <button type="button" class="goal-note-toggle" onclick={() => goalNoteExpanded = !goalNoteExpanded}>
+                  {goalNoteExpanded ? i18n.t('goalPanel.note.collapse') : i18n.t('goalPanel.note.expand')}
+                </button>
+              {/if}
+              {#if goalNote.meta}
+                <span class="goal-note-meta">{goalNote.meta}</span>
+              {/if}
+              {#if goalNote.evidence.length > 0}
+                <button
+                  type="button"
+                  class="goal-note-toggle"
+                  aria-expanded={goalEvidenceExpanded}
+                  onclick={() => goalEvidenceExpanded = !goalEvidenceExpanded}
+                >
+                  {i18n.t('goalPanel.note.evidenceCount', { count: goalNote.evidence.length })}
+                </button>
+                {#if goalEvidenceExpanded}
+                  <ul class="goal-evidence-list">
+                    {#each goalNote.evidence as ref (ref)}
+                      <li>{ref}</li>
+                    {/each}
+                  </ul>
                 {/if}
-              </span>
+              {/if}
             </div>
-            <span class="goal-created-at">
-              {i18n.t('goalPanel.goal.createdAt')} {formatGoalDateTime(currentGoal.createdAt)}
+          {/if}
+          {#if currentGoal.status === 'budget_limited'}
+            <label class="goal-budget-resume-field">
+              <span>{i18n.t('goalPanel.goal.newBudget')}</span>
+              <input
+                type="number"
+                min={currentGoal.tokensUsed + 1}
+                step="1"
+                bind:value={goalBudgetDraft}
+              />
+            </label>
+          {/if}
+          <div class="goal-metrics">
+            <span class="goal-metric">
+              <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
+              <strong>{goalTimeLabel(currentGoalTimeSeconds)}</strong>
+            </span>
+            <span class="goal-metric">
+              <span class="goal-detail-label">{i18n.t('goalPanel.goal.createdAt')}</span>
+              <strong>{formatGoalDateTime(currentGoal.createdAt)}</strong>
+            </span>
+            <span class="goal-metric goal-metric--budget">
+              <span class="goal-detail-label">{i18n.t('goalPanel.goal.budget')}</span>
+              <strong>{goalBudgetLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
+              {#if goalBudgetPct !== null}
+                <span
+                  class="goal-budget-bar"
+                  class:warn={goalBudgetPct >= 90}
+                  role="progressbar"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={goalBudgetPct}
+                ><span style="width: {goalBudgetPct}%"></span></span>
+              {/if}
             </span>
           </div>
-        {/if}
+        </div>
       {/if}
     </section>
   {/if}
@@ -811,7 +883,6 @@
   .goal-panel {
     --goal-tone: var(--primary);
     order: 3;
-    border-left: 2px solid var(--goal-tone);
   }
 
   .goal-panel--paused {
@@ -970,10 +1041,10 @@
 
 
   .goal-edit-form {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    display: flex;
+    flex-direction: column;
     gap: var(--space-2);
-    padding: 2px 0 1px 32px;
+    min-width: 0;
   }
 
   .goal-detail {
@@ -981,7 +1052,10 @@
     flex-direction: column;
     gap: 8px;
     max-height: min(36vh, 320px);
-    padding: 3px 0 1px 32px;
+    /* 全局滚动条宽 5px：始终预留这 5px 并让它落在卡片内边距里，
+       无论是否出现滚动条，内容左右留白都对称。 */
+    margin-right: -5px;
+    padding: 3px 0 1px;
     min-width: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -1012,8 +1086,7 @@
     gap: 4px;
     min-width: 0;
     padding: 6px 10px;
-    border-left: 2px solid var(--goal-tone);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--goal-tone) 7%, transparent);
   }
 
@@ -1071,7 +1144,7 @@
 
   .goal-metrics {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: auto auto minmax(0, 1fr);
     min-width: 0;
     border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
@@ -1082,16 +1155,17 @@
     flex-direction: column;
     gap: 3px;
     min-width: 0;
-    padding: 7px 10px;
+    padding: 7px 14px;
+    border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .goal-metric:first-child {
     padding-left: 0;
-    border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .goal-metric:last-child {
     padding-right: 0;
+    border-right: 0;
   }
 
   .goal-metric strong {
@@ -1125,21 +1199,52 @@
     background: var(--warning);
   }
 
-  .goal-created-at {
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-  }
-
   .goal-edit-input {
+    box-sizing: border-box;
+    width: 100%;
     min-width: 0;
-    height: 30px;
-    padding: 0 var(--space-2);
+    min-height: 56px;
+    max-height: 160px;
+    padding: 6px var(--space-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--background);
     color: var(--foreground);
     font: inherit;
-    font-size: var(--text-xs);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    resize: none;
+    overflow-y: auto;
+  }
+
+  .goal-edit-input[readonly] {
+    opacity: 0.7;
+  }
+
+  .goal-edit-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .goal-edit-hint {
+    min-width: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    line-height: 1.4;
+  }
+
+  .goal-edit-buttons {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: var(--space-2);
+  }
+
+  .icon-action.active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    color: var(--primary);
   }
 
   .goal-edit-input:focus {
@@ -1148,7 +1253,7 @@
   }
 
   .goal-edit-button {
-    height: 30px;
+    height: 26px;
     padding: 0 var(--space-3);
     border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
     border-radius: var(--radius-sm);
@@ -1343,27 +1448,20 @@
       height: 28px;
     }
 
-    .goal-edit-form {
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      padding-left: 0;
-    }
-
-    .goal-detail {
-      padding-left: 0;
-    }
-
+    /* 窄屏：执行时间与创建时间并排一行，Token 用量独占下一行（进度条随之拉满）。 */
     .goal-metrics {
-      grid-template-columns: minmax(0, 1fr);
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .goal-metric:first-child {
+    .goal-metric:nth-child(2) {
       padding-right: 0;
       border-right: 0;
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     }
 
-    .goal-metric:last-child {
+    .goal-metric--budget {
+      grid-column: 1 / -1;
       padding-left: 0;
+      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     }
   }
 </style>
