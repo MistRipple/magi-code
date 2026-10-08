@@ -14,9 +14,9 @@ use crate::{
         session_web_conversation_binding,
     },
     prompt_utils::{
-        CURRENT_TASK_PRIORITY_NOTE, REFERENCE_CONTEXT_PRIORITY_NOTE, SKILL_PROMPT_PRIORITY_NOTE,
+        CURRENT_TASK_PRIORITY_NOTE, PromptFragmentKind, REFERENCE_CONTEXT_PRIORITY_NOTE,
         compose_developer_instructions, render_safeguard_prompt, root_multi_agent_mode_prompt,
-        subagent_multi_agent_mode_prompt, user_rules_from_settings,
+        runtime_context_message, subagent_multi_agent_mode_prompt, user_rules_from_settings,
     },
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
@@ -1962,33 +1962,26 @@ impl LlmTaskDispatcher {
         task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
-    ) -> (String, Option<ExecutionContextSummary>) {
+    ) -> (
+        String,
+        Vec<magi_bridge_client::ChatMessage>,
+        Option<ExecutionContextSummary>,
+    ) {
         let base_prompt = if task.goal.is_empty() {
             task.title.clone()
         } else {
             format!("{}\n\n{}", task.title, task.goal)
         };
-        let task_fact_context_parts = self.task_fact_context_parts(task);
-
-        let Some(ref ctx_runtime) = self.context_runtime else {
-            if task_fact_context_parts.is_empty() {
-                return (base_prompt, None);
-            }
-            let ctx_text = task_fact_context_parts.join("\n");
-            return (
-                format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
-                None,
-            );
-        };
-
-        let Some(ws_id) = workspace_id.clone() else {
-            let ctx_text = task_fact_context_parts.join("\n");
-            let prompt = if ctx_text.is_empty() {
-                base_prompt
-            } else {
-                format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}")
-            };
-            return (prompt, None);
+        let mut context_messages = Vec::new();
+        let task_facts = self.task_fact_context_parts(task);
+        if !task_facts.is_empty() {
+            context_messages.push(runtime_context_message(
+                PromptFragmentKind::TaskContext,
+                task_facts.join("\n"),
+            ));
+        }
+        let (Some(ctx_runtime), Some(ws_id)) = (&self.context_runtime, workspace_id.clone()) else {
+            return (base_prompt, context_messages, None);
         };
         let knowledge_selection = ctx_runtime.select_knowledge_on_demand(KnowledgeContextRequest {
             consumer: KnowledgeConsumer::TaskExecution,
@@ -2032,13 +2025,6 @@ impl LlmTaskDispatcher {
             },
             budget: context_budget,
         });
-        let has_context = !result.selected_recent_turns.is_empty()
-            || knowledge_context_prompt.is_some()
-            || !result.selected_memory.is_empty()
-            || !result.selected_shared_context.is_empty()
-            || !result.selected_file_summaries.is_empty()
-            || !task_fact_context_parts.is_empty();
-
         let mut context_summary = ExecutionContextSummary::from_context_assembly(&result);
         context_summary.used_knowledge = knowledge_selection.results.len();
         context_summary.knowledge_ids = knowledge_selection
@@ -2061,19 +2047,7 @@ impl LlmTaskDispatcher {
             context_summary.truncation_count = context_summary.truncation_parts.len();
         }
 
-        if !has_context {
-            return (base_prompt, Some(context_summary));
-        }
         let mut ctx_parts: Vec<String> = Vec::new();
-        let has_reference_context = !result.selected_recent_turns.is_empty()
-            || knowledge_context_prompt.is_some()
-            || !result.selected_memory.is_empty()
-            || !result.selected_shared_context.is_empty()
-            || !result.selected_file_summaries.is_empty();
-        ctx_parts.extend(task_fact_context_parts);
-        if has_reference_context {
-            ctx_parts.push(REFERENCE_CONTEXT_PRIORITY_NOTE.to_string());
-        }
         for item in &result.selected_recent_turns {
             ctx_parts.push(format!(
                 "[reference:recent-turn:{}] {}",
@@ -2099,11 +2073,14 @@ impl LlmTaskDispatcher {
                 item.absolute_path, item.summary
             ));
         }
-        let ctx_text = ctx_parts.join("\n");
-        (
-            format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
-            Some(context_summary),
-        )
+        if !ctx_parts.is_empty() {
+            ctx_parts.insert(0, REFERENCE_CONTEXT_PRIORITY_NOTE.to_string());
+            context_messages.push(runtime_context_message(
+                PromptFragmentKind::ContextReferences,
+                ctx_parts.join("\n"),
+            ));
+        }
+        (base_prompt, context_messages, Some(context_summary))
     }
 
     fn resolve_user_rules_prompt(
@@ -2256,21 +2233,6 @@ impl LlmTaskDispatcher {
             &thread_id,
         )?
         .ok_or_else(|| "model bridge client 未配置".to_string())
-    }
-
-    fn skill_prompt_instructions(&self, skill_name: Option<&str>) -> Option<String> {
-        let skill_id = skill_name?;
-        let skill_rt = self.skill_runtime.as_ref()?;
-        let plan = skill_rt.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
-            skill_ids: vec![skill_id.to_string()],
-            requested_tools: vec![],
-        });
-        let rendered = plan
-            .prompt_injections
-            .iter()
-            .map(format_skill_prompt_injection)
-            .collect::<Vec<_>>();
-        (!rendered.is_empty()).then(|| rendered.join("\n\n"))
     }
 
     #[cfg(test)]
@@ -2460,15 +2422,13 @@ impl LlmTaskDispatcher {
         };
 
         let skill_name = self.resolve_registered_skill_id(skill_name.as_deref());
-        let (prompt, context_summary) =
+        let (prompt, task_context_messages, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let developer_prompt = compose_developer_instructions(
             system_prompt.as_deref(),
             self.resolve_user_rules_prompt(execution_settings)
                 .as_deref(),
             self.resolve_safeguard_prompt(execution_settings).as_deref(),
-            self.skill_prompt_instructions(skill_name.as_deref())
-                .as_deref(),
         );
         let workspace_identity_root_path = workspace_id
             .as_ref()
@@ -2560,6 +2520,7 @@ impl LlmTaskDispatcher {
             session_id,
             workspace_id,
             prompt,
+            task_context_messages,
             images,
             tools,
             usage_binding,
@@ -2744,13 +2705,6 @@ impl LearningExtractionFailure {
 /// 估算 token 数超过该阈值才会触发新一轮辅助模型调用。
 const SESSION_MEMORY_WATERLINE_TOKENS: u64 = 3_000;
 const SESSION_MEMORY_SOURCE_PREFIX: &str = "session-memory://";
-
-fn format_skill_prompt_injection(injection: &magi_skill_runtime::SkillPromptInjection) -> String {
-    format!(
-        "--- Skill: {} ---\n{}\n{}",
-        injection.heading, SKILL_PROMPT_PRIORITY_NOTE, injection.body
-    )
-}
 
 fn estimate_session_memory_tokens(text: &str) -> u64 {
     estimate_text_tokens(text) as u64
@@ -4153,23 +4107,34 @@ mod tests {
             accesses: Vec::new(),
         };
 
-        let (prompt, summary) =
+        let (prompt, context_messages, summary) =
             dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id.clone()));
+        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        let context = context_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(prompt.contains("[agent-context-package]"));
-        assert!(prompt.contains("只检查当前任务包"));
-        assert!(!prompt.contains("prior session fact for runtime context"));
-        assert!(prompt.contains("Important file summary from current workspace"));
-        assert!(prompt.contains("--- Task ---"));
+        assert!(context.contains("[agent-context-package]"));
+        assert!(context.contains("只检查当前任务包"));
+        assert!(!context.contains("prior session fact for runtime context"));
+        assert!(context.contains("Important file summary from current workspace"));
         let summary = summary.expect("context summary");
         assert_eq!(summary.used_turns, 0);
         assert_eq!(summary.used_file_summaries, 1);
 
         std::fs::write(&file_path, "Externally changed content.")
             .expect("change projected file fact");
-        let (prompt, summary) =
+        let (prompt, context_messages, summary) =
             dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
-        assert!(!prompt.contains("Important file summary from current workspace"));
+        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        let context = context_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!context.contains("Important file summary from current workspace"));
         assert_eq!(summary.expect("context summary").used_file_summaries, 0);
     }
 
@@ -4202,10 +4167,17 @@ mod tests {
             });
         let task = task_with_role("executor", TaskTier::ExecutionChain);
 
-        let (prompt, summary) = dispatcher.assemble_prompt(None, &task, &session_id, &None);
+        let (prompt, context_messages, summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &None);
+        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        let context = context_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(
-            !prompt.contains("Default workspace note"),
+            !context.contains("Default workspace note"),
             "缺少 workspace 时不得伪造 default workspace 并注入知识库内容"
         );
         assert!(summary.is_none());
@@ -4243,10 +4215,16 @@ mod tests {
         task.title = "读取 README 文件".to_string();
         task.goal = "读取 README 文件".to_string();
 
-        let (prompt, summary) =
+        let (prompt, context_messages, summary) =
             dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        let context = context_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(!prompt.contains("读取 README 文件时使用 file_read"));
+        assert!(!context.contains("读取 README 文件时使用 file_read"));
         assert_eq!(summary.expect("context summary").used_knowledge, 0);
         let events = dispatcher.event_bus.snapshot().recent_events;
         let diagnostic = events
@@ -4294,11 +4272,17 @@ mod tests {
         task.title = "分析运行态架构决策".to_string();
         task.goal = "说明为什么运行态采用单一事实源架构".to_string();
 
-        let (prompt, summary) =
+        let (prompt, context_messages, summary) =
             dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+        assert_eq!(prompt, format!("{}\n\n{}", task.title, task.goal));
+        let context = context_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(prompt.contains("[reference:knowledge:adr]"));
-        assert!(prompt.contains("最终约束是禁止多个状态源互相覆盖"));
+        assert!(context.contains("[reference:knowledge:adr]"));
+        assert!(context.contains("最终约束是禁止多个状态源互相覆盖"));
         let summary = summary.expect("context summary");
         assert_eq!(summary.used_knowledge, 1);
         assert_eq!(summary.knowledge_ids, vec!["adr-single-source".to_string()]);
@@ -4317,24 +4301,6 @@ mod tests {
             serde_json::json!(["adr"])
         );
         assert!(diagnostic.payload.get("content").is_none());
-    }
-
-    #[test]
-    fn skill_prompt_injection_marks_priority_boundary() {
-        let injection = magi_skill_runtime::SkillPromptInjection {
-            skill_id: "cn-engineering-standard".to_string(),
-            heading: "中文工程规范".to_string(),
-            body: "严格执行工程闭环。".to_string(),
-            priority: 50,
-        };
-
-        let rendered = format_skill_prompt_injection(&injection);
-
-        assert!(rendered.contains("--- Skill: 中文工程规范 ---"));
-        assert!(rendered.contains("只补充执行方式"));
-        assert!(rendered.contains("不能改变当前任务目标"));
-        assert!(rendered.contains("不能单独授权"));
-        assert!(rendered.ends_with("严格执行工程闭环。"));
     }
 
     #[test]
@@ -4502,8 +4468,13 @@ mod tests {
         let workspace_id = None;
 
         let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
-        let (coordinator_prompt, _) =
+        let (_, coordinator_context, _) =
             dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
+        let coordinator_prompt = coordinator_context
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             coordinator_prompt.contains("多代理协作（root coordinator 必须遵守）"),
             "root coordinator prompt 必须包含多代理协作规则: {coordinator_prompt}"
@@ -4520,8 +4491,13 @@ mod tests {
         );
 
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
-        let (worker_prompt, _) =
+        let (_, worker_context, _) =
             dispatcher.assemble_prompt(None, &worker_task, &session_id, &workspace_id);
+        let worker_prompt = worker_context
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             worker_prompt.contains("子代理模式（当前模式：worker；worker 必须遵守）")
                 && worker_prompt.contains("不要继续创建代理"),

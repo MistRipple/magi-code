@@ -972,6 +972,7 @@ mod tests {
         let mut messages: Vec<magi_bridge_client::ChatMessage> = history
             .into_iter()
             .map(|(role, text)| magi_bridge_client::ChatMessage {
+                context_origin: Default::default(),
                 role: role.to_string(),
                 content: Some(text.to_string()),
                 images: Vec::new(),
@@ -981,6 +982,7 @@ mod tests {
             })
             .collect();
         messages.push(magi_bridge_client::ChatMessage {
+            context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(prompt.to_string()),
             images: Vec::new(),

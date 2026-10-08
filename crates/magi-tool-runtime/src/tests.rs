@@ -143,7 +143,7 @@ fn external_mcp_model_tool_names_do_not_collapse_distinct_identifiers() {
 }
 
 #[test]
-fn file_read_uses_schema_path_and_directory_listing() {
+fn file_read_uses_schema_path_and_rejects_directories() {
     let root = unique_temp_dir("magi-tool-file-read");
     let file_path = root.join("hello.txt");
     fs::write(&file_path, "hello\nworld").expect("write file");
@@ -196,10 +196,9 @@ fn file_read_uses_schema_path_and_directory_listing() {
         &ToolExecutionPolicy::default(),
     );
 
-    assert_eq!(dir_output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(dir_output.status, ExecutionResultStatus::Failed);
     let dir_payload: Value = serde_json::from_str(&dir_output.payload).expect("dir payload json");
-    assert_eq!(dir_payload["mode"], "directory");
-    assert_eq!(dir_payload["entries"].as_array().expect("entries").len(), 1);
+    assert_eq!(dir_payload["error_code"], "file_read_invalid_input");
 }
 
 #[test]
@@ -1561,7 +1560,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
 
     std::thread::sleep(Duration::from_millis(100));
     let cancel_started = Instant::now();
-    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+    let cancelled = registry.cancel_active_executions(&ToolExecutionContextQuery {
         session_id: context.session_id.clone(),
         workspace_id: context.workspace_id.clone(),
         task_id: None,
@@ -1615,7 +1614,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     });
 
     std::thread::sleep(Duration::from_millis(150));
-    let wrong_workspace_cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+    let wrong_workspace_cancelled = registry.cancel_active_executions(&ToolExecutionContextQuery {
         session_id: context.session_id.clone(),
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-other")),
         task_id: context.task_id.clone(),
@@ -1623,7 +1622,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     });
     assert_eq!(wrong_workspace_cancelled, 0);
 
-    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+    let cancelled = registry.cancel_active_executions(&ToolExecutionContextQuery {
         session_id: context.session_id.clone(),
         workspace_id: context.workspace_id.clone(),
         task_id: context.task_id.clone(),
@@ -1666,7 +1665,7 @@ fn session_cancellation_stops_background_processes_in_the_same_scope() {
     );
     assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
 
-    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+    let cancelled = registry.cancel_active_executions(&ToolExecutionContextQuery {
         worker_id: None,
         task_id: context.task_id.clone(),
         session_id: context.session_id.clone(),
@@ -9791,4 +9790,239 @@ fn builtin_results_without_a_canonical_status_are_failures_not_successes() {
             "{payload}"
         );
     }
+}
+
+#[test]
+fn native_search_shares_ignore_and_permission_boundaries_for_paths_and_content() {
+    let root = unique_temp_dir("native-search-boundaries");
+    for dir in ["src", "secret", "target", ".hidden"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for file in [
+        "src/keep.rs",
+        "src/drop.rs",
+        "src/custom.rs",
+        "secret/key.rs",
+        "target/build.rs",
+        ".hidden/config.rs",
+    ] {
+        fs::write(root.join(file), "needle\n").unwrap();
+    }
+    fs::write(root.join(".gitignore"), "src/*.rs\n!src/keep.rs\n").unwrap();
+    fs::write(root.join(".ignore"), "src/custom.rs\n").unwrap();
+    fs::write(root.join("secret/.ignore"), [0xff, 0x00]).unwrap();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        ..test_workspace_context()
+    };
+    let policy = ToolExecutionPolicy {
+        denied_paths: vec!["secret".into()],
+        ..ToolExecutionPolicy::default()
+    };
+    let registry = make_registry();
+    for (target, query) in [("path", "rs"), ("content", "needle")] {
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::SearchText,
+            &serde_json::json!({"query":query,"target":target,"output_mode":"files"}).to_string(),
+            context.clone(),
+            policy.clone(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            output.payload
+        );
+        let payload = payload_of(&output);
+        let files = payload["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{payload}");
+        assert!(files[0].as_str().unwrap().ends_with("src/keep.rs"));
+        assert_eq!(payload["truncated"], false);
+    }
+    let nested = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::SearchText,
+        r#"{"root":"src","target":"path","query":"rs"}"#,
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(payload_of(&nested)["files"].as_array().unwrap().len(), 1);
+    let hidden = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::SearchText,
+        r#"{"target":"path","query":"rs","include_hidden":true}"#,
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(payload_of(&hidden)["files"].as_array().unwrap().len(), 2);
+    let ignored_root = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::SearchText,
+        r#"{"root":"target/build.rs","query":"needle","include_hidden":true}"#,
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(payload_of(&ignored_root)["returned_matches"], 0);
+    let ignored_file_read = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileRead,
+        r#"{"path":"src/drop.rs"}"#,
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(ignored_file_read.status, ExecutionResultStatus::Succeeded);
+    let denied = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileRead,
+        r#"{"path":"secret/key.rs"}"#,
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(denied.status, ExecutionResultStatus::Rejected);
+    let escaped = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::SearchText,
+        r#"{"root":"..","query":"needle"}"#,
+        context,
+        policy,
+    );
+    assert_eq!(escaped.status, ExecutionResultStatus::Rejected);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn native_search_does_not_follow_links_or_read_special_files() {
+    use std::os::unix::fs::symlink;
+    let root = unique_temp_dir("native-search-links");
+    let outside = unique_temp_dir("native-search-outside");
+    fs::write(outside.join("secret"), "needle").unwrap();
+    fs::write(root.join("safe"), "needle").unwrap();
+    symlink(&outside, root.join("escape")).unwrap();
+    symlink(outside.join("secret"), root.join("linked-file")).unwrap();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        ..test_workspace_context()
+    };
+    let registry = make_registry();
+    let result = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::SearchText,
+        r#"{"query":"needle"}"#,
+        context.clone(),
+        ToolExecutionPolicy::default(),
+    );
+    assert_eq!(payload_of(&result)["returned_matches"], 1);
+    let result = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileRead,
+        r#"{"path":"linked-file"}"#,
+        context,
+        ToolExecutionPolicy::default(),
+    );
+    assert_eq!(result.status, ExecutionResultStatus::Rejected);
+    let result = exec_tool(
+        &registry,
+        BuiltinToolName::FileRead,
+        r#"{"path":"/dev/zero"}"#,
+    );
+    assert_eq!(result.status, ExecutionResultStatus::Failed);
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn native_search_has_exact_limits_and_unicode_columns_without_unbounded_excerpts() {
+    let root = unique_temp_dir("native-search-limits");
+    fs::write(
+        root.join("text"),
+        format!("İ甲 KEY\n{}needle\n", "字".repeat(20_000)),
+    )
+    .unwrap();
+    fs::write(root.join("binary"), b"needle\0binary").unwrap();
+    let registry = make_registry();
+    let run = |request: Value| {
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::SearchText,
+            &request.to_string(),
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..test_workspace_context()
+            },
+            ToolExecutionPolicy::default(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Succeeded,
+            "{}",
+            output.payload
+        );
+        payload_of(&output)
+    };
+    let one = run(serde_json::json!({"query":"key", "case_sensitive":false, "limit":1}));
+    assert_eq!(one["matches"][0]["column"], 4);
+    assert_eq!(one["matches"][0]["excerpt"], "İ甲 KEY");
+    assert_eq!(one["truncated"], false);
+    let capped = run(serde_json::json!({"query":"KEY|needle", "query_mode":"regex", "limit":1}));
+    assert_eq!(capped["truncated"], true);
+    let excerpt = run(serde_json::json!({"query":"needle"}));
+    assert_eq!(excerpt["skipped"]["non_text"], 1);
+    assert_eq!(excerpt["matches"][0]["column"], 20_001);
+    assert_eq!(excerpt["matches"][0]["excerpt_truncated"], true);
+    assert!(excerpt["matches"][0]["excerpt"].as_str().unwrap().len() <= 2048);
+    let capped = run(serde_json::json!({"query":"needle", "max_bytes":32}));
+    assert_eq!(capped["returned_matches"], 0);
+    assert_eq!(capped["stop_reason"], "max_bytes");
+    let oversized_query = exec_tool(
+        &registry,
+        BuiltinToolName::SearchText,
+        &serde_json::json!({"root":root, "query":"x".repeat(4097)}).to_string(),
+    );
+    assert_eq!(
+        payload_of(&oversized_query)["error_code"],
+        "search_text_invalid_input"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_read_ranges_preserve_line_numbers_utf8_and_full_content_version() {
+    let root = unique_temp_dir("native-read-range");
+    let path = root.join("text");
+    fs::write(&path, "zero\r\n一二三\r\nlast").unwrap();
+    let registry = make_registry();
+    let run = |mut request: Value| {
+        request["path"] = path.to_string_lossy().to_string().into();
+        payload_of(&exec_tool(
+            &registry,
+            BuiltinToolName::FileRead,
+            &request.to_string(),
+        ))
+    };
+    let value = run(serde_json::json!({"start_line":2,"end_line":2}));
+    assert_eq!(value["content"], "一二三\r\n");
+    assert_eq!(value["start_line"], 2);
+    assert_eq!(value["end_line"], 2);
+    assert_eq!(value["truncated"], false);
+    assert_eq!(
+        value["content_hash"],
+        magi_snapshot::path_content_hash(&path).unwrap()
+    );
+    let value = run(serde_json::json!({"start_line":2,"max_bytes":4}));
+    assert_eq!(value["content"], "一");
+    assert_eq!(value["bytes_read"], 3);
+    assert_eq!(value["truncated"], true);
+    let value = run(serde_json::json!({"start_line":30}));
+    assert_eq!(value["content"], "");
+    assert_eq!(value["end_line"], Value::Null);
+    for args in [
+        serde_json::json!({"start_line":0}),
+        serde_json::json!({"start_line":3,"end_line":2}),
+        serde_json::json!({"start_line":"2"}),
+    ] {
+        assert_eq!(run(args)["error_code"], "file_read_invalid_input");
+    }
+    fs::remove_dir_all(root).unwrap();
 }

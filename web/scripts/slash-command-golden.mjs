@@ -4,6 +4,7 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 await withGoldenViteServer(async (server) => {
   const composerActions = await server.ssrLoadModule('/src/lib/composer-actions.ts');
   const contextReferences = await server.ssrLoadModule('/src/lib/composer-context-references.ts');
+  const userMessageCommand = await server.ssrLoadModule('/src/lib/user-message-command.ts');
 
   const skills = [
     {
@@ -88,6 +89,32 @@ await withGoldenViteServer(async (server) => {
     null,
     'a completed slash token must close after whitespace',
   );
+
+  assert.deepEqual(
+    userMessageCommand.resolveUserMessageCommandLabel({ sessionCommand: 'compact' }),
+    '/compact',
+    'the session command should come from structured metadata alone',
+  );
+  assert.deepEqual(
+    userMessageCommand.resolveUserMessageCommandLabel({ goalMode: true }),
+    '/goal',
+    'goal mode should resolve to one structured command label',
+  );
+  assert.deepEqual(
+    userMessageCommand.resolveUserMessageCommandLabel(
+      { skillName: 'browser-control' },
+    ),
+    '/browser-control',
+    'selected skills must display the persisted identity without consulting mutable skill settings',
+  );
+  assert.equal(
+    userMessageCommand.resolveUserMessageCommandLabel(undefined),
+    '',
+    'messages without structured command metadata should not parse command-like body text',
+  );
+
+  assert.equal(userMessageCommand.resolveUserMessageCommandLabel({ goalMode: true, skillName: 'review' }),
+    '/goal /review', 'all persisted command identities must remain visible');
 
   const firstReference = contextReferences.addComposerContextReference([], {
     kind: 'file',

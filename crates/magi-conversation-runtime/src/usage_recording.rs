@@ -20,9 +20,9 @@ use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ContextBudgetPolicy, ContextMeasurement, ContextPressureProjection, ContextPressureSnapshot,
-    ExecutionBindingIdentity, LlmConfig, ModelIdentitySnapshot, UsageCallIdentity,
-    UsageCallRecordInput, UsageCallStatus, UsagePhase, UsageSourceRole, UsageTokenInput,
-    context_window_tokens_from_usage, prepare_llm_config_for_persistence,
+    ContextUsageBreakdown, ExecutionBindingIdentity, LlmConfig, ModelIdentitySnapshot,
+    UsageCallIdentity, UsageCallRecordInput, UsageCallStatus, UsagePhase, UsageSourceRole,
+    UsageTokenInput, context_window_tokens_from_usage, prepare_llm_config_for_persistence,
     provider_context_tokens_from_usage,
 };
 use std::sync::Arc;
@@ -60,7 +60,7 @@ pub struct ContextUsageRuntimeTrackerInput<'a> {
     /// 本轮实际使用的模型窗口。调用方已经完成模型配置、会话覆盖和
     /// vision 接管的解析，运行时观测不得再次按模型名猜测窗口。
     pub context_window_tokens: u64,
-    pub prefill_tokens: u64,
+    pub context_breakdown: ContextUsageBreakdown,
     pub thread_id: Option<&'a ThreadId>,
     pub model_provider: Option<String>,
     pub binding_revision: u32,
@@ -83,7 +83,7 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             input.turn_id,
             input.call_id,
             input.resolved_model,
-            input.prefill_tokens,
+            input.context_breakdown.total_tokens(),
             Some(input.context_window_tokens),
             input.thread_id,
             input.model_provider.as_deref(),
@@ -91,8 +91,9 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             input.checkpoint_generation,
             "prefill",
             "estimated",
+            Some(&input.context_breakdown),
         );
-        let prefill_tokens = input.prefill_tokens;
+        let prefill_tokens = input.context_breakdown.total_tokens();
         Self {
             input,
             last_emit_at: std::cell::Cell::new(0),
@@ -105,7 +106,8 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             estimate_text_tokens(content).saturating_add(estimate_text_tokens(thinking));
         let estimated_context_tokens = self
             .input
-            .prefill_tokens
+            .context_breakdown
+            .total_tokens()
             .saturating_add(estimated_output_tokens as u64);
         let now = UtcMillis::now().0;
         let previous_tokens = self.last_emitted_tokens.get();
@@ -132,6 +134,11 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             self.input.checkpoint_generation,
             "streaming",
             "estimated",
+            Some(&{
+                let mut breakdown = self.input.context_breakdown.clone();
+                breakdown.add_conversation_tokens(estimated_output_tokens as u64);
+                breakdown
+            }),
         );
         self.last_emit_at.set(now);
         self.last_emitted_tokens.set(estimated_context_tokens);
@@ -144,6 +151,7 @@ pub struct ModelUsageRecordInput<'a> {
     pub binding: &'a ModelUsageBinding,
     pub call_id: String,
     pub usage: Option<&'a serde_json::Value>,
+    pub context_breakdown: Option<ContextUsageBreakdown>,
     pub status: UsageCallStatus,
     pub assignment_id: Option<String>,
     pub error_code: Option<String>,
@@ -208,6 +216,7 @@ pub fn invoke_auxiliary_model_with_usage(
                     context.settings_store,
                     context.expected_turn_id,
                     ModelUsageRecordInput {
+                        context_breakdown: None,
                         session_id,
                         workspace_id: context.workspace_id,
                         binding: &binding,
@@ -229,6 +238,7 @@ pub fn invoke_auxiliary_model_with_usage(
                     context.settings_store,
                     context.expected_turn_id,
                     ModelUsageRecordInput {
+                        context_breakdown: None,
                         session_id,
                         workspace_id: context.workspace_id,
                         binding: &binding,
@@ -393,6 +403,7 @@ pub fn publish_context_usage_update(
     checkpoint_generation: u64,
     phase: &str,
     accuracy: &str,
+    context_breakdown: Option<&ContextUsageBreakdown>,
 ) {
     let context_window = context_window_override
         .unwrap_or_else(|| resolve_model_context_window(settings_store, resolved_model))
@@ -424,8 +435,14 @@ pub fn publish_context_usage_update(
                 .context_window_limit_tokens
                 .is_none_or(|window| window == context_window)
         })
+        .filter(|observation| observation.model_provider.as_deref() == model_provider)
+        .filter(|observation| observation.binding_revision == Some(binding_revision))
         .and_then(|observation| observation.provider_context_tokens);
-    let projected_tokens = token_used.max(previous_anchor.unwrap_or_default());
+    let projected_tokens = if accuracy == "authoritative" {
+        token_used
+    } else {
+        token_used.max(previous_anchor.unwrap_or_default())
+    };
     let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
     let remaining_tokens = context_window.saturating_sub(projected_tokens);
     let measurement = if accuracy == "authoritative" {
@@ -478,6 +495,7 @@ pub fn publish_context_usage_update(
         "pressure_level": snapshot.pressure_level.as_str(),
         "usage_ratio": snapshot.projected_request_tokens as f64 / snapshot.context_window_tokens as f64,
         "observed_at": observed_at.0,
+        "context_breakdown": context_breakdown,
     });
     let _ = event_bus.publish(
         EventEnvelope::usage(
@@ -513,6 +531,7 @@ fn publish_model_usage_record_internal(
         status,
         assignment_id,
         error_code,
+        context_breakdown,
     } = input;
     let usage = match usage_tokens_from_payload(usage) {
         Some(usage) => usage,
@@ -628,6 +647,7 @@ fn publish_model_usage_record_internal(
             checkpoint_generation,
             "completed",
             "authoritative",
+            context_breakdown.as_ref(),
         );
     }
 }
@@ -893,7 +913,10 @@ mod tests {
             call_id: "call-context-runtime",
             resolved_model: "gpt-5.6-luna",
             context_window_tokens: 256_000,
-            prefill_tokens: 1_000,
+            context_breakdown: ContextUsageBreakdown {
+                conversation_tokens: 1_000,
+                ..Default::default()
+            },
             thread_id: None,
             model_provider: None,
             binding_revision: 0,
@@ -1087,6 +1110,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1163,6 +1187,27 @@ mod tests {
         let binding = session_turn_model_usage_binding(true);
         let workspace_id = None;
 
+        let request_breakdown = ContextUsageBreakdown {
+            conversation_tokens: 100,
+            system_instruction_tokens: 25,
+            ..Default::default()
+        };
+        let tracker = ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
+            event_bus: &event_bus,
+            settings_store: Some(&settings_store),
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            turn_id: Some("turn-fixed-context-window"),
+            call_id: "call-fixed-context-window",
+            resolved_model: "gpt-fixed-window",
+            context_window_tokens: 256_000,
+            context_breakdown: request_breakdown.clone(),
+            thread_id: None,
+            model_provider: Some("configured".into()),
+            binding_revision: 0,
+            checkpoint_generation: 0,
+        });
+        tracker.observe_accumulated_output(&"output".repeat(100), "thinking");
         publish_model_usage_record_for_turn_with_context_window(
             &event_bus,
             &session_store,
@@ -1170,6 +1215,7 @@ mod tests {
             Some("turn-fixed-context-window"),
             256_000,
             ModelUsageRecordInput {
+                context_breakdown: Some(request_breakdown.clone()),
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1185,10 +1231,20 @@ mod tests {
             .snapshot()
             .recent_events
             .into_iter()
-            .find(|event| event.event_type == "session.context.pressure.updated")
+            .find(|event| {
+                event.event_type == "session.context.pressure.updated"
+                    && event.payload["phase"] == "completed"
+            })
             .expect("固定窗口必须写入 authoritative pressure 事件");
         assert_eq!(event.payload["context_window_limit_tokens"], json!(256_000));
         assert_eq!(event.payload["projected_request_tokens"], json!(42));
+        assert_eq!(event.payload["context_breakdown"], json!(request_breakdown));
+        let restored = event_bus
+            .with_audit_usage_ledger(|ledger| {
+                latest_usage_observation_for_session(&ledger.usage_entries, session_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(restored.context_breakdown, Some(request_breakdown));
     }
 
     struct SuccessfulAuxiliaryClient;
@@ -1318,6 +1374,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1370,6 +1427,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1423,6 +1481,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1488,6 +1547,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 binding: &binding,
@@ -1560,6 +1620,7 @@ mod tests {
             &session_store,
             Some(&settings_store),
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: &session_id,
                 workspace_id: &None,
                 binding: &binding,

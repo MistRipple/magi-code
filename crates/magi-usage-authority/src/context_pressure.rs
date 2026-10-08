@@ -6,6 +6,68 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 分类上下文估算。分类只说明请求中各来源的大致占用，不替代 provider
+/// 返回的总上下文观测值。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsageBreakdown {
+    pub conversation_tokens: u64,
+    pub image_tokens: u64,
+    pub system_instruction_tokens: u64,
+    pub project_context_tokens: u64,
+    pub skill_tokens: u64,
+    pub context_reference_tokens: u64,
+    pub builtin_tool_tokens: u64,
+    pub mcp_tool_tokens: u64,
+    pub skill_tool_tokens: u64,
+    pub other_tool_tokens: u64,
+}
+
+impl ContextUsageBreakdown {
+    pub fn total_tokens(&self) -> u64 {
+        self.conversation_tokens
+            .saturating_add(self.image_tokens)
+            .saturating_add(self.system_instruction_tokens)
+            .saturating_add(self.project_context_tokens)
+            .saturating_add(self.skill_tokens)
+            .saturating_add(self.context_reference_tokens)
+            .saturating_add(self.builtin_tool_tokens)
+            .saturating_add(self.mcp_tool_tokens)
+            .saturating_add(self.skill_tool_tokens)
+            .saturating_add(self.other_tool_tokens)
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.conversation_tokens = self
+            .conversation_tokens
+            .saturating_add(other.conversation_tokens);
+        self.image_tokens = self.image_tokens.saturating_add(other.image_tokens);
+        self.system_instruction_tokens = self
+            .system_instruction_tokens
+            .saturating_add(other.system_instruction_tokens);
+        self.project_context_tokens = self
+            .project_context_tokens
+            .saturating_add(other.project_context_tokens);
+        self.skill_tokens = self.skill_tokens.saturating_add(other.skill_tokens);
+        self.context_reference_tokens = self
+            .context_reference_tokens
+            .saturating_add(other.context_reference_tokens);
+        self.builtin_tool_tokens = self
+            .builtin_tool_tokens
+            .saturating_add(other.builtin_tool_tokens);
+        self.mcp_tool_tokens = self.mcp_tool_tokens.saturating_add(other.mcp_tool_tokens);
+        self.skill_tool_tokens = self
+            .skill_tool_tokens
+            .saturating_add(other.skill_tool_tokens);
+        self.other_tool_tokens = self
+            .other_tool_tokens
+            .saturating_add(other.other_tool_tokens);
+    }
+
+    pub fn add_conversation_tokens(&mut self, tokens: u64) {
+        self.conversation_tokens = self.conversation_tokens.saturating_add(tokens);
+    }
+}
+
 /// 默认主动压缩比例。它不是硬上限，最终阈值还要扣除输出和恢复预留。
 pub const DEFAULT_PROACTIVE_THRESHOLD_PERCENT: u64 = 85;
 /// 默认保留近期完整历史的比例。

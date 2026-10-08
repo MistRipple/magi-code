@@ -125,7 +125,7 @@ pub(super) async fn accept_session_task_submission_at(
     );
     user_message_metadata.insert("traceId".to_string(), serde_json::Value::String(trace_id));
     let trimmed_text = request.trimmed_text();
-    let message = request.timeline_message(trimmed_text.as_deref());
+    let message = request.timeline_content(trimmed_text.as_deref());
     let mission_title = task_title
         .as_deref()
         .map(str::trim)

@@ -78,17 +78,13 @@ worktree，也就不需要这把租约。机制、触发条件和合并语义见
 
 ### 2.4 子代理
 
-子代理从父 `SessionGitContext.base_head` 派生，不读取“当下可能已变化”的全局 workspace：
+子代理从父会话派发时的工作树快照创建独立 worktree。GitService::snapshot_worktree 使用独立 index，把已跟踪和未跟踪的当前内容写成临时提交，不改变用户的 HEAD、index 或工作树。
 
-- `ReadOnly` 子代理：`git worktree add --detach <path> <base_head>`；
-- 可写子代理：从同一 `base_head` 创建唯一 `magi/agent/*` branch 与独立 worktree；
-- 工具的 `working_directory` 指向代理 worktree；
-- ProjectMemory 与 session snapshot 仍以主 workspace identity root 归档；
-- 子代理模型调用终止后立刻把分配标为 inactive：干净 worktree 自动安全移除，
-  writable branch 保留供主对话 merge；dirty/conflict worktree 保留目录和 context，
-  绝不使用 `--force` 丢失代理产物；
-- 主模型在任何 agent worktree 仍为 active 时不能执行 Git mutation，必须先等待 worker
-  结束，避免 merge 尚在变化的 agent branch。
+- 只读代理使用 detached worktree；可写代理从同一快照创建独立代理分支。
+- 工具 working_directory 指向代理 worktree；ProjectMemory 与 session snapshot 仍以主 workspace identity root 归档。
+- 可写代理终态时把产出提交到代理分支，回执包含分支、提交和改动路径；提交失败须保留工作目录并返回错误。
+- agent_apply 将代理产出相对快照的差异合入主线，不能用切换主 HEAD 或丢弃 dirty 文件代替；冲突返回明确结果。
+- 活动代理的占用按 TaskStore 生命周期释放，重启后核对真实任务状态；主线 Git mutation 不得与活动代理竞态。
 
 因此并行代理不会切换主 HEAD、互相覆盖文件，diff 可以按 task/branch/path 归属。
 
@@ -182,41 +178,14 @@ schema、权限和审批能够逐操作表达；设置页和 `tool_catalog` 的�
 `context_revision + observed_head + worktree_path` 应作为后续上下文缓存键。禁止只按
 `workspace_id` 缓存跨 branch 文件内容。
 
-## 5. Codex 对比
-
-Codex 值得借鉴的边界：
-
-- `thread_data.rs` 分开保存 `forked_from_id` / `parent_thread_id`、`cwd`、`git_info`；
-- `TurnContext` 把当轮 cwd/权限/环境作为执行快照，子代理从父 TurnContext 派生；
-- `cwd` 与 `runtimeWorkspaceRoots` 分开，执行入口与允许访问根不是同一字段；
-- thread 创建时采集 SHA/branch/origin 作为审计快照；
-- TUI 异步 branch 查询按 cwd 校验，拒绝把旧目录结果写回新会话。
-
-参考代码：
-
-- `/Users/xie/code/codex/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs`
-- `/Users/xie/code/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`
-- `/Users/xie/code/codex/codex-rs/core/src/session/turn_context.rs`
-- `/Users/xie/code/codex/codex-rs/core/src/tools/handlers/multi_agents_common.rs`
-- `/Users/xie/code/codex/codex-rs/rollout/src/recorder.rs`
-- `/Users/xie/code/codex/codex-rs/tui/src/chatwidget/status_surfaces.rs`
-
-不能直接照搬的部分：Codex `gitInfo` 主要是快照，不是 branch ownership；Codex 并未
-提供完整 branch CRUD/merge/worktree 生命周期，也不能单靠相同 cwd 的继承解决并行写入。
-Magi 因此额外实现了 session baseline、CAS、repository mutex、execution/mutation lease 和
-真实 agent worktree。
-
-结论：conversation branch 与 Git branch 必须独立建模；`cwd`、runtime roots、Git 元数据
-也必须独立。把其中任意两个压成一个 `branch` 字段会重新引入当前设计要消除的歧义。
-
-## 6. 测试证据
+## 5. 测试入口
 
 - `crates/magi-git/src/lib.rs`：临时仓库覆盖 dirty、stale HEAD、create/switch、merge、
   merge conflict、删除保护、force/remote 确认、worktree、session drift 和 lease 竞态；
 - `crates/magi-api/src/routes/workspace_vcs.rs`：HTTP/session 绑定、自动切换、dirty、drift、
   accept baseline、运行 lease；
-- `task_execution_dispatcher.rs`：子代理从父 base HEAD 创建独立 worktree；
+- `task_execution_dispatcher.rs`：子代理从父工作树快照创建独立 worktree，产出提交到代理分支；
 - `git_tool_runtime.rs`：模型工具绑定 session Git context、execution lease、持久化与刷新；
 - `magi-tool-runtime`：完整 `git_*` schema、权限/风险分级和业务执行器委托；
-- `crates/magi-git/tests/rg_retry.rs`：对 `MistRipple/rg-retry` 的独立临时克隆执行完整本地
-  branch/merge/delete/worktree 流程，基准 clone 保持只读。
+- `crates/magi-git/tests/workflow.rs`：使用临时创建的本地 origin 和 clone 验证
+  branch/merge/delete/worktree 流程，不依赖外部仓库或环境变量。

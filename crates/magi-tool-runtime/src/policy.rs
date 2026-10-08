@@ -160,31 +160,7 @@ impl ToolRegistry {
         let effective_access_profile = policy.effective_access_profile();
         let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
-        let permission_policy = magi_permissions::PermissionPolicy {
-            allowed_tools: policy
-                .allowed_tool_names
-                .iter()
-                .map(|tool_name| {
-                    crate::canonical_builtin_tool_name(tool_name)
-                        .unwrap_or_else(|| tool_name.trim().to_string())
-                })
-                .collect(),
-            denied_tools: policy
-                .denied_tool_names
-                .iter()
-                .map(|tool_name| {
-                    crate::canonical_builtin_tool_name(tool_name)
-                        .unwrap_or_else(|| tool_name.trim().to_string())
-                })
-                .collect(),
-            allowed_paths: effective_tool_policy_allowed_paths(
-                effective_access_profile,
-                &policy.allowed_paths,
-                workspace_root_path,
-            ),
-            denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
-            command_mode: policy.command_mode.clone(),
-        };
+        let permission_policy = execution_permission_policy(&policy, workspace_root_path);
         let mut pending_output = None;
 
         let tool_is_writeful = crate::BuiltinToolName::from_name(input.tool_name.trim())
@@ -496,6 +472,38 @@ fn select_permission_axis_output(
             None
         }
         None => None,
+    }
+}
+
+pub(crate) fn execution_permission_policy(
+    policy: &ToolExecutionPolicy,
+    workspace_root_path: Option<&Path>,
+) -> magi_permissions::PermissionPolicy {
+    let effective_access_profile = policy.effective_access_profile();
+    magi_permissions::PermissionPolicy {
+        allowed_tools: policy
+            .allowed_tool_names
+            .iter()
+            .map(|tool_name| {
+                crate::canonical_builtin_tool_name(tool_name)
+                    .unwrap_or_else(|| tool_name.trim().to_string())
+            })
+            .collect(),
+        denied_tools: policy
+            .denied_tool_names
+            .iter()
+            .map(|tool_name| {
+                crate::canonical_builtin_tool_name(tool_name)
+                    .unwrap_or_else(|| tool_name.trim().to_string())
+            })
+            .collect(),
+        allowed_paths: effective_tool_policy_allowed_paths(
+            effective_access_profile,
+            &policy.allowed_paths,
+            workspace_root_path,
+        ),
+        denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
+        command_mode: policy.command_mode.clone(),
     }
 }
 

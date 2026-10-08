@@ -1,3 +1,4 @@
+import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
 /**
  * 消息类型定义
  */
@@ -506,6 +507,9 @@ export interface OrchestratorRuntimeSnapshot {
     pressureLevel?: string;
     proactiveThresholdTokens?: number;
     hardRequestLimitTokens?: number;
+    responseReserveTokens?: number;
+    recoveryBufferTokens?: number;
+    contextBreakdown?: ContextUsageBreakdown;
     errorRate?: number;
     lastCompactionAt?: number;
     lastCompactionReason?: string;
@@ -763,6 +767,7 @@ export interface QueuedMessage {
   content: string;
   text?: string | null;
   createdAt: number;
+  command: 'compact' | null;
   skillName?: string | null;
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;

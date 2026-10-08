@@ -798,6 +798,17 @@ function modelRetryRuntimeEnvelope(phase, sequence = 3) {
   };
 }
 
+const contextBreakdownFixture = {
+  conversation_tokens: 12_000, image_tokens: 1_000, system_instruction_tokens: 3_000,
+  project_context_tokens: 2_000, skill_tokens: 1_000, context_reference_tokens: 1_000,
+  builtin_tool_tokens: 2_000, mcp_tool_tokens: 1_000, skill_tool_tokens: 1_000, other_tool_tokens: 0,
+};
+const contextBreakdownView = {
+  conversationTokens: 12_000, imageTokens: 1_000, systemInstructionTokens: 3_000,
+  projectContextTokens: 2_000, skillTokens: 1_000, contextReferenceTokens: 1_000,
+  builtinToolTokens: 2_000, mcpToolTokens: 1_000, skillToolTokens: 1_000, otherToolTokens: 0,
+};
+
 function contextUsageEnvelope() {
   return {
     event_id: 'event-session-context-usage-streaming',
@@ -816,6 +827,7 @@ function contextUsageEnvelope() {
       phase: 'streaming',
       measurement: 'estimated',
       projected_request_tokens: 24_000,
+      context_breakdown: contextBreakdownFixture,
       remaining_tokens: 248_000,
       context_window_limit_tokens: 272_000,
       usage_ratio: 24_000 / 272_000,
@@ -1250,6 +1262,7 @@ await withGoldenViteServer(async (server) => {
       warningLevel: 'normal',
       measurement: 'estimated',
       projectedRequestTokens: 24_000,
+      contextBreakdown: contextBreakdownView,
       phase: 'streaming',
       updatedAt: ACCEPTED_AT + 2,
       eventSequence: 3,
@@ -1260,6 +1273,41 @@ await withGoldenViteServer(async (server) => {
     },
     '运行中上下文用量必须通过 SSE 立即进入当前会话 runtime state',
   );
+
+  const beforeReplacement = messagesStore.messagesState.orchestratorRuntimeState;
+  messagesStore.setOrchestratorRuntimeState({
+    ...beforeReplacement,
+    runtimeSnapshot: {
+      ...beforeReplacement.runtimeSnapshot,
+      budgetState: {
+        ...beforeReplacement.runtimeSnapshot.budgetState,
+        providerContextTokens: 12_000,
+        responseReserveTokens: 8_000,
+        recoveryBufferTokens: 4_000,
+        proactiveThresholdTokens: 220_000,
+        hardRequestLimitTokens: 260_000,
+        lastCompactionAt: ACCEPTED_AT,
+        lastCompactionReason: 'manual',
+      },
+    },
+  });
+  const nextPressure = contextUsageEnvelope();
+  nextPressure.sequence = 4;
+  nextPressure.event_id = 'event-next-pressure';
+  nextPressure.payload.call_id = 'next-call';
+  nextPressure.payload.context_breakdown = null;
+  delete nextPressure.payload.resolved_model;
+  delete nextPressure.payload.turn_id;
+  recoveredStream.onmessage?.({ data: JSON.stringify(nextPressure) });
+  assert.equal(messagesStore.messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState?.contextBreakdown,
+    undefined, 'a new call without classification must clear the old call breakdown');
+  const replacedBudget = messagesStore.messagesState.orchestratorRuntimeState.runtimeSnapshot.budgetState;
+  for (const key of ['providerContextTokens', 'responseReserveTokens', 'recoveryBufferTokens',
+    'proactiveThresholdTokens', 'hardRequestLimitTokens', 'resolvedModel', 'turnId']) {
+    assert.equal(replacedBudget[key], undefined, key + ' must not leak from the previous call');
+  }
+  assert.equal(replacedBudget.lastCompactionAt, ACCEPTED_AT);
+  assert.equal(replacedBudget.lastCompactionReason, 'manual');
 
   recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('scheduled')) });
   assert.equal(
@@ -1903,6 +1951,7 @@ await withGoldenViteServer(async (server) => {
       acceptedAt: ACCEPTED_AT + 2500,
       content: '排队消息必须在出队提交时立刻进入主线。',
       text: '排队消息必须在出队提交时立刻进入主线。',
+      command: null,
       skillName: null,
       goalMode: true,
       accessProfile: null,
@@ -1927,6 +1976,7 @@ await withGoldenViteServer(async (server) => {
       acceptedAt: ACCEPTED_AT + 2501,
       content: '请优先给出结论。',
       text: '请优先给出结论。',
+      command: null,
       skillName: null,
       goalMode: false,
       accessProfile: null,
@@ -2013,15 +2063,16 @@ await withGoldenViteServer(async (server) => {
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
     acceptedAt: ACCEPTED_AT + 2600,
-    content: '停止后按队列顺序发送。',
-    text: '停止后按队列顺序发送。',
+    content: '保留压缩重点。',
+    text: '保留压缩重点。',
+    command: 'compact',
     skillName: null,
     goalMode: false,
     accessProfile: null,
     images: [],
     contextReferences: [],
     browserAnnotationRefs: [],
-    canGuide: true,
+    canGuide: false,
     retryCount: 0,
   }];
   messagesStore.setQueuedMessages(queuedTurnPayloads.map((turn) => ({
@@ -2029,6 +2080,7 @@ await withGoldenViteServer(async (server) => {
     requestId: turn.requestId,
     content: turn.content,
     text: turn.text,
+    command: turn.command,
     sessionId: turn.sessionId,
     workspaceId: turn.workspaceId,
     workspacePath: turn.workspacePath,
@@ -2041,6 +2093,11 @@ await withGoldenViteServer(async (server) => {
     browserAnnotationRefs: turn.browserAnnotationRefs,
     canGuide: turn.canGuide,
   })));
+  assert.equal(
+    messagesStore.messagesState.queuedMessages[0]?.command,
+    'compact',
+    'queue snapshots must preserve session commands as structured metadata',
+  );
   const interruptRequestId = 'request-interrupt-current';
   beginSyntheticLocalSubmission(messagesStore, interruptRequestId);
   const interruptCanonicalTurn = completedCanonicalTurn();

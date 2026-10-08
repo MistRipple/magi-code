@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import test from "node:test";
 import { WebSocket, type RawData } from "ws";
 import {
@@ -57,7 +56,9 @@ test("并发 start/close 通过单一生命周期队列收口为一个控制端�
   assert.equal(existsSync(socketPath), false);
 
   await server.start();
-  assert.equal(existsSync(socketPath), true);
+  if (process.platform !== "win32") assert.equal(existsSync(socketPath), true);
+  const client = await connect(socketPath);
+  client.close();
   await server.close();
   assert.equal(existsSync(socketPath), false);
 });

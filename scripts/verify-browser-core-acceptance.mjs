@@ -16,6 +16,7 @@ const files = {
   workbench: 'web/src/web/WebWorkbenchShell.svelte',
   schema: 'contracts/desktop-browser/desktop-ipc.schema.json',
   worker: 'browser-automation-worker/src/runtime.ts',
+  downloadStorage: 'apps/desktop/src/main/browser-download-storage.ts',
 };
 const sources = Object.fromEntries(
   await Promise.all(Object.entries(files).map(async ([name, path]) => [name, await read(path)])),
@@ -90,5 +91,44 @@ assert.match(sources.browserTab, /webpreferences="focusOnNavigation=no"/u);
 assert.match(sources.browserTab, /magi:browserScreenshotCaptured/u);
 assert.match(sources.browserTab, /magi:browserNodeSelected/u);
 assert.match(sources.browserTab, /annotationMenuNumber|annotation-menu-number/u);
+
+function ordered(source, markers, label) {
+  let cursor = -1;
+  for (const marker of markers) {
+    const next = source.indexOf(marker, cursor + 1);
+    assert.notEqual(next, -1, `${label} 缺少或顺序错误: ${marker}`);
+    cursor = next;
+  }
+}
+
+assert.match(sources.downloadStorage, /export const BROWSER_DOWNLOAD_DIRECTORY = "browser-downloads"/u);
+assert.match(sources.downloadStorage, /lstat\(root\)/u);
+assert.match(sources.downloadStorage, /rootStat\.isSymbolicLink\(\)/u);
+assert.match(sources.downloadStorage, /rm\(join\(root, entry\)/u);
+assert.doesNotMatch(sources.downloadStorage, /browser-uploads/u);
+
+ordered(
+  sources.main,
+  [
+    "const surfaces = new BrowserSurfaceManager({",
+    "await surfaces.clearDownloads();",
+    "const browserUploadRoot = join(",
+  ],
+  "启动下载清理",
+);
+const shutdownStart = sources.main.indexOf("async function shutdown(): Promise<void>");
+assert.notEqual(shutdownStart, -1, "退出清理缺少 shutdown");
+const shutdownSource = sources.main.slice(shutdownStart);
+ordered(
+  shutdownSource,
+  ["surfaceManager?.closeAll();", "automationWorker?.stop();", "await surfaceManager?.clearDownloads();"],
+  "退出下载清理",
+);
+
+assert.match(sources.surface, /async clearBrowsingData\(\): Promise<void> \{\s*await this\.clearDownloads\(\)/u);
+assert.match(sources.surface, /#downloadCleanupInProgress/u);
+assert.match(sources.surface, /this\.cancelActiveDownloads\(\)/u);
+assert.match(sources.surface, /item\.cancel\(\)/u);
+assert.match(sources.surface, /browser_download_cleanup_in_progress/u);
 
 console.log('browser core acceptance passed');

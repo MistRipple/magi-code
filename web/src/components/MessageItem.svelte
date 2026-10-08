@@ -28,6 +28,7 @@
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import { resolveBrowserAnnotationArtifactUrl } from '../web/agent-api';
   import { inferConversationPresentationRole } from '../lib/conversation-presentation';
+  import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
 
   // Props
   interface Props {
@@ -199,6 +200,8 @@
     return nonEmptyLines >= 3 || normalized.length >= 140;
   });
 
+  const userCommandLabel = $derived(resolveUserMessageCommandLabel(message.metadata));
+
   function resolveBlockRenderKey(
     block: import('../types/message').ContentBlock,
   ): string {
@@ -211,6 +214,12 @@
 
   const copyableText = $derived.by(() => {
     const content = typeof message.content === 'string' ? message.content.trim() : '';
+    if (isUser) {
+      const visibleUserText = [userCommandLabel, message.content]
+        .filter((part) => part.trim().length > 0)
+        .join(' ');
+      if (visibleUserText) return visibleUserText;
+    }
     if (content) return message.content;
     const blockText = safeBlocks
       .map((block) => {
@@ -383,7 +392,7 @@
   });
 
   const messageImages = $derived(message.images || []);
-  const hasUserText = $derived(Boolean(message.content?.trim()));
+  const hasUserText = $derived(Boolean(userCommandLabel || message.content?.trim()));
   const messageContextReferences = $derived(message.contextReferences || []);
   const messageBrowserAnnotationRefs = $derived(message.browserAnnotationRefs || []);
   const messageBrowserNodeSelections = $derived(message.browserNodeSelections || []);
@@ -544,7 +553,12 @@
       <div class="user-row">
         <div class="user-content">
           <div class="user-plain-content">
-            <MarkdownContent content={message.content || ''} isStreaming={false} {filePreviewScope} />
+            {#if userCommandLabel}
+              <span class="user-command-text">{userCommandLabel}</span>
+            {/if}
+            {#if message.content?.trim()}
+              <MarkdownContent content={message.content} isStreaming={false} {filePreviewScope} />
+            {/if}
           </div>
         </div>
       </div>
@@ -774,6 +788,13 @@
        become a visible blank line inside the user bubble. */
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+
+  .user-command-text {
+    display: block;
+    margin-bottom: 2px;
+    color: #fde68a;
+    font-weight: 650;
   }
 
   /* 用户气泡是固定蓝底，markdown 内部所有文本/标记/代码块都强制白色，

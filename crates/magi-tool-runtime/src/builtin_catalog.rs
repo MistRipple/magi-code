@@ -878,10 +878,9 @@ impl BuiltinToolName {
                 "读取指定路径文件的内容。\n\n\
                 # 何时用\n\
                 - 需要查看文件内容、配置、源码以做出后续决策\n\
-                - 读取已知具体路径的文件（含大文件可用 max_bytes 截取）\n\n\
-                - 已知目录路径时可直接读取一层目录项\n\n\
+                - 读取已知路径；start_line / end_line 按 1 起算、首尾均包含，max_bytes 限制返回内容\n\n\
                 # 何时不用\n\
-                - 递归查找文件路径 → 用 search_text 或 shell_exec 的只读命令\n\
+                - 递归查找文件路径 → 用 search_text(target=path)\n\
                 - 跨文件搜索文本 → 用 search_text，不要逐个 file_read 后自己 grep\n\
                 - 语义检索代码 → 用 search_semantic\n\n\
                 # 反例\n\
@@ -895,7 +894,7 @@ impl BuiltinToolName {
                 - 用户给出图片路径，或代码生成了图片后需要视觉检查\n\n\
                 # 何时不用\n\
                 - 读取文本文件 → 用 file_read\n\
-                - 列目录或查找图片文件路径 → 用 search_text 或 shell_exec 的只读命令\n\n\
+                - 列目录或查找图片文件路径 → 用 search_text(target=path)\n\n\
                 # 约束\n\
                 - 只支持 png/jpeg/gif/webp\n\
                 - 输出会同时包含审计 JSON 和模型可用的 image content；不要把 base64 当普通文本复述"
@@ -952,7 +951,7 @@ impl BuiltinToolName {
                 "移动或重命名文件 / 目录。目标已存在时需要 overwrite=true：文件被原子替换；目标是已存在的目录时还必须设置 confirm_replace_directory=true，整个旧目录会被替换（失败时自动恢复）。不能把目录移动到它自己内部。"
             }
             Self::SearchText => {
-                "在当前工作区或指定目录下跨文件搜索文本。默认按字面量匹配；多关键词、分组或模式搜索使用 query_mode=regex。该能力跨 macOS、Windows、Linux 一致，文本检索禁止改用 shell_exec 调用 rg/grep。query 必填且不得为空。"
+                "在工作区查找文件或搜索文本。target=path 匹配相对文件路径、只返回文件名；target=content（默认）搜索文件内容，output_mode=files 可只返回命中文件，再用 file_read 按行范围读取。query 必填且不得为空；列出全部文件可用 target=path, query_mode=regex, query=.+。默认字面量匹配，模式搜索用 query_mode=regex。遵守 .gitignore/.ignore，默认跳过隐藏项、构建目录和符号链接。行号与 Unicode 字符列号从 1 开始。能力随 daemon 编译交付，跨 macOS、Windows、Linux 一致；禁止改用 shell_exec 调用 rg/grep。"
             }
             Self::SearchSemantic => "本地混合代码检索：联合词法、符号和依赖关系定位相关代码",
             Self::ShellExec => {
@@ -971,7 +970,7 @@ impl BuiltinToolName {
                 - 读文件内容 → file_read（更安全、有大小保护）\n\
                 - 写文件内容 → file_write（避免引号转义陷阱）\n\
                 - 改文件局部 → file_patch（避免 Shell 转义问题）\n\
-                - 查找文本或文件路径 → 必须使用 search_text / search_semantic；禁止调用 rg，避免依赖用户系统是否安装\n\
+                - 查找文本或文件路径 → 必须使用 search_text（target=path 找文件、target=content 搜文本）；禁止调用 rg，避免依赖用户系统是否安装\n\
                 - 读取 package.json、Cargo.toml 等清单 → 使用 file_read，不要仅为解析清单依赖 node/python\n\
                 - Git 状态、分支、拉取、推送、合并、删除和 worktree 生命周期 → 使用 git_status / git_branch_* / git_pull / git_push / git_merge* / git_worktree_*，不要调用 git shell 命令绕过 session context、CAS 与 lease\n\
                 - 不要直接调用 process_launch / process_read / process_write / process_kill / process_list；它们是 shell_exec 的内部后台能力\n\n\
@@ -1194,12 +1193,15 @@ impl BuiltinToolName {
             Self::FileRead => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要读取文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
+                    "path": { "type": "string", "description": "要读取的 UTF-8 普通文件的工作区相对路径（推荐）或当前平台原生绝对路径；找文件用 search_text(target=path)" },
+                    "start_line": { "type": "integer", "minimum": 1, "description": "起始行（从 1 开始，默认 1）" },
+                    "end_line": { "type": "integer", "minimum": 1, "description": "结束行（包含），省略则读到文件末尾或字节上限" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "读取与内容版本计算总时限，默认 10000 毫秒" },
                     "max_bytes": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 1048576,
-                        "description": "文件预览最多读取的字节数（默认 65536，最大 1048576）"
+                        "description": "读取范围最多返回的 UTF-8 字节数（默认 65536，最大 1048576）"
                     }
                 },
                 "required": ["path"]
@@ -1309,11 +1311,15 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "root": { "type": "string", "description": "可选搜索根目录；默认当前工作区" },
-                    "query": { "type": "string", "minLength": 1, "description": "必填、非空的搜索文本或正则表达式" },
+                    "query": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "必填、非空的搜索文本或正则表达式，最多 4096 个字符" },
                     "query_mode": { "type": "string", "enum": ["literal", "regex"], "description": "匹配模式：literal 为字面量（默认），regex 为跨平台正则表达式" },
-                    "limit": { "type": "integer", "description": "最大结果数" },
+                    "target": { "type": "string", "enum": ["content", "path"], "description": "content 搜索内容（默认），path 查找相对文件路径" },
+                    "output_mode": { "type": "string", "enum": ["matches", "files"], "description": "matches 返回命中行；files 只返回文件路径。target=path 时必须为 files（可省略）" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "最大结果数，默认 20" },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "description": "结果条目序列化后的总字节上限，默认 65536；每段摘录最多 2048 字节" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "搜索总时限，默认 10000 毫秒" },
                     "case_sensitive": { "type": "boolean", "description": "是否区分大小写" },
-                    "include_hidden": { "type": "boolean", "description": "是否包含隐藏文件与目录" }
+                    "include_hidden": { "type": "boolean", "description": "是否包含隐藏文件与目录；不会关闭 ignore 规则或权限限制" }
                 },
                 "required": ["query"]
             }),

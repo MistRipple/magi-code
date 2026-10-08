@@ -62,6 +62,9 @@ pub struct ChatToolChoiceFunction {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// 由消息装配端指定的统计来源；仅供本地上下文估算，不发送给模型。
+    #[serde(skip)]
+    pub context_origin: ChatMessageOrigin,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -77,6 +80,16 @@ pub struct ChatMessage {
     /// 持久化，协议适配器负责校验并按原协议回放。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_context: Vec<ModelProviderContext>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatMessageOrigin {
+    #[default]
+    Conversation,
+    SystemInstruction,
+    ProjectContext,
+    Skill,
+    ContextReference,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

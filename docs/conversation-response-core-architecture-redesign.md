@@ -1,9 +1,9 @@
 # Magi 消息响应核心架构：目标与验收合同
 
 > 本文是目标架构和验收合同的唯一来源：定义职责边界、持久化/事件合同、场景范围及整体完成条件。
-> 当前状态和证据只维护在[重构进度](conversation-response-core-architecture-progress.md)；性能测量与候选预算只维护在[性能计划](conversation-response-performance-plan.md)。
+> 性能测量见[性能验证](conversation-performance-validation.md)，可执行验证入口见[脚本与验证入口](validation.md)。历史重构进度与验收记录通过 Git 历史追溯。
 >
-> 本文中的“必须/不得”是规范性约束，不是当前实现声明；是否满足只看进度文档中可复核的代码、测试、构建或真实运行证据。
+> 本文中的“必须/不得”是规范性约束，不是当前实现声明；是否满足须核对当前源码、测试、构建和本次真实运行证据。
 
 阅读顺序：先看第 2–5 节理解所有权和运行合同，再看第 6 节验证入口，最后用第 7 节判断是否允许关闭。当前状态、artifact 和统计不要写回本文。
 
@@ -102,6 +102,14 @@ Coordinator 不得在状态锁内执行外部 IO。模型、工具、Git 和 Tas
 - 主线 Task 执行器遇到失败时，只能先 durable upsert 失败 item；不得在 TaskStore 终态提交前发布 `Turn failed` 或 canonical terminal event。TaskStore 的 Failed/Killed/Completed 提交后，由 finalizer 收口 Coordinator、资源 settlement，再由 Sink 发布唯一终态快照；sidechain 详情 item 不拥有 root Turn 终态，可以即时展示。
 - Task mutation 临界区不得写 SessionStore、同步磁盘或调用跨域回调。
 - 子代理只有在角色、能力、模型、父任务、容量和 Git 预检全部通过后，才可固化角色快照并原子创建 child task；预检失败不得创建 Task、lease 或 Thread。
+
+### 子代理生命周期
+
+TaskStore 的父子关系是任务树的唯一来源。父任务进入终态时级联终止未结束子树；agent_cancel 只能取消直接派发的代理及其子树。agent_wait 读取终态时生成的结构化回执，执行命令、退出码和文件变更来自工具记录。等待支持 all/any；审批关注信号可以提前返回，已结束的结果在超时返回时也计入已收集。
+
+代理工作区从父工作树的派发时快照建立，包含未提交与未跟踪文件，不改变用户 index 和工作树。产出在代理分支提交后写入回执，通过 agent_apply 合入主线；冲突必须返回明确事实。详见[会话 Git 工作流](session-git-workflow.md)。
+
+容量、角色和能力来自现有准入与角色注册表。只读角色的限制在工具权限层执行；子代理不隐式继承父任务的 Skill，排队代理的补充消息在启动时读取。相关回归位于 task_store、tool_batch、agent_spawn_preflight 和 task_execution_dispatcher。
 
 ### 3.4 `CanonicalTurnEventSink`
 
@@ -258,7 +266,7 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 
 ### 6.1 真实入口与轨迹
 
-`MagiTurnHarness` 必须经过真实 `TurnService`、Coordinator、事件投递和 projection；只调用 Sink 内部函数的单测只能证明局部 mutation。轨迹字段、阶段、异常 outcome 和 ledger 校验规则统一见[性能计划 §2](conversation-response-performance-plan.md#2-统一轨迹合同)。
+`MagiTurnHarness` 必须经过真实 `TurnService`、Coordinator、事件投递和 projection；只调用 Sink 内部函数的单测只能证明局部 mutation。检查结果保留请求身份、实际 outcome 和终态；性能问题的观察边界见[性能验证](conversation-performance-validation.md)。
 
 关闭测试宿主必须遵循：
 
@@ -266,13 +274,13 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 停止新接纳 -> 取消活动 Turn -> 等待 settlement promise -> 关闭 daemon/runtime/GUI
 ```
 
-固定 sleep、看到进程退出就猜终态、测试清理直接写 canonical terminal 都不是完成证据。测试宿主必须等到真实 settlement；异常轨迹的必需阶段和缺席原因按性能计划校验，不得合成事件。
+固定 sleep、看到进程退出就猜终态、测试清理直接写 canonical terminal 都不是完成证据。测试宿主必须等到真实 settlement；异常结果须记录缺失阶段与原因，不得合成事件。
 
-### 6.2 声明的最小场景集
+### 6.2 按风险选择场景
 
-矩阵是“声明的最小场景集”，不是未经说明的笛卡尔积；进度文档必须列出已覆盖、未覆盖和有意不组合的项，代表性样本不能扩大解释为完整覆盖。每个声明切片都必须能回到真实入口、版本化轨迹和单一终态证据。
+下表用于按改动选择覆盖范围，不要求每次运行全部组合。日常优先运行直接受影响的模块回归；跨进程、恢复、权限或持久化边界改变时，补充对应的核心集成场景。验收结论只覆盖实际运行的路径。
 
-| 维度 | 最小场景集 |
+| 维度 | 可选覆盖范围 |
 | --- | --- |
 | Session | 新建、短历史、长历史、压缩后、个人、工作区 |
 | Profile | `conversation`、`task` |
@@ -284,13 +292,13 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 
 空流和超时若通过 fault-injection fixture 复现，只能关闭真实 HTTP bridge/daemon 的 transport 异常收口、重试边界和 settlement 切片；Provider 业务可用性仍须由真实上游正常流或明确的上游错误响应单独证明，不能把 fault-injection 结果扩大为完整 Provider 矩阵。
 
-最小场景集按“单维度覆盖 + 有理由的风险组合”验收：先覆盖每个 profile、生命周期和载体的独立入口，再为权限、Git、审批、Browser、MCP、process 和子代理补充会改变事实所有权或真实副作用的组合。未声明的笛卡尔积不属于默认交付范围；新增组合必须在进度台账中写明理由、入口和证据。
+同一风险已有核心集成入口覆盖时，不再维护第二套采样或报告脚本。新增场景应落入所属入口，说明它保护的行为；完整跨平台发布验证仍遵循发布流程。
 
 ## 7. 完成定义与设计复审
 
 ### 7.1 整体完成定义
 
-只有进度文档中的 A–G 全部关闭，并且下列条目逐项具有代码、测试或真实运行证据，才允许宣称重构完成。A–G 的状态以进度文档为准，本文件不保存当前 artifact 或通过记录：
+只有下列条目逐项具有与本次源码和构建对应的测试或真实运行证据，才允许宣称相关改动完成。本文件不保存某次运行的 artifact 或通过记录：
 
 1. `conversation` 不创建 TaskRun、lease、Runner、Git execution context 或 task execution snapshot；只读 `context_snapshot_id` 不属于 TaskRun 资源。
 2. 每个 Session 只有一个 active Coordinator；HTTP 和 App Server 使用同一个 TurnService。
@@ -299,8 +307,8 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 5. Task/Agent 完成由 durable commit + notifier 驱动，不依赖周期轮询；迟到结果被拒绝。
 6. 普通 delta 使用有界写回，终态、重连和重启恢复内容一致。
 7. 权限、Git、MCP、Browser、process 和子代理的声明场景集逐行可复核，包含真实副作用或明确拒绝、审批和终态关联。
-8. Rust、Web、daemon、打包 Electron 和真实 Provider 的声明最小场景集及风险组合均由真实入口验证；代表性或 mock 证据不能补齐未声明切片的缺口。
-9. 性能计划中的 before/after 使用同一 fixture、schema、derive 版本和统计口径，所有硬门槛有可审计结果；候选预算若未满足，必须有版本化原因和复测或重新基线记录，不能静默放宽。只有具备独立源码/可执行文件身份的 baseline 才能把差异解释为性能收益；同一 dirty worktree 上不同 artifact 的结果最多证明可复算、预算观察和采样稳定性。
+8. 受影响模块通过定向回归；涉及跨进程和真实副作用的改动通过对应集成入口。真实 Provider 问题另做上游验证，不把本地 fixture 通过当作上游可用性证明。
+9. 只有涉及性能收益的声明才要求同口径 before/after；保留原始数据、源码/构建身份及失败样本。普通行为修复不要求批量性能采样与报告派生。
 10. 已证明不可达的旧双轨、同步提交、轮询终态和无效兼容语义已删除；保留的迁移/恢复/协议兼容语义有边界说明。
 
 ### 7.2 设计复审触发条件
@@ -308,7 +316,7 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 遇到以下任一情况，应暂停实现并重新评审，而不是继续堆加兼容分支：
 
 - 需要新增数据库、远程队列、跨进程 outbox 或独立 Task Domain Log；
-- 普通 Chat 仍必须创建 Task/lease/Runner 才能返回；
+- 会话命令或 GPT Web 的 conversation profile 被要求创建 Task/lease/Runner 才能返回；
 - 同一个 Turn 仍由多个 store、Runner 或前端分别决定终态；
 - 需要“新路径失败后回退旧路径”；
 - 只能通过 sleep、轮询、前端 loading 或 bootstrap 刷新掩盖响应延迟；

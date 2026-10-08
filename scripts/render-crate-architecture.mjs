@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -24,6 +24,14 @@ const GROUP_LABEL = {
 };
 
 const CRATE_META = {
+  'magi-app-server-protocol': ['bus', 'App Server schema 生成的协议与消息行为'],
+  'magi-appearance': ['base', '跨宿主外观资产与主题资源'],
+  'magi-browser-authority': ['bus', 'Browser Tab、Surface、租约与持久化权威'],
+  'magi-git': ['storage', '结构化 Git 操作、仓库观测与 worktree'],
+  'magi-mcp-server': ['api', '对外 MCP 服务、令牌、传输与网络入口'],
+  'magi-process': ['base', '子进程、Shell 与跨平台进程生命周期'],
+  'magi-session-isolation': ['storage', '会话隔离工作副本与合并'],
+  'magi-web-model': ['bus', 'GPT Web 槽位客户端与远端会话同步'],
   'magi-agent-role': ['exec', 'AgentRole：角色定义、注册表与文件加载'],
   'magi-api': ['api', 'HTTP / 路由、MCP 配置、session 标题'],
   'magi-bridge-client': ['bus', 'LLM 桥接客户端：适配器、决策引擎、最终文本策略'],
@@ -36,7 +44,6 @@ const CRATE_META = {
   'magi-governance': ['bus', '审批 / 决策请求模型'],
   'magi-knowledge-store': ['storage', '本地代码检索引擎：扫描、分词、倒排索引、依赖图'],
   'magi-memory-store': ['storage', '记忆存储'],
-  'magi-mission-metrics': ['mission', '执行组记账：turn、token、wall-clock'],
   'magi-orchestrator': ['exec', '任务编排核心：任务存储、worker 目录、风险与校验策略'],
   'magi-permissions': ['bus', 'L7 工具 / 目录 / 命令三维权限与访问模式'],
   'magi-project-memory': ['storage', 'L14 跨 session / conversation 的项目记忆'],
@@ -46,7 +53,6 @@ const CRATE_META = {
   'magi-session-store': ['storage', '会话生命周期与持久化'],
   'magi-skill-runtime': ['exec', '技能运行时'],
   'magi-snapshot': ['base', 'workspace 文件变更账本'],
-  'magi-spawn-graph': ['exec', 'L5 SpawnGraph：父子 agent spawn 拓扑'],
   'magi-plan': ['mission', 'SessionPlan：用户可见计划协议与执行任务绑定'],
   'magi-tool-runtime': ['exec', '工具执行运行时'],
   'magi-usage-authority': ['bus', 'token 计费、上下文窗口、模型身份、用量账本'],
@@ -78,9 +84,9 @@ const BUSINESS_FLOW = [
   },
   {
     id: 'routing',
-    title: '任务识别与分派',
-    desc: '对话意图被提升为执行链或子 agent 工作；orchestrator 决定执行角色，worker-runtime 承接实际执行。',
-    crates: ['magi-orchestrator', 'magi-agent-role', 'magi-worker-runtime', 'magi-spawn-graph'],
+    title: '任务接纳与分派',
+    desc: 'TurnService 统一接纳请求；HTTP Provider 经 TaskStore 与调度器执行，子代理使用同一任务树和角色注册表。',
+    crates: ['magi-orchestrator', 'magi-agent-role', 'magi-worker-runtime'],
     risk: '显式绑定的任务模型失败必须可见，不能静默 failover 到编排模型。',
   },
   {
@@ -93,9 +99,9 @@ const BUSINESS_FLOW = [
   {
     id: 'closure',
     title: '目标、状态与恢复闭环',
-    desc: 'Session Goal、SessionPlan、ExecutionChain、snapshot、event bus 和项目记忆共同支撑持续推进、恢复、审计与下一轮上下文。',
-    crates: ['magi-session-store', 'magi-plan', 'magi-conversation-runtime', 'magi-snapshot', 'magi-event-bus', 'magi-project-memory', 'magi-mission-metrics'],
-    risk: 'Goal、任务清单和执行链必须各自保持单一权威状态，禁止恢复旧 Mission 治理双轨。',
+    desc: 'Session Goal、SessionPlan、TaskStore、snapshot、canonical 事件日志和项目记忆支撑持续推进、恢复与审计。',
+    crates: ['magi-session-store', 'magi-plan', 'magi-conversation-runtime', 'magi-snapshot', 'magi-event-bus', 'magi-project-memory'],
+    risk: 'Goal、计划、任务树和 canonical Turn 日志各自保持单一权威状态。',
   },
 ];
 
@@ -114,6 +120,17 @@ function buildGraph(metadata) {
     .sort((a, b) => a.name.localeCompare(b.name));
   const packageByName = new Map(packages.map((pkg) => [pkg.name, pkg]));
   const internalNames = new Set(packageByName.keys());
+  for (const name of Object.keys(CRATE_META)) {
+    if (!internalNames.has(name)) throw new Error('架构说明引用已删除的 crate：' + name);
+  }
+  for (const name of internalNames) {
+    if (!Object.hasOwn(CRATE_META, name)) throw new Error('新 crate 缺少架构说明：' + name);
+  }
+  for (const step of BUSINESS_FLOW) {
+    for (const name of step.crates) {
+      if (!internalNames.has(name)) throw new Error('业务流程引用已删除的 crate：' + name);
+    }
+  }
   const edges = [];
 
   for (const pkg of packages) {
@@ -143,13 +160,13 @@ function buildGraph(metadata) {
   for (const pkg of packages) depth(pkg.name);
 
   const nodes = packages.map((pkg) => {
-    const [group, desc] = CRATE_META[pkg.name] || ['base', '未归类 crate'];
+    const [group, desc] = CRATE_META[pkg.name];
     return {
       id: pkg.name,
       group,
       desc,
       layer: layers.get(pkg.name),
-      path: pkg.manifest_path.replace(`${root}/`, '').replace('/Cargo.toml', ''),
+      path: relative(root, dirname(pkg.manifest_path)).split(sep).join('/'),
     };
   });
 
@@ -396,8 +413,8 @@ function renderFlow() {
   rails.className = 'flow-rails';
   rails.innerHTML = \`
     <div class="rail"><b>横切治理</b><span>permissions / governance / safety-gate 贯穿工具、命令、目录访问和高危操作。</span></div>
-    <div class="rail"><b>可观测账本</b><span>event-bus / mission-metrics / usage-authority 记录事件、token、窗口和执行进度。</span></div>
-    <div class="rail"><b>恢复能力</b><span>snapshot / checkpoint / human-checkpoint / validation-runner 支撑中断恢复和完成性校验。</span></div>
+    <div class="rail"><b>可观测账本</b><span>event-bus / usage-authority 记录事件、token、上下文窗口和执行进度。</span></div>
+    <div class="rail"><b>恢复能力</b><span>session-store 的 canonical 检查点、TaskStore 与 snapshot 支撑中断恢复和变更核对。</span></div>
   \`;
   flowView.appendChild(grid);
   flowView.appendChild(rails);

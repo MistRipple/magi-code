@@ -475,6 +475,7 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       content: item.content,
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,
+      command: item.command === 'compact' ? 'compact' : null,
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,

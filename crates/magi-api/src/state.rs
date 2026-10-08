@@ -1049,13 +1049,14 @@ impl Default for BrowserHostStatusSnapshot {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionResourceCancellationReport {
-    pub process_count: usize,
+    pub tool_execution_count: usize,
     pub browser_lease_count: usize,
 }
 
 impl ExecutionResourceCancellationReport {
     pub fn total(self) -> usize {
-        self.process_count.saturating_add(self.browser_lease_count)
+        self.tool_execution_count
+            .saturating_add(self.browser_lease_count)
     }
 }
 
@@ -1097,15 +1098,15 @@ impl ExecutionResourceCoordinator {
         reason: BrowserLeaseEndReason,
         now: UtcMillis,
     ) -> ExecutionResourceCancellationReport {
-        let process_count = self
+        let tool_execution_count = self
             .tool_registry
             .read()
             .expect("execution resource tool registry lock poisoned")
             .as_ref()
-            .map_or(0, |registry| registry.cancel_active_processes(&query));
+            .map_or(0, |registry| registry.cancel_active_executions(&query));
         let browser_lease_count = self.revoke_browser_leases(&query, reason, now);
         ExecutionResourceCancellationReport {
-            process_count,
+            tool_execution_count,
             browser_lease_count,
         }
     }
@@ -3204,16 +3205,14 @@ impl ApiState {
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
-        let mut dto = runtime_read_model_dto_with_usage(
+        runtime_read_model_dto_with_usage(
             self.event_bus.runtime_read_model_input(),
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
             self.task_store(),
             &self.ledger_usage_observations(),
-        );
-        crate::dto::apply_configured_model_context_windows(&mut dto, &self.settings_store);
-        dto
+        )
     }
 
     /// 当前 daemon 的执行准入状态。未装配任务 Runner 的最小化 API 状态不会伪造
@@ -4032,7 +4031,10 @@ impl ApiState {
                 .lock()
                 .expect("session workspace waits lock poisoned");
             if waiting {
-                waits.insert(session_id.as_str().to_string(), blocking_session_ids.to_vec());
+                waits.insert(
+                    session_id.as_str().to_string(),
+                    blocking_session_ids.to_vec(),
+                );
             } else {
                 waits.remove(session_id.as_str());
             }

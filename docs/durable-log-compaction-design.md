@@ -1,16 +1,14 @@
 # 持久日志的追加写入与压缩设计
 
-本文覆盖 daemon 中两类只增不减的持久日志：审计/用量账本（P2-4）与会话 canonical 事件日志（P2-5）。两者的共同问题是写入或启动成本随历史总量线性增长；本设计让写入成本只与新增量相关，启动成本只与最近一次压缩之后的增量相关。
+本文覆盖 daemon 中两类只增不减的持久日志：审计/用量账本与会话 canonical 事件日志。两者的共同问题是写入或启动成本随历史总量线性增长；本设计让写入成本只与新增量相关，启动成本只与最近一次压缩之后的增量相关。
 
-## 1. 审计/用量账本（P2-4）
+## 1. 审计/用量账本
 
-### 1.1 现状与问题
+### 1.1 状态所有权
 
-- 内存：`InMemoryEventBus` 持有 `AuditUsageLedgerSnapshot`（`audit_entries` / `usage_entries` 两个按 sequence 递增的数组）。
-- 磁盘：`state_root/audit-usage-ledger.json` 单文件。运行时维护每 5 秒检查一次 `pending_flush`，有新条目就把**整本账本**序列化后原子重写。账本已有数万条、数十 MB，一次刷盘就要整体序列化并写满文件，拖慢 daemon（心跳超时、工具调用卡顿）。
-- 「重置执行统计」通过删除内存中的 `model.usage.recorded` 条目再整本重写实现。
+InMemoryEventBus 持有审计/用量快照与刷盘水位，StateRepository 负责启动加载。磁盘使用分段 JSONL，执行统计重置通过 usage.stats.reset 事件记录。
 
-### 1.2 目标结构
+### 1.2 持久化结构
 
 ```
 state_root/audit-usage-ledger/
@@ -20,31 +18,30 @@ state_root/audit-usage-ledger/
 
 - **只追加**：每行一条 `{"category":"audit"|"usage", ...AuditUsageLedgerEntry}`。刷盘只把内存中 sequence 大于「已落盘水位」的条目按 sequence 顺序追加到活动段，然后 `sync_data`。水位与刷盘互斥锁放在一起，由事件总线持有；不再有整本序列化。
 - **分段**：活动段超过 8 MiB 时，新条目写入以其首个 sequence 命名的新段。段是保留策略的删除单位。
-- **保留**：保留最近 180 天。启动加载时，最新条目早于保留期的整段被删除，内存只装载保留下来的段。保留只在启动时执行；daemon 长时间运行期间内存仍只增，但单次刷盘成本与历史量无关。
+- **保留**：保留最近 180 天。启动加载时，最新条目早于保留期的整段被删除；最新一段始终保留以延续 sequence，内存只装载保留下来的段。保留只在启动时执行；daemon 长时间运行期间内存仍只增，但单次刷盘成本与历史量无关。
 - **崩溃语义**：追加写可能在最后一行中途中断。加载时只有**最后一段**允许出现不以换行结尾的残行，按 WAL 惯例截断到最后一个完整行；任何完整但无法解析的行、或非最后一段的残行，都视为损坏，拒绝以空账本继续（与现有状态文件的严格策略一致）。
 - **重置执行统计**：不再删除历史条目，而是经事件总线发布一条用量事件 `usage.stats.reset`（与其他条目走同一写入路径）。执行统计只统计最后一次重置之后的 `model.usage.recorded`。会话用量观测（重启后回填预算）不受统计重置影响。
 
-### 1.3 接口变化
+### 1.3 接口职责
 
-| 位置 | 变化 |
+| 位置 | 职责 |
 | --- | --- |
-| `magi-event-bus::ledger` | 新增按目录读写分段的函数：加载（含残行截断与保留删除）与追加。删除整本 `export_json` / `import_json` / `persist_to_path` / `load_from_path`。 |
-| `InMemoryEventBus` | `set_audit_usage_ledger_persistence(dir)` 指向段目录；`refresh_audit_usage_ledger_persistence` 改为增量追加；`import_audit_usage_ledger_snapshot` 改名为 `restore_persisted_audit_usage_ledger`，同时把水位推进到已落盘的最大 sequence。删除 `export/import_audit_usage_ledger_json`、`persist/restore/reset_audit_usage_ledger`。 |
-| `StateRepository` | `audit_usage_ledger_path()` 返回段目录；`load_audit_usage_ledger()` 从段目录加载。 |
-| 设置 `reset_stats` | 改为发布 `usage.stats.reset` 后刷盘。 |
+| magi-event-bus::ledger | 分段加载、残行截断、保留删除和增量追加。 |
+| InMemoryEventBus | 设置段目录、刷新增量、恢复快照并推进已落盘水位。 |
+| StateRepository | 提供段目录路径并加载账本。 |
+| 设置 reset_stats | 发布 usage.stats.reset 后刷盘。 |
 
 ### 1.4 只接受分段格式
 
 持久化账本只有段目录这一种格式。`StateRepository::load_audit_usage_ledger` 只从段目录加载，不做旧格式迁移，也不识别任何旧版账本文件。
 
-## 2. 会话 canonical 事件日志（P2-5）
+## 2. 会话 canonical 事件日志
 
-### 2.1 现状与问题
+### 2.1 状态所有权
 
-- 每个会话的 `state_root/session-events/<session>/` 下，每次提交写一个事务文件 `{first:020}-{last:020}.json`，从不合并。
-- `SessionConversationProjection::load` 每次都从第一个事务文件开始全量重放；启动时每个会话都会加载一次。历史一多，文件数与重放时间线性增长，可能超过 60 秒启动超时。
+每个会话的 canonical 事件日志是会话事实源；同目录内的检查点压缩已提交事务，加载时从最新检查点继续重放后续增量。
 
-### 2.2 目标结构
+### 2.2 持久化结构
 
 ```
 state_root/session-events/<session>/

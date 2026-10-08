@@ -280,10 +280,10 @@ async fn monitor_desktop_parent_process(state: ApiState, mut shutdown_rx: watch:
                     "Electron Desktop 已退出，daemon 正在收口浏览器运行资源"
                 );
                 interrupt_all_tasks_for_daemon_shutdown(&state);
-                let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
+                let cancelled_execution_count = ToolRegistry::cancel_all_active_executions();
                 let cancelled_managed_process_count = state.terminate_managed_processes();
                 tracing::info!(
-                    cancelled_process_count,
+                    cancelled_execution_count,
                     cancelled_managed_process_count,
                     "Desktop parent death 清理已完成，daemon 即将退出"
                 );

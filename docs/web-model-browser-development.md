@@ -367,7 +367,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 | 已保存对话管理 | **新增 / 保留**：Web 历史列表、远端标题和消息增量同步、`conversation_id` 绑定；**不做**删除远端对话（用户在 Web 里自己删）；临时模式不写 Web 历史 |
 | `SettingsWebModelSection.svelte`（约 930 行） | **缩减**为登录状态、临时 / 已保存模式、停止、清除数据、T3 通道（约 150–250 行） |
 | 会话转换校验（`settings.rs`） | **改造**：以“会话引擎类型已固定”为准，不再用消息数启发式，不再有旁路开关 |
-| `scripts/verify-web-model-dom.mjs`（用假 ChatGPT 页面） | **重写**围绕：登录、发送与接收、槽位占用、失效判定、取消、停止；并补一份真实站点的手动验收清单 |
+| GPT Web 回归 | 浏览器 Worker 的 web-model-site 测试、Desktop 的 web-model-session 测试、Web 的 test:web-model 与 daemon/API 对应测试；真实登录、连接器握手、取消和槽位释放按 §13 验收，不再引用已删除的假站点脚本 |
 
 预计删除或缩减约 8,000–9,000 行，占新增总量的三分之一到四成。
 

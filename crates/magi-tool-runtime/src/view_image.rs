@@ -42,7 +42,7 @@ pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) ->
             "not_a_file",
             "目标不是文件，view_image 只能读取图片文件",
         )
-        .instruction("用 file_read 查看目录内容，再用具体的图片文件路径调用。")
+        .instruction("用 search_text(target=path) 查找图片路径，再用具体的图片文件路径调用。")
         .into_payload();
     }
     if metadata.len() > max_bytes {

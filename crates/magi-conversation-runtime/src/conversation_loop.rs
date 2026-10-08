@@ -1,6 +1,6 @@
 use crate::context_authority::{
     ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
-    current_session_file_facts, estimate_chat_messages_tokens, estimate_tool_definition_tokens,
+    current_session_file_facts, estimate_context_usage_breakdown,
 };
 #[cfg(test)]
 use crate::context_authority::{
@@ -143,6 +143,8 @@ pub struct ConversationLoopRequest<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub prompt: String,
+    /// 本次执行的引用和任务事实，与用户正文分开装配，不写入对话 transcript。
+    pub task_context_messages: Vec<ChatMessage>,
     pub images: Vec<SessionTurnImage>,
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub usage_binding: &'a ModelUsageBinding,
@@ -185,6 +187,10 @@ fn direct_runtime_error(error: &BridgeClientError, default_message: &str) -> Str
 /// bridge-client，不承担额外语义。
 pub(crate) fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessage {
     ChatMessage {
+        context_origin: match message.role.as_str() {
+            "system" | "developer" => magi_bridge_client::ChatMessageOrigin::SystemInstruction,
+            _ => magi_bridge_client::ChatMessageOrigin::Conversation,
+        },
         role: message.role.clone(),
         content: message.content.clone(),
         images: message
@@ -738,6 +744,7 @@ fn run_conversation_loop_inner(
         session_id,
         workspace_id,
         prompt,
+        task_context_messages,
         images,
         tools,
         usage_binding,
@@ -786,15 +793,14 @@ fn run_conversation_loop_inner(
     //     S9   PlanStore 快照
     //     Mailbox 待处理消息
     //     Thread 历史 (append-only — 前缀稳定，append 不破前缀缓存)
-    //     本轮 user 输入 (S2-S8 由 assemble_prompt 预拼装)
+    //     本轮 user 输入（只含当前任务正文）
     //
-    // 上游 task_execution_dispatcher::assemble_prompt 将当前任务事实与参考数据
-    // 放进 `prompt`，将角色、Skill、用户规则和安全规则放进 `system_prompt`。
+    // 上游 task_execution_dispatcher::assemble_prompt 将当前任务事实与参考数据分开装配，用户正文放进 `prompt`，将角色、用户规则和安全规则放进 `system_prompt`。
     //   S1 → system_prompt（本函数首条 Role developer fragment）
     //   S2 base task goal / title → prompt 用户消息
-    //   S3 上下文摘要 (knowledge / memory / shared_context) → prompt 用户消息
-    //   S4 task_fact_context → prompt 用户消息
-    //   S5 skill prompt injections → system_prompt developer 前缀
+    //   S3 上下文摘要 (knowledge / memory / shared_context) → 独立引用消息
+    //   S4 task_fact_context → 独立任务事实消息
+    //   S5 skill prompt injections → 独立的 Skill developer 消息
     //   S6 用户规则 (settings.userRules) → system_prompt developer 前缀
     //   S7 安全规则 / S8 SafetyGate 危险模式 → system_prompt developer 前缀
     // 当前任务事实保持 user role 以保留本轮输入边界；运行时安全与授权规则保持
@@ -808,6 +814,13 @@ fn run_conversation_loop_inner(
             PromptFragmentKind::Role,
             system,
         ));
+    }
+    if let Some(skill_message) = skill_runtime.and_then(|runtime| {
+        skill_name
+            .as_deref()
+            .and_then(|id| crate::prompt_utils::skill_prompt_message(runtime, id))
+    }) {
+        static_context_messages.push(skill_message);
     }
     // [CACHE: STATIC] S8b · Workspace 根目录上下文。
     // 引导模型把"当前项目 / current repo"等措辞默认对齐到该 workspace；
@@ -831,6 +844,7 @@ fn run_conversation_loop_inner(
         .any(|m| matches!(m.role.as_str(), "system" | "developer"))
     {
         static_context_messages.push(ChatMessage {
+            context_origin: Default::default(),
             role: "system".to_string(),
             content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
             images: Vec::new(),
@@ -878,7 +892,7 @@ fn run_conversation_loop_inner(
         current_turn_context_priority_prompt(),
     ));
     messages.extend(build_task_context_base_messages(
-        &[],
+        &task_context_messages,
         project_memory,
         memory_write_visible,
         plan_store,
@@ -889,27 +903,23 @@ fn run_conversation_loop_inner(
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
     // 上下文权威层只生成「摘要 + 最近完整消息」模型视图，原始 transcript 永久追加保留。
-    let current_turn_budget_messages = vec![
-        system_prompt_fragment_message(
-            PromptFragmentKind::CurrentAccessProfile,
-            current_access_profile_prompt(current_access_profile, current_command_mode),
-        ),
-        system_prompt_fragment_message(
-            PromptFragmentKind::CurrentTurnPriority,
-            current_turn_context_priority_prompt(),
-        ),
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(prompt.clone()),
-            images: session_turn_image_sources(&images),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            provider_context: Vec::new(),
-        },
-    ];
-    let additional_token_estimate = estimate_chat_messages_tokens(&messages)
-        .saturating_add(estimate_chat_messages_tokens(&current_turn_budget_messages))
-        .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
+    let mut persisted_thread_history = session_store.thread_message_history(thread_id);
+    let resumed_task = !persisted_thread_history.is_empty()
+        && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
+    let current_user_message = (!resumed_task).then(|| ChatMessage {
+        context_origin: Default::default(),
+        role: "user".to_string(),
+        content: Some(prompt.clone()),
+        images: session_turn_image_sources(&images),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        provider_context: Vec::new(),
+    });
+    let mut additional_context = estimate_context_usage_breakdown(&messages, tools.as_deref());
+    additional_context.merge(&estimate_context_usage_breakdown(
+        current_user_message.as_slice(),
+        None,
+    ));
     let selected_context_model = resolved_model_for_usage_binding(
         settings_store.or(live_settings_store),
         usage_binding,
@@ -976,7 +986,7 @@ fn run_conversation_loop_inner(
     };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
-                                additional_token_estimate: usize,
+                                additional_context: magi_usage_authority::ContextUsageBreakdown,
                                 mode: ContextCompactionMode| {
         let compaction_item_id = new_context_compaction_item_id(task_id.as_str(), thread_id, phase);
         let compaction_writeback = ContextCompactionWritebackContext {
@@ -1010,7 +1020,7 @@ fn run_conversation_loop_inner(
             recovery_history: Vec::new(),
             phase,
             context_window_tokens: context_window,
-            additional_token_estimate,
+            additional_context,
             persist_checkpoint: vision_execution_config.is_none(),
             model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
                 vision_execution_config
@@ -1037,11 +1047,10 @@ fn run_conversation_loop_inner(
         }
         prepared
     };
-    let mut persisted_thread_history = session_store.thread_message_history(thread_id);
     let initial_prepared_history = prepare_task_history(
         "pre_turn",
         effective_context_window,
-        additional_token_estimate,
+        additional_context.clone(),
         ContextCompactionMode::Automatic,
     );
     if let Some(terminal) = initial_prepared_history.terminal {
@@ -1056,8 +1065,6 @@ fn run_conversation_loop_inner(
     }
     let mut proactive_context_compaction_completed = initial_prepared_history.compaction.is_some();
     let mut thread_history_snapshot = initial_prepared_history.messages;
-    let resumed_task = !persisted_thread_history.is_empty()
-        && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
     let inherits_interrupted_turn =
         !persisted_thread_history.is_empty() && task.recovery_checkpoint().is_some();
     let recovery_history = resumed_task || inherits_interrupted_turn;
@@ -1102,7 +1109,7 @@ fn run_conversation_loop_inner(
         let normalized_history = prepare_task_history(
             "interrupted_tool_normalization",
             effective_context_window,
-            additional_token_estimate,
+            additional_context.clone(),
             ContextCompactionMode::Automatic,
         );
         if let Some(terminal) = normalized_history.terminal {
@@ -1132,20 +1139,9 @@ fn run_conversation_loop_inner(
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 新 task 首次启动才追加该输入；恢复 runner 必须复用 thread 中已持久化的原始
     // 用户消息（包括图片），不能把同一任务再次作为一轮全新输入发送给模型。
-    if !resumed_task {
-        let current_user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(prompt.clone()),
-            images: session_turn_image_sources(&images),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            provider_context: Vec::new(),
-        };
+    if let Some(current_user_message) = current_user_message {
+        let mut persisted_user_message = chat_message_to_thread_chat_message(&current_user_message);
         messages.push(current_user_message);
-    }
-    if !resumed_task {
-        let current_user_message = messages.last().expect("当前任务必须包含用户消息");
-        let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
         // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，
         // 避免后续纯文本回合把历史图片再次发送给主模型。
         persisted_user_message.images.clear();
@@ -1279,7 +1275,7 @@ fn run_conversation_loop_inner(
             context_base_messages.push(skill_message);
         }
         context_base_messages.extend(build_task_context_base_messages(
-            &[],
+            &task_context_messages,
             project_memory,
             memory_write_visible,
             plan_store,
@@ -1289,8 +1285,7 @@ fn run_conversation_loop_inner(
         let prepared = prepare_task_history(
             phase,
             context_window,
-            estimate_chat_messages_tokens(&context_base_messages)
-                .saturating_add(estimate_tool_definition_tokens(round_tools)),
+            estimate_context_usage_breakdown(&context_base_messages, round_tools),
             mode,
         );
         if let Some(terminal) = prepared.terminal {
@@ -1603,6 +1598,7 @@ fn run_conversation_loop_inner(
             },
         };
         let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
+        let context_breakdown = estimate_context_usage_breakdown(&messages, round_tools.as_deref());
         let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
             let resolved_provider =
                 resolved_provider_for_usage_binding(settings_store, usage_binding, session_id);
@@ -1615,9 +1611,7 @@ fn run_conversation_loop_inner(
                 call_id: &round_call_id,
                 resolved_model: &resolved_context_model,
                 context_window_tokens: effective_context_window,
-                prefill_tokens: estimate_chat_messages_tokens(&messages)
-                    .saturating_add(estimate_tool_definition_tokens(round_tools.as_deref()))
-                    as u64,
+                context_breakdown: context_breakdown.clone(),
                 thread_id: Some(thread_id),
                 model_provider: resolved_provider,
                 binding_revision: usage_binding.binding_revision(),
@@ -1778,6 +1772,7 @@ fn run_conversation_loop_inner(
                             settings_store,
                             expected_turn_id.as_deref(),
                             crate::usage_recording::ModelUsageRecordInput {
+                                context_breakdown: None,
                                 session_id,
                                 workspace_id,
                                 binding: usage_binding,
@@ -1839,6 +1834,7 @@ fn run_conversation_loop_inner(
                         {
                             empty_response_recovery_attempts += 1;
                             messages.push(ChatMessage {
+                                context_origin: Default::default(),
                                 role: "user".to_string(),
                                 content: Some(
                                     model_empty_response_recovery_prompt(had_tool_calls)
@@ -1907,6 +1903,7 @@ fn run_conversation_loop_inner(
                                     return (TaskOutcome::Failed { error }, context_summary);
                                 }
                                 messages.push(ChatMessage {
+                                    context_origin: Default::default(),
                                     role: "assistant".to_string(),
                                     content: Some(partial_visible_content.clone()),
                                     images: Vec::new(),
@@ -1919,6 +1916,7 @@ fn run_conversation_loop_inner(
                                 !partial_visible_content.is_empty(),
                             );
                             messages.push(ChatMessage {
+                                context_origin: Default::default(),
                                 role: "user".to_string(),
                                 content: Some(recovery_prompt.to_string()),
                                 images: Vec::new(),
@@ -1969,6 +1967,7 @@ fn run_conversation_loop_inner(
                                         settings_store,
                                         expected_turn_id.as_deref(),
                                         crate::usage_recording::ModelUsageRecordInput {
+                                            context_breakdown: None,
                                             session_id,
                                             workspace_id,
                                             binding: usage_binding,
@@ -2102,6 +2101,7 @@ fn run_conversation_loop_inner(
                         settings_store,
                         expected_turn_id.as_deref(),
                         crate::usage_recording::ModelUsageRecordInput {
+                            context_breakdown: None,
                             session_id,
                             workspace_id,
                             binding: usage_binding,
@@ -2157,6 +2157,7 @@ fn run_conversation_loop_inner(
                     {
                         empty_response_recovery_attempts += 1;
                         messages.push(ChatMessage {
+                            context_origin: Default::default(),
                             role: "user".to_string(),
                             content: Some(
                                 model_empty_response_recovery_prompt(had_tool_calls).to_string(),
@@ -2369,6 +2370,7 @@ fn run_conversation_loop_inner(
             expected_turn_id.as_deref(),
             effective_context_window,
             crate::usage_recording::ModelUsageRecordInput {
+                context_breakdown: Some(context_breakdown),
                 session_id,
                 workspace_id,
                 binding: usage_binding,
@@ -2426,6 +2428,7 @@ fn run_conversation_loop_inner(
         }
 
         let assistant_response_message = ChatMessage {
+            context_origin: Default::default(),
             role: "assistant".to_string(),
             content: assistant_history_content.clone(),
             images: Vec::new(),
@@ -2510,6 +2513,7 @@ fn run_conversation_loop_inner(
                 completion_recovery_attempts += 1;
                 messages.push(assistant_response_message.clone());
                 messages.push(ChatMessage {
+                    context_origin: Default::default(),
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
                     images: Vec::new(),
@@ -2527,6 +2531,7 @@ fn run_conversation_loop_inner(
                     messages.push(assistant_response_message.clone());
                 }
                 messages.push(ChatMessage {
+                    context_origin: Default::default(),
                     role: "user".to_string(),
                     content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
                     images: Vec::new(),
@@ -2836,6 +2841,7 @@ fn run_conversation_loop_inner(
                 activated_skill_this_round = Some(skill_id);
             }
             let tool_result_message = ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some(model_visible_tool_result(&result, tool_status)),
                 images: Vec::new(),
@@ -4447,7 +4453,7 @@ mod tests {
             recovery_history: recovery_history.clone(),
             phase: "pre_turn",
             context_window_tokens: 256_000,
-            additional_token_estimate: 0,
+            additional_context: Default::default(),
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4471,11 +4477,32 @@ mod tests {
                 .any(|event| event.event_type == "session.context.compacted")
         );
 
+        let pressure = event_bus
+            .with_audit_usage_ledger(|ledger| {
+                magi_event_bus::latest_usage_observation_for_session(
+                    &ledger.usage_entries,
+                    session_id.as_str(),
+                )
+            })
+            .expect("compaction must publish its own pressure snapshot");
+        let expected = estimate_context_usage_breakdown(
+            &first
+                .messages
+                .iter()
+                .map(thread_chat_message_to_chat_message)
+                .collect::<Vec<_>>(),
+            None,
+        );
+        assert_eq!(pressure.phase.as_deref(), Some("compacted"));
+        assert_eq!(pressure.projected_request_tokens, expected.total_tokens());
+        assert_eq!(pressure.context_breakdown, Some(expected));
+        assert_eq!(pressure.checkpoint_generation, Some(1));
+
         let second = authority.prepare(ContextPrepareRequest {
             recovery_history,
             phase: "pre_turn",
             context_window_tokens: 256_000,
-            additional_token_estimate: 0,
+            additional_context: Default::default(),
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4516,7 +4543,10 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
             context_window_tokens: 20_000,
-            additional_token_estimate: 1_000,
+            additional_context: magi_usage_authority::ContextUsageBreakdown {
+                conversation_tokens: 1_000,
+                ..Default::default()
+            },
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4536,7 +4566,10 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
             context_window_tokens: 20_000,
-            additional_token_estimate: 1_000,
+            additional_context: magi_usage_authority::ContextUsageBreakdown {
+                conversation_tokens: 1_000,
+                ..Default::default()
+            },
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4669,7 +4702,7 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "pre_turn",
             context_window_tokens: 256_000,
-            additional_token_estimate: 0,
+            additional_context: Default::default(),
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4724,7 +4757,7 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "pre_turn",
             context_window_tokens: 256_000,
-            additional_token_estimate: 0,
+            additional_context: Default::default(),
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Automatic,
@@ -4780,7 +4813,7 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "manual",
             context_window_tokens: 256_000,
-            additional_token_estimate: 0,
+            additional_context: Default::default(),
             persist_checkpoint: true,
             model_identity: None,
             mode: ContextCompactionMode::Manual { instructions: None },
@@ -4954,7 +4987,10 @@ mod tests {
             recovery_history: Vec::new(),
             phase: "runtime_budget_gate",
             context_window_tokens: COMPACTION_FAILURE_TEST_WINDOW,
-            additional_token_estimate,
+            additional_context: magi_usage_authority::ContextUsageBreakdown {
+                conversation_tokens: additional_token_estimate as u64,
+                ..Default::default()
+            },
             persist_checkpoint: true,
             model_identity: None,
             mode,
@@ -6178,6 +6214,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "持续检查，完成后自行总结".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("round_probe")]),
             usage_binding: &usage_binding,
@@ -6354,6 +6391,10 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "执行探针后完成".to_string(),
+            task_context_messages: vec![crate::prompt_utils::runtime_context_message(
+                PromptFragmentKind::ContextReferences,
+                "RECOVERY_REFERENCE_ONLY",
+            )],
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("round_probe")]),
             usage_binding: &usage_binding,
@@ -6388,6 +6429,25 @@ mod tests {
             .requests
             .lock()
             .expect("task context requests mutex poisoned");
+        for request in requests.iter() {
+            let references = request
+                .messages
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("RECOVERY_REFERENCE_ONLY"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(references.len(), 1, "压缩前后都只能装配一次当前引用");
+            assert_eq!(
+                references[0].context_origin,
+                magi_bridge_client::ChatMessageOrigin::ContextReference
+            );
+        }
         assert!(
             requests[2]
                 .messages
@@ -6554,6 +6614,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: task.goal.clone(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![
                 exposed_test_tool("file_read"),
@@ -6718,6 +6779,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: task.goal.clone(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("diagram_render")]),
             usage_binding: &usage_binding,
@@ -7228,6 +7290,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -7303,6 +7366,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -7398,6 +7462,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "识别图片".to_string(),
+            task_context_messages: Vec::new(),
             images: vec![
                 SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,AAA")
                     .expect("image should parse"),
@@ -7628,6 +7693,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请调用一个失败工具后总结".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -7726,6 +7792,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请先处理失败工具，再通过重试完成任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("recoverable_probe")]),
             usage_binding: &usage_binding,
@@ -7950,6 +8017,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "完成全部计划".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8097,6 +8165,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "执行普通任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8210,6 +8279,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "完成子代理任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8342,6 +8412,10 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: prompt.clone(),
+            task_context_messages: vec![crate::prompt_utils::runtime_context_message(
+                PromptFragmentKind::ContextReferences,
+                "TASK_REFERENCE_ONLY",
+            )],
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8371,6 +8445,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("message containing `{needle}` should exist"))
         };
 
+        let reference_index = content_at("TASK_REFERENCE_ONLY");
+        assert_eq!(
+            messages[reference_index].context_origin,
+            magi_bridge_client::ChatMessageOrigin::ContextReference
+        );
+        let breakdown = estimate_context_usage_breakdown(&messages, None);
+        assert!(breakdown.context_reference_tokens > 0);
+        let prefill = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| {
+                event.event_type == "session.context.pressure.updated"
+                    && event.payload["phase"] == "prefill"
+            })
+            .expect("prefill pressure");
+        assert_eq!(
+            prefill.payload["context_breakdown"],
+            serde_json::json!(breakdown)
+        );
+        assert!(
+            session_store
+                .thread_message_history(&thread_id)
+                .iter()
+                .all(|message| {
+                    !message
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("TASK_REFERENCE_ONLY")
+                }),
+            "临时引用不能作为用户正文持久化后重复注入"
+        );
         let project_memory_index = content_at("旧偏好要求输出 OLD_REFERENCE_RESULT");
         let plan_index = content_at("当前用户可见计划");
         let history_index = content_at("历史要求：输出 OLD_REFERENCE_RESULT");
@@ -8632,6 +8739,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请生成回复".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8849,6 +8957,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请输出最终答复".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -8978,6 +9087,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行子代理任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -9104,6 +9214,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行子代理任务".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -9249,6 +9360,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请先检查文件再给最终答复".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
@@ -9427,6 +9539,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行两个只读 shell 工具".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("shell_exec")]),
             usage_binding: &usage_binding,
@@ -9637,6 +9750,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "读取 fixture".to_string(),
+            task_context_messages: Vec::new(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("file_read")]),
             usage_binding: &usage_binding,

@@ -301,12 +301,12 @@ impl ToolRegistry {
         self.execute_with_policy_for_surface(input, context, policy, false, Some(on_progress))
     }
 
-    pub fn cancel_active_processes(&self, query: &ToolExecutionContextQuery) -> usize {
-        builtin::cancel_active_processes(query)
+    pub fn cancel_active_executions(&self, query: &ToolExecutionContextQuery) -> usize {
+        builtin::read_support::cancel_reads(Some(query)) + builtin::cancel_active_processes(query)
     }
 
-    pub fn cancel_all_active_processes() -> usize {
-        builtin::cancel_all_active_processes()
+    pub fn cancel_all_active_executions() -> usize {
+        builtin::read_support::cancel_reads(None) + builtin::cancel_all_active_processes()
     }
 
     #[cfg(test)]
@@ -400,20 +400,22 @@ impl ToolRegistry {
                         }
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
+                    let mut resources = self.runtime_resources.clone();
+                    resources.file_read_policy = crate::policy::execution_permission_policy(
+                        policy,
+                        context.working_directory.as_deref(),
+                    );
                     let payload = match on_progress {
                         Some(on_progress) => tool.execute_with_progress(
                             &input.tool_call_id,
                             &input.input,
                             &context,
-                            &self.runtime_resources,
+                            &resources,
                             on_progress,
                         ),
-                        None => tool.execute(
-                            &input.tool_call_id,
-                            &input.input,
-                            &context,
-                            &self.runtime_resources,
-                        ),
+                        None => {
+                            tool.execute(&input.tool_call_id, &input.input, &context, &resources)
+                        }
                     };
                     let payload =
                         append_workspace_changed_paths(payload, before_changes.as_ref(), &context);

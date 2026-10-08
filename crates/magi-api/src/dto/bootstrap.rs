@@ -109,10 +109,6 @@ impl BootstrapDto {
             &state.ledger_usage_observations(),
             runtime_session_scope.as_ref(),
         );
-        crate::dto::apply_configured_model_context_windows(
-            &mut dto.runtime_read_model,
-            &state.settings_store,
-        );
         dto.canonical_event_next_sequence =
             state.canonical_event_next_sequence_for(runtime_session_scope.as_ref())?;
         if let Some(workspace_id) = dto

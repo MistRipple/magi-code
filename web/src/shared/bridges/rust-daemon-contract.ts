@@ -1,3 +1,4 @@
+import { normalizeContextUsageBreakdown, type ContextUsageBreakdown } from '../../lib/context-usage-breakdown';
 import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type { CanonicalTurn, CanonicalTurnItem } from '../protocol/canonical-turn';
 import { normalizeCanonicalTurnStrict } from '../protocol/canonical-turn';
@@ -227,6 +228,7 @@ interface RustSessionRuntimeUsageObservation {
   phase?: string | null;
   turn_id?: string | null;
   call_id?: string | null;
+  context_breakdown?: ContextUsageBreakdown | null;
 }
 
 interface RustSessionRuntimeBudget {
@@ -616,6 +618,7 @@ function normalizeRuntimeUsageObservation(raw: unknown): RustSessionRuntimeUsage
     phase: normalizeString(record.phase) || undefined,
     turn_id: normalizeString(record.turn_id) || undefined,
     call_id: normalizeString(record.call_id) || undefined,
+    context_breakdown: normalizeContextUsageBreakdown(record.context_breakdown),
   };
 }
 
@@ -1799,6 +1802,8 @@ function normalizeBudgetWarningLevel(value: string | undefined): BudgetWarningLe
     case 'warning':
     case 'danger':
       return value;
+    case 'compaction_due':
+      return 'danger';
     default:
       return undefined;
   }
@@ -1843,6 +1848,13 @@ function buildRuntimeSnapshot(
       ...(usageObservation?.hard_request_limit_tokens != null
         ? { hardRequestLimitTokens: usageObservation.hard_request_limit_tokens }
         : {}),
+      ...(usageObservation?.response_reserve_tokens != null
+        ? { responseReserveTokens: usageObservation.response_reserve_tokens }
+        : {}),
+      ...(usageObservation?.recovery_buffer_tokens != null
+        ? { recoveryBufferTokens: usageObservation.recovery_buffer_tokens }
+        : {}),
+      ...(usageObservation?.context_breakdown ? { contextBreakdown: usageObservation.context_breakdown } : {}),
       ...(compaction?.compacted_at != null ? { lastCompactionAt: compaction.compacted_at } : {}),
       ...(compaction?.reason ? { lastCompactionReason: compaction.reason } : {}),
       ...(compaction?.original_token_estimate != null

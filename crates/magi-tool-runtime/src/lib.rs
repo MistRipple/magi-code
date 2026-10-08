@@ -9,6 +9,7 @@ mod types;
 mod view_image;
 mod workspace_changes;
 pub use apply_patch::apply_patch_declared_paths_from_input;
+pub use builtin::file_read_result_matches_request;
 #[cfg(test)]
 pub(crate) use builtin_catalog::RestrictedWriteProfilePolicy;
 pub use builtin_catalog::{

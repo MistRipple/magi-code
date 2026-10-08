@@ -87,17 +87,13 @@ await withGoldenViteServer(async (server) => {
       contextReferences: [{}],
       browserNodeSelections: [{}],
       browserAnnotationRefs: ['a'],
-      goalMode: true,
-      skillName: ' review ',
     }),
-    { images: 2, references: 2, annotations: 1, goal: true, skill: 'review' },
+    { images: 2, references: 2, annotations: 1 },
   );
   assert.deepEqual(policy.summarizeQueuedMessage({}), {
     images: 0,
     references: 0,
     annotations: 0,
-    goal: false,
-    skill: '',
   });
   assert.equal(policy.queuedMessageEditable({ images: [{}] }), true);
   assert.equal(policy.queuedMessageEditable({ browserAnnotationRefs: ['a'] }), false);

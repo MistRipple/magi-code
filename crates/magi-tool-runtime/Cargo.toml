@@ -16,6 +16,7 @@ magi-process = { path = "../magi-process" }
 magi-snapshot = { path = "../magi-snapshot" }
 reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
+ignore.workspace = true
 scraper = "0.23"
 urlencoding = "2"
 base64 = "0.22"

@@ -37,6 +37,12 @@ test("窗口创建失败和应用关闭都会结束等待", async () => {
 
 test("窗口未在生命周期超时内创建时返回结构化未就绪错误", async () => {
   const readiness = new DesktopWindowReadiness(10);
-  await assert.rejects(readiness.wait(), /desktop_window_not_ready/u);
+  // 生产超时不保活进程；测试保留句柄直到断言完成。
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await assert.rejects(readiness.wait(), /desktop_window_not_ready/u);
+  } finally {
+    clearInterval(keepAlive);
+  }
   assert.equal(readiness.state, "waiting");
 });

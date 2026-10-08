@@ -1,6 +1,6 @@
 # Magi MCP 服务 · 设计基线
 
-> 状态：**本机模式（回环 HTTP + stdio）与网络模式（Cloudflare Quick Tunnel：默认、地址每次开启都会变；命名隧道：用户自己的域名、地址固定、重启后自动恢复）已实现，GPT Web 侧接入接口就绪**；进度与偏差见《[开发计划](./magi-mcp-server-development-plan.md)》§2.1.1。本文定义 Magi 对外提供的**标准 MCP 服务端**：任何支持 MCP 的客户端（Claude Desktop、Cursor、Cline、ChatGPT 连接器等）都可以连接它，在 Magi 已注册的工作区里使用 Magi 的工具（文件创建 / 编辑 / 删除、搜索、git、变更账本等），审批、审计与变更记录仍由 Magi 负责。
+> 状态：**本机模式（回环 HTTP + stdio）与网络模式（Cloudflare Quick Tunnel：默认、地址每次开启都会变；命名隧道：用户自己的域名、地址固定、重启后自动恢复）已实现，GPT Web 侧接入接口就绪**。本文定义 Magi 对外提供的**标准 MCP 服务端**：任何支持 MCP 的客户端（Claude Desktop、Cursor、Cline、ChatGPT 连接器等）都可以连接它，在 Magi 已注册的工作区里使用 Magi 的工具（文件创建 / 编辑 / 删除、搜索、git、变更账本等），审批、审计与变更记录仍由 Magi 负责。
 > 更新日期：2026-09-30。
 > 相关文档：[GPT Web 开发文档](./web-model-browser-development.md)（其工具能力是本服务的一个客户端）、[工程约束与运行入口](./README.md)、[Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)、[内置浏览器完整设计](./browser-runtime-design.md)。
 
@@ -140,7 +140,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 
 | 命名空间 | 对应 Magi 现有能力 | 最低权限档 | 默认放行 |
 | --- | --- | --- | --- |
-| `magi.fs.read`、`magi.fs.list` | `file_read`、目录读取 | `read_only` | 是 |
+| `magi.fs.read` | `file_read`（按行范围读取普通文件） | `read_only` | 是 |
 | `magi.fs.write`、`magi.fs.patch`、`magi.fs.mkdir`、`magi.fs.move`、`magi.fs.copy` | `file_write`、`file_patch` / `apply_patch`、`file_mkdir`、`file_move`、`file_copy` | `edit` | 否（逐次确认；`edit_trusted` 除外） |
 | `magi.fs.remove` | `file_remove` | `edit` | 否（始终逐次确认，`edit_trusted` 也不豁免） |
 | `magi.search.text`、`magi.search.semantic` | `search_text`、`search_semantic` | `read_only` | 是 |
@@ -360,16 +360,9 @@ node scripts/verify-mcp-server.mjs --base <daemon> --mcp-bin target/debug/magi-m
 3. 用 MCP 官方调试客户端验证 `tools/list` / `tools/call`、挂起与超时、取消。
 任一不成立回到本文重新决策。
 
-**阶段 0 代码核对结果（2026-09-30，读代码，未跑真实客户端）**
+当前实现入口是 magi-conversation-runtime::external_tool 与 external_approval、magi-api::mcp_service 与 mcp_runtime。令牌 PATCH、跨会话审批托盘和外部变更账本已接入；旧计划中的随机端口、令牌存 settings 和“尚无审批 UI”不再适用。当前配置、端口和归属以第 5、10–13 节及源码为准。
 
-| 验证项 | 结论 | 依据与影响 |
-| --- | --- | --- |
-| 工具执行能否脱离模型 turn | **可以** | `magi-tool-runtime::ToolRegistry::execute_with_policy(input, context, policy)` 只需要 `ToolExecutionContext`（会话、工作区、工作目录、访问档）与 `ToolExecutionPolicy`（允许 / 拒绝路径、工具名、命令模式），不依赖 Task 或 turn。MCP 服务直接以它为执行入口。 |
-| 审批能否复用 | **注册表可以复用，等待逻辑要新写** | `ToolApprovalRegistry::request_with_arguments` / `resolve` 把 `task_id`、`turn_id` 当不透明字符串使用，可以用 `external:<token_ref>` 形式的合成标识；但现有等待循环 `await_task_tool_approval`（`tool_batch.rs`）是私有函数，并强依赖“会话当前活动 turn + Task 仍在运行”。MCP 服务需要自己的等待循环，存活判据改为“令牌仍有效且连接未断”。外部审批只支持 `allow_once` / `deny`，不使用 `allow_for_turn`。 |
-| 审批在界面里怎么出现 | **缺口，需要新增全局入口** | 现有审批查询与解析接口按会话作用域（`GET /session/tool-approvals?sessionId=…`）；外部工具会话不是用户当前打开的会话，审批会看不见。需要一个跨会话的“待审批”入口（通知中心 / 全局待办），并把外部审批标明来源客户端。这是阶段 2 的必做项。 |
-| 变更账本对外部写入 | **待验证** | 变更账本以会话为单位；外部写入需要在外部工具会话下建立对应的快照会话，阶段 1–2 中用真实写入验证。 |
-
-> **进度（2026-10-01，分支 `feature/magi-mcp`）：** 本机模式（阶段 1–3）已实现：宿主适配、外部工具会话与账本、审批、令牌持久化（`state_root/mcp-server.json`，**不经 settings**）、固定回环端口、stdio 中继（`magi-mcp`）、设置页、跨会话待审批托盘、审计、只读 git 与 `magi.changes.{list,revert}`；已用真实 daemon 与真实中继二进制端到端验证。网络模式（Quick Tunnel、按需激活、仅网络令牌、退避与限流）已在真实隧道上验证；GPT Web 槽位端点已接线（见 §12）。**未做：** Tailscale / 托管发放（命名隧道已在 2026-10-03 实现，见 §10.2.1）、OAuth、第三方客户端兼容验证、外部会话的用户查看入口。
+尚需独立验证或设计的范围：OAuth、第三方客户端兼容矩阵、真实命名隧道环境和外部工具会话的用户查看入口。保留这些边界，不沿用旧分支、旧工作树或临时测试结果作为交付证据。
 
 ### 阶段 1：本机 stdio + 令牌（只读优先）
 令牌创建 / 存储 / 吊销、stdio 中继、`read_only` 工具集、路径校验、审计、外部工具会话。
@@ -391,7 +384,7 @@ node scripts/verify-mcp-server.mjs --base <daemon> --mcp-bin target/debug/magi-m
 ### 检查命令
 - Rust：`cargo check --workspace --tests` 及新增 crate、`magi-api`、工具运行时相关 crate 的测试。
 - 涉及设置页与前端：`npm --prefix web run check` 及对应 `test:*`。
-- 安全相关改动须运行 `security-review`。
+- 安全相关改动须验证第 15 节的令牌、路径、审批与网络边界，并记录实际运行的用例。
 
 ---
 

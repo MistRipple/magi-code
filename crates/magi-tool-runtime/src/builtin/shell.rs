@@ -139,7 +139,7 @@ pub(super) fn resolve_shell_invocation(
             "工作目录不存在或不是目录",
         )
         .instruction(
-            "确认 cwd 是否正确（可用 file_read 查看父目录）；默认工作区目录不可用时，告知用户重新选择工作区。",
+            "确认 cwd 是否正确（可用 search_text(target=path) 查找文件）；默认工作区目录不可用时，告知用户重新选择工作区。",
         )
         .with("cwd", cwd.display().to_string())
         .into_payload());

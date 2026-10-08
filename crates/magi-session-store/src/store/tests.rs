@@ -3514,6 +3514,57 @@ fn image_only_user_message_is_renderable_without_synthetic_text() {
 }
 
 #[test]
+fn command_only_user_message_is_renderable_after_acceptance_and_reload() {
+    for (key, value) in [
+        (crate::SESSION_COMMAND_METADATA_KEY, json!("compact")),
+        ("skillName", json!("review")),
+        ("goalMode", json!(true)),
+    ] {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-command-only-message");
+        store
+            .create_session(session_id.clone(), "Command Only Message")
+            .expect("session should create");
+        let mut turn = test_turn("turn-command-only-message", "running", 10);
+        turn.user_message = Some(String::new());
+        let mut user = test_turn_item("user-command-only", "");
+        user.metadata.insert(key.to_string(), value.clone());
+        turn.items.push(user);
+        accept_test_turn(&store, &session_id, turn);
+
+        let assert_command = |store: &SessionStore| {
+            let turns = store.canonical_turns_for_session(&session_id);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(
+                turns[0].is_session_command(),
+                key == crate::SESSION_COMMAND_METADATA_KEY
+            );
+            let user = &turns[0].items[0];
+            assert_eq!(user.content.as_deref(), Some(""));
+            assert_eq!(user.metadata[key], value);
+            assert!(user.visibility.renderable, "命令本身就是可见内容");
+        };
+        assert_command(&store);
+        store
+            .set_current_turn_status_for_test(
+                &session_id,
+                Some("turn-command-only-message"),
+                "completed",
+            )
+            .expect("turn should complete");
+        assert_command(&store);
+        let durable = serde_json::from_slice(
+            &serde_json::to_vec(&store.durable_state()).expect("serialize durable state"),
+        )
+        .expect("deserialize durable state");
+        let restored =
+            SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state())
+                .expect("restore command turn");
+        assert_command(&restored);
+    }
+}
+
+#[test]
 fn blocked_current_turn_is_terminal_in_canonical_log() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-blocked-terminal-canonical");

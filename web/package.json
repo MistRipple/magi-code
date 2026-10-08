@@ -3,8 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node -e \"console.error('请使用 MAGI_WEB_DEV=1 cargo run -p magi-daemon-app，并访问 http://127.0.0.1:38123/web.html'); process.exit(1)\"",
-    "dev:rust": "node -e \"console.error('请使用 MAGI_WEB_DEV=1 cargo run -p magi-daemon-app，并访问 http://127.0.0.1:38123/web.html'); process.exit(1)\"",
+    "dev": "node -e \"console.error('请使用 ./scripts/dev-daemon.sh，并访问 http://127.0.0.1:38123/web.html'); process.exit(1)\"",
     "dev:daemon": "vite --config vite.web.config.ts",
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
@@ -65,7 +64,7 @@
     "test:update-manifest": "node scripts/update-manifest-golden.mjs",
     "test:ci-workflow": "node scripts/ci-workflow-golden.mjs",
     "test:tool-error": "node scripts/tool-error-payload-golden.mjs",
-    "test:transport": "node scripts/live-transport-golden.mjs && npm run test:message-scroll-coordinator && npm run test:message-scroll-input",
+    "test:transport": "node scripts/live-transport-golden.mjs && npm run test:app-server-client && npm run test:message-scroll-coordinator && npm run test:message-scroll-input",
     "test:message-scroll-input": "node scripts/message-scroll-input-golden.mjs"
   },
   "devDependencies": {

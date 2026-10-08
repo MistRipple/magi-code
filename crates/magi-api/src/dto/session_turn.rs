@@ -196,7 +196,7 @@ pub struct SessionTurnRequestDto {
     /// 用户点击“继续”恢复最近一次被中断或可恢复的执行；只由界面显式设置。
     #[serde(default)]
     pub resume: bool,
-    /// 用户显式选择的会话命令（如 `/compact`）；`text` 此时是命令参数。
+    /// 用户显式选择的会话命令（如 `/compact`）；`text` 只包含命令参数，命令身份单独存储。
     #[serde(default)]
     pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
     #[serde(default)]
@@ -435,17 +435,8 @@ impl SessionTurnRequestDto {
         trimmed_non_empty(self.replace_turn_id.as_deref())
     }
 
-    pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
-        if let Some(command) = self.command.as_ref() {
-            // 命令在时间线中按用户输入的形式展示：`/compact 补充要求`。
-            let name = match command {
-                magi_app_server_protocol::SessionTurnCommand::Compact => "/compact",
-            };
-            return match trimmed_text {
-                Some(text) => format!("{name} {text}"),
-                None => name.to_string(),
-            };
-        }
+    pub fn timeline_content(&self, trimmed_text: Option<&str>) -> String {
+        // 命令身份只存于 metadata，正文允许为空，不生成占位文本。
         let mut message_lines = Vec::new();
 
         if let Some(text) = trimmed_text {
@@ -466,13 +457,7 @@ impl SessionTurnRequestDto {
                 self.browser_node_selections.len()
             ));
         }
-        if message_lines.is_empty() && !self.images.is_empty() {
-            String::new()
-        } else if message_lines.is_empty() {
-            "[空输入]".to_string()
-        } else {
-            message_lines.join("\n")
-        }
+        message_lines.join("\n")
     }
 
     pub fn parsed_images(&self) -> Result<Vec<SessionTurnImage>, String> {
@@ -794,7 +779,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timeline_message_uses_user_text_directly() {
+    fn timeline_content_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
             desktop_browser_tools_allowed: true,
             session_id: Some("session-a".to_string()),
@@ -822,7 +807,7 @@ mod tests {
         };
 
         assert_eq!(
-            request.timeline_message(request.trimmed_text().as_deref()),
+            request.timeline_content(request.trimmed_text().as_deref()),
             "请分析项目"
         );
     }
@@ -841,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_message_does_not_add_image_count_to_user_content() {
+    fn timeline_content_does_not_add_image_count_to_user_content() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
             "scope": "personal",
             "text": "请分析这张图",
@@ -853,13 +838,13 @@ mod tests {
         .expect("带图会话请求必须可解析");
 
         assert_eq!(
-            request.timeline_message(request.trimmed_text().as_deref()),
+            request.timeline_content(request.trimmed_text().as_deref()),
             "请分析这张图"
         );
     }
 
     #[test]
-    fn image_only_timeline_message_has_no_synthetic_text() {
+    fn image_only_timeline_content_has_no_synthetic_text() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
             "scope": "personal",
             "images": [{
@@ -869,7 +854,7 @@ mod tests {
         }))
         .expect("纯图片会话请求必须可解析");
 
-        assert_eq!(request.timeline_message(None), "");
+        assert_eq!(request.timeline_content(None), "");
     }
 
     #[test]
@@ -902,7 +887,24 @@ mod tests {
     }
 
     #[test]
-    fn timeline_message_keeps_control_fields_out_of_user_content() {
+    fn command_only_timeline_content_has_no_synthetic_text() {
+        for fields in [
+            serde_json::json!({"command": "compact"}),
+            serde_json::json!({"skillName": "review"}),
+            serde_json::json!({"goalMode": true, "skillName": "review"}),
+        ] {
+            let mut payload = serde_json::json!({"scope": "personal"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let request: SessionTurnRequestDto = serde_json::from_value(payload).unwrap();
+            assert_eq!(request.timeline_content(None), "");
+        }
+    }
+
+    #[test]
+    fn timeline_content_keeps_control_fields_out_of_user_content() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
             "scope": "personal",
             "text": "完成稳定性验收",
@@ -913,7 +915,7 @@ mod tests {
         .expect("combined goal and skill request should parse");
 
         assert_eq!(
-            request.timeline_message(request.trimmed_text().as_deref()),
+            request.timeline_content(request.trimmed_text().as_deref()),
             "完成稳定性验收"
         );
     }
@@ -946,7 +948,7 @@ mod tests {
             SessionContextReferenceKindDto::Directory
         );
         assert_eq!(
-            request.timeline_message(request.trimmed_text().as_deref()),
+            request.timeline_content(request.trimmed_text().as_deref()),
             "分析引用的文件",
             "structured references must stay out of user-authored content"
         );

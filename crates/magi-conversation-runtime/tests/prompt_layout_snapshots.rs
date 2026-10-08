@@ -16,7 +16,6 @@ fn snapshot_compose_all_sections() {
         Some("执行当前任务"),
         Some("用户偏好简洁回答"),
         Some("禁止执行破坏性命令"),
-        None,
     )
     .expect("developer prompt");
     assert_snapshot!(prompt);
@@ -24,27 +23,22 @@ fn snapshot_compose_all_sections() {
 
 #[test]
 fn snapshot_compose_user_rules_only() {
-    let prompt =
-        compose_developer_instructions(Some("执行当前任务"), Some("保持中文回复"), None, None)
-            .expect("developer prompt");
+    let prompt = compose_developer_instructions(Some("执行当前任务"), Some("保持中文回复"), None)
+        .expect("developer prompt");
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_compose_safeguard_only() {
-    let prompt = compose_developer_instructions(
-        Some("执行当前任务"),
-        None,
-        Some("禁止读取 .env 文件"),
-        None,
-    )
-    .expect("developer prompt");
+    let prompt =
+        compose_developer_instructions(Some("执行当前任务"), None, Some("禁止读取 .env 文件"))
+            .expect("developer prompt");
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_compose_base_only() {
-    let prompt = compose_developer_instructions(Some("执行当前任务"), Some("   "), Some(""), None)
+    let prompt = compose_developer_instructions(Some("执行当前任务"), Some("   "), Some(""))
         .expect("base developer prompt");
     assert_snapshot!(prompt);
 }

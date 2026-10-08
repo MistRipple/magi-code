@@ -142,6 +142,7 @@ export interface QueuedSessionTurnDto {
   acceptedAt: number;
   content: string;
   text?: string | null;
+  command: 'compact' | null;
   skillName?: string | null;
   goalMode: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;

@@ -10,8 +10,7 @@ use magi_event_bus::{
 };
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
-use magi_settings_store::SettingsStore;
-use magi_usage_authority::{ContextBudgetPolicy, resolve_context_window};
+
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
 use std::collections::{BTreeMap, HashMap};
 
@@ -136,7 +135,7 @@ pub fn runtime_read_model_dto_for_session_with_usage(
 
 /// 仅当实时投影未提供观测值时,用账本回放结果回填会话的 `usage_observation`。
 ///
-/// 反孤儿:实时 `model.usage.recorded` 事件优先(其负载与重启后账本同源同口径),
+/// 反孤儿:实时压力快照优先(其负载与重启后账本同源同口径),
 /// 账本只补齐重启后缺失的会话,避免覆盖更新的实时观测。
 fn backfill_session_usage_observations(
     runtime_read_model: &mut RuntimeReadModelInput,
@@ -170,59 +169,16 @@ fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
             session.budget = None;
             continue;
         };
-        let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
-        let context_window = observation
-            .context_window_limit_tokens
-            .unwrap_or_else(|| resolve_context_window(resolved_model).max(1) as u64);
-        let projected_tokens = observation.projected_request_tokens;
-        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
-        let remaining_tokens = context_window.saturating_sub(projected_tokens);
-        session.budget = Some(SessionRuntimeBudgetEntry {
-            token_used: projected_tokens,
-            remaining_tokens,
-            token_limit: context_window,
-            percent_remaining: (remaining_tokens.saturating_mul(100) / context_window.max(1))
-                as i64,
-            usage_ratio: projected_tokens as f64 / context_window.max(1) as f64,
-            warning_level: observation
-                .pressure_level
-                .clone()
-                .unwrap_or_else(|| policy.level_for(projected_tokens).as_str().to_string()),
-        });
-    }
-}
-
-pub fn apply_configured_model_context_windows(
-    runtime_read_model: &mut RuntimeReadModelInput,
-    settings_store: &SettingsStore,
-) {
-    for session in &mut runtime_read_model.details.sessions {
-        let Some(observation) = session.usage_observation.as_ref() else {
+        let (Some(context_window), Some(pressure_level)) = (
+            observation
+                .context_window_limit_tokens
+                .filter(|window| *window > 0),
+            observation.pressure_level.as_ref(),
+        ) else {
+            session.budget = None;
             continue;
         };
-        let session_id = SessionId::new(session.session_id.clone());
-        let active_model =
-            magi_conversation_runtime::model_config::resolve_orchestrator_model_config(
-                settings_store,
-                Some(&session_id),
-            )
-            .ok()
-            .and_then(|config| config.require_model().ok().map(str::to_string));
-        // 历史压力快照已经绑定了实际调用模型。当前活动模型只用于没有窗口快照的
-        // 冷启动，避免模型切换后把旧调用的分子套到新模型分母上。
-        let resolved_model = observation
-            .resolved_model
-            .as_deref()
-            .or(active_model.as_deref())
-            .unwrap_or("");
-        let context_window = observation.context_window_limit_tokens.unwrap_or_else(|| {
-            magi_conversation_runtime::model_context_window::resolve_model_context_window(
-                Some(settings_store),
-                resolved_model,
-            ) as u64
-        });
         let projected_tokens = observation.projected_request_tokens;
-        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
         let remaining_tokens = context_window.saturating_sub(projected_tokens);
         session.budget = Some(SessionRuntimeBudgetEntry {
             token_used: projected_tokens,
@@ -231,10 +187,7 @@ pub fn apply_configured_model_context_windows(
             percent_remaining: (remaining_tokens.saturating_mul(100) / context_window.max(1))
                 as i64,
             usage_ratio: projected_tokens as f64 / context_window.max(1) as f64,
-            warning_level: observation
-                .pressure_level
-                .clone()
-                .unwrap_or_else(|| policy.level_for(projected_tokens).as_str().to_string()),
+            warning_level: pressure_level.clone(),
         });
     }
 }
@@ -2246,6 +2199,8 @@ mod tests {
             usage_observation: Some(SessionRuntimeUsageObservation {
                 projected_request_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
+                context_window_limit_tokens: Some(272_000),
+                pressure_level: Some("normal".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
             }),
@@ -2282,7 +2237,7 @@ mod tests {
             .budget
             .as_ref()
             .expect("budget should be derived from usage observation");
-        // gpt-5-codex 解析窗口 272k。
+        // 窗口与告警来自观测快照，不再根据模型名或当前设置重算。
         assert_eq!(budget.token_limit, 272_000);
         assert_eq!(budget.token_used, 136_000);
         assert_eq!(budget.remaining_tokens, 136_000);
@@ -2299,59 +2254,32 @@ mod tests {
     }
 
     #[test]
-    fn configured_budget_keeps_observed_model_window_when_active_model_changes() {
-        let settings_store = SettingsStore::new();
-        settings_store
-            .set_section(
-                "orchestrator",
-                serde_json::json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-test",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat"
-                }),
-            )
-            .unwrap();
-        let session_id = SessionId::new("session-model-switch-budget");
-        settings_store
-            .set_session_section(
-                &session_id,
-                "orchestrator",
-                serde_json::json!({
-                    "model": "claude-opus-4.8",
-                    "reasoningEffort": "high"
-                }),
-            )
-            .unwrap();
-        magi_conversation_runtime::model_context_window::set_model_context_window(
-            &settings_store,
-            "claude-opus-4.8",
-            1_000_000,
-        )
-        .unwrap();
-
+    fn budget_requires_bound_window_and_pressure_in_the_observation() {
         let mut input = RuntimeReadModelInput::default();
-        input.details.sessions.push(SessionRuntimeSummaryEntry {
-            session_id: session_id.to_string(),
-            usage_observation: Some(SessionRuntimeUsageObservation {
-                projected_request_tokens: 64_000,
-                resolved_model: Some("gpt-5.6-luna".to_string()),
-                observed_at: Some(UtcMillis(1)),
-                ..SessionRuntimeUsageObservation::default()
-            }),
-            ..SessionRuntimeSummaryEntry::default()
-        });
-
-        apply_configured_model_context_windows(&mut input, &settings_store);
-
-        let budget = input.details.sessions[0]
-            .budget
-            .as_ref()
-            .expect("model switch should preserve session context budget");
-        assert_eq!(budget.token_used, 64_000);
-        assert_eq!(budget.token_limit, 272_000);
-        assert_eq!(budget.remaining_tokens, 208_000);
-        assert!((budget.usage_ratio - (64_000.0 / 272_000.0)).abs() < f64::EPSILON);
+        for (window, pressure) in [
+            (None, Some("normal")),
+            (Some(0), Some("normal")),
+            (Some(256_000), None),
+        ] {
+            input.details.sessions.push(SessionRuntimeSummaryEntry {
+                usage_observation: Some(SessionRuntimeUsageObservation {
+                    projected_request_tokens: 64_000,
+                    resolved_model: Some("gpt-5.6-luna".into()),
+                    context_window_limit_tokens: window,
+                    pressure_level: pressure.map(str::to_string),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        merge_session_budgets(&mut input);
+        assert!(
+            input
+                .details
+                .sessions
+                .iter()
+                .all(|session| session.budget.is_none())
+        );
     }
 
     #[test]
@@ -2369,6 +2297,8 @@ mod tests {
             usage_observation: Some(SessionRuntimeUsageObservation {
                 projected_request_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
+                context_window_limit_tokens: Some(272_000),
+                pressure_level: Some("normal".to_string()),
                 observed_at: Some(UtcMillis(2)),
                 ..SessionRuntimeUsageObservation::default()
             }),
@@ -2381,6 +2311,8 @@ mod tests {
             SessionRuntimeUsageObservation {
                 projected_request_tokens: 68_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
+                context_window_limit_tokens: Some(272_000),
+                pressure_level: Some("normal".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
             },
@@ -2391,6 +2323,8 @@ mod tests {
             SessionRuntimeUsageObservation {
                 projected_request_tokens: 1_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
+                context_window_limit_tokens: Some(272_000),
+                pressure_level: Some("normal".to_string()),
                 observed_at: Some(UtcMillis(1)),
                 ..SessionRuntimeUsageObservation::default()
             },

@@ -16,9 +16,12 @@ mod files;
 pub(crate) mod fs_support;
 mod knowledge;
 mod process;
+pub(crate) mod read_support;
 mod search;
 mod shell;
 mod web;
+
+pub use files::file_read_result_matches_request;
 
 pub(crate) use process::{cancel_active_processes, cancel_all_active_processes};
 #[cfg(test)]
@@ -58,7 +61,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
         resources: &ToolRuntimeResources,
     ) -> String {
         match self.name {
-            BuiltinToolName::FileRead => files::execute_file_read(input, context),
+            BuiltinToolName::FileRead => files::execute_file_read(input, context, resources),
             BuiltinToolName::ViewImage => execute_view_image(input, context),
             BuiltinToolName::ImageGenerate => {
                 execute_image_generate(tool_call_id, input, context, resources)
@@ -70,7 +73,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::FileMkdir => files::execute_file_mkdir(input, context),
             BuiltinToolName::FileCopy => file_transfer::execute_file_copy(input, context),
             BuiltinToolName::FileMove => file_transfer::execute_file_move(input, context),
-            BuiltinToolName::SearchText => search::execute_search_text(input, context),
+            BuiltinToolName::SearchText => search::execute_search_text(input, context, resources),
             BuiltinToolName::SearchSemantic => {
                 knowledge::execute_search_semantic(input, context, resources)
             }

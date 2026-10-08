@@ -28,19 +28,23 @@ fn precondition(observation: &magi_git::GitObservation) -> GitPrecondition {
     }
 }
 
-/// 使用真实开源仓库拓扑验证 Magi 结构化 Git 工作流。
-///
-/// 测试始终先克隆到临时目录，绝不修改 `MAGI_GIT_REAL_REPO` 指向的基准 fixture。
+/// 在独立本地 origin 的克隆上验证分支与 worktree 全流程。
 #[tokio::test]
-async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
-    let Ok(source) = std::env::var("MAGI_GIT_REAL_REPO") else {
-        eprintln!("skip real-repository fixture: MAGI_GIT_REAL_REPO is not set");
-        return;
-    };
+async fn supports_full_local_branch_and_worktree_flow() {
     let fixture = tempfile::tempdir().expect("integration fixture");
-    let repository = fixture.path().join("rg-retry");
+    let source = fixture.path().join("origin");
+    fs::create_dir(&source).expect("create origin");
+    git(&source, &["init", "--initial-branch=main"]);
+    git(&source, &["config", "user.name", "Magi Integration"]);
+    git(&source, &["config", "user.email", "magi@example.test"]);
+    fs::write(source.join("README.md"), "# Local Git fixture\n").expect("write origin");
+    git(&source, &["add", "README.md"]);
+    git(&source, &["commit", "-m", "initial fixture"]);
+    let source_head = git(&source, &["rev-parse", "HEAD"]);
+    let repository = fixture.path().join("workspace");
     let clone = Command::new("git")
-        .args(["clone", "--no-local", source.as_str()])
+        .args(["clone", "--no-local"])
+        .arg(&source)
         .arg(&repository)
         .output()
         .expect("clone fixture");
@@ -72,7 +76,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .branch_create(
             &repository,
             BranchCreateOptions {
-                branch: "magi/test/rg-retry".to_string(),
+                branch: "magi/test/workflow".to_string(),
                 start_point: None,
                 switch: true,
                 precondition: precondition(&initial),
@@ -99,7 +103,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .await
         .expect("switch main");
     let preview = service
-        .merge_preview(&repository, "magi/test/rg-retry", &precondition(&main))
+        .merge_preview(&repository, "magi/test/workflow", &precondition(&main))
         .await
         .expect("merge preview");
     assert!(preview.fast_forward);
@@ -113,7 +117,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .merge(
             &repository,
             MergeOptions {
-                target: "magi/test/rg-retry".to_string(),
+                target: "magi/test/workflow".to_string(),
                 ff_only: false,
                 precondition: precondition(&main),
             },
@@ -125,7 +129,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .branch_delete(
             &repository,
             BranchDeleteOptions {
-                branch: "magi/test/rg-retry".to_string(),
+                branch: "magi/test/workflow".to_string(),
                 remote: None,
                 force: false,
                 confirm_force: false,
@@ -181,7 +185,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .await
         .expect("confirmed force delete");
 
-    let detached_path = fixture.path().join("rg-retry-readonly-agent");
+    let detached_path = fixture.path().join("readonly-agent");
     let detached = service
         .worktree_create(
             &repository,
@@ -211,5 +215,7 @@ async fn rg_retry_supports_full_local_branch_and_worktree_flow() {
         .await
         .expect("remove detached worktree");
 
-    assert_eq!(feature.branch.as_deref(), Some("magi/test/rg-retry"));
+    assert_eq!(feature.branch.as_deref(), Some("magi/test/workflow"));
+    assert_eq!(git(&source, &["rev-parse", "HEAD"]), source_head);
+    assert!(git(&source, &["status", "--porcelain"]).is_empty());
 }

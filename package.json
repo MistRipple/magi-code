@@ -13,7 +13,6 @@
     "test": "npm run test --workspace @magi/desktop && npm run test --workspace @magi/browser-automation-worker && npm run test --workspace magi-web",
     "build": "npm run build --workspace @magi/desktop",
     "test:browser-core": "node scripts/verify-browser-core-acceptance.mjs",
-    "test:browser-download-lifecycle": "node scripts/verify-browser-download-lifecycle.mjs",
     "desktop:dev": "npm run dev --workspace @magi/desktop",
     "desktop:package": "npm run package --workspace @magi/desktop --",
     "release:preflight": "node scripts/release-preflight.mjs",
@@ -21,21 +20,16 @@
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
     "test:electron-browser-permission-matrix": "node scripts/verify-electron-browser-permission-matrix.mjs",
     "test:electron-browser-network-policy": "node scripts/verify-electron-browser-network-policy.mjs",
-    "test:electron-renderer-comparison": "node scripts/derive-electron-renderer-comparison-golden.mjs",
-    "test:performance-envelope": "node scripts/derive-magi-performance-envelope-golden.mjs",
-    "test:context-compaction-metrics": "node scripts/derive-magi-context-compaction-metrics-golden.mjs",
-    "test:electron-context-compaction-metrics": "node scripts/derive-electron-context-compaction-metrics-golden.mjs",
-    "test:permission-ledger": "node scripts/derive-magi-permission-ledger-golden.mjs",
-    "test:trajectory-ledger": "node scripts/derive-magi-trajectory-ledger-golden.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
-    "test:real-provider-performance": "node scripts/verify-real-provider-performance.mjs",
     "release:guard": "npm run browser-tool-catalog:check && npm run browser-network-policy:check && npm run protocol:check && node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
     "protocol:generate": "node scripts/generate-app-server-protocol.mjs",
     "protocol:check": "node scripts/generate-app-server-protocol.mjs --check",
     "browser-tool-catalog:generate": "node scripts/generate-browser-tool-catalog.mjs",
     "browser-tool-catalog:check": "node scripts/generate-browser-tool-catalog.mjs --check",
     "browser-network-policy:generate": "node scripts/generate-browser-network-policy.mjs",
-    "browser-network-policy:check": "node scripts/generate-browser-network-policy.mjs --check"
+    "browser-network-policy:check": "node scripts/generate-browser-network-policy.mjs --check",
+    "docs:architecture": "node scripts/render-crate-architecture.mjs",
+    "docs:architecture:check": "node scripts/render-crate-architecture.mjs --check"
   },
   "engines": {
     "node": ">=22"

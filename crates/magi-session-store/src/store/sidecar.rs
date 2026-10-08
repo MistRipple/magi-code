@@ -439,8 +439,22 @@ fn current_turn_item_renderable(
     if kind == CanonicalTurnItemKind::AssistantText {
         return has_content || !status.is_terminal();
     }
+    // 命令身份是用户消息的可见内容，即使没有任何命令参数。
+    let has_command = kind == CanonicalTurnItemKind::UserMessage
+        && (item
+            .metadata
+            .get(crate::SESSION_COMMAND_METADATA_KEY)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+            || item.metadata.get("goalMode").and_then(Value::as_bool) == Some(true)
+            || item
+                .metadata
+                .get("skillName")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty()));
     has_content
         || has_images
+        || has_command
         || item.tool_call_id.is_some()
         || item.worker_id.is_some()
         || item.task_id.is_some()

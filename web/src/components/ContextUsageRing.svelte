@@ -1,8 +1,11 @@
 <script lang="ts">
+  import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
   import { i18n } from '../stores/i18n.svelte';
   import {
     buildRingDetailItems,
     buildRingTooltip,
+    formatRingPercent,
+    formatRingTokens,
     resolveRingView,
     type ContextRingTone,
   } from '../lib/context-usage-ring';
@@ -14,11 +17,16 @@
     tokenUsed?: number | null;
     remainingTokens?: number | null;
     tokenLimit?: number | null;
+    configuredTokenLimit?: number | null;
     warningLevel?: ContextRingTone | null;
     lastCompactionReason?: string | null;
     originalTokenEstimate?: number | null;
     compactedTokenEstimate?: number | null;
     measurement?: 'estimated' | 'authoritative' | null;
+    contextBreakdown?: ContextUsageBreakdown | null;
+    responseReserveTokens?: number | null;
+    recoveryBufferTokens?: number | null;
+    proactiveThresholdTokens?: number | null;
     onSaveContextWindow?: (contextWindowTokens: number) => Promise<void> | void;
   }
 
@@ -28,11 +36,16 @@
     tokenUsed = null,
     remainingTokens = null,
     tokenLimit = null,
+    configuredTokenLimit = null,
     warningLevel = null,
     lastCompactionReason = null,
     originalTokenEstimate = null,
     compactedTokenEstimate = null,
     measurement = null,
+    contextBreakdown = null,
+    responseReserveTokens = null,
+    recoveryBufferTokens = null,
+    proactiveThresholdTokens = null,
     onSaveContextWindow,
   }: Props = $props();
 
@@ -52,6 +65,31 @@
   const view = $derived(resolveRingView(input));
   const tooltip = $derived(buildRingTooltip(input, (key, params) => i18n.t(key, params)));
   const detailItems = $derived(buildRingDetailItems(input, (key, params) => i18n.t(key, params)));
+  const breakdownRows = $derived.by(() => {
+    const categories = [
+      ['messages', 'input.contextRing.category.messages', contextBreakdown?.conversationTokens ?? 0],
+      ['images', 'input.contextRing.category.images', contextBreakdown?.imageTokens ?? 0],
+      ['system', 'input.contextRing.category.system', contextBreakdown?.systemInstructionTokens ?? 0],
+      ['project', 'input.contextRing.category.project', contextBreakdown?.projectContextTokens ?? 0],
+      ['skills', 'input.contextRing.category.skills', contextBreakdown?.skillTokens ?? 0],
+      ['references', 'input.contextRing.category.references', contextBreakdown?.contextReferenceTokens ?? 0],
+      ['builtin-tools', 'input.contextRing.category.builtinTools', contextBreakdown?.builtinToolTokens ?? 0],
+      ['mcp-tools', 'input.contextRing.category.mcpTools', contextBreakdown?.mcpToolTokens ?? 0],
+      ['skill-tools', 'input.contextRing.category.skillTools', contextBreakdown?.skillToolTokens ?? 0],
+      ['other-tools', 'input.contextRing.category.otherTools', contextBreakdown?.otherToolTokens ?? 0],
+    ] as const;
+    const total = categories.reduce((sum, [, , tokens]) => sum + Math.max(0, tokens), 0);
+    return categories
+      .filter(([, , tokens]) => tokens > 0)
+      .map(([key, labelKey, tokens]) => ({
+        key,
+        label: i18n.t(labelKey),
+        tokens,
+        percent: formatRingPercent(tokens / total),
+        width: tokens / total * 100,
+      }));
+  });
+  const hasBreakdown = $derived(breakdownRows.length > 0);
   const popoverId = `context-usage-ring-${Math.random().toString(36).slice(2)}`;
 
   let rootEl = $state<HTMLSpanElement | null>(null);
@@ -63,7 +101,7 @@
   let saveError = $state('');
 
   function beginEditing() {
-    const tokens = tokenLimit ?? 256_000;
+    const tokens = configuredTokenLimit ?? tokenLimit ?? 256_000;
     if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) {
       draftWindowValue = String(tokens / 1_000_000);
       draftWindowUnit = 'M';
@@ -177,14 +215,52 @@
   >
     <div class="context-popover-title">
       <span>{i18n.t('input.contextRing.label')}</span>
-      <strong>{view.labelText}</strong>
+      <strong>
+        {#if view.hasData && tokenUsed != null && tokenLimit != null}
+          {formatRingTokens(tokenUsed)} / {formatRingTokens(tokenLimit)} ({view.labelText})
+        {:else}
+          {view.labelText}
+        {/if}
+      </strong>
     </div>
     {#if view.hasData}
+      {#if hasBreakdown}
+        <div class="context-breakdown-bar" role="img" aria-label={i18n.t('input.contextRing.breakdown')}>
+          {#each breakdownRows as row (row.key)}
+            <span class="context-breakdown-segment category-{row.key}" style={`width:${row.width}%`}></span>
+          {/each}
+        </div>
+      {/if}
       <div class="context-popover-list">
         {#each detailItems as item (item.key)}
           <span>{item.text}</span>
         {/each}
       </div>
+      {#if hasBreakdown}
+        <div class="context-breakdown-section">
+          <div class="context-breakdown-heading">{i18n.t('input.contextRing.breakdown')}</div>
+          <div class="context-breakdown-list">
+            {#each breakdownRows as row (row.key)}
+              <div class="context-breakdown-row">
+                <span class="context-breakdown-swatch category-{row.key}" aria-hidden="true"></span>
+                <span class="context-breakdown-name">{row.label}</span>
+                <span class="context-breakdown-tokens">{formatRingTokens(row.tokens)}</span>
+                <span class="context-breakdown-percent">{row.percent}%</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {:else}
+        <div class="context-breakdown-empty">{i18n.t('input.contextRing.breakdownUnavailable')}</div>
+      {/if}
+      {#if responseReserveTokens != null || recoveryBufferTokens != null || proactiveThresholdTokens != null}
+        <div class="context-budget-notes">
+          <div class="context-breakdown-heading">{i18n.t('input.contextRing.budget')}</div>
+          {#if responseReserveTokens != null}<span>{i18n.t('input.contextRing.outputReserve', { value: formatRingTokens(responseReserveTokens) })}</span>{/if}
+          {#if recoveryBufferTokens != null}<span>{i18n.t('input.contextRing.recoveryBuffer', { value: formatRingTokens(recoveryBufferTokens) })}</span>{/if}
+          {#if proactiveThresholdTokens != null}<span>{i18n.t('input.contextRing.compactionThreshold', { value: formatRingTokens(proactiveThresholdTokens) })}</span>{/if}
+        </div>
+      {/if}
     {:else}
       <div class="context-popover-empty">{i18n.t('input.contextRing.empty')}</div>
     {/if}
@@ -320,8 +396,10 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: max-content;
-    max-width: min(260px, calc(100vw - 24px));
+    width: min(200px, calc(100vw - 24px));
+    box-sizing: border-box;
+    max-height: min(70vh, 560px);
+    overflow: auto;
     padding: 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -349,18 +427,117 @@
 
   .context-popover-title {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
     color: var(--foreground-muted);
   }
 
   .context-popover-title strong {
     color: var(--foreground);
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
+    text-align: left;
   }
+
+  .context-breakdown-bar {
+    display: flex;
+    width: 100%;
+    height: 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--surface-3);
+  }
+
+  .context-breakdown-segment {
+    display: block;
+    flex: 0 0 auto;
+    height: 100%;
+  }
+
+  .context-breakdown-section,
+  .context-budget-notes {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .context-breakdown-heading {
+    color: var(--foreground-muted);
+    font-weight: 600;
+  }
+
+  .context-breakdown-empty {
+    color: var(--foreground-muted);
+    font-size: 11px;
+  }
+
+  .context-breakdown-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .context-breakdown-row {
+    display: grid;
+    grid-template-columns: 9px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    align-items: center;
+    column-gap: 7px;
+    row-gap: 1px;
+    min-height: 27px;
+  }
+
+  .context-breakdown-swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .context-breakdown-name {
+    grid-column: 2 / 4;
+    grid-row: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .context-breakdown-tokens {
+    grid-column: 2;
+    grid-row: 2;
+    color: var(--foreground-muted);
+    text-align: left;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .context-breakdown-percent {
+    grid-column: 3;
+    grid-row: 2;
+    color: var(--foreground-muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .context-budget-notes {
+    padding-top: 5px;
+    border-top: 1px solid var(--border);
+    color: var(--foreground-muted);
+    font-size: 11px;
+  }
+
+  .category-messages { background: #3b82f6; }
+  .category-images { background: #22d3ee; }
+  .category-system { background: #f97316; }
+  .category-project { background: #14b8a6; }
+  .category-skills { background: #eab308; }
+  .category-references { background: #8b5cf6; }
+  .category-builtin-tools { background: #ec4899; }
+  .category-mcp-tools { background: #22c55e; }
+  .category-skill-tools { background: #c084fc; }
+  .category-other-tools { background: #78716c; }
 
   .context-popover-list {
     display: flex;
@@ -402,7 +579,7 @@
 
   .context-window-input-row {
     display: grid;
-    grid-template-columns: minmax(72px, 1fr) 44px 24px 24px;
+    grid-template-columns: minmax(0, 1fr) 40px 22px 22px;
     align-items: center;
     gap: 4px;
   }
@@ -428,7 +605,7 @@
   }
 
   .context-window-icon-button {
-    width: 24px;
+    width: 22px;
     height: 24px;
     padding: 0;
     border-radius: var(--radius-sm);

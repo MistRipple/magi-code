@@ -1260,7 +1260,7 @@ mod tests {
     fn session_command_turns_never_enter_rebuilt_model_history() {
         let turns = vec![
             canonical_turn("turn-plain", 1, "实现登录接口", false),
-            canonical_turn("turn-compact", 2, "/compact 保留接口约束", true),
+            canonical_turn("turn-compact", 2, "保留接口约束", true),
         ];
         assert!(turns[1].is_session_command());
         let history =

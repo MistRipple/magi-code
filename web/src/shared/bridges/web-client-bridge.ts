@@ -1,3 +1,4 @@
+import { normalizeContextUsageBreakdown } from '../../lib/context-usage-breakdown';
 import {
   AgentApiError,
   BROWSER_AUTHORITY_CHANGED_EVENT,
@@ -1760,6 +1761,7 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
   const measurement = trimBridgeString(payload.measurement) === 'authoritative'
     ? 'authoritative'
     : 'estimated';
+  const contextBreakdown = normalizeContextUsageBreakdown(payload.context_breakdown);
   const current = messagesState.orchestratorRuntimeState;
   const currentBudget = current?.runtimeSnapshot?.budgetState;
   const currentUpdatedAt = currentBudget?.updatedAt ?? 0;
@@ -1788,7 +1790,14 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     || warningLevelValue === 'compaction_due'
   ) ? (warningLevelValue === 'compaction_due' ? 'danger' : warningLevelValue) : undefined;
   const budgetState: NonNullable<OrchestratorRuntimeSnapshot['budgetState']> = {
-    ...currentBudget,
+    // 压力事件是完整的调用快照；只有压缩通知的独立记录跨调用保留。
+    lastCompactionAt: currentBudget?.lastCompactionAt,
+    lastCompactionReason: currentBudget?.lastCompactionReason,
+    originalTokenEstimate: currentBudget?.originalTokenEstimate,
+    compactedTokenEstimate: currentBudget?.compactedTokenEstimate,
+    requestTokenEstimate: currentBudget?.requestTokenEstimate,
+    originalMessageCount: currentBudget?.originalMessageCount,
+    compactedMessageCount: currentBudget?.compactedMessageCount,
     tokenUsed: Math.max(0, Math.floor(tokenUsed)),
     tokenLimit: Math.max(0, Math.floor(tokenLimit)),
     remainingTokens: Math.max(
@@ -1811,9 +1820,14 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     ...(trimBridgeString(payload.resolved_model)
       ? { resolvedModel: trimBridgeString(payload.resolved_model) }
       : {}),
-    ...(readFiniteEventNumber(payload, 'provider_context_tokens') != null
-      ? { providerContextTokens: readFiniteEventNumber(payload, 'provider_context_tokens') }
+    providerContextTokens: readFiniteEventNumber(payload, 'provider_context_tokens'),
+    ...(readFiniteEventNumber(payload, 'response_reserve_tokens') != null
+      ? { responseReserveTokens: readFiniteEventNumber(payload, 'response_reserve_tokens') }
       : {}),
+    ...(readFiniteEventNumber(payload, 'recovery_buffer_tokens') != null
+      ? { recoveryBufferTokens: readFiniteEventNumber(payload, 'recovery_buffer_tokens') }
+      : {}),
+    contextBreakdown,
     ...(readFiniteEventNumber(payload, 'proactive_threshold_tokens') != null
       ? { proactiveThresholdTokens: readFiniteEventNumber(payload, 'proactive_threshold_tokens') }
       : {}),
@@ -1850,25 +1864,9 @@ function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
   const payload = event.payload;
   if (!payload) return;
   const compactedTokenEstimate = readFiniteEventNumber(payload, 'compacted_token_estimate');
-  const tokenLimit = readFiniteEventNumber(payload, 'context_window_limit_tokens')
-    ?? messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState?.tokenLimit;
-  if (compactedTokenEstimate === undefined || tokenLimit === undefined) return;
-  const requestTokenEstimate = readFiniteEventNumber(payload, 'request_token_estimate')
-    ?? compactedTokenEstimate;
+  if (compactedTokenEstimate === undefined) return;
   const compactedAt = readFiniteEventNumber(payload, 'compacted_at');
-  applyContextBudgetRuntimeEvent({
-    ...event,
-    payload: {
-      ...payload,
-      projected_request_tokens: requestTokenEstimate,
-      context_window_limit_tokens: tokenLimit,
-      remaining_tokens: Math.max(0, tokenLimit - requestTokenEstimate),
-      usage_ratio: tokenLimit > 0 ? requestTokenEstimate / tokenLimit : 0,
-      phase: 'compacted',
-      measurement: 'estimated',
-      observed_at: compactedAt ?? event.occurred_at,
-    },
-  });
+  const requestTokenEstimate = readFiniteEventNumber(payload, 'request_token_estimate');
   const state = messagesState.orchestratorRuntimeState;
   const budget = state?.runtimeSnapshot?.budgetState;
   if (!state || !budget) return;
@@ -3963,6 +3961,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     workspacePath: turn.workspacePath?.trim() || undefined,
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
+    command: turn.command === 'compact' ? 'compact' : null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -4162,8 +4161,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     id: userMessageId,
     role: 'user',
     source: 'user',
-    // 与 daemon timeline 展示一致：命令轮次显示为 `/compact 补充要求`。
-    content: command ? [`/${command}`, normalizedText].filter(Boolean).join(' ') : text || '',
+    content: text || '',
     timestamp: requestCreatedAt,
     isStreaming: false,
     isComplete: true,

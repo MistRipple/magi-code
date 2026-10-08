@@ -1,299 +1,259 @@
-use crate::{BuiltinToolAccessMode, ToolExecutionContext};
-use serde_json::Value;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use super::{
-    failure::{filesystem_failure, invalid_input, path_resolution_failure},
-    field_bool, field_string, field_usize, parse_json_object, required_string_field,
-    resolve_path_with_context,
+    failure::invalid_input,
+    field_bool, field_string, parse_json_object,
+    read_support::{
+        DEFAULT_MAX_BYTES, MAX_BYTES, MAX_FILE_BYTES, ReadOperation, WorkspaceFiles, bounded_usize,
+        decode_text,
+    },
+    required_string_field,
 };
+use crate::{BuiltinToolAccessMode, ToolExecutionContext, ToolRuntimeResources};
 use magi_core::ToolFailure;
+use serde_json::{Value, json};
+use std::{fs, path::Path};
 
-pub(super) fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
+pub(super) fn execute_search_text(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    search(input, context, resources).unwrap_or_else(|failure| failure)
+}
+
+fn search(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> Result<String, String> {
     let request = parse_json_object(input);
-    let query =
-        match required_string_field(request.as_ref(), "query", "search_text", "缺少搜索关键词")
-        {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
-    let root_input = request
-        .as_ref()
-        .and_then(|object| field_string(object, "root"))
-        .unwrap_or_else(|| ".".to_string());
-    let root = match resolve_path_with_context(&root_input, context) {
-        Ok(path) => path,
-        Err(error) => {
-            return path_resolution_failure("search_text", &root_input, &error);
+    let query = required_string_field(request.as_ref(), "query", "search_text", "缺少搜索关键词")?;
+    if query.chars().count() > 4096 {
+        return Err(invalid_input("search_text", "query 最多 4096 个字符"));
+    }
+    let request = request.unwrap();
+    let op = ReadOperation::new("search_text", &request, context, resources)?;
+    let root = op.resolve(
+        &field_string(&request, "root").unwrap_or_else(|| ".".into()),
+        context,
+    )?;
+    let root = crate::canonicalize_tool_permission_path(&root);
+    let metadata = fs::metadata(&root).map_err(|e| op.io_failure(&root, &e))?;
+    if metadata.is_dir() {
+        fs::read_dir(&root).map_err(|e| op.io_failure(&root, &e))?;
+    } else if !metadata.is_file() {
+        return Err(invalid_input("search_text", "搜索根必须是目录或普通文件"));
+    }
+    let limit = bounded_usize(&request, "limit", 20, 500, "search_text")?;
+    let max_bytes = bounded_usize(
+        &request,
+        "max_bytes",
+        DEFAULT_MAX_BYTES,
+        MAX_BYTES,
+        "search_text",
+    )?;
+    let case_sensitive = field_bool(&request, "case_sensitive").unwrap_or(true);
+    let include_hidden = field_bool(&request, "include_hidden").unwrap_or(false);
+    let query_mode = field_string(&request, "query_mode").unwrap_or_else(|| "literal".into());
+    let target = field_string(&request, "target").unwrap_or_else(|| "content".into());
+    if !matches!(target.as_str(), "content" | "path") {
+        return Err(invalid_input(
+            "search_text",
+            "target 只支持 content 或 path",
+        ));
+    }
+    let output_mode = field_string(&request, "output_mode")
+        .unwrap_or_else(|| if target == "path" { "files" } else { "matches" }.into());
+    if !matches!(output_mode.as_str(), "matches" | "files")
+        || (target == "path" && output_mode != "files")
+    {
+        return Err(invalid_input(
+            "search_text",
+            "output_mode 只支持 matches 或 files；target=path 时使用 files",
+        ));
+    }
+    // 字面量只做转义，所有匹配均使用同一个 Rust regex 引擎，位置来自原始文本。
+    let pattern = match query_mode.as_str() {
+        "literal" => regex::escape(&query),
+        "regex" => query.clone(),
+        _ => {
+            return Err(invalid_input(
+                "search_text",
+                "query_mode 只支持 literal 或 regex",
+            ));
         }
     };
-    let limit = request
-        .as_ref()
-        .and_then(|object| field_usize(object, "limit"))
-        .unwrap_or(20)
-        .clamp(1, 500);
-    let case_sensitive = request
-        .as_ref()
-        .and_then(|object| field_bool(object, "case_sensitive"))
-        .unwrap_or(true);
-    let include_hidden = request
-        .as_ref()
-        .and_then(|object| field_bool(object, "include_hidden"))
-        .unwrap_or(false);
-    let query_mode = request
-        .as_ref()
-        .and_then(|object| field_string(object, "query_mode"))
-        .unwrap_or_else(|| "literal".to_string());
-    let matcher = match SearchTextMatcher::new(&query, &query_mode, case_sensitive) {
-        Ok(matcher) => matcher,
-        Err(SearchTextMatcherError::UnsupportedMode) => {
-            return invalid_input("search_text", "query_mode 只支持 literal 或 regex");
-        }
-        Err(SearchTextMatcherError::InvalidRegex) => {
-            return ToolFailure::new("search_text", "invalid_regex", "正则表达式无效")
+    let matcher = regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|_| {
+            ToolFailure::new("search_text", "invalid_regex", "正则表达式无效")
                 .instruction("修正 query 的正则语法，或把 query_mode 改成 literal 做字面量搜索。")
-                .into_payload();
-        }
-    };
-
-    let outcome = match search_text_matches(&root, &matcher, include_hidden, limit) {
-        Ok(outcome) => outcome,
-        Err(error) => return search_text_root_failure(error),
-    };
-
-    serde_json::json!({
-        "tool": "search_text",
-        "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "root": root.display().to_string(),
-        "query": query,
-        "query_mode": query_mode,
-        "case_sensitive": case_sensitive,
-        "limit": limit,
-        "scanned_files": outcome.scanned_files,
-        "returned_matches": outcome.matches.len(),
-        "truncated": outcome.truncated,
-        "skipped": {
-            "unreadable": outcome.skipped_unreadable,
-            "too_large": outcome.skipped_too_large,
-            "non_text": outcome.skipped_non_text,
-        },
-        "matches": outcome.matches,
-        "summary": format!(
-            "在 {} 中扫描了 {} 个文件，找到 {} 个匹配{}",
-            root.display(),
-            outcome.scanned_files,
-            outcome.matches.len(),
-            search_text_skip_note(&outcome),
-        )
-    })
-    .to_string()
-}
-
-/// 有文件没能搜索时在摘要里点明，避免把「没搜到」读成「没有」。
-pub(super) fn search_text_skip_note(outcome: &SearchTextOutcome) -> String {
-    let skipped = outcome.skipped_unreadable + outcome.skipped_too_large + outcome.skipped_non_text;
-    if skipped == 0 {
-        return String::new();
-    }
-    format!(
-        "（另有 {skipped} 个文件或目录未搜索：{} 个无法读取、{} 个超过 2MB、{} 个不是文本）",
-        outcome.skipped_unreadable, outcome.skipped_too_large, outcome.skipped_non_text
-    )
-}
-
-/// 搜索根本身读不了：由统一的文件系统失败分类给出「不存在」「没有权限」等类别，
-/// 模型才知道该改路径还是换方式。
-pub(super) fn search_text_root_failure(error: SearchTextFilesystemError) -> String {
-    filesystem_failure("search_text", error.action, &error.path, &error.source).into_payload()
-}
-
-pub(super) fn should_skip_directory(path: &Path, include_hidden: bool) -> bool {
-    let name = match path.file_name().and_then(|value| value.to_str()) {
-        Some(value) => value,
-        None => return false,
-    };
-    if !include_hidden && name.starts_with('.') {
-        return true;
-    }
-    matches!(name, "target" | "node_modules" | "dist" | "coverage")
-}
-
-pub(super) struct SearchTextFilesystemError {
-    action: &'static str,
-    path: PathBuf,
-    source: std::io::Error,
-}
-
-pub(super) enum SearchTextMatcher {
-    Literal { query: String, case_sensitive: bool },
-    Regex(regex::Regex),
-}
-
-pub(super) enum SearchTextMatcherError {
-    UnsupportedMode,
-    InvalidRegex,
-}
-
-impl SearchTextMatcher {
-    fn new(
-        query: &str,
-        query_mode: &str,
-        case_sensitive: bool,
-    ) -> Result<Self, SearchTextMatcherError> {
-        match query_mode {
-            "literal" => Ok(Self::Literal {
-                query: if case_sensitive {
-                    query.to_string()
-                } else {
-                    query.to_lowercase()
-                },
-                case_sensitive,
-            }),
-            "regex" => regex::RegexBuilder::new(query)
-                .case_insensitive(!case_sensitive)
-                .build()
-                .map(Self::Regex)
-                .map_err(|_| SearchTextMatcherError::InvalidRegex),
-            _ => Err(SearchTextMatcherError::UnsupportedMode),
-        }
-    }
-
-    fn find(&self, line: &str) -> Option<usize> {
-        match self {
-            Self::Literal {
-                query,
-                case_sensitive,
-            } => {
-                if *case_sensitive {
-                    line.find(query)
-                } else {
-                    line.to_lowercase().find(query)
-                }
+                .into_payload()
+        })?;
+    op.check()?;
+    let mut items = Vec::<Value>::new();
+    let mut output_bytes = 0;
+    let mut stop_reason = None;
+    let mut scanned_files = 0;
+    let mut unreadable = 0;
+    let mut too_large = 0;
+    let mut non_text = 0;
+    let mut walker = WorkspaceFiles::new(op.clone(), &root, context, include_hidden)?;
+    while let Some(path) = walker.next_file()? {
+        let path = path.as_path();
+        op.authorize(path)?;
+        scanned_files += 1;
+        let path_text = path.to_string_lossy().to_string();
+        let relative_path = path
+            .strip_prefix(&root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(path.file_name().unwrap()));
+        if target == "path" {
+            if matcher.is_match(&relative_path.to_string_lossy().replace('\\', "/")) {
+                stop_reason = push_item(
+                    &mut items,
+                    json!(path_text),
+                    &mut output_bytes,
+                    limit,
+                    max_bytes,
+                );
             }
-            Self::Regex(regex) => regex.find(line).map(|matched| matched.start()),
-        }
-    }
-}
-
-/// 一次文本搜索的结果：命中之外还要说明「哪些地方没搜到」，模型才不会把没搜到当成没有。
-pub(super) struct SearchTextOutcome {
-    matches: Vec<Value>,
-    scanned_files: usize,
-    truncated: bool,
-    /// 读不了的子目录或文件（权限、搜索期间被删除、悬空链接……）。
-    skipped_unreadable: usize,
-    /// 超过体积上限的文件。
-    skipped_too_large: usize,
-    /// 不是 UTF-8 文本的文件（二进制等）。
-    skipped_non_text: usize,
-}
-
-pub(super) const SEARCH_TEXT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-
-/// 遍历搜索根目录。只有**搜索根本身**读不了才算工具失败；
-/// 子目录或文件读不了只跳过并计数——一个无权限的目录不应让整次搜索作废。
-pub(super) fn search_text_matches(
-    root: &Path,
-    matcher: &SearchTextMatcher,
-    include_hidden: bool,
-    limit: usize,
-) -> Result<SearchTextOutcome, SearchTextFilesystemError> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut outcome = SearchTextOutcome {
-        matches: Vec::new(),
-        scanned_files: 0,
-        truncated: false,
-        skipped_unreadable: 0,
-        skipped_too_large: 0,
-        skipped_non_text: 0,
-    };
-
-    while let Some(path) = stack.pop() {
-        if outcome.matches.len() >= limit {
-            break;
-        }
-        let is_root = path == root;
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if is_root => {
-                return Err(SearchTextFilesystemError {
-                    action: "读取搜索路径信息",
-                    path,
-                    source: error,
-                });
-            }
-            Err(_) => {
-                outcome.skipped_unreadable += 1;
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            let mut entries = match fs::read_dir(&path) {
-                Ok(entries) => entries
-                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                    .collect::<Vec<_>>(),
-                Err(error) if is_root => {
-                    return Err(SearchTextFilesystemError {
-                        action: "读取搜索目录",
-                        path,
-                        source: error,
-                    });
-                }
+        } else {
+            let metadata = match fs::metadata(path) {
+                Ok(value) => value,
                 Err(_) => {
-                    outcome.skipped_unreadable += 1;
+                    unreadable += 1;
                     continue;
                 }
             };
-            entries.sort();
-            for entry in entries.into_iter().rev() {
-                if should_skip_directory(&entry, include_hidden) {
+            if metadata.len() > MAX_FILE_BYTES as u64 {
+                too_large += 1;
+                continue;
+            }
+            let mut file = match op.open(path) {
+                Ok(file) => file,
+                Err(failure) if path == root => return Err(failure),
+                Err(_) => {
+                    op.check()?;
+                    unreadable += 1;
                     continue;
                 }
-                stack.push(entry);
+            };
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 16 * 1024];
+            let mut failed = false;
+            while bytes.len() <= MAX_FILE_BYTES {
+                let cap = buffer.len().min(MAX_FILE_BYTES + 1 - bytes.len());
+                match op.read_chunk(&mut file, &mut buffer[..cap], path) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                    Err(failure) if path == root => return Err(failure),
+                    Err(_) => {
+                        op.check()?;
+                        unreadable += 1;
+                        failed = true;
+                        break;
+                    }
+                }
             }
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-
-        outcome.scanned_files += 1;
-        if metadata.len() > SEARCH_TEXT_MAX_FILE_BYTES {
-            outcome.skipped_too_large += 1;
-            continue;
-        }
-
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                outcome.skipped_non_text += 1;
+            if failed {
                 continue;
             }
-            Err(_) => {
-                outcome.skipped_unreadable += 1;
+            if bytes.len() > MAX_FILE_BYTES {
+                too_large += 1;
                 continue;
             }
-        };
-
-        for (line_number, line) in content.lines().enumerate() {
-            if outcome.matches.len() >= limit {
-                break;
+            let content = match decode_text(bytes, false) {
+                Ok(content) => content,
+                Err(()) => {
+                    non_text += 1;
+                    continue;
+                }
+            };
+            for (index, line) in content.lines().enumerate() {
+                op.check()?;
+                let Some(matched) = matcher.find(line) else {
+                    continue;
+                };
+                let item = if output_mode == "files" {
+                    json!(path_text)
+                } else {
+                    let (excerpt, start) = excerpt(line, matched.start());
+                    json!({
+                        "path": path_text,
+                        "line": index + 1,
+                        "column": line[..matched.start()].chars().count() + 1,
+                        "excerpt": excerpt,
+                        "excerpt_start_column": line[..start].chars().count() + 1,
+                        "excerpt_truncated": excerpt.len() < line.len(),
+                    })
+                };
+                stop_reason = push_item(&mut items, item, &mut output_bytes, limit, max_bytes);
+                if stop_reason.is_some() || output_mode == "files" {
+                    break;
+                }
             }
-            if let Some(column) = matcher.find(line) {
-                outcome.matches.push(serde_json::json!({
-                    "path": path.display().to_string(),
-                    "line": line_number + 1,
-                    "column": column + 1,
-                    "excerpt": line.trim().to_string(),
-                }));
-            }
+        }
+        if stop_reason.is_some() {
+            break;
         }
     }
+    op.check()?;
+    unreadable += walker.unreadable;
+    let skip_note = if unreadable + too_large + non_text == 0 {
+        String::new()
+    } else {
+        format!(
+            "（另有 {} 个文件或目录未搜索：{unreadable} 个无法读取、{too_large} 个超过 2MB、{non_text} 个不是文本）",
+            unreadable + too_large + non_text
+        )
+    };
+    let mut result = json!({
+        "tool": "search_text", "status": "succeeded", "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "root": root.display().to_string(), "query": query, "query_mode": query_mode, "target": target, "output_mode": output_mode,
+        "case_sensitive": case_sensitive, "limit": limit, "max_bytes": max_bytes,
+        "scanned_files": scanned_files, "truncated": stop_reason.is_some(), "stop_reason": stop_reason,
+        "skipped": { "unreadable": unreadable, "too_large": too_large, "non_text": non_text },
+        "summary": format!("在 {} 中扫描了 {scanned_files} 个文件，返回 {} 项{skip_note}", root.display(), items.len())
+    });
+    if output_mode == "files" {
+        result["returned_files"] = items.len().into();
+        result["files"] = items.into();
+    } else {
+        result["returned_matches"] = items.len().into();
+        result["matches"] = items.into();
+    }
+    Ok(result.to_string())
+}
 
-    outcome.truncated = outcome.matches.len() >= limit;
-    Ok(outcome)
+fn push_item(
+    items: &mut Vec<Value>,
+    item: Value,
+    bytes: &mut usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Option<&'static str> {
+    if items.len() == limit {
+        return Some("limit");
+    }
+    let size = item.to_string().len() + 1;
+    if *bytes + size > max_bytes {
+        return Some("max_bytes");
+    }
+    *bytes += size;
+    items.push(item);
+    None
+}
+
+fn excerpt(line: &str, matched: usize) -> (&str, usize) {
+    let mut start = matched.saturating_sub(256);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + 2048).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&line[start..end], start)
 }

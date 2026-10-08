@@ -453,6 +453,7 @@ struct QueuedSessionTurnDto {
     accepted_at: UtcMillis,
     content: String,
     text: Option<String>,
+    command: Option<magi_app_server_protocol::SessionTurnCommand>,
     skill_name: Option<String>,
     goal_mode: bool,
     access_profile: Option<AccessProfile>,
@@ -508,8 +509,9 @@ fn session_turn_queue_response(
                     .map(ToString::to_string),
                 workspace_path: queued.request.workspace_path.clone(),
                 accepted_at: queued.accepted_at,
-                content: queued.request.timeline_message(text.as_deref()),
+                content: queued.request.timeline_content(text.as_deref()),
                 text,
+                command: queued.request.command.clone(),
                 skill_name: queued.request.skill_name.clone(),
                 goal_mode: queued.request.goal_mode,
                 access_profile: queued.request.access_profile,
@@ -1765,7 +1767,7 @@ async fn submit_conversation_session_turn(
             .ensure_session_mission(&session_id, accepted_at, || {
                 MissionId::new(format!("mission-session-conversation-{}", accepted_at.0))
             });
-    let message = request.timeline_message(request.trimmed_text().as_deref());
+    let message = request.timeline_content(request.trimmed_text().as_deref());
     let mut metadata =
         magi_conversation_runtime::session_images::session_turn_images_metadata(&images);
     let context_references = request.context_references();
@@ -2552,7 +2554,7 @@ async fn submit_mainline_session_turn(
     let route = decision.route;
     let user_text = request
         .trimmed_text()
-        .unwrap_or_else(|| request.timeline_message(None));
+        .unwrap_or_else(|| request.timeline_content(None));
     let goal_mode = request.goal_mode;
     let execution_goal = if goal_mode {
         format!("{}\n\n用户原始输入：{}", goal_mode_tool_intent(), user_text)
@@ -2627,7 +2629,12 @@ async fn submit_mainline_session_turn(
         None,
     );
     if goal_start_turn {
-        remember_goal_start_request(&state, &accepted.session_id, &accepted.root_task_id, &request);
+        remember_goal_start_request(
+            &state,
+            &accepted.session_id,
+            &accepted.root_task_id,
+            &request,
+        );
     }
     super::schedule_session_task_dispatch(state.clone(), accepted.clone());
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
@@ -3002,7 +3009,9 @@ async fn resubmit_goal_start_turn(
             None => id,
         })
         .unwrap_or_else(|| format!("goal-start-{failed_turn_id}"));
-    request.request_id = Some(format!("{base_request_id}{GOAL_START_RETRY_SUFFIX}{attempt}"));
+    request.request_id = Some(format!(
+        "{base_request_id}{GOAL_START_RETRY_SUFFIX}{attempt}"
+    ));
     request.user_message_id = None;
     request.placeholder_message_id = None;
     let request_fingerprint = match request.request_fingerprint() {
@@ -5999,14 +6008,11 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
 
         assert_eq!(
-            request.timeline_message(request.trimmed_text().as_deref()),
-            "/compact 保留接口约束"
+            request.timeline_content(request.trimmed_text().as_deref()),
+            "保留接口约束"
         );
         let bare = compact_command_request(None);
-        assert_eq!(
-            bare.timeline_message(bare.trimmed_text().as_deref()),
-            "/compact"
-        );
+        assert_eq!(bare.timeline_content(bare.trimmed_text().as_deref()), "");
         assert!(!session_turn_request_is_plain_text(&request));
         assert_ne!(
             request.request_fingerprint().expect("fingerprint"),
@@ -6051,6 +6057,119 @@ mod tests {
         existing.session_id = Some(session_id.to_string());
         let decision = decide_session_turn(&state, &existing).unwrap();
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+    }
+
+    #[tokio::test]
+    async fn compact_command_acceptance_preserves_visible_command_and_argument_separation() {
+        for text in [None, Some("保留接口约束")] {
+            let state = test_state();
+            let session_id = SessionId::new("session-compact-command");
+            state
+                .session_store
+                .create_session(session_id.clone(), "compact")
+                .unwrap();
+            let mut request = compact_command_request(text);
+            request.request_id = Some("request-compact-command".to_string());
+            request.user_message_id = Some("user-compact-command".to_string());
+            let payload = serde_json::to_value(&request).unwrap();
+            let (status, body) = post_json(state.clone(), "/session/turn", payload.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let user = body["canonicalTurn"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "user_message")
+                .unwrap();
+            assert_eq!(user["content"], text.unwrap_or_default());
+            assert_eq!(user["metadata"]["sessionCommand"], "compact");
+            assert_eq!(user["visibility"]["renderable"], true);
+
+            let (status, replay) = post_json(state.clone(), "/session/turn", payload).await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(replay["replayed"], true);
+            assert_eq!(replay["turnId"], body["turnId"]);
+            assert_eq!(
+                state
+                    .session_store
+                    .canonical_turns_for_session(&session_id)
+                    .len(),
+                1
+            );
+            // 此 fixture 没有 dispatcher：等待真实后台失败收口，不能留下悬挂的执行。
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state
+                    .turn_coordinator()
+                    .current_attempt(&session_id, body["turnId"].as_str().unwrap())
+                    .is_ok()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conversation should settle");
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_command_queue_preserves_structured_command_after_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let persistence = || {
+            Arc::new(RuntimeStatePersistence::new(
+                root.path(),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ))
+        };
+        let state = test_state().with_runtime_persistence(persistence());
+        let session_id = SessionId::new("session-queued-compact");
+        let workspace_id = register_workspace(&state, "workspace-queued-compact", "queued-compact");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "queued compact",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        for (index, text) in [None, Some("保留接口约束")].into_iter().enumerate() {
+            let mut queued = queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                &format!("queue-compact-{index}"),
+                UtcMillis(index as u64 + 10),
+            );
+            queued.request.command = Some(magi_app_server_protocol::SessionTurnCommand::Compact);
+            queued.request.text = text.map(str::to_string);
+            state.enqueue_regular_session_turn(queued).unwrap();
+        }
+        let restored = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            state.session_store.clone(),
+            state.workspace_registry.clone(),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        assert_eq!(restored.restore_regular_session_turn_queues().unwrap(), 2);
+        for state in [state, restored] {
+            let Json(queue) = get_session_turn_queue(
+                State(state),
+                Query(SessionTurnQueueScope {
+                    session_id: session_id.to_string(),
+                    workspace_id: Some(workspace_id.to_string()),
+                    workspace_path: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let queue = serde_json::to_value(queue).unwrap();
+            assert_eq!(queue["queuedTurns"].as_array().unwrap().len(), 2);
+            for (index, text) in ["", "保留接口约束"].into_iter().enumerate() {
+                assert_eq!(queue["queuedTurns"][index]["command"], "compact");
+                assert_eq!(queue["queuedTurns"][index]["content"], text);
+                assert_eq!(queue["queuedTurns"][index]["canGuide"], false);
+            }
+        }
     }
 
     #[test]

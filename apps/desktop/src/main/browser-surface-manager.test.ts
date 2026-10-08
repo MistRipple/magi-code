@@ -10,56 +10,56 @@ import {
 const source = readFileSync(
   new URL("./browser-surface-manager.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const desktopControlServerSource = readFileSync(
   new URL("./desktop-control-server.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const windowManagerSource = readFileSync(
   new URL("./window-manager.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const webviewSecuritySource = readFileSync(
   new URL("./browser-webview-security.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const indexSource = readFileSync(
   new URL("./index.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const preloadSource = readFileSync(
   new URL("../preload/index.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const schemaSource = readFileSync(
   new URL(
     "../../../../contracts/desktop-browser/desktop-ipc.schema.json",
     import.meta.url,
   ),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const browserTabSource = readFileSync(
   new URL(
     "../../../../web/src/components/tabs/BrowserTabContent.svelte",
     import.meta.url,
   ),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const rightPaneSource = readFileSync(
   new URL("../../../../web/src/web/RightPane.svelte", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const webModelTabSource = readFileSync(
   new URL(
     "../../../../web/src/components/tabs/WebModelTabContent.svelte",
     import.meta.url,
   ),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 const webModelSessionSource = readFileSync(
   new URL("./web-model-session.ts", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/gu, "\n");
 
 function normalizeSourceWhitespace(value: string): string {
   return value.replace(/\s+/gu, " ");

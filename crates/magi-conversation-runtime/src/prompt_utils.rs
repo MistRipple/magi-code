@@ -247,6 +247,7 @@ pub fn current_access_profile_prompt(
 pub fn skill_prompt_message(runtime: &SkillRuntime, skill_id: &str) -> Option<ChatMessage> {
     let skill = runtime.registry().get(skill_id)?;
     Some(ChatMessage {
+        context_origin: magi_bridge_client::ChatMessageOrigin::Skill,
         role: "developer".to_string(),
         content: Some(format!(
             "--- Skill: {} ---\n{}\n{}",
@@ -330,6 +331,7 @@ pub enum PromptFragmentKind {
     WorkspaceContext,
     DeveloperInstructions,
     ContextReferences,
+    TaskContext,
     ProjectMemory,
     UserPlan,
     Mailbox,
@@ -340,12 +342,27 @@ pub enum PromptFragmentKind {
 }
 
 impl PromptFragmentKind {
+    pub fn context_origin(self) -> magi_bridge_client::ChatMessageOrigin {
+        use magi_bridge_client::ChatMessageOrigin;
+        match self {
+            Self::ProjectMemory => ChatMessageOrigin::ProjectContext,
+            Self::ContextReferences
+            | Self::TaskContext
+            | Self::UserPlan
+            | Self::Mailbox
+            | Self::KnowledgeContext => ChatMessageOrigin::ContextReference,
+            Self::ThreadHistoryBoundary => ChatMessageOrigin::Conversation,
+            _ => ChatMessageOrigin::SystemInstruction,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Role => "role",
             Self::WorkspaceContext => "workspace_context",
             Self::DeveloperInstructions => "developer_instructions",
             Self::ContextReferences => "context_references",
+            Self::TaskContext => "task_context",
             Self::ProjectMemory => "project_memory",
             Self::UserPlan => "user_plan",
             Self::Mailbox => "mailbox",
@@ -365,6 +382,7 @@ impl PromptFragmentKind {
             | Self::CurrentTurnPriority => "developer",
             Self::ProjectMemory
             | Self::ContextReferences
+            | Self::TaskContext
             | Self::UserPlan
             | Self::Mailbox
             | Self::ThreadHistoryBoundary
@@ -380,7 +398,7 @@ impl PromptFragmentKind {
             | Self::CurrentAccessProfile
             | Self::CurrentTurnPriority => PromptTrustLevel::TrustedInstruction,
             Self::ThreadHistoryBoundary => PromptTrustLevel::Transcript,
-            Self::UserPlan => PromptTrustLevel::TaskFact,
+            Self::UserPlan | Self::TaskContext => PromptTrustLevel::TaskFact,
             Self::ProjectMemory
             | Self::ContextReferences
             | Self::Mailbox
@@ -392,6 +410,7 @@ impl PromptFragmentKind {
         match self {
             Self::Role | Self::WorkspaceContext => PromptStability::Static,
             Self::DeveloperInstructions
+            | Self::TaskContext
             | Self::ContextReferences
             | Self::ProjectMemory
             | Self::UserPlan
@@ -428,6 +447,7 @@ pub fn system_prompt_fragment_message(
     content: impl AsRef<str>,
 ) -> ChatMessage {
     ChatMessage {
+        context_origin: kind.context_origin(),
         role: kind.role().to_string(),
         content: Some(render_prompt_fragment(kind, content)),
         images: Vec::new(),
@@ -445,7 +465,6 @@ pub fn compose_developer_instructions(
     base: Option<&str>,
     user_rules: Option<&str>,
     safeguard: Option<&str>,
-    skill_instructions: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(base) = base.map(str::trim).filter(|value| !value.is_empty()) {
@@ -461,12 +480,6 @@ pub fn compose_developer_instructions(
             "{SEGMENT_HEADER_SAFEGUARD}\n{SAFEGUARD_PRIORITY_NOTE}\n{safeguard}"
         ));
     }
-    if let Some(skill) = skill_instructions
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        sections.push(skill.to_string());
-    }
     (!sections.is_empty()).then(|| sections.join(SEGMENT_SEP))
 }
 
@@ -480,6 +493,7 @@ pub fn reference_context_message(
 
 pub fn runtime_context_message(kind: PromptFragmentKind, content: impl AsRef<str>) -> ChatMessage {
     ChatMessage {
+        context_origin: kind.context_origin(),
         role: "user".to_string(),
         content: Some(render_prompt_fragment(kind, content)),
         images: Vec::new(),

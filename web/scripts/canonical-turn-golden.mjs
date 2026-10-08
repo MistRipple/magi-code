@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 await withGoldenViteServer(async (server) => {
+  const userMessageCommand = await server.ssrLoadModule('/src/lib/user-message-command.ts');
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
@@ -18,6 +19,7 @@ await withGoldenViteServer(async (server) => {
   const markdownUrl = await server.ssrLoadModule('/src/lib/markdown-url.ts');
   const turnStore = await server.ssrLoadModule('/src/stores/turn-store.svelte.ts');
   runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, conversationPresentation, markdownUrl);
+  assertUserCommandSurvivesAcceptanceAndReload(reducer, projection, userMessageCommand);
   assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
@@ -1957,6 +1959,56 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
     ],
     'accepted canonical turn should keep the same visible timeline shape',
   );
+}
+
+function assertUserCommandSurvivesAcceptanceAndReload(reducer, projection, command) {
+  for (const [metadata, content, expectedLabel] of [
+    [{ sessionCommand: 'compact' }, '', '/compact'],
+    [{ sessionCommand: 'compact' }, '保留接口约束', '/compact'],
+    [{ goalMode: true }, '完成当前目标', '/goal'],
+    [{ skillName: 'review' }, '', '/review'],
+    [{ goalMode: true, skillName: 'review' }, '完成审查', '/goal /review'],
+    [{ skillName: 'owner/repo/skills/review' }, '审查当前改动', '/owner/repo/skills/review'],
+    [{}, '/ordinary-text', ''],
+  ]) {
+    const local = baseCase('local-command', 'session-command', 'turn-local-command', 10);
+    const accepted = baseCase('accepted-command', local.sessionId, 'turn-command', 20);
+    const identity = { requestId: 'request-command', userMessageId: 'user-message' };
+    const localUser = user(local, 1, content);
+    localUser.metadata = { ...identity, ...metadata, localOptimistic: true };
+    const acceptedUser = user(accepted, 1, content);
+    acceptedUser.metadata = { ...identity, ...metadata };
+    const acceptedTurn = turn(accepted, 'running', [acceptedUser]);
+    const assertCommand = (state) => {
+      const timeline = projection.buildCanonicalTimelineProjection(state);
+      assert.equal(timeline.threadRenderEntries.length, 1, 'one user card per command');
+      const message = timeline.artifacts[0].message;
+      assert.equal(message.content, content, 'command identity must stay out of the body');
+      assert.equal(command.resolveUserMessageCommandLabel(message.metadata), expectedLabel);
+    };
+    let state = reducer.reduceCanonicalTurnEvent(
+      reducer.createCanonicalTurnReducerState(local.sessionId),
+      event(local, 0, 'turn_started', {
+        turn: {
+          ...turn(local, 'running', [localUser]),
+          metadata: { requestId: identity.requestId, localOptimistic: true },
+        },
+        item: localUser,
+      }),
+    ).state;
+    assertCommand(state);
+    const acceptedEvent = event(accepted, 1, 'turn_started', { turn: acceptedTurn, item: acceptedUser });
+    for (const next of [acceptedEvent, acceptedEvent, event(accepted, 2, 'turn_completed', {
+      turn: { ...acceptedTurn, status: 'completed', completedAt: 30 },
+    })]) {
+      const result = reducer.reduceCanonicalTurnEvent(state, next);
+      assert.equal(result.error, undefined);
+      state = result.state;
+      assert.equal(state.turns.length, 1, 'accepted and repeated events must not duplicate the turn');
+      assertCommand(state);
+    }
+    assertCommand(reducer.replaceCanonicalTurns(local.sessionId, JSON.parse(JSON.stringify(state.turns))));
+  }
 }
 
 function assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection) {

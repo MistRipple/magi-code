@@ -1249,9 +1249,12 @@ impl DaemonRuntime {
         }
         self.runtime_maintenance.request_graceful_shutdown(reason);
         self.browser_host_controller_lifecycle.request_shutdown();
-        let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
-        if cancelled_process_count > 0 {
-            info!(cancelled_process_count, "daemon 关闭前已终止全部工具进程树");
+        let cancelled_execution_count = ToolRegistry::cancel_all_active_executions();
+        if cancelled_execution_count > 0 {
+            info!(
+                cancelled_execution_count,
+                "daemon 关闭前已取消工具执行并终止进程树"
+            );
         }
         let cancelled_managed_process_count = self.managed_process_group.terminate_all();
         if cancelled_managed_process_count > 0 {
@@ -1423,6 +1426,7 @@ impl DaemonRuntime {
                             &session_store,
                             Some(&settings_store),
                             ModelUsageRecordInput {
+                                context_breakdown: None,
                                 session_id,
                                 workspace_id: &execution_context.workspace_id,
                                 binding: &binding,

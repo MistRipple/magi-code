@@ -1,12 +1,10 @@
 # Magi 上下文压力与压缩统一架构
 
-> 文档类型：后续开发唯一架构基线
+> 文档类型：上下文压力与压缩的架构和验收基线
 >
 > 状态：核心链路已实现，后续仅允许在本架构内迭代
 >
-> 目标执行人：Luna
->
-> 更新日期：2026-09-27
+> 更新日期：2026-10-08
 >
 > 适用范围：Magi 主对话、识图模型单轮接管、辅助模型、worker、上下文统计、上下文压缩、超限恢复、检查点、事件投影和前端上下文用量展示
 
@@ -18,7 +16,7 @@
 - [OpenAI Codex](https://github.com/openai/codex)：当前上下文窗口与累计计费分离、压缩后立即重算、活动窗口和前缀基线。
 - [Grok Build](https://github.com/xai-org/grok-build)：85% 阈值、token counter 抽象、工具配对安全、状态重新注入、摘要质量门禁和历史指纹。
 - [Claude Code 官方仓库](https://github.com/anthropics/claude-code)：最新产品行为、缺陷记录和长期会话 UX 验收标准。
-- `/Users/xie/code/claude-code-2.1.87`：Claude Code 2.1.87 的可读实现，包括 auto compact、microcompact、compact boundary、token estimation、超限重试和状态清理。
+- Claude Code 2.1.87 的历史实现分析，包括 auto compact、microcompact、compact boundary、token estimation、超限重试和状态清理。
 
 本文不是代码迁移说明，也不是把五个项目拼成五套实现。后续 agent 必须先遵守本文的所有权边界和唯一数据流，再决定具体代码位置。
 
@@ -39,50 +37,29 @@
 11. daemon 重启、session 恢复和个人无工作区会话都使用同一套规则。
 12. worker、辅助模型、生图模型和识图模型的账单可记录，但不能覆盖主对话上下文锚点。
 
-## 3. 当前问题与根本原因
+## 3. 设计原则
 
-### 3.1 表面问题
-
-- 长会话中 Magi 可能比 Codex 更晚触发压缩。
-- 当前 token 统计在模型切换后可能出现分子来自旧模型、分母来自新模型。
-- 压缩输入固定受 32K 限制，头尾保留会跳过中间历史。
-- 工具结果虽然被限制长度，但压缩范围和工具配对边界没有统一的数据模型。
-- provider 上下文错误仍有一部分依赖错误字符串分类。
-- 压缩后 UI 可能继续展示压缩前的观测值，直到下一次模型调用。
-
-### 3.2 五个 Why
-
-1. 为什么统计可能不准？`model.usage.recorded` 保存的是通用 `context_window_tokens`，DTO 再根据当前活动模型推导窗口，没有把观测和模型配置绑定成不可变快照。
-2. 为什么压缩会偏晚？`context_authority.rs` 同时使用固定 90% 阈值、固定 8K 目标、固定 32K 输入和估算 prefill 分支，实际请求增量没有进入唯一压力模型。
-3. 为什么历史可能无声丢失？`bounded_compaction_source` 为满足输入限制采用头尾截断，而不是按照完整回合选择连续压缩范围。
-4. 为什么恢复容易复杂？运行时、usage authority、event bus、API DTO 和前端各自携带一部分 token 语义，provider 错误又在多处按文本判断。
-5. 为什么会出现重复或过度工作流？压缩、工具结果缩减、流式估算和错误恢复没有由一个 `ContextAuthority` 统一编排，导致多个“看似兜底”的路径叠加。
-
-最终根因是：上下文压力不是当前系统的一等领域对象，导致不同模块分别维护窗口、token、压缩和恢复状态。
-
-## 4. 设计原则
-
-### 4.1 单一权威
+### 3.1 单一权威
 
 所有上下文压力都由 `magi-usage-authority` 计算，运行时只提供输入和执行压缩，event bus 只投影，API 只转换 DTO，前端只展示。
 
-### 4.2 当前窗口与累计用量分离
+### 3.2 当前窗口与累计用量分离
 
 `provider_context_tokens` 不得进入累计账单 reducer；`billable_tokens` 不得用于判断下一次请求是否接近窗口。
 
-### 4.3 连续历史优先
+### 3.3 连续历史优先
 
 压缩选择完整的时间连续范围。不能用“保留最早几条 + 最近几条”的拼接替代连续摘要；如果摘要模型容量不足，缩小本次连续前缀，保留剩余历史供下一次有界压缩。
 
-### 4.4 结构正确优先于错误兜底
+### 3.4 结构正确优先于错误兜底
 
 工具调用、工具结果、图片附件和 provider 私有上下文必须在数据结构层保持合法。校验失败时不得安装半成品检查点，也不得用第二套兼容路径掩盖问题。
 
-### 4.5 复杂度受控
+### 3.5 复杂度受控
 
 Magi 只保留一条标准压缩链路。不会复制 Claude Code 中同时存在的 microcompact、snip、reactive compact、session-memory compact、context-collapse 等长期并行策略，也不会引入 Grok Build 的多种 compaction mode。
 
-## 5. 目标架构
+## 4. 目标架构
 
 ```mermaid
 flowchart LR
@@ -108,7 +85,7 @@ flowchart LR
     P --> Q["Context Usage UI"]
 ```
 
-### 5.1 模块职责
+### 4.1 模块职责
 
 | 模块 | 唯一职责 | 禁止行为 |
 | --- | --- | --- |
@@ -120,11 +97,11 @@ flowchart LR
 | `magi-api` | 读取快照并生成稳定 DTO | 用当前设置覆盖历史观测模型 |
 | Web UI | 展示快照和压缩状态 | 重新计算 token、窗口或阈值 |
 
-## 6. 核心领域模型
+## 5. 核心领域模型
 
 以下类型是架构要求，实际名称可以按仓库风格调整，但三种 token 语义不能合并。
 
-```rust /Users/xie/code/magi-rust-rewrite/crates/magi-usage-authority/src/context_pressure.rs
+```rust
 pub struct ModelIdentity {
     pub provider: String,
     pub model: String,
@@ -166,7 +143,7 @@ pub struct ContextPressureSnapshot {
 
 `BillableTokens` 只进入 usage ledger。上下文压力快照可以引用一次调用的 billing record，但不能从累计 billing total 反推当前窗口。
 
-### 6.1 锚点与增量
+### 5.1 锚点与增量
 
 同一模型连续调用时：
 
@@ -183,7 +160,7 @@ projected_request_tokens
 
 流式阶段可以发布估算快照；模型调用成功后，provider usage 替换流式估算。流式输出内容不得被当作累计账单，直到调用结束才写入最终 usage record。
 
-### 6.2 模型切换
+### 5.2 模型切换
 
 模型切换不是修改分母的局部操作，而是一次压力上下文重建：
 
@@ -194,7 +171,7 @@ projected_request_tokens
 
 识图模型只接管当前带图片回合。该回合的快照绑定识图模型；下一回合恢复主模型时必须重新估算，不能沿用识图模型锚点。
 
-## 7. 窗口预算策略
+## 6. 窗口预算策略
 
 窗口计算必须是模型感知的，不使用固定的全局 90% 规则。
 
@@ -217,9 +194,9 @@ retained_history_target = floor(context_window × 18%)
 
 告警和压缩使用同一个 `ContextBudgetPolicy`，不再保留 95%、90%、60/80/90 各自独立的分级口径。UI 可以展示 Normal、Notice、Warning、CompactionDue、Overflow，但这些状态必须由快照给出。
 
-## 8. 压缩算法
+## 7. 压缩算法
 
-### 8.1 压缩输入视图
+### 7.1 压缩输入视图
 
 原始 transcript 永久保留。模型可见的活动上下文由以下顺序组成：
 
@@ -236,7 +213,7 @@ retained_history_target = floor(context_window × 18%)
 - 图片、文档和其他附件引用。
 - 未完成的当前回合。
 
-### 8.2 压缩边界选择
+### 7.2 压缩边界选择
 
 选择从活动历史起点开始的连续完整前缀进行摘要，保留最近完整回合，使压缩后历史目标接近 `retained_history_target`。
 
@@ -249,7 +226,7 @@ retained_history_target = floor(context_window × 18%)
 
 如果摘要模型输入容量不足，只缩小连续压缩前缀，不使用头尾拼接。自动压缩和超限恢复在一次准备阶段达到安全请求门禁后收口；用户显式 `/compact` 可以在同一条命令内执行有界的连续前缀折叠，直到达到当前窗口的保留目标（固定输入已经占满目标时退回安全门禁）。每一轮都必须安装为完整候选或保持原上下文不变，不得把多轮内部折叠变成无界重试。
 
-### 8.3 大型工具结果
+### 7.3 大型工具结果
 
 大型旧工具结果在摘要前先做确定性缩减：
 
@@ -263,7 +240,7 @@ retained_history_target = floor(context_window × 18%)
 
 模型视图中历史工具结果的总预算与当前窗口成比例：`max(48KB, context_window × 25% × 4 字节)`（`model_visible_tool_history_budget_bytes`）。大窗口模型不会在上下文尚空时就截断旧文件与搜索结果；超过预算时最近结果保留一半预算，较早结果降为保留 ID、状态、路径和哈希的结构化事实。
 
-### 8.4 摘要模型输入预算
+### 7.4 摘要模型输入预算
 
 摘要由唯一的压缩模型绑定执行：配置了辅助模型时使用辅助模型，否则使用当前主模型。输入预算从这个实际调用模型的上下文窗口计算（`resolve_compaction_model` → `compaction_source_budget`），不得使用主模型窗口为辅助模型计算预算，也不再使用 `COMPACTION_MAX_SOURCE_TOKENS = 32_000`。
 
@@ -280,7 +257,7 @@ retained_history_target = floor(context_window × 18%)
 
 摘要模型输出不可被当作用户指令。图片、工具结果和网页内容中的指令只属于待总结数据。
 
-### 8.5 摘要质量门禁
+### 7.5 摘要质量门禁
 
 摘要安装前必须通过：
 
@@ -293,11 +270,11 @@ retained_history_target = floor(context_window × 18%)
 
 校验失败时保持原上下文不变，向运行时返回结构化失败原因。
 
-## 9. 检查点与持久化
+## 8. 检查点与持久化
 
-当前 `ThreadContextCheckpoint` 需要扩展为带代际和来源身份的检查点，建议字段如下：
+检查点必须携带代际和来源身份。下列结构表达字段语义，实际类型以 magi-session-store 为准：
 
-```rust /Users/xie/code/magi-rust-rewrite/crates/magi-session-store/src/models.rs
+```rust
 pub struct ThreadContextCheckpoint {
     pub thread_id: ThreadId,
     pub checkpoint_id: String,
@@ -317,7 +294,7 @@ pub struct ThreadContextCheckpoint {
 }
 ```
 
-### 9.1 原子提交顺序
+### 8.1 原子提交顺序
 
 ```text
 读取活动 transcript
@@ -334,7 +311,7 @@ pub struct ThreadContextCheckpoint {
 
 原始 transcript 不删除。检查点只定义模型下一次请求使用的活动视图，UI 历史视图仍可通过原始 transcript 和边界信息展示完整记录。
 
-### 9.2 重启恢复
+### 8.2 重启恢复
 
 daemon 重启后：
 
@@ -345,9 +322,9 @@ daemon 重启后：
 
 一次性迁移旧状态时，将旧的 `context_window_tokens` 作为账单/历史审计数据保留，但不再作为新运行时压力计算入口。迁移完成后，运行时不保留新旧双轨判断。
 
-## 10. 错误处理与无感恢复
+## 9. 错误处理与无感恢复
 
-### 10.1 类型化上下文错误
+### 9.1 类型化上下文错误
 
 在 `magi-bridge-client` 的 provider 适配层将以下错误归一为 `ContextLengthExceeded`：
 
@@ -357,7 +334,7 @@ daemon 重启后：
 
 `magi-conversation-runtime::model_error` 不再作为主路径解析原始错误字符串；文本解析仅保留在 provider 适配层的测试覆盖中。
 
-### 10.2 恢复状态机
+### 9.2 恢复状态机
 
 ```text
 PreflightPressureCheck
@@ -390,7 +367,7 @@ RetryInvoke context overflow
 - 第二次恢复仍失败时显示明确错误，并说明当前上下文无法在现有模型窗口内继续。
 - 连续多个 turn 的同类失败使用 session 级有界熔断和结构化原因，不能每轮自动打同一请求。
 
-### 10.3 手动压缩（`/compact`）
+### 9.3 手动压缩（`/compact`）
 
 压缩策略由 `ContextCompactionMode` 表达，三种策略共用同一条选择边界、摘要、质量门禁和检查点安装链路：
 
@@ -405,26 +382,26 @@ RetryInvoke context overflow
 1. Web 输入框以命令 chip 表达命令，输入文本作为可选补充要求；`turn/start` 与 HTTP `/api/session/turn` 使用同一 `command: "compact"` 字段（schema：`contracts/app-server/app-server.schema.json` 的 `SessionTurnCommand`）。
 2. `TurnService` 校验命令只能用于已有会话，且不能与技能、目标模式、图片、上下文引用、引导或编辑组合；命令进入请求指纹，不经意图分类，固定作为 conversation Turn 接纳。因此排队、幂等、取消、重连恢复和终态都复用普通 Turn 链路。
 3. 执行器在轮前上下文准备阶段以 `Manual` 策略强制压缩，写入压缩通知 item 后以 completed 收口，不调用主模型，也不把命令文本写入模型可见历史。补充要求只影响摘要保留重点，不改变固定交接标题。
-4. canonical user item 带 `sessionCommand` metadata；所有从 canonical Turn 重建模型历史的路径（thread projection、执行恢复历史、continue 重建、中断恢复查找）都通过 `CanonicalTurn::is_session_command` 排除命令轮次。
+4. canonical user item 带 `sessionCommand` metadata，正文只保存补充要求；排队、即时卡片、历史卡片和复制文本均从结构化身份展示命令，无参数命令仍可见。所有从 canonical Turn 重建模型历史的路径（thread projection、执行恢复历史、continue 重建、中断恢复查找）都通过 `CanonicalTurn::is_session_command` 排除命令轮次。
 5. 摘要仍由辅助模型执行（未配置时使用主模型），与自动压缩一致。
 
-### 10.4 取消
+### 9.4 取消
 
 取消必须同时停止摘要模型、当前模型调用和恢复重试。取消不会安装候选检查点，不修改原始 transcript，不发布“压缩成功”。
 
-## 11. 多模型、识图模型与 worker 隔离
+## 10. 多模型、识图模型与 worker 隔离
 
-### 11.1 主模型
+### 10.1 主模型
 
 主模型调用更新主线压力锚点和主线上下文快照。
 
-### 11.2 识图模型
+### 10.2 识图模型
 
 带图片且主模型不支持图片时，识图模型使用当前完整活动上下文加最新图文请求处理这一回合。该调用的 provider usage 可以计费和审计，但不覆盖主模型锚点。
 
 识图模型响应进入会话 transcript 后，下一次无图请求恢复主模型；由于模型身份变化，主模型重新建立压力估算。识图模型不能变成持续会话模型，也不能修改主模型配置。
 
-### 11.3 辅助模型和 worker
+### 10.3 辅助模型和 worker
 
 辅助模型、worker、生图模型和压缩模型：
 
@@ -435,9 +412,9 @@ RetryInvoke context overflow
 
 read model 按 `session_id + thread_id + source_role` 过滤，主线只读取 orchestrator/当前实际主线调用。
 
-## 12. 事件与 API 契约
+## 11. 事件与 API 契约
 
-### 12.1 领域事件
+### 11.1 领域事件
 
 新增或收敛为以下事件：
 
@@ -450,7 +427,7 @@ read model 按 `session_id + thread_id + source_role` 过滤，主线只读取 o
 
 事件 payload 必须携带 `session_id`、`thread_id`、`turn_id` 和 `source_role`，worker 事件不能覆盖主线读模型。
 
-### 12.2 API DTO
+### 11.2 API DTO
 
 `SessionRuntimeUsageObservation` 不再只有一个含义不清的 `context_window_tokens`。对外至少提供：
 
@@ -472,40 +449,47 @@ observed_at
 
 累计账单在 usage ledger DTO 中单独提供，不塞进上下文圆环 DTO。
 
-### 12.3 前端展示
+### 11.3 前端展示
 
 `ContextUsageRing.svelte` 只消费后端快照：
 
 - 圆环进度使用 `projected_request_tokens / context_window_tokens`。
 - provider 锚点、估算和压缩后状态使用后端 `measurement`。
+- 点击用量圆环时展示请求组成分类。分类来自实际构建的消息和本轮携带的工具定义，并与总量使用同一 token 估算入口；图片按现有本地估算口径计数。provider 只返回总量，因此明细标记为估算，不能当作 provider 分项数据。
+- 分类来源由消息装配时的类型字段和工具 origin 决定，不扫描正文中的标签或 Skill 标记。初始、流式和完成快照使用当前调用的分类，完成时直接携带原请求分类，不从账本反查流式分类。
+- 压缩安装检查点后，运行时重算分类并发布同一种压力快照。读模型和重启回放只接受压力快照；账单事件与压缩通知不另外推导用量。
+- 任务装配保留用户正文和独立的引用、任务事实消息；临时引用不拼入用户正文，也不随正文重复写入 transcript。
+- REST 和 SSE 共用分类解码器，压力快照整体替换上一调用的字段，仅保留独立的最近压缩记录。缺失分类时清除旧值。窗口和告警沿用实际调用快照，切换模型或编辑设置不改写历史观测。
+- 分类色条和列表百分比以分类估算总量为分母；provider 总占用独立展示，不将分类按 provider 总量缩放。
+- 输出预留、恢复缓冲和自动压缩阈值作为请求预算单独展示，不计入已发送上下文分类。
 - 压缩成功后立刻回落，不等待下一次模型调用。
 - tooltip 可以展示“当前请求预计占用”和“完整窗口”，不得把累计账单称为当前已用上下文。
 - 超限恢复过程中显示处理中状态，不显示中间失败错误。
 - 压缩通知状态只来自后端 `compactionState`：`running`、`completed`、`skipped`、`deferred`、`cancelled`、`failed`。前端不推断压缩失败是否终止了本轮。
 
-## 13. 代码改造边界
+## 12. 实现入口
 
-### 13.1 Rust 后端
+### 12.1 Rust 后端
 
-- `crates/magi-usage-authority/src/context_window.rs`：删除多套阈值语义，承载 `ContextBudgetPolicy` 和压力快照计算。
+- `crates/magi-usage-authority/src/context_window.rs`：窗口配置与 token 计数基础。
 - `crates/magi-usage-authority/src/costing.rs`、`types.rs`：拆分 provider context、projected request、billable usage。
-- 新增 `crates/magi-usage-authority/src/context_pressure.rs`：锚点、增量、模型绑定和窗口评估。
+- `crates/magi-usage-authority/src/context_pressure.rs`：ContextBudgetPolicy、压力快照、模型绑定和窗口评估。
 - `crates/magi-conversation-runtime/src/usage_recording.rs`：provider usage 归一化、流式估算和主线/辅助角色分流。
-- `crates/magi-conversation-runtime/src/context_authority.rs`：只保留一条压缩编排，删除固定 8K、32K 头尾截断和重复阈值。
+- `crates/magi-conversation-runtime/src/context_authority.rs`：连续压缩规划、检查点安装与超限恢复编排。
 - `crates/magi-conversation-runtime/src/model_error.rs` 与 `crates/magi-bridge-client`：错误类型化，统一上下文超限分类。
 - `crates/magi-session-store/src/models.rs`、`store/sidecar.rs`：检查点代际、source fingerprint、模型身份和压力快照持久化。
 - `crates/magi-event-bus/src/read_model.rs`：按 generation、thread 和 source role 投影最新压力。
 - `crates/magi-api/src/dto/read_model.rs`：只转换后端快照，不重新推导旧模型窗口。
 - `crates/magi-conversation-runtime/src/session_turn_execution.rs`、`conversation_loop.rs`：接入统一 preflight、压缩和 typed overflow recovery。
 
-### 13.2 Web 前端
+### 12.2 Web 前端
 
-- `web/src/shared/bridges/rust-daemon-contract.ts`：更新压力和压缩 DTO。
-- `web/src/shared/bridges/web-client-bridge.ts`：消费压力更新事件，清理旧字段兼容读取。
+- `web/src/shared/bridges/rust-daemon-contract.ts`：压力和压缩 DTO。
+- `web/src/shared/bridges/web-client-bridge.ts`：消费压力更新事件与分类明细。
 - `web/src/lib/context-usage-ring.ts`、`web/src/components/ContextUsageRing.svelte`：只展示 projected pressure。
 - `web/src/stores/messages.svelte.ts` 和运行态 store：维护 compacting/recovery 状态，不自行估算。
 
-## 14. 五个参考项目的取舍
+## 13. 五个参考项目的取舍
 
 | 项目 | 采用 | 不采用 |
 | --- | --- | --- |
@@ -515,63 +499,9 @@ observed_at
 | Claude Code 官方仓库 | 从 changelog 提取 stale UI、重复压缩、prompt too long、状态丢失、内存释放等验收项 | feature flag、reactive/snips/session-memory 等并行状态机 |
 | Claude Code 2.1.87 | `tokenCountWithEstimation` 的 response ID 回溯、effective window、compact boundary、post compact state budget、failure circuit breaker | `truncateHeadForPTLRetry` 这类会丢旧上下文的兜底路径 |
 
-## 15. Luna 实施顺序
+## 14. 测试矩阵
 
-### 阶段 0：建立基线
-
-阅读本文和以下现有实现，先不要改常量：
-
-- `context_authority.rs`
-- `usage_recording.rs`
-- `magi-usage-authority/src/context_window.rs`
-- `magi-usage-authority/src/costing.rs`
-- `magi-event-bus/src/read_model.rs`
-- `magi-api/src/dto/read_model.rs`
-- `magi-session-store/src/models.rs`
-- `magi-session-store/src/store/sidecar.rs`
-
-执行现有定向测试并记录基线。任何与当前任务无关的工作区改动不得回退。
-
-### 阶段 1：完成 token 语义拆分
-
-先实现数据类型和纯计算测试，再接入运行时。完成标准：
-
-- billable total 不参与压力计算。
-- provider usage、stream estimate、projected request 三个来源可区分。
-- 模型切换会使锚点失效。
-- 同一 response ID 的 streaming 分片和工具结果不会漏算。
-
-### 阶段 2：建立统一压力快照
-
-实现 `ContextBudgetPolicy`、`ContextPressureSnapshot` 和 `ContextTokenCounter`，替换 DTO 层自行推导窗口的逻辑。完成标准：同一个快照可以同时驱动 runtime、event bus、API 和 UI。
-
-### 阶段 3：重建压缩 planner
-
-实现 ConversationUnit、连续边界选择、大工具结果确定性缩减、摘要输入预算和 Quality Gate。删除固定 8K、32K 头尾截断和重复 compaction 分支。完成标准：任何被压缩的历史都能通过 source range 和 checkpoint 恢复对应关系。
-
-### 阶段 4：完成原子检查点
-
-扩展 session store，增加 fingerprint、generation、模型身份和压力结果；候选检查点未通过校验不得落盘。完成标准：取消、摘要失败、历史并发变化都不会改变活动上下文。
-
-### 阶段 5：接入 typed overflow recovery
-
-在 bridge/provider 层归一化超限错误，runtime 只处理结构化分类；实现一次主动压缩和一次强制恢复的上限。完成标准：原始用户消息不重复、失败调用正确记账、恢复成功不显示临时错误。
-
-### 阶段 6：接入多模型隔离
-
-验证主模型、识图模型、辅助模型、worker 和压缩模型的 usage role、checkpoint generation 和压力快照隔离。完成标准：识图模型只接管带图回合，下一回合主模型重新建锚点。
-
-### 阶段 7：收敛事件、DTO 和 UI
-
-只保留新快照字段，删除旧的运行时兼容读取和前端重复计算。完成标准：压缩后 UI 立即刷新，重启后恢复值和实时值一致。
-
-### 阶段 8：清理与验证
-
-删除废弃常量、旧函数、旧事件字段和无效分支。完成全量定向测试、Clippy、前端检查、daemon 真实浏览器验收和长会话回放。
-
-## 16. 测试矩阵
-
-### 16.1 纯计算测试
+### 14.1 纯计算测试
 
 - 128K、200K、272K、1M 窗口的 effective limit、主动阈值和保留目标。
 - provider anchor + delta 的精确结果。
@@ -580,7 +510,7 @@ observed_at
 - 同一 response ID 的多 assistant 分片和交错 tool result 完整计入。
 - worker、vision、image generation 不更新主线压力。
 
-### 16.2 压缩测试
+### 14.2 压缩测试
 
 - 连续历史边界选择。
 - 工具调用/结果配对。
@@ -593,7 +523,7 @@ observed_at
 - source fingerprint 变化、模型切换和取消不会安装结果。
 - 检查点连续二次压缩和 daemon 重启恢复。
 
-### 16.3 恢复测试
+### 14.3 恢复测试
 
 - preflight 主动压缩。
 - provider context overflow 无感恢复。
@@ -601,7 +531,7 @@ observed_at
 - 超限错误没有模型输出副作用时才重试。
 - 失败调用计入 ledger，成功调用只记一次。
 
-### 16.4 产品验收
+### 14.4 产品验收
 
 - 200K 以上长会话持续处理，不因 90% 才压缩而突然失败。
 - 压缩期间页面有明确进行中状态，不弹出中间错误。
@@ -610,9 +540,9 @@ observed_at
 - 下一轮无图片请求恢复主模型且上下文连续。
 - 无工作区个人会话和工作区会话使用相同统计与压缩语义。
 
-## 17. 验证命令
+## 15. 验证命令
 
-```bash /Users/xie/code/magi-rust-rewrite
+```bash
 cargo test -p magi-usage-authority
 cargo test -p magi-event-bus latest_usage_observations_from_ledger
 cargo test -p magi-conversation-runtime --lib
@@ -623,7 +553,7 @@ npm --prefix web run check
 
 真实浏览器验收必须使用 daemon 托管入口：
 
-```bash /Users/xie/code/magi-rust-rewrite
+```bash
 ./scripts/dev-daemon.sh
 curl -I http://127.0.0.1:38123/web.html
 curl http://127.0.0.1:38123/health
@@ -631,7 +561,7 @@ curl http://127.0.0.1:38123/health
 
 浏览器验证至少覆盖：首次请求、模型切换、带图单轮接管、压缩中状态、压缩后圆环、超限恢复、取消和 daemon 重启。
 
-## 18. 完成定义
+## 16. 完成定义
 
 只有同时满足以下条件才能关闭本任务：
 
@@ -643,4 +573,4 @@ curl http://127.0.0.1:38123/health
 - 主线、识图、辅助和 worker usage 隔离正确。
 - 压缩后 UI 和 daemon 重启后的 UI 均展示正确值。
 - 测试矩阵和真实浏览器验收全部通过。
-- Luna 在最终提交说明中明确列出：根本原因、修改模块、删除的旧路径、测试命令和未解决阻塞。
+- 验证结果记录实际执行的命令与剩余缺口，不沿用历史通过状态。

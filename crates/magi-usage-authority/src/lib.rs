@@ -15,9 +15,9 @@ mod tests;
 pub use authority::{UsageAuthority, build_execution_binding_identity, build_usage_call_identity};
 pub use context_pressure::{
     ContextBudgetPolicy, ContextMeasurement, ContextPressureLevel, ContextPressureProjection,
-    ContextPressureSnapshot, DEFAULT_PROACTIVE_THRESHOLD_PERCENT, DEFAULT_RECOVERY_BUFFER_TOKENS,
-    DEFAULT_RESPONSE_RESERVE_TOKENS, DEFAULT_RETAINED_HISTORY_PERCENT, ModelIdentitySnapshot,
-    project_request_tokens,
+    ContextPressureSnapshot, ContextUsageBreakdown, DEFAULT_PROACTIVE_THRESHOLD_PERCENT,
+    DEFAULT_RECOVERY_BUFFER_TOKENS, DEFAULT_RESPONSE_RESERVE_TOKENS,
+    DEFAULT_RETAINED_HISTORY_PERCENT, ModelIdentitySnapshot, project_request_tokens,
 };
 pub use context_window::{DEFAULT_CONTEXT_WINDOW, resolve_context_window};
 pub use costing::{

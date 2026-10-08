@@ -267,7 +267,7 @@ fn check_transfer(
             return TransferCheck::Failed(
                 ToolFailure::new(tool, "source_not_found", "源路径不存在")
                     .instruction(
-                        "用 file_read 读取其父目录确认实际路径后，再用正确的 source 调用。",
+                        "用 search_text(target=path) 查找文件确认实际路径后，再用正确的 source 调用。",
                     )
                     .into_payload(),
             );
@@ -373,7 +373,7 @@ pub(super) fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> 
         if plan.src_is_dir {
             failure = failure
                 .instruction(
-                    "目标目录可能已部分写入；用 file_read 查看目标目录，必要时先清理再重新复制。",
+                    "目标目录可能已部分写入；用 search_text(target=path) 查看目标文件，必要时先清理再重新复制。",
                 )
                 .with("destination_partially_written", true);
         }

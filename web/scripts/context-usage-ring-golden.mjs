@@ -82,6 +82,13 @@ assert.doesNotMatch(
 
 await withGoldenViteServer(async (server) => {
   const ring = await server.ssrLoadModule('/src/lib/context-usage-ring.ts');
+  const { normalizeContextUsageBreakdown } = await server.ssrLoadModule('/src/lib/context-usage-breakdown.ts');
+  const breakdownFixture = {
+    conversation_tokens: 30_000, image_tokens: 1_000, system_instruction_tokens: 10_000,
+    project_context_tokens: 5_000, skill_tokens: 5_000, context_reference_tokens: 5_000,
+    builtin_tool_tokens: 5_000, mcp_tool_tokens: 5_000, skill_tool_tokens: 2_000, other_tool_tokens: 0,
+  };
+  assert.equal(normalizeContextUsageBreakdown({ conversation_tokens: 3 }), undefined);
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
 
   // 简易翻译桩：回显 key 并插值，方便断言 tooltip 组合结果。
@@ -327,7 +334,8 @@ await withGoldenViteServer(async (server) => {
           sessions: [
             {
               session_id: 'session-context-budget',
-              latest_event_type: 'model.usage.recorded',
+              latest_event_type: 'session.context.pressure.updated',
+              usage_observation: { context_breakdown: breakdownFixture },
               current_status: 'idle',
               budget: {
                 token_used: 68_000,
@@ -363,6 +371,7 @@ await withGoldenViteServer(async (server) => {
       {
         tokenUsed: 68_000,
         projectedRequestTokens: 68_000,
+        contextBreakdown: normalizeContextUsageBreakdown(breakdownFixture),
         remainingTokens: 204_000,
         tokenLimit: 272_000,
         usageRatio: 0.25,
@@ -419,7 +428,7 @@ await withGoldenViteServer(async (server) => {
     assert.match(ring.buildRingTooltip(input, t), /估算值/);
   }
 
-  // 场景 12.1：上下文占用属于会话；切换模型只改变窗口上限，不能重置已用量。
+  // 场景 12.1：当前设置不能改写上一次实际模型调用的窗口。
   {
     const projected = ring.projectSessionContextBudget({
       tokenLimit: 1_000_000,
@@ -433,13 +442,13 @@ await withGoldenViteServer(async (server) => {
       },
     });
     assert.equal(projected.tokenUsed, 18_100);
-    assert.equal(projected.tokenLimit, 1_000_000);
-    assert.equal(projected.remainingTokens, 981_900);
-    assert.equal(projected.usageRatio, 0.0181);
-    assert.equal(ring.resolveRingView(projected).percentText, '2');
+    assert.equal(projected.tokenLimit, 272_000);
+    assert.equal(projected.remainingTokens, 253_900);
+    assert.equal(projected.usageRatio, 18_100 / 272_000);
+    assert.equal(ring.resolveRingView(projected).percentText, '7');
   }
 
-  // 场景 12.2：窗口配置变化后，圆环的已用、剩余、比例和告警必须同步重算。
+  // 场景 12.2：窗口、告警和预算一并读取服务端快照。
   {
     const projected = ring.projectSessionContextBudget({
       tokenLimit: 20_000,
@@ -453,10 +462,10 @@ await withGoldenViteServer(async (server) => {
       },
     });
     assert.equal(projected.tokenUsed, 18_100);
-    assert.equal(projected.tokenLimit, 20_000);
-    assert.equal(projected.remainingTokens, 1_900);
-    assert.equal(projected.usageRatio, 0.905);
-    assert.equal(projected.warningLevel, 'danger');
+    assert.equal(projected.tokenLimit, 272_000);
+    assert.equal(projected.remainingTokens, 253_900);
+    assert.equal(projected.usageRatio, 18_100 / 272_000);
+    assert.equal(projected.warningLevel, 'normal');
   }
 
   // 场景 12.3：压缩事件必须让圆环按压缩后的活动上下文回落，而非保留压缩前占用。

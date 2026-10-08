@@ -1,3 +1,4 @@
+import type { ContextUsageBreakdown } from './context-usage-breakdown';
 // 上下文用量圆环的纯逻辑层。
 // 抽离自 ContextUsageRing.svelte，便于在 golden 测试里覆盖多场景，
 // 同时与 RuntimeStatePanel 的 budget 展示约定保持一致。
@@ -14,6 +15,10 @@ export interface ContextRingInput {
   originalTokenEstimate?: number | null;
   compactedTokenEstimate?: number | null;
   measurement?: 'estimated' | 'authoritative' | null;
+  responseReserveTokens?: number | null;
+  recoveryBufferTokens?: number | null;
+  proactiveThresholdTokens?: number | null;
+  contextBreakdown?: ContextUsageBreakdown | null;
 }
 
 export interface SessionContextBudgetProjection extends Omit<ContextRingInput, 'warningLevel'> {
@@ -53,44 +58,10 @@ function normalizePositiveInteger(value: number | null | undefined): number | nu
     : null;
 }
 
-function warningLevelForRatio(ratio: number): ContextRingTone {
-  if (ratio >= 0.9) return 'danger';
-  if (ratio >= 0.8) return 'warning';
-  if (ratio >= 0.6) return 'notice';
-  return 'normal';
-}
-
 export function projectSessionContextBudget(
   input: SessionContextBudgetProjectionInput,
 ): SessionContextBudgetProjection {
-  const budget = input.budget ?? null;
-  const configuredTokenLimit = normalizePositiveInteger(input.tokenLimit);
-  const runtimeTokenLimit = normalizePositiveInteger(budget?.tokenLimit);
-  const tokenLimit = configuredTokenLimit ?? runtimeTokenLimit;
-
-  if (!budget) {
-    return { tokenLimit };
-  }
-
-  const tokenUsed = budget.tokenUsed != null && Number.isFinite(budget.tokenUsed)
-    ? Math.max(0, Math.floor(budget.tokenUsed))
-    : null;
-  if (tokenUsed == null || tokenLimit == null) {
-    return {
-      ...budget,
-      tokenLimit,
-    };
-  }
-
-  const usageRatio = Math.min(1, tokenUsed / tokenLimit);
-  return {
-    ...budget,
-    tokenUsed,
-    tokenLimit,
-    remainingTokens: Math.max(0, tokenLimit - tokenUsed),
-    usageRatio,
-    warningLevel: warningLevelForRatio(usageRatio),
-  };
+  return input.budget ?? { tokenLimit: normalizePositiveInteger(input.tokenLimit) };
 }
 
 export function hasUsageData(ratio: number | null | undefined): boolean {

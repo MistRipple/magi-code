@@ -50,24 +50,28 @@ npm run desktop:dev
 - 多步骤工作进入目标模式，目标抽屉承载目标内容、状态与操作
 - 执行计划来自会话级 `SessionPlan`，通过稳定 ID、revision 与真实执行任务绑定，只在存在计划项时展示
 - 代理协作保留内部 root task 作为编排锚点，用户主视图通过代理运行抽屉展示实际代理任务
-- 跨轮、可恢复、高风险工作以 Mission / Checkpoint / Validation 等运行事实承载
+- 跨轮恢复由 canonical Turn 日志、TaskStore 检查点和变更账本承载；审批沿用 daemon 权限入口
 
 后续设计说明从当前代码和产品形态反向整理。
 
-## 方案文档
+## 架构与维护文档
 
 - [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。
 - [对话展示：完整模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
-- [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：面向 Luna 后续开发的 token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
-- [知识图谱开发与验收计划](./knowledge-graph-plan.md)：知识、代码文件、符号和 Agent 图谱能力的分阶段实现边界与验收标准。
-- [Magi 对话响应链路性能开发与验收计划](./conversation-response-performance-plan.md)：发送接纳、后台准备、模型连接复用、流式增量写回、前端渲染和桌面端性能验收基线。
+- [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
+- [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
+- [对话性能验证](./conversation-performance-validation.md)：按性能问题选择测量阶段、证据和比较口径。
 - [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
-- [用户自定义子代理角色开发计划](./custom-worker-role-development-plan.md)：按阶段记录实现、验证和最终提交状态。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
 - [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与权限档、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
-- [Magi MCP 服务开发计划](./magi-mcp-server-development-plan.md)：工作包、进度、与设计的偏差、审查清单与已知缺口。
+
+- [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
+- [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。
+- [会话 Git 工作流](./session-git-workflow.md)与[会话隔离工作副本](./session-isolation.md)：工作目录、执行租约、子代理产出与合并。
+- [Rust crate 依赖图](./architecture.html)：由 Cargo workspace 生成；维护命令见[脚本与验证入口](./validation.md)。
+- [脚本与验证入口](./validation.md)：构建、定向回归、真实集成验收和文档维护规则。
 
 ## 用户场景与产品要求
 

@@ -93,16 +93,12 @@ export interface QueuedMessageShape {
   contextReferences?: unknown[];
   browserAnnotationRefs?: string[];
   browserNodeSelections?: unknown[];
-  goalMode?: boolean;
-  skillName?: string | null;
 }
 
 export interface QueuedAttachmentSummary {
   images: number;
   references: number;
   annotations: number;
-  goal: boolean;
-  skill: string;
 }
 
 /** 排队卡片上需要提示的非纯文字部分，免得用户以为排队的只是一句话。 */
@@ -111,8 +107,6 @@ export function summarizeQueuedMessage(queued: QueuedMessageShape): QueuedAttach
     images: queued.images?.length ?? 0,
     references: (queued.contextReferences?.length ?? 0) + (queued.browserNodeSelections?.length ?? 0),
     annotations: queued.browserAnnotationRefs?.length ?? 0,
-    goal: queued.goalMode === true,
-    skill: queued.skillName?.trim() ?? '',
   };
 }
 

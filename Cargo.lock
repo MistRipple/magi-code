@@ -1701,6 +1701,7 @@ dependencies = [
  "base64",
  "dirs",
  "encoding_rs",
+ "ignore",
  "magi-bridge-client",
  "magi-browser-authority",
  "magi-core",

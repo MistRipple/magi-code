@@ -78,13 +78,15 @@ impl FsFailureKind {
     fn instruction(self) -> &'static str {
         match self {
             Self::NotFound => {
-                "用 file_read 读取其父目录确认实际路径后，再用正确的路径调用；不要重复同一个路径。"
+                "用 search_text(target=path) 查找文件确认实际路径后，再用正确的路径调用；不要重复同一个路径。"
             }
             Self::PermissionDenied => {
                 "不要用相同参数重试；换一个有权限的位置，或告知用户需要调整权限。"
             }
             Self::AlreadyExists => "换一个目标路径；确认要覆盖时，使用该工具的覆盖参数显式允许。",
-            Self::NotADirectory => "用 file_read 查看父目录，确认每一级路径的类型后再调用。",
+            Self::NotADirectory => {
+                "用 search_text(target=path) 查找文件，确认每一级路径的类型后再调用。"
+            }
             Self::IsADirectory => "目标是目录；改用目录对应的操作，或指向目录内的具体文件。",
             Self::DirectoryNotEmpty => "目录非空；需要连同内容一起处理时，使用该工具的递归参数。",
             Self::StorageFull => "磁盘空间不足；不要重复写入，告知用户先释放空间。",

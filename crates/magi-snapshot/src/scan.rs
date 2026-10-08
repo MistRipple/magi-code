@@ -237,12 +237,15 @@ pub fn read_file_meta(
 
 pub fn hash_file(path: &Path) -> SnapshotResult<String> {
     let mut file = fs::File::open(path).map_err(|error| SnapshotError::io(path, error))?;
+    hash_reader(&mut file).map_err(|error| SnapshotError::io(path, error))
+}
+
+/// 与快照内容版本使用同一哈希算法，允许调用方提供带预算的流。
+pub fn hash_reader(reader: &mut impl Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| SnapshotError::io(path, error))?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }

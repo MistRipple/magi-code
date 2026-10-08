@@ -489,10 +489,12 @@ impl ToolExecutionLedger {
         {
             return None;
         }
-        let adapted = adapt_file_read_result(&fact.result, &arguments)?;
+        if !magi_tool_runtime::file_read_result_matches_request(&fact.result, &arguments) {
+            return None;
+        }
         Some(reused_result(
             "file_read",
-            &adapted,
+            &fact.result,
             "current_session_file_fact",
             "文件内容未变化，已复用当前会话中的文件事实，未再次执行读取。",
         ))
@@ -529,63 +531,6 @@ fn current_file_fact_from_result(result: &str) -> Option<CurrentFileFact> {
         result: result.to_string(),
         summary,
     })
-}
-
-fn adapt_file_read_result(source_result: &str, arguments: &Value) -> Option<String> {
-    let mut source = serde_json::from_str::<Value>(source_result).ok()?;
-    if source.get("mode").and_then(Value::as_str) != Some("file") {
-        return Some(source.to_string());
-    }
-    let Some(requested_max_bytes) = arguments
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-    else {
-        return (!source
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(true))
-        .then(|| source.to_string());
-    };
-    let content = source.get("content").and_then(Value::as_str)?;
-    let source_bytes = source
-        .get("bytes_read")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(content.len());
-    let source_truncated = source
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if source_truncated && source_bytes < requested_max_bytes {
-        return None;
-    }
-    let content_bytes = content.as_bytes();
-    let adapted_len = requested_max_bytes.min(content_bytes.len());
-    let adapted_content = String::from_utf8_lossy(&content_bytes[..adapted_len]).to_string();
-    let file_size = source
-        .get("file_size_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(adapted_len as u64);
-    let path = source
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    source["max_bytes"] = requested_max_bytes.into();
-    source["bytes_read"] = adapted_len.into();
-    source["content"] = adapted_content.into();
-    source["truncated"] = (file_size > requested_max_bytes as u64).into();
-    source["summary"] = if file_size > requested_max_bytes as u64 {
-        format!(
-            "已从会话文件事实中复用 {} 的前 {} 字节",
-            path, requested_max_bytes
-        )
-        .into()
-    } else {
-        format!("已从会话文件事实中复用文件 {path}").into()
-    };
-    Some(source.to_string())
 }
 
 fn reusable_result_is_current(tool_name: &str, result: &str) -> bool {
@@ -1332,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn new_task_reuses_session_file_fact_with_different_preview_size() {
+    fn session_file_fact_reuse_requires_the_same_read_range_and_budget() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("Cargo.toml");
         let content = "[workspace]\nresolver = \"2\"\n";
@@ -1348,6 +1293,8 @@ mod tests {
                 "content_hash": magi_snapshot::path_content_hash(&path).expect("hash fixture"),
                 "file_size_bytes": content.len(),
                 "max_bytes": 4096,
+                "start_line": 1,
+                "requested_end_line": null,
                 "bytes_read": content.len(),
                 "truncated": false,
                 "encoding": "utf-8-lossy",
@@ -1357,21 +1304,30 @@ mod tests {
             .to_string(),
             summary: content.to_string(),
         };
-        let call = call(
-            "call-current-fact",
-            "file_read",
-            r#"{"path":"Cargo.toml","max_bytes":12}"#,
-        );
         let ledger = ToolExecutionLedger::for_task_goal("继续使用文件事实")
             .with_current_file_facts(&[fact], Some(directory.path()));
-        let ToolCallExecutionDecision::Reuse { result } = &ledger.plan(&[call], None)[0] else {
-            panic!("新 task 必须复用未变化的会话文件事实");
+        for arguments in [
+            serde_json::json!({"path":"Cargo.toml", "max_bytes":12}),
+            serde_json::json!({"path":"Cargo.toml", "max_bytes":4096, "start_line":2}),
+            serde_json::json!({"path":"Cargo.toml", "max_bytes":4096, "end_line":1}),
+            serde_json::json!({"path":"Cargo.toml"}),
+        ] {
+            let request = call("range", "file_read", &arguments.to_string());
+            assert!(matches!(
+                ledger.plan(&[request], None)[0],
+                ToolCallExecutionDecision::Execute { .. }
+            ));
+        }
+        let request = call(
+            "same-range",
+            "file_read",
+            r#"{"path":"Cargo.toml","max_bytes":4096}"#,
+        );
+        let ToolCallExecutionDecision::Reuse { result } = &ledger.plan(&[request], None)[0] else {
+            panic!("相同范围应复用");
         };
-        let payload: Value = serde_json::from_str(result).expect("reuse result json");
-        assert_eq!(payload["reason"], "current_session_file_fact");
-        assert_eq!(payload["source_result"]["content"], "[workspace]\n");
-        assert_eq!(payload["source_result"]["max_bytes"], 12);
-        assert_eq!(payload["source_result"]["truncated"], true);
+        let payload: Value = serde_json::from_str(result).unwrap();
+        assert_eq!(payload["source_result"]["content"], content);
     }
 
     #[test]

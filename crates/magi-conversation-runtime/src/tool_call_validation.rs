@@ -138,6 +138,7 @@ pub(crate) fn validate_tool_call_batch(
 
 pub(crate) fn invalid_tool_result_message(invalid: &InvalidToolCall) -> ChatMessage {
     ChatMessage {
+        context_origin: Default::default(),
         role: "tool".to_string(),
         content: Some(invalid.issue.model_feedback()),
         images: Vec::new(),

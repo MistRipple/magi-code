@@ -2485,6 +2485,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some(tool_result.to_string()),
                 images: Vec::new(),
@@ -2511,6 +2512,7 @@ mod tests {
         let duplicate_id = "call_duplicate";
         let normalized = normalize_chat_tool_call_history(&[
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -2523,6 +2525,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("package contents".to_string()),
                 images: Vec::new(),
@@ -2531,6 +2534,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("reused package contents".to_string()),
                 images: Vec::new(),
@@ -2539,6 +2543,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("tsconfig contents".to_string()),
                 images: Vec::new(),
@@ -2560,6 +2565,7 @@ mod tests {
         let duplicate_id = "call_duplicate";
         let normalized = normalize_chat_tool_call_history(&[
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -2571,6 +2577,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("package contents".to_string()),
                 images: Vec::new(),
@@ -2579,6 +2586,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("tsconfig contents".to_string()),
                 images: Vec::new(),
@@ -2611,6 +2619,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "user".to_string(),
                 content: Some("识别这张图片".to_string()),
                 images: vec![crate::llm_types::ImageSource {
@@ -2684,6 +2693,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "搜索最新消息".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -3117,6 +3127,7 @@ mod tests {
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![
                 crate::types::ChatMessage {
+                    context_origin: Default::default(),
                     role: "system".to_string(),
                     content: Some("系统约束".to_string()),
                     images: Vec::new(),
@@ -3125,6 +3136,7 @@ mod tests {
                     provider_context: Vec::new(),
                 },
                 crate::types::ChatMessage {
+                    context_origin: Default::default(),
                     role: "user".to_string(),
                     content: Some("你好".to_string()),
                     images: Vec::new(),

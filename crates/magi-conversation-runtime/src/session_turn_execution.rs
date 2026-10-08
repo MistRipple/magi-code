@@ -6,7 +6,7 @@
 
 use crate::context_authority::{
     ContextAuthority, ContextCompactionMode, ContextCompactionTerminal, ContextPrepareRequest,
-    PreparedThreadHistory, estimate_chat_messages_tokens,
+    PreparedThreadHistory, estimate_context_usage_breakdown,
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
@@ -447,6 +447,7 @@ fn normalize_interrupted_session_tool_history(
     Ok(inserted)
 }
 
+#[cfg(test)]
 fn build_session_turn_messages(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
@@ -500,7 +501,6 @@ fn build_session_turn_messages_with_runtime(
         None,
         user_rules.as_deref(),
         safeguard.as_deref(),
-        None,
     ) {
         messages.push(crate::prompt_utils::developer_instructions_message(
             developer,
@@ -543,14 +543,17 @@ fn build_session_turn_messages_with_runtime(
         ));
     }
     messages.extend(history.iter().map(thread_chat_message_to_chat_message));
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: Some(prompt.to_string()),
-        images: session_turn_image_sources(&request.images),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        provider_context: Vec::new(),
-    });
+    if request.command.is_none() {
+        messages.push(ChatMessage {
+            context_origin: Default::default(),
+            role: "user".to_string(),
+            content: Some(prompt.to_string()),
+            images: session_turn_image_sources(&request.images),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        });
+    }
     messages
 }
 
@@ -735,7 +738,7 @@ fn rebuild_messages_for_context_window(
         recovery_history: Vec::new(),
         phase: "context_limit_recovery",
         context_window_tokens: context_window,
-        additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages),
+        additional_context: estimate_context_usage_breakdown(&fixed_messages, None),
         persist_checkpoint,
         model_identity: None,
         mode: ContextCompactionMode::Recovery,
@@ -943,13 +946,17 @@ fn run_session_turn_execution_inner(
             .as_ref()
             .and_then(|config| config.context_window_tokens()),
     );
-    let fixed_messages = build_session_turn_messages(
-        session_store,
-        &request,
-        &prompt,
-        knowledge_context_prompt.as_deref(),
-        &[],
-    );
+    let fixed_messages =
+        build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
+            session_store,
+            request: &request,
+            prompt: &prompt,
+            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+            history: &[],
+            settings_store,
+            safety_gate,
+            skill_runtime,
+        });
     let (compaction_phase, compaction_mode) = match request.command.as_ref() {
         Some(SessionTurnCommand::CompactContext { instructions }) => (
             "manual",
@@ -1006,7 +1013,7 @@ fn run_session_turn_execution_inner(
             recovery_history,
             phase: compaction_phase,
             context_window_tokens: effective_context_window,
-            additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages),
+            additional_context: estimate_context_usage_breakdown(&fixed_messages, None),
             persist_checkpoint: vision_execution_config.is_none(),
             model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
                 vision_execution_config
@@ -1208,6 +1215,7 @@ fn run_session_turn_execution_inner(
                 {
                     empty_response_recovery_attempts += 1;
                     messages.push(ChatMessage {
+                        context_origin: Default::default(),
                         role: "user".to_string(),
                         content: Some(model_empty_response_recovery_prompt(false).to_string()),
                         images: Vec::new(),
@@ -1313,6 +1321,7 @@ fn run_session_turn_execution_inner(
             {
                 SessionTurnInputBoundary::Pending(steers) => {
                     messages.push(ChatMessage {
+                        context_origin: Default::default(),
                         role: "assistant".to_string(),
                         content: Some(content),
                         images: Vec::new(),
@@ -1337,6 +1346,7 @@ fn run_session_turn_execution_inner(
         }
         if !response_provider_context.is_empty() {
             messages.push(ChatMessage {
+                context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -1347,6 +1357,7 @@ fn run_session_turn_execution_inner(
         }
         empty_response_recovery_attempts += 1;
         messages.push(ChatMessage {
+            context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(model_empty_response_recovery_prompt(false).to_string()),
             images: Vec::new(),
@@ -1430,6 +1441,7 @@ fn append_session_turn_steers_to_messages(
             continue;
         };
         messages.push(ChatMessage {
+            context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(text),
             images: Vec::new(),
@@ -1629,7 +1641,7 @@ fn stream_session_turn_round(
             .unwrap_or_default();
     let resolved_provider =
         resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
-    let prefill_tokens = estimate_chat_messages_tokens(messages);
+    let context_breakdown = estimate_context_usage_breakdown(messages, None);
     let context_usage_tracker = (usage_binding.tracks_active_context() && !web_engine).then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
@@ -1640,7 +1652,7 @@ fn stream_session_turn_round(
             call_id: &call_id,
             resolved_model: &resolved_model,
             context_window_tokens,
-            prefill_tokens: prefill_tokens as u64,
+            context_breakdown: context_breakdown.clone(),
             thread_id: Some(orchestrator_thread_id),
             model_provider: resolved_provider,
             binding_revision: usage_binding.binding_revision(),
@@ -1863,6 +1875,7 @@ fn stream_session_turn_round(
                 settings_store,
                 Some(&request.turn_id),
                 crate::usage_recording::ModelUsageRecordInput {
+                    context_breakdown: None,
                     session_id: &request.session_id,
                     workspace_id: &request.workspace_id,
                     binding: usage_binding,
@@ -1963,6 +1976,7 @@ fn stream_session_turn_round(
                     );
                 }
                 messages.push(ChatMessage {
+                    context_origin: Default::default(),
                     role: "assistant".to_string(),
                     content: Some(partial_visible_content.clone()),
                     images: Vec::new(),
@@ -1972,6 +1986,7 @@ fn stream_session_turn_round(
                 });
             }
             messages.push(ChatMessage {
+                context_origin: Default::default(),
                 role: "user".to_string(),
                 content: Some(
                     model_stream_interruption_recovery_prompt(!partial_visible_content.is_empty())
@@ -2019,6 +2034,7 @@ fn stream_session_turn_round(
                         settings_store,
                         Some(&request.turn_id),
                         crate::usage_recording::ModelUsageRecordInput {
+                            context_breakdown: None,
                             session_id: &request.session_id,
                             workspace_id: &request.workspace_id,
                             binding: usage_binding,
@@ -2076,6 +2092,7 @@ fn stream_session_turn_round(
         Some(&request.turn_id),
         context_window_tokens,
         crate::usage_recording::ModelUsageRecordInput {
+            context_breakdown: Some(context_breakdown),
             session_id: &request.session_id,
             workspace_id: &request.workspace_id,
             binding: usage_binding,
@@ -2225,6 +2242,7 @@ fn stream_session_turn_round(
     // 需要 retire——空回复直接在 canonical turn 里留白即可。
 
     let assistant_response_message = ChatMessage {
+        context_origin: Default::default(),
         role: "assistant".to_string(),
         content: parsed
             .content
@@ -4522,6 +4540,7 @@ mod tests {
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
+            context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(request.prompt.clone()),
             images: Vec::new(),
@@ -4640,6 +4659,7 @@ mod tests {
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
+            context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(request.prompt.clone()),
             images: Vec::new(),

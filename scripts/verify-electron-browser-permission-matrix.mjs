@@ -24,7 +24,7 @@ const appExecutable = join(
 const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_BROWSER_PERMISSION_CDP_PORT || "10427", 10);
 const daemonPort = 38123;
 const evidencePath = process.env.MAGI_ELECTRON_BROWSER_PERMISSION_EVIDENCE_PATH?.trim()
-  || "/tmp/magi-electron-browser-permission-matrix-20260922.json";
+  || join(tmpdir(), "magi-electron-browser-permission-matrix-" + Date.now() + ".json");
 const profiles = [
   { name: "ReadOnly", wire: "read_only" },
   { name: "Restricted", wire: "restricted" },

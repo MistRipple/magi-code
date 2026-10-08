@@ -40,6 +40,11 @@
 
 - `file_read`：内容必须是 UTF-8 文本。含 NUL 或不是 UTF-8 的内容返回 `file_read_not_utf8_text`（图片提示用 `view_image`），
   不再用替换字符伪装成文本；预览被截断时只丢弃末尾被切开的字符。
+  只接受普通文件；文件查找统一使用 `search_text(target=path)`，不再通过目录读取逐层定位。
+  `start_line` / `end_line` 从 1 起算且包含首尾，返回原始文本、实际起止行和 `line_count`；超出文件末尾返回空范围。
+  返回内容默认最多 64KiB、硬上限 1MiB，`truncated` 只表示请求范围被字节预算截断。
+  读取与快照使用同一完整内容哈希算法；范围提取与哈希共用一次分块读取，遵守同一个超时/取消预算。
+  会话事实只复用相同起止范围与字节预算，缓存层不再实现另一套文本裁剪。
 - `file_write` / `file_patch` / `apply_patch`：写入走「同目录临时文件 + rename」，中途失败不会留下半截文件，
   符号链接写到真实文件，已有文件的权限位保持不变。
 - `file_patch`：整批 patch 要么全部匹配并写入，要么一个都不写；失败结果区分 `no_match` / `ambiguous_match` / `not_applicable`。
@@ -100,11 +105,25 @@
   `too_many_redirects`。
 - 暂态 5xx / 408 / 429 / 超时 / 连接类故障最多请求 3 次；404、401、403 等不重试，`instruction` 给出对应建议。
 
-## search_text
+## 文件查找与文本搜索
 
-- 只有**搜索根本身**读不了才失败：`search_text_not_found`、`search_text_permission_denied`、`search_text_failed`。
-- 子目录或文件读不了、超过 2MB、不是 UTF-8 文本，都只跳过并计入结果里的 `skipped`
-  （`unreadable` / `too_large` / `non_text`），摘要里点明有多少没搜，避免把「没搜到」读成「没有」。
+- 保留受控 `search_text` 入口：`target=path` 匹配搜索根内的相对文件路径；`target=content` 搜索内容。
+  `output_mode=files` 只返回命中文件路径，`matches` 返回命中行。模型先定位文件，再按行范围调用 `file_read`。
+- 唯一底层实现编译进 daemon：Rust `regex` 负责字面量（转义）与正则匹配，`ignore` 负责忽略规则。
+  不启动外部搜索进程，不探测或依赖用户的 `grep` / `rg`，不引入 CodeGraph。
+- 文件查找和内容搜索共用逐目录遍历与权限检查。工作区至搜索根及其子目录的 `.gitignore` / `.ignore` 生效；
+  内层同类规则优先，`.ignore` 优先于 `.gitignore`，支持否定模式。为保持安装后行为一致，不读取全局 Git 配置或工作区外的 ignore。
+  默认跳过隐藏项，始终排除 `.git`、构建目录（`target/node_modules/dist/coverage`）与遍历发现的符号链接。
+  `include_hidden` 只影响隐藏项；权限、ignore 与构建目录过滤继续生效。明确指定文件的 `file_read` 只受权限约束，可读取被搜索忽略的文件。
+- 搜索根先走现有 PermissionEngine；递归路径与 ignore 文件在读取前再用同一派生策略复核。
+  未授权后代不读取、不返回路径。`file_read` 同样检查规范化后的真实路径并拒绝特殊文件，避免阻塞设备/FIFO。
+- 普通子文件读不了、超过 2MiB、含 NUL 或不是 UTF-8 文本时跳过并计入 `skipped`。
+  搜索根读取失败使用统一文件系统失败码；ignore 文件无效或过大时失败，不能悄悄忽略过滤规则后扩大搜索范围。
+- 行号与 Unicode 字符列号从 1 开始，不裁掉行首空白。长行仅返回最多 2048 字节的命中附近摘录，带 `excerpt_start_column` / `excerpt_truncated`。
+- 结果默认 20 项、最多 500 项；序列化条目总预算默认 64KiB、最多 1MiB（固定结果信封另计）。实际发现额外命中才报 `truncated`，`stop_reason` 区分条数与字节上限。
+- 搜索与范围读取统一默认 10 秒、最大 60 秒。逐目录、规则、分块和匹配检查预算；超时返回 `*_timeout`，取消返回 `status=cancelled`。
+  取消接入现有会话/任务资源释放入口，按 worker/task/session/workspace 限定作用范围；停止后不把部分结果声明为成功。
+  这是同步本地文件 I/O 的协作式中止，不能抢占内核中尚未返回的文件系统调用。
 
 ## update_plan
 

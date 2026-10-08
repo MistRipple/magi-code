@@ -34,6 +34,7 @@
   import Modal from './Modal.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
   import { projectSessionContextBudget } from '../lib/context-usage-ring';
+  import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
   import GitContextControl from './GitContextControl.svelte';
   import SessionIsolationChip from './SessionIsolationChip.svelte';
   import { generateId } from '../lib/utils';
@@ -1884,7 +1885,7 @@
     });
   }
 
-  // 编辑 = 把排队消息整条取回输入框（文字、图片、引用、目标 / skill），队列移除仍由服务端权威请求完成，
+  // 编辑 = 把排队消息整条取回输入框（文字、图片、引用、命令、目标 / skill），队列移除仍由服务端权威请求完成，
   // 失败时原消息会保留并重新同步。输入框里已有草稿时不覆盖，更不能悄悄丢掉排队消息里的附件。
   function editQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
@@ -1924,7 +1925,7 @@
       browserAnnotations: [],
       browserNodeSelections: (target.browserNodeSelections ?? []).map(cloneBrowserNodeSelection),
       goalMode: target.goalMode === true,
-      sessionCommand: null,
+      sessionCommand: target.command === 'compact' ? 'compact' : null,
       skill: restoredSkill,
     });
   }
@@ -2664,11 +2665,15 @@
         {#each queuedMessages as queued (queued.id)}
           {@const guideAvailable = canGuideQueuedMessage(queued)}
           {@const attachments = summarizeQueuedMessage(queued)}
+          {@const commandLabel = resolveUserMessageCommandLabel({
+            sessionCommand: queued.command,
+            goalMode: queued.goalMode,
+            skillName: queued.skillName,
+          })}
           <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>
-              {#if attachments.goal}<span class="ia-queue-badge">/goal</span>{/if}
-              {#if attachments.skill}<span class="ia-queue-badge">/{attachments.skill}</span>{/if}
+              {#if commandLabel}<span class="ia-queue-command">{commandLabel}</span>{/if}
               {#if attachments.images > 0}
                 <span class="ia-queue-badge">{i18n.t('input.queue.badge.images', { count: attachments.images })}</span>
               {/if}
@@ -3142,6 +3147,7 @@
           <span class="ia-toolbar-divider" aria-hidden="true"></span>
           <ContextUsageRing
             model={currentPickerModel}
+            configuredTokenLimit={configuredContextWindow}
             usageRatio={contextBudgetView?.usageRatio ?? null}
             tokenUsed={contextBudgetView?.tokenUsed ?? null}
             remainingTokens={contextBudgetView?.remainingTokens ?? null}
@@ -3151,6 +3157,10 @@
             originalTokenEstimate={contextBudgetView?.originalTokenEstimate ?? null}
             compactedTokenEstimate={contextBudgetView?.compactedTokenEstimate ?? null}
             measurement={contextBudgetView?.measurement ?? null}
+            contextBreakdown={contextBudgetView?.contextBreakdown ?? null}
+            responseReserveTokens={contextBudgetView?.responseReserveTokens ?? null}
+            recoveryBufferTokens={contextBudgetView?.recoveryBufferTokens ?? null}
+            proactiveThresholdTokens={contextBudgetView?.proactiveThresholdTokens ?? null}
             onSaveContextWindow={saveCurrentModelContextWindow}
           />
         </div>
@@ -4648,6 +4658,13 @@
     background: color-mix(in srgb, var(--primary) 12%, transparent);
     border-radius: var(--radius-full, 999px);
     vertical-align: 1px;
+  }
+
+  .ia-queue-command {
+    display: inline-block;
+    margin-right: 6px;
+    color: var(--color-orchestrator);
+    font-weight: 600;
   }
 
   .ia-queue-panel {

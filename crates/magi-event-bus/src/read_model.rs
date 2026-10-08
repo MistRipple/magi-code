@@ -3,7 +3,7 @@ use magi_core::{
     AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_excerpt,
     public_runtime_summary,
 };
-use magi_usage_authority::{UsageTokenInput, provider_context_tokens_from_usage};
+use magi_usage_authority::ContextUsageBreakdown;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -359,6 +359,9 @@ pub struct SessionRuntimeUsageObservation {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub call_id: Option<String>,
+    /// 本地分类估算，不改变 provider 总量的统计口径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_breakdown: Option<ContextUsageBreakdown>,
 }
 
 /// 会话上下文预算快照,由 `magi-api` 装配 DTO 时填充。
@@ -421,7 +424,7 @@ pub struct SessionRuntimeSummaryEntry {
     pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
     pub current_turn: Option<SessionRuntimeTurnSummaryEntry>,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
-    /// 最近一次模型请求的上下文窗口观测值（由 model.usage.recorded 提取）。
+    /// 最近一次模型请求的上下文窗口观测值（由 session.context.pressure.updated 提取）。
     pub usage_observation: Option<SessionRuntimeUsageObservation>,
     /// 上下文预算快照，由 magi-api 装配 DTO 时用 usage-authority 计算填充。
     pub budget: Option<SessionRuntimeBudgetEntry>,
@@ -2316,15 +2319,14 @@ fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
-/// 从主线模型 usage/pressure 事件提取最近一次上下文压力观测。
+/// 从主线上下文压力事件提取最近一次观测。
 ///
-/// payload 是 camelCase 序列化的 `UsageCallRecordInput` 或压力快照；event bus
-/// 只保留事件中已经给出的 provider 锚点、预测 token 和模型身份，不推导窗口或告警级别。
+/// 账单事件仍由用量账本保存；会话预算只消费压力快照中已给出的 provider 锚点、预测 token
+/// 和模型身份，不从账单或压缩通知推导第二份预算事实。
 fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeUsageObservation> {
-    if event.event_type == "session.context.pressure.updated" {
-        return pressure_observation_from_payload(&event.payload, Some(event.occurred_at));
-    }
-    usage_observation_from_payload(&event.event_type, &event.payload)
+    (event.event_type == "session.context.pressure.updated")
+        .then(|| pressure_observation_from_payload(&event.payload, Some(event.occurred_at)))
+        .flatten()
 }
 
 fn pressure_observation_from_payload(
@@ -2341,9 +2343,6 @@ fn pressure_observation_from_payload(
     let projected_request_tokens = payload
         .get("projected_request_tokens")
         .and_then(serde_json::Value::as_u64)?;
-    if projected_request_tokens == 0 {
-        return None;
-    }
     let resolved_model = payload
         .get("resolved_model")
         .and_then(serde_json::Value::as_str)
@@ -2410,6 +2409,10 @@ fn pressure_observation_from_payload(
             .get("call_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        context_breakdown: payload
+            .get("context_breakdown")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     })
 }
 
@@ -2478,170 +2481,23 @@ fn context_compaction_from_event(
     })
 }
 
-/// 从 `model.usage.recorded` 负载提取上下文窗口观测值。
-///
-/// 反孤儿:既服务于实时 `recent_events` 投影,也服务于守护进程重启后从
-/// 审计/用量账本回放的路径(`latest_usage_observations_from_ledger`),两条
-/// 路径共用同一口径,避免重启前后预算计算出现漂移。
-///
-/// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的输入
-/// token 锚点；completion token 和累计账单 total 不参与当前窗口判断。OpenAI
-/// 缓存读已包含在 input 中，Anthropic 的独立缓存读写则计入上下文窗口。
-///
-/// 输入区圆环展示主线 orchestrator 的上下文窗口。worker / auxiliary 的模型
-/// 调用仍进入审计账本与任务指标,但不能覆盖主线会话窗口统计。
+/// 上下文观测只读取运行时发布的压力快照。账单和压缩通知不产生第二份预算事实。
 fn usage_observation_from_payload(
     event_type: &str,
     payload: &serde_json::Value,
 ) -> Option<SessionRuntimeUsageObservation> {
-    if event_type == "session.context.compacted" {
-        if payload
-            .get("thread_scope")
-            .and_then(serde_json::Value::as_str)
-            != Some("mainline")
-        {
-            return None;
-        }
-        return Some(SessionRuntimeUsageObservation {
-            provider_context_tokens: None,
-            projected_request_tokens: payload
-                .get("request_token_estimate")
-                .and_then(serde_json::Value::as_u64)?,
-            context_window_limit_tokens: payload
-                .get("context_window_limit_tokens")
-                .and_then(serde_json::Value::as_u64),
-            model_provider: payload
-                .get("model_provider")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            binding_revision: payload
-                .get("binding_revision")
-                .and_then(serde_json::Value::as_u64)
-                .map(|value| value as u32),
-            response_reserve_tokens: payload
-                .get("response_reserve_tokens")
-                .and_then(serde_json::Value::as_u64),
-            recovery_buffer_tokens: payload
-                .get("recovery_buffer_tokens")
-                .and_then(serde_json::Value::as_u64),
-            proactive_threshold_tokens: payload
-                .get("proactive_threshold_tokens")
-                .and_then(serde_json::Value::as_u64),
-            hard_request_limit_tokens: payload
-                .get("hard_request_limit_tokens")
-                .and_then(serde_json::Value::as_u64),
-            pressure_level: payload
-                .get("pressure_level")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            checkpoint_generation: payload
-                .get("checkpoint_generation")
-                .and_then(serde_json::Value::as_u64),
-            resolved_model: payload
-                .get("resolved_model")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string),
-            observed_at: payload
-                .get("compacted_at")
-                .and_then(serde_json::Value::as_u64)
-                .map(UtcMillis),
-            measurement: Some("estimated".to_string()),
-            phase: Some("compacted".to_string()),
-            thread_id: payload
-                .get("thread_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            turn_id: payload
-                .get("turn_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            call_id: payload
-                .get("checkpoint_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-        });
-    }
-    if event_type != "model.usage.recorded" {
+    if event_type != "session.context.pressure.updated" {
         return None;
     }
-    if payload.get("status").and_then(|value| value.as_str()) != Some("success") {
-        return None;
-    }
-    if !is_orchestrator_usage_payload(payload) {
-        return None;
-    }
-    let usage = payload.get("usage")?;
-    let usage = serde_json::from_value::<UsageTokenInput>(usage.clone()).ok()?;
-    let provider_context_tokens = provider_context_tokens_from_usage(&usage);
-    if provider_context_tokens == 0 {
-        return None;
-    }
-    let resolved_model = payload
-        .get("modelConfig")
-        .and_then(|config| config.get("model"))
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    let observed_at = payload
-        .get("timestamp")
-        .and_then(serde_json::Value::as_u64)
-        .map(UtcMillis);
-    Some(SessionRuntimeUsageObservation {
-        provider_context_tokens: Some(provider_context_tokens),
-        projected_request_tokens: provider_context_tokens,
-        context_window_limit_tokens: payload
-            .get("contextWindowTokens")
-            .and_then(serde_json::Value::as_u64),
-        model_provider: payload
-            .get("modelConfig")
-            .and_then(|config| config.get("provider"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        binding_revision: payload
-            .get("executionBinding")
-            .and_then(|binding| binding.get("bindingRevision"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as u32),
-        response_reserve_tokens: None,
-        recovery_buffer_tokens: None,
-        proactive_threshold_tokens: None,
-        hard_request_limit_tokens: None,
-        pressure_level: None,
-        checkpoint_generation: None,
-        resolved_model,
-        observed_at,
-        measurement: Some("authoritative".to_string()),
-        phase: Some("completed".to_string()),
-        thread_id: payload
-            .get("threadId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        turn_id: payload
-            .get("turnId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        call_id: payload
-            .get("callIdentity")
-            .and_then(|identity| identity.get("callId"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    })
-}
-
-fn is_orchestrator_usage_payload(payload: &serde_json::Value) -> bool {
-    payload
-        .get("executionBinding")
-        .and_then(|binding| binding.get("role"))
-        .and_then(serde_json::Value::as_str)
-        == Some("orchestrator")
+    pressure_observation_from_payload(payload, None)
 }
 
 /// 从已恢复的审计/用量账本条目重建每会话最近一次用量观测值。
 ///
 /// 反孤儿/重启容错:守护进程重启后实时 `recent_events` 缓冲区从空开始,
-/// `model.usage.recorded` 事件只存在于持久化的用量账本中。读模型按 sidecar
+/// 压力快照保存在持久化的用量账本中。读模型按 sidecar
 /// 重建会话条目却拿不到观测值,导致预算整体丢失。此函数按账本顺序(`sequence`)
-/// 回放,保留每个会话的最后一次成功观测,供 DTO 装配层回填 `usage_observation`
+/// 回放,保留每个会话最后一条有效压力快照,供 DTO 装配层回填 `usage_observation`
 /// 后再计算预算。
 pub fn latest_usage_observations_from_ledger(
     usage_entries: &[crate::AuditUsageLedgerEntry],
@@ -2651,8 +2507,8 @@ pub fn latest_usage_observations_from_ledger(
 
 /// 只取某一个会话的最近一次用量观测值。
 ///
-/// 先按会话过滤再解析负载，不会为其它会话的条目付出解析代价；每次模型调用与
-/// 上下文压力更新都会走这里，账本越大越明显。
+/// 先按会话过滤再解析负载，不会为其它会话的条目付出解析代价；上下文压力更新会走这里，
+/// 账本越大越明显。
 pub fn latest_usage_observation_for_session(
     usage_entries: &[crate::AuditUsageLedgerEntry],
     session_id: &str,
@@ -3349,51 +3205,6 @@ mod tests {
     }
 
     #[test]
-    fn model_usage_recorded_records_session_usage_observation() {
-        let mut usage_event = EventEnvelope::audit(
-            EventId::new("event-model-usage-recorded"),
-            "model.usage.recorded",
-            json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": 12_000,
-                    "outputTokens": 3_000,
-                    "cacheReadTokens": 2_000,
-                    "cacheReadIncludedInInput": true
-                },
-                "executionBinding": { "role": "orchestrator" },
-                "modelConfig": { "model": "gpt-5-codex" },
-                "timestamp": 1_700_000_000_000_u64
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(SessionId::new("session-usage")),
-            ..EventContext::default()
-        });
-        usage_event.sequence = 1;
-
-        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
-        let session = read_model
-            .details
-            .sessions
-            .iter()
-            .find(|entry| entry.session_id == "session-usage")
-            .expect("session runtime entry should exist");
-        let observation = session
-            .usage_observation
-            .as_ref()
-            .expect("usage observation should be recorded");
-
-        // 当前上下文只统计 provider 的输入锚点；completion 不属于下一请求的上下文，
-        // 已计入 input 的 cache read 也不能重复累加。
-        assert_eq!(observation.projected_request_tokens, 12_000);
-        assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_000)));
-        // event-bus 不计算窗口/告警,budget 留给 magi-api 装配。
-        assert!(session.budget.is_none());
-    }
-
-    #[test]
     fn live_context_usage_event_updates_session_observation_before_turn_completion() {
         let mut context_event = EventEnvelope::domain(
             EventId::new("event-live-context-usage"),
@@ -3425,78 +3236,6 @@ mod tests {
         assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_100)));
         assert_eq!(observation.measurement.as_deref(), Some("estimated"));
         assert_eq!(observation.phase.as_deref(), Some("streaming"));
-    }
-
-    #[test]
-    fn model_usage_recorded_prefers_input_tokens_for_context_window() {
-        let mut usage_event = EventEnvelope::audit(
-            EventId::new("event-model-usage-total-tokens"),
-            "model.usage.recorded",
-            json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": 12_000,
-                    "outputTokens": 3_000,
-                    "totalTokens": 18_000
-                },
-                "executionBinding": { "role": "orchestrator" },
-                "modelConfig": { "model": "gpt-5-codex" },
-                "timestamp": 1_700_000_000_000_u64
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(SessionId::new("session-usage-total")),
-            ..EventContext::default()
-        });
-        usage_event.sequence = 1;
-
-        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
-        let observation = read_model
-            .details
-            .sessions
-            .iter()
-            .find(|entry| entry.session_id == "session-usage-total")
-            .and_then(|entry| entry.usage_observation.as_ref())
-            .expect("usage observation should be recorded");
-
-        assert_eq!(observation.projected_request_tokens, 12_000);
-    }
-
-    #[test]
-    fn model_usage_recorded_counts_anthropic_cache_tokens_for_context_window() {
-        let mut usage_event = EventEnvelope::audit(
-            EventId::new("event-model-usage-anthropic-cache"),
-            "model.usage.recorded",
-            json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": 1_000,
-                    "outputTokens": 200,
-                    "cacheReadTokens": 4_000,
-                    "cacheWriteTokens": 800,
-                    "cacheReadIncludedInInput": false
-                },
-                "executionBinding": { "role": "orchestrator" },
-                "modelConfig": { "model": "claude-sonnet" },
-                "timestamp": 1_700_000_000_001_u64
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(SessionId::new("session-usage-anthropic-cache")),
-            ..EventContext::default()
-        });
-        usage_event.sequence = 1;
-
-        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
-        let observation = read_model
-            .details
-            .sessions
-            .iter()
-            .find(|entry| entry.session_id == "session-usage-anthropic-cache")
-            .and_then(|entry| entry.usage_observation.as_ref())
-            .expect("Anthropic cache usage should be recorded");
-
-        assert_eq!(observation.projected_request_tokens, 5_800);
     }
 
     #[test]
@@ -3545,16 +3284,15 @@ mod tests {
         assert_eq!(compaction.threshold_tokens, Some(244_800));
         assert_eq!(compaction.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(compaction.compacted_at, Some(UtcMillis(1_700_000_000_002)));
-        let observation = read_model
-            .details
-            .sessions
-            .iter()
-            .find(|entry| entry.session_id == "session-compacted")
-            .and_then(|entry| entry.usage_observation.as_ref())
-            .expect("compaction should immediately update context usage");
-        assert_eq!(observation.projected_request_tokens, 48_000);
-        assert_eq!(observation.measurement.as_deref(), Some("estimated"));
-        assert_eq!(observation.phase.as_deref(), Some("compacted"));
+        assert!(
+            read_model
+                .details
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == "session-compacted")
+                .and_then(|entry| entry.usage_observation.as_ref())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3589,71 +3327,49 @@ mod tests {
     }
 
     #[test]
-    fn model_usage_recorded_ignores_worker_usage_for_session_context_ring() {
-        let mut orchestrator_event = EventEnvelope::audit(
-            EventId::new("event-orchestrator-usage"),
+    fn pressure_snapshot_survives_billing_and_replays_with_identical_breakdown() {
+        let entry = usage_ledger_entry("session-pressure", 1, 12_000, 0, "model", 10);
+        let pressure = EventEnvelope::usage(
+            EventId::new("pressure"),
+            &entry.event_type,
+            entry.payload.clone(),
+        )
+        .with_context(entry.context.clone());
+        let billing = EventEnvelope::usage(
+            EventId::new("billing"),
             "model.usage.recorded",
             json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": 20_000,
-                    "outputTokens": 1_000
-                },
-                "executionBinding": { "role": "orchestrator" },
-                "modelConfig": { "model": "gpt-5-codex" },
-                "timestamp": 700_u64
+                "status": "success", "executionBinding": { "role": "orchestrator" },
+                "usage": { "inputTokens": 99_000, "outputTokens": 5_000 }, "timestamp": 11
             }),
         )
-        .with_context(EventContext {
-            session_id: Some(SessionId::new("session-role-filter")),
-            ..EventContext::default()
-        });
-        orchestrator_event.sequence = 1;
-
-        let mut worker_event = EventEnvelope::audit(
-            EventId::new("event-worker-usage"),
-            "model.usage.recorded",
-            json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": 99_000,
-                    "outputTokens": 9_000
-                },
-                "executionBinding": { "role": "worker" },
-                "modelConfig": { "model": "gpt-5-codex" },
-                "timestamp": 900_u64
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(SessionId::new("session-role-filter")),
-            ..EventContext::default()
-        });
-        worker_event.sequence = 2;
-
-        let read_model = RuntimeReadModelInput::from_events(&[orchestrator_event, worker_event]);
-        let observation = read_model
-            .details
-            .sessions
-            .iter()
-            .find(|entry| entry.session_id == "session-role-filter")
-            .and_then(|entry| entry.usage_observation.as_ref())
-            .expect("orchestrator usage observation should be retained");
-
-        assert_eq!(observation.projected_request_tokens, 20_000);
-        assert_eq!(observation.observed_at, Some(UtcMillis(700)));
+        .with_context(entry.context.clone());
+        let live = RuntimeReadModelInput::from_events(&[pressure, billing]);
+        let observation = live.details.sessions[0].usage_observation.as_ref().unwrap();
+        let replay = latest_usage_observation_for_session(&[entry], "session-pressure").unwrap();
+        assert_eq!(observation.projected_request_tokens, 12_000);
+        assert_eq!(observation.context_breakdown, replay.context_breakdown);
+        assert_eq!(
+            observation
+                .context_breakdown
+                .as_ref()
+                .unwrap()
+                .conversation_tokens,
+            12_000
+        );
     }
 
     fn usage_ledger_entry(
         session_id: &str,
         sequence: u64,
         input_tokens: u64,
-        output_tokens: u64,
+        _output_tokens: u64,
         model: &str,
         timestamp: u64,
     ) -> crate::AuditUsageLedgerEntry {
         crate::AuditUsageLedgerEntry {
             event_id: format!("event-{session_id}-{sequence}"),
-            event_type: "model.usage.recorded".to_string(),
+            event_type: "session.context.pressure.updated".to_string(),
             occurred_at: UtcMillis(timestamp),
             sequence,
             context: EventContext {
@@ -3661,14 +3377,11 @@ mod tests {
                 ..EventContext::default()
             },
             payload: json!({
-                "status": "success",
-                "usage": {
-                    "inputTokens": input_tokens,
-                    "outputTokens": output_tokens
-                },
-                "executionBinding": { "role": "orchestrator" },
-                "modelConfig": { "model": model },
-                "timestamp": timestamp
+                "projected_request_tokens": input_tokens,
+                "provider_context_tokens": input_tokens,
+                "source_role": "orchestrator", "measurement": "authoritative",
+                "phase": "completed", "resolved_model": model, "observed_at": timestamp,
+                "context_breakdown": ContextUsageBreakdown { conversation_tokens: input_tokens, ..Default::default() }
             }),
         }
     }
@@ -3749,7 +3462,7 @@ mod tests {
             ),
             crate::AuditUsageLedgerEntry {
                 event_id: "event-context-compaction-ledger".to_string(),
-                event_type: "session.context.compacted".to_string(),
+                event_type: "session.context.pressure.updated".to_string(),
                 occurred_at: UtcMillis(200),
                 sequence: 2,
                 context: EventContext {
@@ -3758,9 +3471,10 @@ mod tests {
                 },
                 payload: json!({
                     "thread_scope": "mainline",
-                    "request_token_estimate": 7_200,
+                    "projected_request_tokens": 7_200,
+                    "measurement": "estimated", "phase": "compacted",
                     "resolved_model": "gpt-5-codex",
-                    "compacted_at": 200_u64
+                    "observed_at": 200_u64
                 }),
             },
         ];
@@ -3794,7 +3508,7 @@ mod tests {
     fn latest_usage_observations_from_ledger_ignores_newer_worker_usage() {
         let mut worker_entry =
             usage_ledger_entry("session-a", 8, 99_000, 1_000, "gpt-5-codex", 800);
-        worker_entry.payload["executionBinding"]["role"] = json!("worker");
+        worker_entry.payload["source_role"] = json!("worker");
 
         let entries = vec![
             usage_ledger_entry("session-a", 7, 20_000, 1_000, "gpt-5-codex", 700),

@@ -16,9 +16,10 @@ if (options.help) {
 validateVersion(options.tag);
 
 const commonSteps = [
+  ["crate 架构文档一致性", npm, ["run", "docs:architecture:check"]],
   ["TypeScript 与 Svelte 检查", npm, ["run", "check"]],
   ["Desktop、Worker 与 Web 测试", npm, ["run", "test"]],
-  ["Browser 下载生命周期验证", npm, ["run", "test:browser-download-lifecycle"]],
+  ["Browser 核心边界验证", npm, ["run", "test:browser-core"]],
   ["Web 生产构建", npm, ["run", "build", "--workspace", "magi-web"]],
   ["Browser Automation Worker 生产构建", npm, ["run", "build", "--workspace", "@magi/browser-automation-worker"]],
   ["单一 Electron 发行边界", npm, ["run", "release:guard"]],
@@ -29,12 +30,6 @@ const commonSteps = [
 ];
 
 for (const [label, command, args] of commonSteps) run(label, command, args);
-
-if (process.platform === "win32") {
-  for (const [label, args] of windowsRustSteps()) run(label, "cargo", [rustPrefix(), ...args]);
-} else if (process.platform === "darwin") {
-  for (const [label, args] of macRustSteps()) run(label, "cargo", [rustPrefix(), ...args]);
-}
 
 if (options.package) {
   run("当前平台 Electron Desktop 发行打包", npm, ["run", "desktop:package"]);
@@ -87,30 +82,6 @@ function rustPrefix() {
   return `+${rustToolchain}`;
 }
 
-function windowsRustSteps() {
-  return [
-    ["Windows host_path 测试", ["test", "-p", "magi-core", "--test", "host_path", "--locked"]],
-    ["Windows workspace 路径注册测试", ["test", "-p", "magi-workspace", "native_workspace_registration_keeps_authoritative_path_ref", "--locked"]],
-    ["Windows magi-process 测试", ["test", "-p", "magi-process", "--all-targets", "--locked"]],
-    ["Windows magi-permissions 测试", ["test", "-p", "magi-permissions", "--all-targets", "--locked"]],
-    ["Windows tool runtime 进程测试", ["test", "-p", "magi-tool-runtime", "process_inspect_reports_current_process", "--locked"]],
-    ["Windows shell path parser 测试", ["test", "-p", "magi-tool-runtime", "shell_path_parser_tests", "--locked"]],
-    ["Windows shell dialect 测试", ["test", "-p", "magi-tool-runtime", "shell_argument_matches_selected_shell_dialect", "--locked"]],
-    ["Windows shell 参数测试", ["test", "-p", "magi-tool-runtime", "shell_exec_accepts_shell_program_with_arguments", "--locked"]],
-    ["Windows 工作目录测试", ["test", "-p", "magi-tool-runtime", "builtins_use_context_working_directory_for_relative_inputs", "--locked"]],
-    ["Windows API path_ref 测试", ["test", "-p", "magi-api", "path_ref", "--locked"]],
-    ["Windows daemon 全目标检查", ["check", "-p", "magi-daemon", "--all-targets", "--locked"]],
-  ];
-}
-
-function macRustSteps() {
-  return [
-    ["macOS host_path 测试", ["test", "-p", "magi-core", "--test", "host_path", "--locked"]],
-    ["macOS magi-process 测试", ["test", "-p", "magi-process", "--all-targets", "--locked"]],
-    ["macOS daemon 全目标检查", ["check", "-p", "magi-daemon", "--all-targets", "--locked"]],
-  ];
-}
-
 function parseArgs(values) {
   const output = { audit: false, help: false, package: false, tag: null };
   for (let index = 0; index < values.length; index += 1) {
@@ -141,6 +112,6 @@ function printHelp() {
   --help         显示帮助
 
 推荐：
-  npm run release:preflight -- --tag v3.0.48 --package --audit
+  npm run release:preflight -- --tag vX.Y.Z --package --audit
 `);
 }

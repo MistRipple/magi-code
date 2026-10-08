@@ -478,6 +478,10 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
             "exit_code",
             "file_size_bytes",
             "bytes_read",
+            "start_line",
+            "end_line",
+            "line_count",
+            "stop_reason",
             "truncated",
             "original_token_count",
             "omitted_bytes",
@@ -613,6 +617,9 @@ fn compact_historical_tool_result(result: &str, max_bytes: usize) -> String {
             "path",
             "content_hash",
             "file_size_bytes",
+            "start_line",
+            "end_line",
+            "line_count",
             "exit_code",
             "summary",
             "message",
@@ -817,6 +824,21 @@ mod tests {
             model_visible_tool_result(result, ExecutionResultStatus::Failed),
             result
         );
+    }
+
+    #[test]
+    fn model_visible_file_range_keeps_line_coordinates_after_truncation() {
+        let result = serde_json::json!({
+            "tool": "file_read", "status": "succeeded", "content": "x".repeat(50_000),
+            "start_line": 200, "end_line": 240, "line_count": 41,
+        })
+        .to_string();
+        let visible = model_visible_tool_result(&result, ExecutionResultStatus::Succeeded);
+        let parsed: Value = serde_json::from_str(&visible).unwrap();
+        assert_eq!(parsed["model_truncated"], true);
+        assert_eq!(parsed["start_line"], 200);
+        assert_eq!(parsed["end_line"], 240);
+        assert_eq!(parsed["line_count"], 41);
     }
 
     #[test]

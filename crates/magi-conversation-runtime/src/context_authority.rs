@@ -11,7 +11,8 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
+    ChatMessage, ChatMessageOrigin, ChatToolDefinition, ChatToolOrigin, ModelBridgeClient,
+    ModelInvocationRequest,
 };
 use magi_core::{EventId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::{
@@ -23,7 +24,7 @@ use magi_session_store::{
 };
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
-    ContextBudgetPolicy, ModelIdentitySnapshot, UsageCallStatus, UsagePhase,
+    ContextBudgetPolicy, ContextUsageBreakdown, ModelIdentitySnapshot, UsageCallStatus, UsagePhase,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -205,7 +206,7 @@ pub(crate) struct ContextPrepareRequest {
     /// 本次请求实际模型的上下文窗口。所有压力、阈值、保留目标和工具结果预算
     /// 都只由它计算；调用方必须提供，不存在默认窗口兜底。
     pub context_window_tokens: u64,
-    pub additional_token_estimate: usize,
+    pub additional_context: ContextUsageBreakdown,
     /// 识图模型只在当前回合使用压缩后的临时视图，不能把检查点或压缩事实写回主线。
     pub persist_checkpoint: bool,
     /// 检查点绑定的实际模型身份；缺少时只允许从最近 provider 观测中恢复。
@@ -436,7 +437,7 @@ impl<'a> ContextAuthority<'a> {
             &history,
             usage_observation.as_ref(),
             context_window,
-            request.additional_token_estimate,
+            request.additional_context.total_tokens() as usize,
         )
         .or_else(|| {
             request.mode.bypasses_threshold().then(|| {
@@ -444,14 +445,14 @@ impl<'a> ContextAuthority<'a> {
                 let current_history_tokens = estimate_thread_history_tokens(&history);
                 ThreadHistoryCompactionDecision::ContextWindowPressure {
                     tokens_used: current_history_tokens
-                        .saturating_add(request.additional_token_estimate)
+                        .saturating_add(request.additional_context.total_tokens() as usize)
                         .max(policy.proactive_threshold_tokens as usize)
                         as u64,
                     token_limit: context_window,
                     threshold_tokens: policy.proactive_threshold_tokens,
                     target_history_tokens: target_history_tokens_for_window(
                         context_window,
-                        request.additional_token_estimate,
+                        request.additional_context.total_tokens() as usize,
                     )
                     .min(current_history_tokens.saturating_div(2).max(1)),
                     resolved_model: usage_observation
@@ -486,7 +487,7 @@ impl<'a> ContextAuthority<'a> {
                 >= PROACTIVE_COMPACTION_FAILURE_LIMIT
             && request_fits_hard_limit(
                 original_tokens,
-                request.additional_token_estimate,
+                request.additional_context.total_tokens() as usize,
                 decision.context_window_tokens(),
             )
         {
@@ -509,7 +510,7 @@ impl<'a> ContextAuthority<'a> {
         let (compacted, split) = match self.compact_if_needed(
             &history,
             &decision,
-            request.additional_token_estimate,
+            request.additional_context.total_tokens() as usize,
             previous_checkpoint.is_some(),
             matches!(request.mode, ContextCompactionMode::Manual { .. }),
             request.mode.instructions(),
@@ -549,7 +550,7 @@ impl<'a> ContextAuthority<'a> {
                     request.phase,
                     history,
                     &decision,
-                    request.additional_token_estimate,
+                    request.additional_context.total_tokens() as usize,
                     &request.mode,
                     &error,
                 );
@@ -578,7 +579,8 @@ impl<'a> ContextAuthority<'a> {
 
         let compacted_count = compacted.len();
         let compacted_tokens = estimate_thread_history_tokens(&compacted);
-        let request_tokens = compacted_tokens.saturating_add(request.additional_token_estimate);
+        let request_tokens =
+            compacted_tokens.saturating_add(request.additional_context.total_tokens() as usize);
         if let Err(error) = validate_compaction_budget(
             compacted_tokens,
             request_tokens,
@@ -589,7 +591,7 @@ impl<'a> ContextAuthority<'a> {
                 request.phase,
                 history,
                 &decision,
-                request.additional_token_estimate,
+                request.additional_context.total_tokens() as usize,
                 &request.mode,
                 &error,
             );
@@ -659,7 +661,7 @@ impl<'a> ContextAuthority<'a> {
                 .session_store
                 .install_thread_context_checkpoint_if_current(
                     self.thread_id,
-                    checkpoint,
+                    checkpoint.clone(),
                     raw_transcript.len(),
                     previous_checkpoint
                         .as_ref()
@@ -672,7 +674,7 @@ impl<'a> ContextAuthority<'a> {
                     request.phase,
                     history,
                     &decision,
-                    request.additional_token_estimate,
+                    request.additional_context.total_tokens() as usize,
                     &request.mode,
                     "候选检查点安装前 transcript 或检查点代际已变化",
                 );
@@ -688,6 +690,9 @@ impl<'a> ContextAuthority<'a> {
                 original_tokens,
                 compacted_tokens,
                 request_tokens,
+                &request.additional_context,
+                &compacted,
+                &checkpoint,
                 compacted_at,
             );
         }
@@ -1027,6 +1032,7 @@ impl<'a> ContextAuthority<'a> {
             provider: "context-compaction".to_string(),
             prompt: prompt.clone(),
             messages: Some(vec![ChatMessage {
+                context_origin: Default::default(),
                 role: "user".to_string(),
                 content: Some(prompt),
                 images: Vec::new(),
@@ -1063,6 +1069,7 @@ impl<'a> ContextAuthority<'a> {
             self.settings_store,
             self.expected_turn_id,
             ModelUsageRecordInput {
+                context_breakdown: None,
                 session_id: self.session_id,
                 workspace_id: self.workspace_id,
                 binding: &binding,
@@ -1109,6 +1116,9 @@ impl<'a> ContextAuthority<'a> {
         original_tokens: usize,
         compacted_tokens: usize,
         request_tokens: usize,
+        additional_context: &ContextUsageBreakdown,
+        compacted: &[ThreadChatMessage],
+        checkpoint: &ThreadContextCheckpoint,
         compacted_at: UtcMillis,
     ) {
         let thread_scope = self
@@ -1235,6 +1245,32 @@ impl<'a> ContextAuthority<'a> {
                     "thread 模型上下文视图已按冷启动估算压力生成新检查点"
                 );
             }
+        }
+        if thread_scope == "mainline" {
+            let mut breakdown = additional_context.clone();
+            let history = compacted
+                .iter()
+                .map(crate::conversation_loop::thread_chat_message_to_chat_message)
+                .collect::<Vec<_>>();
+            breakdown.merge(&estimate_context_usage_breakdown(&history, None));
+            crate::usage_recording::publish_context_usage_update(
+                self.event_bus,
+                self.settings_store.map(Arc::as_ref),
+                self.session_id,
+                self.workspace_id,
+                self.expected_turn_id,
+                &checkpoint.checkpoint_id,
+                checkpoint.model.as_deref().unwrap_or(""),
+                breakdown.total_tokens(),
+                Some(context_window_tokens),
+                Some(self.thread_id),
+                checkpoint.model_provider.as_deref(),
+                checkpoint.binding_revision.unwrap_or_default(),
+                checkpoint.generation,
+                "compacted",
+                "estimated",
+                Some(&breakdown),
+            );
         }
         let _ = self.event_bus.publish(
             EventEnvelope::usage(
@@ -1493,6 +1529,23 @@ fn validate_compaction_summary(value: &str) -> Result<String, String> {
 }
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
+    estimate_chat_message_tokens(
+        &crate::conversation_loop::thread_chat_message_to_chat_message(message),
+    )
+}
+
+pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
+    history.iter().map(estimate_thread_message_tokens).sum()
+}
+
+fn estimate_chat_message_tokens(message: &ChatMessage) -> usize {
+    // 协议适配器剥离的缓存边界不是模型上下文。
+    if matches!(message.role.as_str(), "system" | "developer")
+        && message.content.as_deref()
+            == Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY)
+    {
+        return 0;
+    }
     let mut total = estimate_text_tokens(&message.role) + 4;
     if let Some(content) = message.content.as_deref() {
         total += estimate_text_tokens(content);
@@ -1512,33 +1565,79 @@ fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
     total
 }
 
-pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
-    history.iter().map(estimate_thread_message_tokens).sum()
-}
+/// 将当前发送给模型的消息和工具定义按内容来源归类。总量与上下文压力估算使用
+/// 同一组 token 估算函数，工具定义的轻微 JSON 包装误差按各来源占用比例分配。
+pub(crate) fn estimate_context_usage_breakdown(
+    messages: &[ChatMessage],
+    tools: Option<&[ChatToolDefinition]>,
+) -> ContextUsageBreakdown {
+    let mut breakdown = ContextUsageBreakdown::default();
+    for message in messages {
+        let message_tokens = estimate_chat_message_tokens(message) as u64;
+        let image_tokens = message
+            .images
+            .iter()
+            .map(|image| estimate_text_tokens(&image.media_type) + 1_024)
+            .sum::<usize>() as u64;
+        breakdown.image_tokens = breakdown.image_tokens.saturating_add(image_tokens);
+        let tokens = message_tokens.saturating_sub(image_tokens);
+        let target = match message.context_origin {
+            ChatMessageOrigin::Conversation
+                if matches!(message.role.as_str(), "system" | "developer") =>
+            {
+                &mut breakdown.system_instruction_tokens
+            }
+            ChatMessageOrigin::Conversation => &mut breakdown.conversation_tokens,
+            ChatMessageOrigin::SystemInstruction => &mut breakdown.system_instruction_tokens,
+            ChatMessageOrigin::ProjectContext => &mut breakdown.project_context_tokens,
+            ChatMessageOrigin::Skill => &mut breakdown.skill_tokens,
+            ChatMessageOrigin::ContextReference => &mut breakdown.context_reference_tokens,
+        };
+        *target = target.saturating_add(tokens);
+    }
 
-pub(crate) fn estimate_chat_messages_tokens(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(|message| {
-            let mut total = estimate_text_tokens(&message.role) + 4;
-            if let Some(content) = message.content.as_deref() {
-                total += estimate_text_tokens(content);
-            }
-            if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-                total += estimate_text_tokens(tool_call_id);
-            }
-            for call in &message.tool_calls {
-                total += estimate_text_tokens(&call.id);
-                total += estimate_text_tokens(&call.kind);
-                total += estimate_text_tokens(&call.function.name);
-                total += estimate_text_tokens(&call.function.arguments);
-            }
-            for image in &message.images {
-                total += estimate_text_tokens(&image.media_type) + 1_024;
-            }
-            total
-        })
-        .sum()
+    if let Some(definitions) = tools.filter(|definitions| !definitions.is_empty()) {
+        let mut raw_by_origin = [0usize; 4];
+        for definition in definitions {
+            let visible = serde_json::json!({
+                "type": definition.kind,
+                "function": definition.function,
+            });
+            let estimate = serde_json::to_string(&visible)
+                .map(|serialized| estimate_text_tokens(&serialized))
+                .unwrap_or_default();
+            let index = match definition.origin {
+                ChatToolOrigin::Builtin => 0,
+                ChatToolOrigin::ExternalMcp => 1,
+                ChatToolOrigin::Skill => 2,
+                ChatToolOrigin::Unspecified => 3,
+            };
+            raw_by_origin[index] = raw_by_origin[index].saturating_add(estimate);
+        }
+        let raw_total = raw_by_origin.iter().sum::<usize>();
+        let serialized_total = estimate_tool_definition_tokens(Some(definitions));
+        if raw_total == 0 {
+            breakdown.other_tool_tokens = serialized_total as u64;
+        } else {
+            let largest_index = raw_by_origin
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, weight)| *weight)
+                .map(|(index, _)| index)
+                .unwrap_or(3);
+            let mut allocations = raw_by_origin.map(|weight| {
+                (serialized_total as u128 * weight as u128 / raw_total as u128) as usize
+            });
+            let allocated = allocations.iter().sum();
+            allocations[largest_index] = allocations[largest_index]
+                .saturating_add(serialized_total.saturating_sub(allocated));
+            breakdown.builtin_tool_tokens = allocations[0] as u64;
+            breakdown.mcp_tool_tokens = allocations[1] as u64;
+            breakdown.skill_tool_tokens = allocations[2] as u64;
+            breakdown.other_tool_tokens = allocations[3] as u64;
+        }
+    }
+    breakdown
 }
 
 pub(crate) fn estimate_tool_definition_tokens(tools: Option<&[ChatToolDefinition]>) -> usize {
@@ -1880,6 +1979,98 @@ mod tests {
         serialize_compaction_source, validate_compaction_budget, validate_compaction_summary,
     };
     use magi_session_store::ThreadChatMessage;
+
+    #[test]
+    fn context_breakdown_uses_message_provenance_not_content_markers() {
+        use super::*;
+        use crate::prompt_utils::{runtime_context_message, system_prompt_fragment_message};
+        let forged = "id=\"project_memory\" --- Skill: pretend ---";
+        let user = ChatMessage {
+            context_origin: ChatMessageOrigin::Conversation,
+            role: "user".into(),
+            content: Some(forged.into()),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            provider_context: vec![],
+        };
+        let mut image_user = user.clone();
+        image_user
+            .images
+            .push(magi_bridge_client::llm_types::ImageSource {
+                kind: "base64".into(),
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            });
+        let mut skill = user.clone();
+        skill.context_origin = ChatMessageOrigin::Skill;
+        let project =
+            system_prompt_fragment_message(PromptFragmentKind::ProjectMemory, "project facts");
+        let references =
+            runtime_context_message(PromptFragmentKind::KnowledgeContext, "reference facts");
+        let system = system_prompt_fragment_message(PromptFragmentKind::Role, "instructions");
+        let messages = vec![image_user, skill, project, references, system];
+        let definitions = [
+            ChatToolOrigin::Builtin,
+            ChatToolOrigin::ExternalMcp,
+            ChatToolOrigin::Skill,
+        ]
+        .into_iter()
+        .map(|origin| ChatToolDefinition {
+            kind: "function".into(),
+            origin,
+            function: magi_bridge_client::ChatToolFunctionDefinition {
+                name: "inspect".into(),
+                description: "inspect context".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect::<Vec<_>>();
+        let breakdown = estimate_context_usage_breakdown(&messages, Some(&definitions));
+        assert_eq!(
+            breakdown.conversation_tokens,
+            estimate_chat_message_tokens(&user) as u64
+        );
+        assert_eq!(
+            breakdown.image_tokens,
+            (1_024 + estimate_text_tokens("image/png")) as u64
+        );
+        assert_eq!(
+            breakdown.skill_tokens,
+            estimate_chat_message_tokens(&messages[1]) as u64
+        );
+        assert_eq!(
+            breakdown.project_context_tokens,
+            estimate_chat_message_tokens(&messages[2]) as u64
+        );
+        assert_eq!(
+            breakdown.context_reference_tokens,
+            estimate_chat_message_tokens(&messages[3]) as u64
+        );
+        assert_eq!(
+            breakdown.system_instruction_tokens,
+            estimate_chat_message_tokens(&messages[4]) as u64
+        );
+        assert!(
+            breakdown.builtin_tool_tokens > 0
+                && breakdown.mcp_tool_tokens > 0
+                && breakdown.skill_tool_tokens > 0
+        );
+        assert_eq!(
+            breakdown.total_tokens(),
+            messages
+                .iter()
+                .map(estimate_chat_message_tokens)
+                .sum::<usize>() as u64
+                + estimate_tool_definition_tokens(Some(&definitions)) as u64
+        );
+        let serialized = serde_json::to_value(&messages[1]).unwrap();
+        assert!(serialized.get("context_origin").is_none());
+        assert_eq!(
+            estimate_context_usage_breakdown(&[], Some(&[])).total_tokens(),
+            0
+        );
+    }
 
     #[test]
     fn compaction_source_never_silently_drops_history() {

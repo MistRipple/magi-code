@@ -403,6 +403,8 @@ pub struct RuntimeCapabilityDependencyEntry {
 /// daemon 进程内的共享服务引用，由 ToolRegistry 持有并在 dispatch 时传入。
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
+    /// 由受控工具入口派生，供递归读取逐项复核权限。
+    pub(crate) file_read_policy: magi_permissions::PermissionPolicy,
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
     pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
     pub external_mcp_tool_executor: Option<ExternalMcpToolExecutor>,

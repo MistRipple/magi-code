@@ -2,15 +2,14 @@
 
 use super::{
     failure::{filesystem_failure, invalid_input, path_resolution_failure},
-    field_bool, field_string, field_usize, parse_json_object, resolve_path_with_context,
+    field_bool, field_string, parse_json_object,
+    read_support::{DEFAULT_MAX_BYTES, MAX_BYTES, ReadOperation, bounded_usize, decode_text},
+    resolve_path_with_context,
 };
-use crate::{BuiltinToolAccessMode, ToolExecutionContext};
+use crate::{BuiltinToolAccessMode, ToolExecutionContext, ToolRuntimeResources};
 use magi_core::{ToolFailure, fs_atomic::write_atomic_preserving_target};
 use serde_json::Value;
-use std::{fs, io::Read, path::Path};
-
-const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
-const FILE_READ_MAX_BYTES: usize = 1024 * 1024;
+use std::{fs, io::Read};
 
 fn non_empty_path_field(
     request: &serde_json::Map<String, Value>,
@@ -23,141 +22,136 @@ fn non_empty_path_field(
     }
 }
 
-fn content_hash_failure(tool: &str, path: &Path, error: impl std::fmt::Display) -> String {
-    tracing::warn!(tool, path = %path.display(), error = %error, "content hash failed");
-    ToolFailure::new(tool, "hash_failed", "计算内容版本失败")
-        .instruction("原因已记录到日志；不要用相同参数重复调用，换一种方式或告知用户。")
+pub(super) fn execute_file_read(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    read_file(input, context, resources).unwrap_or_else(|failure| failure)
+}
+
+fn read_file(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> Result<String, String> {
+    let request = parse_json_object(input)
+        .ok_or_else(|| invalid_input("file_read", "输入必须为 JSON 对象，包含 path 字段"))?;
+    let path_input = non_empty_path_field(&request, "path", "file_read")?;
+    let (max_bytes, start_line, end_line) = read_bounds(&request)?;
+    let op = ReadOperation::new("file_read", &request, context, resources)?;
+    let path = op.resolve(&path_input, context)?;
+    let mut file = op.open(&path)?;
+    let file_size_bytes = file.metadata().map_err(|e| op.io_failure(&path, &e))?.len();
+    let mut preview = RangePreview {
+        file: &mut file,
+        op: &op,
+        line: 1,
+        start: start_line,
+        end: end_line.unwrap_or(usize::MAX),
+        max_bytes,
+        bytes: Vec::new(),
+        truncated: false,
+    };
+    // 一次顺序读取同时取范围和计算完整内容版本；每块检查取消和超时。
+    let content_hash =
+        magi_snapshot::scan::hash_reader(&mut preview).map_err(|e| op.io_failure(&path, &e))?;
+    let truncated = preview.truncated;
+    let content = decode_text(preview.bytes, truncated).map_err(|()| {
+        ToolFailure::new(
+            "file_read",
+            "not_utf8_text",
+            "读取范围不是 UTF-8 文本（可能是二进制文件或其他编码）",
+        )
+        .instruction("图片请用 view_image；其他二进制文件需要对应的读取工具。")
+        .with("file_size_bytes", file_size_bytes)
         .into_payload()
+    })?;
+    op.check()?;
+    let line_count = content.lines().count();
+    Ok(serde_json::json!({
+        "tool": "file_read", "status": "succeeded", "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "mode": "file", "path": path.display().to_string(), "content_hash": content_hash, "file_size_bytes": file_size_bytes,
+        "max_bytes": max_bytes, "bytes_read": content.len(), "truncated": truncated, "encoding": "utf-8",
+        "start_line": start_line, "end_line": if line_count == 0 { None } else { Some(start_line + line_count - 1) },
+        "requested_end_line": end_line, "line_count": line_count, "content": content,
+        "summary": format!("已读取 {} 从第 {} 行开始的 {} 行{}", path.display(), start_line, line_count, if truncated { "（达到字节上限）" } else { "" }),
+    }).to_string())
 }
 
-pub(super) fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
-    let Some(request) = parse_json_object(input) else {
-        return invalid_input("file_read", "输入必须为 JSON 对象，包含 path 字段");
-    };
-    let path_input = match non_empty_path_field(&request, "path", "file_read") {
-        Ok(value) => value,
-        Err(failure) => return failure,
-    };
-    let max_bytes = field_usize(&request, "max_bytes")
-        .unwrap_or(DEFAULT_FILE_READ_MAX_BYTES)
-        .clamp(1, FILE_READ_MAX_BYTES);
+fn read_bounds(
+    request: &serde_json::Map<String, Value>,
+) -> Result<(usize, usize, Option<usize>), String> {
+    let max_bytes = bounded_usize(
+        &request,
+        "max_bytes",
+        DEFAULT_MAX_BYTES,
+        MAX_BYTES,
+        "file_read",
+    )?;
+    let start_line = bounded_usize(&request, "start_line", 1, usize::MAX, "file_read")?;
+    let end_line = request
+        .get("end_line")
+        .map(|_| bounded_usize(&request, "end_line", usize::MAX, usize::MAX, "file_read"))
+        .transpose()?;
+    if end_line.is_some_and(|end| end < start_line) {
+        return Err(invalid_input("file_read", "end_line 不能小于 start_line"));
+    }
+    Ok((max_bytes, start_line, end_line))
+}
 
-    let path = match resolve_path_with_context(&path_input, context) {
-        Ok(path) => path,
-        Err(error) => return path_resolution_failure("file_read", &path_input, &error),
+/// 会话缓存仅复用完全相同的读取范围，禁止在缓存层维护第二套文本截取实现。
+pub fn file_read_result_matches_request(result: &str, arguments: &Value) -> bool {
+    let Some(request) = arguments.as_object() else {
+        return false;
     };
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return filesystem_failure("file_read", "读取文件信息", &path, &error).into_payload();
-        }
+    let Ok((max_bytes, start_line, end_line)) = read_bounds(request) else {
+        return false;
     };
+    let Ok(source) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    source["mode"] == "file"
+        && source["max_bytes"] == max_bytes
+        && source["start_line"] == start_line
+        && source["requested_end_line"] == serde_json::json!(end_line)
+}
 
-    if metadata.is_dir() {
-        let names: std::io::Result<Vec<std::ffi::OsString>> =
-            fs::read_dir(&path).and_then(|entries| {
-                entries
-                    .map(|entry| entry.map(|entry| entry.file_name()))
-                    .collect()
-            });
-        let entries = match names {
-            Ok(names) => names,
-            Err(error) => {
-                return filesystem_failure("file_read", "读取目录", &path, &error).into_payload();
+struct RangePreview<'a> {
+    file: &'a mut fs::File,
+    op: &'a ReadOperation,
+    line: usize,
+    start: usize,
+    end: usize,
+    max_bytes: usize,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+impl Read for RangePreview<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.op.check().map_err(std::io::Error::other)?;
+        let n = self.file.read(buffer)?;
+        self.op.check().map_err(std::io::Error::other)?;
+        // 分块而非 read_line：单行任意长也不会无界分配内存。
+        if self.line <= self.end && !self.truncated {
+            for &byte in &buffer[..n] {
+                if self.line > self.end {
+                    break;
+                }
+                if self.line >= self.start {
+                    if self.bytes.len() == self.max_bytes {
+                        self.truncated = true;
+                        break;
+                    }
+                    self.bytes.push(byte);
+                }
+                if byte == b'\n' {
+                    self.line = self.line.saturating_add(1);
+                }
             }
-        };
-        let mut entries: Vec<String> = entries
-            .into_iter()
-            .map(|name| name.to_string_lossy().to_string())
-            .collect();
-        entries.sort();
-        let content_hash = match magi_snapshot::path_content_hash(&path) {
-            Ok(content_hash) => content_hash,
-            Err(error) => return content_hash_failure("file_read", &path, error),
-        };
-        return serde_json::json!({
-            "tool": "file_read",
-            "status": "succeeded",
-            "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-            "mode": "directory",
-            "path": path.display().to_string(),
-            "content_hash": content_hash,
-            "entries": entries,
-            "entry_count": entries.len(),
-            "summary": format!("目录 {} 包含 {} 项", path.display(), entries.len())
-        })
-        .to_string();
-    }
-
-    let file_size_bytes = metadata.len();
-    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
-    let read_result = fs::File::open(&path).and_then(|file| {
-        file.take(max_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| ())
-    });
-    if let Err(error) = read_result {
-        return filesystem_failure("file_read", "读取文件", &path, &error).into_payload();
-    }
-    let truncated = file_size_bytes > max_bytes as u64 || bytes.len() > max_bytes;
-    bytes.truncate(max_bytes);
-
-    let content = match decode_text_preview(bytes, truncated) {
-        Ok(content) => content,
-        Err(()) => {
-            return ToolFailure::new(
-                "file_read",
-                "not_utf8_text",
-                "文件不是 UTF-8 文本（可能是二进制文件或其他编码）",
-            )
-            .instruction(
-                "不要再用 file_read 读取它。图片请用 view_image；其他二进制文件需要时用 shell_exec 调用对应工具（如 file、xxd）。",
-            )
-            .with("file_size_bytes", file_size_bytes)
-            .into_payload();
         }
-    };
-    let content_hash = match magi_snapshot::path_content_hash(&path) {
-        Ok(content_hash) => content_hash,
-        Err(error) => return content_hash_failure("file_read", &path, error),
-    };
-
-    serde_json::json!({
-        "tool": "file_read",
-        "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "mode": "file",
-        "path": path.display().to_string(),
-        "content_hash": content_hash,
-        "file_size_bytes": file_size_bytes,
-        "max_bytes": max_bytes,
-        "bytes_read": content.len(),
-        "truncated": truncated,
-        "encoding": "utf-8",
-        "content": content,
-        "summary": if truncated {
-            format!("已预览文件 {} 的前 {} 字节", path.display(), content.len())
-        } else {
-            format!("已读取文件 {}", path.display())
-        }
-    })
-    .to_string()
-}
-
-/// 把读到的字节解码成文本。含 NUL 或不是 UTF-8 的内容不是文本，不能用替换字符伪装成文本；
-/// 预览被截断时，末尾被切开的多字节字符不算错误，丢弃即可。
-fn decode_text_preview(mut bytes: Vec<u8>, truncated: bool) -> Result<String, ()> {
-    if bytes.contains(&0) {
-        return Err(());
+        Ok(n)
     }
-    match std::str::from_utf8(&bytes) {
-        Ok(_) => {}
-        Err(error) if truncated && error.error_len().is_none() => {
-            bytes.truncate(error.valid_up_to());
-        }
-        Err(_) => return Err(()),
-    }
-    String::from_utf8(bytes).map_err(|_| ())
 }
 
 pub(super) fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
@@ -570,20 +564,20 @@ mod tests {
 
     #[test]
     fn text_preview_rejects_binary_and_non_utf8_content() {
-        assert!(decode_text_preview(b"plain text".to_vec(), false).is_ok());
-        assert!(decode_text_preview(vec![0x50, 0x4b, 0x00, 0x04], false).is_err());
-        assert!(decode_text_preview(vec![0xff, 0xfe, 0x41], false).is_err());
+        assert!(decode_text(b"plain text".to_vec(), false).is_ok());
+        assert!(decode_text(vec![0x50, 0x4b, 0x00, 0x04], false).is_err());
+        assert!(decode_text(vec![0xff, 0xfe, 0x41], false).is_err());
     }
 
     #[test]
     fn truncated_preview_drops_a_split_multibyte_character_but_not_invalid_bytes() {
         let text = "中文".as_bytes();
         // 截在“文”的中间：被切开的字符丢弃，不算二进制。
-        let preview = decode_text_preview(text[..4].to_vec(), true).expect("split character");
+        let preview = decode_text(text[..4].to_vec(), true).expect("split character");
         assert_eq!(preview, "中");
         // 同样的字节没有被截断时说明文件本身不是合法 UTF-8。
-        assert!(decode_text_preview(text[..4].to_vec(), false).is_err());
+        assert!(decode_text(text[..4].to_vec(), false).is_err());
         // 截断位置之前就出现的非法字节仍然是二进制。
-        assert!(decode_text_preview(vec![0x41, 0xff, 0x42], true).is_err());
+        assert!(decode_text(vec![0x41, 0xff, 0x42], true).is_err());
     }
 }
