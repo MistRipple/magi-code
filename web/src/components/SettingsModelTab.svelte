@@ -602,7 +602,7 @@
     gap: 2px;
     min-height: 0;
     overflow-y: auto;
-    scrollbar-width: thin;
+    /* 不设 scrollbar-width：标准属性会盖掉全局的 5px 细滚动条样式，换成系统自带的粗滚动条。 */
   }
 
   .rail-search {
