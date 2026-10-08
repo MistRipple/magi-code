@@ -6,7 +6,7 @@ import { ensureArray } from "../lib/utils";
 import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
 import { isSupportedLocale } from "../i18n/locales";
-import { confirmMessage } from "./confirm-dialog.svelte";
+import { chooseAction, confirmMessage } from "./confirm-dialog.svelte";
 import {
   directIncidentError,
   incidentErrorDiagnostics,
@@ -1865,7 +1865,77 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     vscode.postMessage({ type: "logout" });
   }
 
+  /** 还没保存的模型配置草稿。新建且尚未填写任何连接信息的引擎不算。 */
+  function unsavedModelDrafts(): Array<{ target: ModelConfigTarget; key: string; label: string }> {
+    const drafts: Array<{ target: ModelConfigTarget; key: string; label: string }> = [];
+    const roles: Array<[ModelConfigTarget, string]> = [
+      ["orch", "settings.model.orchestratorModel"],
+      ["comp", "settings.model.auxiliaryModel"],
+      ["image", "settings.model.imageGenerationModel"],
+      ["vision", "settings.model.visionModel"],
+    ];
+    for (const [target, labelKey] of roles) {
+      if (isModelConfigDraftDirty(target, target, getModelFormConfig(target, target))) {
+        drafts.push({ target, key: target, label: i18n.t(labelKey) });
+      }
+    }
+    for (const [key, config] of Object.entries(workerConfigs)) {
+      const dirty = unsavedEngines.has(key)
+        ? Boolean(config.baseUrl?.trim() || config.apiKey?.trim() || config.model?.trim())
+        : isModelConfigDraftDirty("worker", key, config);
+      if (dirty) drafts.push({ target: "worker", key, label: getWorkerDisplayName(key) });
+    }
+    return drafts;
+  }
+
+  function discardModelDraft(target: ModelConfigTarget, key: string): void {
+    const baseline = modelConfigBaselines[key];
+    if (!baseline) return;
+    const restored = cloneModelFormConfig(baseline);
+    if (target === "worker") {
+      workerConfigs = { ...workerConfigs, [key]: restored as WorkerModelFormConfig };
+    } else if (target === "orch") {
+      orchConfig = restored as InteractiveModelFormConfig;
+    } else if (target === "comp") {
+      compConfig = restored;
+    } else if (target === "vision") {
+      visionConfig = restored;
+    } else {
+      imageConfig = restored;
+    }
+  }
+
+  /**
+   * 离开设置前处理未保存的模型配置：保存并返回 / 放弃修改 / 继续编辑。
+   * 返回 false 表示用户要留下继续编辑，或保存失败（失败原因已由保存流程提示）。
+   */
+  async function resolveUnsavedModelDrafts(): Promise<boolean> {
+    const drafts = unsavedModelDrafts();
+    if (drafts.length === 0) return true;
+    const choice = await chooseAction({
+      title: i18n.t("settings.model.unsavedClose.title"),
+      message: i18n.t("settings.model.unsavedClose.message", {
+        names: drafts.map((draft) => draft.label).join(i18n.t("settings.model.unsavedClose.separator")),
+      }),
+      confirmLabel: i18n.t("settings.model.unsavedClose.save"),
+      secondaryLabel: i18n.t("settings.model.unsavedClose.discard"),
+      cancelLabel: i18n.t("settings.model.unsavedClose.keepEditing"),
+      tone: "default",
+    });
+    if (choice === "cancel") return false;
+    if (choice === "secondary") {
+      for (const draft of drafts) discardModelDraft(draft.target, draft.key);
+      return true;
+    }
+    for (const draft of drafts) {
+      await saveModelConfig(draft.target, draft.key);
+      if (saveStatus[draft.key] === "error") return false;
+    }
+    return true;
+  }
+
   async function closeSettings() {
+    if (!(await resolveUnsavedModelDrafts())) return;
     await flushUserRulesSave();
     await safeguardSaveQueue;
     // 关闭面板前清理所有未保存的引擎（只存在于前端的幽灵引擎）
