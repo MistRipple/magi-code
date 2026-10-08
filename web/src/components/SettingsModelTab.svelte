@@ -118,11 +118,93 @@
   let canScrollLeft = $state(false);
   let canScrollRight = $state(false);
 
+  // 浮层式滚动条：原生滚动条会一直占位，这里用悬浮在标签条底边的滑块，
+  // 鼠标移进标签条才出现、移出就隐藏，不占布局空间，且可拖动。
+  let thumbLeft = $state(0);
+  let thumbWidth = $state(0);
+  let tabbarHovered = $state(false);
+  let thumbDragging = $state(false);
+
   function updateScrollState() {
     const el = tabbarWrapperEl?.querySelector('.tabbar-scroll') as HTMLElement | null;
     if (!el) return;
     canScrollLeft = el.scrollLeft > 2;
     canScrollRight = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+    const overflow = el.scrollWidth > el.clientWidth + 1;
+    thumbWidth = overflow ? Math.max(28, (el.clientWidth / el.scrollWidth) * el.clientWidth) : 0;
+    const maxScroll = el.scrollWidth - el.clientWidth;
+    thumbLeft = overflow && maxScroll > 0
+      ? (el.scrollLeft / maxScroll) * (el.clientWidth - thumbWidth)
+      : 0;
+  }
+
+  // 在标签上按住鼠标左右拖动来滚动标签条。浏览器只对触摸屏提供“拖动即滚动”，
+  // 鼠标按下后得到的是 click / 文本选择，所以要自己处理：位移超过阈值才算拖动，
+  // 否则仍是普通点击；拖动结束后吞掉紧跟着的那次 click，避免松手时误切换标签。
+  const PAN_THRESHOLD_PX = 4;
+  let tabPanning = $state(false);
+
+  function startTabPan(event: PointerEvent) {
+    if (event.button !== 0 || event.pointerType !== 'mouse') return;
+    const scroller = event.currentTarget as HTMLElement;
+    if (scroller.scrollWidth <= scroller.clientWidth) return;
+    if ((event.target as HTMLElement).closest('input')) return;
+    const startX = event.clientX;
+    const startScroll = scroller.scrollLeft;
+    let moved = false;
+    const move = (e: PointerEvent) => {
+      const dx = e.clientX - startX;
+      if (!moved) {
+        if (Math.abs(dx) < PAN_THRESHOLD_PX) return;
+        moved = true;
+        tabPanning = true;
+        scroller.style.scrollBehavior = 'auto';
+        try { scroller.setPointerCapture(e.pointerId); } catch { /* 合成事件没有有效的 pointerId */ }
+      }
+      scroller.scrollLeft = startScroll - dx;
+    };
+    const end = () => {
+      scroller.removeEventListener('pointermove', move);
+      scroller.removeEventListener('pointerup', end);
+      scroller.removeEventListener('pointercancel', end);
+      scroller.style.scrollBehavior = '';
+      tabPanning = false;
+      if (moved) {
+        const swallow = (e: Event) => { e.stopPropagation(); e.preventDefault(); };
+        scroller.addEventListener('click', swallow, { capture: true, once: true });
+        setTimeout(() => scroller.removeEventListener('click', swallow, true), 0);
+      }
+    };
+    scroller.addEventListener('pointermove', move);
+    scroller.addEventListener('pointerup', end);
+    scroller.addEventListener('pointercancel', end);
+  }
+
+  function startThumbDrag(event: PointerEvent) {
+    const scroller = tabbarWrapperEl?.querySelector('.tabbar-scroll') as HTMLElement | null;
+    if (!scroller) return;
+    event.preventDefault();
+    const thumb = event.currentTarget as HTMLElement;
+    thumb.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startScroll = scroller.scrollLeft;
+    const scrollable = scroller.scrollWidth - scroller.clientWidth;
+    const travel = Math.max(1, scroller.clientWidth - thumbWidth);
+    scroller.style.scrollBehavior = 'auto';
+    thumbDragging = true;
+    const move = (e: PointerEvent) => {
+      scroller.scrollLeft = startScroll + ((e.clientX - startX) / travel) * scrollable;
+    };
+    const end = () => {
+      thumbDragging = false;
+      scroller.style.scrollBehavior = '';
+      thumb.removeEventListener('pointermove', move);
+      thumb.removeEventListener('pointerup', end);
+      thumb.removeEventListener('pointercancel', end);
+    };
+    thumb.addEventListener('pointermove', move);
+    thumb.addEventListener('pointerup', end);
+    thumb.addEventListener('pointercancel', end);
   }
 
   function scrollTabIntoView(tabId: string) {
@@ -145,6 +227,17 @@
     workerModelTabs;
     modelConfigTab;
     requestAnimationFrame(updateScrollState);
+  });
+
+  // 容器宽度或标签内容变化（窗口缩放、数据晚到、重命名）都要重新计算滑块。
+  $effect(() => {
+    const scroller = tabbarWrapperEl?.querySelector('.tabbar-scroll') as HTMLElement | null;
+    const track = tabbarWrapperEl?.querySelector('.tabbar-track') as HTMLElement | null;
+    if (!scroller || !track) return;
+    const observer = new ResizeObserver(() => updateScrollState());
+    observer.observe(scroller);
+    observer.observe(track);
+    return () => observer.disconnect();
   });
 
   type RailItem = { id: string; name: string; sub: string; statusClass: string; statusText: string };
@@ -232,8 +325,18 @@
         bind:this={tabbarWrapperEl}
         class:can-scroll-left={canScrollLeft}
         class:can-scroll-right={canScrollRight}
+        role="presentation"
+        onmouseenter={() => { tabbarHovered = true; }}
+        onmouseleave={() => { tabbarHovered = false; }}
       >
-        <div class="tabbar-scroll" onscroll={updateScrollState} onwheel={wheelToHorizontal}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="tabbar-scroll"
+          class:panning={tabPanning}
+          onscroll={updateScrollState}
+          onwheel={wheelToHorizontal}
+          onpointerdown={startTabPan}
+        >
           <div class="tabbar-track" role="tablist" aria-label={i18n.t('settings.zone.quickStart')}>
             <span class="tab-group-label" aria-hidden="true">{i18n.t('settings.model.tabGroup.roles')}</span>
             {#each roleRailItems as item (item.id)}
@@ -309,6 +412,18 @@
             </button>
           </div>
         </div>
+        {#if thumbWidth > 0}
+          <div class="tabbar-thumb-track" class:visible={tabbarHovered || thumbDragging} aria-hidden="true">
+            <!-- 仅供鼠标拖动的装饰性滑块；键盘用户通过 tab 焦点滚动，无需也不应暴露为控件。 -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+              class="tabbar-thumb"
+              class:dragging={thumbDragging}
+              style="left:{thumbLeft}px;width:{thumbWidth}px"
+              onpointerdown={startThumbDrag}
+            ></div>
+          </div>
+        {/if}
       </div>
 
       <div class="tab-content-area">
@@ -620,22 +735,38 @@
     overflow-y: hidden;
     scroll-behavior: smooth;
     -webkit-overflow-scrolling: touch;
-    /* 横向滚动条：平时不显示，鼠标移到标签条上才出现；细（与全局 5px 一致）但仍可拖动。
-       不设 scrollbar-width，否则会盖掉下面的自定义样式。 */
+    scrollbar-width: none;
   }
-  .tabbar-scroll::-webkit-scrollbar { height: 5px; }
-  .tabbar-scroll::-webkit-scrollbar-track { background: transparent; }
-  .tabbar-scroll::-webkit-scrollbar-thumb {
-    background: transparent;
+  .tabbar-scroll::-webkit-scrollbar { height: 0; }
+  .tabbar-scroll.panning { cursor: grabbing; user-select: none; }
+  .tabbar-scroll.panning :global(.role-tab) { cursor: grabbing; }
+
+  /* 悬浮滑块：贴在标签条底边，不占布局高度；移进标签条出现、移出隐藏。 */
+  .tabbar-thumb-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 5px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+  .tabbar-thumb-track.visible { opacity: 1; }
+  .tabbar-thumb {
+    position: absolute;
+    top: 0;
+    bottom: 0;
     border-radius: var(--radius-full);
-    transition: background var(--transition-fast);
+    background: color-mix(in srgb, var(--foreground) 26%, transparent);
+    pointer-events: auto;
+    cursor: grab;
+    touch-action: none;
   }
-  .tabbar-scroll:hover::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--foreground) 24%, transparent);
+  .tabbar-thumb:hover, .tabbar-thumb.dragging {
+    background: color-mix(in srgb, var(--foreground) 46%, transparent);
   }
-  .tabbar-scroll:hover::-webkit-scrollbar-thumb:hover {
-    background: color-mix(in srgb, var(--foreground) 45%, transparent);
-  }
+  .tabbar-thumb.dragging { cursor: grabbing; }
 
   .tabbar-track {
     display: flex;
