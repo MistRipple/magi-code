@@ -1119,7 +1119,7 @@
   "settings.model.addEngine": "Add Engine",
   "settings.model.deleteEngine": "Delete Engine",
   "settings.model.defaultEngineName": "Model {n}",
-  "settings.model.renameEngineHint": "Double-click to rename",
+  "settings.model.renameEngineHint": "Double-click or press F2 to rename, Delete to remove",
   "settings.model.confirmDeleteEngine": "Are you sure you want to delete this engine?",
   "settings.model.confirmDeleteEngineWithRefs": "This engine is referenced by {count} agents. Associated agents will become unready if deleted. Confirm?",
   "settings.tools.selectLocalSkillFolder": "Select Local Skill Directory",

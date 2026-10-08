@@ -276,6 +276,11 @@
                 style="--worker-brand-color: {workerColor.color}"
                 onclick={() => { if (!isEditing) selectTab(workerTab); }}
                 ondblclick={(e) => { e.stopPropagation(); startRename(workerTab); }}
+                onkeydown={(e) => {
+                  if (isEditing) return;
+                  if (e.key === 'F2') { e.preventDefault(); startRename(workerTab); }
+                  else if (e.key === 'Delete') { e.preventDefault(); deleteEngine(workerTab); }
+                }}
                 title={isEditing ? '' : i18n.t('settings.model.renameEngineHint')}
               >
                 <span

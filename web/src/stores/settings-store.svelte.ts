@@ -1027,12 +1027,14 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   };
 
   function getStatusClass(status: string): string {
+    // 已配置与已连接同属正常；只有「使用主模型」这类回退才用警示色。
     if (
       status === "available" ||
-      status === "connected"
+      status === "connected" ||
+      status === "configured"
     )
       return "success";
-    if (status === "configured" || status === "orchestrator") return "warning";
+    if (status === "orchestrator") return "warning";
     if (status === "checking") return "checking";
     if (status === "recorded") return "recorded";
     if (status === "disabled" || status === "not_configured") return "disabled";

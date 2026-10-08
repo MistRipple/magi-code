@@ -1119,7 +1119,7 @@
   "settings.model.addEngine": "添加引擎",
   "settings.model.deleteEngine": "删除引擎",
   "settings.model.defaultEngineName": "模型 {n}",
-  "settings.model.renameEngineHint": "双击重命名",
+  "settings.model.renameEngineHint": "双击或按 F2 重命名，按 Delete 删除",
   "settings.model.confirmDeleteEngine": "确认删除该引擎？",
   "settings.model.confirmDeleteEngineWithRefs": "该引擎被 {count} 个角色引用，删除后相关角色将变为未就绪。确认删除？",
   "settings.tools.selectLocalSkillFolder": "选择本地 Skill 目录",

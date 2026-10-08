@@ -56,6 +56,8 @@
   }>();
 
   const keyVisibleKey = $derived(formType);
+  // 同一时刻只渲染一个表单，但 statusKey 仍按引擎区分，避免切换引擎时 label 指向旧控件。
+  const fieldId = (name: string) => `model-config-${statusKey}-${name}`;
 
   function editableConfigSnapshot(value: any): string {
     const normalized = {
@@ -339,12 +341,15 @@
 
 </script>
 
-<!-- svelte-ignore a11y_label_has_associated_control -->
 <div class="llm-config-form">
+  {#if description}
+    <p class="llm-config-lead">{description}</p>
+  {/if}
   <div class="llm-config-field-row url-mode-row">
     <div class="llm-config-field">
-      <label class="form-label">{i18n.t('settings.model.field.baseUrl')}</label>
+      <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
       <input
+        id={fieldId('base-url')}
         type="text"
         class="form-input"
         bind:value={config.baseUrl}
@@ -352,8 +357,8 @@
       />
     </div>
     <div class="llm-config-field llm-config-field--compact">
-      <label class="form-label">{i18n.t('settings.model.field.urlMode')}</label>
-      <div class="ui-segmented url-mode-switch">
+      <span class="form-label" id={fieldId('url-mode-label')}>{i18n.t('settings.model.field.urlMode')}</span>
+      <div class="ui-segmented url-mode-switch" role="group" aria-labelledby={fieldId('url-mode-label')}>
         <button
           type="button"
           class="ui-segmented__option"
@@ -381,12 +386,12 @@
 
   {#if showProtocolField}
     <div class="llm-config-field protocol-field">
-      <label class="form-label">{i18n.t('settings.model.field.apiProtocol')}</label>
+      <label class="form-label" for={fieldId('protocol')}>{i18n.t('settings.model.field.apiProtocol')}</label>
       <div class="protocol-control-row">
         <select
+          id={fieldId('protocol')}
           class="form-input protocol-select"
           bind:value={config.apiProtocol}
-          aria-label={i18n.t('settings.model.field.apiProtocol')}
           title={i18n.t('settings.model.protocolHint')}
         >
           <option value="openai_responses">{i18n.t('settings.model.protocol.openaiResponses')}</option>
@@ -415,13 +420,15 @@
     class:key-only={!showModelField && !showAdvancedOptions}
   >
     <div class="llm-config-field">
-      <label class="form-label">{i18n.t('settings.model.field.apiKey')}</label>
+      <label class="form-label" for={fieldId('api-key')}>{i18n.t('settings.model.field.apiKey')}</label>
       <div class="api-key-wrapper">
         <input
+          id={fieldId('api-key')}
           type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
           class="form-input api-key-input"
           bind:value={config.apiKey}
-          placeholder="sk-ant-..."
+          placeholder={config.apiProtocol === 'anthropic_messages' ? 'sk-ant-...' : 'sk-...'}
+          autocomplete="off"
         />
         <button
           type="button"
@@ -436,9 +443,10 @@
 
     {#if showModelField}
       <div class="llm-config-field">
-        <label class="form-label">{i18n.t('settings.model.field.model')}</label>
+        <label class="form-label" for={fieldId('model')}>{i18n.t('settings.model.field.model')}</label>
         <div class="model-combobox" bind:this={comboboxEl}>
           <input
+            id={fieldId('model')}
             type="text"
             class="form-input"
             bind:value={config.model}
@@ -515,8 +523,8 @@
 
     {#if showAdvancedOptions}
       <div class="llm-config-field">
-        <label class="form-label">{i18n.t('settings.model.field.level')}</label>
-        <select class="form-input" bind:value={config.reasoningEffort}>
+        <label class="form-label" for={fieldId('level')}>{i18n.t('settings.model.field.level')}</label>
+        <select id={fieldId('level')} class="form-input" bind:value={config.reasoningEffort}>
           <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
           <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
           <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
@@ -610,18 +618,9 @@
 
   <div
     class="apple-dashboard-bar model-form-actions"
-    class:model-form-actions--buttons-only={!description}
+    class:model-form-actions--buttons-only={!isDirty}
   >
-    {#if description}
-      <span class="model-form-action-desc">
-        {description}
-        {#if isDirty}
-          <span class="model-form-dirty-tag" title={i18n.t('settings.model.unsavedChanges')}>
-            {i18n.t('settings.model.unsaved')}
-          </span>
-        {/if}
-      </span>
-    {:else if isDirty}
+    {#if isDirty}
       <span class="model-form-action-desc">
         <span class="model-form-dirty-tag" title={i18n.t('settings.model.unsavedChanges')}>
           {i18n.t('settings.model.unsaved')}
@@ -708,6 +707,13 @@
 
   .llm-config-field--compact {
     min-width: 0;
+  }
+
+  .llm-config-lead {
+    margin: var(--space-2) 0 0;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--foreground-muted);
   }
 
   .llm-config-hint {
