@@ -675,7 +675,7 @@ fn retryable_http_response(status: u16, body: &str) -> bool {
 
 /// 暂态故障的文本特征：服务商用 200 + 错误体、或仅在消息里说明「过载 / 暂不可用」，
 /// 没有可依据的状态码时靠它识别。
-pub fn is_transient_provider_error_text(normalized: &str) -> bool {
+fn is_transient_provider_error_text(normalized: &str) -> bool {
     normalized.contains("overloaded")
         || normalized.contains("server is busy")
         || normalized.contains("servers are busy")
