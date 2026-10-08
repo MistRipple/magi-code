@@ -2871,6 +2871,7 @@
   "settings.browser.clearData": "Clear browser data",
   "settings.browser.clearDataDescription": "Clear Magi's private browser session data without reading or modifying system browsers.",
   "settings.browser.clearDataConfirm": "This deletes the cache, site storage and cookies of Magi's private browser sessions and reloads the current page. It also signs GPT Web out, cancels any running inference and releases the slot. Continue?",
+  "settings.browser.clearDataPartial": "GPT Web was stopped, but the browsing data could not be cleared: {reason}. You can try clearing again.",
   "settings.browser.clearingData": "Clearing",
   "settings.browser.clearDataSucceeded": "Magi browser data cleared",
   "settings.browser.checkDesktopUpdates": "Check for Magi updates",

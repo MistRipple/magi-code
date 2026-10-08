@@ -2871,6 +2871,7 @@
   "settings.browser.clearData": "清理浏览数据",
   "settings.browser.clearDataDescription": "清理 Magi 私有浏览器会话的数据，不读取或修改系统浏览器。",
   "settings.browser.clearDataConfirm": "清理后会删除 Magi 私有浏览器会话的缓存、站点存储和 Cookie，并刷新当前页面。这会同时让 GPT Web 退出登录、取消进行中的推理并释放占用。是否继续？",
+  "settings.browser.clearDataPartial": "GPT Web 已停止，但浏览数据没有清除成功：{reason}。可以再点一次清除重试。",
   "settings.browser.clearingData": "清理中",
   "settings.browser.clearDataSucceeded": "Magi 浏览数据已清理",
   "settings.browser.checkDesktopUpdates": "检查 Magi 更新",
