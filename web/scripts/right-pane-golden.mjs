@@ -249,23 +249,51 @@ await withGoldenViteServer(async (server) => {
   assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
   // 切换项目 / 会话不动 appTabs（A2）。
   // 草稿里打开了右栏，发出第一条消息得到真实会话 id 后右栏必须保持展开，标签也跟过去。
-  rightPane.activateRightPaneSession('workspace-draft', '__draft__');
+  // 草稿没有会话 id（空串），右栏状态挂在项目作用域上；草稿被固定为真实会话时显式交接。
+  rightPane.activateRightPaneSession('workspace-draft', '');
   rightPane.setRightPaneCollapsed(rightPane.rightPaneState.activeScopeKey, false);
+  rightPane.rightPaneState.perSession['workspace:workspace-draft'].openTabs = [{
+    id: 'terminal:draft-terminal',
+    kind: 'terminal',
+    label: 'Terminal',
+    accentToken: null,
+    payload: { terminalTabId: 'draft-terminal', workspaceId: 'workspace-draft', sessionId: '' },
+    lastActivatedAt: 1,
+  }];
+  rightPane.rightPaneState.perSession['workspace:workspace-draft'].activeTabId = 'terminal:draft-terminal';
+  rightPane.adoptDraftPaneForSession('workspace-draft', 'session-adopted');
   rightPane.activateRightPaneSession('workspace-draft', 'session-adopted');
+  const adoptedPane = rightPane.getRightPaneState('workspace-draft\u0000session-adopted');
   assert.equal(
-    rightPane.getRightPaneState('workspace-draft\u0000session-adopted').collapsed,
+    adoptedPane.collapsed,
     false,
     'adopting a real session id must not collapse the right pane the user had open',
   );
+  assert.deepEqual(adoptedPane.openTabs.map((tab) => tab.id), ['terminal:draft-terminal']);
+  assert.equal(adoptedPane.activeTabId, 'terminal:draft-terminal');
+  const draftScope = rightPane.rightPaneState.perSession['workspace:workspace-draft'];
+  assert.deepEqual(draftScope.openTabs, [], 'tabs travel with the session, not with the draft scope');
   assert.equal(
-    rightPane.rightPaneState.perSession['workspace-draft\u0000__draft__'],
-    undefined,
-    'the draft scope is released after its pane moves to the adopted session',
+    draftScope.collapsed,
+    false,
+    'the open/closed preference stays with the draft scope so the next new session opens the same way',
   );
+  // 同一个会话的重复通知不能覆盖它已有的右栏状态。
+  rightPane.setRightPaneCollapsed('workspace-draft\u0000session-adopted', true);
+  rightPane.adoptDraftPaneForSession('workspace-draft', 'session-adopted');
+  assert.equal(rightPane.getRightPaneState('workspace-draft\u0000session-adopted').collapsed, true);
   // 从未展开过的草稿仍然沿用折叠，不会凭空打开。
-  rightPane.activateRightPaneSession('workspace-draft-closed', '__draft__');
+  rightPane.activateRightPaneSession('workspace-draft-closed', '');
+  rightPane.adoptDraftPaneForSession('workspace-draft-closed', 'session-closed');
   rightPane.activateRightPaneSession('workspace-draft-closed', 'session-closed');
   assert.equal(rightPane.getRightPaneState('workspace-draft-closed\u0000session-closed').collapsed, true);
+  // 个人（无项目）草稿同理：右栏开着发消息，新会话不能把它折叠掉。
+  rightPane.activateRightPaneSession('', '');
+  rightPane.setRightPaneCollapsed(rightPane.rightPaneState.activeScopeKey, false);
+  rightPane.adoptDraftPaneForSession('', 'session-personal');
+  rightPane.activateRightPaneSession('', 'session-personal');
+  assert.equal(rightPane.getRightPaneState('session:session-personal').collapsed, false);
+  assert.equal(rightPane.getRightPaneState('personal').collapsed, false);
 
   rightPane.activateRightPaneSession('workspace-other', 'session-other');
   assert.equal(rightPane.rightPaneState.appTabs.length, 1);

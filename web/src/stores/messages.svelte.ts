@@ -1571,6 +1571,21 @@ export function setCurrentSessionId(id: string | null) {
   saveWebviewState();
 }
 
+type DraftSessionAdoptionListener = (workspaceId: string, sessionId: string) => void;
+const draftSessionAdoptionListeners = new Set<DraftSessionAdoptionListener>();
+
+/**
+ * 草稿被第一条消息固定成真实会话时的通知（在会话 id 切换之前触发）。
+ * 右栏等「按会话作用域保存状态」的模块借此把草稿状态交接给新会话；
+ * 用监听而不是直接依赖，是为了让会话 store 不反向依赖这些带副作用的 UI store。
+ */
+export function onDraftSessionAdopted(listener: DraftSessionAdoptionListener): () => void {
+  draftSessionAdoptionListeners.add(listener);
+  return () => {
+    draftSessionAdoptionListeners.delete(listener);
+  };
+}
+
 export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined): boolean {
   const nextSessionId = normalizeSessionId(id);
   if (!nextSessionId) {
@@ -1582,6 +1597,10 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   }
   if (currentSessionId) {
     return false;
+  }
+  // 草稿在这一刻变成真实会话：订阅者必须赶在会话 id 切换触发作用域重算之前完成交接。
+  for (const listener of draftSessionAdoptionListeners) {
+    listener(messagesState.currentWorkspaceId ?? '', nextSessionId);
   }
   saveCurrentExecutionProjection(currentSessionId);
   rekeyExecutionProjection(currentSessionId, nextSessionId);

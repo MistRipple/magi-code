@@ -231,8 +231,6 @@ function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
   return typeof workspaceId === 'string' ? workspaceId.trim() : '';
 }
 
-const DRAFT_SESSION_ID = '__draft__';
-
 function normalizeSessionId(sessionId: string | null | undefined): string {
   return typeof sessionId === 'string' ? sessionId.trim() : '';
 }
@@ -676,9 +674,6 @@ export function activateRightPaneSession(
   const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
   const normalizedSessionId = normalizeSessionId(sessionId);
   const scopeKey = paneScopeKey(normalizedWorkspaceId, normalizedSessionId);
-  const previousScopeKey = rightPaneState.activeScopeKey;
-  const previousWasDraft = normalizeSessionId(rightPaneState.activeSessionId) === DRAFT_SESSION_ID;
-  const targetIsNew = !rightPaneState.perSession[scopeKey];
   if (normalizedWorkspaceId && normalizedSessionId) {
     migrateWorkspacePaneIntoSession(normalizedWorkspaceId, scopeKey);
   }
@@ -686,35 +681,41 @@ export function activateRightPaneSession(
   rightPaneState.activeSessionId = normalizedSessionId;
   rightPaneState.activeScopeKey = scopeKey;
   ensureSession(scopeKey);
-  // 草稿里发出第一条消息后才得到真实会话 id，作用域键随之改变：新会话必须沿用用户刚才看到的右栏
-  // （展开状态、已打开的标签），不能落回「默认折叠」——否则右栏会在发送的瞬间自己关掉。
-  if (
-    targetIsNew
-    && previousWasDraft
-    && normalizedSessionId !== ''
-    && normalizedSessionId !== DRAFT_SESSION_ID
-    && previousScopeKey
-    && previousScopeKey !== scopeKey
-  ) {
-    inheritDraftPane(previousScopeKey, scopeKey);
-  }
 }
 
-/** 把草稿作用域的右栏状态整体交给刚得到真实 id 的会话；草稿作用域随之释放。 */
-function inheritDraftPane(draftScopeKey: string, targetScopeKey: string): void {
-  const draft = rightPaneState.perSession[draftScopeKey];
-  const target = rightPaneState.perSession[targetScopeKey];
-  if (!draft || !target) return;
-  const mergedTabs = [...target.openTabs];
-  for (const tab of draft.openTabs) {
-    if (!mergedTabs.some((existing) => existing.id === tab.id)) mergedTabs.push(tab);
+/**
+ * 草稿里发出第一条消息、刚得到真实会话 id 时调用（必须在当前会话切换之前）：
+ * 新会话沿用用户刚才看到的右栏——展开状态和已打开的标签都跟过去，而不是落回「默认折叠」，
+ * 否则右栏会在发送的瞬间自己关掉。
+ *
+ * 草稿没有会话 id，右栏状态挂在项目作用域（或个人作用域）上。标签随会话走，所以从草稿作用域移走；
+ * 展开 / 折叠是用户的偏好，草稿作用域保留它，下一个新会话继续按这个偏好打开。
+ * 目标会话已有右栏状态时不覆盖：这是同一个会话的重复通知，不是新会话的诞生。
+ */
+export function adoptDraftPaneForSession(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): void {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) return;
+  const targetScopeKey = paneScopeKey(workspaceId, normalizedSessionId);
+  const sourceScopeKey = rightPaneState.activeScopeKey;
+  if (
+    !sourceScopeKey
+    || sourceScopeKey === targetScopeKey
+    || rightPaneState.perSession[targetScopeKey]
+    || normalizeSessionId(rightPaneState.activeSessionId) !== ''
+  ) {
+    return;
   }
-  target.openTabs = mergedTabs;
-  if (draft.activeTabId && mergedTabs.some((tab) => tab.id === draft.activeTabId)) {
-    target.activeTabId = draft.activeTabId;
-  }
-  target.collapsed = draft.collapsed;
-  delete rightPaneState.perSession[draftScopeKey];
+  const source = rightPaneState.perSession[sourceScopeKey];
+  if (!source) return;
+  const target = ensureSession(targetScopeKey);
+  target.openTabs = source.openTabs;
+  target.activeTabId = source.activeTabId;
+  target.collapsed = source.collapsed;
+  source.openTabs = [];
+  source.activeTabId = null;
 }
 
 /** 读取某个 session 的面板状态（响应式引用）；空 sessionId 或未初始化时返回空快照 */

@@ -11,10 +11,12 @@
     isPersistedSessionId,
     setCurrentTopTab,
     messagesState,
+    onDraftSessionAdopted,
   } from './stores/messages.svelte';
   import { refreshPendingChangesProjection } from './lib/pending-changes-refresh';
   import {
     activateRightPaneSession,
+    adoptDraftPaneForSession,
     removeBrowserTabProjection,
     synchronizeBrowserTabs,
   } from './stores/right-pane.svelte';
@@ -249,6 +251,10 @@
       });
     }
   });
+
+  // 草稿被第一条消息固定成真实会话时，右栏沿用用户刚才看到的状态（展开 / 标签），
+  // 不能落回新作用域的默认折叠。
+  $effect(() => onDraftSessionAdopted(adoptDraftPaneForSession));
 
   // 切换会话时同步 RightPane 上下文；空 sessionId 也要清掉，避免显示别的会话残留
   $effect(() => {
