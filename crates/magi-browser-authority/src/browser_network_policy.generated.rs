@@ -38,3 +38,9 @@ pub const PRIVATE_NETWORK_CIDRS: &[&str] = &[
     "100.64.0.0/10",
     "fc00::/7",
 ];
+
+pub const PREVIEW_HOSTNAME: &str = "site.localhost";
+
+pub const PREVIEW_PATH_PREFIX: &str = "/api/files/site/";
+
+pub const PREVIEW_OPEN_PATH: &str = "/api/files/site-open";

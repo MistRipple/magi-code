@@ -33,3 +33,9 @@ export const BROWSER_PRIVATE_NETWORK_CIDRS: readonly string[] = [
   "100.64.0.0/10",
   "fc00::/7",
 ];
+
+export const BROWSER_PREVIEW_HOSTNAME = "site.localhost";
+
+export const BROWSER_PREVIEW_PATH_PREFIX = "/api/files/site/";
+
+export const BROWSER_PREVIEW_OPEN_PATH = "/api/files/site-open";

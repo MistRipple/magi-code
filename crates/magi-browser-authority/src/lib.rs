@@ -17,6 +17,7 @@ pub use authority::{
     MAX_BROWSER_TABS_PER_SESSION, MAX_BROWSER_TABS_TOTAL, ValidateBrowserNodeSelection,
     ValidateBrowserWrite, ValidatedBrowserWrite,
 };
+pub use browser_network_policy::{PREVIEW_HOSTNAME, PREVIEW_PATH_PREFIX};
 pub use browser_tool_catalog::{
     BROWSER_TOOL_CATALOG_SCHEMA_ID, BROWSER_TOOL_CATALOG_SIZE, BrowserToolAccess, BrowserToolKind,
 };

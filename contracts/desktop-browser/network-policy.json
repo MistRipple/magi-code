@@ -21,6 +21,9 @@
     "::1/128",
     "::/128"
   ],
+  "previewHostname": "site.localhost",
+  "previewPathPrefix": "/api/files/site/",
+  "previewOpenPath": "/api/files/site-open",
   "privateNetworkCidrs": [
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -29,6 +32,18 @@
     "fc00::/7"
   ],
   "vectors": {
+    "previewAllowed": [
+      "http://127.0.0.1:38123/api/files/site-open?workspaceId=ws-1&filePath=index.html",
+      "http://site.localhost:38123/api/files/site/token/ws-1/index.html",
+      "http://site.localhost:38123/api/files/site/token/ws-1/assets/app.js"
+    ],
+    "previewRejected": [
+      "http://site.localhost:38123/api/session/tool-approval",
+      "http://site.localhost:38123/web.html",
+      "http://site.localhost:38123/api/files/site-open",
+      "http://127.0.0.1:38123/api/files/site-open/extra",
+      "http://site.localhost:38123/api/files/siteX/a"
+    ],
     "alwaysBlocked": [
       "http://169.254.169.254/latest/meta-data",
       "http://169.254.170.2/v2/credentials",

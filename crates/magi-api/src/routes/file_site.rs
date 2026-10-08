@@ -40,6 +40,7 @@ struct SiteAssetPath {
 
 async fn open_site_preview(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<SiteOpenQuery>,
 ) -> Result<Response, ApiError> {
     let requested_path = query
@@ -66,12 +67,17 @@ async fn open_site_preview(
 
     let workspace_id = binding.workspace_id.as_str();
     let preview_token = state.tunnel_manager.site_preview_token(workspace_id).await;
-    let location = format!(
+    let path = format!(
         "/api/files/site/{}/{}/{}",
         encode_path_segment(&preview_token),
         encode_path_segment(workspace_id),
         encode_relative_path(&relative_path),
     );
+    // 本机预览放到独立来源上：预览里的脚本不能与 API 同源。
+    let location = match crate::request_guard::isolated_preview_origin(&headers) {
+        Some(origin) => format!("{origin}{path}"),
+        None => path,
+    };
     let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -379,5 +385,31 @@ mod tests {
         assert!(location.starts_with("/api/files/site/"));
         assert!(location.ends_with("/workspace-site/index.html"));
         assert!(!location.contains("transport-secret"));
+    }
+
+    #[tokio::test]
+    async fn local_site_open_redirects_to_the_isolated_preview_origin() {
+        let root = tempdir().expect("tempdir should create");
+        fs::write(root.path().join("index.html"), "ok").expect("html should write");
+        let state = test_state(root.path(), "workspace-site");
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/site-open?workspaceId=workspace-site&filePath=index.html")
+                    .header(header::HOST, "127.0.0.1:38123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("redirect should include location");
+        assert!(location.starts_with("http://site.localhost:38123/api/files/site/"));
+        assert!(location.ends_with("/workspace-site/index.html"));
     }
 }

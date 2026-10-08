@@ -20,6 +20,12 @@ const LISTS = [
   ['privateNetworkCidrs', 'PRIVATE_NETWORK_CIDRS', 'cidr'],
 ];
 
+const STRINGS = [
+  ['previewHostname', 'PREVIEW_HOSTNAME'],
+  ['previewPathPrefix', 'PREVIEW_PATH_PREFIX'],
+  ['previewOpenPath', 'PREVIEW_OPEN_PATH'],
+];
+
 function fail(message) {
   throw new Error(`Browser network policy generation failed: ${message}`);
 }
@@ -49,8 +55,16 @@ function load(source) {
     }
     result[key] = values;
   }
+  for (const [key] of STRINGS) {
+    if (typeof source[key] !== 'string' || !source[key]) fail(`${key} 必须是非空字符串`);
+    result[key] = source[key];
+  }
+  if (!/^[a-z0-9.-]+\.localhost$/u.test(result.previewHostname)) fail('previewHostname 必须是 *.localhost 子域');
+  if (!result.previewPathPrefix.startsWith('/') || !result.previewPathPrefix.endsWith('/')) {
+    fail('previewPathPrefix 必须以 / 开头并以 / 结尾');
+  }
   const vectors = source.vectors;
-  for (const name of ['alwaysBlocked', 'allowed', 'blockedWhenPrivateNetworkDisallowed', 'allowedEvenWhenPrivateNetworkDisallowed']) {
+  for (const name of ['previewAllowed', 'previewRejected', 'alwaysBlocked', 'allowed', 'blockedWhenPrivateNetworkDisallowed', 'allowedEvenWhenPrivateNetworkDisallowed']) {
     if (!Array.isArray(vectors?.[name]) || vectors[name].length === 0) fail(`vectors.${name} 必须是非空数组`);
   }
   return result;
@@ -67,6 +81,9 @@ function renderRust(policy) {
     for (const value of policy[key]) lines.push(`    ${JSON.stringify(value)},`);
     lines.push('];', '');
   }
+  for (const [key, name] of STRINGS) {
+    lines.push(`pub const ${name}: &str = ${JSON.stringify(policy[key])};`, '');
+  }
   return `${lines.join('\n').trimEnd()}\n`;
 }
 
@@ -80,6 +97,9 @@ function renderTypeScript(policy) {
     lines.push(`export const BROWSER_${name}: readonly string[] = [`);
     for (const value of policy[key]) lines.push(`  ${JSON.stringify(value)},`);
     lines.push('];', '');
+  }
+  for (const [key, name] of STRINGS) {
+    lines.push(`export const BROWSER_${name} = ${JSON.stringify(policy[key])};`, '');
   }
   return `${lines.join('\n').trimEnd()}\n`;
 }

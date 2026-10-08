@@ -327,6 +327,9 @@ pub fn build_router(state: ApiState) -> Router {
             tunnel_manager,
             enforce_public_tunnel_auth,
         ))
+        .layer(middleware::from_fn(
+            crate::request_guard::enforce_request_guard,
+        ))
         .with_state(state)
 }
 

@@ -3,6 +3,9 @@ import {
   BROWSER_BLOCKED_HOSTNAMES,
   BROWSER_LOOPBACK_CIDRS,
   BROWSER_LOOPBACK_HOSTNAMES,
+  BROWSER_PREVIEW_HOSTNAME,
+  BROWSER_PREVIEW_OPEN_PATH,
+  BROWSER_PREVIEW_PATH_PREFIX,
   BROWSER_PRIVATE_NETWORK_CIDRS,
 } from "@magi/desktop-browser-contracts";
 
@@ -145,6 +148,16 @@ function effectivePort(url: URL): number {
   return url.protocol === "https:" || url.protocol === "wss:" ? 443 : 80;
 }
 
+function isSitePreviewTarget(url: URL, config: BrowserNetworkPolicyConfig): boolean {
+  if (!config.selfPorts.has(effectivePort(url))) return false;
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === BROWSER_PREVIEW_HOSTNAME) {
+    return url.pathname.startsWith(BROWSER_PREVIEW_PATH_PREFIX);
+  }
+  // 预览入口是只会重定向到预览来源的 GET 端点，由内置浏览器的 HTML 预览从本机地址打开。
+  return url.pathname === BROWSER_PREVIEW_OPEN_PATH;
+}
+
 /** 目标主机是否允许访问（不含协议与凭据规则）：子资源、重定向与 WebSocket 请求都用它。 */
 export function evaluateBrowserRequestTarget(
   url: URL,
@@ -154,6 +167,9 @@ export function evaluateBrowserRequestTarget(
   if (!REQUEST_PROTOCOLS.has(url.protocol)) return { allowed: true };
   const hostClass = classifyHost(url);
   if (hostClass === "blocked") return { allowed: false, reason: "blocked_target" };
+  // 本机 HTML 预览由 daemon 在独立来源（*.localhost）上提供，daemon 只在该主机上开放预览路径；
+  // 它与 API 来源不同，页面脚本无法同源调用审批等接口。
+  if (hostClass === "loopback" && isSitePreviewTarget(url, config)) return { allowed: true };
   if (hostClass === "loopback" && config.selfPorts.has(effectivePort(url))) {
     return { allowed: false, reason: "self_origin" };
   }

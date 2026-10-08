@@ -237,7 +237,9 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 - 静态规则（元数据主机名、`169.254.0.0/16` 等链路本地与云元数据地址、IPv4 映射的 IPv6 形式、本机与私有网段分类）在 `contracts/desktop-browser/network-policy.json`，由 `scripts/generate-browser-network-policy.mjs` 生成 Rust 与 TypeScript 常量；两端测试读取同一组 `vectors`。
 - daemon 在工具与 API 入口用同一规则做早期拒绝（`validate_browser_navigation_url`）；Electron Main 的求值器 `browser-network-policy.ts` 是实际执行点。
-- 动态规则只属于 Main：Magi 自身服务端口（daemon）不允许被 guest 访问，否则代理可以把自己的浏览器当成 Web 客户端去调用审批、提问等接口。
+- 动态规则只属于 Main：Magi 自身服务端口（daemon）不允许被 guest 访问，否则代理可以把自己的浏览器当成 Web 客户端去调用审批、提问等接口。仅有两个例外：HTML 预览入口 `/api/files/site-open`（只会重定向），以及预览来源 `site.localhost` 上的 `/api/files/site/`。
+- HTML 预览与 API 不同源：本机访问时 `site-open` 重定向到 `http://site.localhost:<端口>/api/files/site/...`。预览里的脚本可能来自模型生成或被注入的内容，不能与 API 同源；daemon 的请求守卫（`magi-api::request_guard`）只在该主机上开放预览路径，其余一律 403。
+- daemon 请求守卫同时防两类本机攻击：`Host` 必须是本机、局域网、单标签主机名、已知私有后缀（`.local`、`.lan`、`.ts.net` 等）或 `MAGI_ALLOWED_HOSTS` 声明的域名（防 DNS 重绑定）；写请求若带 `Origin` 必须与 `Host` 同源（防跨站写）。公网隧道请求由隧道令牌认证，不经过这两项检查。
 - 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
 
 ### 5.3 标记与 DOM 选择

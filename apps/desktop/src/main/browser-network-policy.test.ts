@@ -79,3 +79,22 @@ test("协议与凭据只约束导航入口，不约束子资源请求", () => {
     { allowed: true },
   );
 });
+
+test("共享用例：HTML 预览主机只放行预览路径，其余同端口路径仍是自身来源", () => {
+  const withSelf: BrowserNetworkPolicyConfig = { selfPorts: new Set([38123]), allowPrivateNetwork: false };
+  for (const raw of vectors("previewAllowed")) {
+    assert.deepEqual(verdict(raw, withSelf), { allowed: true }, raw);
+  }
+  for (const raw of vectors("previewRejected")) {
+    if (raw.startsWith("http://127.0.0.1")) {
+      assert.deepEqual(verdict(raw, withSelf), { allowed: false, reason: "self_origin" }, raw);
+      continue;
+    }
+    assert.deepEqual(verdict(raw, withSelf), { allowed: false, reason: "self_origin" }, raw);
+    assert.deepEqual(
+      verdict(raw, { ...withSelf, allowPrivateNetwork: true }),
+      { allowed: false, reason: "self_origin" },
+      raw,
+    );
+  }
+});
