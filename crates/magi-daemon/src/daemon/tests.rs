@@ -3844,7 +3844,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_missing() {
     let state_root = temp_state_root("stale-session-chain-root-missing");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-    let workspace_root = state_root.join("workspace");
+    let workspace_root = temp_state_root("stale-session-chain-root-missing-workspace");
     let repository = StateRepository::new(state_root);
     let session_store = SessionStore::new();
     let workspace_store = WorkspaceStore::new();
