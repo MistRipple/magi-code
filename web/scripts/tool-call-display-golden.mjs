@@ -175,7 +175,7 @@ assert.doesNotMatch(
 );
 assert.match(
   conversationToolGroupSource,
-  /\.conversation-tool-group \.tool-group-list :global\(\.tool-call\)\s*\{[\s\S]*?border:\s*0;[\s\S]*?background:\s*transparent;/,
+  /:global\(\.conversation-turn \.summary-tool-flow \.tool-call\)\s*\{[\s\S]*?border:\s*0;[\s\S]*?background:\s*transparent;/,
   '工具组内的原始工具卡片必须压平，避免出现嵌套卡片外框',
 );
 assert.doesNotMatch(
