@@ -2,8 +2,7 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { LOCALES, type LocaleCode } from '../i18n/locales';
-  import { updateAgentRuntimeSetting } from '../web/agent-api';
-  import { addToast } from '../stores/messages.svelte';
+  import { switchLocale } from '../lib/locale-switch';
   import { shellUi, togglePopover, closePopover } from '../stores/shell-ui.svelte';
 
   const open = $derived(shellUi.popover === 'language');
@@ -17,12 +16,7 @@
     }
     pendingLocale = code;
     try {
-      // 先由 daemon 持久化：成功后 updateAgentRuntimeSetting 才切换界面语言，
-      // 依赖语言的数据（如角色模板）随后按新语言重载。
-      await updateAgentRuntimeSetting('locale', code);
-      closePopover('language');
-    } catch (error) {
-      addToast('error', error instanceof Error ? error.message : String(error));
+      if (await switchLocale(code)) closePopover('language');
     } finally {
       pendingLocale = null;
     }

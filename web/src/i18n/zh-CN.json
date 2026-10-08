@@ -1122,6 +1122,7 @@
   "settings.model.confirmDeleteEngineWithRefs": "该引擎被 {count} 个角色引用，删除后相关角色将变为未就绪。确认删除？",
   "settings.tools.selectLocalSkillFolder": "选择本地 Skill 目录",
   "settings.locale.label": "语言",
+  "settings.locale.description": "选择界面显示的语言",
   "settings.stats.title": "使用统计",
   "settings.stats.desc": "查看模型与角色的累计调用和 Token 消耗",
   "settings.stats.inputTokens": "输入 Token: {count}",

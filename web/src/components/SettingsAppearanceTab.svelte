@@ -3,6 +3,8 @@
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { LOCALES, isSupportedLocale } from '../i18n/locales';
+  import { switchLocale } from '../lib/locale-switch';
   import {
     activateAppearanceTheme,
     createAppearanceTheme,
@@ -318,6 +320,30 @@
 </script>
 
 <div class="appearance-tab settings-tab-inner">
+  <div class="system-appearance-row locale-row">
+    <span class="system-appearance-icon" aria-hidden="true"><Icon name="globe" size={16} /></span>
+    <div class="system-appearance-copy">
+      <strong>{i18n.t('settings.locale.label')}</strong>
+      <span>{i18n.t('settings.locale.description')}</span>
+    </div>
+    <select
+      class="form-input locale-select"
+      aria-label={i18n.t('settings.locale.label')}
+      value={i18n.locale}
+      onchange={(event) => {
+        const code = event.currentTarget.value;
+        // 失败时界面语言没变，把下拉恢复成实际语言。
+        if (isSupportedLocale(code)) {
+          void switchLocale(code).then((ok) => { if (!ok) event.currentTarget.value = i18n.locale; });
+        }
+      }}
+    >
+      {#each LOCALES as locale (locale.code)}
+        <option value={locale.code} lang={locale.code}>{locale.nativeName}</option>
+      {/each}
+    </select>
+  </div>
+
   <div class="appearance-toolbar">
     <div>
       <div class="toolbar-title">{i18n.t('appearance.libraryTitle')}</div>
@@ -543,6 +569,7 @@
   .toolbar-title { font-size: var(--text-lg); font-weight: var(--font-semibold); }
   .toolbar-subtitle { margin-top: 4px; color: var(--foreground-muted); font-size: var(--text-sm); }
   .toolbar-actions, .theme-actions, .wallpaper-actions { gap: 8px; }
+  .locale-select { width: auto; min-width: 140px; }
   .system-appearance-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 12px 2px; border-block: 1px solid var(--border-subtle); }
   .system-appearance-icon { width: 32px; height: 32px; display: grid; place-items: center; border-radius: var(--radius-md); background: var(--primary-muted); color: var(--primary); }
   .system-appearance-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }

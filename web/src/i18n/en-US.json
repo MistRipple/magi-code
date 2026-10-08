@@ -1122,6 +1122,7 @@
   "settings.model.confirmDeleteEngineWithRefs": "This engine is referenced by {count} agents. Associated agents will become unready if deleted. Confirm?",
   "settings.tools.selectLocalSkillFolder": "Select Local Skill Directory",
   "settings.locale.label": "Language",
+  "settings.locale.description": "Choose the language used in the interface",
   "settings.stats.title": "Usage Statistics",
   "settings.stats.desc": "Inspect cumulative calls and token usage by model and role",
   "settings.stats.inputTokens": "Input Tokens: {count}",
