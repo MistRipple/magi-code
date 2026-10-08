@@ -555,7 +555,9 @@ mod tests {
             _context: &ToolExecutionContext,
             _resources: &ToolRuntimeResources,
         ) -> String {
-            format!("echo:{input}")
+            // 内置工具的结果必须带规范状态；测试替身也遵守同一合同。
+            serde_json::json!({ "tool": "file_read", "status": "succeeded", "echo": input })
+                .to_string()
         }
 
         fn spec(&self) -> BuiltinToolSpec {
@@ -582,14 +584,16 @@ mod tests {
             context: &ToolExecutionContext,
             _resources: &ToolRuntimeResources,
         ) -> String {
-            format!(
-                "cwd:{}",
-                context
+            serde_json::json!({
+                "tool": "cwd_echo",
+                "status": "succeeded",
+                "cwd": context
                     .working_directory
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            )
+                    .unwrap_or_default(),
+            })
+            .to_string()
         }
 
         fn spec(&self) -> BuiltinToolSpec {
@@ -916,7 +920,9 @@ mod tests {
             Ok(SkillDispatchResult::Builtin { output }) => output,
             other => panic!("unexpected result: {other:?}"),
         };
-        assert_eq!(result.payload, format!("cwd:{}", explicit_root.display()));
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.payload).expect("cwd_echo returns a JSON object");
+        assert_eq!(payload["cwd"], explicit_root.display().to_string());
     }
 
     #[test]
