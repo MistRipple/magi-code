@@ -371,8 +371,15 @@
 
   .safeguard-add-row {
     display: flex;
+    align-items: stretch;
     gap: 8px;
     margin-top: 8px;
+  }
+
+  /* 添加按钮与输入框等高：btn--sm 自带固定高度，这里让它随行拉伸。 */
+  .safeguard-add-row > button {
+    height: auto;
+    flex-shrink: 0;
   }
 
   .safeguard-add-input {
