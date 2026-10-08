@@ -727,6 +727,112 @@ pub enum PlanUpdateError {
     Store(String),
 }
 
+impl PlanUpdateError {
+    /// 稳定的错误码：运行时按「工具 + 参数 + 错误码」识别重复失败，同一类失败必须落在同一个码上。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidJson(_) => "plan_invalid_arguments",
+            Self::InvalidLanguage(_) => "plan_invalid_language",
+            Self::EmptyPlan => "plan_empty",
+            Self::TooManyItems(_) => "plan_too_many_items",
+            Self::BlankTitle(_) | Self::TitleTooLong(_) => "plan_invalid_title",
+            Self::MultipleInProgress | Self::MissingInProgress => "plan_invalid_in_progress",
+            Self::InvalidItemId(_) | Self::DuplicateItemId(_) => "plan_invalid_item_id",
+            Self::UnexpectedPlanId => "plan_unexpected_plan_id",
+            Self::MissingItemId => "plan_missing_item_id",
+            Self::MissingPlanId => "plan_missing_plan_id",
+            Self::PlanIdMismatch => "plan_id_mismatch",
+            Self::RevisionConflict { .. } => "plan_revision_conflict",
+            Self::LanguageChanged { .. } => "plan_language_changed",
+            Self::NewPlanHasTerminalItem | Self::NewItemMustBePending(_) => "plan_invalid_new_item",
+            Self::InvalidTransition { .. } => "plan_invalid_transition",
+            Self::CannotRemoveActiveItem(_) | Self::CannotRemoveBoundItem(_) => {
+                "plan_cannot_remove_item"
+            }
+            Self::MissingPlan => "plan_missing",
+            Self::UnknownItem(_) => "plan_unknown_item",
+            Self::ItemNotActive(_) => "plan_item_not_active",
+            Self::Store(_) => "plan_store_failed",
+        }
+    }
+
+    /// 失败是否取决于「当前计划」的状态：是的话，失败结果要把当前计划一并交给模型，
+    /// 模型才能基于它重新提交，而不是凭记忆里已经过期的版本反复试。
+    fn depends_on_current_plan(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingItemId
+                | Self::MissingPlanId
+                | Self::PlanIdMismatch
+                | Self::RevisionConflict { .. }
+                | Self::LanguageChanged { .. }
+                | Self::InvalidTransition { .. }
+                | Self::CannotRemoveActiveItem(_)
+                | Self::CannotRemoveBoundItem(_)
+                | Self::UnknownItem(_)
+                | Self::ItemNotActive(_)
+        )
+    }
+
+    /// 面向模型的修复指引。
+    pub fn instruction(&self, current: Option<&SessionPlan>) -> String {
+        match self {
+            Self::RevisionConflict { actual: 0, .. } => {
+                "当前会话还没有计划：首次创建计划时 expected_revision 传 0，且不要传 planId。".to_string()
+            }
+            Self::RevisionConflict { actual, .. } => format!(
+                "计划已经被更新到 revision {actual}（之前的调用或界面操作已修改过它），你用的是过期版本。以 current_plan 为准重新提交：expected_revision 传 {actual}，沿用 current_plan 里的 planId 和每个步骤的 itemId；不要再用旧版本号。"
+            ),
+            Self::MissingPlanId | Self::PlanIdMismatch => {
+                "更新现有计划必须携带 current_plan.planId；请用它重新提交。".to_string()
+            }
+            Self::MissingItemId | Self::UnknownItem(_) => {
+                "更新现有计划时每个步骤都要携带 current_plan 中已有的 itemId；新增步骤不要自拟已被占用的 itemId。".to_string()
+            }
+            Self::InvalidTransition { .. } | Self::ItemNotActive(_) => {
+                "步骤状态只能按 pending → in_progress → completed 推进（或 blocked）；请对照 current_plan 里各步骤的当前状态调整后重新提交。".to_string()
+            }
+            Self::CannotRemoveActiveItem(_) | Self::CannotRemoveBoundItem(_) => {
+                "进行中、已完成或仍绑定任务的步骤不能从计划里移除；请保留它们后重新提交。".to_string()
+            }
+            Self::LanguageChanged { .. } => {
+                "计划语言在更新过程中不能切换；请沿用 current_plan 的语言重新提交。".to_string()
+            }
+            Self::MultipleInProgress | Self::MissingInProgress => {
+                "非终态计划必须有且仅有一个 in_progress 步骤；请调整后重新提交。".to_string()
+            }
+            Self::NewPlanHasTerminalItem | Self::NewItemMustBePending(_) => {
+                "新计划的步骤都从 pending 开始，并且只把第一个步骤设为 in_progress。".to_string()
+            }
+            Self::Store(_) => "计划暂时无法保存：请稍后用同样的内容重新提交一次。".to_string(),
+            _ => {
+                if current.is_some() {
+                    "对照 current_plan 修正参数后重新提交。".to_string()
+                } else {
+                    "修正参数后重新提交。".to_string()
+                }
+            }
+        }
+    }
+}
+
+/// update_plan 的失败结果：稳定错误码 + 修复指引；取决于当前计划状态的失败附带当前计划。
+fn update_plan_failure_payload(error: &PlanUpdateError, current: Option<SessionPlan>) -> String {
+    let mut payload = serde_json::json!({
+        "tool": "update_plan",
+        "status": "failed",
+        "error_code": error.code(),
+        "error": error.to_string(),
+        "instruction": error.instruction(current.as_ref()),
+    });
+    if error.depends_on_current_plan()
+        && let (Some(plan), Some(object)) = (current, payload.as_object_mut())
+    {
+        object.insert("current_plan".to_string(), serde_json::json!(plan));
+    }
+    payload.to_string()
+}
+
 pub fn execute_update_plan_tool(
     event_bus: &InMemoryEventBus,
     plan_store: &PlanStore,
@@ -761,12 +867,7 @@ pub fn execute_update_plan_tool(
             )
         }
         Err(error) => (
-            serde_json::json!({
-                "tool": "update_plan",
-                "status": "failed",
-                "error": error.to_string(),
-            })
-            .to_string(),
+            update_plan_failure_payload(&error, plan_store.snapshot()),
             ExecutionResultStatus::Failed,
         ),
     }
@@ -1460,6 +1561,105 @@ mod tests {
         assert_eq!(updated.items[0].status, PlanItemStatus::Blocked);
         assert!(store.has_blocked_item());
         assert!(!store.requires_execution_follow_up());
+    }
+
+    fn tool_update(
+        store: &PlanStore,
+        session: &str,
+        plan_id: Option<&str>,
+        expected_revision: u64,
+        status: &str,
+    ) -> (serde_json::Value, magi_core::ExecutionResultStatus) {
+        let (payload, status) = execute_update_plan_tool(
+            &InMemoryEventBus::new(16),
+            store,
+            &SessionId::new(session),
+            None,
+            None,
+            None,
+            &serde_json::json!({
+                "planId": plan_id,
+                "expectedRevision": expected_revision,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
+                "language": "zh-CN",
+                "plan": [{ "itemId": "implement", "step": "完成实现", "status": status }]
+            })
+            .to_string(),
+        );
+        (
+            serde_json::from_str(&payload).expect("tool payload should be json"),
+            status,
+        )
+    }
+
+    #[test]
+    fn stale_revision_failure_hands_the_model_the_current_plan_to_rebase_on() {
+        let store = test_store("stale-revision");
+        let (created, _) = tool_update(&store, "stale-revision", None, 0, "in_progress");
+        let plan_id = created["plan"]["planId"].as_str().expect("planId").to_string();
+        // 界面或之前的调用把计划推进到了 revision 2。
+        let (second, _) = tool_update(&store, "stale-revision", Some(&plan_id), 1, "in_progress");
+        assert_eq!(second["plan"]["revision"], 2);
+
+        let (failure, status) = tool_update(&store, "stale-revision", Some(&plan_id), 1, "completed");
+
+        assert_eq!(status, magi_core::ExecutionResultStatus::Failed);
+        assert_eq!(failure["error_code"], "plan_revision_conflict");
+        assert_eq!(failure["current_plan"]["revision"], 2, "必须带上当前计划，模型才能基于它重新提交");
+        assert_eq!(failure["current_plan"]["planId"], plan_id);
+        let instruction = failure["instruction"].as_str().expect("instruction");
+        assert!(instruction.contains("expected_revision 传 2"), "{instruction}");
+    }
+
+    #[test]
+    fn first_creation_with_a_wrong_revision_explains_that_no_plan_exists_yet() {
+        let store = test_store("no-plan-yet");
+
+        let (failure, status) = tool_update(&store, "no-plan-yet", None, 3, "in_progress");
+
+        assert_eq!(status, magi_core::ExecutionResultStatus::Failed);
+        assert_eq!(failure["error_code"], "plan_revision_conflict");
+        assert!(failure.get("current_plan").is_none(), "没有计划时没有可附带的内容");
+        assert!(failure["instruction"].as_str().is_some_and(|text| text.contains("expected_revision 传 0")));
+    }
+
+    #[test]
+    fn argument_shape_errors_do_not_attach_the_current_plan() {
+        let store = test_store("shape-error");
+        let (created, _) = tool_update(&store, "shape-error", None, 0, "in_progress");
+        assert_eq!(created["status"], "succeeded");
+
+        let (payload, _) = execute_update_plan_tool(
+            &InMemoryEventBus::new(16),
+            &store,
+            &SessionId::new("shape-error"),
+            None,
+            None,
+            None,
+            "not json",
+        );
+        let failure: serde_json::Value = serde_json::from_str(&payload).expect("json");
+
+        assert_eq!(failure["error_code"], "plan_invalid_arguments");
+        assert!(failure.get("current_plan").is_none());
+        assert!(failure["instruction"].as_str().is_some());
+    }
+
+    #[test]
+    fn every_error_has_a_stable_code_and_an_instruction() {
+        let errors = [
+            PlanUpdateError::EmptyPlan,
+            PlanUpdateError::MissingPlanId,
+            PlanUpdateError::PlanIdMismatch,
+            PlanUpdateError::RevisionConflict { expected: 1, actual: 2 },
+            PlanUpdateError::MissingPlan,
+            PlanUpdateError::Store("x".to_string()),
+        ];
+        for error in errors {
+            assert!(error.code().starts_with("plan_"), "{error}");
+            assert!(!error.instruction(None).is_empty(), "{error}");
+        }
     }
 
     #[test]
