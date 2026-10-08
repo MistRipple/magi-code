@@ -1117,6 +1117,8 @@
   "settings.agents.importConflictOverwrite": "Overwrite existing role",
   "settings.agents.importConflictRename": "Save as a new role",
   "settings.model.addEngine": "Add Engine",
+  "settings.model.showAllEngines": "Show all ({count})",
+  "settings.model.collapseEngines": "Show less",
   "settings.model.searchEngines": "Search engines",
   "settings.model.noEngineMatch": "No matching engines",
   "settings.model.card.connection": "Connection",

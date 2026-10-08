@@ -143,17 +143,23 @@
     workerModelTabs.map((id: string) => railItem(id, getWorkerDisplayName(id), workerConfigs[id]?.model)),
   );
 
-  // 引擎很多时左侧列表不能无限变长（右侧详情是固定高度，会留下大片空白）：
-  // 引擎区单独滚动，数量超过阈值时再提供搜索。
-  const ENGINE_SEARCH_THRESHOLD = 6;
+  // 引擎很多时左侧列表默认只显示前几个（当前选中的引擎始终可见），其余「展开全部」；
+  // 页面只有一个滚动区，不在列表里再嵌一层滚动。超过阈值时提供搜索。
+  const ENGINE_COLLAPSED_COUNT = 6;
   let engineQuery = $state('');
-  const showEngineSearch = $derived(workerRailItems.length > ENGINE_SEARCH_THRESHOLD);
+  let enginesExpanded = $state(false);
+  const hasManyEngines = $derived(workerRailItems.length > ENGINE_COLLAPSED_COUNT);
   const visibleWorkerRailItems = $derived.by(() => {
-    const query = showEngineSearch ? engineQuery.trim().toLowerCase() : '';
-    if (!query) return workerRailItems;
-    return workerRailItems.filter((item) => (
-      `${item.name} ${item.sub}`.toLowerCase().includes(query)
-    ));
+    const query = hasManyEngines ? engineQuery.trim().toLowerCase() : '';
+    if (query) {
+      return workerRailItems.filter((item) => (
+        `${item.name} ${item.sub}`.toLowerCase().includes(query)
+      ));
+    }
+    if (!hasManyEngines || enginesExpanded) return workerRailItems;
+    const head = workerRailItems.slice(0, ENGINE_COLLAPSED_COUNT);
+    const active = workerRailItems.find((item) => item.id === modelConfigTab);
+    return active && !head.includes(active) ? [...head, active] : head;
   });
 
   function tabTitle(tabId: string): string {
@@ -231,7 +237,7 @@
           {/each}
 
           <div class="rail-group-label rail-group-label--engines">{i18n.t('settings.model.tabGroup.engines')}</div>
-          {#if showEngineSearch}
+          {#if hasManyEngines}
             <input
               type="search"
               class="rail-search"
@@ -295,6 +301,13 @@
             <div class="rail-empty">{i18n.t('settings.model.noEngineMatch')}</div>
           {/each}
           </div>
+          {#if hasManyEngines && !engineQuery.trim()}
+            <button type="button" class="rail-more" onclick={() => { enginesExpanded = !enginesExpanded; }}>
+              {enginesExpanded
+                ? i18n.t('settings.model.collapseEngines')
+                : i18n.t('settings.model.showAllEngines', { count: workerRailItems.length })}
+            </button>
+          {/if}
 
           <button type="button" class="rail-add" onclick={openAddEngineDialog}>
             <Icon name="plus" size={12} />
@@ -580,9 +593,7 @@
     display: grid;
     grid-template-columns: 208px minmax(0, 1fr);
     gap: var(--space-5, 20px);
-    align-items: stretch;
-    /* 详情很短（主模型）时仍给列表留出放下四个角色和添加按钮的高度。 */
-    min-height: 420px;
+    align-items: start;
   }
 
   .model-rail {
@@ -590,20 +601,25 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
-    /* 列表的高度由右侧详情决定，自己不撑高网格：引擎再多也只是引擎区内部滚动，
-       不会让右侧详情下方出现大片空白；角色固定在上方，添加按钮固定在底部。 */
-    contain: size;
   }
 
   .rail-engines {
     display: flex;
-    flex: 1 1 auto;
     flex-direction: column;
     gap: 2px;
-    min-height: 0;
-    overflow-y: auto;
-    /* 不设 scrollbar-width：标准属性会盖掉全局的 5px 细滚动条样式，换成系统自带的粗滚动条。 */
   }
+
+  .rail-more {
+    padding: 5px var(--space-3);
+    border: none;
+    background: transparent;
+    color: var(--primary);
+    font-family: inherit;
+    font-size: var(--text-xs);
+    text-align: left;
+    cursor: pointer;
+  }
+  .rail-more:hover { text-decoration: underline; }
 
   .rail-search {
     margin: 0 0 var(--space-1);
@@ -730,9 +746,8 @@
 
   /* 窄容器：列表改为横向滑动的一排，详情在下方整宽显示。 */
   @container settings-model (max-width: 720px) {
-    .model-workbench { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); min-height: 0; }
+    .model-workbench { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
     .model-rail {
-      contain: none;
       flex-direction: row;
       align-items: stretch;
       overflow-x: auto;
@@ -741,7 +756,7 @@
     }
     .model-rail::-webkit-scrollbar { height: 0; }
     .rail-engines { display: contents; }
-    .rail-search { display: none; }
+    .rail-search, .rail-more { display: none; }
     .rail-group-label { align-self: center; padding: 0 var(--space-1); white-space: nowrap; }
     .rail-group-label--engines { margin-top: 0; padding-left: var(--space-3); }
     .rail-item, .rail-add { width: auto; flex: 0 0 auto; }
