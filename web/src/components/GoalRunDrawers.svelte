@@ -538,9 +538,11 @@
           onclick={() => goalDrawerExpanded = !goalDrawerExpanded}
         >
           <span class="drawer-leading-icon goal-status-icon dock-lead" style="--dock-tone: var(--goal-tone)"><Icon name={goalStatusIcon(currentGoal)} size={14} /></span>
-          <span class="goal-heading">
+          <span class="goal-heading" class:expanded={goalDrawerExpanded}>
             <span class="goal-status-title">{goalStatusLabel(currentGoal)}</span>
-            <span class="goal-objective">{currentGoal.objective}</span>
+            {#if !goalDrawerExpanded}
+              <span class="goal-objective">{currentGoal.objective}</span>
+            {/if}
           </span>
           <span class="goal-meta dock-meta">{goalTimeLabel(currentGoalTimeSeconds)}</span>
           <Icon name={goalDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
@@ -1103,13 +1105,14 @@
       display: none;
     }
 
-    /* 状态标题隐藏后只剩一列。保持 grid 让目标文字成为网格项（块级）：
-       内联元素上的 overflow / text-overflow 不生效，长目标会冲出卡片。 */
-    .goal-heading {
+    /* 收起时状态标题隐藏、只剩一列目标文字。保持 grid 让目标文字成为网格项（块级）：
+       内联元素上的 overflow / text-overflow 不生效，长目标会冲出卡片。
+       展开后完整目标在详情里，标题行只留状态标题。 */
+    .goal-heading:not(.expanded) {
       grid-template-columns: minmax(0, 1fr);
     }
 
-    .goal-status-title {
+    .goal-heading:not(.expanded) .goal-status-title {
       display: none;
     }
 
