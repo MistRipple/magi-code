@@ -143,6 +143,19 @@
     workerModelTabs.map((id: string) => railItem(id, getWorkerDisplayName(id), workerConfigs[id]?.model)),
   );
 
+  // 引擎很多时左侧列表不能无限变长（右侧详情是固定高度，会留下大片空白）：
+  // 引擎区单独滚动，数量超过阈值时再提供搜索。
+  const ENGINE_SEARCH_THRESHOLD = 6;
+  let engineQuery = $state('');
+  const showEngineSearch = $derived(workerRailItems.length > ENGINE_SEARCH_THRESHOLD);
+  const visibleWorkerRailItems = $derived.by(() => {
+    const query = showEngineSearch ? engineQuery.trim().toLowerCase() : '';
+    if (!query) return workerRailItems;
+    return workerRailItems.filter((item) => (
+      `${item.name} ${item.sub}`.toLowerCase().includes(query)
+    ));
+  });
+
   function tabTitle(tabId: string): string {
     return roleRailItems.find((item) => item.id === tabId)?.name ?? getWorkerDisplayName(tabId);
   }
@@ -218,7 +231,17 @@
           {/each}
 
           <div class="rail-group-label rail-group-label--engines">{i18n.t('settings.model.tabGroup.engines')}</div>
-          {#each workerRailItems as item (item.id)}
+          {#if showEngineSearch}
+            <input
+              type="search"
+              class="rail-search"
+              bind:value={engineQuery}
+              placeholder={i18n.t('settings.model.searchEngines')}
+              aria-label={i18n.t('settings.model.searchEngines')}
+            />
+          {/if}
+          <div class="rail-engines">
+          {#each visibleWorkerRailItems as item (item.id)}
             {@const isActive = modelConfigTab === item.id}
             {@const isEditing = editingTab === item.id}
             <button
@@ -268,7 +291,10 @@
                 >×</span>
               {/if}
             </button>
+          {:else}
+            <div class="rail-empty">{i18n.t('settings.model.noEngineMatch')}</div>
           {/each}
+          </div>
 
           <button type="button" class="rail-add" onclick={openAddEngineDialog}>
             <Icon name="plus" size={12} />
@@ -554,16 +580,48 @@
     display: grid;
     grid-template-columns: 208px minmax(0, 1fr);
     gap: var(--space-5, 20px);
-    align-items: start;
+    align-items: stretch;
+    /* 详情很短（主模型）时仍给列表留出放下四个角色和添加按钮的高度。 */
+    min-height: 420px;
   }
 
   .model-rail {
-    position: sticky;
-    top: 0;
     display: flex;
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    /* 列表的高度由右侧详情决定，自己不撑高网格：引擎再多也只是引擎区内部滚动，
+       不会让右侧详情下方出现大片空白；角色固定在上方，添加按钮固定在底部。 */
+    contain: size;
+  }
+
+  .rail-engines {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: 2px;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+
+  .rail-search {
+    margin: 0 0 var(--space-1);
+    padding: 5px var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--vscode-input-background, transparent);
+    color: var(--foreground);
+    font-family: inherit;
+    font-size: var(--text-xs);
+    outline: none;
+  }
+  .rail-search:focus { border-color: var(--primary); }
+
+  .rail-empty {
+    padding: var(--space-2) var(--space-3);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
   }
 
   .rail-group-label {
@@ -672,9 +730,9 @@
 
   /* 窄容器：列表改为横向滑动的一排，详情在下方整宽显示。 */
   @container settings-model (max-width: 720px) {
-    .model-workbench { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+    .model-workbench { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); min-height: 0; }
     .model-rail {
-      position: static;
+      contain: none;
       flex-direction: row;
       align-items: stretch;
       overflow-x: auto;
@@ -682,6 +740,8 @@
       scrollbar-width: none;
     }
     .model-rail::-webkit-scrollbar { height: 0; }
+    .rail-engines { display: contents; }
+    .rail-search { display: none; }
     .rail-group-label { align-self: center; padding: 0 var(--space-1); white-space: nowrap; }
     .rail-group-label--engines { margin-top: 0; padding-left: var(--space-3); }
     .rail-item, .rail-add { width: auto; flex: 0 0 auto; }
