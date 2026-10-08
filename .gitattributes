@@ -1,0 +1,2 @@
+# Keep generated source and scripts identical on every build platform.
+* text=auto eol=lf

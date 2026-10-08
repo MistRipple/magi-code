@@ -130,8 +130,12 @@ jobs:
       - name: 安装 Linux 运行验收依赖
         if: matrix.os == 'linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2 libgtk-3-0 libnss3 xauth xvfb
+          # Avoid a stalled runner mirror blocking the entire packaging job.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y libasound2 libgtk-3-0 libnss3 xauth xvfb
       - name: 校验唯一 Electron 发行边界
         run: npm run release:guard
       - name: 构建 Web、Worker、daemon、Electron 并组装安装包

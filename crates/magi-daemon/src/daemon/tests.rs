@@ -1547,11 +1547,31 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     .await;
     assert_completed_two_agent_run_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
-    let after_resume_bootstrap = get_json(
-        app.clone(),
-        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
-    )
-    .await;
+    // continue 接纳请求后，恢复消费由后台执行完成；等待可观察的消费事实。
+    let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+    let after_resume_bootstrap = loop {
+        let bootstrap = get_json(
+            app.clone(),
+            "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+        )
+        .await;
+        if bootstrap["runtimeReadModel"]["recovery"]["summaries"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["recovery_id"] == "recovery-bootstrap-route"
+                        && entry["current_status"] == "consumed"
+                })
+            })
+        {
+            break bootstrap;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovery was not consumed: {bootstrap:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     // bootstrap 与独立 read-model 请求之间可能有后台终态事件到达；动态的
     // recent_event_count/latest_sequence 允许前进，但协议元数据必须保持一致。
     for key in [
