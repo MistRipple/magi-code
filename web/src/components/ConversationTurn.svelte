@@ -269,15 +269,14 @@
         />
       {:else if block.kind === 'tool-group'}
         {#if expanded}
-          <div class="turn-process-entry">
-            <ConversationToolGroup
-              items={block.items}
-              {readOnly}
-              {displayContext}
-              {filePreviewScopeForItem}
-              {continueInterruptedSession}
-            />
-          </div>
+          <!-- 与思考 / 文字阶段同级：不再额外缩进一层、也不画引导线 -->
+          <ConversationToolGroup
+            items={block.items}
+            {readOnly}
+            {displayContext}
+            {filePreviewScopeForItem}
+            {continueInterruptedSession}
+          />
         {/if}
       {:else}
       <section
@@ -297,7 +296,7 @@
       {/if}
     {/each}
     {#if expanded && runtimeActive}
-    <div class="turn-process-entry turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} /></div>
+    <div class="turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} /></div>
     {/if}
   </div>
 
@@ -417,12 +416,6 @@
     min-width: 0;
   }
 
-  .turn-process-entry {
-    min-width: 0;
-    padding-left: 8px;
-    border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
-  }
-
   .turn-runtime-row :global(.turn-runtime-indicator) {
     margin-left: 0;
   }
@@ -440,10 +433,6 @@
     .turn-disclosure-header,
     .turn-status-header {
       min-height: 40px;
-    }
-
-    .turn-process-entry {
-      padding-left: 6px;
     }
   }
 </style>

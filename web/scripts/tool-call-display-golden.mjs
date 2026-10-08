@@ -198,10 +198,10 @@ assert.doesNotMatch(
   /<Icon\s/,
   '普通过程行使用统一的中性节点，不得混入多套装饰图标',
 );
-assert.match(
+assert.doesNotMatch(
   conversationTurnSource,
-  /\.turn-process-entry\s*\{[\s\S]*?padding-left:\s*8px;/,
-  '摘要过程必须保持紧凑的单层缩进',
+  /turn-process-entry/,
+  '整轮折叠里的思考、文字阶段与独立工具组同级：不得再给工具组套一层额外缩进 / 引导线，缩进只存在于展开后的内容里',
 );
 assert.match(
   toolCallSource,
