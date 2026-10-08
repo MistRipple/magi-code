@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import test from "node:test";
+import test, { before, after } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -26,6 +26,11 @@ function assertScreenshotHeader(binary: Buffer, format: "png" | "jpeg" | "webp")
         && binary.subarray(8, 12).equals(WEBP_BYTES.subarray(8, 12));
   assert.equal(valid, true, `${format} header should be valid`);
 }
+
+// FakePort 没有真实 Worker IPC 句柄；保活测试进程以覆盖生产中 unref 的超时。
+let keepAlive: ReturnType<typeof setInterval>;
+before(() => { keepAlive = setInterval(() => {}, 1_000); });
+after(() => clearInterval(keepAlive));
 
 class FakePort implements ParentPort {
   #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
@@ -430,9 +435,7 @@ test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
   );
 });
 
-test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误语义", async (t) => {
-  const keepAlive = setInterval(() => {}, 1_000);
-  t.after(() => clearInterval(keepAlive));
+test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误语义", async () => {
   const port = new SilentPort();
   const client = new CdpClient(port);
 
