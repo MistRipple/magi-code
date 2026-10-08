@@ -305,7 +305,7 @@ fn shell_pipe_reader_keeps_bounded_tail_and_reports_truncation() {
 }
 
 #[test]
-fn search_text_filesystem_failure_uses_public_error_message() {
+fn search_text_missing_root_reports_not_found_without_internal_details() {
     let root = unique_temp_dir("magi-tool-search-text-error");
     let missing_path = root.join("missing");
     let governance = Arc::new(GovernanceService::default());
@@ -334,8 +334,8 @@ fn search_text_filesystem_failure_uses_public_error_message() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], "search_text");
     assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "search_text_failed");
-    assert_eq!(payload["error"], "文本搜索暂不可用，请检查路径或权限");
+    assert_eq!(payload["error_code"], "search_text_not_found");
+    assert_eq!(payload["error"], "目标路径不存在，请检查路径");
     assert!(
         !output.payload.contains("missing")
             && !output.payload.contains("No such")
@@ -426,6 +426,73 @@ fn search_text_supports_json_input() {
             >= 2
     );
     assert!(!payload["matches"].as_array().expect("matches").is_empty());
+}
+
+fn run_search_text(root: &std::path::Path, query: &str) -> (ExecutionResultStatus, Value) {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-search-skip"),
+            tool_name: BuiltinToolName::SearchText.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({ "root": root.to_string_lossy(), "query": query }).to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        test_workspace_context(),
+        &ToolExecutionPolicy::default(),
+    );
+    (
+        output.status,
+        serde_json::from_str(&output.payload).expect("payload json"),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn search_text_skips_unreadable_descendants_instead_of_failing_the_whole_search() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = unique_temp_dir("magi-tool-search-skip");
+    fs::write(root.join("found.txt"), "needle in the open").expect("write");
+    fs::write(root.join("binary.bin"), [0xff_u8, 0xfe, 0x00, 0x01]).expect("write binary");
+    symlink(root.join("missing-target"), root.join("dangling")).expect("dangling symlink");
+    let locked = root.join("locked");
+    fs::create_dir_all(&locked).expect("locked dir");
+    fs::write(locked.join("hidden.txt"), "needle behind a locked directory").expect("write");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
+
+    let (status, payload) = run_search_text(&root, "needle");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock dir");
+
+    // root 用户不受目录权限限制，无法构造「读不了」，这时只验证搜索照常成功。
+    assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+    assert!(payload["returned_matches"].as_u64().expect("matches") >= 1);
+    assert_eq!(payload["skipped"]["non_text"], 1);
+    let unreadable = payload["skipped"]["unreadable"].as_u64().expect("unreadable");
+    if unreadable > 0 {
+        assert!(
+            payload["summary"].as_str().is_some_and(|text| text.contains("未搜索")),
+            "有未搜索的内容必须在摘要里点明: {payload}"
+        );
+    }
+}
+
+#[test]
+fn search_text_reports_oversized_files_as_skipped_not_as_absent() {
+    let root = unique_temp_dir("magi-tool-search-large");
+    fs::write(root.join("big.txt"), format!("{}\nneedle", "x".repeat(2 * 1024 * 1024 + 1))).expect("write");
+    fs::write(root.join("small.txt"), "needle").expect("write");
+
+    let (status, payload) = run_search_text(&root, "needle");
+
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+    assert_eq!(payload["returned_matches"], 1);
+    assert_eq!(payload["skipped"]["too_large"], 1);
+    assert!(payload["summary"].as_str().is_some_and(|text| text.contains("超过 2MB")));
 }
 
 #[test]
@@ -6565,75 +6632,180 @@ fn web_fetch_truncates_multibyte_text_without_panicking() {
     assert!(content.contains("内容已截断至 50,000 字符"));
 }
 
-#[test]
-fn web_fetch_network_failure_uses_public_error_message() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed local port");
-    let url = format!("http://{}", listener.local_addr().expect("local address"));
-    drop(listener);
-
-    let registry = make_registry();
-    let output = exec_tool(
-        &registry,
-        BuiltinToolName::WebFetch,
-        &serde_json::json!({ "url": url }).to_string(),
-    );
-
-    assert_eq!(output.status, ExecutionResultStatus::Failed);
-    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-    assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
-    assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "web_fetch_failed");
-    assert_eq!(payload["error"], "网页内容暂不可获取，请稍后重试");
-    assert!(
-        !output.payload.contains("Connection")
-            && !output.payload.contains("refused")
-            && !output.payload.contains("tcp")
-            && !output.payload.contains("127.0.0.1"),
-        "web_fetch 运行态失败不能暴露底层网络细节: {}",
-        output.payload
-    );
-}
-
-#[test]
-fn web_fetch_http_status_keeps_actionable_status_code() {
+/// 依次回应 `responses` 的本地服务：每个连接读完请求后写回一份响应，返回实际处理的请求数。
+fn serve_sequence(responses: Vec<String>) -> (String, thread::JoinHandle<usize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
     let url = format!(
         "http://{}",
         listener.local_addr().expect("local test server address")
     );
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept web_fetch request");
-        let mut buffer = [0_u8; 1024];
-        let _ = stream.read(&mut buffer);
-        let body = "temporarily unavailable";
-        let response = format!(
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write web_fetch response");
+    let handle = thread::spawn(move || {
+        let mut handled = 0;
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("accept web_fetch request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(response.as_bytes())
+                .expect("write web_fetch response");
+            handled += 1;
+        }
+        handled
     });
+    (url, handle)
+}
 
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn fetch_payload(url: &str) -> (ExecutionResultStatus, Value, String) {
     let registry = make_registry();
     let output = exec_tool(
         &registry,
         BuiltinToolName::WebFetch,
         &serde_json::json!({ "url": url }).to_string(),
     );
-    server.join().expect("local web_fetch server should finish");
-
-    assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-    assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
-    assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "web_fetch_failed");
-    assert_eq!(payload["error"], "网页返回 HTTP 503");
+    (output.status, payload, output.payload)
 }
 
 #[test]
-#[ignore = "live network smoke for manually verifying Bing-backed web_search"]
+fn web_fetch_network_failure_reports_category_without_internal_details() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed local port");
+    let url = format!("http://{}", listener.local_addr().expect("local address"));
+    drop(listener);
+
+    let (status, payload, raw) = fetch_payload(&url);
+
+    assert_eq!(status, ExecutionResultStatus::Failed);
+    assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["error_code"], "web_fetch_connect_failed");
+    assert_eq!(
+        payload["error"],
+        "网页获取失败：无法建立连接（已自动重试 2 次）"
+    );
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("不要用相同地址立刻重复调用")),
+        "已自动重试后要明确告诉模型别再用同样参数重试，运行时对相同参数连续失败会止损整轮任务"
+    );
+    assert!(
+        !raw.contains("Connection")
+            && !raw.contains("refused")
+            && !raw.contains("tcp")
+            && !raw.contains("127.0.0.1"),
+        "web_fetch 失败不能暴露底层网络细节: {raw}"
+    );
+}
+
+#[test]
+fn web_fetch_retries_transient_http_status_then_reports_it_with_retry_count() {
+    let unavailable = http_response(
+        "503 Service Unavailable",
+        "text/plain",
+        "temporarily unavailable",
+    );
+    let (url, server) = serve_sequence(vec![unavailable.clone(), unavailable.clone(), unavailable]);
+
+    let (status, payload, _) = fetch_payload(&url);
+
+    assert_eq!(
+        server.join().expect("server"),
+        3,
+        "暂态 5xx 在访问层重试到上限"
+    );
+    assert_eq!(status, ExecutionResultStatus::Failed);
+    assert_eq!(payload["error_code"], "web_fetch_http_error");
+    assert_eq!(payload["http_status"], 503);
+    assert_eq!(payload["error"], "网页返回 HTTP 503（已自动重试 2 次）");
+}
+
+#[test]
+fn web_fetch_recovers_when_a_transient_failure_clears_on_retry() {
+    let (url, server) = serve_sequence(vec![
+        http_response("502 Bad Gateway", "text/plain", "bad gateway"),
+        http_response(
+            "200 OK",
+            "text/html",
+            "<html><body><main><h1>恢复了</h1></main></body></html>",
+        ),
+    ]);
+
+    let (status, payload, _) = fetch_payload(&url);
+
+    assert_eq!(server.join().expect("server"), 2);
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+    assert!(
+        payload["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("恢复了"))
+    );
+}
+
+#[test]
+fn web_fetch_does_not_retry_permanent_http_errors() {
+    let (url, server) = serve_sequence(vec![http_response(
+        "404 Not Found",
+        "text/plain",
+        "missing",
+    )]);
+
+    let (status, payload, _) = fetch_payload(&url);
+
+    assert_eq!(
+        server.join().expect("server"),
+        1,
+        "404 重试没有意义，只请求一次"
+    );
+    assert_eq!(status, ExecutionResultStatus::Failed);
+    assert_eq!(payload["error_code"], "web_fetch_http_error");
+    assert_eq!(payload["http_status"], 404);
+    assert_eq!(payload["error"], "网页返回 HTTP 404");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("页面不存在"))
+    );
+}
+
+#[test]
+fn web_fetch_rejects_binary_content_instead_of_returning_garbage_text() {
+    let (url, server) = serve_sequence(vec![http_response(
+        "200 OK",
+        "application/pdf",
+        "%PDF-1.7 binary",
+    )]);
+
+    let (status, payload, _) = fetch_payload(&url);
+    server.join().expect("server");
+
+    assert_eq!(status, ExecutionResultStatus::Failed);
+    assert_eq!(payload["error_code"], "web_fetch_unsupported_content");
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("application/pdf"))
+    );
+}
+
+#[test]
+fn web_fetch_rejects_non_http_urls_without_sending_a_request() {
+    for url in ["ftp://example.com/file", "not a url", "file:///etc/hosts"] {
+        let (status, payload, _) = fetch_payload(url);
+
+        assert_eq!(status, ExecutionResultStatus::Failed, "{url}");
+        assert_eq!(payload["error_code"], "web_fetch_invalid_url", "{url}");
+    }
+}
+
+#[test]
+#[ignore = "live network smoke for manually verifying web_search against the real search sources"]
 fn web_search_live_smoke_returns_json_payload() {
     let registry = make_registry();
     let output = exec_tool(
@@ -6646,6 +6818,11 @@ fn web_search_live_smoke_returns_json_payload() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::WebSearch.as_str());
     assert_eq!(payload["status"], "succeeded");
+    assert!(
+        payload["source"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty())
+    );
     assert!(payload["result_count"].as_u64().unwrap_or_default() > 0);
     let results = payload["results"].as_array().expect("results array");
     assert!(results.iter().all(|result| {

@@ -4,7 +4,6 @@ use crate::{
     apply_patch::execute_apply_patch, image_generate::execute_image_generate,
     tool_catalog::execute_tool_catalog, view_image::execute_view_image,
 };
-use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId, UtcMillis};
 use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde_json::Value;
@@ -22,6 +21,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+mod web;
 
 // Shell 命令可能包含构建、测试或用户明确要求的等待。默认超时必须覆盖常见
 // 的长命令，不能把没有输出但仍在正常运行的命令误判成失败。
@@ -45,17 +46,14 @@ const FILE_DELETE_PUBLIC_ERROR: &str = "文件暂不可删除，请检查路径�
 const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或权限";
 const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
 const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
-const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路径或权限";
+const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查运行环境";
+const SEARCH_TEXT_PERMISSION_PUBLIC_ERROR: &str = "没有权限读取该搜索路径";
 const DIFF_PREVIEW_PUBLIC_ERROR: &str = "差异预览源暂不可读取，请检查路径或权限";
 const SHELL_EXEC_PUBLIC_ERROR: &str = "shell 命令暂不可执行，请检查运行环境";
 const PROCESS_LAUNCH_PUBLIC_ERROR: &str = "后台进程暂不可启动，请检查运行环境";
 const PROCESS_KILL_PUBLIC_ERROR: &str = "后台进程暂不可停止，请稍后重试";
 const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍后重试";
 const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍后重试";
-const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
-const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
-const WEB_FETCH_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
-const WEB_FETCH_MAX_CONTENT_CHARS: usize = 50_000;
 const PATH_RESOLUTION_PUBLIC_ERROR: &str = "路径暂不可解析，请检查工作区或路径";
 const PATH_NOT_FOUND_PUBLIC_ERROR: &str = "目标路径不存在，请检查路径";
 const PATH_ALREADY_EXISTS_PUBLIC_ERROR: &str = "目标路径已存在，请确认是否允许覆盖";
@@ -194,8 +192,8 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::ProcessList => execute_process_list(context),
             BuiltinToolName::ProcessInspect => execute_process_inspect(input),
             BuiltinToolName::DiffPreview => execute_diff_preview(input, context),
-            BuiltinToolName::WebSearch => execute_web_search(input),
-            BuiltinToolName::WebFetch => execute_web_fetch(input),
+            BuiltinToolName::WebSearch => web::execute_web_search(input),
+            BuiltinToolName::WebFetch => web::execute_web_fetch(input),
             BuiltinToolName::BrowserNavigate
             | BuiltinToolName::BrowserSnapshot
             | BuiltinToolName::BrowserClick
@@ -641,19 +639,10 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let (matches, scanned_files, truncated) =
-        match search_text_matches(&root, &matcher, include_hidden, limit) {
-            Ok(result) => result,
-            Err(error) => {
-                return builtin_filesystem_error(
-                    "search_text",
-                    SEARCH_TEXT_PUBLIC_ERROR,
-                    error.action,
-                    &error.path,
-                    error.source,
-                );
-            }
-        };
+    let outcome = match search_text_matches(&root, &matcher, include_hidden, limit) {
+        Ok(outcome) => outcome,
+        Err(error) => return search_text_root_failure(error),
+    };
 
     serde_json::json!({
         "tool": "search_text",
@@ -664,18 +653,66 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
         "query_mode": query_mode,
         "case_sensitive": case_sensitive,
         "limit": limit,
-        "scanned_files": scanned_files,
-        "returned_matches": matches.len(),
-        "truncated": truncated,
-        "matches": matches,
+        "scanned_files": outcome.scanned_files,
+        "returned_matches": outcome.matches.len(),
+        "truncated": outcome.truncated,
+        "skipped": {
+            "unreadable": outcome.skipped_unreadable,
+            "too_large": outcome.skipped_too_large,
+            "non_text": outcome.skipped_non_text,
+        },
+        "matches": outcome.matches,
         "summary": format!(
-            "在 {} 中扫描了 {} 个文件，找到 {} 个匹配",
+            "在 {} 中扫描了 {} 个文件，找到 {} 个匹配{}",
             root.display(),
-            scanned_files,
-            matches.len()
+            outcome.scanned_files,
+            outcome.matches.len(),
+            search_text_skip_note(&outcome),
         )
     })
     .to_string()
+}
+
+/// 有文件没能搜索时在摘要里点明，避免把「没搜到」读成「没有」。
+fn search_text_skip_note(outcome: &SearchTextOutcome) -> String {
+    let skipped =
+        outcome.skipped_unreadable + outcome.skipped_too_large + outcome.skipped_non_text;
+    if skipped == 0 {
+        return String::new();
+    }
+    format!(
+        "（另有 {skipped} 个文件或目录未搜索：{} 个无法读取、{} 个超过 2MB、{} 个不是文本）",
+        outcome.skipped_unreadable, outcome.skipped_too_large, outcome.skipped_non_text
+    )
+}
+
+/// 搜索根本身读不了：区分「不存在」「没有权限」和其他失败，模型才知道该改路径还是换方式。
+fn search_text_root_failure(error: SearchTextFilesystemError) -> String {
+    match error.source.kind() {
+        std::io::ErrorKind::NotFound => {
+            tracing::warn!(tool = "search_text", path = %error.path.display(), "search root does not exist");
+            builtin_error_with_code(
+                "search_text",
+                "search_text_not_found",
+                PATH_NOT_FOUND_PUBLIC_ERROR,
+            )
+        }
+        std::io::ErrorKind::PermissionDenied => builtin_filesystem_error_with_code(
+            "search_text",
+            "search_text_permission_denied",
+            SEARCH_TEXT_PERMISSION_PUBLIC_ERROR,
+            error.action,
+            &error.path,
+            error.source,
+        ),
+        _ => builtin_filesystem_error(
+            "search_text",
+            SEARCH_TEXT_PUBLIC_ERROR,
+            error.action,
+            &error.path,
+            error.source,
+        ),
+    }
 }
 
 fn execute_shell_exec(
@@ -2464,28 +2501,56 @@ impl SearchTextMatcher {
     }
 }
 
+/// 一次文本搜索的结果：命中之外还要说明「哪些地方没搜到」，模型才不会把没搜到当成没有。
+struct SearchTextOutcome {
+    matches: Vec<Value>,
+    scanned_files: usize,
+    truncated: bool,
+    /// 读不了的子目录或文件（权限、搜索期间被删除、悬空链接……）。
+    skipped_unreadable: usize,
+    /// 超过体积上限的文件。
+    skipped_too_large: usize,
+    /// 不是 UTF-8 文本的文件（二进制等）。
+    skipped_non_text: usize,
+}
+
+const SEARCH_TEXT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 遍历搜索根目录。只有**搜索根本身**读不了才算工具失败；
+/// 子目录或文件读不了只跳过并计数——一个无权限的目录不应让整次搜索作废。
 fn search_text_matches(
     root: &Path,
     matcher: &SearchTextMatcher,
     include_hidden: bool,
     limit: usize,
-) -> Result<(Vec<Value>, usize, bool), SearchTextFilesystemError> {
+) -> Result<SearchTextOutcome, SearchTextFilesystemError> {
     let mut stack = vec![root.to_path_buf()];
-    let mut matches = Vec::new();
-    let mut scanned_files = 0usize;
+    let mut outcome = SearchTextOutcome {
+        matches: Vec::new(),
+        scanned_files: 0,
+        truncated: false,
+        skipped_unreadable: 0,
+        skipped_too_large: 0,
+        skipped_non_text: 0,
+    };
 
     while let Some(path) = stack.pop() {
-        if matches.len() >= limit {
+        if outcome.matches.len() >= limit {
             break;
         }
+        let is_root = path == root;
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) => {
+            Err(error) if is_root => {
                 return Err(SearchTextFilesystemError {
                     action: "读取搜索路径元数据失败",
                     path,
                     source: error,
                 });
+            }
+            Err(_) => {
+                outcome.skipped_unreadable += 1;
+                continue;
             }
         };
         if metadata.is_dir() {
@@ -2493,12 +2558,16 @@ fn search_text_matches(
                 Ok(entries) => entries
                     .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                     .collect::<Vec<_>>(),
-                Err(error) => {
+                Err(error) if is_root => {
                     return Err(SearchTextFilesystemError {
                         action: "读取搜索目录失败",
                         path,
                         source: error,
                     });
+                }
+                Err(_) => {
+                    outcome.skipped_unreadable += 1;
+                    continue;
                 }
             };
             entries.sort();
@@ -2514,22 +2583,30 @@ fn search_text_matches(
             continue;
         }
 
-        scanned_files += 1;
-        if metadata.len() > 2 * 1024 * 1024 {
+        outcome.scanned_files += 1;
+        if metadata.len() > SEARCH_TEXT_MAX_FILE_BYTES {
+            outcome.skipped_too_large += 1;
             continue;
         }
 
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
-            Err(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                outcome.skipped_non_text += 1;
+                continue;
+            }
+            Err(_) => {
+                outcome.skipped_unreadable += 1;
+                continue;
+            }
         };
 
         for (line_number, line) in content.lines().enumerate() {
-            if matches.len() >= limit {
+            if outcome.matches.len() >= limit {
                 break;
             }
             if let Some(column) = matcher.find(line) {
-                matches.push(serde_json::json!({
+                outcome.matches.push(serde_json::json!({
                     "path": path.display().to_string(),
                     "line": line_number + 1,
                     "column": column + 1,
@@ -2539,8 +2616,8 @@ fn search_text_matches(
         }
     }
 
-    let truncated = matches.len() >= limit;
-    Ok((matches, scanned_files, truncated))
+    outcome.truncated = outcome.matches.len() >= limit;
+    Ok(outcome)
 }
 
 fn parse_ps_line(line: &str) -> Option<Value> {
@@ -3410,384 +3487,6 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         "summary": format!("已移动 {} → {}", src.display(), dst.display())
     })
     .to_string()
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// web.search — Bing HTML 搜索
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn execute_web_search(input: &str) -> String {
-    let request = parse_json_object(input);
-    let query = match required_string_field(
-        request.as_ref(),
-        &["query"],
-        "web_search",
-        "缺少搜索关键词 query",
-    ) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-
-    let search_url = bing_search_url(&query);
-
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_search",
-                WEB_SEARCH_PUBLIC_ERROR,
-                "初始化 HTTP 客户端失败",
-                e,
-            );
-        }
-    };
-
-    let response = match client.get(&search_url).send() {
-        Ok(r) => r,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_search",
-                WEB_SEARCH_PUBLIC_ERROR,
-                "发送搜索请求失败",
-                e,
-            );
-        }
-    };
-
-    if !response.status().is_success() {
-        return builtin_error(
-            "web_search",
-            format!("搜索服务返回 HTTP {}", response.status().as_u16()),
-        );
-    }
-
-    let html = match response.text() {
-        Ok(t) => t,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_search",
-                WEB_SEARCH_PUBLIC_ERROR,
-                "读取搜索响应失败",
-                e,
-            );
-        }
-    };
-
-    let results = match parse_search_results(&html) {
-        Ok(results) => results,
-        Err(reason) => return builtin_error("web_search", reason),
-    };
-
-    serde_json::json!({
-        "tool": "web_search",
-        "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "query": query,
-        "result_count": results.len(),
-        "results": results,
-        "summary": format!("搜索 \"{}\" 返回 {} 条结果", query, results.len())
-    })
-    .to_string()
-}
-
-fn bing_search_url(query: &str) -> String {
-    let encoded = urlencoding::encode(query);
-    format!("https://www.bing.com/search?q={encoded}&setlang=en-us&cc=us")
-}
-
-fn parse_search_results(html: &str) -> Result<Vec<Value>, String> {
-    let normalized = html.to_ascii_lowercase();
-    if normalized.contains("unfortunately, bots use duckduckgo too")
-        || normalized.contains("anomaly-modal")
-        || normalized.contains("challenge-form")
-        || normalized.contains("b_captcha")
-    {
-        return Err("搜索服务要求人机验证，当前无法完成自动搜索".to_string());
-    }
-
-    let mut results = Vec::new();
-    let link_re = regex::Regex::new(
-        r#"(?si)<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>[\s\S]*?<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>[\s\S]*?</h2>[\s\S]*?<div[^>]+class="[^"]*b_caption[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>"#
-    ).unwrap();
-
-    for cap in link_re.captures_iter(html) {
-        let raw_url = decode_html_entities(&cap[1]);
-        let title = strip_html_tags(&decode_html_entities(&cap[2]));
-        let snippet = strip_html_tags(&decode_html_entities(&cap[3]));
-        let url = decode_bing_result_url(&raw_url);
-        if !title.trim().is_empty() {
-            results.push(serde_json::json!({
-                "title": title.trim(),
-                "url": url,
-                "snippet": snippet.trim()
-            }));
-        }
-        if results.len() >= 10 {
-            break;
-        }
-    }
-    if !results.is_empty()
-        || normalized.contains("there are no results for")
-        || normalized.contains("class=\"b_no\"")
-    {
-        Ok(results)
-    } else {
-        Err("搜索服务返回了无法识别的响应，未获得可信搜索结果".to_string())
-    }
-}
-
-fn decode_bing_result_url(raw: &str) -> String {
-    if raw.contains("bing.com/ck/a") {
-        for pair in raw.split('?').nth(1).unwrap_or_default().split('&') {
-            let Some((key, value)) = pair.split_once('=') else {
-                continue;
-            };
-            if key != "u" {
-                continue;
-            }
-            let Ok(decoded_param) = urlencoding::decode(value) else {
-                break;
-            };
-            let Some(encoded_url) = decoded_param.strip_prefix("a1") else {
-                break;
-            };
-            if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded_url)
-                && let Ok(url) = String::from_utf8(bytes)
-            {
-                return url;
-            }
-            break;
-        }
-    }
-    raw.to_string()
-}
-
-fn strip_html_tags(text: &str) -> String {
-    let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
-    tag_re.replace_all(text, "").to_string()
-}
-
-fn decode_html_entities(text: &str) -> String {
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&apos;", "'")
-        .replace("&mdash;", "—")
-        .replace("&ndash;", "–")
-        .replace("&hellip;", "…")
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// web.fetch — URL 内容获取 + HTML→Markdown
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn execute_web_fetch(input: &str) -> String {
-    let request = parse_json_object(input);
-    let url = match required_string_field(request.as_ref(), &["url"], "web_fetch", "缺少 URL") {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_fetch",
-                WEB_FETCH_PUBLIC_ERROR,
-                "初始化 HTTP 客户端失败",
-                e,
-            );
-        }
-    };
-
-    let mut response = match client.get(&url).send() {
-        Ok(r) => r,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_fetch",
-                WEB_FETCH_PUBLIC_ERROR,
-                "发送网页请求失败",
-                e,
-            );
-        }
-    };
-
-    if !response.status().is_success() {
-        return builtin_error(
-            "web_fetch",
-            format!("网页返回 HTTP {}", response.status().as_u16()),
-        );
-    }
-
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let mut response_bytes = Vec::new();
-    let response_truncated = match response
-        .by_ref()
-        .take(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut response_bytes)
-    {
-        Ok(_) => response_bytes.len() as u64 > WEB_FETCH_MAX_RESPONSE_BYTES,
-        Err(e) => {
-            return builtin_runtime_error(
-                "web_fetch",
-                WEB_FETCH_PUBLIC_ERROR,
-                "读取网页响应体失败",
-                e,
-            );
-        }
-    };
-    if response_truncated {
-        response_bytes.truncate(WEB_FETCH_MAX_RESPONSE_BYTES as usize);
-    }
-    let body = decode_web_response_body(&response_bytes, &content_type);
-
-    let content = if content_type.contains("application/json") {
-        format!("```json\n{}\n```", body)
-    } else if content_type.contains("text/plain") {
-        body.clone()
-    } else {
-        html_to_markdown(&body)
-    };
-
-    let (content, content_truncated) = truncate_web_content(content, WEB_FETCH_MAX_CONTENT_CHARS);
-    let truncated = response_truncated || content_truncated;
-
-    serde_json::json!({
-        "tool": "web_fetch",
-        "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "url": url,
-        "content_type": content_type,
-        "content_length": content.len(),
-        "truncated": truncated,
-        "content": content,
-        "summary": format!("已获取 {} ({} 字符)", url, content.len())
-    })
-    .to_string()
-}
-
-fn truncate_web_content(content: String, max_chars: usize) -> (String, bool) {
-    if content.chars().count() <= max_chars {
-        return (content, false);
-    }
-
-    let prefix = content.chars().take(max_chars).collect::<String>();
-    (
-        format!("{prefix}\n\n---\n*[内容已截断至 50,000 字符]*"),
-        true,
-    )
-}
-
-fn decode_web_response_body(bytes: &[u8], content_type: &str) -> String {
-    let encoding = content_type
-        .split(';')
-        .find_map(|part| part.trim().strip_prefix("charset="))
-        .map(|label| label.trim_matches(['\"', '\'']))
-        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
-        .unwrap_or(encoding_rs::UTF_8);
-    let (decoded, _, _) = encoding.decode(bytes);
-    decoded.into_owned()
-}
-
-fn html_to_markdown(html: &str) -> String {
-    let mut cleaned = extract_main_content(html);
-    for pattern in [
-        r"(?si)<script[\s\S]*?</script>",
-        r"(?si)<style[\s\S]*?</style>",
-        r"(?si)<noscript[\s\S]*?</noscript>",
-    ] {
-        cleaned = regex::Regex::new(pattern)
-            .unwrap()
-            .replace_all(&cleaned, "")
-            .to_string();
-    }
-    for tag in ["nav", "footer", "header", "aside", "iframe"] {
-        let pattern = format!(r"(?si)<{tag}[^>]*>[\s\S]*?</{tag}>");
-        cleaned = regex::Regex::new(&pattern)
-            .unwrap()
-            .replace_all(&cleaned, "")
-            .to_string();
-    }
-
-    let mut md = cleaned;
-    for level in 1..=6 {
-        let pattern = format!(r"(?si)<h{level}[^>]*>([\s\S]*?)</h{level}>");
-        md = regex::Regex::new(&pattern)
-            .unwrap()
-            .replace_all(&md, |caps: &regex::Captures| {
-                let text = strip_html_tags(&decode_html_entities(&caps[1]));
-                format!("\n{} {}\n", "#".repeat(level), text.trim())
-            })
-            .to_string();
-    }
-    let md = regex::Regex::new(r"(?si)<pre[^>]*>\s*<code[^>]*>([\s\S]*?)</code>\s*</pre>")
-        .unwrap()
-        .replace_all(&md, |caps: &regex::Captures| {
-            format!("\n```\n{}\n```\n", decode_html_entities(&caps[1]).trim())
-        });
-    let md = regex::Regex::new(r"(?si)<code[^>]*>([\s\S]*?)</code>")
-        .unwrap()
-        .replace_all(&md, |caps: &regex::Captures| {
-            format!("`{}`", decode_html_entities(&caps[1]).trim())
-        });
-    let md = regex::Regex::new(r#"(?si)<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)
-        .unwrap()
-        .replace_all(&md, |caps: &regex::Captures| {
-            let text = strip_html_tags(&decode_html_entities(&caps[2]));
-            format!("[{}]({})", text.trim(), &caps[1])
-        });
-    let md = regex::Regex::new(r"(?si)<li[^>]*>([\s\S]*?)</li>")
-        .unwrap()
-        .replace_all(&md, |caps: &regex::Captures| {
-            format!(
-                "\n- {}",
-                strip_html_tags(&decode_html_entities(&caps[1])).trim()
-            )
-        });
-    let md = md
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n");
-    let md = md.replace("</p>", "\n\n");
-    let md = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&md, "");
-    let md = regex::Regex::new(r"\n{3,}")
-        .unwrap()
-        .replace_all(&md, "\n\n");
-
-    decode_html_entities(&md).trim().to_string()
-}
-
-fn extract_main_content(html: &str) -> String {
-    let patterns = [
-        r"(?si)<main[^>]*>([\s\S]*?)</main>",
-        r"(?si)<article[^>]*>([\s\S]*?)</article>",
-        r#"(?si)<div[^>]+role="main"[^>]*>([\s\S]*?)</div>"#,
-        r"(?si)<body[^>]*>([\s\S]*?)</body>",
-    ];
-    for pat in &patterns {
-        if let Some(caps) = regex::Regex::new(pat).unwrap().captures(html) {
-            return caps[1].to_string();
-        }
-    }
-    html.to_string()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -4770,70 +4469,6 @@ mod tests {
             }
         );
         assert!(resolve_shell_command_spec(Some("sh.exe".to_string())).is_err());
-    }
-
-    #[test]
-    fn search_challenge_page_is_not_treated_as_empty_success() {
-        let html = r#"<html><body><h1>Unfortunately, bots use DuckDuckGo too.</h1></body></html>"#;
-
-        let error = parse_search_results(html).expect_err("challenge page must fail");
-
-        assert!(error.contains("验证"));
-    }
-
-    #[test]
-    fn search_explicit_no_results_page_remains_a_valid_empty_result() {
-        let html = r#"<li class="b_no">There are no results for this query.</li>"#;
-
-        let results = parse_search_results(html).expect("explicit empty result is valid");
-
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn bing_search_result_parser_returns_source_url_and_text() {
-        let html = r#"
-            <li class="b_algo">
-              <h2><a href="https://www.bing.com/ck/a?x=1&amp;u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8&amp;ntb=1">The <strong>Rust</strong> Language</a></h2>
-              <div class="b_caption"><p>Reliable and efficient software.</p></div>
-            </li>
-        "#;
-
-        let results = parse_search_results(html).expect("bing result should parse");
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["title"], "The Rust Language");
-        assert_eq!(results[0]["url"], "https://www.rust-lang.org/");
-        assert_eq!(results[0]["snippet"], "Reliable and efficient software.");
-    }
-
-    #[test]
-    fn bing_search_request_uses_stable_language_and_region() {
-        let url = bing_search_url("Rust official website");
-
-        assert!(url.contains("q=Rust%20official%20website"));
-        assert!(url.contains("setlang=en-us"));
-        assert!(url.contains("cc=us"));
-    }
-
-    #[test]
-    fn truncate_web_content_respects_utf8_character_boundaries() {
-        let content = "中".repeat(50_001);
-
-        let (truncated, was_truncated) = truncate_web_content(content, 50_000);
-
-        assert!(was_truncated);
-        assert!(truncated.starts_with(&"中".repeat(50_000)));
-        assert!(truncated.contains("内容已截断至 50,000 字符"));
-    }
-
-    #[test]
-    fn web_response_decoder_honors_declared_legacy_charset() {
-        let (encoded, _, _) = encoding_rs::BIG5.encode("繁體中文");
-
-        let decoded = decode_web_response_body(&encoded, "text/plain; charset=big5");
-
-        assert_eq!(decoded, "繁體中文");
     }
 
     #[test]

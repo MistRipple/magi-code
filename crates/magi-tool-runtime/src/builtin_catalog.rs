@@ -966,8 +966,12 @@ impl BuiltinToolName {
             Self::ProcessList => "列出当前上下文里的受管后台进程",
             Self::ProcessInspect => "按 PID 或名字查询正在运行的系统进程",
             Self::DiffPreview => "对两段文本生成 unified diff 预览",
-            Self::WebSearch => "通过 DuckDuckGo 搜索网络并返回结果",
-            Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
+            Self::WebSearch => {
+                "联网搜索，返回标题、网址、摘要和发布时间（如有）。网络故障时工具已自动重试并切换备用来源，失败后用相同关键词重复调用不会改变结果；改用不同关键词、web_fetch 直接访问已知网址，或向用户说明暂时无法联网"
+            }
+            Self::WebFetch => {
+                "抓取一个 http/https URL 的内容并将 HTML 转为 markdown；只支持网页和文本，不支持 PDF、图片等二进制文件。暂态网络故障已自动重试，失败后不要用相同地址立刻重复调用"
+            }
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
