@@ -112,9 +112,6 @@
       <span class="session-isolation-label">
         {isolation ? i18n.t('isolation.chip.on') : i18n.t('isolation.chip.off')}
       </span>
-      {#if isolation}
-        <Icon name="chevron-down" size={10} />
-      {/if}
     </button>
 
     {#if open && isolation}
