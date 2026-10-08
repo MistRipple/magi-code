@@ -1764,6 +1764,7 @@
   "goalPanel.goal.elapsed": "累计执行时间",
   "goalPanel.goal.budget": "Token 用量",
   "goalPanel.goal.newBudget": "新的 Token 预算",
+  "goalPanel.goal.newBudgetHint": "默认为已用量的 2 倍，可修改后再继续",
   "goalPanel.goal.createdAt": "创建时间",
   "goalPanel.goal.expandedTitle": "目标 · {status}",
   "goalPanel.edit.placeholder": "描述这个目标要达成的结果",

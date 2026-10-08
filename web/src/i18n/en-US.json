@@ -1764,6 +1764,7 @@
   "goalPanel.goal.elapsed": "Execution time",
   "goalPanel.goal.budget": "Token usage",
   "goalPanel.goal.newBudget": "New token budget",
+  "goalPanel.goal.newBudgetHint": "Defaults to 2× the usage so far; edit it before resuming",
   "goalPanel.goal.createdAt": "Created",
   "goalPanel.goal.expandedTitle": "Goal · {status}",
   "goalPanel.edit.placeholder": "Describe the outcome this goal should reach",

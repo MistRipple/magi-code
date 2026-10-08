@@ -157,7 +157,7 @@
       const revisionKey = `${currentGoal.goalId}:${currentGoal.controlRevision}`;
       if (observedBudgetGoalRevision !== revisionKey) {
         observedBudgetGoalRevision = revisionKey;
-        goalBudgetDraft = '';
+        goalBudgetDraft = String(suggestedGoalBudget(currentGoal.tokensUsed));
       }
     } else {
       observedBudgetGoalRevision = '';
@@ -381,6 +381,12 @@
 
   function goalCanResume(goal: SessionGoalDto): boolean {
     return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canResume === true;
+  }
+
+  /** 预算耗尽后继续所需的新预算建议值：已用量的 2 倍，向上取整到千，用户可直接修改。 */
+  function suggestedGoalBudget(tokensUsed: number): number {
+    const used = Number.isFinite(tokensUsed) ? Math.max(0, Math.round(tokensUsed)) : 0;
+    return Math.max(1000, Math.ceil((used * 2) / 1000) * 1000);
   }
 
   function goalResumeBudgetValid(goal: SessionGoalDto): boolean {
@@ -825,12 +831,16 @@
           {/if}
           {#if currentGoal.status === 'budget_limited'}
             <label class="goal-budget-resume-field">
-              <span>{i18n.t('goalPanel.goal.newBudget')}</span>
+              <span class="goal-budget-resume-copy">
+                <span>{i18n.t('goalPanel.goal.newBudget')}</span>
+                <span class="goal-budget-resume-hint">{i18n.t('goalPanel.goal.newBudgetHint')}</span>
+              </span>
               <input
                 type="number"
                 min={currentGoal.tokensUsed + 1}
-                step="1"
+                step="1000"
                 bind:value={goalBudgetDraft}
+                aria-invalid={!goalResumeBudgetValid(currentGoal)}
               />
             </label>
           {/if}
@@ -943,6 +953,19 @@
     font-size: 12px;
   }
 
+  .goal-budget-resume-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .goal-budget-resume-hint {
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    opacity: 0.85;
+  }
+
   .goal-budget-resume-field input {
     min-width: 0;
     height: 28px;
@@ -952,6 +975,11 @@
     background: var(--vscode-input-background);
     color: var(--foreground);
     font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .goal-budget-resume-field input[aria-invalid='true'] {
+    border-color: var(--error);
   }
 
   .run-drawer-toggle:focus-visible {
@@ -1148,7 +1176,6 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
     min-width: 0;
     border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .goal-metric {
