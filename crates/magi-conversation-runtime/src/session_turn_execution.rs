@@ -21,7 +21,7 @@ use crate::{
     },
     model_config::{resolve_orchestrator_model_config, resolve_vision_execution_config},
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
         classify_model_invocation_error, model_empty_response_recovery_prompt,
         model_stream_interruption_recovery_prompt, public_model_image_invocation_error_message,
@@ -1094,7 +1094,8 @@ fn run_session_turn_execution_inner(
     let mut final_model_round: Option<usize> = None;
     let mut main_timeline_entry_id: Option<String> = None;
     let mut empty_response_recovery_attempts = 0usize;
-    let mut pre_output_invocation_recovery_attempts = 0usize;
+    // 暂态故障的重试只发生在 HTTP 调用层；这里仅累计它上报的重试次数，用于失败诊断。
+    let provider_retry_attempts = std::cell::Cell::new(0usize);
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut context_limit_recovery_attempted = false;
     let mut last_response_observation: Option<String> = None;
@@ -1112,7 +1113,7 @@ fn run_session_turn_execution_inner(
                 usage_binding: &usage_binding,
                 prompt: &prompt,
                 messages: &mut messages,
-                pre_output_invocation_recovery_attempts,
+                provider_retry_attempts: &provider_retry_attempts,
                 stream_interruption_recovery_attempts,
                 round,
                 context_window_tokens: effective_context_window,
@@ -1125,11 +1126,6 @@ fn run_session_turn_execution_inner(
             Ok(output) => output,
             Err(SessionTurnRoundError::StreamInterruptedRecovered) => {
                 stream_interruption_recovery_attempts += 1;
-                round = round.saturating_add(1);
-                continue;
-            }
-            Err(SessionTurnRoundError::PreOutputInvocationRecovered) => {
-                pre_output_invocation_recovery_attempts += 1;
                 round = round.saturating_add(1);
                 continue;
             }
@@ -1265,7 +1261,7 @@ fn run_session_turn_execution_inner(
                         continue;
                     }
                 }
-                let retry_attempts = pre_output_invocation_recovery_attempts
+                let retry_attempts = provider_retry_attempts.get()
                     + stream_interruption_recovery_attempts
                     + empty_response_recovery_attempts
                     + usize::from(non_stream_recovery_attempted);
@@ -1508,7 +1504,7 @@ struct SessionTurnRoundRuntime<'a> {
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
     messages: &'a mut Vec<ChatMessage>,
-    pre_output_invocation_recovery_attempts: usize,
+    provider_retry_attempts: &'a std::cell::Cell<usize>,
     stream_interruption_recovery_attempts: usize,
     round: usize,
     context_window_tokens: u64,
@@ -1551,7 +1547,6 @@ enum SessionTurnRoundError {
     },
     InvalidResponse(Box<ModelFailureDiagnostic>),
     RoundLimitReached(DeterministicToolFailure),
-    PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
     WritebackFailed(String),
 }
@@ -1580,7 +1575,7 @@ fn stream_session_turn_round(
         usage_binding,
         prompt,
         messages,
-        pre_output_invocation_recovery_attempts,
+        provider_retry_attempts,
         stream_interruption_recovery_attempts,
         round,
         context_window_tokens,
@@ -1829,6 +1824,9 @@ fn stream_session_turn_round(
         .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
         .map(|goal| goal.goal_id);
     let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
+        if retry_event.phase == magi_bridge_client::ModelRetryRuntimePhase::Scheduled {
+            provider_retry_attempts.set(provider_retry_attempts.get() + 1);
+        }
         publish_model_retry_runtime_event(
             event_bus,
             &request.session_id,
@@ -1877,21 +1875,6 @@ fn stream_session_turn_round(
             );
             let partial_visible_content = streamed_visible_content.borrow().trim().to_string();
             let partial_thinking = streamed_thinking.borrow().trim().to_string();
-            if partial_visible_content.is_empty()
-                && partial_thinking.is_empty()
-                && classification.retryable_before_output
-                && pre_output_invocation_recovery_attempts < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
-            {
-                tracing::warn!(
-                    session_id = %request.session_id,
-                    round,
-                    attempt = pre_output_invocation_recovery_attempts + 1,
-                    max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
-                    error_code = classification.code,
-                    "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
-                );
-                return Err(SessionTurnRoundError::PreOutputInvocationRecovered);
-            }
             if classification.code != "model_stream_interrupted" {
                 return Err(SessionTurnRoundError::Failed {
                     error: raw_error,
@@ -4556,7 +4539,7 @@ mod tests {
             usage_binding: &usage_binding,
             prompt: &request.prompt,
             messages: &mut messages,
-            pre_output_invocation_recovery_attempts: 0,
+            provider_retry_attempts: &std::cell::Cell::new(0),
             stream_interruption_recovery_attempts: 0,
             round: 0,
             context_window_tokens: 256_000,
@@ -4674,7 +4657,7 @@ mod tests {
             usage_binding: &usage_binding,
             prompt: &request.prompt,
             messages: &mut messages,
-            pre_output_invocation_recovery_attempts: 0,
+            provider_retry_attempts: &std::cell::Cell::new(0),
             stream_interruption_recovery_attempts: 0,
             round: 0,
             context_window_tokens: 256_000,

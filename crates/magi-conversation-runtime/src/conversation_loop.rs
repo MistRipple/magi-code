@@ -52,7 +52,7 @@ use crate::{
 };
 use crate::{
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
         classify_model_invocation_error, model_empty_response_recovery_prompt,
         model_stream_interruption_recovery_prompt,
@@ -1352,7 +1352,8 @@ fn run_conversation_loop_inner(
         return (outcome, context_summary);
     }
 
-    let mut pre_output_invocation_recovery_attempts = 0usize;
+    // 暂态故障的重试只发生在 HTTP 调用层；这里仅累计它上报的重试次数，用于失败诊断。
+    let provider_retry_attempts = std::cell::Cell::new(0usize);
     'conversation_round: for round in 0usize.. {
         if let Some(failure) = model_round_limit_failure(round, is_sidechain) {
             let error = match append_task_error_turn_item(
@@ -1737,6 +1738,9 @@ fn run_conversation_loop_inner(
             };
 
             let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
+                if retry_event.phase == magi_bridge_client::ModelRetryRuntimePhase::Scheduled {
+                    provider_retry_attempts.set(provider_retry_attempts.get() + 1);
+                }
                 publish_model_retry_runtime_event(
                     turn_writeback_context.event_bus,
                     turn_writeback_context.session_id,
@@ -1829,23 +1833,6 @@ fn run_conversation_loop_inner(
                         let partial_visible_content =
                             streamed_visible_content.borrow().trim().to_string();
                         let partial_thinking = streamed_thinking.borrow().trim().to_string();
-                        if partial_visible_content.is_empty()
-                            && partial_thinking.is_empty()
-                            && classification.retryable_before_output
-                            && pre_output_invocation_recovery_attempts
-                                < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
-                        {
-                            pre_output_invocation_recovery_attempts += 1;
-                            tracing::warn!(
-                                task_id = %task.task_id,
-                                round = round,
-                                attempt = pre_output_invocation_recovery_attempts,
-                                max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
-                                error_code = classification.code,
-                                "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
-                            );
-                            continue 'conversation_round;
-                        }
                         if classification.code == "model_empty_response"
                             && empty_response_recovery_attempts
                                 < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
@@ -2007,7 +1994,7 @@ fn run_conversation_loop_inner(
                                         recovery_classification,
                                         &recovery_detail,
                                         "response_stream_recovery",
-                                        pre_output_invocation_recovery_attempts
+                                        provider_retry_attempts.get()
                                             + stream_interruption_recovery_attempts
                                             + 1,
                                     );
@@ -2046,7 +2033,7 @@ fn run_conversation_loop_inner(
                         } else {
                             "request_dispatch"
                         };
-                        let retry_attempts = pre_output_invocation_recovery_attempts
+                        let retry_attempts = provider_retry_attempts.get()
                             + stream_interruption_recovery_attempts
                             + empty_response_recovery_attempts;
                         let model_failure = if classification.code == "model_empty_response" {
@@ -2164,21 +2151,6 @@ fn run_conversation_loop_inner(
                             }
                         }
                     }
-                    if classification.retryable_before_output
-                        && pre_output_invocation_recovery_attempts
-                            < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
-                    {
-                        pre_output_invocation_recovery_attempts += 1;
-                        tracing::warn!(
-                            task_id = %task.task_id,
-                            round = round,
-                            attempt = pre_output_invocation_recovery_attempts,
-                            max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
-                            error_code = classification.code,
-                            "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
-                        );
-                        continue 'conversation_round;
-                    }
                     if classification.code == "model_empty_response"
                         && empty_response_recovery_attempts
                             < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
@@ -2206,7 +2178,7 @@ fn run_conversation_loop_inner(
                     }
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
                     let retry_attempts =
-                        pre_output_invocation_recovery_attempts + empty_response_recovery_attempts;
+                        provider_retry_attempts.get() + empty_response_recovery_attempts;
                     let model_failure = if classification.code == "model_empty_response" {
                         ModelFailureDiagnostic::empty_response(
                             had_tool_calls,
@@ -3086,7 +3058,7 @@ fn run_conversation_loop_inner(
     if final_content.trim().is_empty() {
         let retry_attempts = empty_response_recovery_attempts
             + stream_interruption_recovery_attempts
-            + pre_output_invocation_recovery_attempts
+            + provider_retry_attempts.get()
             + usize::from(stream_interruption_non_stream_recovery_attempted);
         let model_failure = ModelFailureDiagnostic::empty_response(
             had_tool_calls,

@@ -267,41 +267,22 @@ impl HarnessModelClient {
         state.agent_spawn_emitted = 0;
     }
 
-    pub fn set_retry_then_completed(&self, response: impl Into<String>) {
+    /// 前 `failures` 次调用以 `error` 失败，之后才返回正常回复。
+    pub fn set_transient_failures_then_completed(
+        &self,
+        response: impl Into<String>,
+        error: impl Into<String>,
+        failures: usize,
+    ) {
         let mut state = self
             .state
             .lock()
             .expect("harness provider state should hold");
         state.behavior = Some(ProviderBehavior::TransientThenCompleted {
             response: response.into(),
-            error: "provider transport failed: connection reset by peer".to_string(),
-        });
-        state.transient_failures_remaining = 1;
-    }
-
-    /// 连续 `failures` 次超时之后才返回正常回复：用来越过轮次内的单次自动恢复，让整轮失败。
-    pub fn set_timeout_failures_then_completed(&self, response: impl Into<String>, failures: usize) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("harness provider state should hold");
-        state.behavior = Some(ProviderBehavior::TransientThenCompleted {
-            response: response.into(),
-            error: "provider request timed out".to_string(),
+            error: error.into(),
         });
         state.transient_failures_remaining = failures;
-    }
-
-    pub fn set_timeout_then_completed(&self, response: impl Into<String>) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("harness provider state should hold");
-        state.behavior = Some(ProviderBehavior::TransientThenCompleted {
-            response: response.into(),
-            error: "provider request timed out".to_string(),
-        });
-        state.transient_failures_remaining = 1;
     }
 
     pub fn set_hold_for_cancellation(&self) {
@@ -8748,10 +8729,12 @@ done
     async fn goal_start_turn_failing_before_the_goal_exists_is_resubmitted_after_backoff() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("goal-start-retry", "目标起始轮失败后自动重提");
-        // 起始轮连续两次超时（轮次内的单次自动恢复也失败），整轮失败；此时目标还没创建。
-        harness
-            .provider
-            .set_timeout_failures_then_completed("目标已建立", 2);
+        // 起始轮因超时失败（HTTP 调用层已放弃），整轮失败；此时目标还没创建。
+        harness.provider.set_transient_failures_then_completed(
+            "目标已建立",
+            "provider request timed out",
+            1,
+        );
         let accepted = harness
             .submit_workspace_goal_start(
                 &session_id,
@@ -12978,56 +12961,32 @@ done
     }
 
     #[tokio::test]
-    async fn transient_provider_failure_retries_before_first_delta_and_completes() {
-        let harness = MagiTurnHarness::new("重试后完成");
-        harness.provider.set_retry_then_completed("重试后完成");
+    async fn transient_provider_failure_is_not_rerun_above_the_http_layer() {
+        // 暂态故障的重试只在 HTTP 调用层（带退避、可见进度）发生一次；调用层放弃后，
+        // 会话运行时不再悄悄把同一请求重跑一遍，否则一次故障会被放大成成倍的请求。
+        let harness = MagiTurnHarness::new("不应出现");
+        harness.provider.set_transient_failures_then_completed(
+            "不应出现",
+            "provider request timed out",
+            1,
+        );
         let response = harness
             .submit(
                 None,
-                "暂态 Provider 故障后重试",
-                "harness-retry-request",
-                "harness-retry-user",
+                "暂态 Provider 故障",
+                "harness-transient-request",
+                "harness-transient-user",
             )
             .await
             .expect("暂态故障仍应先接纳 Turn");
         let session_id = SessionId::new(response.session_id.clone());
-        let turn_id = response.turn_id.clone().expect("重试 Turn 应有 Turn");
+        let turn_id = response.turn_id.clone().expect("Turn 应有 ID");
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.content.as_deref() == Some("重试后完成")
-        }));
-        assert!(
-            harness.provider.requests().len() >= 2,
-            "首 delta 前暂态 Provider 故障必须重新请求"
-        );
-    }
-
-    #[tokio::test]
-    async fn timeout_provider_failure_retries_before_first_delta_and_completes() {
-        let harness = MagiTurnHarness::new("超时后完成");
-        harness.provider.set_timeout_then_completed("超时后完成");
-        let response = harness
-            .submit(
-                None,
-                "超时后重试",
-                "harness-timeout-request",
-                "harness-timeout-user",
-            )
-            .await
-            .expect("超时故障仍应先接纳 Turn");
-        let session_id = SessionId::new(response.session_id.clone());
-        let turn_id = response.turn_id.clone().expect("超时 Turn 应有 Turn");
-        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
-        assert!(turn.items.iter().any(|item| {
-            item.kind == CanonicalTurnItemKind::AssistantText
-                && item.content.as_deref() == Some("超时后完成")
-        }));
-        assert!(
-            harness.provider.requests().len() >= 2,
-            "首 delta 前超时必须重新请求"
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
+        assert_eq!(
+            harness.provider.requests().len(),
+            1,
+            "调用层放弃后不应再重跑同一请求"
         );
     }
 

@@ -30,10 +30,14 @@ const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const OPENAI_STREAM_IDLE_TIMEOUT_MS_ENV: &str = "MAGI_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS";
 const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
-const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
+/// 暂态故障（5xx、限流、断连、网关抖动）的重试是整个模型调用链里**唯一**的一层：
+/// 退避窗口约 1.5 分钟，足以覆盖网关重启、上游短暂过载；更上层不再重复重跑同一请求。
+const MODEL_PROVIDER_MAX_RETRIES: usize = 8;
 const MODEL_PROVIDER_EMPTY_STREAM_RETRIES: usize = 2;
+/// 等待响应超时（整段 300s 无响应）本身已经很久，再重试多次只会把一轮拖成几十分钟。
+const MODEL_PROVIDER_TIMEOUT_RETRIES: usize = 2;
 const MODEL_PROVIDER_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_MAX_RETRIES] =
-    [200, 400, 800, 1_600, 3_200];
+    [500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000];
 const MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_EMPTY_STREAM_RETRIES] =
     [1_000, 3_000];
 const MODEL_PROVIDER_MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(60);
@@ -492,6 +496,9 @@ fn shared_streaming_http_client() -> Result<reqwest::Client, BridgeClientError> 
     match CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            // 对端静默消失（网关崩溃、网络切换）时，等响应头最长要 300s；TCP 保活让操作系统
+            // 更早发现连接已死，错误交给重试层处理，而不是让一轮白等 5 分钟。
+            .tcp_keepalive(Duration::from_secs(30))
             // 流式请求不设置总 timeout；响应体的 idle timeout 由 streaming_http_io
             // 按 chunk 单独控制，避免长回复被误判为超时。
             .build()
@@ -648,6 +655,39 @@ fn retryable_http_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 429 | 529) || status >= 500
 }
 
+/// 额度耗尽、欠费这类 429 不会因为等待而恢复，重试只会白白消耗时间。
+fn is_permanent_quota_exhaustion(status: u16, detail: &str) -> bool {
+    if status != 429 {
+        return false;
+    }
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("insufficient_quota")
+        || detail.contains("exceeded your current quota")
+        || detail.contains("billing")
+        || detail.contains("credit balance")
+        || detail.contains("out of credits")
+}
+
+/// 带响应内容的状态码重试判定：在状态码规则之上排除永久性的额度耗尽。
+fn retryable_http_response(status: u16, body: &str) -> bool {
+    retryable_http_status(status) && !is_permanent_quota_exhaustion(status, body)
+}
+
+/// 暂态故障的文本特征：服务商用 200 + 错误体、或仅在消息里说明「过载 / 暂不可用」，
+/// 没有可依据的状态码时靠它识别。
+pub fn is_transient_provider_error_text(normalized: &str) -> bool {
+    normalized.contains("overloaded")
+        || normalized.contains("server is busy")
+        || normalized.contains("servers are busy")
+        || normalized.contains("service unavailable")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("connection reset")
+        || normalized.contains("connection aborted")
+        || normalized.contains("connection closed")
+        || normalized.contains("failed to connect")
+        || normalized.contains("dns error")
+}
+
 fn retryable_bridge_error(error: &BridgeClientError) -> bool {
     if model_invocation_error_is_cancelled(error) {
         return false;
@@ -657,13 +697,30 @@ fn retryable_bridge_error(error: &BridgeClientError) -> bool {
             layer: BridgeErrorLayer::Transport,
             ..
         } => true,
-        BridgeClientError::HttpStatusFailed { http_status, .. } => {
+        BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            message,
+            ..
+        } => is_transient_provider_error_text(&message.to_ascii_lowercase()),
+        BridgeClientError::HttpStatusFailed {
+            http_status,
+            message,
+            ..
+        } => {
             retryable_http_status(*http_status)
+                && !is_permanent_quota_exhaustion(*http_status, message)
         }
         _ => false,
     }
 }
 
+fn is_timeout_error(error: &BridgeClientError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
+}
+
+/// 连接成功但上游没有返回任何内容（空流）：只给少量重试机会。
+/// 返回 HTML 等非事件流内容通常是地址配错或网关登录页，重试没有意义，不在此列。
 fn retryable_empty_stream_error(error: &BridgeClientError) -> bool {
     matches!(
         error,
@@ -931,8 +988,9 @@ fn execute_cancellable_http_post_with_retries(
             is_cancelled,
         );
         match result {
-            Ok((status, _response_body, retry_after))
-                if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            Ok((status, response_body, retry_after))
+                if retryable_http_response(status, &response_body)
+                    && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
                 let delay = provider_retry_delay(retries, retry_after);
@@ -969,8 +1027,9 @@ fn execute_http_post_with_retries(
             headers.clone(),
         );
         match result {
-            Ok((status, _response_body, retry_after))
-                if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            Ok((status, response_body, retry_after))
+                if retryable_http_response(status, &response_body)
+                    && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
                 sleep_retry_delay(provider_retry_delay(retries, retry_after));
@@ -1259,6 +1318,7 @@ fn execute_streaming_http_post_with_retries(
     is_cancelled: &dyn Fn() -> bool,
 ) -> StreamingHttpResult {
     let mut retries = 0usize;
+    let mut timeout_retries = 0usize;
     loop {
         let emitted_delta = AtomicBool::new(false);
         let guarded_chunk = |delta: &ModelStreamingDelta| {
@@ -1278,12 +1338,18 @@ fn execute_streaming_http_post_with_retries(
         let can_retry =
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
         let can_retry_empty_stream = retries < MODEL_PROVIDER_EMPTY_STREAM_RETRIES;
+        let timeout_budget_left = result.as_ref().err().is_none_or(|error| {
+            !is_timeout_error(error) || timeout_retries < MODEL_PROVIDER_TIMEOUT_RETRIES
+        });
         match result {
             Err(error)
-                if (can_retry && retryable_bridge_error(&error))
+                if (can_retry && timeout_budget_left && retryable_bridge_error(&error))
                     || (can_retry_empty_stream && retryable_empty_stream_error(&error)) =>
             {
                 retries += 1;
+                if is_timeout_error(&error) {
+                    timeout_retries += 1;
+                }
                 let is_empty_stream = retryable_empty_stream_error(&error);
                 let delay = if is_empty_stream {
                     empty_stream_retry_delay(retries)
@@ -5182,12 +5248,80 @@ mod tests {
 
     #[test]
     fn model_retry_policy_uses_short_exponential_backoff() {
-        assert_eq!(MODEL_PROVIDER_MAX_RETRIES, 5);
-        assert_eq!(base_retry_delay(1), Duration::from_millis(200));
-        assert_eq!(base_retry_delay(2), Duration::from_millis(400));
-        assert_eq!(base_retry_delay(3), Duration::from_millis(800));
-        assert_eq!(base_retry_delay(4), Duration::from_millis(1_600));
-        assert_eq!(base_retry_delay(5), Duration::from_millis(3_200));
+        assert_eq!(MODEL_PROVIDER_MAX_RETRIES, 8);
+        let delays = (1..=MODEL_PROVIDER_MAX_RETRIES)
+            .map(|attempt| base_retry_delay(attempt).as_millis() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            [500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000]
+        );
+        // 退避窗口约 1.5 分钟：能覆盖网关重启与上游短暂过载。
+        assert!(delays.iter().sum::<u64>() >= 90_000);
+    }
+
+    #[test]
+    fn permanent_quota_exhaustion_is_not_retried_but_plain_rate_limits_are() {
+        let quota = provider_http_status_error(
+            429,
+            r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota"}}"#,
+            None,
+        );
+        assert!(!retryable_bridge_error(&quota), "额度耗尽等待不会恢复");
+        let rate_limited = provider_http_status_error(
+            429,
+            r#"{"error":{"message":"Rate limit reached, retry in 2s","type":"rate_limit_error"}}"#,
+            Some(Duration::from_secs(2)),
+        );
+        assert!(retryable_bridge_error(&rate_limited));
+        assert!(!retryable_http_response(
+            429,
+            r#"{"error":{"type":"insufficient_quota"}}"#
+        ));
+        assert!(retryable_http_response(503, "{}"));
+        assert!(!retryable_http_response(400, "{}"));
+    }
+
+    #[test]
+    fn transient_text_in_a_business_error_is_retried_but_other_business_errors_are_not() {
+        let overloaded = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32006),
+            message: "provider rejected request: Our servers are currently Overloaded".to_string(),
+        };
+        assert!(retryable_bridge_error(&overloaded));
+        let invalid = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32006),
+            message: "provider rejected request: invalid api key".to_string(),
+        };
+        assert!(!retryable_bridge_error(&invalid));
+        let html = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32006),
+            message: "provider response invalid: expected event stream, body=<html>".to_string(),
+        };
+        assert!(
+            !retryable_bridge_error(&html),
+            "地址配错或登录页不是暂态故障"
+        );
+    }
+
+    #[test]
+    fn timeouts_get_a_smaller_retry_budget_than_other_transient_failures() {
+        let timeout = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: "provider transport failed: operation timed out after 300 seconds".to_string(),
+        };
+        assert!(is_timeout_error(&timeout));
+        const { assert!(MODEL_PROVIDER_TIMEOUT_RETRIES < MODEL_PROVIDER_MAX_RETRIES) };
+        let reset = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: "provider transport failed: connection reset by peer".to_string(),
+        };
+        assert!(!is_timeout_error(&reset));
     }
 
     #[test]
@@ -5205,7 +5339,7 @@ mod tests {
             "退避必须带随机抖动，避免多个子代理同步重试"
         );
         assert!(delays.iter().all(|delay| {
-            (Duration::from_millis(600)..=Duration::from_millis(1_000)).contains(delay)
+            (Duration::from_millis(1_500)..=Duration::from_millis(2_500)).contains(delay)
         }));
         let error = provider_http_status_error(429, "{}", Some(Duration::from_secs(3)));
         assert_eq!(
@@ -5260,28 +5394,28 @@ mod tests {
             .expect("retry should recover");
 
         let mut events = events.into_inner();
-        // 退避带 ±25% 抖动：首轮 200ms 的基础等待落在 150..=250ms。
+        // 退避带 ±25% 抖动：首轮 500ms 的基础等待落在 375..=625ms。
         let scheduled_delay = events[0].delay_ms.take().expect("scheduled retry delay");
-        assert!((150..=250).contains(&scheduled_delay), "{scheduled_delay}");
+        assert!((375..=625).contains(&scheduled_delay), "{scheduled_delay}");
         assert_eq!(
             events,
             vec![
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Scheduled,
                     attempt: 1,
-                    max_attempts: 5,
+                    max_attempts: 8,
                     delay_ms: None,
                 },
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
                     attempt: 1,
-                    max_attempts: 5,
+                    max_attempts: 8,
                     delay_ms: None,
                 },
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Settled,
                     attempt: 1,
-                    max_attempts: 5,
+                    max_attempts: 8,
                     delay_ms: None,
                 },
             ]
