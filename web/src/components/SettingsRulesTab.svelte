@@ -176,6 +176,7 @@
                 <span class="safeguard-badge-text">{rule.pattern}</span>
                 <select
                   class="safeguard-action-select"
+                  data-action={rule.action}
                   value={rule.action}
                   aria-label={i18n.t('settings.safeguard.actionLabel')}
                   onclick={(e) => e.stopPropagation()}
@@ -289,20 +290,27 @@
     border: 1px solid transparent;
   }
 
+  /* 规则默认全部启用，启用态用淡色底；实心大面积主色会让整页像一堵蓝墙，
+     真正需要注意的是被停用的规则，所以停用态用虚线 + 删除线区分。 */
   .safeguard-badge.enabled {
-    background: var(--primary);
-    color: var(--primary-foreground);
-    border-color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--foreground);
+    border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
   }
 
   .safeguard-badge.enabled:hover {
-    opacity: 0.85;
+    background: color-mix(in srgb, var(--primary) 20%, transparent);
   }
 
   .safeguard-badge.disabled {
     background: transparent;
     color: var(--foreground-muted);
     border-color: var(--border);
+    border-style: dashed;
+  }
+
+  .safeguard-badge.disabled .safeguard-badge-text {
+    text-decoration: line-through;
   }
 
   .safeguard-badge.disabled:hover {
@@ -315,22 +323,32 @@
     font-family: var(--font-sans, sans-serif);
     font-size: 10px;
     line-height: 1;
-    padding: 2px 5px;
+    padding: 2px 16px 2px 6px;
     border-radius: 6px;
     border: 0;
-    background: rgba(var(--primary-rgb, 0, 122, 255), 0.12);
+    background-color: color-mix(in srgb, var(--foreground) 10%, transparent);
+    /* 下拉箭头：select 去掉原生外观后需要自己给出可点击的提示。 */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0.5 0.5 4 4 7.5 0.5' fill='none' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 5px center;
     color: inherit;
     white-space: nowrap;
     cursor: pointer;
   }
 
+  /* 动作强度一眼可辨：阻断最强用危险色，审计只记录用弱化色。 */
+  .safeguard-action-select[data-action='hard_block'] {
+    background-color: color-mix(in srgb, var(--danger) 18%, transparent);
+    color: var(--danger);
+  }
+
+  .safeguard-action-select[data-action='audit_only'] {
+    color: var(--foreground-muted);
+  }
+
   .safeguard-action-select:focus {
     outline: 1px solid currentColor;
     outline-offset: 1px;
-  }
-
-  .safeguard-badge.enabled .safeguard-action-select {
-    background: rgba(255, 255, 255, 0.18);
   }
 
   .safeguard-badge-remove {
@@ -348,10 +366,6 @@
 
   .safeguard-badge-remove:hover {
     opacity: 1;
-    background: rgba(255, 255, 255, 0.2);
-  }
-
-  .safeguard-badge.disabled .safeguard-badge-remove:hover {
     background: var(--surface-hover);
   }
 

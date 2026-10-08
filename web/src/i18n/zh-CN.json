@@ -931,7 +931,7 @@
   "settings.zone.browser": "浏览器",
   "settings.zone.browserDesc": "管理浏览器能力与桌面组件",
   "settings.zone.preferences": "偏好",
-  "settings.zone.preferencesDesc": "自定义任务处理指令与系统级安全防护",
+  "settings.zone.preferencesDesc": "对话显示方式、全局规则与安全防护",
   "settings.zone.usage": "统计",
   "settings.zone.usageDesc": "查看模型与角色的累计调用和 Token 消耗",
   "settings.zone.roles": "代理",

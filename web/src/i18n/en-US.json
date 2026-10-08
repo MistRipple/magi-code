@@ -931,7 +931,7 @@
   "settings.zone.browser": "Browser",
   "settings.zone.browserDesc": "Manage browser capabilities and desktop components",
   "settings.zone.preferences": "Rules",
-  "settings.zone.preferencesDesc": "Customize task instructions and system safeguards",
+  "settings.zone.preferencesDesc": "Conversation display, global rules and safeguards",
   "settings.zone.usage": "Stats",
   "settings.zone.usageDesc": "Inspect cumulative calls and token usage by model and role",
   "settings.zone.roles": "Agents",
