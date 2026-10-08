@@ -50,7 +50,7 @@
   </button>
 
   {#if expanded}
-    <div class="tool-group-list" id={contentId}>
+    <div class="tool-group-list summary-tool-flow" id={contentId}>
       {#each items as item (item.key)}
         <MessageItem
           message={item.message}
@@ -129,12 +129,16 @@
     border-left: 0;
   }
 
-  .conversation-tool-group .tool-group-list :global(.message-item.assistant) {
+  /*
+   * 摘要模式的「过程行」样式：工具组展开后的列表和被提升出来的向你提问共用，
+   * 以 .summary-tool-flow 为边界，限定在 .conversation-turn 内以保证压得过 ToolCall 自身的卡片样式。
+   */
+  :global(.conversation-turn .summary-tool-flow .message-item.assistant) {
     margin-top: 0;
     padding-inline: 0;
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-call) {
+  :global(.conversation-turn .summary-tool-flow .tool-call) {
     margin-top: 0;
     overflow: visible;
     border: 0;
@@ -142,7 +146,7 @@
     background: transparent;
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-header) {
+  :global(.conversation-turn .summary-tool-flow .tool-header) {
     min-height: 34px;
     gap: 8px;
     padding: 4px 0;
@@ -154,39 +158,39 @@
    * 这里移除通用 tool-header 的整行 hover 背景，避免无内缩的底色直接顶到两侧；
    * 交互反馈改为颜色和指针，键盘导航仍保留可见焦点。
    */
-  .conversation-tool-group .tool-group-list :global(.tool-header:hover) {
+  :global(.conversation-turn .summary-tool-flow .tool-header:hover) {
     background: transparent;
     color: var(--foreground);
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-header:hover .tool-icon),
-  .conversation-tool-group .tool-group-list :global(.tool-header:focus-visible .tool-icon) {
+  :global(.conversation-turn .summary-tool-flow .tool-header:hover .tool-icon),
+  :global(.conversation-turn .summary-tool-flow .tool-header:focus-visible .tool-icon) {
     color: var(--foreground);
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-header:focus-visible) {
+  :global(.conversation-turn .summary-tool-flow .tool-header:focus-visible) {
     outline: 1px solid color-mix(in srgb, var(--primary) 72%, transparent);
     outline-offset: 2px;
     border-radius: var(--radius-sm);
   }
 
-  .conversation-tool-group .tool-group-list :global(.chevron) {
+  :global(.conversation-turn .summary-tool-flow .chevron) {
     flex: 0 0 12px;
     color: var(--foreground-muted);
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-icon) {
+  :global(.conversation-turn .summary-tool-flow .tool-icon) {
     flex: 0 0 14px;
     color: var(--foreground-muted);
     opacity: 0.78;
   }
 
-  .conversation-tool-group .tool-group-list :global(.status-dot) {
+  :global(.conversation-turn .summary-tool-flow .status-dot) {
     width: 6px;
     height: 6px;
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-content) {
+  :global(.conversation-turn .summary-tool-flow .tool-content) {
     margin: 0 0 8px;
     padding: 7px 0 7px 8px;
     border-top: 0;
@@ -194,7 +198,7 @@
     background: transparent;
   }
 
-  .conversation-tool-group .tool-group-list :global(.tool-content.diagram-content) {
+  :global(.conversation-turn .summary-tool-flow .tool-content.diagram-content) {
     margin-left: 0;
     padding: 0;
     border-left: 0;
@@ -210,7 +214,7 @@
       padding-left: 6px;
     }
 
-    .conversation-tool-group .tool-group-list :global(.tool-content) {
+    :global(.conversation-turn .summary-tool-flow .tool-content) {
       padding-left: 6px;
     }
   }

@@ -281,6 +281,8 @@
       {:else}
       <section
           class="turn-promoted"
+          class:summary-tool-flow={block.role === 'interaction'}
+          data-turn-interaction={block.role === 'interaction' ? 'true' : undefined}
           data-turn-attention={block.role === 'attention' ? 'true' : undefined}
           data-turn-artifact={block.role === 'artifact' ? 'true' : undefined}
       >
