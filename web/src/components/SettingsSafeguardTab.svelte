@@ -2,7 +2,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
-  import SafeguardAuditDialog from './SafeguardAuditDialog.svelte';
+  import SafeguardAuditPanel from './SafeguardAuditPanel.svelte';
 
   let {
     SAFEGUARD_CATEGORIES,
@@ -30,7 +30,7 @@
     setSafeguardAuditCount: (count: number) => void;
   }>();
 
-  let auditDialogOpen = $state(false);
+  let view = $state<'rules' | 'audit'>('rules');
 
   const SAFEGUARD_ACTIONS = [
     'require_approval_in_restricted',
@@ -65,112 +65,107 @@
 
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
-  <div class="settings-section" style="border-bottom: none;">
-    <div class="settings-section-header">
-      <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
-      {#if safeguardStatusText}
-        <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
-          {#if safeguardSaveStatus === 'saving'}
-            <Icon name="refresh" size={13} />
-          {:else if safeguardSaveStatus === 'saved'}
-            <Icon name="check" size={13} />
-          {:else}
-            <Icon name="close" size={13} />
-          {/if}
-          <span>{safeguardStatusText}</span>
-        </div>
-      {/if}
-    </div>
-    <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
-    <div class="safeguard-policy-note">
-      {i18n.t('settings.safeguard.policyNote')}
-      <div class="safeguard-audit-summary" class:unhealthy={!safeguardAuditPersistenceHealthy}>
-        {#if safeguardAuditPersistenceHealthy}
-          {i18n.t('settings.safeguard.auditSummary', { count: safeguardAuditCount })}
-          {#if safeguardAuditCount > 0}
-            <button type="button" class="safeguard-audit-link" onclick={() => { auditDialogOpen = true; }}>
-              {i18n.t('settings.safeguard.audit.view')}
-            </button>
-          {/if}
-        {:else}
-          {i18n.t('settings.safeguard.auditUnavailable')}
-        {/if}
-      </div>
-    </div>
+  <div class="safeguard-tabs" role="tablist" aria-label={i18n.t('settings.zone.safeguard')}>
+    <button type="button" role="tab" class="safeguard-tab" class:active={view === 'rules'} aria-selected={view === 'rules'} data-testid="safeguard-tab-rules" onclick={() => { view = 'rules'; }}>
+      {i18n.t('settings.safeguard.tab.rules')}
+    </button>
+    <button type="button" role="tab" class="safeguard-tab" class:active={view === 'audit'} aria-selected={view === 'audit'} data-testid="safeguard-tab-audit" onclick={() => { view = 'audit'; }}>
+      {i18n.t('settings.safeguard.tab.audit')}
+      {#if safeguardAuditCount > 0}<span class="safeguard-tab-count">{safeguardAuditCount}</span>{/if}
+    </button>
+  </div>
 
-    <div class="safeguard-categories">
-      {#each SAFEGUARD_CATEGORIES as category}
-        {@const categoryRules = getRulesForCategory(category)}
-        {#if categoryRules.length > 0 || category === 'custom'}
-          <div class="safeguard-category">
-            <div class="safeguard-category-label">{i18n.t(`settings.safeguard.category.${category}`)}</div>
-            {#if categoryRules.length > 0}
-              <ul class="safeguard-rules">
-                {#each categoryRules as { rule, index } (rule.pattern)}
-                  <li class="safeguard-rule" class:safeguard-rule--off={!rule.enabled}>
-                    <Toggle
-                      size="small"
-                      checked={rule.enabled}
-                      ariaLabel={rule.pattern}
-                      title={rule.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
-                      onchange={() => toggleSafeguardRule(index)}
-                    />
-                    <code class="safeguard-rule-pattern">{rule.pattern}</code>
-                    <select
-                      class="safeguard-action-select"
-                      data-action={rule.action}
-                      value={rule.action}
-                      aria-label={i18n.t('settings.safeguard.actionLabel')}
-                      onchange={(e) => updateSafeguardRuleAction(index, e.currentTarget.value)}
-                    >
-                      {#each SAFEGUARD_ACTIONS as action}
-                        <option value={action}>{getSafeguardActionLabel(action)}</option>
-                      {/each}
-                    </select>
-                    {#if category === 'custom'}
-                      <button
-                        type="button"
-                        class="btn-icon btn-icon--sm btn-icon--danger"
-                        title={i18n.t('settings.tools.delete')}
-                        aria-label={i18n.t('settings.tools.delete')}
-                        onclick={() => removeCustomRule(index)}
-                      >
-                        <Icon name="delete" size={12} />
-                      </button>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
+  {#if view === 'rules'}
+    <div class="settings-section" style="border-bottom: none;">
+      <div class="settings-section-header">
+        <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
+        {#if safeguardStatusText}
+          <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
+            {#if safeguardSaveStatus === 'saving'}
+              <Icon name="refresh" size={13} />
+            {:else if safeguardSaveStatus === 'saved'}
+              <Icon name="check" size={13} />
+            {:else}
+              <Icon name="close" size={13} />
             {/if}
-            {#if category === 'custom'}
-              <div class="safeguard-add-row">
-                <input
-                  type="text"
-                  class="form-input safeguard-add-input"
-                  bind:value={newCustomRule}
-                  placeholder={i18n.t('settings.safeguard.addPlaceholder')}
-                  onkeydown={(e) => e.key === 'Enter' && addCustomRule()}
-                />
-                <button class="btn btn--primary btn--sm" onclick={addCustomRule}>
-                  <Icon name="plus" size={14} />
-                  {i18n.t('settings.safeguard.add')}
-                </button>
-              </div>
-            {/if}
+            <span>{safeguardStatusText}</span>
           </div>
         {/if}
-      {/each}
-    </div>
-  </div>
-</div>
-</div>
+      </div>
+      <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
+      <div class="safeguard-policy-note">{i18n.t('settings.safeguard.policyNote')}</div>
 
-{#if auditDialogOpen}
-  <SafeguardAuditDialog
-    onClose={() => { auditDialogOpen = false; }}
-    onCountChange={setSafeguardAuditCount}
-  />
-{/if}
+      <div class="safeguard-categories">
+        {#each SAFEGUARD_CATEGORIES as category}
+          {@const categoryRules = getRulesForCategory(category)}
+          {#if categoryRules.length > 0 || category === 'custom'}
+            <div class="safeguard-category">
+              <div class="safeguard-category-label">{i18n.t(`settings.safeguard.category.${category}`)}</div>
+              {#if categoryRules.length > 0}
+                <ul class="safeguard-rules">
+                  {#each categoryRules as { rule, index } (rule.pattern)}
+                    <li class="safeguard-rule" class:safeguard-rule--off={!rule.enabled}>
+                      <Toggle
+                        size="small"
+                        checked={rule.enabled}
+                        ariaLabel={rule.pattern}
+                        title={rule.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
+                        onchange={() => toggleSafeguardRule(index)}
+                      />
+                      <code class="safeguard-rule-pattern">{rule.pattern}</code>
+                      <select
+                        class="safeguard-action-select"
+                        data-action={rule.action}
+                        value={rule.action}
+                        aria-label={i18n.t('settings.safeguard.actionLabel')}
+                        onchange={(e) => updateSafeguardRuleAction(index, e.currentTarget.value)}
+                      >
+                        {#each SAFEGUARD_ACTIONS as action}
+                          <option value={action}>{getSafeguardActionLabel(action)}</option>
+                        {/each}
+                      </select>
+                      {#if category === 'custom'}
+                        <button
+                          type="button"
+                          class="btn-icon btn-icon--sm btn-icon--danger"
+                          title={i18n.t('settings.tools.delete')}
+                          aria-label={i18n.t('settings.tools.delete')}
+                          onclick={() => removeCustomRule(index)}
+                        >
+                          <Icon name="delete" size={12} />
+                        </button>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+              {#if category === 'custom'}
+                <div class="safeguard-add-row">
+                  <input
+                    type="text"
+                    class="form-input safeguard-add-input"
+                    bind:value={newCustomRule}
+                    placeholder={i18n.t('settings.safeguard.addPlaceholder')}
+                    onkeydown={(e) => e.key === 'Enter' && addCustomRule()}
+                  />
+                  <button class="btn btn--primary btn--sm" onclick={addCustomRule}>
+                    <Icon name="plus" size={14} />
+                    {i18n.t('settings.safeguard.add')}
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        {/each}
+      </div>
+    </div>
+  {:else}
+    <div class="settings-section" style="border-bottom: none;">
+      <SafeguardAuditPanel persistenceHealthy={safeguardAuditPersistenceHealthy} onCountChange={setSafeguardAuditCount} />
+    </div>
+  {/if}
+</div>
+</div>
 
 <style>
   .rules-save-status {
@@ -184,6 +179,25 @@
 
   .rules-save-status.error { color: var(--danger); }
 
+  .safeguard-tabs { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border-subtle, var(--border)); margin: 0 var(--space-4); }
+  .safeguard-tab {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px 10px;
+    border: none;
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .safeguard-tab:hover { color: var(--foreground); }
+  .safeguard-tab.active { color: var(--foreground); font-weight: var(--font-semibold); }
+  .safeguard-tab.active::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--primary); }
+  .safeguard-tab:focus-visible { outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent); outline-offset: -3px; border-radius: 4px; }
+  .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: 11px; font-weight: normal; font-variant-numeric: tabular-nums; }
+
   .safeguard-policy-note {
     margin-top: 8px;
     padding: 8px 10px;
@@ -193,20 +207,6 @@
     font-size: var(--text-xs);
     line-height: 1.5;
   }
-
-  .safeguard-audit-summary { margin-top: 4px; color: var(--foreground); }
-  .safeguard-audit-summary.unhealthy { color: var(--danger); }
-
-  .safeguard-audit-link {
-    margin-left: 8px;
-    padding: 0;
-    border: none;
-    background: none;
-    color: var(--primary);
-    font-size: inherit;
-    cursor: pointer;
-  }
-  .safeguard-audit-link:hover { text-decoration: underline; }
 
   .safeguard-categories { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
 
