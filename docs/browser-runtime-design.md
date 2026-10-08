@@ -258,6 +258,18 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 - daemon 请求守卫同时防两类本机攻击：`Host` 必须是本机、局域网、单标签主机名、已知私有后缀（`.local`、`.lan`、`.ts.net` 等）或 `MAGI_ALLOWED_HOSTS` 声明的域名（防 DNS 重绑定）；写请求若带 `Origin` 必须与 `Host` 同源（防跨站写）。公网隧道请求由隧道令牌认证，不经过这两项检查。
 - 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
 
+### 5.7 访问档位与网页写动作
+
+浏览器工具的网页写动作由权限引擎统一判定（`PermissionRequest::BrowserAction`，工具名与参数的分类在 `browser_action_class`），不再因为「工具目录里标记为只读访问模式」而绕过访问档位：
+
+| 动作 | 只读 | 受限 | 完全访问 |
+| --- | --- | --- | --- |
+| 导航、快照、读取、截图、滚动、悬停、控制台与网络读取 | 允许 | 允许 | 允许 |
+| 点击、输入、按键、填表、拖拽、上传文件、处理对话框 | 拒绝 | 允许 | 允许 |
+| 执行脚本（`browser_evaluate`）、写站点存储（`browser_storage` 的 set / remove / clear）、WebMCP execute | 拒绝 | 需要确认 | 允许 |
+
+只读命令模式（`command_mode=read_only`）在任何访问档位下都按「只读」处理。上传文件的路径另按文件工具的同一套路径范围授权。
+
 ### 5.6 网页内容是不可信输入
 
 页面正文、DOM、控制台、网络、存储和标签页标题都来自不受信任的网站，可能夹带伪装成指令的文字。daemon 在浏览器工具结果的唯一出口（`BrowserToolRuntimeDependencies::execute`）给携带这类内容的结果（`browser_read`、`browser_snapshot`、`browser_console`、`browser_network`、`browser_evaluate`、`browser_storage`、`browser_tabs`、`browser_webmcp`，以及带页面快照的操作类结果）统一加上 `content_trust: "untrusted_web_content"` 与 `content_notice`，提示模型把页面内容当作数据而不是用户指令。截图、视口等不携带页面文本的结果不加。

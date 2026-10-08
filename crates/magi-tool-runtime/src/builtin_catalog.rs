@@ -851,7 +851,15 @@ impl BuiltinToolName {
     }
 
     pub fn uses_input_sensitive_invocation_policy(&self) -> bool {
-        matches!(self, Self::ShellExec | Self::FileRemove)
+        // 浏览器的脚本执行与站点存储写入按访问档位判定（见 browser_action_class）。
+        matches!(
+            self,
+            Self::ShellExec
+                | Self::FileRemove
+                | Self::BrowserEvaluate
+                | Self::BrowserStorage
+                | Self::BrowserWebMcp
+        )
     }
 
     pub fn description(&self) -> &'static str {

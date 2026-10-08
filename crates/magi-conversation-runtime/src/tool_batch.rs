@@ -3325,6 +3325,24 @@ pub(crate) fn access_profile_tool_decision(
             return Some(decision);
         }
     }
+    // 浏览器工具对网页的写动作按访问档位判定：只读拒绝，受限下执行脚本 / 改站点存储需要确认。
+    if let Some(class) = magi_tool_runtime::browser_action_class(&canonical_tool_name, arguments) {
+        let browser_request = magi_permissions::PermissionRequest::BrowserAction { class };
+        if let Some(decision) = select_access_profile_axis_decision(
+            &mut pending_decision,
+            permission_decision_payload(
+                &canonical_tool_name,
+                engine.decide(
+                    &browser_request,
+                    &canonical_policy,
+                    effective_access_profile,
+                ),
+                effective_access_profile,
+            ),
+        ) {
+            return Some(decision);
+        }
+    }
     let normalized_read_only_paths = normalize_tool_policy_paths(
         read_only_paths,
         workspace_root_path.map(|path| path.as_path()),
@@ -5150,6 +5168,91 @@ mod tests {
         .expect("restricted write shell inside symlinked workspace should require approval");
 
         assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn browser_web_actions_follow_the_access_profile() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let decide =
+            |profile: magi_core::AccessProfile, tool: &str, arguments: serde_json::Value| {
+                access_profile_tool_decision(AccessProfileToolDecisionInput {
+                    access_profile: profile,
+                    command_mode: "",
+                    allowed_tools: &[],
+                    denied_tools: &[],
+                    allowed_paths: &[],
+                    denied_paths: &[],
+                    read_only_paths: &[],
+                    requested_tool_name: tool,
+                    arguments: &arguments.to_string(),
+                    workspace_root_path: Some(&workspace_root),
+                })
+            };
+        use magi_core::AccessProfile::{FullAccess, ReadOnly, Restricted};
+
+        // 观察类动作在任何档位都不拦。
+        for tool in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_read",
+            "browser_scroll",
+        ] {
+            for profile in [ReadOnly, Restricted, FullAccess] {
+                assert!(
+                    decide(profile, tool, serde_json::json!({})).is_none(),
+                    "{tool} {profile:?}"
+                );
+            }
+        }
+        // 点击 / 输入等交互动作：只读拒绝，受限与完全访问放行。
+        let click = serde_json::json!({ "element_ref": "e:1:2" });
+        let rejected = decide(ReadOnly, "browser_click", click.clone()).expect("只读拒绝点击");
+        assert_eq!(rejected.status, ExecutionResultStatus::Rejected);
+        assert!(decide(Restricted, "browser_click", click.clone()).is_none());
+        assert!(decide(FullAccess, "browser_click", click).is_none());
+        // 执行脚本 / 写站点存储：只读拒绝，受限需要确认，完全访问放行。
+        for (tool, arguments) in [
+            (
+                "browser_evaluate",
+                serde_json::json!({ "expression": "1+1" }),
+            ),
+            (
+                "browser_storage",
+                serde_json::json!({ "area": "local", "action": "set", "key": "k", "value": "v" }),
+            ),
+            (
+                "browser_storage",
+                serde_json::json!({ "area": "cookies", "action": "clear" }),
+            ),
+            ("browser_webmcp", serde_json::json!({ "action": "execute" })),
+        ] {
+            let read_only = decide(ReadOnly, tool, arguments.clone()).expect("只读拒绝");
+            assert_eq!(read_only.status, ExecutionResultStatus::Rejected, "{tool}");
+            let restricted = decide(Restricted, tool, arguments.clone()).expect("受限需要确认");
+            assert_eq!(
+                restricted.status,
+                ExecutionResultStatus::NeedsApproval,
+                "{tool}"
+            );
+            assert!(decide(FullAccess, tool, arguments).is_none(), "{tool}");
+        }
+        // 只读类的存储 / 对话框 / WebMCP 操作不受影响。
+        for (tool, arguments) in [
+            (
+                "browser_storage",
+                serde_json::json!({ "area": "local", "action": "list" }),
+            ),
+            ("browser_dialog", serde_json::json!({ "action": "list" })),
+            ("browser_webmcp", serde_json::json!({ "action": "list" })),
+        ] {
+            for profile in [ReadOnly, Restricted, FullAccess] {
+                assert!(
+                    decide(profile, tool, arguments.clone()).is_none(),
+                    "{tool} {profile:?}"
+                );
+            }
+        }
     }
 
     #[test]

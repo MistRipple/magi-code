@@ -599,6 +599,41 @@ fn canonicalize_existing_permission_ancestor(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// 浏览器工具在网页上的动作类别。观察类动作（导航、读取、快照、截图、滚动、悬停等）返回 `None`。
+pub fn browser_action_class(
+    canonical_tool_name: &str,
+    arguments: &str,
+) -> Option<magi_permissions::BrowserActionClass> {
+    use magi_permissions::BrowserActionClass::{Execute, Interact};
+    let action = || {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(|action| action.trim().to_ascii_lowercase())
+            })
+            .unwrap_or_default()
+    };
+    match canonical_tool_name {
+        "browser_click"
+        | "browser_click_at"
+        | "browser_type"
+        | "browser_press"
+        | "browser_fill_form"
+        | "browser_drag"
+        | "browser_upload_file" => Some(Interact),
+        "browser_dialog" => (action() != "list").then_some(Interact),
+        "browser_evaluate" => Some(Execute),
+        "browser_storage" => {
+            matches!(action().as_str(), "set" | "remove" | "clear").then_some(Execute)
+        }
+        "browser_webmcp" => (action() == "execute").then_some(Execute),
+        _ => None,
+    }
+}
+
 pub fn tool_path_access_requests(
     canonical_tool_name: &str,
     arguments: &str,

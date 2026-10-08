@@ -42,6 +42,18 @@ pub enum PermissionRequest<'a> {
     /// shell 命令分类：caller 把 shell_exec 的 `arguments` 原文传进来，由引擎
     /// 结合模型声明与命令文本推断这是不是只读命令。
     ShellCommand { arguments_json: &'a str },
+    /// 浏览器工具在网页上的动作类别：由 caller 按工具名与参数分类。
+    BrowserAction { class: BrowserActionClass },
+}
+
+/// 浏览器动作对网页产生影响的程度。只用于访问档位判定：
+/// 导航、读取、截图、滚动这类观察动作不在此列，任何档位都不拦。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserActionClass {
+    /// 点击、输入、按键、填表、拖拽、上传文件、处理对话框：会提交表单、触发购买等外部副作用。
+    Interact,
+    /// 在网页里执行任意脚本、读写站点存储：能力不受页面可见元素限制。
+    Execute,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +161,29 @@ impl PermissionEngine {
             PermissionRequest::ShellCommand { arguments_json } => {
                 self.decide_shell_command(arguments_json, policy, access_profile)
             }
+            PermissionRequest::BrowserAction { class } => {
+                self.decide_browser_action(*class, policy, access_profile)
+            }
+        }
+    }
+
+    fn decide_browser_action(
+        &self,
+        class: BrowserActionClass,
+        policy: &PermissionPolicy,
+        access_profile: AccessProfile,
+    ) -> Decision {
+        if access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode() {
+            return Decision::Deny {
+                reason: "只读任务不允许在网页上点击、输入或执行脚本等有外部副作用的操作"
+                    .to_string(),
+            };
+        }
+        match (access_profile, class) {
+            (AccessProfile::Restricted, BrowserActionClass::Execute) => Decision::NeedsApproval {
+                reason: "受限执行下，在网页里运行脚本或读写站点存储需要确认".to_string(),
+            },
+            _ => Decision::Allow,
         }
     }
 
@@ -994,6 +1029,50 @@ fn path_is_within(target: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_actions_follow_the_access_profile() {
+        let engine = PermissionEngine::default();
+        let policy = PermissionPolicy::default();
+        let decide = |class, profile| {
+            engine.decide(
+                &PermissionRequest::BrowserAction { class },
+                &policy,
+                profile,
+            )
+        };
+        for class in [BrowserActionClass::Interact, BrowserActionClass::Execute] {
+            assert!(
+                decide(class, AccessProfile::ReadOnly).is_deny(),
+                "{class:?}"
+            );
+            assert!(
+                decide(class, AccessProfile::FullAccess).is_allow(),
+                "{class:?}"
+            );
+        }
+        assert!(decide(BrowserActionClass::Interact, AccessProfile::Restricted).is_allow());
+        assert!(matches!(
+            decide(BrowserActionClass::Execute, AccessProfile::Restricted),
+            Decision::NeedsApproval { .. }
+        ));
+        let read_only_mode = PermissionPolicy {
+            command_mode: "read_only".to_string(),
+            ..PermissionPolicy::default()
+        };
+        assert!(
+            engine
+                .decide(
+                    &PermissionRequest::BrowserAction {
+                        class: BrowserActionClass::Interact
+                    },
+                    &read_only_mode,
+                    AccessProfile::FullAccess
+                )
+                .is_deny(),
+            "只读命令模式在任何访问档位下都不允许网页写动作"
+        );
+    }
 
     fn engine_with_test_tools() -> PermissionEngine {
         let mut engine = PermissionEngine::default();
