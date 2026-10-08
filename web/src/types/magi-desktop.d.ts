@@ -266,6 +266,16 @@ interface MagiDesktopBridge {
     tabId: string;
     downloadId: string;
   }): Promise<MagiDesktopWindowSnapshot>;
+  /** 在系统文件管理器中显示已完成的下载；文件已不存在时返回 false。 */
+  revealBrowserDownload(request: {
+    tabId: string;
+    downloadId: string;
+  }): Promise<boolean>;
+  /** 弹出系统保存对话框把已完成的下载另存；用户取消或文件已不存在时返回 false。 */
+  saveBrowserDownload(request: {
+    tabId: string;
+    downloadId: string;
+  }): Promise<boolean>;
   startBrowserInspect(
     request: MagiDesktopBrowserInspectRequest,
   ): Promise<MagiDesktopWindowSnapshot>;

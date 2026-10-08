@@ -85,6 +85,7 @@ Main 保留这些职责：
 - `webContents.debugger` 的受控 CDP lane、Target 生命周期和工具命令；
 - 当前 Surface 的 fixed 设备指标与基于 `displaySize` 的 Chromium 显示比例；
 - 页面加载、失败、崩溃、标题、下载、控制台和 agent cursor 事件；
+- 下载只写入 Magi 私有下载目录（启动时清空），绝不回落到系统下载目录；已完成的下载由 Main 记住文件位置，界面提供「在文件夹中显示」和「另存为…」（系统保存对话框由用户选择位置），不提供「打开」，避免直接执行下载来的文件；
 - Worker/daemon 重连后的物理页面恢复。
 
 Main 不负责：

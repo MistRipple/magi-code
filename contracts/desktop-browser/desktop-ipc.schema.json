@@ -20,6 +20,8 @@
         "magi-desktop:activate-panel",
         "magi-desktop:set-browser-viewport",
         "magi-desktop:cancel-browser-download",
+        "magi-desktop:reveal-browser-download",
+        "magi-desktop:save-browser-download",
         "magi-desktop:start-browser-inspect",
         "magi-desktop:stop-browser-inspect",
         "magi-desktop:start-browser-annotation-capture",
@@ -55,6 +57,8 @@
     { "$ref": "#/$defs/activatePanel" },
     { "$ref": "#/$defs/setBrowserViewport" },
     { "$ref": "#/$defs/cancelBrowserDownload" },
+    { "$ref": "#/$defs/revealBrowserDownload" },
+    { "$ref": "#/$defs/saveBrowserDownload" },
     { "$ref": "#/$defs/startBrowserInspect" },
     { "$ref": "#/$defs/stopBrowserInspect" },
     { "$ref": "#/$defs/startBrowserAnnotationCapture" },
@@ -435,6 +439,40 @@
       "required": ["channel", "payload"],
       "properties": {
         "channel": { "const": "magi-desktop:cancel-browser-download" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tabId", "downloadId"],
+          "properties": {
+            "tabId": { "$ref": "#/$defs/id" },
+            "downloadId": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "revealBrowserDownload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:reveal-browser-download" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tabId", "downloadId"],
+          "properties": {
+            "tabId": { "$ref": "#/$defs/id" },
+            "downloadId": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "saveBrowserDownload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:save-browser-download" },
         "payload": {
           "type": "object",
           "additionalProperties": false,

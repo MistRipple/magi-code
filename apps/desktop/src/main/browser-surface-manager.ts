@@ -265,6 +265,8 @@ interface BrowserSurfaceRecord {
    * interrupted 状态重新伪装成 started。
    */
   downloads: Map<string, ActiveBrowserDownload>;
+  /** 已完成下载的文件位置（私有下载目录内），供用户在界面里显示或另存为；保留最近若干个。 */
+  completedFiles: Map<string, CompletedBrowserDownload>;
   lifecycleEpoch: number;
   lifecycleAbort: AbortController;
 }
@@ -275,6 +277,14 @@ interface NavigationFrameIdentity {
 }
 
 type ActiveBrowserDownloadState = "started" | "progressing" | "interrupted";
+
+/** 界面里可操作的已完成下载数量上限，超过后淘汰最早的。 */
+const MAX_COMPLETED_DOWNLOADS = 20;
+
+export interface CompletedBrowserDownload {
+  path: string;
+  filename: string;
+}
 
 interface ActiveBrowserDownload {
   item: Electron.DownloadItem;
@@ -888,6 +898,7 @@ export class BrowserSurfaceManager {
       annotationCaptureRenderPromise: null,
       annotationCaptureExecutionContextId: null,
       downloads: new Map(),
+      completedFiles: new Map(),
       lifecycleEpoch: 0,
       lifecycleAbort: new AbortController(),
     };
@@ -1142,6 +1153,19 @@ export class BrowserSurfaceManager {
       throw error;
     }
     return true;
+  }
+
+  /** 已完成下载的文件位置；下载目录在启动时清空，文件不在了就返回 null。 */
+  completedDownload(
+    windowId: string,
+    tabId: string,
+    downloadId: string,
+  ): CompletedBrowserDownload | null {
+    const record = this.#surfaces.forWindowTab(windowId, tabId);
+    if (!record || record.closed) return null;
+    const download = record.completedFiles.get(downloadId);
+    if (!download || !existsSync(download.path)) return null;
+    return download;
   }
 
   downloadSnapshotWindowId(tabId: string): string | null {
@@ -3951,6 +3975,17 @@ export class BrowserSurfaceManager {
     });
     item.once("done", (_event, state) => {
       record.downloads.delete(downloadId);
+      if (state === "completed") {
+        record.completedFiles.set(downloadId, {
+          path: item.getSavePath(),
+          filename,
+        });
+        while (record.completedFiles.size > MAX_COMPLETED_DOWNLOADS) {
+          const oldest = record.completedFiles.keys().next().value;
+          if (oldest === undefined) break;
+          record.completedFiles.delete(oldest);
+        }
+      }
       if (!record.closed) {
         this.emitDownload(record, {
           downloadId,

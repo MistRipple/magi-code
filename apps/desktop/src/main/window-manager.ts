@@ -641,6 +641,14 @@ export class WindowManager {
     );
   }
 
+  completedBrowserDownload(
+    windowId: string,
+    tabId: string,
+    downloadId: string,
+  ) {
+    return this.#surfaceManager.completedDownload(windowId, tabId, downloadId);
+  }
+
   async startBrowserInspect(
     windowId: string,
     request: { tabId: string; surfaceId: string; navigationRevision: number },

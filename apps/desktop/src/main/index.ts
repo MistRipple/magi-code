@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -498,6 +499,52 @@ function registerIpc(): void {
       if (!cancelled) throw new Error("browser_download_not_found");
       publishBrowserSnapshot(windowId);
       return manager.snapshot(windowId);
+    },
+  );
+  handleIpc(
+    "magi-desktop:reveal-browser-download",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["tabId", "downloadId"],
+        "browserDownloadReveal",
+      );
+      const download = manager.completedBrowserDownload(
+        windowId,
+        text(request.tabId, "tabId"),
+        text(request.downloadId, "downloadId"),
+      );
+      if (!download) return false;
+      shell.showItemInFolder(download.path);
+      return true;
+    },
+  );
+  handleIpc(
+    "magi-desktop:save-browser-download",
+    async (event, value: unknown) => {
+      const { manager, windowId } = trustedAppSender(event.sender.id);
+      const request = rejectUnknownFields(
+        object(value),
+        ["tabId", "downloadId"],
+        "browserDownloadSave",
+      );
+      const download = manager.completedBrowserDownload(
+        windowId,
+        text(request.tabId, "tabId"),
+        text(request.downloadId, "downloadId"),
+      );
+      if (!download) return false;
+      const owner = BrowserWindow.fromWebContents(event.sender);
+      const options = {
+        defaultPath: join(app.getPath("downloads"), download.filename),
+      };
+      const chosen = owner
+        ? await dialog.showSaveDialog(owner, options)
+        : await dialog.showSaveDialog(options);
+      if (chosen.canceled || !chosen.filePath) return false;
+      await copyFile(download.path, chosen.filePath);
+      return true;
     },
   );
   handleIpc(

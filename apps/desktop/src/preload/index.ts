@@ -122,6 +122,10 @@ contextBridge.exposeInMainWorld("magiDesktop", {
     ipcRenderer.invoke("magi-desktop:set-browser-viewport", request),
   cancelBrowserDownload: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:cancel-browser-download", request),
+  revealBrowserDownload: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:reveal-browser-download", request),
+  saveBrowserDownload: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:save-browser-download", request),
   startBrowserInspect: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:start-browser-inspect", request),
   stopBrowserInspect: (request: unknown) =>

@@ -1217,6 +1217,29 @@
     })();
   }
 
+  let savedDownloadId = $state('');
+
+  function finishedDownloadAction(action: 'reveal' | 'save'): void {
+    const download = activeDownload;
+    if (!download || download.state !== 'completed') return;
+    void (async () => {
+      actionError = '';
+      try {
+        const request = { tabId, downloadId: download.downloadId };
+        const done = action === 'reveal'
+          ? await window.magiDesktop?.revealBrowserDownload(request)
+          : await window.magiDesktop?.saveBrowserDownload(request);
+        if (done === undefined) throw new Error(i18n.t('browser.error.internalUnavailable'));
+        if (action === 'save' && done) savedDownloadId = download.downloadId;
+        // reveal 返回 false 说明文件已不在下载目录；save 返回 false 也可能只是用户取消，
+        // 只有文件确实不在了才提示。
+        if (!done && action === 'reveal') actionError = i18n.t('browser.download.fileMissing');
+      } catch (cause) {
+        actionError = errorMessage(cause);
+      }
+    })();
+  }
+
   function formatDownloadBytes(value: number): string {
     if (value < 1024) return `${value} B`;
     const units = ['KB', 'MB', 'GB'];
@@ -1845,6 +1868,13 @@
         <span class="browser-download-state">{i18n.t(`browser.download.${activeDownload.state}`)}</span>
         {#if activeDownload.state === 'interrupted'}
           <span class="browser-download-bytes">{formatDownloadBytes(activeDownload.receivedBytes)}</span>
+        {/if}
+        {#if activeDownload.state === 'completed'}
+          {#if savedDownloadId === activeDownload.downloadId}
+            <span class="browser-download-state">{i18n.t('browser.download.saved')}</span>
+          {/if}
+          <button type="button" onclick={() => finishedDownloadAction('reveal')}>{i18n.t('browser.download.reveal')}</button>
+          <button type="button" onclick={() => finishedDownloadAction('save')}>{i18n.t('browser.download.saveAs')}</button>
         {/if}
       {/if}
     </div>
