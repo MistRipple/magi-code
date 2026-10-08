@@ -430,7 +430,9 @@ test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
   );
 });
 
-test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误语义", async () => {
+test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误语义", async (t) => {
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   const port = new SilentPort();
   const client = new CdpClient(port);
 

@@ -1403,6 +1403,20 @@ mod tests {
         (path, port)
     }
 
+    async fn wait_for_test_listener_release(port: u16) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    drop(listener);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("上一个服务实例必须释放测试端口");
+    }
+
     fn state() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(16));
         let governance = Arc::new(GovernanceService::default());
@@ -1480,6 +1494,7 @@ mod tests {
         let port = status.port.unwrap();
         assert_eq!(port, expected_port);
         first.stop_locked(&mut *first.control.lock().await).await;
+        wait_for_test_listener_release(port).await;
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains(&issued.secret), "令牌原文不得落盘");
@@ -1939,6 +1954,7 @@ mod tests {
         runtime
             .stop_locked(&mut *runtime.control.lock().await)
             .await;
+        wait_for_test_listener_release(status.port.unwrap()).await;
         let fake2 = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let restarted = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake2.clone());
         // 上一个监听任务刚被中止，内核释放端口是异步的：重启时偶尔还绑不上，短暂重试。
@@ -2188,6 +2204,7 @@ mod tests {
             .await
             .unwrap();
         first.stop_locked(&mut *first.control.lock().await).await;
+        wait_for_test_listener_release(port).await;
 
         let second = McpServiceRuntime::load(path.clone());
         for _ in 0..20 {
