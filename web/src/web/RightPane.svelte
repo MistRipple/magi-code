@@ -1772,18 +1772,23 @@
     box-shadow: var(--shadow-lg);
   }
 
+  /* 图标 + 名称在第一行，不可用原因在名称下方换行显示：原因文案较长，
+     和名称挤在同一行只会撑出菜单。 */
   .right-pane-add-menu-item {
     width: 100%;
     min-height: 32px;
-    padding: 0 8px;
-    display: flex;
+    padding: 6px 8px;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
     align-items: center;
-    gap: 8px;
+    column-gap: 8px;
+    row-gap: 2px;
     border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground);
     font: inherit;
+    text-align: left;
     cursor: pointer;
   }
 
@@ -1793,9 +1798,12 @@
   }
 
   .right-pane-add-menu-reason {
-    margin-left: auto;
+    grid-column: 2;
     color: var(--muted-foreground);
     font-size: var(--text-xs);
+    line-height: 1.4;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .right-pane-add-menu-item:disabled {
