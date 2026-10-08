@@ -190,6 +190,7 @@
       >
         <div class="tabbar-scroll" onscroll={updateScrollState}>
           <div class="tabbar-track" role="tablist">
+            <span class="tab-group-label" aria-hidden="true">{i18n.t('settings.model.tabGroup.roles')}</span>
             <!-- 主模型 -->
             <button
               type="button"
@@ -258,6 +259,8 @@
               <span class="role-tab-name">{i18n.t('settings.model.visionModel')}</span>
             </button>
 
+            <span class="tab-group-divider" aria-hidden="true"></span>
+            <span class="tab-group-label" aria-hidden="true">{i18n.t('settings.model.tabGroup.engines')}</span>
             <!-- 代理引擎 -->
             {#each workerModelTabs as workerTab (workerTab)}
               {@const workerStatus = resolveModelConfigTabStatus(workerTab, modelStatuses)}
@@ -327,6 +330,7 @@
               onclick={openAddEngineDialog}
             >
               <Icon name="plus" size={12} />
+              <span>{i18n.t('settings.model.addEngine')}</span>
             </button>
           </div>
         </div>
@@ -498,63 +502,6 @@
                 {/each}
               </div>
             {/if}
-          </div>
-        </div>
-
-        <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-avatar engine-avatar--auxiliary" aria-hidden="true">
-            <Icon name="sparkles" size={15} />
-            <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
-              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
-            ></span>
-          </div>
-          <div class="engine-identity">
-            <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
-            {#if compConfig?.model}
-              <span class="engine-model-tag">{compConfig.model}</span>
-            {/if}
-          </div>
-          <div class="engine-consumers">
-            <span class="engine-system-note">{i18n.t('settings.model.auxiliarySystemUsage')}</span>
-          </div>
-        </div>
-
-        <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-avatar engine-avatar--image" aria-hidden="true">
-            <Icon name="sparkles" size={15} />
-            <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}"
-              title={getStatusText(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}
-            ></span>
-          </div>
-          <div class="engine-identity">
-            <span class="engine-name">{i18n.t('settings.model.imageGenerationModel')}</span>
-            {#if imageConfig?.model}
-              <span class="engine-model-tag">{imageConfig.model}</span>
-            {/if}
-          </div>
-          <div class="engine-consumers">
-            <span class="engine-system-note">{i18n.t('settings.model.imageGenerationSystemUsage')}</span>
-          </div>
-        </div>
-
-        <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-avatar engine-avatar--vision" aria-hidden="true">
-            <Icon name="eye" size={15} />
-            <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('vision', modelStatuses))}"
-              title={getStatusText(resolveModelConfigTabStatus('vision', modelStatuses))}
-            ></span>
-          </div>
-          <div class="engine-identity">
-            <span class="engine-name">{i18n.t('settings.model.visionModel')}</span>
-            {#if visionConfig?.model}
-              <span class="engine-model-tag">{visionConfig.model}</span>
-            {/if}
-          </div>
-          <div class="engine-consumers">
-            <span class="engine-system-note">{i18n.t('settings.model.visionDesc')}</span>
           </div>
         </div>
 
@@ -781,6 +728,23 @@
   .role-tab--add {
     color: var(--ind-foreground-soft, var(--ind-foreground-muted));
     padding: 7px 9px 9px;
+    white-space: nowrap;
+  }
+
+  /* 固定角色与自建引擎是两类东西：分组标签 + 分隔线，而不是一排同质的标签。 */
+  .tab-group-label {
+    align-self: center;
+    padding: 0 6px 2px 4px;
+    color: var(--ind-foreground-soft, var(--ind-foreground-muted));
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .tab-group-divider {
+    align-self: center;
+    width: 1px;
+    height: 16px;
+    margin: 0 6px 2px;
+    background: var(--ind-border-separator);
   }
   .role-tab--add:hover {
     color: var(--ind-tab-accent);
@@ -902,13 +866,6 @@
   .engine-avatar--primary {
     color: var(--ind-tab-accent, var(--info));
     background: color-mix(in srgb, var(--ind-tab-accent, var(--info)) 11%, var(--ind-bg-control, var(--surface-2)));
-  }
-  .engine-avatar--auxiliary {
-    color: var(--ind-foreground-secondary, var(--foreground));
-  }
-  .engine-avatar--image {
-    color: var(--warning, #d97706);
-    background: color-mix(in srgb, var(--warning, #d97706) 11%, var(--ind-bg-control, var(--surface-2)));
   }
   .engine-avatar > .model-status-dot,
   .engine-avatar > .worker-dot {
