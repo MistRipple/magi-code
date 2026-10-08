@@ -338,12 +338,74 @@ await withGoldenViteServer(async (server) => {
       { active: false },
     );
     assert.doesNotMatch(doneThinking, /conversation-thinking-text/u, '收起的思考阶段只显示标题行里的内容预览，不渲染正文');
-    assert.match(doneThinking, /conversation-phase-label[^>]*>先算每小时的注水量/u, '收起时标题是思考内容的预览');
+    assert.match(doneThinking, /conversation-phase-label[^>]*>思考已完成</u, '收起的思考行标题始终是思考自己的状态，不是一句看不出是思考的内容预览');
+    assert.match(doneThinking, /title="先算每小时的注水量/u, '内容预览留在悬停提示里');
     const streamingText = phaseHtml({
       key: 'phase:stream-render',
       entries: [eventEntry('s9', { content: listText, source: 'orchestrator' })],
     });
     assert.doesNotMatch(streamingText, /conversation-phase-header/u, '流式正文不带重复的标题行');
+  }
+
+  // ---- 思考独立成块：自己折叠，不跟整轮「已处理」绑在一起 ----
+  const split = disclosure.buildConversationDisclosureBlocks([
+    eventEntry('p1', { content: '先看一下。' }),
+    eventEntry('th10', thinkingMessage({ status: 'completed', streaming: false })),
+    eventEntry('p2', { content: '再看一下。' }),
+    toolEntry('t40'),
+  ]);
+  assert.deepEqual(
+    split.map((block) => block.kind === 'phase' && disclosure.isThinkingOnlyPhase(block.phase)),
+    [false, true, false],
+    '思考前后的文字各成阶段，思考单独一块，且被识别为独立展示',
+  );
+  assert.equal(split.length, 3);
+  const emptyThinking = disclosure.buildConversationDisclosureBlocks([
+    eventEntry('th11', message({
+      type: 'thinking',
+      blocks: [{ id: 'e', type: 'thinking', content: '', thinking: { groupId: 'g', status: 'completed', isStreaming: false, segments: [{ segmentId: 's', messageId: 'm', status: 'completed', content: '  ' }] } }],
+    })),
+  ]);
+  assert.deepEqual(emptyThinking, [], '没有内容的思考不占一行');
+  const streamingEmpty = thinkingMessage({ status: 'running', streaming: true });
+  streamingEmpty.blocks[0].thinking.segments[0].content = '';
+  assert.equal(
+    disclosure.buildConversationDisclosureBlocks([eventEntry('th12', streamingEmpty)]).length,
+    1,
+    '刚开始、还没有文字的流式思考要显示出来，用户才知道模型在思考',
+  );
+
+  {
+    // 整轮折叠（有最终回答、没有在运行）时，思考仍然作为独立的一行显示，自己决定展开与否。
+    const { render: renderTurn } = await server.ssrLoadModule('svelte/server');
+    const turnComponent = await server.ssrLoadModule('/src/components/ConversationTurn.svelte');
+    const turnItems = [
+      { key: 'u1', message: message({ id: 'u1', role: 'user', type: 'user_input', content: '问题', source: 'user' }) },
+      { key: 'th20', message: thinkingMessage({ status: 'completed', streaming: false }) },
+      { key: 'f1', message: message({ id: 'f1', content: '答案是 3 小时。', source: 'orchestrator', metadata: { assistantOutputKind: 'final' } }) },
+    ];
+    const turnHtml = (extraItems = []) => renderTurn(turnComponent.default, {
+      props: {
+        turnId: 'turn-1',
+        items: [...turnItems, ...extraItems],
+        runtimeActive: false,
+        initialExpanded: false,
+        filePreviewScopeForItem: () => undefined,
+        canEditMessage: () => false,
+        editMessage: () => undefined,
+        continueInterruptedSession: () => undefined,
+      },
+    }).body.replace(/<!--[\s\S]*?-->/gu, '');
+    const collapsedTurn = turnHtml();
+    assert.match(collapsedTurn, /data-conversation-phase=/u, '整轮折叠时思考行仍然显示');
+    assert.match(collapsedTurn, /思考已完成/u);
+    assert.doesNotMatch(collapsedTurn, /turn-disclosure-header/u, '只有思考时没有可折叠的过程，不画整轮折叠的标题');
+    const withTool = turnHtml([{ key: 't50', message: message({ type: 'tool_call', blocks: [] }) }]);
+    assert.doesNotMatch(
+      withTool.replace(/<section class="conversation-phase[\s\S]*?<\/section>/u, ''),
+      /conversation-phase-header/u,
+      '整轮折叠时，文字阶段和工具仍然收在「已处理」里',
+    );
   }
 
   // ---- Markdown：紧凑列表项里的行内标记必须被解析，而不是显示成原始符号 ----

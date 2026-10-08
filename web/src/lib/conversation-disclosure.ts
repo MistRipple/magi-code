@@ -499,6 +499,27 @@ export function resolveConversationPhasePresentation(
   };
 }
 
+/** 思考消息里有没有可显示的文字（或仍在流式输出）。空的思考不占一行。 */
+export function thinkingHasVisibleContent(message: Message): boolean {
+  if (message.isStreaming) return true;
+  for (const block of message.blocks || []) {
+    if (!block || typeof block !== 'object' || block.type !== 'thinking' || !block.thinking) continue;
+    if (block.thinking.isStreaming) return true;
+    if (block.thinking.segments.some((segment) => segment.content.trim().length > 0)) return true;
+  }
+  return typeof message.content === 'string' && message.content.trim().length > 0;
+}
+
+/**
+ * 只有思考的阶段独立展示：不受整轮「已处理」折叠控制，自己决定展开还是收起，
+ * 也不算作整轮折叠里的内容。
+ */
+export function isThinkingOnlyPhase(phase: ConversationPhase): boolean {
+  return phase.entries.length > 0 && phase.entries.every(
+    (entry) => entry.kind === 'event' && entry.item.message.type === 'thinking',
+  );
+}
+
 export function resolveConversationPhaseSummary(
   phase: ConversationPhase,
   translate: ConversationTranslate,
@@ -542,6 +563,16 @@ export function buildConversationDisclosureBlocks(
         kind: 'phase',
         phase: { key: `phase:${entry.key}`, entries: [entry] },
       });
+      continue;
+    }
+
+    if (entry.kind === 'event' && entry.item.message.type === 'thinking') {
+      // 思考是独立的一块：有自己的折叠状态，不随整轮「已处理」一起展开 / 收起。
+      // 前后的文字与工具仍按原规则成阶段，所以先收住当前阶段。
+      flushPhase();
+      if (thinkingHasVisibleContent(entry.item.message)) {
+        blocks.push({ kind: 'phase', phase: { key: `phase:${entry.key}`, entries: [entry] } });
+      }
       continue;
     }
 

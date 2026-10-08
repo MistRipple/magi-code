@@ -25,6 +25,7 @@
     buildConversationDisclosureBlocks,
     buildConversationStreamEntries,
     isConversationFinalMessage,
+    isThinkingOnlyPhase,
     type ConversationDisclosureBlock,
   } from '../lib/conversation-disclosure';
 
@@ -119,9 +120,12 @@
   );
   const streamEntries = $derived(buildConversationStreamEntries(presentationItems));
 
+  // 整轮「已处理」折叠控制的是文字阶段和工具；思考独立展示、自己折叠，不算在里面。
   const hasProcess = $derived(
-    streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
-      || runtimeActive,
+    streamEntries.some(
+      (entry) => entry.kind === 'tool-group'
+        || (entry.kind === 'event' && entry.item.message.type !== 'thinking'),
+    ) || runtimeActive,
   );
   const isLive = $derived(
     runtimeActive
@@ -245,7 +249,7 @@
   <div class="turn-stream" id={`turn-process-${turnId}`}>
     {#each disclosureBlocks as block (block.kind === 'phase' ? block.phase.key : block.key)}
       {#if block.kind === 'phase'}
-        {#if expanded}
+        {#if expanded || isThinkingOnlyPhase(block.phase)}
         <ConversationPhase
           phase={block.phase}
           active={block.phase.key === activePhaseKey}

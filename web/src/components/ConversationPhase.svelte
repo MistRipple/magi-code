@@ -66,8 +66,17 @@
     return first.item.message.blocks?.find((block) => block?.type === 'thinking')?.thinking;
   });
   const headerLabel = $derived.by(() => {
+    // 独立的思考行：标题始终是思考自己的状态（思考中 / 思考已完成），不用内容预览——
+    // 否则收起后只剩一句看不出是「思考」的话。
+    // 模型已经转去输出文字 / 调用工具（这一阶段不再是当前阶段）时，思考就是结束了，
+    // 即使投影里的思考项要等整轮结束才标记完成。
+    if (presentation.thinkingOnly) {
+      return resolveThinkingTitle(
+        firstThinkingGroup && { ...firstThinkingGroup, isStreaming: firstThinkingGroup.isStreaming && active },
+        i18n.t.bind(i18n),
+      );
+    }
     if (!presentation.headerRepeatsBody) return summary;
-    if (presentation.thinkingOnly) return resolveThinkingTitle(firstThinkingGroup, i18n.t.bind(i18n));
     return i18n.t(active ? 'messageList.turnDisclosure.processing' : 'messageList.turnDisclosure.processed');
   });
 
