@@ -1951,7 +1951,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(status.network.enabled, "命名隧道开着时重启后应恢复：{status:?}");
+        assert!(
+            status.network.enabled,
+            "命名隧道开着时重启后应恢复：{status:?}"
+        );
         assert_eq!(
             status.network.mcp_url.as_deref(),
             Some("https://mcp.example.com/mcp")

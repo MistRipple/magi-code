@@ -56,6 +56,7 @@ pub struct AsyncManagedChild {
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
 struct WindowsJobHandle(isize);
 
 #[derive(Clone, Debug)]

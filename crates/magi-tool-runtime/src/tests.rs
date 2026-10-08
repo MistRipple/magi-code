@@ -1845,7 +1845,10 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     let search_payload: Value =
         serde_json::from_str(&search_output.payload).expect("search payload should parse");
     assert_eq!(search_output.status, ExecutionResultStatus::Succeeded);
-    assert_eq!(search_payload["root"], root.display().to_string());
+    assert_eq!(
+        std::fs::canonicalize(search_payload["root"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&root).unwrap()
+    );
     assert_eq!(search_payload["returned_matches"], 1);
 }
 

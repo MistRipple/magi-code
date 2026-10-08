@@ -1290,7 +1290,7 @@ mod tests {
     fn shell_read_only_declaration_allows_dev_null_redirection() {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
-        let args = r#"{"command":"if command -v rg >/dev/null 2>&1; then rg --files; fi","access_mode":"read_only"}"#;
+        let args = r#"{"shell":"bash","command":"if command -v rg >/dev/null 2>&1; then rg --files; fi","access_mode":"read_only"}"#;
         let req = PermissionRequest::ShellCommand {
             arguments_json: args,
         };
@@ -1548,6 +1548,7 @@ mod tests {
     #[test]
     fn shell_read_only_allows_compound_repository_inspection() {
         let args = serde_json::json!({
+            "shell": "bash",
             "access_mode": "read_only",
             "command": "cd /Users/xie/code/magi && {\n  echo \"=== ROOT LISTING ===\";\n  ls -la;\n  echo;\n  echo \"=== GIT STATE ===\";\n  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    git rev-parse --is-inside-work-tree;\n    git remote -v 2>/dev/null | head -5;\n    git status --short | head -50;\n    echo \"--- recent commits ---\";\n    git log --oneline -15 2>/dev/null || echo \"(no commits)\";\n  else\n    echo \"NOT_GIT_WORKTREE\";\n  fi\n  echo;\n  echo \"=== FILE COUNT BY TYPE (top-level dirs only) ===\";\n  for d in */; do printf \"%s \" \"$d\"; find \"$d\" -type f 2>/dev/null | wc -l; done | head -40;\n} 2>&1 | head -200"
         })
@@ -1559,6 +1560,7 @@ mod tests {
     #[test]
     fn shell_read_only_ignores_write_command_names_inside_search_patterns() {
         let args = serde_json::json!({
+            "shell": "bash",
             "access_mode": "read_only",
             "command": "grep -rn \"Router::\\|layer(\\|middleware\\|DefaultBodyLimit\\|Cors\\|serve\\|bind\\|0.0.0.0\\|127.0.0.1\\|tunnel_token\\|sessions.json\\|write_all\\|atomic\" crates/magi-api crates/magi-daemon apps --include='*.rs' 2>/dev/null | head -80; echo '==='; grep -rn \"max_tokens\\|temperature\\|context_window\\|token_limit\\|compress\\|truncate\" crates/magi-context-runtime crates/magi-conversation-runtime --include='*.rs' 2>/dev/null | head -40; echo '==='; wc -c .magi/sessions.json 2>/dev/null; ls -la .magi/snapshots 2>/dev/null | head"
         })

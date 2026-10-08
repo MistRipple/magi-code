@@ -83,16 +83,16 @@ fn read_bounds(
     request: &serde_json::Map<String, Value>,
 ) -> Result<(usize, usize, Option<usize>), String> {
     let max_bytes = bounded_usize(
-        &request,
+        request,
         "max_bytes",
         DEFAULT_MAX_BYTES,
         MAX_BYTES,
         "file_read",
     )?;
-    let start_line = bounded_usize(&request, "start_line", 1, usize::MAX, "file_read")?;
+    let start_line = bounded_usize(request, "start_line", 1, usize::MAX, "file_read")?;
     let end_line = request
         .get("end_line")
-        .map(|_| bounded_usize(&request, "end_line", usize::MAX, usize::MAX, "file_read"))
+        .map(|_| bounded_usize(request, "end_line", usize::MAX, usize::MAX, "file_read"))
         .transpose()?;
     if end_line.is_some_and(|end| end < start_line) {
         return Err(invalid_input("file_read", "end_line 不能小于 start_line"));

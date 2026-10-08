@@ -17,7 +17,10 @@ use std::collections::HashMap;
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/session/isolations", get(list_session_isolations))
-        .route("/session/workspace-waits", get(list_session_workspace_waits))
+        .route(
+            "/session/workspace-waits",
+            get(list_session_workspace_waits),
+        )
         .route("/session/isolation", get(get_session_isolation))
         .route("/session/isolation/enable", post(enable_session_isolation))
         .route(

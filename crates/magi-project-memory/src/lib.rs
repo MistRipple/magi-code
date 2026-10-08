@@ -667,11 +667,17 @@ mod tests {
         let home = TempDir::new().unwrap();
         let store = store(&home, "/Users/x/throwaway");
 
-        assert!(!store.root().exists(), "只打开不写入，不能在状态目录里留下空目录");
+        assert!(
+            !store.root().exists(),
+            "只打开不写入，不能在状态目录里留下空目录"
+        );
         assert!(store.list_entries().unwrap().is_empty());
         assert!(store.load_index().unwrap().is_none());
         assert!(!store.delete_entry("missing").unwrap());
-        assert!(!store.root().exists(), "读取和删除不存在的条目同样不创建目录");
+        assert!(
+            !store.root().exists(),
+            "读取和删除不存在的条目同样不创建目录"
+        );
 
         store
             .save_entry(&MemoryEntry {

@@ -3766,7 +3766,10 @@ done
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
-            format!("---\nname: demo\ndescription: 演示\n---\n# 演示\n{}", "正文。".repeat(200)),
+            format!(
+                "---\nname: demo\ndescription: 演示\n---\n# 演示\n{}",
+                "正文。".repeat(200)
+            ),
         )
         .unwrap();
         std::fs::write(dir.join("scripts/run.sh"), "echo ok\n").unwrap();
@@ -3787,7 +3790,10 @@ done
 
         let Json(detail) = get_instruction_skill_detail(
             State(state),
-            Query(HashMap::from([("skillId".to_string(), "demo-skill".to_string())])),
+            Query(HashMap::from([(
+                "skillId".to_string(),
+                "demo-skill".to_string(),
+            )])),
         )
         .await
         .expect("detail should load");
@@ -3801,8 +3807,15 @@ done
             .iter()
             .map(|file| file["path"].as_str().unwrap())
             .collect();
-        assert_eq!(files, ["SKILL.md", "scripts/run.sh"], "只列相对路径，隐藏文件不列");
-        assert!(!detail.to_string().contains("magi-skill-detail"), "不得暴露本机绝对路径");
+        assert_eq!(
+            files,
+            ["SKILL.md", "scripts/run.sh"],
+            "只列相对路径，隐藏文件不列"
+        );
+        assert!(
+            !detail.to_string().contains("magi-skill-detail"),
+            "不得暴露本机绝对路径"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

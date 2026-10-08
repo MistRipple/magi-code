@@ -23,7 +23,8 @@ pub(super) const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 static NEXT_READ: AtomicU64 = AtomicU64::new(1);
-static ACTIVE_READS: LazyLock<Mutex<HashMap<u64, (ProcessExecutionScope, Arc<AtomicBool>)>>> =
+type ActiveRead = (ProcessExecutionScope, Arc<AtomicBool>);
+static ACTIVE_READS: LazyLock<Mutex<HashMap<u64, ActiveRead>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn cancel_reads(query: Option<&ToolExecutionContextQuery>) -> usize {
