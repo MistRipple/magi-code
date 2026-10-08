@@ -1,4 +1,6 @@
 mod authority;
+#[path = "browser_network_policy.generated.rs"]
+mod browser_network_policy;
 #[path = "browser_tool_catalog.generated.rs"]
 mod browser_tool_catalog;
 mod capability;

@@ -14,5 +14,6 @@
 
 - App Server schema：修改后运行 `npm run protocol:generate` 和 `npm run protocol:check`，检查生成的 Rust、TypeScript diff 及全部消费者。
 - Browser 工具 catalog：按 `scripts/generate-browser-tool-catalog.mjs` 的源文件关系修改 schema/脚本/生成物，再运行 `npm run browser-tool-catalog:generate` 和 `npm run browser-tool-catalog:check`。
+- Browser 网络边界：规则唯一来源是 `contracts/desktop-browser/network-policy.json`，生成物由 `scripts/generate-browser-network-policy.mjs` 产生；修改后运行 `npm run browser-network-policy:generate` 和 `npm run browser-network-policy:check`，并运行 daemon 与 Desktop 两端的定向测试。
 - Desktop Browser 其他 schema：运行 `npm --workspace @magi/desktop-browser-contracts run check`，并运行受影响的 Desktop/Worker/daemon 定向检查。
 - 只改生成物时，先确认它与源 schema 一致；不得以手改生成物替代 schema 变更。

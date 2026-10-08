@@ -1,5 +1,24 @@
-const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
-const BLOCKED_HOSTS = new Set(["169.254.169.254", "metadata.google.internal"]);
+import {
+  evaluateBrowserNavigation,
+  type BrowserNetworkPolicyConfig,
+} from "./browser-network-policy.js";
+
+let networkPolicy: BrowserNetworkPolicyConfig = {
+  selfPorts: new Set(),
+  allowPrivateNetwork: true,
+};
+
+/**
+ * 设置浏览器 guest 的网络边界。由 Main 在启动和设置变化时调用；
+ * 导航入口、`will-navigate` 和 session 网络层拦截读取的是同一份配置。
+ */
+export function configureBrowserNetworkPolicy(config: BrowserNetworkPolicyConfig): void {
+  networkPolicy = config;
+}
+
+export function currentBrowserNetworkPolicy(): BrowserNetworkPolicyConfig {
+  return networkPolicy;
+}
 
 /**
  * Chromium 在主文档加载失败时会把 guest 切换到内部错误页。
@@ -14,10 +33,10 @@ export function normalizeNavigableUrl(value: string): string {
   if (trimmed === "about:blank") return trimmed;
   const candidate = /^[A-Za-z][A-Za-z\d+.-]*:/u.test(trimmed) ? trimmed : `https://${trimmed}`;
   const url = new URL(candidate);
-  if (!ALLOWED_NAVIGATION_PROTOCOLS.has(url.protocol) || BLOCKED_HOSTS.has(url.hostname)) {
-    throw new Error(`browser_navigation_url_rejected:${url.protocol}//${url.host}`);
+  const verdict = evaluateBrowserNavigation(url, networkPolicy);
+  if (!verdict.allowed) {
+    throw new Error(`browser_navigation_url_rejected:${verdict.reason}:${url.protocol}//${url.host}`);
   }
-  if (url.username || url.password) throw new Error("browser_navigation_credentials_rejected");
   return url.href;
 }
 

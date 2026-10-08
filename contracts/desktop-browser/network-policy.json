@@ -1,0 +1,83 @@
+{
+  "$comment": "浏览器网络边界规则的唯一来源。Rust（daemon 入口校验）与 TypeScript（Electron Main 的导航与网络层拦截）的常量由 scripts/generate-browser-network-policy.mjs 生成，两端的测试都读取 vectors 校验同一组用例。动态规则（Magi 自身 daemon 端口、是否允许本机与局域网）不在这里，由 Main 持有。",
+  "blockedHostnames": [
+    "metadata.google.internal",
+    "metadata.goog",
+    "instance-data.ec2.internal"
+  ],
+  "blockedCidrs": [
+    "169.254.0.0/16",
+    "100.100.100.200/32",
+    "192.0.0.192/32",
+    "fd00:ec2::254/128",
+    "fe80::/10"
+  ],
+  "loopbackHostnames": [
+    "localhost"
+  ],
+  "loopbackCidrs": [
+    "127.0.0.0/8",
+    "0.0.0.0/8",
+    "::1/128",
+    "::/128"
+  ],
+  "privateNetworkCidrs": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "fc00::/7"
+  ],
+  "vectors": {
+    "alwaysBlocked": [
+      "http://169.254.169.254/latest/meta-data",
+      "http://169.254.170.2/v2/credentials",
+      "https://169.254.10.20/path",
+      "http://2852039166/",
+      "http://0xa9fea9fe/",
+      "http://metadata.google.internal/computeMetadata/v1",
+      "http://metadata.google.internal./computeMetadata/v1",
+      "http://METADATA.GOOGLE.INTERNAL/",
+      "http://sub.metadata.google.internal/",
+      "http://metadata.goog/",
+      "http://instance-data.ec2.internal/latest/meta-data",
+      "http://[::ffff:169.254.169.254]/",
+      "http://[::ffff:a9fe:a9fe]/",
+      "http://[fd00:ec2::254]/latest/meta-data",
+      "http://[fe80::1]/",
+      "http://100.100.100.200/latest/meta-data",
+      "http://192.0.0.192/opc/v2/instance"
+    ],
+    "allowed": [
+      "about:blank",
+      "https://example.com/path",
+      "https://metadata.example.com/",
+      "https://notmetadata.google.internal.example.com/",
+      "https://8.8.8.8/",
+      "https://[2606:4700:4700::1111]/",
+      "https://169.255.0.1/"
+    ],
+    "blockedWhenPrivateNetworkDisallowed": [
+      "http://127.0.0.1:3000/",
+      "http://127.1/",
+      "http://localhost:5173/",
+      "http://app.localhost/",
+      "http://[::1]:8080/",
+      "http://0.0.0.0:8000/",
+      "http://10.0.0.5/",
+      "http://172.16.4.1/",
+      "http://172.31.255.255/",
+      "http://192.168.1.1/",
+      "http://100.64.0.1/",
+      "http://[fd12:3456::1]/",
+      "http://[::ffff:192.168.1.1]/"
+    ],
+    "allowedEvenWhenPrivateNetworkDisallowed": [
+      "https://example.com/",
+      "http://172.32.0.1/",
+      "http://172.15.0.1/",
+      "http://100.128.0.1/",
+      "http://11.0.0.1/"
+    ]
+  }
+}

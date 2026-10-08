@@ -33,7 +33,9 @@ import {
   browserPartitionForSession,
   WEB_MODEL_PARTITION,
 } from "./web-model-session.js";
+import { evaluateBrowserRequestTarget } from "./browser-network-policy.js";
 import {
+  currentBrowserNetworkPolicy,
   isChromiumErrorPageUrl,
   normalizeNavigableUrl,
   resolveBrowserPageTitle,
@@ -3839,6 +3841,22 @@ export class BrowserSurfaceManager {
     // 应用级持久分区保留 HTTP 缓存（登录态与站点资源按浏览器语义落盘）；
     // 普通浏览器 Tab 沿用 cache:false 的内存会话语义。
     const browserSession = browserSessionForPartition(partitionId);
+    // 网络边界在 session 层统一执行：覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket，
+    // 页面无法绕过只检查导航入口的规则。规则与求值器见 browser-network-policy.ts。
+    browserSession.webRequest.onBeforeRequest(
+      { urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"] },
+      (details, callback) => {
+        try {
+          const verdict = evaluateBrowserRequestTarget(
+            new URL(details.url),
+            currentBrowserNetworkPolicy(),
+          );
+          callback({ cancel: !verdict.allowed });
+        } catch {
+          callback({ cancel: true });
+        }
+      },
+    );
     browserSession.setPermissionCheckHandler(() => false);
     browserSession.setPermissionRequestHandler(
       (_webContents, _permission, callback) => {

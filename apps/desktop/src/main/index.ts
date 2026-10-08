@@ -24,6 +24,7 @@ import {
 } from "@magi/desktop-browser-contracts";
 import { assertDesktopIpcMessage } from "@magi/desktop-browser-contracts/validation";
 import { AutomationWorker } from "./automation-worker.js";
+import { configureBrowserNetworkPolicy } from "./browser-surface-url.js";
 import {
   BrowserSurfaceManager,
   type BrowserDisplaySizeInput,
@@ -65,6 +66,11 @@ if (!Number.isInteger(daemonPort) || daemonPort < 1024 || daemonPort > 65535) {
   throw new Error(`magi_desktop_daemon_port_invalid:${daemonPort}`);
 }
 const AGENT_ORIGIN = `http://127.0.0.1:${daemonPort}`;
+// Magi 自身服务不能被浏览器 guest 访问：代理或页面访问本机 daemon 等于绕过工具审批边界。
+configureBrowserNetworkPolicy({
+  selfPorts: new Set([daemonPort]),
+  allowPrivateNetwork: true,
+});
 const DESKTOP_RENDERER_AUTH_HEADER = "X-Magi-Desktop-Renderer-Token";
 const MAGI_DAEMON_SERVICE_NAME = "magi-rust-backend";
 const DESKTOP_HOST_READY_POLL_INTERVAL_MS = 50;

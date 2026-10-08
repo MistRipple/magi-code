@@ -231,6 +231,15 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | App Renderer 重载 | 旧 `<webview>` 由 DOM 生命周期释放；同一逻辑 Surface 等待新 guest 注册，旧 WebContents 事件由 lifecycle epoch 丢弃，URL、标记和当前运行期 viewport 重放。 |
 | Desktop 重启 | 新 desktopEpoch；只恢复 BrowserAuthority 持久化的 Tab URL、标题和标记，重新创建物理 Surface。视口、焦点、页面历史、表单和 DOM 内存不跨重启。 |
 
+### 5.5 网络边界
+
+浏览器 guest 可以访问公网、本机和局域网（开发服务器是核心用途），但有三条固定边界，规则只有一份来源：
+
+- 静态规则（元数据主机名、`169.254.0.0/16` 等链路本地与云元数据地址、IPv4 映射的 IPv6 形式、本机与私有网段分类）在 `contracts/desktop-browser/network-policy.json`，由 `scripts/generate-browser-network-policy.mjs` 生成 Rust 与 TypeScript 常量；两端测试读取同一组 `vectors`。
+- daemon 在工具与 API 入口用同一规则做早期拒绝（`validate_browser_navigation_url`）；Electron Main 的求值器 `browser-network-policy.ts` 是实际执行点。
+- 动态规则只属于 Main：Magi 自身服务端口（daemon）不允许被 guest 访问，否则代理可以把自己的浏览器当成 Web 客户端去调用审批、提问等接口。
+- 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
+
 ### 5.3 标记与 DOM 选择
 
 标记选择层、备注编辑器和标记历史是当前 Browser Tab 内容槽内的 Renderer DOM 浮层；它们不得占用右栏外框空间。坐标只允许按以下单向关系转换：

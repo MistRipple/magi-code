@@ -1,3 +1,11 @@
+export {
+  BROWSER_BLOCKED_CIDRS,
+  BROWSER_BLOCKED_HOSTNAMES,
+  BROWSER_LOOPBACK_CIDRS,
+  BROWSER_LOOPBACK_HOSTNAMES,
+  BROWSER_PRIVATE_NETWORK_CIDRS,
+} from "./browser-network-policy.generated.js";
+
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 6 } as const;
 
 /**
