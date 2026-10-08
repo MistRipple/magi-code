@@ -6,10 +6,10 @@ export {
   BROWSER_PREVIEW_HOSTNAME,
   BROWSER_PREVIEW_OPEN_PATH,
   BROWSER_PREVIEW_PATH_PREFIX,
-  BROWSER_PRIVATE_NETWORK_CIDRS,
+  BROWSER_LAN_CIDRS,
 } from "./browser-network-policy.generated.js";
 
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 6 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 7 } as const;
 
 /**
  * Browser Surface 允许自动化附着的页面内部 Target 类型。
@@ -196,6 +196,10 @@ export type BrowserHostCommand =
   | {
       type: "set_annotations";
       payload: { tab_id: BrowserTabId; annotations: unknown[] };
+    }
+  | {
+      type: "configure_network_policy";
+      payload: { lan_access_enabled: boolean };
     }
   | { type: "inspect_start"; payload: BrowserSurfaceIdentity }
   | { type: "inspect_stop"; payload: BrowserSurfaceIdentity }

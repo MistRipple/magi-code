@@ -273,6 +273,8 @@ mod tests {
                 revision: provider_revision.load(Ordering::Acquire),
                 in_app_browser_enabled: true,
                 browser_use_enabled: provider_enabled.load(Ordering::Acquire),
+                devtools_enabled: true,
+                lan_access_enabled: false,
                 host_status: BrowserHostStatus::Ready,
                 host_protocol_compatible: true,
             }),

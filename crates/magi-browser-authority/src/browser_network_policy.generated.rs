@@ -31,7 +31,7 @@ pub const LOOPBACK_CIDRS: &[&str] = &[
 ];
 
 #[rustfmt::skip]
-pub const PRIVATE_NETWORK_CIDRS: &[&str] = &[
+pub const LAN_CIDRS: &[&str] = &[
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",

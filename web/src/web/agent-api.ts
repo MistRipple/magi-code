@@ -991,10 +991,17 @@ export interface BrowserSessionSnapshot {
   updatedAt: number;
 }
 
-export interface BrowserCapabilitiesSnapshot {
-  revision: number;
+export interface BrowserCapabilitySettings {
   inAppBrowserEnabled: boolean;
   browserUseEnabled: boolean;
+  /** 开发者工具集（性能、Lighthouse、堆快照等低频诊断）对模型可见。 */
+  devtoolsEnabled: boolean;
+  /** 浏览器允许访问局域网私有网段；本机回环地址始终允许。 */
+  lanAccessEnabled: boolean;
+}
+
+export interface BrowserCapabilitiesSnapshot extends BrowserCapabilitySettings {
+  revision: number;
   hostStatus: 'stopped' | 'starting' | 'ready' | 'reconnecting' | 'failed';
   hostProtocolCompatible: boolean;
   hostState: string;
@@ -1074,10 +1081,9 @@ export async function getBrowserCapabilities(): Promise<BrowserCapabilitiesSnaps
   return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'load browser capabilities');
 }
 
-export async function updateBrowserSettings(settings: {
-  inAppBrowserEnabled: boolean;
-  browserUseEnabled: boolean;
-}): Promise<BrowserCapabilitiesSnapshot> {
+export async function updateBrowserSettings(
+  settings: BrowserCapabilitySettings,
+): Promise<BrowserCapabilitiesSnapshot> {
   const response = await getTransport().request(agentUrl('/api/browser/settings'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

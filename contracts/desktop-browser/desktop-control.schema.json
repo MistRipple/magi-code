@@ -305,6 +305,14 @@
         "viewport": { "$ref": "#/$defs/logicalViewport" }
       }
     },
+    "networkPolicyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lan_access_enabled"],
+      "properties": {
+        "lan_access_enabled": { "type": "boolean" }
+      }
+    },
     "annotationsPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -1278,6 +1286,15 @@
           "properties": {
             "type": { "const": "set_annotations" },
             "payload": { "$ref": "#/$defs/annotationsPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "configure_network_policy" },
+            "payload": { "$ref": "#/$defs/networkPolicyPayload" }
           }
         },
         {

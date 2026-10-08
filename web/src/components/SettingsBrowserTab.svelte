@@ -10,6 +10,7 @@
     resetWebModels,
     updateBrowserSettings,
     type BrowserCapabilitiesSnapshot,
+    type BrowserCapabilitySettings,
     type BrowserResourceTabSnapshot,
     type BrowserResourcesSnapshot,
   } from '../web/agent-api';
@@ -33,7 +34,7 @@
   let resourceError = $state('');
   let actionNotice = $state('');
   let activeAction = $state<DesktopAction | ''>('');
-  let savingSetting = $state<'inAppBrowserEnabled' | 'browserUseEnabled' | ''>('');
+  let savingSetting = $state<keyof BrowserCapabilitySettings | ''>('');
   let browserResources = $state<BrowserResourcesSnapshot | null>(null);
   let resourceManagerOpen = $state(false);
   let resourceLoading = $state(false);
@@ -202,7 +203,7 @@
   }
 
   async function saveCapabilitySetting(
-    key: 'inAppBrowserEnabled' | 'browserUseEnabled',
+    key: keyof BrowserCapabilitySettings,
     enabled: boolean,
   ): Promise<void> {
     if (!isDesktop || !capabilitySnapshot || savingSetting) return;
@@ -210,12 +211,11 @@
     capabilityError = '';
     try {
       capabilitySnapshot = await updateBrowserSettings({
-        inAppBrowserEnabled: key === 'inAppBrowserEnabled'
-          ? enabled
-          : capabilitySnapshot.inAppBrowserEnabled,
-        browserUseEnabled: key === 'browserUseEnabled'
-          ? enabled
-          : capabilitySnapshot.browserUseEnabled,
+        inAppBrowserEnabled: capabilitySnapshot.inAppBrowserEnabled,
+        browserUseEnabled: capabilitySnapshot.browserUseEnabled,
+        devtoolsEnabled: capabilitySnapshot.devtoolsEnabled,
+        lanAccessEnabled: capabilitySnapshot.lanAccessEnabled,
+        [key]: enabled,
       });
       window.dispatchEvent(new CustomEvent('magi:browserCapabilitiesChanged', {
         detail: capabilitySnapshot,
@@ -440,6 +440,30 @@
             disabled={!isDesktop || !capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
             ariaLabel={i18n.t('settings.browser.browserUse')}
             onchange={(enabled) => void saveCapabilitySetting('browserUseEnabled', enabled)}
+          />
+        </div>
+        <div class="capability-row">
+          <div>
+            <strong>{i18n.t('settings.browser.devtools')}</strong>
+            <span>{i18n.t('settings.browser.devtoolsDescription')}</span>
+          </div>
+          <Toggle
+            checked={capabilitySnapshot?.devtoolsEnabled ?? false}
+            disabled={!isDesktop || !capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
+            ariaLabel={i18n.t('settings.browser.devtools')}
+            onchange={(enabled) => void saveCapabilitySetting('devtoolsEnabled', enabled)}
+          />
+        </div>
+        <div class="capability-row">
+          <div>
+            <strong>{i18n.t('settings.browser.lanAccess')}</strong>
+            <span>{i18n.t('settings.browser.lanAccessDescription')}</span>
+          </div>
+          <Toggle
+            checked={capabilitySnapshot?.lanAccessEnabled ?? false}
+            disabled={!isDesktop || !capabilitySnapshot || capabilityLoading || Boolean(savingSetting)}
+            ariaLabel={i18n.t('settings.browser.lanAccess')}
+            onchange={(enabled) => void saveCapabilitySetting('lanAccessEnabled', enabled)}
           />
         </div>
       </div>

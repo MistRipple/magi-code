@@ -16,6 +16,7 @@ use magi_browser_authority::{
     BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget, BrowserSurfaceBinding,
     BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
     CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
+    validate_browser_navigation_url_with,
 };
 use magi_core::{
     BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, ExecutionOwnership,
@@ -78,8 +79,10 @@ impl BrowserToolRuntimeDependencies {
             .clone();
         BrowserCapabilitySnapshot {
             revision: host.revision,
-            in_app_browser_enabled: host.in_app_browser_enabled,
-            browser_use_enabled: host.browser_use_enabled,
+            in_app_browser_enabled: host.settings.in_app_browser_enabled,
+            browser_use_enabled: host.settings.browser_use_enabled,
+            devtools_enabled: host.settings.devtools_enabled,
+            lan_access_enabled: host.settings.lan_access_enabled,
             host_status: host.status,
             host_protocol_compatible: host.protocol_compatible,
         }
@@ -233,7 +236,7 @@ impl BrowserToolRuntimeDependencies {
         // 会先创建并展示 about:blank，再返回参数错误，留下与失败请求无关的
         // 物理页面和 revision 事件。
         let navigation = (tool_name == "browser_navigate")
-            .then(|| parse_browser_navigation(arguments))
+            .then(|| parse_browser_navigation(arguments, self.capabilities().lan_access_enabled))
             .transpose()?;
         let executor = browser_executor_key(scope.context);
         let tab = self
@@ -1451,7 +1454,11 @@ impl BrowserToolRuntimeDependencies {
             "new" => {
                 let initial_url =
                     optional_string(arguments, "url").unwrap_or_else(|| "about:blank".to_string());
-                validate_browser_navigation_url(&initial_url).map_err(|error| {
+                validate_browser_navigation_url_with(
+                    &initial_url,
+                    self.capabilities().lan_access_enabled,
+                )
+                .map_err(|error| {
                     BrowserToolError::new(
                         "browser_navigation_url_rejected",
                         format!("浏览器导航 URL 不合法: {error}"),
@@ -1594,6 +1601,7 @@ fn validate_browser_tabs_arguments(arguments: &Map<String, Value>) -> Result<(),
 
 fn parse_browser_navigation(
     arguments: &Map<String, Value>,
+    allow_lan_access: bool,
 ) -> Result<BrowserNavigation, BrowserToolError> {
     let action = optional_string(arguments, "action")
         .or_else(|| optional_string(arguments, "url").map(|_| "url".to_string()))
@@ -1635,7 +1643,7 @@ fn parse_browser_navigation(
                 ));
             }
             let url = string_arg(arguments, "url")?;
-            validate_browser_navigation_url(&url).map_err(|error| {
+            validate_browser_navigation_url_with(&url, allow_lan_access).map_err(|error| {
                 BrowserToolError::new(
                     "browser_navigation_url_rejected",
                     format!("浏览器导航 URL 不合法: {error}"),
@@ -2929,7 +2937,7 @@ mod tests {
             Value::String("file:///Users/xie/.magi/personal-sessions/session/".to_string()),
         );
 
-        let error = parse_browser_navigation(&arguments)
+        let error = parse_browser_navigation(&arguments, true)
             .expect_err("invalid navigation must fail before ensure_tab can create a tab");
         assert_eq!(error.code, "browser_navigation_url_rejected");
     }
@@ -2938,7 +2946,7 @@ mod tests {
     fn browser_navigation_stop_has_no_url_or_timeout_side_effects() {
         let arguments = Map::from_iter([("action".to_string(), Value::String("stop".to_string()))]);
         assert!(matches!(
-            parse_browser_navigation(&arguments),
+            parse_browser_navigation(&arguments, true),
             Ok(magi_browser_authority::BrowserNavigation::Stop)
         ));
 
@@ -2946,7 +2954,7 @@ mod tests {
             ("action".to_string(), Value::String("stop".to_string())),
             ("timeout_ms".to_string(), Value::from(1000)),
         ]);
-        let error = parse_browser_navigation(&invalid)
+        let error = parse_browser_navigation(&invalid, true)
             .expect_err("stop must reject timeout because it is an immediate interrupt");
         assert_eq!(error.code, "invalid_navigation");
     }
@@ -3212,6 +3220,8 @@ mod tests {
                 revision: 1,
                 in_app_browser_enabled: true,
                 browser_use_enabled: true,
+                devtools_enabled: true,
+                lan_access_enabled: false,
                 host_status: BrowserHostStatus::Ready,
                 host_protocol_compatible: true,
             }),
@@ -3427,8 +3437,10 @@ mod tests {
             .expect("browser profile should register");
         let host_status = Arc::new(RwLock::new(BrowserHostStatusSnapshot {
             revision: 1,
-            in_app_browser_enabled: true,
-            browser_use_enabled: true,
+            settings: crate::state::BrowserCapabilitySettings {
+                devtools_enabled: true,
+                ..Default::default()
+            },
             status: BrowserHostStatus::Ready,
             protocol_compatible: true,
             last_error_code: None,
@@ -3464,6 +3476,8 @@ mod tests {
                     revision: 1,
                     in_app_browser_enabled: true,
                     browser_use_enabled: true,
+                    devtools_enabled: true,
+                    lan_access_enabled: false,
                     host_status: BrowserHostStatus::Ready,
                     host_protocol_compatible: true,
                 }),

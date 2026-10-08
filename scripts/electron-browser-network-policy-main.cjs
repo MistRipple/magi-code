@@ -35,6 +35,10 @@ app.whenReady().then(async () => {
       res.writeHead(302, { location: `http://127.0.0.1:${selfPort}/api/session/tool-approvals` });
       return res.end();
     }
+    if (req.url === "/redirect-lan") {
+      res.writeHead(302, { location: "http://10.0.0.5:81/admin" });
+      return res.end();
+    }
     if (req.url === "/redirect-metadata") {
       res.writeHead(302, { location: "http://169.254.169.254/latest/meta-data" });
       return res.end();
@@ -44,7 +48,7 @@ app.whenReady().then(async () => {
     res.end(`<!doctype html><title>t</title><iframe id=f src="http://127.0.0.1:${selfPort}/api/frame"></iframe>`);
   });
 
-  const config = { selfPorts: new Set([selfPort]), allowPrivateNetwork: true };
+  const config = { selfPorts: new Set([selfPort]), allowLanAccess: false };
   const ses = session.fromPartition("magi-browser-netpolicy-smoke");
   // 与 BrowserSurfaceManager.configurePartition 里的钩子完全一致。
   ses.webRequest.onBeforeRequest(
@@ -86,6 +90,17 @@ app.whenReady().then(async () => {
     });
     record(`${name}被拦截`, failure.startsWith("-20:"), failure);
   }
+  // 局域网私有网段默认关闭：导航到局域网地址立即被拦截（-20），不是等待连接超时。
+  const lanFailure = await new Promise((resolve) => {
+    wc.once("did-fail-load", (_e, code, desc) => resolve(`${code}:${desc}`));
+    wc.loadURL("http://192.168.254.254:81/").catch(() => {});
+  });
+  record("局域网地址在开关关闭时立即被拦截", lanFailure.startsWith("-20:"), lanFailure);
+  const lanRedirect = await new Promise((resolve) => {
+    wc.once("did-fail-load", (_e, code, desc) => resolve(`${code}:${desc}`));
+    wc.loadURL(`http://127.0.0.1:${web.port}/redirect-lan`).catch(() => {});
+  });
+  record("重定向到局域网地址同样被拦截", lanRedirect.startsWith("-20:"), lanRedirect);
   record("重定向后自身端口服务器仍然零命中", !selfHits.some((hit) => hit.url.startsWith("/api/session")), JSON.stringify(selfHits));
 
   // 4) 预览来源：site.localhost 解析到本机并且被放行

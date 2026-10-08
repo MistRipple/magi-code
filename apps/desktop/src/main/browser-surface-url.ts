@@ -5,7 +5,7 @@ import {
 
 let networkPolicy: BrowserNetworkPolicyConfig = {
   selfPorts: new Set(),
-  allowPrivateNetwork: true,
+  allowLanAccess: false,
 };
 
 /**

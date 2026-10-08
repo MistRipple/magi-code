@@ -21,8 +21,8 @@ function vectors(name: string): string[] {
   return values;
 }
 
-const open: BrowserNetworkPolicyConfig = { selfPorts: new Set(), allowPrivateNetwork: true };
-const closed: BrowserNetworkPolicyConfig = { selfPorts: new Set(), allowPrivateNetwork: false };
+const open: BrowserNetworkPolicyConfig = { selfPorts: new Set(), allowLanAccess: true };
+const closed: BrowserNetworkPolicyConfig = { selfPorts: new Set(), allowLanAccess: false };
 
 function verdict(raw: string, config: BrowserNetworkPolicyConfig) {
   return evaluateBrowserNavigation(new URL(raw), config);
@@ -34,22 +34,29 @@ test("共享用例：云元数据与链路本地地址始终被拦截", () => {
   }
 });
 
-test("共享用例：公网目标放行", () => {
-  for (const raw of [...vectors("allowed"), ...vectors("allowedEvenWhenPrivateNetworkDisallowed")]) {
+test("共享用例：公网目标始终放行", () => {
+  for (const raw of [...vectors("allowed"), ...vectors("public")]) {
     assert.deepEqual(verdict(raw, open), { allowed: true }, raw);
     assert.deepEqual(verdict(raw, closed), { allowed: true }, raw);
   }
 });
 
-test("共享用例：关闭本机与局域网后私有目标被拦截，打开时放行", () => {
-  for (const raw of vectors("blockedWhenPrivateNetworkDisallowed")) {
+test("共享用例：本机回环地址不受局域网开关影响", () => {
+  for (const raw of vectors("loopback")) {
     assert.deepEqual(verdict(raw, open), { allowed: true }, raw);
-    assert.deepEqual(verdict(raw, closed), { allowed: false, reason: "private_network" }, raw);
+    assert.deepEqual(verdict(raw, closed), { allowed: true }, raw);
+  }
+});
+
+test("共享用例：局域网私有网段只在开关打开时放行", () => {
+  for (const raw of vectors("lan")) {
+    assert.deepEqual(verdict(raw, open), { allowed: true }, raw);
+    assert.deepEqual(verdict(raw, closed), { allowed: false, reason: "lan_access_disabled" }, raw);
   }
 });
 
 test("Magi 自身端口只在本机地址上被拦截", () => {
-  const withSelf: BrowserNetworkPolicyConfig = { selfPorts: new Set([38123]), allowPrivateNetwork: true };
+  const withSelf: BrowserNetworkPolicyConfig = { selfPorts: new Set([38123]), allowLanAccess: true };
   for (const raw of [
     "http://127.0.0.1:38123/web.html",
     "http://localhost:38123/api/session/tool-approval",
@@ -81,7 +88,7 @@ test("协议与凭据只约束导航入口，不约束子资源请求", () => {
 });
 
 test("共享用例：HTML 预览主机只放行预览路径，其余同端口路径仍是自身来源", () => {
-  const withSelf: BrowserNetworkPolicyConfig = { selfPorts: new Set([38123]), allowPrivateNetwork: false };
+  const withSelf: BrowserNetworkPolicyConfig = { selfPorts: new Set([38123]), allowLanAccess: false };
   for (const raw of vectors("previewAllowed")) {
     assert.deepEqual(verdict(raw, withSelf), { allowed: true }, raw);
   }
@@ -92,7 +99,7 @@ test("共享用例：HTML 预览主机只放行预览路径，其余同端口路
     }
     assert.deepEqual(verdict(raw, withSelf), { allowed: false, reason: "self_origin" }, raw);
     assert.deepEqual(
-      verdict(raw, { ...withSelf, allowPrivateNetwork: true }),
+      verdict(raw, { ...withSelf, allowLanAccess: true }),
       { allowed: false, reason: "self_origin" },
       raw,
     );

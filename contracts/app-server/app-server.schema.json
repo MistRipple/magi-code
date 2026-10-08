@@ -684,13 +684,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "revision", "inAppBrowserEnabled", "browserUseEnabled", "hostStatus",
-        "hostProtocolCompatible"
+        "revision", "inAppBrowserEnabled", "browserUseEnabled", "devtoolsEnabled",
+        "lanAccessEnabled", "hostStatus", "hostProtocolCompatible"
       ],
       "properties": {
         "revision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
         "inAppBrowserEnabled": { "type": "boolean" },
         "browserUseEnabled": { "type": "boolean" },
+        "devtoolsEnabled": { "type": "boolean" },
+        "lanAccessEnabled": { "type": "boolean" },
         "hostStatus": { "$ref": "#/$defs/BrowserHostStatus" },
         "hostProtocolCompatible": { "type": "boolean" }
       }

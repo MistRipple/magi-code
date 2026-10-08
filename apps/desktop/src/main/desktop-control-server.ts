@@ -85,6 +85,7 @@ export class DesktopControlServer {
   readonly #ensureBrowserSurfaceInBackground: EnsureBrowserSurfaceInBackground;
   readonly #materializeBrowserSurfaceInBackground: MaterializeBrowserSurfaceInBackground;
   readonly #handshake: () => DesktopBrowserHandshake;
+  readonly #applyNetworkPolicy: (policy: { lanAccessEnabled: boolean }) => void;
   readonly #onConnectionState: ((connected: boolean) => void) | undefined;
   readonly #queues = new Map<string, ResourceQueue>();
   readonly #active = new Map<string, DesktopControlCommand>();
@@ -127,6 +128,8 @@ export class DesktopControlServer {
     ensureBrowserSurfaceInBackground: EnsureBrowserSurfaceInBackground;
     materializeBrowserSurfaceInBackground: MaterializeBrowserSurfaceInBackground;
     handshake: () => DesktopBrowserHandshake;
+    /** daemon 推送的浏览器网络策略：由 Main 在 guest 网络层执行。 */
+    applyNetworkPolicy: (policy: { lanAccessEnabled: boolean }) => void;
     onConnectionState?: (connected: boolean) => void;
   }) {
     this.#socketPath = input.socketPath;
@@ -138,6 +141,7 @@ export class DesktopControlServer {
     this.#materializeBrowserSurfaceInBackground =
       input.materializeBrowserSurfaceInBackground;
     this.#handshake = input.handshake;
+    this.#applyNetworkPolicy = input.applyNetworkPolicy;
     this.#onConnectionState = input.onConnectionState;
   }
 
@@ -922,6 +926,12 @@ export class DesktopControlServer {
             },
           },
         });
+      }
+      case "configure_network_policy": {
+        this.#applyNetworkPolicy({
+          lanAccessEnabled: command.payload.lan_access_enabled,
+        });
+        return succeeded({ type: "empty" });
       }
       case "set_annotations": {
         this.recordAnnotationProjection(

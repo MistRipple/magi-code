@@ -13,6 +13,10 @@ pub enum BrowserNavigationUrlError {
     UserCredentialsNotAllowed,
     #[error("browser navigation URL targets a blocked network endpoint")]
     BlockedNetworkTarget,
+    #[error(
+        "browser navigation URL targets a local-network address; enable LAN access in Settings → Browser to allow it"
+    )]
+    LanAccessDisabled,
 }
 
 /// 将 Browser Host 的页面状态收敛到可恢复的 URL 边界。
@@ -40,6 +44,15 @@ pub fn browser_navigation_origin(raw_url: &str) -> Option<String> {
 /// scheme、URL 凭据和云元数据 / 链路本地地址，避免本机网络边界被网页导航绕过。
 /// 规则来自 `contracts/desktop-browser/network-policy.json`，Electron Main 使用同一份。
 pub fn validate_browser_navigation_url(raw_url: &str) -> Result<(), BrowserNavigationUrlError> {
+    validate_browser_navigation_url_with(raw_url, true)
+}
+
+/// 同 [`validate_browser_navigation_url`]，并按设置决定是否允许局域网私有网段。
+/// 本机回环地址始终允许（开发服务器），Magi 自身端口由 Electron Main 在网络层拦截。
+pub fn validate_browser_navigation_url_with(
+    raw_url: &str,
+    allow_lan_access: bool,
+) -> Result<(), BrowserNavigationUrlError> {
     let url = Url::parse(raw_url.trim()).map_err(|_| BrowserNavigationUrlError::InvalidUrl)?;
     if url.as_str() == "about:blank" {
         return Ok(());
@@ -50,18 +63,19 @@ pub fn validate_browser_navigation_url(raw_url: &str) -> Result<(), BrowserNavig
     if !url.username().is_empty() || url.password().is_some() {
         return Err(BrowserNavigationUrlError::UserCredentialsNotAllowed);
     }
-    if classify_host(url.host().ok_or(BrowserNavigationUrlError::InvalidUrl)?) == HostClass::Blocked
-    {
-        return Err(BrowserNavigationUrlError::BlockedNetworkTarget);
+    match classify_host(url.host().ok_or(BrowserNavigationUrlError::InvalidUrl)?) {
+        HostClass::Blocked => Err(BrowserNavigationUrlError::BlockedNetworkTarget),
+        HostClass::Lan if !allow_lan_access => Err(BrowserNavigationUrlError::LanAccessDisabled),
+        HostClass::Loopback | HostClass::Lan | HostClass::Public => Ok(()),
     }
-    Ok(())
 }
 
-/// 目标主机的网络归类。`Private` 是本机与局域网，是否放行由调用方的设置决定。
+/// 目标主机的网络归类。回环（本机开发服务器）始终允许，局域网私有网段由设置决定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostClass {
     Blocked,
-    Private,
+    Loopback,
+    Lan,
     Public,
 }
 
@@ -116,8 +130,7 @@ fn parse_cidrs(values: &[&str]) -> Vec<Cidr> {
 
 static BLOCKED_CIDRS: LazyLock<Vec<Cidr>> = LazyLock::new(|| parse_cidrs(policy::BLOCKED_CIDRS));
 static LOOPBACK_CIDRS: LazyLock<Vec<Cidr>> = LazyLock::new(|| parse_cidrs(policy::LOOPBACK_CIDRS));
-static PRIVATE_CIDRS: LazyLock<Vec<Cidr>> =
-    LazyLock::new(|| parse_cidrs(policy::PRIVATE_NETWORK_CIDRS));
+static LAN_CIDRS: LazyLock<Vec<Cidr>> = LazyLock::new(|| parse_cidrs(policy::LAN_CIDRS));
 
 fn hostname_matches(host: &str, names: &[&str]) -> bool {
     names.iter().any(|name| {
@@ -135,7 +148,7 @@ fn classify_host(host: Host<&str>) -> HostClass {
             if hostname_matches(&domain, policy::BLOCKED_HOSTNAMES) {
                 HostClass::Blocked
             } else if hostname_matches(&domain, policy::LOOPBACK_HOSTNAMES) {
-                HostClass::Private
+                HostClass::Loopback
             } else {
                 HostClass::Public
             }
@@ -160,8 +173,10 @@ fn classify_ip(ip: IpAddr) -> HostClass {
     };
     if any(&BLOCKED_CIDRS) {
         HostClass::Blocked
-    } else if any(&LOOPBACK_CIDRS) || any(&PRIVATE_CIDRS) {
-        HostClass::Private
+    } else if any(&LOOPBACK_CIDRS) {
+        HostClass::Loopback
+    } else if any(&LAN_CIDRS) {
+        HostClass::Lan
     } else {
         HostClass::Public
     }
@@ -171,6 +186,7 @@ fn classify_ip(ip: IpAddr) -> HostClass {
 mod tests {
     use super::{
         BrowserNavigationUrlError, HostClass, classify_host, validate_browser_navigation_url,
+        validate_browser_navigation_url_with,
     };
     use url::Url;
 
@@ -206,22 +222,38 @@ mod tests {
 
     #[test]
     fn shared_vectors_allowed_targets_are_accepted() {
-        for url in vectors("allowed")
-            .into_iter()
-            .chain(vectors("allowedEvenWhenPrivateNetworkDisallowed"))
-        {
+        for url in vectors("allowed") {
             assert!(validate_browser_navigation_url(&url).is_ok(), "{url}");
         }
     }
 
     #[test]
-    fn shared_vectors_private_network_is_classified_private_but_not_blocked() {
-        for url in vectors("blockedWhenPrivateNetworkDisallowed") {
-            assert_eq!(class_of(&url), HostClass::Private, "{url}");
-            assert!(validate_browser_navigation_url(&url).is_ok(), "{url}");
+    fn shared_vectors_classify_loopback_lan_and_public_targets() {
+        for url in vectors("loopback") {
+            assert_eq!(class_of(&url), HostClass::Loopback, "{url}");
+            assert!(
+                validate_browser_navigation_url_with(&url, false).is_ok(),
+                "{url}"
+            );
         }
-        for url in vectors("allowedEvenWhenPrivateNetworkDisallowed") {
+        for url in vectors("lan") {
+            assert_eq!(class_of(&url), HostClass::Lan, "{url}");
+            assert!(
+                validate_browser_navigation_url_with(&url, true).is_ok(),
+                "{url}"
+            );
+            assert_eq!(
+                validate_browser_navigation_url_with(&url, false),
+                Err(BrowserNavigationUrlError::LanAccessDisabled),
+                "{url}"
+            );
+        }
+        for url in vectors("public") {
             assert_eq!(class_of(&url), HostClass::Public, "{url}");
+            assert!(
+                validate_browser_navigation_url_with(&url, false).is_ok(),
+                "{url}"
+            );
         }
     }
 

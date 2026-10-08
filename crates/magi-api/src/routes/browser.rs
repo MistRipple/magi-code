@@ -18,7 +18,7 @@ use magi_browser_authority::{
     BrowserNavigation, BrowserNormalizedRect, BrowserRegionAnnotationAnchor, BrowserSession,
     BrowserSessionLifecycle, BrowserSessionOwner, BrowserSurfaceControlSnapshot, BrowserTab,
     BrowserTabLifecycle, BrowserViewport, CreateBrowserSession, CreateBrowserTab,
-    MAX_BROWSER_TABS_TOTAL, validate_browser_navigation_url,
+    MAX_BROWSER_TABS_TOTAL, validate_browser_navigation_url_with,
 };
 use magi_core::{
     BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, SessionId,
@@ -218,8 +218,7 @@ async fn register_desktop_connection(
         let previous = state.browser_host_status();
         let status = BrowserHostStatusSnapshot {
             revision: previous.revision,
-            in_app_browser_enabled: previous.in_app_browser_enabled,
-            browser_use_enabled: previous.browser_use_enabled,
+            settings: previous.settings,
             status: BrowserHostStatus::Starting,
             protocol_compatible: false,
             last_error_code: None,
@@ -251,8 +250,7 @@ async fn clear_desktop_connection(
         let previous = state.browser_host_status();
         let status = BrowserHostStatusSnapshot {
             revision: previous.revision,
-            in_app_browser_enabled: previous.in_app_browser_enabled,
-            browser_use_enabled: previous.browser_use_enabled,
+            settings: previous.settings,
             status: BrowserHostStatus::Stopped,
             protocol_compatible: false,
             last_error_code: None,
@@ -502,6 +500,8 @@ struct BrowserCapabilitiesResponse {
     revision: u64,
     in_app_browser_enabled: bool,
     browser_use_enabled: bool,
+    devtools_enabled: bool,
+    lan_access_enabled: bool,
     host_status: magi_browser_authority::BrowserHostStatus,
     host_protocol_compatible: bool,
     host_state: String,
@@ -531,6 +531,8 @@ fn browser_capabilities_response(
         revision: host.revision,
         in_app_browser_enabled: capability.in_app_browser_enabled,
         browser_use_enabled: capability.browser_use_enabled,
+        devtools_enabled: capability.devtools_enabled,
+        lan_access_enabled: capability.lan_access_enabled,
         host_status: host.status,
         host_protocol_compatible: host.protocol_compatible,
         host_state: serde_json::to_value(host.status)
@@ -559,6 +561,8 @@ fn browser_platform_capabilities(
 struct UpdateBrowserSettingsRequest {
     in_app_browser_enabled: bool,
     browser_use_enabled: bool,
+    devtools_enabled: bool,
+    lan_access_enabled: bool,
     client_platform: Option<BrowserClientPlatform>,
 }
 
@@ -568,10 +572,20 @@ async fn update_browser_settings(
     Json(request): Json<UpdateBrowserSettingsRequest>,
 ) -> Result<Json<BrowserCapabilitiesResponse>, ApiError> {
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
-    state.update_browser_capability_settings(
-        request.in_app_browser_enabled,
-        request.browser_use_enabled,
-    )?;
+    // 先让已连接的 Desktop 应用新的网络策略，成功后才落盘；未连接时在下次建立连接时推送。
+    if let Some(client) = state.browser_host_client() {
+        crate::browser_network_policy::push_network_policy(&client, request.lan_access_enabled)
+            .await
+            .map_err(|error| {
+                ApiError::Conflict(format!("设置未能同步到桌面浏览器，未保存: {error}"))
+            })?;
+    }
+    state.update_browser_capability_settings(crate::state::BrowserCapabilitySettings {
+        in_app_browser_enabled: request.in_app_browser_enabled,
+        browser_use_enabled: request.browser_use_enabled,
+        devtools_enabled: request.devtools_enabled,
+        lan_access_enabled: request.lan_access_enabled,
+    })?;
     let response = browser_capabilities_response(
         &state,
         request_client_platform(&state, &headers, request.client_platform),
@@ -582,6 +596,8 @@ async fn update_browser_settings(
         serde_json::json!({
             "in_app_browser_enabled": response.in_app_browser_enabled,
             "browser_use_enabled": response.browser_use_enabled,
+            "devtools_enabled": response.devtools_enabled,
+            "lan_access_enabled": response.lan_access_enabled,
             "revision": response.revision,
         }),
     ));
@@ -2369,7 +2385,7 @@ async fn create_tab(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let browser_session_id = BrowserSessionId::new(browser_session_id);
     let session = wait_for_browser_session_ready(&state, &browser_session_id).await?;
-    validate_navigation_url(&request.initial_url)?;
+    validate_navigation_url(&state, &request.initial_url)?;
     let now = UtcMillis::now();
     let tab_id = BrowserTabId::new(format!(
         "browser-tab-{}-{}",
@@ -3349,7 +3365,7 @@ async fn navigate_tab(
                 .filter(|url| !url.is_empty())
                 .ok_or_else(|| ApiError::InvalidInput("url 导航必须提供 URL".to_string()))?
                 .to_string();
-            validate_navigation_url(&url)?;
+            validate_navigation_url(&state, &url)?;
             BrowserNavigation::Url {
                 url,
                 handle_before_unload: None,
@@ -3440,9 +3456,12 @@ async fn navigate_tab(
     Ok(Json(response))
 }
 
-fn validate_navigation_url(url: &str) -> Result<(), ApiError> {
-    validate_browser_navigation_url(url)
-        .map_err(|error| ApiError::InvalidInput(format!("浏览器导航 URL 不合法: {error}")))
+fn validate_navigation_url(state: &ApiState, url: &str) -> Result<(), ApiError> {
+    validate_browser_navigation_url_with(
+        url,
+        state.browser_capability_snapshot().lan_access_enabled,
+    )
+    .map_err(|error| ApiError::InvalidInput(format!("浏览器导航 URL 不合法: {error}")))
 }
 
 #[derive(Debug, Deserialize)]

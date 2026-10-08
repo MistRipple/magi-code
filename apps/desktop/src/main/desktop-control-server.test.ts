@@ -103,6 +103,34 @@ test("控制连接断开只释放浏览器自动化控制态，不关闭逻辑 T
   }
 });
 
+test("configure_network_policy 由 Main 直接应用，不经过 Worker", async () => {
+  const applied: Array<{ lanAccessEnabled: boolean }> = [];
+  const worker = {
+    execute: async () => failedOutcome("network policy must not reach the worker"),
+    forwardSurfaceEvent: async () => undefined,
+  } as unknown as AutomationWorker;
+  const { server, socketPath } = createControlServer(worker, {
+    onNetworkPolicy: (policy) => applied.push(policy),
+  });
+  await server.start();
+  const client = await connect(socketPath);
+  try {
+    for (const [requestId, enabled] of [["policy-on", true], ["policy-off", false]] as const) {
+      const responsePromise = nextJsonMatching(client, (message) => message.request_id === requestId);
+      client.send(JSON.stringify(request(requestId, {
+        type: "configure_network_policy",
+        payload: { lan_access_enabled: enabled },
+      })));
+      const response = await responsePromise;
+      assert.equal(response.outcome?.status, "succeeded", requestId);
+    }
+    assert.deepEqual(applied, [{ lanAccessEnabled: true }, { lanAccessEnabled: false }]);
+  } finally {
+    await closeSocket(client);
+    await server.close();
+  }
+});
+
 test("primary_changed 未完成 Worker 重绑前，同一 Tab 的命令不得执行", async () => {
   const rebind = deferred<void>();
   const calls: BrowserHostCommand[] = [];
@@ -1119,13 +1147,16 @@ function createControlServer(
     onRetainForAgent?: (tabId: string) => void;
     onConnectionState?: (connected: boolean) => void;
     onHostControlReleased?: () => void;
+    onNetworkPolicy?: (policy: { lanAccessEnabled: boolean }) => void;
   } = {},
 ): { server: DesktopControlServer; socketPath: string } {
   // macOS limits Unix-domain socket paths to a little over 100 bytes. The
   // system temp directory is already long enough that a UUID-based name can
   // exceed that limit, so keep the test socket basename deliberately short.
-  const socketRoot = process.platform === "win32" ? tmpdir() : "/tmp";
-  const socketPath = join(socketRoot, `magi-dc-${process.pid}-${socketSequence++}.sock`);
+  const socketName = "magi-dc-" + process.pid + "-" + socketSequence++;
+  const socketPath = process.platform === "win32"
+    ? "\\\\.\\pipe\\" + socketName
+    : join("/tmp", socketName + ".sock");
   const bindings = options.bindings ?? [binding];
   let primaryTabId = options.primaryTabId ?? binding.tab_id;
   let primaryWindowId = options.primaryWindowId
@@ -1216,6 +1247,7 @@ function createControlServer(
         reannouncePrimary: true,
       }),
     handshake: () => handshake,
+    applyNetworkPolicy: (policy) => options.onNetworkPolicy?.(policy),
     ...(options.onConnectionState ? { onConnectionState: options.onConnectionState } : {}),
   });
   return { server, socketPath };

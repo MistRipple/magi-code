@@ -1036,6 +1036,10 @@ pub struct BrowserCapabilitySnapshot {
     pub in_app_browser_enabled: bool,
     #[serde(rename = "browserUseEnabled")]
     pub browser_use_enabled: bool,
+    #[serde(rename = "devtoolsEnabled")]
+    pub devtools_enabled: bool,
+    #[serde(rename = "lanAccessEnabled")]
+    pub lan_access_enabled: bool,
     #[serde(rename = "hostStatus")]
     pub host_status: BrowserHostStatus,
     #[serde(rename = "hostProtocolCompatible")]

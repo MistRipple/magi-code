@@ -68,9 +68,10 @@ if (!Number.isInteger(daemonPort) || daemonPort < 1024 || daemonPort > 65535) {
 }
 const AGENT_ORIGIN = `http://127.0.0.1:${daemonPort}`;
 // Magi 自身服务不能被浏览器 guest 访问：代理或页面访问本机 daemon 等于绕过工具审批边界。
+// 局域网访问默认关闭；daemon 在 Host 连接建立时以及设置变化时推送实际开关。
 configureBrowserNetworkPolicy({
   selfPorts: new Set([daemonPort]),
-  allowPrivateNetwork: true,
+  allowLanAccess: false,
 });
 const DESKTOP_RENDERER_AUTH_HEADER = "X-Magi-Desktop-Renderer-Token";
 const MAGI_DAEMON_SERVICE_NAME = "magi-rust-backend";
@@ -269,6 +270,11 @@ if (singleInstance) {
         materializeBrowserSurfaceInBackground: (input) =>
           manager.materializeBrowserSurfaceInBackground(input),
         handshake: () => handshake(worker!),
+        applyNetworkPolicy: ({ lanAccessEnabled }) =>
+          configureBrowserNetworkPolicy({
+            selfPorts: new Set([daemonPort]),
+            allowLanAccess: lanAccessEnabled,
+          }),
         onConnectionState: (connected) => {
           desktopControlConnected = connected;
           desktopControlConnectionRevision =

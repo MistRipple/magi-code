@@ -3474,6 +3474,8 @@ mod tests {
                     revision: 11,
                     in_app_browser_enabled: true,
                     browser_use_enabled: true,
+                    devtools_enabled: true,
+                    lan_access_enabled: false,
                     host_status: magi_browser_authority::BrowserHostStatus::Ready,
                     host_protocol_compatible: true,
                 }),

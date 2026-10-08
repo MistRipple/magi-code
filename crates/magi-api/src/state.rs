@@ -939,11 +939,62 @@ pub struct RunnerStatusSnapshot {
     pub last_error: Option<String>,
 }
 
+/// 用户在设置里控制的浏览器能力开关。daemon 是它们的唯一所有者：
+/// 持久化在设置存储的 `browser` 分区，运行时随状态快照一起读取。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCapabilitySettings {
+    pub in_app_browser_enabled: bool,
+    pub browser_use_enabled: bool,
+    /// 开发者工具集（性能、Lighthouse、堆快照等低频诊断）对模型可见。
+    pub devtools_enabled: bool,
+    /// 浏览器允许访问局域网私有网段；本机回环地址始终允许。
+    pub lan_access_enabled: bool,
+}
+
+impl Default for BrowserCapabilitySettings {
+    fn default() -> Self {
+        Self {
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            devtools_enabled: false,
+            lan_access_enabled: false,
+        }
+    }
+}
+
+impl BrowserCapabilitySettings {
+    pub fn from_section(section: &serde_json::Value) -> Self {
+        let defaults = Self::default();
+        let flag = |key: &str, default: bool| {
+            section
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default)
+        };
+        Self {
+            in_app_browser_enabled: flag("inAppBrowserEnabled", defaults.in_app_browser_enabled),
+            browser_use_enabled: flag("browserUseEnabled", defaults.browser_use_enabled),
+            devtools_enabled: flag("devtoolsEnabled", defaults.devtools_enabled),
+            lan_access_enabled: flag("lanAccessEnabled", defaults.lan_access_enabled),
+        }
+    }
+
+    pub fn to_section(self) -> serde_json::Value {
+        serde_json::json!({
+            "inAppBrowserEnabled": self.in_app_browser_enabled,
+            "browserUseEnabled": self.browser_use_enabled,
+            "devtoolsEnabled": self.devtools_enabled,
+            "lanAccessEnabled": self.lan_access_enabled,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserHostStatusSnapshot {
     pub revision: u64,
-    pub in_app_browser_enabled: bool,
-    pub browser_use_enabled: bool,
+    #[serde(flatten)]
+    pub settings: BrowserCapabilitySettings,
     pub status: BrowserHostStatus,
     pub protocol_compatible: bool,
     pub last_error_code: Option<String>,
@@ -988,8 +1039,7 @@ impl Default for BrowserHostStatusSnapshot {
     fn default() -> Self {
         Self {
             revision: 1,
-            in_app_browser_enabled: true,
-            browser_use_enabled: true,
+            settings: BrowserCapabilitySettings::default(),
             status: BrowserHostStatus::Stopped,
             protocol_compatible: false,
             last_error_code: None,
@@ -2786,31 +2836,22 @@ impl ApiState {
             .write()
             .expect("browser host status lock poisoned");
         status.revision = current.revision.saturating_add(1);
-        status.in_app_browser_enabled = current.in_app_browser_enabled;
-        status.browser_use_enabled = current.browser_use_enabled;
+        status.settings = current.settings;
         *current = status;
     }
 
     pub fn update_browser_capability_settings(
         &self,
-        in_app_browser_enabled: bool,
-        browser_use_enabled: bool,
+        settings: BrowserCapabilitySettings,
     ) -> Result<(), ApiError> {
         self.settings_store
-            .set_section(
-                "browser",
-                serde_json::json!({
-                    "inAppBrowserEnabled": in_app_browser_enabled,
-                    "browserUseEnabled": browser_use_enabled,
-                }),
-            )
+            .set_section("browser", settings.to_section())
             .map_err(crate::errors::settings_persistence_error)?;
         let mut current = self
             .browser_host_status
             .write()
             .expect("browser host status lock poisoned");
-        current.in_app_browser_enabled = in_app_browser_enabled;
-        current.browser_use_enabled = browser_use_enabled;
+        current.settings = settings;
         current.revision = current.revision.saturating_add(1);
         Ok(())
     }
@@ -2964,8 +3005,10 @@ impl ApiState {
         let host = self.browser_host_status();
         BrowserCapabilitySnapshot {
             revision: host.revision,
-            in_app_browser_enabled: host.in_app_browser_enabled,
-            browser_use_enabled: host.browser_use_enabled,
+            in_app_browser_enabled: host.settings.in_app_browser_enabled,
+            browser_use_enabled: host.settings.browser_use_enabled,
+            devtools_enabled: host.settings.devtools_enabled,
+            lan_access_enabled: host.settings.lan_access_enabled,
             host_status: host.status,
             host_protocol_compatible: host.protocol_compatible,
         }
@@ -3444,14 +3487,7 @@ impl ApiState {
             .browser_host_status
             .write()
             .expect("browser host status lock poisoned");
-        runtime.in_app_browser_enabled = browser
-            .get("inAppBrowserEnabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        runtime.browser_use_enabled = browser
-            .get("browserUseEnabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+        runtime.settings = BrowserCapabilitySettings::from_section(&browser);
         drop(runtime);
         self.settings_store = store;
         self
@@ -5404,6 +5440,33 @@ mod tests {
     use magi_session_store::{ActiveExecutionChain, ActiveExecutionDispatchContext};
     use std::collections::HashMap;
     use std::time::Duration;
+
+    #[test]
+    fn browser_capability_settings_default_to_safe_values_and_round_trip() {
+        let defaults = BrowserCapabilitySettings::from_section(&serde_json::json!({}));
+        assert!(defaults.in_app_browser_enabled);
+        assert!(defaults.browser_use_enabled);
+        assert!(!defaults.devtools_enabled, "开发者工具集默认关闭");
+        assert!(!defaults.lan_access_enabled, "局域网访问默认关闭");
+
+        let custom = BrowserCapabilitySettings {
+            in_app_browser_enabled: false,
+            browser_use_enabled: true,
+            devtools_enabled: true,
+            lan_access_enabled: true,
+        };
+        assert_eq!(
+            BrowserCapabilitySettings::from_section(&custom.to_section()),
+            custom
+        );
+        // 旧设置文件只有前两项：缺失的新开关取默认值，不丢已有设置。
+        let legacy = BrowserCapabilitySettings::from_section(&serde_json::json!({
+            "inAppBrowserEnabled": false,
+            "browserUseEnabled": false,
+        }));
+        assert!(!legacy.in_app_browser_enabled && !legacy.browser_use_enabled);
+        assert!(!legacy.devtools_enabled && !legacy.lan_access_enabled);
+    }
 
     #[test]
     fn prepared_role_delete_transaction_restores_role_and_binding_snapshot() {

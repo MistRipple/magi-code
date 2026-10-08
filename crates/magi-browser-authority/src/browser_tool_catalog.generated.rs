@@ -48,6 +48,14 @@ pub enum BrowserToolAccess {
     Mixed,
 }
 
+/// 核心工具默认可见；开发者工具集（性能、Lighthouse、堆快照等低频诊断）需要在设置里开启。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserToolTier {
+    Core,
+    Devtools,
+}
+
 impl BrowserToolKind {
     pub const ALL: [Self; 28] = [
         Self::Navigate,
@@ -177,6 +185,39 @@ impl BrowserToolKind {
             Self::Pwa => BrowserToolAccess::Read,
             Self::Read => BrowserToolAccess::Read,
             Self::Storage => BrowserToolAccess::Mixed,
+        }
+    }
+
+    pub fn tier(self) -> BrowserToolTier {
+        match self {
+            Self::Navigate => BrowserToolTier::Core,
+            Self::Snapshot => BrowserToolTier::Core,
+            Self::Click => BrowserToolTier::Core,
+            Self::Type => BrowserToolTier::Core,
+            Self::Press => BrowserToolTier::Core,
+            Self::Scroll => BrowserToolTier::Core,
+            Self::Screenshot => BrowserToolTier::Core,
+            Self::Tabs => BrowserToolTier::Core,
+            Self::Viewport => BrowserToolTier::Core,
+            Self::WaitFor => BrowserToolTier::Core,
+            Self::Hover => BrowserToolTier::Core,
+            Self::Drag => BrowserToolTier::Core,
+            Self::FillForm => BrowserToolTier::Core,
+            Self::Dialog => BrowserToolTier::Core,
+            Self::UploadFile => BrowserToolTier::Core,
+            Self::ClickAt => BrowserToolTier::Core,
+            Self::Evaluate => BrowserToolTier::Core,
+            Self::Console => BrowserToolTier::Core,
+            Self::Network => BrowserToolTier::Core,
+            Self::Emulate => BrowserToolTier::Core,
+            Self::Performance => BrowserToolTier::Devtools,
+            Self::Lighthouse => BrowserToolTier::Devtools,
+            Self::Heap => BrowserToolTier::Devtools,
+            Self::ThirdParty => BrowserToolTier::Devtools,
+            Self::WebMcp => BrowserToolTier::Devtools,
+            Self::Pwa => BrowserToolTier::Devtools,
+            Self::Read => BrowserToolTier::Core,
+            Self::Storage => BrowserToolTier::Core,
         }
     }
 

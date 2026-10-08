@@ -17,7 +17,7 @@ const LISTS = [
   ['blockedCidrs', 'BLOCKED_CIDRS', 'cidr'],
   ['loopbackHostnames', 'LOOPBACK_HOSTNAMES', 'hostname'],
   ['loopbackCidrs', 'LOOPBACK_CIDRS', 'cidr'],
-  ['privateNetworkCidrs', 'PRIVATE_NETWORK_CIDRS', 'cidr'],
+  ['lanCidrs', 'LAN_CIDRS', 'cidr'],
 ];
 
 const STRINGS = [
@@ -64,7 +64,7 @@ function load(source) {
     fail('previewPathPrefix 必须以 / 开头并以 / 结尾');
   }
   const vectors = source.vectors;
-  for (const name of ['previewAllowed', 'previewRejected', 'alwaysBlocked', 'allowed', 'blockedWhenPrivateNetworkDisallowed', 'allowedEvenWhenPrivateNetworkDisallowed']) {
+  for (const name of ['previewAllowed', 'previewRejected', 'alwaysBlocked', 'allowed', 'loopback', 'lan', 'public']) {
     if (!Array.isArray(vectors?.[name]) || vectors[name].length === 0) fail(`vectors.${name} 必须是非空数组`);
   }
   return result;

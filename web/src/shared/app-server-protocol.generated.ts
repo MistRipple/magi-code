@@ -430,6 +430,8 @@ export interface BrowserCapabilitySnapshot {
   revision: number;
   inAppBrowserEnabled: boolean;
   browserUseEnabled: boolean;
+  devtoolsEnabled: boolean;
+  lanAccessEnabled: boolean;
   hostStatus: BrowserHostStatus;
   hostProtocolCompatible: boolean;
 }

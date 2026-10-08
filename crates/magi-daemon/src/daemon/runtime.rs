@@ -1518,6 +1518,8 @@ impl DaemonRuntime {
                         revision: 0,
                         in_app_browser_enabled: false,
                         browser_use_enabled: false,
+                        devtools_enabled: false,
+                        lan_access_enabled: false,
                         host_status: magi_browser_authority::BrowserHostStatus::Stopped,
                         host_protocol_compatible: false,
                     },

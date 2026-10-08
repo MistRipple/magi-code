@@ -6,7 +6,7 @@ import {
   BROWSER_PREVIEW_HOSTNAME,
   BROWSER_PREVIEW_OPEN_PATH,
   BROWSER_PREVIEW_PATH_PREFIX,
-  BROWSER_PRIVATE_NETWORK_CIDRS,
+  BROWSER_LAN_CIDRS,
 } from "@magi/desktop-browser-contracts";
 
 /**
@@ -21,8 +21,8 @@ import {
 export interface BrowserNetworkPolicyConfig {
   /** Magi 自身服务监听的端口：guest 不能访问本机上的这些来源。 */
   readonly selfPorts: ReadonlySet<number>;
-  /** 是否放行本机与局域网地址。关闭后只允许公网目标。 */
-  readonly allowPrivateNetwork: boolean;
+  /** 是否放行局域网私有网段。本机回环地址（开发服务器）始终放行，Magi 自身端口除外。 */
+  readonly allowLanAccess: boolean;
 }
 
 export type BrowserUrlRejection =
@@ -30,13 +30,13 @@ export type BrowserUrlRejection =
   | "credentials"
   | "blocked_target"
   | "self_origin"
-  | "private_network";
+  | "lan_access_disabled";
 
 export type BrowserUrlVerdict =
   | { readonly allowed: true }
   | { readonly allowed: false; readonly reason: BrowserUrlRejection };
 
-type HostClass = "blocked" | "loopback" | "private" | "public";
+type HostClass = "blocked" | "loopback" | "lan" | "public";
 
 interface Cidr {
   readonly bits: 32 | 128;
@@ -108,7 +108,7 @@ function cidrContains(cidr: Cidr, bits: 32 | 128, value: bigint): boolean {
 
 const BLOCKED_CIDRS = BROWSER_BLOCKED_CIDRS.map(parseCidr);
 const LOOPBACK_CIDRS = BROWSER_LOOPBACK_CIDRS.map(parseCidr);
-const PRIVATE_CIDRS = BROWSER_PRIVATE_NETWORK_CIDRS.map(parseCidr);
+const LAN_CIDRS = BROWSER_LAN_CIDRS.map(parseCidr);
 
 function hostnameMatches(host: string, names: readonly string[]): boolean {
   return names.some((name) => host === name || host.endsWith(`.${name}`));
@@ -125,7 +125,7 @@ function classifyAddress(bits: 32 | 128, value: bigint): HostClass {
       cidrs.some((cidr) => cidrContains(cidr, candidateBits, candidate)));
   if (inAny(BLOCKED_CIDRS)) return "blocked";
   if (inAny(LOOPBACK_CIDRS)) return "loopback";
-  if (inAny(PRIVATE_CIDRS)) return "private";
+  if (inAny(LAN_CIDRS)) return "lan";
   return "public";
 }
 
@@ -173,8 +173,8 @@ export function evaluateBrowserRequestTarget(
   if (hostClass === "loopback" && config.selfPorts.has(effectivePort(url))) {
     return { allowed: false, reason: "self_origin" };
   }
-  if (!config.allowPrivateNetwork && hostClass !== "public") {
-    return { allowed: false, reason: "private_network" };
+  if (!config.allowLanAccess && hostClass === "lan") {
+    return { allowed: false, reason: "lan_access_disabled" };
   }
   return { allowed: true };
 }

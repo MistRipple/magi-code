@@ -20,6 +20,7 @@ pub use authority::{
 pub use browser_network_policy::{PREVIEW_HOSTNAME, PREVIEW_OPEN_PATH, PREVIEW_PATH_PREFIX};
 pub use browser_tool_catalog::{
     BROWSER_TOOL_CATALOG_SCHEMA_ID, BROWSER_TOOL_CATALOG_SIZE, BrowserToolAccess, BrowserToolKind,
+    BrowserToolTier,
 };
 pub use capability::{
     BrowserCapabilityRejection, BrowserCapabilitySnapshot, BrowserCapabilityUnavailableReason,
@@ -41,7 +42,7 @@ pub use host_client::{
 pub use host_protocol::*;
 pub use navigation::{
     BrowserNavigationUrlError, browser_navigation_origin, normalize_browser_page_state,
-    validate_browser_navigation_url,
+    validate_browser_navigation_url, validate_browser_navigation_url_with,
 };
 
 #[cfg(test)]

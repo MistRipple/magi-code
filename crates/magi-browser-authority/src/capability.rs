@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BrowserToolAccess, BrowserToolKind};
+use crate::{BrowserToolAccess, BrowserToolKind, BrowserToolTier};
 
 /// Electron Main 托管的真实浏览器控制通道状态。
 ///
@@ -38,6 +38,10 @@ pub struct BrowserCapabilitySnapshot {
     pub revision: u64,
     pub in_app_browser_enabled: bool,
     pub browser_use_enabled: bool,
+    /// 开发者工具集（性能、Lighthouse、堆快照等低频诊断）是否对模型可见。
+    pub devtools_enabled: bool,
+    /// 浏览器是否允许访问局域网私有网段。本机回环地址始终允许（开发服务器）。
+    pub lan_access_enabled: bool,
     pub host_status: BrowserHostStatus,
     pub host_protocol_compatible: bool,
 }
@@ -68,6 +72,9 @@ impl BrowserCapabilitySnapshot {
 
     pub fn allows_catalog_tool(&self, tool: BrowserToolKind) -> bool {
         if self.unavailable_reason().is_some() {
+            return false;
+        }
+        if tool.tier() == BrowserToolTier::Devtools && !self.devtools_enabled {
             return false;
         }
         tool.is_supported()
@@ -130,9 +137,39 @@ mod tests {
             revision: 1,
             in_app_browser_enabled: true,
             browser_use_enabled: true,
+            devtools_enabled: true,
+            lan_access_enabled: false,
             host_status: BrowserHostStatus::Ready,
             host_protocol_compatible: true,
         }
+    }
+
+    #[test]
+    fn devtools_tier_is_hidden_until_enabled() {
+        let mut snapshot = ready_snapshot();
+        snapshot.devtools_enabled = false;
+        let visible = snapshot.visible_tools();
+        assert!(visible.contains(&BrowserToolKind::Evaluate));
+        for tool in [
+            BrowserToolKind::Performance,
+            BrowserToolKind::Lighthouse,
+            BrowserToolKind::Heap,
+            BrowserToolKind::ThirdParty,
+            BrowserToolKind::WebMcp,
+            BrowserToolKind::Pwa,
+        ] {
+            assert!(!visible.contains(&tool), "{tool:?}");
+            assert!(matches!(
+                snapshot.allows_execution(tool, BrowserToolAccess::Read),
+                Err(BrowserCapabilityRejection::ToolNotVisible { .. })
+            ));
+        }
+        snapshot.devtools_enabled = true;
+        assert!(
+            snapshot
+                .visible_tools()
+                .contains(&BrowserToolKind::Lighthouse)
+        );
     }
 
     #[test]

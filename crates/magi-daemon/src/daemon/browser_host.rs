@@ -377,6 +377,27 @@ async fn run_desktop_browser_controller(state: ApiState, mut shutdown_rx: watch:
             reconnecting = true;
             continue;
         }
+        // 先把用户设置的网络策略交给 Main，再宣布 Host 可用：浏览器工具开始工作时策略必须已生效。
+        if let Err(error) = magi_api::browser_network_policy::push_network_policy(
+            &client,
+            state.browser_capability_snapshot().lan_access_enabled,
+        )
+        .await
+        {
+            tracing::error!(%error, "Electron Desktop 网络策略同步失败");
+            client.close().await;
+            set_host_status(
+                &state,
+                BrowserHostStatus::Failed,
+                "failed",
+                true,
+                Some("browser_network_policy_sync_failed".to_string()),
+                Some(&handshake),
+            );
+            publish_host_status(&state);
+            reconnecting = true;
+            continue;
+        }
         let generation = state.set_browser_host_client(Some(client.clone()));
         set_host_status(
             &state,
@@ -1460,8 +1481,7 @@ fn set_host_status(
     let previous = state.browser_host_status();
     state.set_browser_host_status(BrowserHostStatusSnapshot {
         revision: 0,
-        in_app_browser_enabled: previous.in_app_browser_enabled,
-        browser_use_enabled: previous.browser_use_enabled,
+        settings: previous.settings,
         status,
         protocol_compatible,
         last_error_code: error_code,

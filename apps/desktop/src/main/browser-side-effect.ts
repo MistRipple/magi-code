@@ -28,6 +28,7 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "set_logical_viewport":
     case "get_logical_viewport":
     case "set_annotations":
+    case "configure_network_policy":
     case "inspect_start":
     case "inspect_stop":
     case "close_page":

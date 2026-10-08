@@ -26,7 +26,7 @@ export const BROWSER_LOOPBACK_CIDRS: readonly string[] = [
   "::/128",
 ];
 
-export const BROWSER_PRIVATE_NETWORK_CIDRS: readonly string[] = [
+export const BROWSER_LAN_CIDRS: readonly string[] = [
   "10.0.0.0/8",
   "172.16.0.0/12",
   "192.168.0.0/16",

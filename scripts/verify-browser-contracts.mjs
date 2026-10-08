@@ -214,7 +214,7 @@ const tsCommands = sorted(
 const rustCommands = rustEnumVariants(rustHostProtocol, "BrowserHostCommand", "Rust BrowserHostCommand");
 assert.deepEqual(schemaCommands, tsCommands, "Schema/TypeScript 命令集合不一致");
 assert.deepEqual(schemaCommands, rustCommands, "Schema/Rust 命令集合不一致");
-assert.equal(schemaCommands.length, 34, "Desktop Browser 命令集合数量发生漂移");
+assert.equal(schemaCommands.length, 35, "Desktop Browser 命令集合数量发生漂移");
 
 for (const branch of controlSchema.$defs.command.oneOf) {
   const command = branch.properties.type.const;
