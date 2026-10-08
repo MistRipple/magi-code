@@ -550,6 +550,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "HeapProfiler.takeHeapSnapshot",
   "Input.dispatchKeyEvent",
   "Input.dispatchMouseEvent",
+  "Input.cancelDragging",
   "Input.insertText",
   "Network.emulateNetworkConditions",
   "Network.getResponseBody",

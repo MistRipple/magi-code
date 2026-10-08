@@ -846,7 +846,12 @@ test("页面滚动不再经过会超时的 Input.dispatchMouseEvent CDP 通道",
 });
 
 test("click_at 的 double_click 产生完整双击序列", async () => {
-  const port = new ScriptedPort(() => ({}));
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, observed: true } } };
+    return {};
+  });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   const result = await runtime.execute("double-click", binding, {
     type: "devtools",
@@ -862,6 +867,9 @@ test("click_at 的 double_click 产生完整双击序列", async () => {
 test("click_at 按下触发导航后不向新文档发送释放事件", async () => {
   const nextBinding = { ...binding, navigation_revision: binding.navigation_revision + 1 };
   const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, observed: true } } };
     if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
       port.emit("Page.frameStartedLoading", {}, nextBinding);
     }
@@ -874,7 +882,7 @@ test("click_at 按下触发导航后不向新文档发送释放事件", async ()
     payload: { tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 } },
   });
 
-  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(result.outcome.status, "indeterminate");
   assert.deepEqual(
     port.requests
       .filter((request) => request.method === "Input.dispatchMouseEvent")
@@ -980,7 +988,7 @@ test("输入回读缺失或不匹配时不提交、不补写，清空同样必�
         if (method !== "Runtime.evaluate") return {};
         const expression = String(params.expression);
         if (expression.includes(".verifyText(")) return { result: { value: applied === undefined ? null : { applied } } };
-        if (expression.includes(".finishClick(")) return { result: { value: { observed: true } } };
+        if (expression.includes(".finishPointer(")) return { result: { value: { observed: true } } };
         const target = { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: true, sensitive: null };
         return { result: { value: expression.includes(".prepareText(") ? { target, expected: text } : target } };
       });
@@ -1029,38 +1037,83 @@ test("点击完成后异步到达的 JavaScript 对话框事件仍可被下一�
   assert.deepEqual(value?.dialog, { type: "alert", message: "magi-dialog" });
 });
 
-test("drag 使用完整 HTML DragEvent 生命周期，而不是只发送一次鼠标移动", async () => {
+test("拖拽只使用原生鼠标序列；未观察到 drop 不报告成功", async () => {
+  for (const observed of [true, false]) {
+    const port = new ScriptedPort((method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") {
+        return { result: { value: String(params.expression).includes(".finishPointer(")
+          ? { observed } : { source: { x: 10, y: 20 }, target: { x: 200, y: 20 } } } };
+      }
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute("drag-call", binding, {
+      type: "devtools", payload: { tab_id: binding.tab_id, operation: "drag", arguments: {
+        source: { element_ref: "e:1:source" }, target: { element_ref: "e:1:target" },
+      } },
+    });
+    assert.equal(result.outcome.status, observed ? "succeeded" : "indeterminate");
+    const events = port.requests.filter(request => request.method === "Input.dispatchMouseEvent");
+    assert.equal(events.filter(request => request.params.type === "mousePressed").length, 1);
+    assert.equal(events.filter(request => request.params.type === "mouseReleased").length, 1);
+    assert.equal(events.filter(request => request.params.type === "mouseMoved" && request.params.buttons === 1).length, 8);
+    assert.equal(port.requests.some(request => String(request.params.expression).includes("new DragEvent")), false);
+  }
+});
+
+test("悬停和坐标点击没有收到目标事件时返回未确认；双击中途导航不继续第二次点击", async () => {
+  for (const operation of ["hover", "click_at"]) {
+    const port = new ScriptedPort((method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, observed: false } } };
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute(operation, binding, { type: "devtools", payload: {
+      tab_id: binding.tab_id, operation, arguments: { element_ref: "e:1:target", x: 20, y: 30 },
+    } });
+    assert.equal(result.outcome.status, "indeterminate");
+  }
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate") {
-      const expression = String(params.expression);
-      if (expression.includes("new DragEvent") || expression.includes("dragstart")) {
-        return { result: { value: { dragged: true, drag_over_accepted: true, drop_accepted: true } } };
-      }
-      return { result: { value: null } };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, observed: true } } };
+    if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
+      port.emit("Page.frameStartedLoading", {}, { ...binding, navigation_revision: binding.navigation_revision + 1 });
     }
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
-  const result = await runtime.execute("drag-call", binding, {
-    type: "devtools",
-    payload: {
-      tab_id: binding.tab_id,
-      operation: "drag",
-      arguments: {
-        source: { element_ref: "e:1:source" },
-        target: { element_ref: "e:1:target" },
-      },
-    },
+  const result = await runtime.execute("double-navigation", binding, { type: "devtools", payload: {
+    tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30, double_click: true },
+  } });
+  assert.equal(result.outcome.status, "indeterminate");
+  assert.equal(port.requests.filter(request => request.method === "Input.dispatchMouseEvent" && request.params.type === "mousePressed").length, 1);
+});
+
+test("拖拽中断先原生取消再释放鼠标，不重放拖拽", async () => {
+  let failed = false;
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") return { result: { value: { source: {x:10,y:10}, target: {x:200,y:10} } } };
+    if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved" && params.buttons === 1 && !failed) {
+      failed = true;
+      return new Error("browser_cdp_error:drag interrupted");
+    }
+    return {};
   });
-  assert.equal(result.outcome.status, "succeeded");
-  assert.equal(
-    port.requests.filter((request) => request.method === "Input.dispatchMouseEvent").length,
-    0,
-    "拖拽不应退化为不完整的鼠标事件序列",
-  );
-  assert.ok(port.requests.some((request) => String(request.params.expression).includes("new DragEvent")));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("interrupted-drag", binding, { type: "devtools", payload: {
+    tab_id: binding.tab_id, operation: "drag", arguments: { source: {element_ref:"e:1:source"}, target: {element_ref:"e:1:target"} },
+  } });
+  assert.equal(result.outcome.status, "indeterminate");
+  const inputs = port.requests.filter(request => request.method.startsWith("Input."));
+  assert.equal(inputs.filter(request => request.params.type === "mousePressed").length, 1);
+  assert.deepEqual(inputs.slice(-2).map(request => [request.method, request.params.type]), [["Input.cancelDragging", undefined], ["Input.dispatchMouseEvent", "mouseReleased"]]);
 });
 
 test("对话框事件即使来自 CDP 子会话也能列出并使用同一会话处理", async () => {
@@ -1164,9 +1217,9 @@ test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async 
       if (expression.includes("e:1:radio") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "radio" } } };
       if (expression.includes("e:1:checkbox") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "checkbox" } } };
       if (expression.includes("e:1:select") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "select", multiple: true } } };
-      if (expression.includes("selectedOptions")) return { result: { value: { applied: true } } };
-      if (expression.includes("prepareClick")) return { result:{ value:{x:10,y:20,role:"checkbox",name:"test"} } };
-      if (expression.includes("finishClick")) return { result:{value:{observed:true}} };
+      if (expression.includes(".selectOptions(")) return { result: { value: { applied: true } } };
+      if (expression.includes("preparePointer")) return { result:{ value:{x:10,y:20,role:"checkbox",name:"test"} } };
+      if (expression.includes("finishPointer")) return { result:{value:{observed:true}} };
       if (expression.endsWith(".checked")) return { result:{value:clickCount > 0} };
       return { result: { value: null } };
     }
@@ -1195,7 +1248,7 @@ test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async 
     : null;
   assert.equal(fillResult?.filled, 3);
   const evaluateCalls = port.requests.filter((request) => request.method === "Runtime.evaluate");
-  assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes("element.options")));
+  assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes(".selectOptions(")));
   assert.equal(clickCount, 1);
   assert.ok(!evaluateCalls.some((request) => String(request.params.expression).includes("element.click()")));
 });
@@ -1972,7 +2025,7 @@ test("点击不使用固定延时且原生事件后校验目标", async () => {
     .filter((request) => request.method === "Runtime.evaluate")
     .map((request) => String(request.params.expression))
     .filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation."));
-  assert.equal(expressions.filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.prepareClick(")).length, 1);
+  assert.equal(expressions.filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.preparePointer(")).length, 1);
   assert.equal(expressions.some((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.focus(")), false, "不再单独往返 focus");
 });
 

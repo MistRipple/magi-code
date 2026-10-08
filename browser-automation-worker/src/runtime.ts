@@ -851,33 +851,58 @@ export class BrowserAutomationRuntime {
     return this.evaluate(binding, `globalThis.__magiBrowserAutomation.target(${JSON.stringify(target.element_ref)})`);
   }
 
-  /** 滚动、命中检测后，点击始终只发送一组原生鼠标事件。 */
   private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget, forText = false): Promise<BrowserActionTarget> {
-    const token = `click-${randomUUID()}`;
+    return this.pointerAction(binding, "click", ref.element_ref, null, forText);
+  }
+
+  /** 节点点击、坐标点击和悬停共用定位、原生事件和确认，失败不重放。 */
+  private async pointerAction(
+    binding: BrowserSurfaceBinding,
+    event: "click" | "dblclick" | "mousemove",
+    ref: string | null,
+    point: { x: number; y: number } | null,
+    forText = false,
+  ): Promise<BrowserActionTarget> {
+    const token = `pointer-${randomUUID()}`;
     const target = await this.evaluate<PageTarget>(binding,
-      `globalThis.__magiBrowserAutomation.prepareClick(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(token)}, ${forText})`);
-    let started = false;
+      `globalThis.__magiBrowserAutomation.preparePointer(${JSON.stringify(ref)}, ${JSON.stringify(token)}, ${JSON.stringify(event)}, ${JSON.stringify(point)}, ${forText})`);
     let finished = false;
     try {
-      if (!await this.pointer(binding, "mouseMoved", target.x, target.y)) throw protocolFailure("browser_click_unconfirmed", "悬停触发对话框，尚未确认目标点击", true);
-      await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyClickPoint(${JSON.stringify(ref.element_ref)}, ${target.x}, ${target.y})`);
-      started = true;
-      if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) throw protocolFailure("browser_click_unconfirmed", "按下时打开对话框，点击结果未确认", true);
-      if (this.navigationAdvanced(binding)) throw protocolFailure("browser_click_unconfirmed", "按下时页面发生导航，点击结果未确认", true);
-      if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) throw protocolFailure("browser_click_unconfirmed", "点击后打开对话框，请检查对话框状态", true);
-      if (this.navigationAdvanced(binding) || this.currentPage(binding.surface_id)?.dialog) throw protocolFailure("browser_click_unconfirmed", "页面状态已变化，目标点击结果未确认", true);
-      const observed = await this.evaluate<{ observed: boolean }>(binding,
-        `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(token)})`);
+      await this.observedPointer(binding, "mouseMoved", target.x, target.y);
+      if (event !== "mousemove") {
+        for (let clickCount = 1; clickCount <= (event === "dblclick" ? 2 : 1); clickCount++) {
+          await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyPointer(${JSON.stringify(token)}, ${target.x}, ${target.y})`);
+          await this.observedPointer(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount });
+          await this.observedPointer(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount });
+        }
+      }
+      const observed = await this.finishPointer(binding, token);
       finished = true;
-      if (observed?.observed !== true) throw protocolFailure("browser_click_unconfirmed", "没有确认目标收到原生点击；检查页面状态，不要直接重试", true);
+      if (!observed) throw protocolFailure("browser_pointer_unconfirmed", "没有确认目标收到原生事件；检查页面状态，不要直接重试", true);
       return actionTarget(target);
     } catch (cause) {
-      if (started) throw sideEffectFailure(cause);
-      throw cause;
+      throw sideEffectFailure(cause);
     } finally {
-      if (!finished && !this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted && !this.currentPage(binding.surface_id)?.dialog) {
-        await this.evaluate(binding, `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(token)})`).catch(() => undefined);
-      }
+      if (!finished) await this.cleanupPointer(binding, token);
+    }
+  }
+
+  private async observedPointer(binding: BrowserSurfaceBinding, type: string, x: number, y: number, extra: Record<string, unknown> = {}): Promise<void> {
+    if (!await this.pointerOrHandleDialog(binding, type, x, y, extra)
+      || this.navigationAdvanced(binding) || this.currentPage(binding.surface_id)?.dialog) {
+      throw protocolFailure("browser_pointer_unconfirmed", "操作中页面导航或打开对话框，结果未确认", true);
+    }
+  }
+
+  private async finishPointer(binding: BrowserSurfaceBinding, token: string): Promise<boolean> {
+    const result = await this.evaluate<{ observed: boolean }>(binding,
+      `globalThis.__magiBrowserAutomation.finishPointer(${JSON.stringify(token)})`);
+    return result?.observed === true;
+  }
+
+  private async cleanupPointer(binding: BrowserSurfaceBinding, token: string): Promise<void> {
+    if (!this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted && !this.currentPage(binding.surface_id)?.dialog) {
+      await this.finishPointer(binding, token).catch(() => undefined);
     }
   }
 
@@ -1179,26 +1204,14 @@ export class BrowserAutomationRuntime {
   ): Promise<unknown> {
     switch (operation) {
       case "hover": {
-        const target = await this.target(binding, snapshotTarget(args));
-        await this.pointer(binding, "mouseMoved", target.x, target.y);
-        return { hovered: true, target: actionTarget(target) };
+        const target = await this.pointerAction(binding, "mousemove", snapshotTarget(args).element_ref, null);
+        return { hovered: true, target };
       }
       case "click_at": {
-        const x = finiteNumber(args.x, "x");
-        const y = finiteNumber(args.y, "y");
         const doubleClick = args.double_click === true;
-        if (!await this.pointer(binding, "mouseMoved", x, y)) {
-          return { clicked: true, double_click: doubleClick };
-        }
-        const clicks = doubleClick ? 2 : 1;
-        for (let index = 0; index < clicks; index += 1) {
-          const clickCount = doubleClick ? index + 1 : 1;
-          if (!await this.pointerOrHandleDialog(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount })) break;
-          if (this.navigationAdvanced(binding)) break;
-          if (!await this.pointerOrHandleDialog(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount })) break;
-          if (this.navigationAdvanced(binding)) break;
-        }
-        return { clicked: true, double_click: doubleClick };
+        const target = await this.pointerAction(binding, doubleClick ? "dblclick" : "click", null,
+          { x: finiteNumber(args.x, "x"), y: finiteNumber(args.y, "y") });
+        return { clicked: true, double_click: doubleClick, target };
       }
       case "drag": {
         return this.drag(binding, args);
@@ -1389,36 +1402,43 @@ export class BrowserAutomationRuntime {
   }
 
   private async drag(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
-    const source = snapshotTarget(args, "source");
-    const target = snapshotTarget(args, "target");
-    const result = await this.evaluate<Record<string, unknown>>(
-      binding,
-      `(() => {
-        const source = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(source.element_ref)});
-        const target = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
-        if (!source || source.nodeType !== 1 || !target || target.nodeType !== 1) throw new Error('browser_drag_target_stale');
-        if (typeof DataTransfer !== 'function' || typeof DragEvent !== 'function') throw new Error('browser_drag_unsupported');
-        const sourceRect = source.getBoundingClientRect();
-        const targetRect = target.getBoundingClientRect();
-        const dataTransfer = new DataTransfer();
-        dataTransfer.effectAllowed = 'move';
-        const event = (type, rect) => new DragEvent(type, {
-          bubbles: true,
-          cancelable: true,
-          composed: true,
-          clientX: rect.left + rect.width / 2,
-          clientY: rect.top + rect.height / 2,
-          dataTransfer,
-        });
-        source.dispatchEvent(event('dragstart', sourceRect));
-        target.dispatchEvent(event('dragenter', targetRect));
-        const dragOverAccepted = !target.dispatchEvent(event('dragover', targetRect));
-        const dropAccepted = !target.dispatchEvent(event('drop', targetRect));
-        source.dispatchEvent(event('dragend', targetRect));
-        return { dragged: true, drag_over_accepted: dragOverAccepted, drop_accepted: dropAccepted };
-      })()`,
-    );
-    return result ?? { dragged: true };
+    const source = snapshotTarget(args, "source"), target = snapshotTarget(args, "target");
+    const token = `drag-${randomUUID()}`;
+    type Points = { source: { x: number; y: number }; target: { x: number; y: number } };
+    const points = await this.evaluate<Points>(binding,
+      `globalThis.__magiBrowserAutomation.prepareDrag(${JSON.stringify(source.element_ref)}, ${JSON.stringify(target.element_ref)}, ${JSON.stringify(token)})`);
+    let pressed = false;
+    let finished = false;
+    try {
+      await this.observedPointer(binding, "mouseMoved", points.source.x, points.source.y);
+      const current = await this.evaluate<Points>(binding, `globalThis.__magiBrowserAutomation.verifyDrag(${JSON.stringify(token)})`);
+      if (current.source.x !== points.source.x || current.source.y !== points.source.y) throw protocolFailure("browser_drag_target_moved", "拖拽前目标位置已改变");
+      pressed = true;
+      await this.observedPointer(binding, "mousePressed", points.source.x, points.source.y, { button: "left", buttons: 1, clickCount: 1 });
+      // Chromium 自己执行 dragstart/dragover/drop，遵守站点取消与 dropEffect。
+      for (let step = 1; step <= 8; step++) {
+        await this.observedPointer(binding, "mouseMoved",
+          points.source.x + (current.target.x - points.source.x) * step / 8,
+          points.source.y + (current.target.y - points.source.y) * step / 8,
+          { button: "left", buttons: 1 });
+      }
+      await this.observedPointer(binding, "mouseReleased", current.target.x, current.target.y, { button: "left", buttons: 0, clickCount: 1 });
+      pressed = false;
+      const observed = await this.finishPointer(binding, token);
+      finished = true;
+      if (!observed) throw protocolFailure("browser_drag_unconfirmed", "未确认目标收到原生 drop；页面可能取消或拒绝了拖拽，不要直接重试", true);
+      return { dragged: true };
+    } catch (cause) {
+      throw sideEffectFailure(cause);
+    } finally {
+      if (pressed && !this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted && !this.currentPage(binding.surface_id)?.dialog) {
+        // 原生取消成功后才释放鼠标，失败时不能用释放事件意外提交 drop。
+        await this.#cdp.send(binding, "Input.cancelDragging").then(async () => {
+          if (!this.navigationAdvanced(binding)) await this.pointer(binding, "mouseReleased", points.source.x, points.source.y, { button: "left", buttons: 0, clickCount: 1 });
+        }).catch(() => undefined);
+      }
+      if (!finished) await this.cleanupPointer(binding, token);
+    }
   }
 
   private async waitForDialog(binding: BrowserSurfaceBinding): Promise<Record<string, unknown> | null> {
@@ -1604,27 +1624,13 @@ export class BrowserAutomationRuntime {
     if (!values.every((item) => typeof item === "string" || typeof item === "number")) {
       throw protocolFailure("browser_fill_form_invalid", "select values must be strings or numbers");
     }
-    const serialized = values.map(String);
-    const result = await this.evaluate<{ applied: boolean }>(
-      binding,
-      `(() => {
-        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
-        globalThis.__magiBrowserAutomation.formControl(${JSON.stringify(target.element_ref)});
-        if (!element || element.tagName !== 'SELECT') throw new Error('browser_fill_form_target_stale');
-        const values = ${JSON.stringify(serialized)};
-        const options = [...element.options];
-        if (values.some((value) => !options.some((option) => option.value === value))) throw new Error('browser_fill_form_select_option_not_found');
-        if (element.multiple) {
-          for (const option of options) option.selected = values.includes(option.value);
-        } else {
-          element.value = values[0];
-        }
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        const actual = [...element.selectedOptions].map(option => option.value);
-        return { applied: actual.length === new Set(values).size && actual.every(value => values.includes(value)) };
-      })()`,
-    ).catch((cause) => { throw sideEffectFailure(cause); });
+    const serialized = [...new Set(values.map(String))];
+    const result = await this.evaluate<{ applied: boolean }>(binding,
+      `globalThis.__magiBrowserAutomation.selectOptions(${JSON.stringify(target.element_ref)}, ${JSON.stringify(serialized)})`).catch((cause) => {
+        // 页面脚本只在写入前抛校验错误；写入阶段自己返回 applied=false。
+        if (cause instanceof Error && cause.message.startsWith("browser_page_script_failed:")) throw cause;
+        throw sideEffectFailure(cause);
+      });
     if (result?.applied !== true) throw protocolFailure("browser_fill_form_unconfirmed", "选项状态未达到预期", true);
   }
 
@@ -2154,7 +2160,7 @@ function empty(): { result: BrowserCommandResult } {
   return { result: { type: "empty" } };
 }
 
-/** 页面运行时 target()/prepareClick() 返回的目标信息。 */
+/** 页面运行时 target()/preparePointer() 返回的目标信息。 */
 interface PageTarget {
   x: number;
   y: number;

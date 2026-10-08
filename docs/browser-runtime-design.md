@@ -212,6 +212,9 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 页面操作和快照遵循以下单一执行规则：
 
 - 节点点击在滚动后检查可见、启用和实际命中（含 open shadow DOM 与同源 iframe 外层遮挡），只发送一组 CDP 原生鼠标事件。用目标捕获到的可信 click 确认结果，不用 DOM click 补点、不等待固定延时；导航、对话框或引用失效导致无法确认时报告 indeterminate，不能直接重试写操作。
+- 节点点击、坐标点击/双击和悬停共用 Worker 的 pointerAction 与页面定位、事件观察入口。坐标先校验当前 CSS 视口范围；悬停先滚入视口。分别确认目标收到可信 click、dblclick、mousemove，双击中途导航或对话框立即停止后续输入。跨域 iframe 的坐标输入可以投递，但父文档无法观察内部事件，返回未确认而非成功。
+- 拖拽只发送原生按下、移动、释放，由 Chromium 执行拖拽生命周期、DataTransfer 和取消规则；删除合成 DragEvent 路径。只支持可原生拖拽且两端能同时获得命中点的目标；收到目标可信 drop 才报告成功，取消/拒绝返回未确认。中途失败在同一有效文档中先原生 cancelDragging，再释放鼠标，不能补拖。
+- 下拉选择在页面运行时先完整验证选项存在及 option/optgroup 启用状态，验证完毕才统一选择、发出 input/change 并回读。多选中任一目标无效时该控件不写入；批量表单已完成前面的控件而后续失败时保留 indeterminate 语义。
 - 文本输入先经同一原生点击获得 guest 焦点，由 Chromium 编辑命令选择文本，再通过 Input.insertText 输入或 Backspace 清空。replace=false 追加到末尾；替换、追加、清空都必须严格回读相等后才允许 submit_key，不用 value setter 补写。读不到、被页面改写或输入中导航均返回结果未确认。
 - Main 在当前 Surface lane 投递原生写入前聚焦受控 guest WebContents，确保键盘路由正确；不激活宿主窗口，也不在导航完成时抢焦点。
 - 快照的节点选择、排序和 UTF-8 文本预算只由 Worker 采集端执行，默认 96 个节点、10 KiB 文本。保留已收集节点；敏感输入值在采集源排除，祖先/标签名称也不能重新带入敏感表单文本。daemon 只投影，不进行第二次裁剪。

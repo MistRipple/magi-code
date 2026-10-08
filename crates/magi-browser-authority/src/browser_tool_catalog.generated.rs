@@ -255,12 +255,14 @@ impl BrowserToolKind {
             Self::WaitFor => {
                 "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
             }
-            Self::Hover => "将鼠标悬停到当前浏览器快照中的元素。",
+            Self::Hover => {
+                "将鼠标悬停到最近快照的元素；先滚入视口并检查实际命中，确认目标收到原生鼠标移动事件后返回。结果未确认时先检查页面状态。"
+            }
             Self::Drag => {
-                "把当前浏览器快照中的 source 元素拖到 target 元素。两个 element_ref 必须来自最近一次 browser_snapshot 或交互工具结果；可使用快照里的 e 引用或结构性 draggable div 等节点的 group 引用。页面发生变化后先重新获取快照，不要复用旧引用。"
+                "将最近快照中可原生拖拽的 source 元素拖到 target。使用 Chromium 原生鼠标拖拽，遵守页面取消和目标接收规则，确认目标收到可信 drop 后返回。两端需可见且可命中；不支持的目标明确失败，不合成 DragEvent 或补拖。"
             }
             Self::FillForm => {
-                "按 fields 中的统一快照引用一次性填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。"
+                "按 fields 的最近快照引用填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。select 必须先验证全部选项存在且未被 option/optgroup 禁用，随后统一写入和回读；验证失败不修改该控件。"
             }
             Self::Dialog => {
                 "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
@@ -269,7 +271,7 @@ impl BrowserToolKind {
                 "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。file_path / file_paths 可以是相对当前工作目录的路径或绝对路径，和 file_read 受同一套路径范围约束（受限档位只能上传工作区内的文件）。"
             }
             Self::ClickAt => {
-                "在当前浏览器页面的 CSS 坐标位置点击，支持双击；用于快照无法检查的元素，例如跨域 iframe 内的控件。"
+                "在当前视口的 CSS 坐标点击或双击。坐标必须位于视口内；与节点点击共用命中检查和原生事件确认。跨域 iframe 内仍可投递坐标输入，但无法观察内部事件时返回结果未确认，需检查页面状态，不能直接重试。"
             }
             Self::Evaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
             Self::Console => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",

@@ -16,7 +16,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     annotationResizeObserver: null,
     annotationMarkers: new Map(),
     annotationListenersInstalled: false,
-    clickGuards: new Map(),
+    pointerGuards: new Map(),
   };
   // iframe 内的元素属于另一个 realm，instanceof Element 对它们恒为 false，
   // 因此所有“是不是元素”的判断都改用 nodeType，保证同源 iframe 内的节点可被快照和操作。
@@ -313,6 +313,33 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     }
     return true;
   };
+  const verifyPoint = (element, x, y) => {
+    assertActionable(element);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) throw new Error('browser_pointer_outside_viewport');
+    const local = element.getBoundingClientRect(), global = rectFor(element);
+    if (!hitAt(element, (x-global.x) * local.width/global.width+local.x, (y-global.y) * local.height/global.height+local.y)) throw new Error('browser_target_obscured');
+  };
+  const elementAtPoint = (x, y) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) throw new Error('browser_pointer_outside_viewport');
+    let root = document, element = root.elementFromPoint(x, y);
+    while (element) {
+      if (isFrameElement(element)) {
+        const doc = frameDocument(element);
+        // 跨域 frame 保留坐标输入能力；父文档看不到内部事件时不能报告已确认。
+        if (!doc) break;
+        assertFrameTransform(element);
+        const { rect, sx, sy } = frameGeometry(element);
+        x = (x-rect.x)/sx-element.clientLeft; y = (y-rect.y)/sy-element.clientTop;
+        root = doc;
+      } else if (element.shadowRoot) root = element.shadowRoot;
+      else break;
+      const next = root.elementFromPoint(x, y);
+      if (next === element) break;
+      element = next;
+    }
+    if (!element) throw new Error('browser_pointer_target_missing');
+    return element;
+  };
   const actionPoint = (element) => {
     assertActionable(element);
     const view = element.ownerDocument.defaultView;
@@ -590,8 +617,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       }
       const root = selector ? document.querySelector(selector) : (document.body || document.documentElement);
       if (!root) throw new Error('browser_snapshot_scope_not_found');
-      for (const guard of state.clickGuards.values()) guard.element.ownerDocument.removeEventListener('click', guard.listener, true);
-      state.clickGuards.clear();
+      for (const token of state.pointerGuards.keys()) this.finishPointer(token);
       state.snapshotRevision = revision;
       state.nextRef = 1;
       state.refs = new Map();
@@ -640,30 +666,82 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         name: nameFor(element),
       };
     },
-    prepareClick(ref, token, forText) {
-      const element = this.resolve(ref);
+    preparePointer(ref, token, eventType, point, forText = false) {
+      const element = ref ? this.resolve(ref) : elementAtPoint(point.x, point.y);
       if (forText) assertTextTarget(element); else assertActionable(element);
-      scrollTo(element);
-      const point = actionPoint(element);
-      const guard = { element, observed: false, listener: null };
-      guard.listener = (event) => { if (event.isTrusted && event.composedPath().includes(element)) guard.observed = true; };
-      element.ownerDocument.addEventListener('click', guard.listener, true);
-      state.clickGuards.set(String(token), guard);
-      return { ...this.target(ref), ...point };
+      if (!point) scrollTo(element);
+      const position = point || actionPoint(element);
+      verifyPoint(element, position.x, position.y);
+      const guard = { element, eventType, observed: false, listeners: [] };
+      const listener = event => {
+        if (isFrameElement(element) && !frameDocument(element)) return;
+        if (event.isTrusted && event.composedPath().includes(element)) guard.observed = true;
+      };
+      element.ownerDocument.addEventListener(eventType, listener, true);
+      guard.listeners.push([element.ownerDocument, eventType, listener]);
+      state.pointerGuards.set(String(token), guard);
+      const rect = rectFor(element);
+      return { x: position.x, y: position.y, bounds: rect, role: roleFor(element), name: nameFor(element) };
     },
-    verifyClickPoint(ref, x, y) {
-      const element = this.resolve(ref);
-      assertActionable(element);
-      const local = element.getBoundingClientRect(), global = rectFor(element);
-      if (!hitAt(element, (x-global.x) * local.width/global.width+local.x, (y-global.y) * local.height/global.height+local.y)) throw new Error('browser_target_obscured');
+    verifyPointer(token, x, y) {
+      const guard = state.pointerGuards.get(String(token));
+      if (!guard) throw new Error('browser_pointer_observation_missing');
+      verifyPoint(guard.element, x, y);
       return true;
     },
-    finishClick(token) {
-      const guard = state.clickGuards.get(String(token));
+    finishPointer(token) {
+      const guard = state.pointerGuards.get(String(token));
       if (!guard) return { observed: false };
-      guard.element.ownerDocument.removeEventListener('click', guard.listener, true);
-      state.clickGuards.delete(String(token));
+      for (const [doc, type, listener] of guard.listeners) doc.removeEventListener(type, listener, true);
+      state.pointerGuards.delete(String(token));
       return { observed: guard.observed };
+    },
+    prepareDrag(sourceRef, targetRef, token) {
+      const source = this.resolve(sourceRef), target = this.resolve(targetRef);
+      assertActionable(source); assertActionable(target);
+      if (source === target) throw new Error('browser_drag_same_target');
+      if (!source.draggable) throw new Error('browser_drag_source_not_draggable');
+      scrollTo(target); scrollTo(source);
+      // 在投递输入之前确认两端均有有效命中点；不在按住鼠标后猜测页面坐标。
+      const start = actionPoint(source), end = actionPoint(target);
+      const guard = { source, target, observed: false, listeners: [] };
+      const listener = event => {
+        if (event.isTrusted && event.composedPath().includes(target)) guard.observed = true;
+      };
+      target.ownerDocument.addEventListener('drop', listener, true);
+      guard.listeners.push([target.ownerDocument, 'drop', listener]);
+      state.pointerGuards.set(String(token), guard);
+      return { source: start, target: end };
+    },
+    verifyDrag(token) {
+      const guard = state.pointerGuards.get(String(token));
+      if (!guard) throw new Error('browser_pointer_observation_missing');
+      return { source: actionPoint(guard.source), target: actionPoint(guard.target) };
+    },
+    selectOptions(ref, values) {
+      const element = this.resolve(ref);
+      this.formControl(ref);
+      if (element.tagName !== 'SELECT') throw new Error('browser_fill_form_target_stale');
+      if (!element.multiple && values.length !== 1) throw new Error('browser_fill_form_invalid');
+      const options = [...element.options];
+      const selected = values.map(value => {
+        const matches = options.filter(option => option.value === value);
+        if (!matches.length) throw new Error('browser_fill_form_select_option_not_found');
+        const option = matches.find(option => !disabled(option));
+        if (!option) throw new Error('browser_fill_form_select_option_disabled');
+        return option;
+      });
+      // 全部选项验证通过才写入，禁止先改一部分再发现禁用选项。
+      try {
+        for (const option of options) option.selected = selected.includes(option);
+        const EventCtor = element.ownerDocument.defaultView.Event;
+        element.dispatchEvent(new EventCtor('input', { bubbles: true }));
+        element.dispatchEvent(new EventCtor('change', { bubbles: true }));
+        const actual = [...element.selectedOptions];
+        return { applied: element.isConnected && actual.length === selected.length && actual.every(option => selected.includes(option)) };
+      } catch {
+        return { applied: false };
+      }
     },
     prepareText(ref, text, replace) {
       const element = this.resolve(ref);
