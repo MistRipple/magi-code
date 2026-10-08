@@ -232,17 +232,6 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | App Renderer 重载 | 旧 `<webview>` 由 DOM 生命周期释放；同一逻辑 Surface 等待新 guest 注册，旧 WebContents 事件由 lifecycle epoch 丢弃，URL、标记和当前运行期 viewport 重放。 |
 | Desktop 重启 | 新 desktopEpoch；只恢复 BrowserAuthority 持久化的 Tab URL、标题和标记，重新创建物理 Surface。视口、焦点、页面历史、表单和 DOM 内存不跨重启。 |
 
-### 5.5 网络边界
-
-浏览器 guest 可以访问公网、本机和局域网（开发服务器是核心用途），但有三条固定边界，规则只有一份来源：
-
-- 静态规则（元数据主机名、`169.254.0.0/16` 等链路本地与云元数据地址、IPv4 映射的 IPv6 形式、本机与私有网段分类）在 `contracts/desktop-browser/network-policy.json`，由 `scripts/generate-browser-network-policy.mjs` 生成 Rust 与 TypeScript 常量；两端测试读取同一组 `vectors`。
-- daemon 在工具与 API 入口用同一规则做早期拒绝（`validate_browser_navigation_url`）；Electron Main 的求值器 `browser-network-policy.ts` 是实际执行点。
-- 动态规则只属于 Main：Magi 自身服务端口（daemon）不允许被 guest 访问，否则代理可以把自己的浏览器当成 Web 客户端去调用审批、提问等接口。仅有两个例外：HTML 预览入口 `/api/files/site-open`（只会重定向），以及预览来源 `site.localhost` 上的 `/api/files/site/`。
-- HTML 预览与 API 不同源：本机访问时 `site-open` 重定向到 `http://site.localhost:<端口>/api/files/site/...`。预览里的脚本可能来自模型生成或被注入的内容，不能与 API 同源；daemon 的请求守卫（`magi-api::request_guard`）只在该主机上开放预览路径，其余一律 403。
-- daemon 请求守卫同时防两类本机攻击：`Host` 必须是本机、局域网、单标签主机名、已知私有后缀（`.local`、`.lan`、`.ts.net` 等）或 `MAGI_ALLOWED_HOSTS` 声明的域名（防 DNS 重绑定）；写请求若带 `Origin` 必须与 `Host` 同源（防跨站写）。公网隧道请求由隧道令牌认证，不经过这两项检查。
-- 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
-
 ### 5.3 标记与 DOM 选择
 
 标记选择层、备注编辑器和标记历史是当前 Browser Tab 内容槽内的 Renderer DOM 浮层；它们不得占用右栏外框空间。坐标只允许按以下单向关系转换：
@@ -255,6 +244,21 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 标记截图先从同一个 Chromium WebContents 捕获当前完整可见 viewport，再由 daemon 在内存中按归一化区域无损裁剪；不能调用会改变页面滚动的 Chromium clipped capture，也不能缩放或重新渲染网页。显式 `browser_screenshot` clip 使用相同裁剪实现，PNG/JPEG/WebP 重新计算字节数和 SHA-256。标记提交后保存为独立 Artifact 和消息引用。DOM 选择保存 URL、标题、节点标识、属性、文本、受上限约束的 HTML、`outer_html_truncated`、边界和导航代次，不承诺无限完整的页面 HTML。
 
 标记和 DOM 选择可以同时存在。移动鼠标、切换工具或结束 Inspect 不得清除已经保存的选择；导航或切换 Browser Tab 时才按导航代次使活动选择失效。截图命令必须携带当前 `navigationRevision`，选择后立即导航时拒绝旧请求，不能生成新页面截图配旧页面锚点。截图工具必须写入消息编辑框或明确的 Artifact 引用，而不是只下载到本地。
+
+### 5.5 网络边界
+
+浏览器 guest 可以访问公网、本机和局域网（开发服务器是核心用途），但有三条固定边界，规则只有一份来源：
+
+- 静态规则（元数据主机名、`169.254.0.0/16` 等链路本地与云元数据地址、IPv4 映射的 IPv6 形式、本机与私有网段分类）在 `contracts/desktop-browser/network-policy.json`，由 `scripts/generate-browser-network-policy.mjs` 生成 Rust 与 TypeScript 常量；两端测试读取同一组 `vectors`。
+- daemon 在工具与 API 入口用同一规则做早期拒绝（`validate_browser_navigation_url`）；Electron Main 的求值器 `browser-network-policy.ts` 是实际执行点。
+- 动态规则只属于 Main：Magi 自身服务端口（daemon）不允许被 guest 访问，否则代理可以把自己的浏览器当成 Web 客户端去调用审批、提问等接口。仅有两个例外：HTML 预览入口 `/api/files/site-open`（只会重定向），以及预览来源 `site.localhost` 上的 `/api/files/site/`。
+- HTML 预览与 API 不同源：本机访问时 `site-open` 重定向到 `http://site.localhost:<端口>/api/files/site/...`。预览里的脚本可能来自模型生成或被注入的内容，不能与 API 同源；daemon 的请求守卫（`magi-api::request_guard`）只在该主机上开放预览路径，其余一律 403。
+- daemon 请求守卫同时防两类本机攻击：`Host` 必须是本机、局域网、单标签主机名、已知私有后缀（`.local`、`.lan`、`.ts.net` 等）或 `MAGI_ALLOWED_HOSTS` 声明的域名（防 DNS 重绑定）；写请求若带 `Origin` 必须与 `Host` 同源（防跨站写）。公网隧道请求由隧道令牌认证，不经过这两项检查。
+- 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
+
+### 5.6 网页内容是不可信输入
+
+页面正文、DOM、控制台、网络、存储和标签页标题都来自不受信任的网站，可能夹带伪装成指令的文字。daemon 在浏览器工具结果的唯一出口（`BrowserToolRuntimeDependencies::execute`）给携带这类内容的结果（`browser_read`、`browser_snapshot`、`browser_console`、`browser_network`、`browser_evaluate`、`browser_storage`、`browser_tabs`、`browser_webmcp`，以及带页面快照的操作类结果）统一加上 `content_trust: "untrusted_web_content"` 与 `content_notice`，提示模型把页面内容当作数据而不是用户指令。截图、视口等不携带页面文本的结果不加。
 
 ## 6. 视口策略
 
