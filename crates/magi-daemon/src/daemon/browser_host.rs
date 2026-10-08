@@ -1034,8 +1034,24 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
             received_bytes,
             total_bytes,
             byte_length,
+            saved_path,
             error,
         } => {
+            // 文件位置只进登记（供 browser_download 复制进工作区），不进下面面向用户的事件。
+            state
+                .browser_downloads()
+                .record(magi_api::browser_downloads::BrowserDownloadUpdate {
+                    tab_id: tab_id.clone(),
+                    download_id: download_id.clone(),
+                    filename: suggested_filename.clone(),
+                    state: download_state.clone(),
+                    received_bytes,
+                    total_bytes,
+                    saved_path,
+                    error: error
+                        .as_ref()
+                        .map(|value| magi_core::public_runtime_excerpt(value, 1024)),
+                });
             publish_tab_event(
                 state,
                 "browser.download.updated",

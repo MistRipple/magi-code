@@ -62,6 +62,7 @@ pub struct BrowserToolRuntimeDependencies {
     pub authority: Arc<Mutex<magi_browser_authority::BrowserAuthority>>,
     pub write_lock: Arc<Mutex<()>>,
     pub control_locks: crate::state::BrowserControlLocks,
+    pub downloads: Arc<crate::browser_downloads::BrowserDownloadRegistry>,
     pub state_writable: Arc<std::sync::atomic::AtomicBool>,
     pub host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
     pub host_client: Arc<RwLock<Option<BrowserHostClient>>>,
@@ -230,6 +231,11 @@ impl BrowserToolRuntimeDependencies {
         if tool_name == "browser_tabs" {
             return self
                 .execute_tabs(arguments, &browser_session, scope, &client)
+                .await;
+        }
+        if tool_name == "browser_download" {
+            return self
+                .execute_download(arguments, &browser_session, scope)
                 .await;
         }
         // 导航参数必须在自动创建 Browser Tab 之前完成校验。否则一个无效 URL
@@ -1422,6 +1428,91 @@ impl BrowserToolRuntimeDependencies {
         Ok(path.display().to_string())
     }
 
+    /// 列出本会话的下载，或把已完成的下载复制进工作区。
+    ///
+    /// 目标路径已在工具调用前按访问档位授权（与 file_write 同一套路径范围）；这里只负责
+    /// 解析路径与原子地复制。下载文件在 Desktop 私有目录里的位置从不返回给模型。
+    async fn execute_download(
+        &self,
+        arguments: &Map<String, Value>,
+        session: &magi_browser_authority::BrowserSession,
+        scope: BrowserToolCallScope<'_>,
+    ) -> Result<String, BrowserToolError> {
+        let action = string_arg(arguments, "action")?;
+        let tab_ids = session.tab_ids.clone();
+        match action.as_str() {
+            "list" => {
+                let filter = optional_string(arguments, "tab_id").map(BrowserTabId::new);
+                if let Some(tab_id) = filter.as_ref()
+                    && !tab_ids.contains(tab_id)
+                {
+                    return Err(BrowserToolError::new(
+                        "browser_tab_scope_mismatch",
+                        "指定的浏览器 Tab 不属于当前浏览器会话",
+                    ));
+                }
+                let scoped = filter.map_or_else(|| tab_ids.clone(), |tab_id| vec![tab_id]);
+                Ok(json!({
+                    "tool": "browser_download",
+                    "status": "succeeded",
+                    "downloads": self.downloads.list_for_tabs(&scoped),
+                })
+                .to_string())
+            }
+            "save" => {
+                let download_id = string_arg(arguments, "download_id")?;
+                let destination = string_arg(arguments, "destination_path")?;
+                let overwrite = bool_arg(arguments, "overwrite", false);
+                let Some(state) = self.downloads.download_state(&download_id, &tab_ids) else {
+                    return Err(BrowserToolError::new(
+                        "browser_download_not_found",
+                        "当前浏览器会话里没有这个下载；先用 action=list 查看 download_id",
+                    ));
+                };
+                let Some((source, filename)) =
+                    self.downloads.completed_file(&download_id, &tab_ids)
+                else {
+                    return Err(BrowserToolError::new(
+                        "browser_download_not_ready",
+                        format!("下载尚未完成（当前状态 {state}）；等待完成后再保存"),
+                    ));
+                };
+                let working_directory =
+                    scope.context.working_directory.as_deref().ok_or_else(|| {
+                        BrowserToolError::new(
+                            "browser_download_working_directory_unavailable",
+                            "当前任务没有工作目录，无法解析保存位置",
+                        )
+                    })?;
+                let mut target = magi_core::HostPath::resolve_native_input(
+                    &destination,
+                    Some(working_directory),
+                    dirs::home_dir().as_deref(),
+                )
+                .map(magi_core::HostPath::into_path_buf)
+                .map_err(|_| BrowserToolError::new("invalid_arguments", "destination_path 无效"))?;
+                if target.is_dir() {
+                    target.push(&filename);
+                }
+                let bytes = copy_download_into_place(&source, &target, overwrite).await?;
+                Ok(json!({
+                    "tool": "browser_download",
+                    "status": "succeeded",
+                    "saved": true,
+                    "download_id": download_id,
+                    "filename": filename,
+                    "destination_path": destination,
+                    "bytes": bytes,
+                })
+                .to_string())
+            }
+            _ => Err(BrowserToolError::new(
+                "invalid_arguments",
+                "browser_download 的 action 只支持 list 或 save",
+            )),
+        }
+    }
+
     async fn execute_tabs(
         &self,
         arguments: &Map<String, Value>,
@@ -1986,6 +2077,46 @@ fn mark_untrusted_web_content(tool_name: &str, payload: String) -> String {
     Value::Object(object).to_string()
 }
 
+/// 先复制到目标同目录的临时文件再改名，失败不会留下半截文件，也不会先删掉已有文件。
+async fn copy_download_into_place(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    overwrite: bool,
+) -> Result<u64, BrowserToolError> {
+    let failed = |message: &str| BrowserToolError::new("browser_download_save_failed", message);
+    if !tokio::fs::try_exists(source).await.unwrap_or(false) {
+        return Err(BrowserToolError::new(
+            "browser_download_file_missing",
+            "下载文件已经不在 Magi 的下载目录里（重启后会清空），请重新下载",
+        ));
+    }
+    if !overwrite && tokio::fs::try_exists(target).await.unwrap_or(false) {
+        return Err(BrowserToolError::new(
+            "browser_download_destination_exists",
+            "目标文件已存在；换一个文件名，或设置 overwrite=true 覆盖",
+        ));
+    }
+    let Some(parent) = target.parent() else {
+        return Err(failed("保存位置无效"));
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|_| failed("无法创建保存目录"))?;
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| failed("保存位置缺少文件名"))?;
+    let temporary = parent.join(format!(".{file_name}.magi-download.tmp"));
+    let bytes = tokio::fs::copy(source, &temporary)
+        .await
+        .map_err(|_| failed("复制下载文件失败"))?;
+    if let Err(_error) = tokio::fs::rename(&temporary, target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(failed("写入保存位置失败"));
+    }
+    Ok(bytes)
+}
+
 fn resolve_upload_file_arguments(
     arguments: &Map<String, Value>,
     context: &magi_tool_runtime::ToolExecutionContext,
@@ -2129,6 +2260,13 @@ fn browser_tool_requested_access(
     let action = arguments.get("action").and_then(Value::as_str);
     let lighthouse_mode = arguments.get("mode").and_then(Value::as_str);
     if kind == BrowserToolKind::Tabs {
+        return if action == Some("list") {
+            BrowserToolAccess::Read
+        } else {
+            BrowserToolAccess::Write
+        };
+    }
+    if kind == BrowserToolKind::Download {
         return if action == Some("list") {
             BrowserToolAccess::Read
         } else {
@@ -2824,6 +2962,63 @@ fn should_resync_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn download_is_copied_without_overwriting_unless_asked() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("private-download.bin");
+        std::fs::write(&source, b"payload").expect("source");
+        let target = root.path().join("workspace/out/report.bin");
+
+        let copied = copy_download_into_place(&source, &target, false)
+            .await
+            .expect("first save");
+        assert_eq!(copied, 7);
+        assert_eq!(std::fs::read(&target).expect("saved file"), b"payload");
+
+        let exists = copy_download_into_place(&source, &target, false)
+            .await
+            .expect_err("default must not overwrite");
+        assert_eq!(exists.code, "browser_download_destination_exists");
+
+        std::fs::write(&source, b"new").expect("update source");
+        copy_download_into_place(&source, &target, true)
+            .await
+            .expect("overwrite=true replaces");
+        assert_eq!(std::fs::read(&target).expect("saved file"), b"new");
+        assert!(
+            !target
+                .with_file_name(".report.bin.magi-download.tmp")
+                .exists(),
+            "临时文件不能残留"
+        );
+
+        std::fs::remove_file(&source).expect("remove source");
+        let missing = copy_download_into_place(&source, &root.path().join("x.bin"), false)
+            .await
+            .expect_err("missing source");
+        assert_eq!(missing.code, "browser_download_file_missing");
+    }
+
+    #[test]
+    fn download_requested_access_is_read_for_list_and_write_for_save() {
+        let list = serde_json::from_str::<Value>(r#"{"action":"list"}"#).expect("json");
+        let save = serde_json::from_str::<Value>(r#"{"action":"save"}"#).expect("json");
+        assert_eq!(
+            browser_tool_requested_access(
+                BrowserToolKind::Download,
+                list.as_object().expect("obj")
+            ),
+            BrowserToolAccess::Read
+        );
+        assert_eq!(
+            browser_tool_requested_access(
+                BrowserToolKind::Download,
+                save.as_object().expect("obj")
+            ),
+            BrowserToolAccess::Write
+        );
+    }
+
     #[test]
     fn page_content_results_are_marked_untrusted() {
         for tool in [
@@ -2978,6 +3173,7 @@ mod tests {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3042,6 +3238,7 @@ mod tests {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3153,6 +3350,7 @@ mod tests {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3207,6 +3405,7 @@ mod tests {
             authority: Arc::new(Mutex::new(BrowserAuthority::new())),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
@@ -3450,6 +3649,7 @@ mod tests {
             authority: Arc::new(Mutex::new(authority)),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status,
             host_client,
@@ -3894,6 +4094,7 @@ mod tests {
             authority: Arc::new(Mutex::new(BrowserAuthority::new())),
             write_lock: Arc::new(Mutex::new(())),
             control_locks: Default::default(),
+            downloads: Default::default(),
             state_writable: Arc::new(AtomicBool::new(true)),
             host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const BROWSER_TOOL_CATALOG_SCHEMA_ID: &str =
     "https://magi.dev/contracts/browser-tool.schema.json";
-pub const BROWSER_TOOL_CATALOG_SIZE: usize = 28;
+pub const BROWSER_TOOL_CATALOG_SIZE: usize = 29;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +38,7 @@ pub enum BrowserToolKind {
     Pwa,
     Read,
     Storage,
+    Download,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ pub enum BrowserToolTier {
 }
 
 impl BrowserToolKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Navigate,
         Self::Snapshot,
         Self::Click,
@@ -86,6 +87,7 @@ impl BrowserToolKind {
         Self::Pwa,
         Self::Read,
         Self::Storage,
+        Self::Download,
     ];
 
     pub fn name(self) -> &'static str {
@@ -118,6 +120,7 @@ impl BrowserToolKind {
             Self::Pwa => "browser_pwa",
             Self::Read => "browser_read",
             Self::Storage => "browser_storage",
+            Self::Download => "browser_download",
         }
     }
 
@@ -151,6 +154,7 @@ impl BrowserToolKind {
             "browser_pwa" => Some(Self::Pwa),
             "browser_read" => Some(Self::Read),
             "browser_storage" => Some(Self::Storage),
+            "browser_download" => Some(Self::Download),
             _ => None,
         }
     }
@@ -185,6 +189,7 @@ impl BrowserToolKind {
             Self::Pwa => BrowserToolAccess::Read,
             Self::Read => BrowserToolAccess::Read,
             Self::Storage => BrowserToolAccess::Mixed,
+            Self::Download => BrowserToolAccess::Mixed,
         }
     }
 
@@ -218,6 +223,7 @@ impl BrowserToolKind {
             Self::Pwa => BrowserToolTier::Devtools,
             Self::Read => BrowserToolTier::Core,
             Self::Storage => BrowserToolTier::Core,
+            Self::Download => BrowserToolTier::Core,
         }
     }
 
@@ -290,6 +296,9 @@ impl BrowserToolKind {
             }
             Self::Storage => {
                 "读写当前页面所属站点的 localStorage / sessionStorage，列出或清理该站点的 cookie，适合 Web 测试中检查登录态、预置或清空存储。cookie 只返回名称、域、路径、过期时间和 HttpOnly/Secure/SameSite 等属性，任何情况下都不返回 cookie 值，也不能写入 cookie。"
+            }
+            Self::Download => {
+                "查看当前浏览器会话里的下载，或把已完成的下载保存到工作区。在页面里点击下载链接后，用 action=list 确认下载状态（state=completed 表示完成）；action=save 把文件复制到 destination_path（相对当前工作目录或绝对路径，和 file_write 受同一套路径范围约束），默认不覆盖已有文件。下载文件原来的位置不对模型公开，也不能直接打开或执行。"
             }
         }
     }
@@ -379,6 +388,9 @@ impl BrowserToolKind {
             }
             Self::Storage => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"area":{"type":"string","enum":["local","session","cookies"],"description":"local=localStorage，session=sessionStorage，cookies=当前站点的 cookie"},"action":{"type":"string","enum":["list","get","set","remove","clear"],"description":"cookies 只支持 list 与 clear；get/set/remove 只用于 local、session"},"key":{"type":"string","minLength":1,"description":"get/set/remove 时必填的存储键名"},"value":{"type":"string","description":"set 时必填的存储值"}},"required":["area","action"]}"#
+            }
+            Self::Download => {
+                r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","save"],"description":"list 列出本会话的下载；save 把已完成的下载保存到工作区"},"download_id":{"type":"string","minLength":1,"description":"save 时必填；来自 list 返回的 download_id"},"destination_path":{"type":"string","minLength":1,"description":"save 时必填；保存位置（含文件名）"},"overwrite":{"type":"boolean","description":"save 时目标文件已存在是否覆盖；默认 false"},"tab_id":{"type":"string","description":"list 时可选；只列出该标签页触发的下载"}},"required":["action"]}"#
             }
         }
     }

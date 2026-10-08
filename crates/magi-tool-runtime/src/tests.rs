@@ -6978,6 +6978,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "browser_pwa",
             "browser_read",
             "browser_storage",
+            "browser_download",
             "diagram_render",
             "image_generate",
             "knowledge_query",

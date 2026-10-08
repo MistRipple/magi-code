@@ -125,6 +125,8 @@ export type BrowserSurfaceEvent =
       receivedBytes: number;
       totalBytes: number | null;
       byteLength?: number;
+      /** 已完成下载在私有下载目录里的位置，只交给同机的 daemon，不进入任何面向用户的事件。 */
+      savedPath?: string;
       error?: string;
     }
   | { type: "user_takeover"; binding: BrowserSurfaceBinding }
@@ -3993,6 +3995,7 @@ export class BrowserSurfaceManager {
           state: state,
           receivedBytes: item.getReceivedBytes(),
           totalBytes: nonNegativeTotalBytes(item.getTotalBytes()),
+          ...(state === "completed" ? { savedPath: item.getSavePath() } : {}),
         });
       }
     });
@@ -4035,6 +4038,7 @@ export class BrowserSurfaceManager {
       receivedBytes: number;
       totalBytes: number | null;
       byteLength?: number;
+      savedPath?: string;
       error?: string;
     },
   ): void {

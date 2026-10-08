@@ -1151,11 +1151,16 @@ function trustedAppSender(webContentsId: number): {
 function publishBrowserEvent(event: BrowserSurfaceEvent): void {
   // Surface 事件属于创建它的窗口。广播给所有窗口会让同一逻辑 Tab 的
   // Secondary Surface 污染另一个窗口的地址、加载状态和 Agent 光标。
+  // 下载文件的私有位置只交给同机 daemon，不发给 Renderer。
+  const rendererEvent =
+    event.type === "download" && event.savedPath !== undefined
+      ? (({ savedPath: _savedPath, ...rest }) => rest)(event)
+      : event;
   try {
     windowManager?.broadcast(
       event.binding.window_id,
       "magi-desktop:browser-event",
-      event,
+      rendererEvent,
     );
   } catch {
     // 目标窗口可能刚好关闭，WindowManager 会负责清理它的 Surface。

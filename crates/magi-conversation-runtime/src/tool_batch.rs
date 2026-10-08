@@ -5256,6 +5256,51 @@ mod tests {
     }
 
     #[test]
+    fn browser_download_save_uses_the_same_write_scope_as_file_write() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-outside-download-target.bin");
+        let mut task = test_task(
+            "task-browser-download-scope",
+            "task-browser-download-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        let decide = |arguments: serde_json::Value| {
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::BrowserDownload.as_str(),
+                &arguments.to_string(),
+                Some(&workspace_root),
+            )
+        };
+
+        assert!(
+            decide(serde_json::json!({ "action": "list" })).is_none(),
+            "列出下载不涉及任何路径"
+        );
+        assert!(
+            decide(serde_json::json!({
+                "action": "save",
+                "download_id": "d1",
+                "destination_path": "build/report.pdf",
+            }))
+            .is_none(),
+            "保存到工作区内可以"
+        );
+        let rejected = decide(serde_json::json!({
+            "action": "save",
+            "download_id": "d1",
+            "destination_path": outside_path.display().to_string(),
+        }))
+        .expect("工作区外不能保存");
+        assert_eq!(rejected.status, ExecutionResultStatus::Rejected);
+    }
+
+    #[test]
     fn browser_upload_file_uses_the_same_read_scope_as_file_read() {
         let workspace = tempdir().expect("workspace tempdir");
         let workspace_root = workspace.path().to_path_buf();

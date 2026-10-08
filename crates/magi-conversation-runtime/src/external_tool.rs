@@ -208,6 +208,7 @@ pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
         | T::BrowserScroll
         | T::BrowserSnapshot
         | T::BrowserStorage
+        | T::BrowserDownload
         | T::BrowserTabs
         | T::BrowserThirdParty
         | T::BrowserType

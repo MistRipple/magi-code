@@ -339,6 +339,7 @@ export class DesktopControlServer {
             ...(event.byteLength !== undefined
               ? { byte_length: event.byteLength }
               : {}),
+            ...(event.savedPath ? { saved_path: event.savedPath } : {}),
             ...(event.error ? { error: event.error } : {}),
           },
         });

@@ -745,6 +745,9 @@ pub enum BrowserHostEvent {
         total_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         byte_length: Option<u64>,
+        /// 已完成下载在 Desktop 私有下载目录里的位置；只用于 daemon 把文件复制进工作区。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saved_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

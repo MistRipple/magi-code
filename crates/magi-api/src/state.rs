@@ -1366,6 +1366,7 @@ pub struct ApiState {
     pub browser_authority: Arc<Mutex<BrowserAuthority>>,
     browser_write_lock: Arc<Mutex<()>>,
     pub(crate) browser_control_locks: BrowserControlLocks,
+    pub(crate) browser_downloads: Arc<crate::browser_downloads::BrowserDownloadRegistry>,
     app_server_request_locks: Arc<Mutex<HashMap<String, AppServerRequestLockEntry>>>,
     browser_state_writable: Arc<AtomicBool>,
     browser_host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
@@ -2150,6 +2151,7 @@ impl ApiState {
             browser_authority,
             browser_write_lock,
             browser_control_locks: BrowserControlLocks::default(),
+            browser_downloads: Arc::default(),
             app_server_request_locks: Arc::new(Mutex::new(HashMap::new())),
             browser_state_writable: Arc::new(AtomicBool::new(true)),
             browser_host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
@@ -2987,11 +2989,16 @@ impl ApiState {
         self.browser_host_generation.load(Ordering::Acquire)
     }
 
+    pub fn browser_downloads(&self) -> &Arc<crate::browser_downloads::BrowserDownloadRegistry> {
+        &self.browser_downloads
+    }
+
     pub fn browser_tool_runtime_dependencies(&self) -> crate::BrowserToolRuntimeDependencies {
         crate::BrowserToolRuntimeDependencies {
             authority: Arc::clone(&self.browser_authority),
             write_lock: Arc::clone(&self.browser_write_lock),
             control_locks: self.browser_control_locks.clone(),
+            downloads: Arc::clone(&self.browser_downloads),
             state_writable: Arc::clone(&self.browser_state_writable),
             host_status: Arc::clone(&self.browser_host_status),
             host_client: Arc::clone(&self.browser_host_client),

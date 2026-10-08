@@ -258,6 +258,16 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 - daemon 请求守卫同时防两类本机攻击：`Host` 必须是本机、局域网、单标签主机名、已知私有后缀（`.local`、`.lan`、`.ts.net` 等）或 `MAGI_ALLOWED_HOSTS` 声明的域名（防 DNS 重绑定）；写请求若带 `Origin` 必须与 `Host` 同源（防跨站写）。公网隧道请求由隧道令牌认证，不经过这两项检查。
 - 执行点在 guest session 的 `webRequest.onBeforeRequest`，覆盖主文档、重定向、iframe、fetch/XHR 与 WebSocket；`will-navigate` 和导航入口 `normalizeNavigableUrl` 复用同一求值器。只检查导航入口无法拦住页面内的重定向和子资源请求。
 
+### 5.8 下载取回
+
+下载只写入 Magi 私有下载目录。Main 在下载完成事件里带上文件位置（`saved_path`，只发给同机的 daemon，不进入 Renderer 事件，也不出现在任何工具结果）；daemon 的 `BrowserDownloadRegistry` 记住最近 50 条，按浏览器会话的标签页隔离。模型通过 `browser_download`：
+
+- `action=list` 列出本会话的下载（`download_id`、文件名、状态、大小）；
+- `action=save` 把已完成的下载复制到 `destination_path`：路径和 `file_write` 受同一套访问档位范围约束，默认不覆盖已有文件，先写同目录临时文件再改名；
+- 下载文件原来的位置对模型不可见，也不提供「打开」或执行。
+
+重启后下载目录清空，登记随之失效。
+
 ### 5.7 访问档位与网页写动作
 
 浏览器工具的网页写动作由权限引擎统一判定（`PermissionRequest::BrowserAction`，工具名与参数的分类在 `browser_action_class`），不再因为「工具目录里标记为只读访问模式」而绕过访问档位：

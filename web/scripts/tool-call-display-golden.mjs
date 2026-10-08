@@ -581,6 +581,8 @@ await withGoldenViteServer(async (server) => {
   assert.equal(browserDisplay.browserToolSummary('browser_upload_file', { file_paths: ['/tmp/a/x.png', '/tmp/a/y.pdf'] }), 'x.png, y.pdf');
   assert.equal(browserDisplay.browserToolSummary('browser_storage', { area: 'local', action: 'set', key: 'feature_flag', value: 'on' }), 'local set feature_flag', '存储摘要不展示写入的值');
   assert.equal(browserDisplay.browserToolSummary('browser_storage', { area: 'cookies', action: 'list' }), 'cookies list');
+  assert.equal(browserDisplay.browserToolSummary('browser_download', { action: 'list' }), 'list');
+  assert.equal(browserDisplay.browserToolSummary('browser_download', { action: 'save', download_id: 'd1', destination_path: 'build/assets/report.pdf' }), 'report.pdf', '保存下载只展示目标文件名');
   const readPayload = JSON.stringify({
     tool: 'browser_read',
     status: 'succeeded',

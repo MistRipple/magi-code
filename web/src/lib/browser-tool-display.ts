@@ -53,6 +53,9 @@ export function browserToolSummary(
       return normalizeToolDisplayText(args.expression);
     case 'browser_storage':
       return [args.area, args.action, args.key].map(normalizeToolDisplayText).filter(Boolean).join(' ');
+    case 'browser_download':
+      // 只展示保存位置的文件名；list 没有可展示的目标。
+      return normalizeToolDisplayText(args.destination_path).split(/[\\/]/u).pop() || normalizeToolDisplayText(args.action);
     case 'browser_upload_file': {
       const paths = Array.isArray(args.file_paths) ? args.file_paths : [args.file_path];
       return paths

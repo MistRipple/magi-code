@@ -57,6 +57,7 @@ pub enum BuiltinToolName {
     BrowserPwa,
     BrowserRead,
     BrowserStorage,
+    BrowserDownload,
     // ── 可视化 ──
     DiagramRender,
     /// 通过已配置的图片生成模型生成图片并保存到当前工作区。
@@ -129,7 +130,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 81] = [
+    pub const ALL: [Self; 82] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -179,6 +180,7 @@ impl BuiltinToolName {
         Self::BrowserPwa,
         Self::BrowserRead,
         Self::BrowserStorage,
+        Self::BrowserDownload,
         Self::DiagramRender,
         Self::ImageGenerate,
         Self::KnowledgeQuery,
@@ -264,6 +266,7 @@ impl BuiltinToolName {
             Self::BrowserPwa => "browser_pwa",
             Self::BrowserRead => "browser_read",
             Self::BrowserStorage => "browser_storage",
+            Self::BrowserDownload => "browser_download",
             Self::DiagramRender => "diagram_render",
             Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
@@ -347,7 +350,8 @@ impl BuiltinToolName {
             | Self::BrowserWebMcp
             | Self::BrowserPwa
             | Self::BrowserRead
-            | Self::BrowserStorage => "browser",
+            | Self::BrowserStorage
+            | Self::BrowserDownload => "browser",
             Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery | Self::KnowledgeGraphQuery => "knowledge",
             Self::ToolCatalog => "tooling",
@@ -428,6 +432,7 @@ impl BuiltinToolName {
             "browser_pwa" => Some(Self::BrowserPwa),
             "browser_read" => Some(Self::BrowserRead),
             "browser_storage" => Some(Self::BrowserStorage),
+            "browser_download" => Some(Self::BrowserDownload),
             "diagram_render" => Some(Self::DiagramRender),
             "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
@@ -809,7 +814,8 @@ impl BuiltinToolName {
             | Self::BrowserThirdParty
             | Self::BrowserWebMcp
             | Self::BrowserEmulate
-            | Self::BrowserStorage => RiskLevel::Medium,
+            | Self::BrowserStorage
+            | Self::BrowserDownload => RiskLevel::Medium,
             Self::FileRemove
             | Self::ShellExec
             | Self::ProcessLaunch

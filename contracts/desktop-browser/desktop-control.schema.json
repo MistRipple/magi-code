@@ -1117,6 +1117,7 @@
                 "received_bytes": { "type": "integer", "minimum": 0 },
                 "total_bytes": { "type": ["integer", "null"], "minimum": 0 },
                 "byte_length": { "type": "integer", "minimum": 0 },
+                "saved_path": { "type": "string" },
                 "error": { "type": "string" }
               }
             }

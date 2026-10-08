@@ -682,6 +682,7 @@ export type BrowserHostEvent =
         received_bytes: number;
         total_bytes: number | null;
         byte_length?: number;
+        saved_path?: string;
         error?: string;
       };
     }

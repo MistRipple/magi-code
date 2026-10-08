@@ -664,6 +664,22 @@ pub fn tool_path_access_requests(
         crate::BuiltinToolName::FileRead | crate::BuiltinToolName::ViewImage => {
             push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);
         }
+        crate::BuiltinToolName::BrowserDownload => {
+            // 保存下载只在 action=save 时写工作区：与 file_write 使用同一套路径范围。
+            let saves = object
+                .and_then(|object| object.get("action"))
+                .and_then(Value::as_str)
+                .is_some_and(|action| action.trim().eq_ignore_ascii_case("save"));
+            if saves {
+                push_tool_path_fields(
+                    &mut paths,
+                    object,
+                    &["destination_path"],
+                    write,
+                    workspace_root_path,
+                );
+            }
+        }
         crate::BuiltinToolName::BrowserUploadFile => {
             // 把本地文件交给网页上传，等同于读取这些文件：与 file_read 使用同一套路径范围。
             push_tool_path_fields(
