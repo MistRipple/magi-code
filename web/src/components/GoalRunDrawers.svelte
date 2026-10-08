@@ -1103,8 +1103,10 @@
       display: none;
     }
 
+    /* 状态标题隐藏后只剩一列。保持 grid 让目标文字成为网格项（块级）：
+       内联元素上的 overflow / text-overflow 不生效，长目标会冲出卡片。 */
     .goal-heading {
-      display: block;
+      grid-template-columns: minmax(0, 1fr);
     }
 
     .goal-status-title {

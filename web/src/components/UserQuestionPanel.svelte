@@ -387,6 +387,8 @@
     background: transparent;
     color: var(--foreground);
     text-align: left;
+    /* 全局把 button 设为 nowrap；选项文字（含长描述）要在卡片内换行，不能整行冲出去。 */
+    white-space: normal;
     cursor: pointer;
     font: inherit;
     transition: background var(--transition-fast), border-color var(--transition-fast);
@@ -430,6 +432,7 @@
     background: transparent;
     color: inherit;
     text-align: left;
+    white-space: normal;
     cursor: pointer;
     font: inherit;
   }

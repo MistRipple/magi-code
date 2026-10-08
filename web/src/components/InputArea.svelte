@@ -4267,6 +4267,8 @@
     border-radius: var(--radius-sm, 6px);
     cursor: pointer;
     text-align: left;
+    /* 全局 button 是 nowrap；名称与路径要在弹层内换行，不能冲出弹层。 */
+    white-space: normal;
     color: var(--foreground);
     transition: background var(--transition-fast);
   }

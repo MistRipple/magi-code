@@ -1740,6 +1740,8 @@
     font-size: var(--text-xs);
     line-height: 1.45;
     color: var(--foreground-muted);
+    /* 卡片本身是 button（全局 nowrap）；失败说明要在卡片内换行。 */
+    white-space: normal;
     overflow-wrap: anywhere;
   }
 
