@@ -20,6 +20,7 @@
     "release:preflight:full": "node scripts/release-preflight.mjs --package --audit",
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
     "test:electron-browser-permission-matrix": "node scripts/verify-electron-browser-permission-matrix.mjs",
+    "test:electron-browser-network-policy": "node scripts/verify-electron-browser-network-policy.mjs",
     "test:electron-renderer-comparison": "node scripts/derive-electron-renderer-comparison-golden.mjs",
     "test:performance-envelope": "node scripts/derive-magi-performance-envelope-golden.mjs",
     "test:context-compaction-metrics": "node scripts/derive-magi-context-compaction-metrics-golden.mjs",

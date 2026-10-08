@@ -324,6 +324,8 @@ App Server 的 `initialize/initialized` 只在可信 Desktop 传输且客户端�
 10. 检查控制台和日志，不得有 `setBounds` 浏览器调用、Overlay IPC、黑屏、focus 串位、Surface stale 误报或无限连接等待。
 11. 应用级 Web 模型会话（§4.3）：登录 GPT Web 后折叠右栏、关闭该视图、切换项目 / 会话，确认右栏现有标签与活动面板不被夺走、单一 guest 不被销毁、后台推理继续；重启 Magi 后登录态仍在（`persist:magi-web-model`），临时对话失效、已保存对话按 `conversation_id` 重绑，且不会恢复第二个 WebView。
 
+网络边界（§5.5）有独立的真实 Chromium 验收：`npm run test:electron-browser-network-policy` 用开发依赖里的 Electron 启动不显示窗口的最小宿主，验证 iframe、fetch 和重定向无法绕过 session 层拦截，并确认 `*.localhost` 预览来源能解析到本机。
+
 前置命令：
 
 ```bash
