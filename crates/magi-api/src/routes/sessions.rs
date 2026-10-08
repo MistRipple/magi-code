@@ -2560,11 +2560,13 @@ async fn submit_mainline_session_turn(
         decision.execution_goal.clone().unwrap_or(user_text.clone())
     };
     let mut required_tool_chain = decision.required_tool_chain.clone();
+    let mut goal_start_turn = false;
     if goal_mode {
         let has_unfinished_goal = request
             .requested_session_id()
             .and_then(|session_id| state.session_store.current_unfinished_goal(&session_id))
             .is_some();
+        goal_start_turn = !has_unfinished_goal;
         required_tool_chain.retain(|tool| tool != "get_goal" && tool != "create_goal");
 
         let mut goal_tool_chain = vec!["get_goal".to_string()];
@@ -2624,6 +2626,9 @@ async fn submit_mainline_session_turn(
         Some(&format!("turn-session-action-{}", accepted.accepted_at.0)),
         None,
     );
+    if goal_start_turn {
+        remember_goal_start_request(&state, &accepted.session_id, &accepted.root_task_id, &request);
+    }
     super::schedule_session_task_dispatch(state.clone(), accepted.clone());
     Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id: accepted.session_id,
@@ -2838,6 +2843,197 @@ fn goal_runtime_retry_backoff(
         .saturating_mul(1u64 << (blocker.consecutive_turns - 1).min(4))
         .min(60);
     Some(std::time::Duration::from_secs(seconds))
+}
+
+/// 目标起始轮的重试上限：连同首次共 3 次尝试，与目标续跑的受阻阈值保持一致。
+const GOAL_START_RETRY_MAX: u32 = 2;
+const GOAL_START_RETRY_SUFFIX: &str = "-goalstart-retry-";
+
+/// 登记目标起始轮的原始请求，供轮次在目标创建前因暂态故障失败时重提。
+fn remember_goal_start_request(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &magi_core::TaskId,
+    request: &SessionTurnRequestDto,
+) {
+    let mut request = request.clone();
+    // 重提发生在已存在的会话里：会话 ID 以实际受理的为准，初始模型配置已在首轮落到会话上。
+    request.session_id = Some(session_id.as_str().to_string());
+    request.orchestrator_session_config = None;
+    request.replace_turn_id = None;
+    request.steer_current_turn = false;
+    request.expected_turn_id = None;
+    state
+        .goal_start_requests
+        .lock()
+        .expect("goal start requests lock poisoned")
+        .insert(root_task_id.as_str().to_string(), request);
+}
+
+/// 目标起始轮在终态收口时的唯一入口：成功或不可重试就丢弃登记，暂态失败且目标还没创建时
+/// 退避后把原请求重新排进会话队列。
+///
+/// 已经创建出目标的失败由 [`record_active_goal_turn_failure`] 接管；这里只覆盖「模型在创建目标之前
+/// 就失败」——此时没有目标可续跑，不重提的话用户只能手动重发。
+pub(crate) fn settle_goal_start_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &magi_core::TaskId,
+    turn_id: &str,
+    succeeded: bool,
+) {
+    let Some(request) = state
+        .goal_start_requests
+        .lock()
+        .expect("goal start requests lock poisoned")
+        .remove(root_task_id.as_str())
+    else {
+        return;
+    };
+    if succeeded
+        || state
+            .session_store
+            .current_unfinished_goal(session_id)
+            .is_some()
+        || !goal_start_failure_is_retryable(state, session_id, turn_id)
+    {
+        return;
+    }
+    let attempt = goal_start_retry_attempt(&request);
+    if attempt >= GOAL_START_RETRY_MAX {
+        return;
+    }
+    let delay = std::time::Duration::from_secs(5u64 << attempt);
+    tracing::warn!(
+        session_id = %session_id,
+        turn_id,
+        attempt = attempt + 1,
+        delay_secs = delay.as_secs(),
+        "目标起始轮在创建目标前失败，退避后自动重提"
+    );
+    let state = state.clone();
+    let session_id = session_id.clone();
+    let failed_turn_id = turn_id.to_string();
+    crate::state::spawn_session_turn_work("magi-goal-start-retry", async move {
+        tokio::time::sleep(delay).await;
+        resubmit_goal_start_turn(state, session_id, failed_turn_id, request, attempt + 1).await;
+    });
+}
+
+fn goal_start_retry_attempt(request: &SessionTurnRequestDto) -> u32 {
+    request
+        .request_id()
+        .and_then(|id| {
+            id.rsplit_once(GOAL_START_RETRY_SUFFIX)
+                .and_then(|(_, attempt)| attempt.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// 失败轮的模型诊断标明可重试（超时、5xx、网络抖动等）；鉴权、模型不存在、请求被拒这类
+/// 确定性错误重提只会重复失败。没有结构化诊断（例如运行时自身的错误）不自动重提。
+fn goal_start_failure_is_retryable(
+    state: &ApiState,
+    session_id: &SessionId,
+    turn_id: &str,
+) -> bool {
+    state
+        .session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .is_some_and(|turn| {
+            turn.items.iter().any(|item| {
+                item.status == magi_session_store::CanonicalTurnItemStatus::Failed
+                    && item
+                        .metadata
+                        .get("modelFailure")
+                        .and_then(|failure| failure.get("retryable"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        })
+}
+
+async fn resubmit_goal_start_turn(
+    state: ApiState,
+    session_id: SessionId,
+    failed_turn_id: String,
+    mut request: SessionTurnRequestDto,
+    attempt: u32,
+) {
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
+    let latest_turn_id = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .filter(|turn| !turn.is_session_command())
+        .max_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        })
+        .map(|turn| turn.turn_id);
+    // 退避期间用户已经发了新消息、手动重试、或目标已经出现：不再替用户重复提交。
+    if latest_turn_id.as_deref() != Some(failed_turn_id.as_str())
+        || state.queued_regular_session_turn_count(&session_id) > 0
+        || state
+            .session_store
+            .current_unfinished_goal(&session_id)
+            .is_some()
+        || state
+            .session_store
+            .ensure_current_turn_acceptance_available(&session_id)
+            .is_err()
+    {
+        return;
+    }
+    let Some(session) = state.session_store.session(&session_id) else {
+        return;
+    };
+    if session.status != SessionLifecycleStatus::Active {
+        return;
+    }
+    let workspace_id = session_workspace_id(&state, &session);
+    let base_request_id = request
+        .request_id()
+        .map(|id| match id.rsplit_once(GOAL_START_RETRY_SUFFIX) {
+            Some((base, _)) => base.to_string(),
+            None => id,
+        })
+        .unwrap_or_else(|| format!("goal-start-{failed_turn_id}"));
+    request.request_id = Some(format!("{base_request_id}{GOAL_START_RETRY_SUFFIX}{attempt}"));
+    request.user_message_id = None;
+    request.placeholder_message_id = None;
+    let request_fingerprint = match request.request_fingerprint() {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            tracing::warn!(%session_id, error, "目标起始轮重提失败：请求无法生成指纹");
+            return;
+        }
+    };
+    let decision = match decide_session_turn(&state, &request) {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(%session_id, ?error, "目标起始轮重提失败：无法决策路由");
+            return;
+        }
+    };
+    if let Err(error) = enqueue_session_turn_response(EnqueueSessionTurnInput {
+        state: &state,
+        request,
+        request_fingerprint,
+        requested_workspace_id: workspace_id.clone(),
+        accepted_at: super::monotonic_accepted_at(),
+        decision,
+        session_id: session_id.clone(),
+        workspace_id: workspace_id.clone(),
+    }) {
+        tracing::warn!(%session_id, ?error, "目标起始轮重提失败：写入排队失败");
+        return;
+    }
+    drop(_session_turn_guard);
+    schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
 }
 
 fn plan_allows_goal_continuation(plan: Option<&magi_session_store::SessionPlan>) -> bool {

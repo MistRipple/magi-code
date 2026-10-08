@@ -420,6 +420,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 session_id,
                 root_task_id.as_str(),
             );
+            crate::routes::sessions::settle_goal_start_turn(
+                state,
+                session_id,
+                root_task_id,
+                expected_turn_id.unwrap_or_default(),
+                true,
+            );
         } else {
             let failure_reason = state
                 .task_store()
@@ -436,6 +443,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 session_id,
                 root_task_id.as_str(),
                 &failure_reason,
+            );
+            crate::routes::sessions::settle_goal_start_turn(
+                state,
+                session_id,
+                root_task_id,
+                expected_turn_id.unwrap_or_default(),
+                false,
             );
         }
         // 目标会退避后自动重试时计划要保持运行，否则续跑会因计划暂停而被拦住。

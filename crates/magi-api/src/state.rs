@@ -1283,6 +1283,9 @@ pub struct ApiState {
     /// 正在等别的会话用完工作区的会话（会话 → 占用工作区的会话）。事件只通知变化，
     /// 页面刷新或重连后靠这份快照还原「正在等谁」。
     pub session_workspace_waits: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// 目标模式「起始轮」的原始请求（根任务 → 请求）。目标由模型在这一轮里创建，轮次在创建前就因
+    /// 暂态故障失败时还没有目标可续跑，只能重提原请求；终态收口时取走，只在内存里保留。
+    pub goal_start_requests: Arc<Mutex<HashMap<String, SessionTurnRequestDto>>>,
     /// turn/worker 与 Git mutation 的 workspace 级 lease 协调器，消除“检查后立即竞态”。
     pub workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
     pub governance: Arc<GovernanceService>,
@@ -2070,6 +2073,7 @@ impl ApiState {
             session_code_contexts: magi_git::SessionCodeContextRegistry::default(),
             session_isolations: magi_session_isolation::SessionIsolationRegistry::default(),
             session_workspace_waits: Arc::new(Mutex::new(HashMap::new())),
+            goal_start_requests: Arc::new(Mutex::new(HashMap::new())),
             workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
             governance,
             knowledge_store: Arc::new(KnowledgeStore::new()),

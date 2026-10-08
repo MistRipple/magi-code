@@ -279,6 +279,19 @@ impl HarnessModelClient {
         state.transient_failures_remaining = 1;
     }
 
+    /// 连续 `failures` 次超时之后才返回正常回复：用来越过轮次内的单次自动恢复，让整轮失败。
+    pub fn set_timeout_failures_then_completed(&self, response: impl Into<String>, failures: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("harness provider state should hold");
+        state.behavior = Some(ProviderBehavior::TransientThenCompleted {
+            response: response.into(),
+            error: "provider request timed out".to_string(),
+        });
+        state.transient_failures_remaining = failures;
+    }
+
     pub fn set_timeout_then_completed(&self, response: impl Into<String>) {
         let mut state = self
             .state
@@ -1336,6 +1349,45 @@ impl MagiTurnHarness {
             self.provider.timing.mark_accepted_returned();
         }
         response
+    }
+
+    /// 以目标模式提交工作区里的一轮（新目标的起始轮）。
+    pub async fn submit_workspace_goal_start(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &magi_core::WorkspaceId,
+        workspace_path: &Path,
+        text: &str,
+        request_id: &str,
+    ) -> Result<SessionTurnResponseDto, crate::errors::ApiError> {
+        self.provider.begin_timing();
+        TurnService::new(self.state.clone())
+            .submit(SessionTurnRequestDto {
+                desktop_browser_tools_allowed: false,
+                session_id: Some(session_id.to_string()),
+                scope: SessionScopeKindDto::Workspace,
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: Some(workspace_path.display().to_string()),
+                text: Some(text.to_string()),
+                skill_name: None,
+                locale: Some("zh-CN".to_string()),
+                goal_mode: true,
+                resume: false,
+                images: Vec::new(),
+                context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
+                browser_node_selections: Vec::new(),
+                access_profile: Some(AccessProfile::FullAccess),
+                orchestrator_session_config: None,
+                request_id: Some(request_id.to_string()),
+                user_message_id: None,
+                placeholder_message_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
+                replace_turn_id: None,
+                command: None,
+            })
+            .await
     }
 
     pub async fn steer(
@@ -8690,6 +8742,109 @@ done
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn goal_start_turn_failing_before_the_goal_exists_is_resubmitted_after_backoff() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("goal-start-retry", "目标起始轮失败后自动重提");
+        // 起始轮连续两次超时（轮次内的单次自动恢复也失败），整轮失败；此时目标还没创建。
+        harness
+            .provider
+            .set_timeout_failures_then_completed("目标已建立", 2);
+        let accepted = harness
+            .submit_workspace_goal_start(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "目标：整理文档",
+                "harness-goal-start",
+            )
+            .await
+            .expect("目标起始轮应被接纳");
+        let first_turn_id = accepted.turn_id.clone().expect("应有 Turn");
+        let first = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        assert_eq!(first.status, CanonicalTurnStatus::Failed);
+        assert!(
+            harness
+                .state
+                .session_store
+                .current_unfinished_goal(&session_id)
+                .is_none(),
+            "模型在创建目标前就失败，不应已有目标"
+        );
+
+        // 退避（5s）后原请求被重新排队并开始新的一轮，用户不必手动重发。
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let retried_turn = loop {
+            let retried = harness
+                .state
+                .session_store
+                .canonical_turns_for_session(&session_id)
+                .into_iter()
+                .find(|turn| turn.turn_id != first_turn_id && !turn.is_session_command());
+            if let Some(turn) = retried {
+                break turn;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "目标起始轮应在退避后自动重提"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_request_id("harness-goal-start-goalstart-retry-1")
+                .map(|turn| turn.turn_id),
+            Some(retried_turn.turn_id),
+            "重提的请求要带重试序号，防止无限重提并保持幂等"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_start_turn_is_not_resubmitted_for_a_non_retryable_failure() {
+        let (harness, workspace_id, workspace_root, session_id) =
+            prepare_git_approval_case("goal-start-no-retry", "目标起始轮的配置错误不重提");
+        harness
+            .provider
+            .set_failure("provider rejected request: model_not_found (http_status=404)");
+        let accepted = harness
+            .submit_workspace_goal_start(
+                &session_id,
+                &workspace_id,
+                &workspace_root,
+                "目标：整理文档",
+                "harness-goal-start-no-retry",
+            )
+            .await
+            .expect("目标起始轮应被接纳");
+        let first_turn_id = accepted.turn_id.clone().expect("应有 Turn");
+        let first = harness.wait_for_terminal(&session_id, &first_turn_id).await;
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .find_map(|item| item.metadata.get("modelFailure"))
+                .and_then(|failure| failure.get("retryable"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "前提：模型不存在属于用户不可重试的确定性错误"
+        );
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let turns = harness
+            .state
+            .session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .filter(|turn| !turn.is_session_command())
+            .count();
+        assert_eq!(turns, 1, "确定性错误重提只会重复失败，不应自动重提");
+        assert!(
+            harness.state.goal_start_requests.lock().unwrap().is_empty(),
+            "终态收口后不应残留登记"
+        );
     }
 
     #[tokio::test]
