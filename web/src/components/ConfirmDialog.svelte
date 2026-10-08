@@ -6,20 +6,25 @@
 </script>
 
 {#if request}
-  <Modal title={request.title} size="sm" onClose={() => settleConfirm(false)} closeOnBackdrop>
+  <Modal title={request.title} size="sm" onClose={() => settleConfirm('cancel')} closeOnBackdrop>
     <p class="confirm-message">{request.message}</p>
 
     {#snippet footer()}
       <div class="confirm-footer">
-        <button type="button" class="confirm-btn" onclick={() => settleConfirm(false)}>
+        <button type="button" class="confirm-btn" onclick={() => settleConfirm('cancel')}>
           {request.cancelLabel}
         </button>
+        {#if request.secondaryLabel}
+          <button type="button" class="confirm-btn confirm-btn--secondary" onclick={() => settleConfirm('secondary')}>
+            {request.secondaryLabel}
+          </button>
+        {/if}
         <button
           type="button"
           class="confirm-btn"
           class:confirm-btn--primary={request.tone !== 'danger'}
           class:confirm-btn--danger={request.tone === 'danger'}
-          onclick={() => settleConfirm(true)}
+          onclick={() => settleConfirm('confirm')}
         >
           {request.confirmLabel}
         </button>
@@ -57,6 +62,11 @@
 
   .confirm-btn:hover {
     background: color-mix(in srgb, var(--foreground) 7%, transparent);
+    color: var(--foreground);
+  }
+
+  .confirm-btn--secondary {
+    border: 1px solid var(--border);
     color: var(--foreground);
   }
 

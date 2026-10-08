@@ -5,6 +5,7 @@ import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
 import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
+import { confirmMessage } from "./confirm-dialog.svelte";
 import {
   directIncidentError,
   incidentErrorDiagnostics,
@@ -3769,50 +3770,56 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     });
   }
 
-  function toggleSafeguardRule(index: number): void {
+  async function toggleSafeguardRule(index: number): Promise<void> {
     const rule = safeguardRules[index];
     if (!rule) return;
     if (
       rule.enabled
-      && !window.confirm(i18n.t("settings.safeguard.disableConfirm", { pattern: rule.pattern }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.disableConfirm", { pattern: rule.pattern }), { tone: "danger" }))
     ) {
       return;
     }
+    // 对话框期间规则可能已被改动：以当前状态为准重新取一次。
+    const current = safeguardRules[index];
+    if (!current || current.pattern !== rule.pattern) return;
     safeguardRules[index] = {
-      ...rule,
-      enabled: !rule.enabled,
+      ...current,
+      enabled: !current.enabled,
     };
     safeguardRules = [...safeguardRules];
     saveSafeguardRules();
   }
 
-  function updateSafeguardRuleAction(index: number, action: string): void {
+  async function updateSafeguardRuleAction(index: number, action: string): Promise<void> {
     const rule = safeguardRules[index];
     if (!rule) return;
     const normalizedAction = normalizeSafeguardAction(action);
     if (rule.action === normalizedAction) return;
     if (
       safetyActionPrecedence(normalizedAction) < safetyActionPrecedence(rule.action)
-      && !window.confirm(i18n.t("settings.safeguard.downgradeConfirm", { pattern: rule.pattern }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.downgradeConfirm", { pattern: rule.pattern }), { tone: "danger" }))
     ) {
       return;
     }
+    const current = safeguardRules[index];
+    if (!current || current.pattern !== rule.pattern) return;
     safeguardRules[index] = {
-      ...rule,
+      ...current,
       action: normalizedAction,
     };
     safeguardRules = [...safeguardRules];
     saveSafeguardRules();
   }
 
-  function removeCustomRule(index: number): void {
+  async function removeCustomRule(index: number): Promise<void> {
     const rule = safeguardRules[index];
     if (
       rule
-      && !window.confirm(i18n.t("settings.safeguard.removeConfirm", { pattern: rule.pattern }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.removeConfirm", { pattern: rule.pattern }), { tone: "danger" }))
     ) {
       return;
     }
+    if (rule && safeguardRules[index]?.pattern !== rule.pattern) return;
     safeguardRules = safeguardRules.filter((_, i) => i !== index);
     saveSafeguardRules();
   }

@@ -19,6 +19,7 @@
   import IsolationBanner from './IsolationBanner.svelte';
   import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
     getAgentChangeDiff,
@@ -109,9 +110,9 @@
     if (changeMutationPending) return;
     vscode.postMessage({ type: 'approveChange', filePath: edit.filePath, ...editScope(edit) });
   }
-  function revertChange(edit: Edit) {
+  async function revertChange(edit: Edit) {
     if (changeMutationPending || edit.revertible !== true) return;
-    const confirmed = window.confirm(i18n.t('edits.confirm.revertChange', { file: edit.filePath }));
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertChange', { file: edit.filePath }), { tone: 'danger' });
     if (!confirmed) return;
     vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
@@ -120,15 +121,15 @@
     if (changeMutationPending || edits.length === 0) return;
     vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
-  function revertAllChanges() {
+  async function revertAllChanges() {
     if (changeMutationPending || edits.length === 0 || !allEditsRevertible) return;
-    const confirmed = window.confirm(i18n.t('edits.confirm.revertAll', { count: edits.length }));
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertAll', { count: edits.length }), { tone: 'danger' });
     if (!confirmed) return;
     vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
-  function revertCurrentRound() {
+  async function revertCurrentRound() {
     if (changeMutationPending || !latestExecutionGroupId || !currentRoundRevertible) return;
-    const confirmed = window.confirm(i18n.t('edits.confirm.revertRound', { count: currentRoundEdits.length }));
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertRound', { count: currentRoundEdits.length }), { tone: 'danger' });
     if (!confirmed) return;
     vscode.postMessage({
       type: 'revertExecutionGroup',

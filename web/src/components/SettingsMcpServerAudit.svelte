@@ -7,6 +7,7 @@
    */
   import { onMount } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
   import {
     clearMcpServerAudit,
@@ -69,7 +70,7 @@
     const message = filterTokenId
       ? i18n.t('mcpServer.audit.clearClientConfirm', { client: filterName, count: String(total) })
       : i18n.t('mcpServer.audit.clearAllConfirm', { count: String(total) });
-    if (total === 0 || !window.confirm(message)) return;
+    if (total === 0 || !(await confirmMessage(message, { tone: 'danger' }))) return;
     busy = true;
     try {
       const result = await clearMcpServerAudit(filterTokenId || undefined);

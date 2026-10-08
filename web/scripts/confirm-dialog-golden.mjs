@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 globalThis.$state = (value) => value;
+globalThis.$derived = (value) => (typeof value === 'function' ? value() : value);
+globalThis.$derived.by = (fn) => fn();
 
 await withGoldenViteServer(async (server) => {
-  const { confirmAction, settleConfirm, confirmDialogState } = await server.ssrLoadModule(
+  const { confirmAction, chooseAction, settleConfirm, confirmDialogState } = await server.ssrLoadModule(
     '/src/stores/confirm-dialog.svelte.ts',
   );
   const request = (message) => ({
@@ -18,13 +20,13 @@ await withGoldenViteServer(async (server) => {
   {
     const pending = confirmAction(request('a'));
     assert.equal(confirmDialogState.request?.message, 'a');
-    settleConfirm(true);
+    settleConfirm('confirm');
     assert.equal(await pending, true);
     assert.equal(confirmDialogState.request, null);
   }
   {
     const pending = confirmAction(request('b'));
-    settleConfirm(false);
+    settleConfirm('cancel');
     assert.equal(await pending, false);
     assert.equal(confirmDialogState.request, null);
   }
@@ -35,13 +37,21 @@ await withGoldenViteServer(async (server) => {
     const second = confirmAction(request('second'));
     assert.equal(await first, false);
     assert.equal(confirmDialogState.request?.message, 'second');
-    settleConfirm(true);
+    settleConfirm('confirm');
     assert.equal(await second, true);
   }
 
   // 没有请求时答复是空操作。
-  settleConfirm(true);
+  settleConfirm('confirm');
   assert.equal(confirmDialogState.request, null);
+
+  // 第二动作：三个出口各自返回对应结果，Esc / 遮罩等同 cancel，不会误触发动作。
+  for (const choice of ['confirm', 'secondary', 'cancel']) {
+    const pending = chooseAction({ ...request('c'), secondaryLabel: '另存为' });
+    assert.equal(confirmDialogState.request?.secondaryLabel, '另存为');
+    settleConfirm(choice);
+    assert.equal(await pending, choice);
+  }
 });
 
 console.log('confirm dialog golden passed');

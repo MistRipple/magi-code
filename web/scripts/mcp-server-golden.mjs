@@ -48,7 +48,7 @@ assert.match(section, /getMcpServerTokenSecret\(token\.tokenId\)/);
 assert.match(section, /token\.hasSecret/);
 assert.match(section, /data-mcp-token-no-secret/);
 assert.match(section, /rotateMcpServerToken\(token\.tokenId\)/);
-assert.match(section, /window\.confirm\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
+assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
 // 编辑：高风险档要确认；升到高风险档时网络一并关闭；工作区不可改
 assert.match(section, /confirmHighRisk: editNeedsConfirm \? editConfirmHighRisk : undefined/);
 assert.match(section, /const network = editHighRisk \? false : editNetwork/);
@@ -61,7 +61,7 @@ assert.match(section, /\(!needsConfirm \|\| confirmHighRisk\)/);
 assert.match(section, /confirmHighRisk: needsConfirm \? confirmHighRisk : undefined/);
 
 // ── 网络模式：需要确认风险；高风险权限档不能带网络；地址会变要提示 ─────────────
-assert.match(section, /window\.confirm\(i18n\.t\('mcpServer\.network\.confirm'\)\)/);
+assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.network\.confirm'\)/);
 assert.match(section, /setMcpServerNetwork\(enabled, enabled\)/);
 assert.match(section, /allowNetwork: allowNetwork && !needsConfirm \? true : undefined/);
 assert.match(section, /if \(needsConfirm\) allowNetwork = false/);
@@ -100,7 +100,7 @@ assert.match(section, /data-mcp-create-open/, '新建令牌表单默认收起');
 assert.match(audit, /const PAGE_SIZE = 20/);
 assert.match(audit, /offset,\s*tokenId: filterTokenId \|\| undefined/);
 assert.match(audit, /clearMcpServerAudit\(filterTokenId \|\| undefined\)/);
-assert.match(audit, /window\.confirm\(message\)/, '清理前必须确认');
+assert.match(audit, /confirmMessage\(message/, '清理前必须确认');
 assert.match(agentApi, /clear mcp server audit/);
 assert.match(agentApi, /if \(options\.offset\) query\.set\('offset'/);
 
@@ -117,7 +117,7 @@ assert.match(zhCN['mcpServer.snippets.placeholderNote'], /MAGI_MCP_TOKEN/);
 assert.ok(agentApi.includes('/api/mcp-server/direct'));
 assert.match(agentApi, /method: 'PUT',\s*body: request/);
 assert.match(section, /data-mcp-server-direct="1"/);
-assert.match(section, /window\.confirm\(i18n\.t\('mcpServer\.direct\.confirm'\)\)/);
+assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.direct\.confirm'\)/);
 assert.match(section, /confirmRisk: true/);
 assert.match(section, /data-mcp-direct-risk/, '页面必须展示明文传输的风险');
 assert.match(zhCN['mcpServer.direct.risk'], /明文 HTTP/);

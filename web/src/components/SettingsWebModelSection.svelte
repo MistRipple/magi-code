@@ -9,6 +9,7 @@
   import { onMount, tick } from 'svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
   import {
     configureWebConnector,
@@ -266,7 +267,7 @@
   /** 「停止」：取消在飞推理、销毁页面、释放槽位；登录态保留。 */
   async function stopWeb(): Promise<void> {
     if (stopping) return;
-    if (slotOwner?.active && !window.confirm(i18n.t('webModel.stop.confirmBody'))) return;
+    if (slotOwner?.active && !(await confirmMessage(i18n.t('webModel.stop.confirmBody'), { tone: 'danger' }))) return;
     stopping = true;
     errorMessage = '';
     try {
@@ -353,7 +354,7 @@
   /** 会改动用户 ChatGPT 账号里的连接器设置：必须经用户确认。 */
   async function configureConnector(): Promise<void> {
     if (connectorBusy) return;
-    if (!window.confirm(i18n.t('webModel.connector.confirmBody'))) return;
+    if (!(await confirmMessage(i18n.t('webModel.connector.confirmBody')))) return;
     connectorBusy = true;
     errorMessage = '';
     try {
@@ -395,7 +396,7 @@
       addToast('warning', i18n.t('settings.browser.webModel.needDesktop'));
       return;
     }
-    if (!window.confirm(i18n.t('webModel.clearData.confirmBody'))) return;
+    if (!(await confirmMessage(i18n.t('webModel.clearData.confirmBody'), { tone: 'danger' }))) return;
     clearing = true;
     errorMessage = '';
     try {

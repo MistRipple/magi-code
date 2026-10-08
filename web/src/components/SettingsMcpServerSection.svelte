@@ -8,6 +8,7 @@
    */
   import { onMount } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
   import { addToast } from '../stores/messages.svelte';
   import {
@@ -241,8 +242,8 @@
     });
   }
 
-  function clearNamedTunnel(): Promise<void> {
-    if (!window.confirm(i18n.t('mcpServer.named.clearConfirm'))) return Promise.resolve();
+  async function clearNamedTunnel(): Promise<void> {
+    if (!(await confirmMessage(i18n.t('mcpServer.named.clearConfirm'), { tone: 'danger' }))) return;
     return act(async () => {
       status = await clearMcpServerNamedTunnel();
       namedCheck = null;
@@ -286,8 +287,8 @@
     }
   }
 
-  function startDirect(): Promise<void> {
-    if (!window.confirm(i18n.t('mcpServer.direct.confirm'))) return Promise.resolve();
+  async function startDirect(): Promise<void> {
+    if (!(await confirmMessage(i18n.t('mcpServer.direct.confirm'), { tone: 'danger' }))) return;
     return act(async () => {
       const port = directPort.trim();
       status = await setMcpServerDirect({
@@ -317,10 +318,10 @@
     directPort = status.port ? String(status.port) : '';
   }
 
-  function toggleNetwork(enabled: boolean): Promise<void> {
-    if (enabled && !window.confirm(i18n.t('mcpServer.network.confirm'))) {
+  async function toggleNetwork(enabled: boolean): Promise<void> {
+    if (enabled && !(await confirmMessage(i18n.t('mcpServer.network.confirm'), { tone: 'danger' }))) {
       void refresh();
-      return Promise.resolve();
+      return;
     }
     return act(async () => {
       status = await setMcpServerNetwork(enabled, enabled);
@@ -399,9 +400,9 @@
     });
   }
 
-  function rotate(token: McpServerToken): Promise<void> {
-    if (!window.confirm(i18n.t('mcpServer.token.rotateConfirm', { client: token.clientName }))) {
-      return Promise.resolve();
+  async function rotate(token: McpServerToken): Promise<void> {
+    if (!(await confirmMessage(i18n.t('mcpServer.token.rotateConfirm', { client: token.clientName }), { tone: 'danger' }))) {
+      return;
     }
     return act(async () => {
       const rotated = await rotateMcpServerToken(token.tokenId);
@@ -412,8 +413,8 @@
     });
   }
 
-  function revokeAll(): Promise<void> {
-    if (!window.confirm(i18n.t('mcpServer.token.revokeAllConfirm'))) return Promise.resolve();
+  async function revokeAll(): Promise<void> {
+    if (!(await confirmMessage(i18n.t('mcpServer.token.revokeAllConfirm'), { tone: 'danger' }))) return;
     return act(async () => {
       status = await revokeAllMcpServerTokens();
       toggleViewOff();

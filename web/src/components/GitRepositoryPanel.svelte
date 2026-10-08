@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { addToast, getActiveInteractionType, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
     currentGitExpectedContext,
     gitContextBindingKey,
@@ -108,7 +109,7 @@
         addToast('success', i18n.t('input.branch.alreadyUpToDate'));
         return;
       }
-      const confirmed = window.confirm(i18n.t('input.branch.mergeConfirm', {
+      const confirmed = await confirmMessage(i18n.t('input.branch.mergeConfirm', {
         branch: target,
         commits: preview.incomingCommitCount,
         files: preview.changedPaths.length,
@@ -134,10 +135,10 @@
 
   async function deleteLocalBranch(branch: string, force = false): Promise<void> {
     if (interactionLocked || gitContextState.contextDrift || branch === gitContextState.currentBranch) return;
-    const confirmed = window.confirm(i18n.t(
+    const confirmed = await confirmMessage(i18n.t(
       force ? 'input.branch.forceDeleteConfirm' : 'input.branch.deleteConfirm',
       { branch },
-    ));
+    ), { tone: 'danger' });
     if (!confirmed) return;
     localError = null;
     try {
@@ -163,7 +164,7 @@
     if (interactionLocked || gitContextState.contextDrift) return;
     const separator = fullName.indexOf('/');
     if (separator <= 0 || separator >= fullName.length - 1) return;
-    if (!window.confirm(i18n.t('input.branch.remoteDeleteConfirm', { branch: fullName }))) return;
+    if (!(await confirmMessage(i18n.t('input.branch.remoteDeleteConfirm', { branch: fullName }), { tone: 'danger' }))) return;
     const remote = fullName.slice(0, separator);
     const branch = fullName.slice(separator + 1);
     try {
@@ -210,10 +211,10 @@
 
   async function removeWorktree(path: string, force = false): Promise<void> {
     if (interactionLocked || path === gitContextState.worktreePath) return;
-    const confirmed = window.confirm(i18n.t(
+    const confirmed = await confirmMessage(i18n.t(
       force ? 'input.branch.worktreeForceRemoveConfirm' : 'input.branch.worktreeRemoveConfirm',
       { path },
-    ));
+    ), { tone: 'danger' });
     if (!confirmed) return;
     try {
       const result = await runGitContextOperation('worktreeRemove', binding, () => (

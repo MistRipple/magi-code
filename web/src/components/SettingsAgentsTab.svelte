@@ -3,6 +3,7 @@
   import type { ProfessionalCapabilitySummary, RoleTemplate } from '../shared/types/role-templates';
   import { isAgentBindingOperational, resolveSelectableRegistryEngines } from '../shared/model-governance';
   import { i18n } from '../stores/i18n.svelte';
+  import { chooseAction, confirmMessage } from '../stores/confirm-dialog.svelte';
   import { AgentApiError } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import EnginePicker from './EnginePicker.svelte';
@@ -322,9 +323,9 @@
 
   async function removeSelectedRole(template: RoleTemplate) {
     if (!template.deletable || template.roleRevision === undefined) return;
-    if (!window.confirm(i18n.t('settings.agents.confirmDelete', {
+    if (!(await confirmMessage(i18n.t('settings.agents.confirmDelete', {
       name: resolveLocalizedTemplateDisplayName(template),
-    }))) return;
+    }), { tone: 'danger' }))) return;
     try {
       await deleteRole(template.templateId, template.roleRevision);
       selectedKey = null;
@@ -353,11 +354,17 @@
       }
       const message = error instanceof Error ? error.message : i18n.t('settings.agents.error.importFallback');
       try {
-        if (!window.confirm(`${message}\n\n${i18n.t('settings.agents.importConflictInstruction')}`)) {
-          await importRole(content, 'rename');
-        } else {
-          await importRole(content, 'overwrite');
-        }
+        // 三个出口：覆盖已有角色、另存为新角色、取消导入（Esc / 点遮罩 / 取消都不会导入）。
+        const choice = await chooseAction({
+          title: i18n.t('settings.agents.importConflictTitle'),
+          message,
+          confirmLabel: i18n.t('settings.agents.importConflictOverwrite'),
+          secondaryLabel: i18n.t('settings.agents.importConflictRename'),
+          cancelLabel: i18n.t('common.cancel'),
+          tone: 'danger',
+        });
+        if (choice === 'confirm') await importRole(content, 'overwrite');
+        else if (choice === 'secondary') await importRole(content, 'rename');
       } catch {
         // store 层已显示具体错误；导入流程在这里消费后续冲突操作的拒绝。
       }
