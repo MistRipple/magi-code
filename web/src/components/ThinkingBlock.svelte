@@ -5,6 +5,7 @@
   import Icon from './Icon.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { resolveThinkingTitle } from '../lib/thinking-title';
 
   interface Props {
     group: ThinkingGroup;
@@ -21,15 +22,7 @@
   // 折叠状态只由初始配置决定；流式输出期间也允许用户手动展开/折叠
   let collapsed = $state(untrack(() => !(initialExpanded ?? false)));
 
-  const title = $derived.by(() => {
-    if (group.status === 'failed') return i18n.t('thinkingBlock.failedTitle');
-    if (group.status === 'blocked' || group.status === 'cancelled') {
-      return i18n.t('thinkingBlock.interruptedTitle');
-    }
-    return group.isStreaming
-      ? i18n.t('thinkingBlock.streamingTitle')
-      : i18n.t('thinkingBlock.completedTitle');
-  });
+  const title = $derived(resolveThinkingTitle(group, i18n.t.bind(i18n)));
 
   function isSegmentStreaming(segment: ThinkingSegment): boolean {
     return segment.status === 'pending' || segment.status === 'running';

@@ -274,9 +274,77 @@ await withGoldenViteServer(async (server) => {
   const shortText = { key: 'phase:short', entries: [eventEntry('s3', { content: '开始处理。' })] };
   assert.deepEqual(
     disclosure.resolveConversationPhasePresentation(shortText, { active: true, expanded: true, manualOverride: false }),
-    { bodyOnly: false, headerRepeatsBody: false },
+    { bodyOnly: false, headerRepeatsBody: false, thinkingOnly: false },
     '一句短文字本身就是标题，没有重复',
   );
+
+  // ---- 思考：摘要模式不能再套一张原始风格的思考卡片，也不能因为「去重」丢掉标题 ----
+  const thinkingMessage = (overrides = {}) => message({
+    type: 'thinking',
+    content: '',
+    blocks: [{
+      id: 'tb',
+      type: 'thinking',
+      content: '',
+      thinking: {
+        groupId: 'g1',
+        status: overrides.status ?? 'running',
+        isStreaming: overrides.streaming ?? true,
+        segments: [{
+          segmentId: 's1',
+          messageId: 'm',
+          status: overrides.status ?? 'running',
+          content: '先算每小时的注水量：A 是 1/6，B 是 1/4，C 排水 1/12。',
+        }],
+      },
+    }],
+  });
+  const thinkingPhase = { key: 'phase:think', entries: [eventEntry('th1', thinkingMessage())] };
+  const thinkingPresentation = disclosure.resolveConversationPhasePresentation(thinkingPhase, {
+    active: true,
+    expanded: true,
+    manualOverride: false,
+  });
+  assert.equal(thinkingPresentation.bodyOnly, false, '思考阶段始终保留标题行：标题承担「思考中 / 已思考」的状态');
+  assert.equal(thinkingPresentation.thinkingOnly, true);
+  assert.equal(thinkingPresentation.headerRepeatsBody, true, '展开后标题不再重复思考正文，改为状态标题');
+  assert.equal(
+    disclosure.resolveConversationPhasePresentation(
+      { key: 'phase:mixed', entries: [eventEntry('th2', thinkingMessage()), toolEntry('t30')] },
+      { active: true, expanded: true, manualOverride: false },
+    ).thinkingOnly,
+    false,
+    '思考后面跟着工具的阶段不能把标题写成「思考中」',
+  );
+
+  {
+    const { render: renderComponent } = await server.ssrLoadModule('svelte/server');
+    const phaseComponent = await server.ssrLoadModule('/src/components/ConversationPhase.svelte');
+    const phaseHtml = (phase, props = {}) => renderComponent(phaseComponent.default, {
+      props: {
+        phase,
+        active: true,
+        filePreviewScopeForItem: () => undefined,
+        continueInterruptedSession: () => undefined,
+        ...props,
+      },
+    }).body.replace(/<!--[\s\S]*?-->/gu, '');
+    const activeThinking = phaseHtml(thinkingPhase);
+    assert.doesNotMatch(activeThinking, /class="thinking-block/u, '摘要风格不渲染原始风格的思考卡片');
+    assert.match(activeThinking, /先算每小时的注水量/u, '思考文字展开后仍然可见');
+    assert.match(activeThinking, /conversation-phase-label[^>]*>思考中\.\.\.</u, '展开的思考阶段标题是「思考中」状态而不是内容预览');
+    const doneThinking = phaseHtml(
+      { key: 'phase:done', entries: [eventEntry('th3', thinkingMessage({ status: 'completed', streaming: false }))] },
+      { active: false },
+    );
+    assert.doesNotMatch(doneThinking, /conversation-thinking-text/u, '收起的思考阶段只显示标题行里的内容预览，不渲染正文');
+    assert.match(doneThinking, /conversation-phase-label[^>]*>先算每小时的注水量/u, '收起时标题是思考内容的预览');
+    const streamingText = phaseHtml({
+      key: 'phase:stream-render',
+      entries: [eventEntry('s9', { content: listText, source: 'orchestrator' })],
+    });
+    assert.doesNotMatch(streamingText, /conversation-phase-header/u, '流式正文不带重复的标题行');
+  }
 
   // ---- Markdown：紧凑列表项里的行内标记必须被解析，而不是显示成原始符号 ----
   // render 必须经由同一个模块运行器加载，才能与组件共用同一份 svelte 服务端上下文。

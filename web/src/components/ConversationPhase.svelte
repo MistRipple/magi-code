@@ -12,6 +12,8 @@
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
   import ConversationProcessRow from './ConversationProcessRow.svelte';
+  import ConversationThinkingText from './ConversationThinkingText.svelte';
+  import { resolveThinkingTitle } from '../lib/thinking-title';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
 
   interface Props {
@@ -58,11 +60,16 @@
   );
   // 收起时标题是内容摘要；展开后首条正文已经完整显示在下方，标题再写一遍同样的话就是重复，
   // 改为只表达阶段状态（状态点另外表达“正在执行”）。
-  const headerLabel = $derived(
-    presentation.headerRepeatsBody
-      ? i18n.t(active ? 'messageList.turnDisclosure.processing' : 'messageList.turnDisclosure.processed')
-      : summary,
-  );
+  const firstThinkingGroup = $derived.by(() => {
+    const first = phase.entries[0];
+    if (first?.kind !== 'event') return undefined;
+    return first.item.message.blocks?.find((block) => block?.type === 'thinking')?.thinking;
+  });
+  const headerLabel = $derived.by(() => {
+    if (!presentation.headerRepeatsBody) return summary;
+    if (presentation.thinkingOnly) return resolveThinkingTitle(firstThinkingGroup, i18n.t.bind(i18n));
+    return i18n.t(active ? 'messageList.turnDisclosure.processing' : 'messageList.turnDisclosure.processed');
+  });
 
   function toggle(): void {
     manualOverride = true;
@@ -119,8 +126,14 @@
         <div class="turn-process-entry">
           {#if detail.kind === 'compact'}
             <ConversationProcessRow item={detail.entry.item} />
+          {:else if detail.kind === 'rich' && detail.entry.item.message.type === 'thinking'}
+            <!-- 思考：摘要风格只缩进显示思考文字，状态由阶段标题表达，不再嵌一张原始风格的思考卡片 -->
+            <ConversationThinkingText
+              message={detail.entry.item.message}
+              filePreviewScope={filePreviewScopeForItem(detail.entry.item)}
+            />
           {:else if detail.kind === 'rich'}
-            <!-- 带结构的过程内容（Markdown、表格、代码、思考）按完整正文渲染，不压平成一行 -->
+            <!-- 带结构的过程内容（Markdown、表格、代码）按完整正文渲染，不压平成一行 -->
             <MessageItem
               message={detail.entry.item.message}
               {readOnly}
