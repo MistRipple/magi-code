@@ -4,6 +4,7 @@
   import type { TimelineRenderItem } from '../types/message';
   import {
     resolveConversationPhaseDetails,
+    resolveConversationPhasePresentation,
     resolveConversationPhaseSummary,
     type ConversationPhase as ConversationPhaseModel,
   } from '../lib/conversation-disclosure';
@@ -33,7 +34,7 @@
 
   // 自动状态只负责“当前阶段展开、离开当前阶段后收起”；用户手动操作优先。
   let expanded = $state(untrack(() => active));
-  let manualOverride = false;
+  let manualOverride = $state(false);
   let previousActive = $state(untrack(() => active));
 
   $effect(() => {
@@ -48,12 +49,20 @@
   const summary = $derived(
     resolveConversationPhaseSummary(phase, i18n.t.bind(i18n)),
   );
-  // 进行中也保留当前阶段的具体摘要，状态点单独表达“正在执行”。
-  const headerLabel = $derived(summary);
   // 标题已经完整表达的阶段（例如一句短文字）展开后没有更多信息：
   // 只显示静态标题，不给一个点开后什么都不多的箭头。
   const details = $derived(resolveConversationPhaseDetails(phase));
   const expandable = $derived(details.length > 0);
+  const presentation = $derived(
+    resolveConversationPhasePresentation(phase, { active, expanded, manualOverride }),
+  );
+  // 收起时标题是内容摘要；展开后首条正文已经完整显示在下方，标题再写一遍同样的话就是重复，
+  // 改为只表达阶段状态（状态点另外表达“正在执行”）。
+  const headerLabel = $derived(
+    presentation.headerRepeatsBody
+      ? i18n.t(active ? 'messageList.turnDisclosure.processing' : 'messageList.turnDisclosure.processed')
+      : summary,
+  );
 
   function toggle(): void {
     manualOverride = true;
@@ -68,7 +77,9 @@
   data-conversation-phase={phase.key}
   data-conversation-phase-state={active ? 'active' : 'completed'}
 >
-  {#if expandable}
+  {#if presentation.bodyOnly}
+    <!-- 正在流式输出的一段文字：直接显示正文，不带标题行，结束后它作为最终回答原样留在原处。 -->
+  {:else if expandable}
     <button
       type="button"
       class="conversation-phase-header"
@@ -99,7 +110,11 @@
   {/if}
 
   {#if expanded && expandable}
-    <div class="conversation-phase-content" id={contentId}>
+    <div
+      class="conversation-phase-content"
+      class:body-only={presentation.bodyOnly}
+      id={contentId}
+    >
       {#each details as detail (detail.entry.key)}
         <div class="turn-process-entry">
           {#if detail.kind === 'compact'}
@@ -244,6 +259,12 @@
     min-width: 0;
     padding: 0 0 1px 8px;
     border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  }
+
+  /* 只有正文时不画过程用的左侧引导线和缩进，外观与最终回答一致。 */
+  .conversation-phase-content.body-only {
+    padding: 0;
+    border-left: 0;
   }
 
   .turn-process-entry {

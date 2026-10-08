@@ -456,6 +456,41 @@ export function resolveConversationPhaseDetails(
   return details;
 }
 
+export interface ConversationPhasePresentationState {
+  /** 阶段是否是正在进行的当前阶段。 */
+  active: boolean;
+  /** 阶段当前是否展开。 */
+  expanded: boolean;
+  /** 用户是否手动展开 / 收起过：手动操作优先于自动状态。 */
+  manualOverride: boolean;
+}
+
+export interface ConversationPhasePresentation {
+  /**
+   * 正在流式输出的一段纯文字：不要标题行，正文直接显示。
+   * 这段文字在回合结束前还无法确定是不是最终回答（结束时才会归入回答区），
+   * 如果先挂一个「标题 + 同样内容的正文」，结束时标题凭空消失，用户会看到同一段话出现两遍。
+   */
+  bodyOnly: boolean;
+  /** 展开后标题行是否会重复首条正文：此时标题应改为中性的状态文案而不是内容预览。 */
+  headerRepeatsBody: boolean;
+}
+
+export function resolveConversationPhasePresentation(
+  phase: ConversationPhase,
+  state: ConversationPhasePresentationState,
+): ConversationPhasePresentation {
+  const firstEntry = phase.entries[0];
+  const firstShownBelow = resolveConversationPhaseDetails(phase).some(
+    (detail) => detail.kind === 'rich' && detail.entry === firstEntry,
+  );
+  const textOnly = phase.entries.every((entry) => entry.kind === 'event');
+  return {
+    bodyOnly: state.active && !state.manualOverride && textOnly && firstShownBelow,
+    headerRepeatsBody: state.expanded && firstShownBelow,
+  };
+}
+
 export function resolveConversationPhaseSummary(
   phase: ConversationPhase,
   translate: ConversationTranslate,

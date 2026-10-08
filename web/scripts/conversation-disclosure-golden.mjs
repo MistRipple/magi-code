@@ -232,6 +232,52 @@ await withGoldenViteServer(async (server) => {
     '模型文字之后的新文字仍然开始下一个阶段',
   );
 
+  // ---- 流式正文不能出现「标题 + 同样内容的正文」：结束时标题会凭空消失，同一段话看起来出现两遍 ----
+  const listText = '还可以帮你：\n- 制定计划：拆分步骤\n- 比较与决策：分析优缺点';
+  const streamingPhase = { key: 'phase:stream', entries: [eventEntry('s1', { content: listText })] };
+  const streaming = disclosure.resolveConversationPhasePresentation(streamingPhase, {
+    active: true,
+    expanded: true,
+    manualOverride: false,
+  });
+  assert.equal(streaming.bodyOnly, true, '正在流式输出的一段多行文字只显示正文，不带标题行');
+  assert.equal(streaming.headerRepeatsBody, true);
+  assert.equal(
+    disclosure.resolveConversationPhasePresentation(streamingPhase, {
+      active: true,
+      expanded: true,
+      manualOverride: true,
+    }).bodyOnly,
+    false,
+    '用户手动操作过的阶段保留标题行，否则没有办法再收起',
+  );
+  assert.equal(
+    disclosure.resolveConversationPhasePresentation(streamingPhase, {
+      active: false,
+      expanded: false,
+      manualOverride: false,
+    }).headerRepeatsBody,
+    false,
+    '收起时标题就是内容摘要，不算重复',
+  );
+  const withTool = {
+    key: 'phase:tool',
+    entries: [eventEntry('s2', { content: listText }), toolEntry('t20')],
+  };
+  const withToolPresentation = disclosure.resolveConversationPhasePresentation(withTool, {
+    active: true,
+    expanded: true,
+    manualOverride: false,
+  });
+  assert.equal(withToolPresentation.bodyOnly, false, '带工具的阶段需要标题行来收起 / 展开');
+  assert.equal(withToolPresentation.headerRepeatsBody, true, '但展开后标题不应再重复首条正文');
+  const shortText = { key: 'phase:short', entries: [eventEntry('s3', { content: '开始处理。' })] };
+  assert.deepEqual(
+    disclosure.resolveConversationPhasePresentation(shortText, { active: true, expanded: true, manualOverride: false }),
+    { bodyOnly: false, headerRepeatsBody: false },
+    '一句短文字本身就是标题，没有重复',
+  );
+
   // ---- Markdown：紧凑列表项里的行内标记必须被解析，而不是显示成原始符号 ----
   // render 必须经由同一个模块运行器加载，才能与组件共用同一份 svelte 服务端上下文。
   const { render } = await server.ssrLoadModule('svelte/server');
