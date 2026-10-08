@@ -43,6 +43,10 @@
   let observedBudgetGoalRevision = '';
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
   let planClearLoading = $state(false);
+  let goalNoteEl = $state<HTMLElement | null>(null);
+  let goalNoteExpanded = $state(false);
+  let goalNoteOverflows = $state(false);
+  let goalEvidenceExpanded = $state(false);
   let goalClockObservedAt = $state(Date.now());
 
   $effect(() => {
@@ -77,6 +81,27 @@
   const currentPlanItems = $derived<PlanItemDto[]>(
     Array.isArray(currentPlan?.items) ? currentPlan.items : []
   );
+  const goalNote = $derived(currentGoal ? goalNoteOf(currentGoal) : null);
+  const goalBudgetPct = $derived(
+    currentGoal ? goalBudgetPercent(currentGoal.tokensUsed, currentGoal.tokenBudget) : null,
+  );
+
+  // 折叠状态下检测说明是否被截断，只有真被截断才显示“展开全文”。
+  $effect(() => {
+    const el = goalNoteEl;
+    if (!el) {
+      goalNoteOverflows = false;
+      return;
+    }
+    void goalNote?.text;
+    const measure = () => {
+      if (!goalNoteExpanded) goalNoteOverflows = el.scrollHeight > el.clientHeight + 1;
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
 
   $effect(() => {
     const timingStartedAt = currentGoal?.timingStartedAt;
@@ -266,6 +291,57 @@
     }
   }
 
+  /** 展开区里解释“为什么是这个状态”的说明：模型写的文字（阻塞原因、完成总结）会折叠，固定说明不折叠。 */
+  interface GoalNote {
+    text: string;
+    /** 模型写的长文字：限制行数，点击展开全文。 */
+    collapsible: boolean;
+    meta: string | null;
+    evidence: string[];
+  }
+
+  function goalNoteOf(goal: SessionGoalDto): GoalNote | null {
+    switch (goal.status) {
+      case 'blocked': {
+        const reason = goal.blocker?.reason?.trim();
+        if (!reason) return null;
+        const turns = goal.blocker?.consecutiveTurns ?? 0;
+        return {
+          text: reason,
+          collapsible: true,
+          meta: turns > 1 ? i18n.t('goalPanel.note.blockedTurns', { count: turns }) : null,
+          evidence: [],
+        };
+      }
+      case 'complete': {
+        const summary = goal.completion?.summary?.trim();
+        if (!summary) return null;
+        return {
+          text: summary,
+          collapsible: true,
+          meta: null,
+          evidence: goal.completion?.evidenceRefs ?? [],
+        };
+      }
+      case 'usage_limited':
+        return { text: i18n.t('goalPanel.note.usageLimited'), collapsible: false, meta: null, evidence: [] };
+      case 'budget_limited':
+        return { text: i18n.t('goalPanel.note.budgetLimited'), collapsible: false, meta: null, evidence: [] };
+      case 'active':
+        if (goal.continuation.phase !== 'waiting') return null;
+        return {
+          text: goal.continuation.reason === 'resume_requested'
+            ? i18n.t('goalPanel.note.resumeRequested')
+            : i18n.t('goalPanel.note.waiting'),
+          collapsible: false,
+          meta: null,
+          evidence: [],
+        };
+      default:
+        return null;
+    }
+  }
+
   function goalCanEdit(goal: SessionGoalDto): boolean {
     return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canEdit === true;
   }
@@ -286,17 +362,31 @@
   function goalBudgetLabel(tokensUsed: number, tokenBudget?: number | null): string {
     const used = Number.isFinite(tokensUsed) ? Math.max(0, Math.round(tokensUsed)) : 0;
     if (!tokenBudget || tokenBudget <= 0) {
-      return `${used.toLocaleString()} tokens`;
+      return used.toLocaleString();
     }
-    return `${used.toLocaleString()} / ${Math.round(tokenBudget).toLocaleString()} tokens`;
+    return `${used.toLocaleString()} / ${Math.round(tokenBudget).toLocaleString()}`;
+  }
+
+  function goalBudgetPercent(tokensUsed: number, tokenBudget?: number | null): number | null {
+    if (!tokenBudget || tokenBudget <= 0 || !Number.isFinite(tokensUsed)) return null;
+    return Math.min(100, Math.max(0, Math.round((tokensUsed / tokenBudget) * 100)));
   }
 
   function goalTimeLabel(seconds: number): string {
     const value = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
-    if (value < 60) return `${value}s`;
-    const minutes = Math.floor(value / 60);
-    const remain = value % 60;
-    return remain > 0 ? `${minutes}m ${remain}s` : `${minutes}m`;
+    if (value < 60) return i18n.t('goalPanel.time.seconds', { s: value });
+    if (value < 3600) {
+      const m = Math.floor(value / 60);
+      const s = value % 60;
+      return s > 0
+        ? i18n.t('goalPanel.time.minutesSeconds', { m, s })
+        : i18n.t('goalPanel.time.minutes', { m });
+    }
+    const h = Math.floor(value / 3600);
+    const m = Math.floor((value % 3600) / 60);
+    return m > 0
+      ? i18n.t('goalPanel.time.hoursMinutes', { h, m })
+      : i18n.t('goalPanel.time.hours', { h });
   }
 
   function formatGoalDateTime(timestamp?: number): string {
@@ -539,7 +629,11 @@
         >
           <span class="drawer-leading-icon goal-status-icon dock-lead" style="--dock-tone: var(--goal-tone)"><Icon name={goalStatusIcon(currentGoal)} size={14} /></span>
           <span class="goal-heading" class:expanded={goalDrawerExpanded}>
-            <span class="goal-status-title">{goalStatusLabel(currentGoal)}</span>
+            <span class="goal-status-title">
+              {goalDrawerExpanded
+                ? i18n.t('goalPanel.goal.expandedTitle', { status: goalStatusLabel(currentGoal) })
+                : goalStatusLabel(currentGoal)}
+            </span>
             {#if !goalDrawerExpanded}
               <span class="goal-objective">{currentGoal.objective}</span>
             {/if}
@@ -623,6 +717,40 @@
         {:else}
           <div class="goal-detail">
             <p class="goal-detail-objective-text">{currentGoal.objective}</p>
+            {#if goalNote}
+              <div class="goal-note goal-note--{currentGoal.status}">
+                <p
+                  class="goal-note-text"
+                  class:clamped={goalNote.collapsible && !goalNoteExpanded}
+                  bind:this={goalNoteEl}
+                >{goalNote.text}</p>
+                {#if goalNote.collapsible && (goalNoteOverflows || goalNoteExpanded)}
+                  <button type="button" class="goal-note-toggle" onclick={() => goalNoteExpanded = !goalNoteExpanded}>
+                    {goalNoteExpanded ? i18n.t('goalPanel.note.collapse') : i18n.t('goalPanel.note.expand')}
+                  </button>
+                {/if}
+                {#if goalNote.meta}
+                  <span class="goal-note-meta">{goalNote.meta}</span>
+                {/if}
+                {#if goalNote.evidence.length > 0}
+                  <button
+                    type="button"
+                    class="goal-note-toggle"
+                    aria-expanded={goalEvidenceExpanded}
+                    onclick={() => goalEvidenceExpanded = !goalEvidenceExpanded}
+                  >
+                    {i18n.t('goalPanel.note.evidenceCount', { count: goalNote.evidence.length })}
+                  </button>
+                  {#if goalEvidenceExpanded}
+                    <ul class="goal-evidence-list">
+                      {#each goalNote.evidence as ref (ref)}
+                        <li>{ref}</li>
+                      {/each}
+                    </ul>
+                  {/if}
+                {/if}
+              </div>
+            {/if}
             {#if currentGoal.status === 'budget_limited'}
               <label class="goal-budget-resume-field">
                 <span>{i18n.t('goalPanel.goal.newBudget')}</span>
@@ -634,18 +762,24 @@
                 />
               </label>
             {/if}
-            <div class="goal-stat-strip">
-              <span class="goal-detail-item">
+            <div class="goal-metrics">
+              <span class="goal-metric">
                 <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
                 <strong>{goalTimeLabel(currentGoalTimeSeconds)}</strong>
               </span>
-              <span class="goal-detail-item">
+              <span class="goal-metric">
                 <span class="goal-detail-label">{i18n.t('goalPanel.goal.budget')}</span>
                 <strong>{goalBudgetLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
-              </span>
-              <span class="goal-detail-item">
-                <span class="goal-detail-label">{i18n.t('goalPanel.goal.updatedAtShort')}</span>
-                <strong>{formatGoalDateTime(currentGoal.updatedAt)}</strong>
+                {#if goalBudgetPct !== null}
+                  <span
+                    class="goal-budget-bar"
+                    class:warn={goalBudgetPct >= 90}
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow={goalBudgetPct}
+                  ><span style="width: {goalBudgetPct}%"></span></span>
+                {/if}
               </span>
             </div>
             <span class="goal-created-at">
@@ -871,40 +1005,124 @@
     line-height: var(--leading-tight);
   }
 
-  .goal-stat-strip {
+  .goal-note {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 0;
+    padding: 6px 10px;
+    border-left: 2px solid var(--goal-tone);
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--goal-tone) 7%, transparent);
+  }
+
+  .goal-note-text {
+    margin: 0;
+    min-width: 0;
+    max-width: 100%;
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .goal-note-text.clamped {
+    display: -webkit-box;
+    line-clamp: 3;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .goal-note-meta {
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+  }
+
+  .goal-note-toggle {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--primary);
+    font: inherit;
+    font-size: var(--text-2xs);
+    cursor: pointer;
+  }
+
+  .goal-note-toggle:hover {
+    text-decoration: underline;
+  }
+
+  .goal-evidence-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    max-width: 100%;
+    list-style: none;
+    color: var(--foreground-muted);
+    font-family: var(--font-mono, monospace);
+    font-size: var(--text-2xs);
+    overflow-wrap: anywhere;
+  }
+
+  .goal-metrics {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     min-width: 0;
     border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  .goal-detail-item {
+  .goal-metric {
     display: flex;
     flex-direction: column;
     gap: 3px;
     min-width: 0;
     padding: 7px 10px;
+  }
+
+  .goal-metric:first-child {
+    padding-left: 0;
     border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  .goal-detail-item:first-child {
-    padding-left: 0;
-  }
-
-  .goal-detail-item:last-child {
+  .goal-metric:last-child {
     padding-right: 0;
-    border-right: 0;
   }
 
-  .goal-detail-item strong {
+  .goal-metric strong {
     min-width: 0;
     overflow: hidden;
     color: var(--foreground);
     font-size: var(--text-xs);
     font-weight: var(--font-semibold);
+    font-variant-numeric: tabular-nums;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .goal-budget-bar {
+    display: block;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--foreground) 10%, transparent);
+  }
+
+  .goal-budget-bar > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--primary);
+    transition: width var(--transition-fast);
+  }
+
+  .goal-budget-bar.warn > span {
+    background: var(--warning);
   }
 
   .goal-created-at {
@@ -1134,19 +1352,17 @@
       padding-left: 0;
     }
 
-    .goal-stat-strip {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+    .goal-metrics {
+      grid-template-columns: minmax(0, 1fr);
     }
 
-    .goal-detail-item:nth-child(2) {
+    .goal-metric:first-child {
+      padding-right: 0;
       border-right: 0;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     }
 
-    .goal-detail-item:nth-child(n + 3) {
-      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-    }
-
-    .goal-detail-item:nth-child(3) {
+    .goal-metric:last-child {
       padding-left: 0;
     }
   }
