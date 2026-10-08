@@ -7,7 +7,7 @@
  * `settingsMounted` 表示设置视图已经创建（创建后一直保活，只切换显示）。
  */
 
-export type ShellPopover = 'notifications' | 'lan';
+export type ShellPopover = 'notifications' | 'lan' | 'language';
 
 export const shellUi = $state<{
   settingsOpen: boolean;

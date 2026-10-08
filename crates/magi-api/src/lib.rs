@@ -12,6 +12,7 @@ mod errors;
 pub mod git_tool_runtime;
 mod host_paths;
 mod isolation;
+mod locales;
 pub mod mcp_config;
 mod mcp_direct;
 mod mcp_runtime;

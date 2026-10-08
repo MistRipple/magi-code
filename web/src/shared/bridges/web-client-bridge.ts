@@ -22,6 +22,7 @@ import {
   type WorkspaceAgentBindingOverride,
 } from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
+import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
 import type { SessionTurnCommand } from '../app-server-protocol.generated';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
@@ -5878,15 +5879,15 @@ export function createWebClientBridge(): ClientBridge {
     getInitialLocale(): SupportedLocale {
       if (typeof window !== 'undefined') {
         const storedLocale = safeLocalStorageGetItem('magi-locale');
-        if (storedLocale === 'zh-CN' || storedLocale === 'en-US') {
+        if (isSupportedLocale(storedLocale)) {
           return storedLocale;
         }
         const locale = (window as unknown as { __INITIAL_LOCALE__?: string }).__INITIAL_LOCALE__;
-        if (locale === 'zh-CN' || locale === 'en-US') {
+        if (isSupportedLocale(locale)) {
           return locale;
         }
       }
-      return 'zh-CN';
+      return DEFAULT_LOCALE;
     },
     notifyReady(): void {
       void restoreBridgeState('notify_ready').catch((error) => {

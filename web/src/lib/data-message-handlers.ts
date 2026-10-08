@@ -52,6 +52,7 @@ import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import { resolveNotificationPresentation } from '../shared/notification-presentation';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
+import { isSupportedLocale } from '../i18n/locales';
 import {
   handleRetryRuntimePayload,
 } from './message-utils';
@@ -1706,7 +1707,7 @@ function handleSettingsBootstrapLoaded(message: ClientBridgeMessage) {
   )
     ? message.runtimeSettings as { locale?: unknown }
     : null;
-  if (runtimeSettings?.locale === 'zh-CN' || runtimeSettings?.locale === 'en-US') {
+  if (isSupportedLocale(runtimeSettings?.locale)) {
     i18n.setLocale(runtimeSettings.locale);
   }
 }

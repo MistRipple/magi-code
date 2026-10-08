@@ -5270,8 +5270,8 @@ fn runtime_settings_from_snapshot(
     let locale = snapshot
         .get("locale")
         .and_then(|value| value.as_str())
-        .filter(|value| matches!(*value, "zh-CN" | "en-US"))
-        .unwrap_or("zh-CN");
+        .filter(|value| crate::locales::is_supported_locale(value))
+        .unwrap_or(crate::locales::DEFAULT_LOCALE);
     let conversation_display_mode = snapshot
         .get("conversationDisplayMode")
         .and_then(|value| value.as_str())

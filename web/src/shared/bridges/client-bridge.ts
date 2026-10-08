@@ -1,4 +1,6 @@
-export type SupportedLocale = 'zh-CN' | 'en-US' | '';
+import type { LocaleCode } from '../../i18n/locales';
+
+export type SupportedLocale = LocaleCode | '';
 export type ClientBridgeKind = 'vscode' | 'web';
 
 export interface ClientBridgeMessage {

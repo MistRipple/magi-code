@@ -1195,17 +1195,9 @@ async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value
 #[serde(tag = "key", content = "value", deny_unknown_fields)]
 enum RuntimeSettingUpdate {
     #[serde(rename = "locale")]
-    Locale(RuntimeLocale),
+    Locale(String),
     #[serde(rename = "conversationDisplayMode")]
     ConversationDisplayMode(ConversationDisplayMode),
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-enum RuntimeLocale {
-    #[serde(rename = "zh-CN")]
-    ZhCn,
-    #[serde(rename = "en-US")]
-    EnUs,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1221,28 +1213,31 @@ async fn update_setting(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let update = serde_json::from_value::<RuntimeSettingUpdate>(request).map_err(|error| {
         ApiError::InvalidInput(format!(
-            "只能更新 locale（zh-CN / en-US）或 conversationDisplayMode（original / summary）：{error}"
+            "只能更新 locale 或 conversationDisplayMode（original / summary）：{error}"
         ))
     })?;
     let (key, value) = match update {
-        RuntimeSettingUpdate::Locale(locale) => (
-            "locale",
-            match locale {
-                RuntimeLocale::ZhCn => "zh-CN",
-                RuntimeLocale::EnUs => "en-US",
-            },
-        ),
+        RuntimeSettingUpdate::Locale(locale) => {
+            if !crate::locales::is_supported_locale(&locale) {
+                return Err(ApiError::InvalidInput(format!(
+                    "不支持的界面语言 {locale}，可选：{}",
+                    crate::locales::SUPPORTED_LOCALES.join(" / ")
+                )));
+            }
+            ("locale", locale)
+        }
         RuntimeSettingUpdate::ConversationDisplayMode(mode) => (
             "conversationDisplayMode",
             match mode {
                 ConversationDisplayMode::Original => "original",
                 ConversationDisplayMode::Summary => "summary",
-            },
+            }
+            .to_string(),
         ),
     };
     state
         .settings_store
-        .set(key, serde_json::Value::String(value.to_string()))
+        .set(key, serde_json::Value::String(value))
         .map_err(settings_persistence_error)?;
     Ok(Json(state.settings_runtime_json()))
 }

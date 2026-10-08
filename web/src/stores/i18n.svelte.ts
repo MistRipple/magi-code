@@ -3,23 +3,20 @@
  * 使用 class 实例模式确保 $state/$derived 跨模块响应式正确追踪
  */
 
-import zhCN from '../i18n/zh-CN.json';
-import enUS from '../i18n/en-US.json';
-import type { LocaleCode } from '../i18n/types';
+import { DEFAULT_LOCALE, LOCALES, isSupportedLocale, type LocaleCode } from '../i18n/locales';
 
-const dictionaries: Record<LocaleCode, Record<string, string>> = {
-  'zh-CN': zhCN,
-  'en-US': enUS,
-};
+const dictionaries = Object.fromEntries(
+  LOCALES.map((locale) => [locale.code, locale.dictionary]),
+) as Record<LocaleCode, Record<string, string>>;
 
 function resolveInitialLocale(): LocaleCode {
   if (typeof window !== 'undefined') {
     const locale = (window as unknown as { __INITIAL_LOCALE__?: string }).__INITIAL_LOCALE__;
-    if (locale === 'zh-CN' || locale === 'en-US') {
+    if (isSupportedLocale(locale)) {
       return locale;
     }
   }
-  return 'zh-CN';
+  return DEFAULT_LOCALE;
 }
 
 class I18nStore {
@@ -40,8 +37,10 @@ class I18nStore {
     return text;
   }
 
-  setLocale(locale: LocaleCode): void {
-    this.locale = locale;
+  setLocale(locale: string): void {
+    if (isSupportedLocale(locale)) {
+      this.locale = locale;
+    }
   }
 }
 

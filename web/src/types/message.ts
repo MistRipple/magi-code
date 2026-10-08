@@ -4,7 +4,7 @@ import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
  */
 
 import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
-import type { LocaleCode } from '../i18n/types';
+import type { LocaleCode } from '../i18n/locales';
 import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---

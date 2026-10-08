@@ -1,4 +1,4 @@
-import type { ClientBridgeMessage } from '../shared/bridges/client-bridge';
+import type { ClientBridgeMessage, SupportedLocale } from '../shared/bridges/client-bridge';
 import {
   getBridgeKind,
   getBridgeState,
@@ -38,7 +38,7 @@ export function getInitialSessionId(): string {
   return getInitialBridgeSessionId();
 }
 
-export function getInitialLocale(): 'zh-CN' | 'en-US' | '' {
+export function getInitialLocale(): SupportedLocale {
   return getInitialBridgeLocale();
 }
 

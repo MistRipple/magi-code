@@ -37,6 +37,7 @@ import type {
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
+import { isSupportedLocale, normalizeLocale } from '../i18n/locales';
 import type { MessageBrowserNodeSelection } from '../types/message';
 import {
   resolveAgentBindingContext,
@@ -317,7 +318,7 @@ function normalizeSettingsBootstrapPayload(
       : { locale: 'zh-CN', conversationDisplayMode: 'original' }
   ) as Record<string, unknown>;
   const runtimeSettings: SettingsRuntimeSnapshot = {
-    locale: runtimeSettingsRecord.locale === 'en-US' ? 'en-US' : 'zh-CN',
+    locale: normalizeLocale(runtimeSettingsRecord.locale),
     conversationDisplayMode: runtimeSettingsRecord.conversationDisplayMode === 'summary'
       ? 'summary'
       : 'original',
@@ -3291,7 +3292,7 @@ export async function acceptWorkspaceGitContext(
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {
   const payload = await postGlobalJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
-  if (key === 'locale' && (payload?.locale === 'zh-CN' || payload?.locale === 'en-US')) {
+  if (key === 'locale' && isSupportedLocale(payload?.locale)) {
     safeWriteLocalStorage('magi-locale', payload.locale);
     i18n.setLocale(payload.locale);
   }

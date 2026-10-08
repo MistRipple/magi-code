@@ -13,9 +13,6 @@ import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
 import { i18n } from '../stores/i18n.svelte';
-import {
-    updateAgentRuntimeSetting,
-  } from '../web/agent-api';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
@@ -40,6 +37,15 @@ import {
     onClose: () => onClose?.(),
     // 保活期间不可见时，存储不做统计这类重活（见 settings-store 中的说明）。
     isActive: () => active,
+  });
+
+  // 界面语言由侧栏切换；角色模板等数据由 daemon 按当前语言返回，语言变化后需要重新加载。
+  let loadedLocale = untrack(() => i18n.locale);
+  $effect(() => {
+    const locale = i18n.locale;
+    if (locale === loadedLocale) return;
+    loadedLocale = locale;
+    void untrack(() => store.reloadRoleTemplates());
   });
 
   const activeTabDefinition = $derived(
@@ -176,32 +182,6 @@ import {
         <div class="header-title-group">
           <h2>{i18n.t(activeTabDefinition.titleKey)}</h2>
           <span class="header-description">{i18n.t(activeTabDefinition.descKey)}</span>
-        </div>
-      </div>
-      <div class="header-actions">
-        <div class="locale-selector">
-          <button
-            class="locale-btn"
-            class:active={i18n.locale === 'zh-CN'}
-            onclick={async () => {
-              i18n.setLocale('zh-CN');
-              await updateAgentRuntimeSetting('locale', 'zh-CN');
-              await store.reloadRoleTemplates();
-            }}
-          >
-            {i18n.t('settings.locale.zhCN')}
-          </button>
-          <button
-            class="locale-btn"
-            class:active={i18n.locale === 'en-US'}
-            onclick={async () => {
-              i18n.setLocale('en-US');
-              await updateAgentRuntimeSetting('locale', 'en-US');
-              await store.reloadRoleTemplates();
-            }}
-          >
-            {i18n.t('settings.locale.enUS')}
-          </button>
         </div>
       </div>
     </header>
@@ -752,41 +732,6 @@ import {
   /* ============================================
      Settings Panel - 优化后的样式
      ============================================ */
-
-
-  .locale-selector {
-    display: flex;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    overflow: hidden;
-    margin-left: auto;
-  }
-
-  .locale-btn {
-    padding: var(--space-1) var(--space-3);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    color: var(--foreground-muted);
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    white-space: nowrap;
-  }
-
-  .locale-btn:hover {
-    color: var(--foreground);
-    background: var(--surface-3);
-  }
-
-  .locale-btn.active {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-
-  .locale-btn + .locale-btn {
-    border-left: 1px solid var(--border);
-  }
 
 
   /* 动画 */
@@ -1411,13 +1356,6 @@ import {
       line-height: 1.35;
     }
 
-    .header-actions {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      flex: 0 0 auto;
-    }
-
     .scroll-content {
       padding: 20px max(28px, calc((100% - 960px) / 2));
       overflow: hidden;
@@ -1507,11 +1445,6 @@ import {
       padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)) !important;
       gap: 24px !important;
     }
-
-    .header-actions .locale-selector .locale-btn {
-      padding: 4px 8px;
-      font-size: 12px;
-    }
   }
 
   @media (max-width: 480px) {
@@ -1531,9 +1464,6 @@ import {
       -webkit-box-orient: vertical;
       -webkit-line-clamp: 2;
       line-clamp: 2;
-    }
-    .header-actions {
-      gap: 8px;
     }
   }
 </style>

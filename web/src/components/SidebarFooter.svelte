@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import DesktopUpdateStatus from './DesktopUpdateStatus.svelte';
+  import LocaleSwitcher from './LocaleSwitcher.svelte';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
   import { openSettings } from '../stores/shell-ui.svelte';
@@ -43,6 +44,7 @@
     >
       <Icon name={themeIcon} size={14} />
     </button>
+    <LocaleSwitcher />
   </div>
   <DesktopUpdateStatus />
 </div>

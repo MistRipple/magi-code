@@ -5,6 +5,7 @@ import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
 import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
+import { isSupportedLocale } from "../i18n/locales";
 import { confirmMessage } from "./confirm-dialog.svelte";
 import {
   directIncidentError,
@@ -1465,7 +1466,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     const runtimeDisplayMode: ConversationDisplayMode = payload.runtimeSettings?.conversationDisplayMode === 'summary'
       ? 'summary'
       : 'original';
-    if (options?.allowLocaleHydration !== false && (runtimeLocale === 'zh-CN' || runtimeLocale === 'en-US')) {
+    if (options?.allowLocaleHydration !== false && isSupportedLocale(runtimeLocale)) {
       i18n.setLocale(runtimeLocale);
     }
     conversationDisplayMode = runtimeDisplayMode;
