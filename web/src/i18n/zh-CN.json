@@ -1117,6 +1117,8 @@
   "settings.agents.importConflictOverwrite": "覆盖已有角色",
   "settings.agents.importConflictRename": "另存为新角色",
   "settings.model.addEngine": "添加引擎",
+  "settings.model.card.connection": "连接",
+  "settings.model.card.model": "模型",
   "settings.model.unsavedClose.title": "有未保存的模型配置",
   "settings.model.unsavedClose.message": "以下配置的修改还没有保存：{names}。",
   "settings.model.unsavedClose.separator": "、",

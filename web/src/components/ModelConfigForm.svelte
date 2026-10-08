@@ -14,6 +14,9 @@
     showModelField = true,
     showAdvancedOptions = true,
     description = null,
+    title = '',
+    statusClass = '',
+    statusLabel = '',
     visionBuiltinTextModelRules = [],
     saveStatus,
     testStatus,
@@ -38,6 +41,10 @@
     showModelField?: boolean;
     showAdvancedOptions?: boolean;
     description?: string | null;
+    /** 表单标题与当前连接状态（状态点颜色类名与文字）。 */
+    title?: string;
+    statusClass?: string;
+    statusLabel?: string;
     visionBuiltinTextModelRules?: VisionBuiltinTextModelRule[];
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
@@ -342,9 +349,26 @@
 </script>
 
 <div class="llm-config-form">
-  {#if description}
-    <p class="llm-config-lead">{description}</p>
+  {#if title || description}
+    <header class="cfg-header">
+      {#if title}
+        <div class="cfg-title-row">
+          <h3 class="cfg-title">{title}</h3>
+          {#if statusLabel}
+            <span class="cfg-status cfg-status--{statusClass}">
+              <span class="cfg-status-dot" aria-hidden="true"></span>{statusLabel}
+            </span>
+          {/if}
+        </div>
+      {/if}
+      {#if description}
+        <p class="llm-config-lead">{description}</p>
+      {/if}
+    </header>
   {/if}
+
+  <section class="cfg-card" aria-label={i18n.t('settings.model.card.connection')}>
+  <h4 class="cfg-card-title">{i18n.t('settings.model.card.connection')}</h4>
   <div class="llm-config-field-row url-mode-row">
     <div class="llm-config-field">
       <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
@@ -413,13 +437,7 @@
     </div>
   {/if}
 
-  <div
-    class="llm-config-field-row credentials-row"
-    class:has-level={showAdvancedOptions}
-    class:has-context-window={formType === 'vision'}
-    class:key-only={!showModelField && !showAdvancedOptions}
-  >
-    <div class="llm-config-field">
+  <div class="llm-config-field">
       <label class="form-label" for={fieldId('api-key')}>{i18n.t('settings.model.field.apiKey')}</label>
       <div class="api-key-wrapper">
         <input
@@ -440,7 +458,16 @@
         </button>
       </div>
     </div>
+  </section>
 
+  {#if showModelField || showAdvancedOptions || formType === 'vision'}
+  <section class="cfg-card" aria-label={i18n.t('settings.model.card.model')}>
+  <h4 class="cfg-card-title">{i18n.t('settings.model.card.model')}</h4>
+  <div
+    class="llm-config-field-row model-row"
+    class:has-level={showAdvancedOptions}
+    class:has-context-window={formType === 'vision'}
+  >
     {#if showModelField}
       <div class="llm-config-field">
         <label class="form-label" for={fieldId('model')}>{i18n.t('settings.model.field.model')}</label>
@@ -533,9 +560,11 @@
       </div>
     {/if}
   </div>
+  </section>
+  {/if}
 
   {#if formType === 'vision'}
-    <section class="vision-routing-settings" aria-labelledby="vision-routing-title">
+    <section class="cfg-card vision-routing-settings" aria-labelledby="vision-routing-title">
         <div class="vision-routing-heading">
           <div>
             <div class="form-label" id="vision-routing-title">
@@ -688,17 +717,14 @@
     grid-template-columns: 1fr;
     gap: var(--space-3);
   }
-  .llm-config-field-row.credentials-row {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-  .llm-config-field-row.credentials-row.has-level {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 96px;
-  }
-  .llm-config-field-row.credentials-row.has-context-window {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(118px, 0.42fr);
-  }
-  .llm-config-field-row.credentials-row.key-only {
+  .llm-config-field-row.model-row {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .llm-config-field-row.model-row.has-level {
+    grid-template-columns: minmax(0, 1fr) 140px;
+  }
+  .llm-config-field-row.model-row.has-context-window {
+    grid-template-columns: minmax(0, 1fr) minmax(118px, 0.42fr);
   }
   .llm-config-field-row.url-mode-row {
     grid-template-columns: minmax(0, 1fr) 180px;
@@ -707,6 +733,44 @@
 
   .llm-config-field--compact {
     min-width: 0;
+  }
+
+  .cfg-header { display: flex; flex-direction: column; gap: var(--space-1); }
+  .cfg-title-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+  .cfg-title { margin: 0; font-size: var(--text-lg); font-weight: var(--font-semibold); color: var(--foreground); }
+  .cfg-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+  .cfg-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--foreground-muted); }
+  .cfg-status--success .cfg-status-dot { background: var(--success, #16a34a); }
+  .cfg-status--success { color: var(--foreground); }
+  .cfg-status--warning .cfg-status-dot, .cfg-status--checking .cfg-status-dot { background: var(--warning, #d97706); }
+  .cfg-status--error .cfg-status-dot { background: var(--error, #dc2626); }
+  .cfg-status--error { color: var(--error, #dc2626); border-color: color-mix(in srgb, var(--error, #dc2626) 40%, var(--border)); }
+
+  /* 分组卡片：连接 / 模型 / 路由规则各自成块，字段不再平铺成一长条。 */
+  .cfg-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-1, transparent);
+  }
+  .cfg-card-title {
+    margin: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.04em;
   }
 
   .llm-config-lead {
@@ -783,8 +847,6 @@
     flex-direction: column;
     gap: var(--space-3);
     min-width: 0;
-    padding-top: var(--space-4);
-    border-top: 1px solid var(--border-subtle);
   }
 
   .vision-routing-heading {
@@ -1060,12 +1122,19 @@
     background: var(--primary-muted, rgba(var(--primary-rgb, 100, 149, 237), 0.1));
   }
 
+  /* 操作栏吸底：长表单（识图规则）滚动时「测试 / 保存」始终可达。 */
   .model-form-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: var(--space-3);
-    margin-top: 24px;
+    margin-top: var(--space-2);
+    padding: var(--space-3) 0;
+    border-top: 1px solid var(--border-subtle, var(--border));
+    background: var(--background, var(--surface-1));
   }
 
   .model-form-actions--buttons-only {
@@ -1121,10 +1190,9 @@
       align-items: stretch;
     }
     .llm-config-field-row,
-    .llm-config-field-row.credentials-row,
-    .llm-config-field-row.credentials-row.has-level,
-    .llm-config-field-row.credentials-row.has-context-window,
-    .llm-config-field-row.credentials-row.key-only,
+    .llm-config-field-row.model-row,
+    .llm-config-field-row.model-row.has-level,
+    .llm-config-field-row.model-row.has-context-window,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }
@@ -1154,10 +1222,9 @@
       align-items: stretch;
     }
     .llm-config-field-row,
-    .llm-config-field-row.credentials-row,
-    .llm-config-field-row.credentials-row.has-level,
-    .llm-config-field-row.credentials-row.has-context-window,
-    .llm-config-field-row.credentials-row.key-only,
+    .llm-config-field-row.model-row,
+    .llm-config-field-row.model-row.has-level,
+    .llm-config-field-row.model-row.has-context-window,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }

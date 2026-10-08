@@ -1117,6 +1117,8 @@
   "settings.agents.importConflictOverwrite": "Overwrite existing role",
   "settings.agents.importConflictRename": "Save as a new role",
   "settings.model.addEngine": "Add Engine",
+  "settings.model.card.connection": "Connection",
+  "settings.model.card.model": "Model",
   "settings.model.unsavedClose.title": "Unsaved model settings",
   "settings.model.unsavedClose.message": "These settings have unsaved changes: {names}.",
   "settings.model.unsavedClose.separator": ", ",

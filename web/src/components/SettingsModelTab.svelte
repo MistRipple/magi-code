@@ -106,32 +106,46 @@
     );
   }
 
-  // --- 统一 tab 滚动状态检测 ---
-  let tabbarWrapperEl: HTMLElement | undefined = $state();
-  let canScrollLeft = $state(false);
-  let canScrollRight = $state(false);
+  // --- 左侧列表（窄屏时横向排列）：切换时把当前项滚入可视区 ---
+  let railEl: HTMLElement | undefined = $state();
 
-  function updateScrollState() {
-    const el = tabbarWrapperEl?.querySelector('.tabbar-scroll') as HTMLElement | null;
-    if (!el) return;
-    canScrollLeft = el.scrollLeft > 2;
-    canScrollRight = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
-  }
-
-  /** 切换 tab 时自动滚入可视区 */
   function scrollTabIntoView(tabId: string) {
     requestAnimationFrame(() => {
-      const btn = tabbarWrapperEl?.querySelector(`.role-tab[data-tab-id="${CSS.escape(tabId)}"]`) as HTMLElement | null;
+      const btn = railEl?.querySelector(`[data-tab-id="${CSS.escape(tabId)}"]`) as HTMLElement | null;
       btn?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
-      setTimeout(updateScrollState, 200);
     });
   }
 
-  $effect(() => {
-    workerModelTabs;
-    modelConfigTab;
-    requestAnimationFrame(updateScrollState);
-  });
+  type RailItem = { id: string; name: string; sub: string; statusClass: string; statusText: string };
+
+  function railStatusKey(tabId: string): string {
+    return tabId === 'image' ? 'imageGeneration' : tabId;
+  }
+
+  function tabStatus(tabId: string): { statusClass: string; statusText: string } {
+    const status = resolveModelConfigTabStatus(railStatusKey(tabId), modelStatuses);
+    return { statusClass: getStatusClass(status), statusText: getStatusText(status) };
+  }
+
+  function railItem(id: string, name: string, model: string | undefined): RailItem {
+    const status = tabStatus(id);
+    return { id, name, sub: model?.trim() || status.statusText, ...status };
+  }
+
+  const roleRailItems = $derived<RailItem[]>([
+    { ...railItem('orch', i18n.t('settings.model.orchestratorModel'), undefined), sub: i18n.t('settings.model.sessionModelSelection') },
+    railItem('comp', i18n.t('settings.model.auxiliaryModel'), compConfig?.model),
+    railItem('image', i18n.t('settings.model.imageGenerationModel'), imageConfig?.model),
+    railItem('vision', i18n.t('settings.model.visionModel'), visionConfig?.model),
+  ]);
+
+  const workerRailItems = $derived<RailItem[]>(
+    workerModelTabs.map((id: string) => railItem(id, getWorkerDisplayName(id), workerConfigs[id]?.model)),
+  );
+
+  function tabTitle(tabId: string): string {
+    return roleRailItems.find((item) => item.id === tabId)?.name ?? getWorkerDisplayName(tabId);
+  }
 
   // --- Inline rename 状态机 ---
   let editingTab = $state<string | null>(null);
@@ -182,165 +196,94 @@
 <div class="apple-manager settings-tab-inner">
   <div class="apple-scroller-proxy">
     <div class="settings-section">
-      <div
-        class="tabbar-wrapper"
-        bind:this={tabbarWrapperEl}
-        class:can-scroll-left={canScrollLeft}
-        class:can-scroll-right={canScrollRight}
-      >
-        <div class="tabbar-scroll" onscroll={updateScrollState}>
-          <div class="tabbar-track" role="tablist">
-            <span class="tab-group-label" aria-hidden="true">{i18n.t('settings.model.tabGroup.roles')}</span>
-            <!-- 主模型 -->
+      <div class="model-workbench">
+        <div class="model-rail" role="tablist" aria-orientation="vertical" aria-label={i18n.t('settings.zone.quickStart')} bind:this={railEl}>
+          <div class="rail-group-label">{i18n.t('settings.model.tabGroup.roles')}</div>
+          {#each roleRailItems as item (item.id)}
             <button
               type="button"
-              class="role-tab"
-              class:active={modelConfigTab === 'orch'}
+              class="rail-item"
+              class:active={modelConfigTab === item.id}
               role="tab"
-              aria-selected={modelConfigTab === 'orch'}
-              data-tab-id="orch"
-              onclick={() => selectTab('orch')}
+              aria-selected={modelConfigTab === item.id}
+              data-tab-id={item.id}
+              onclick={() => selectTab(item.id)}
             >
-              <span
-                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses))}"
-                title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses))}
-              ></span>
-              <span class="role-tab-name">{i18n.t('settings.model.orchestratorModel')}</span>
+              <span class="rail-dot {item.statusClass}" title={item.statusText}></span>
+              <span class="rail-copy">
+                <span class="rail-name">{item.name}</span>
+                <span class="rail-sub">{item.sub}</span>
+              </span>
             </button>
+          {/each}
 
-            <!-- 辅助模型 -->
+          <div class="rail-group-label rail-group-label--engines">{i18n.t('settings.model.tabGroup.engines')}</div>
+          {#each workerRailItems as item (item.id)}
+            {@const isActive = modelConfigTab === item.id}
+            {@const isEditing = editingTab === item.id}
             <button
               type="button"
-              class="role-tab"
-              class:active={modelConfigTab === 'comp'}
+              class="rail-item rail-item--engine"
+              class:active={isActive}
+              class:editing={isEditing}
               role="tab"
-              aria-selected={modelConfigTab === 'comp'}
-              data-tab-id="comp"
-              onclick={() => selectTab('comp')}
+              aria-selected={isActive}
+              data-tab-id={item.id}
+              onclick={() => { if (!isEditing) selectTab(item.id); }}
+              ondblclick={(e) => { e.stopPropagation(); startRename(item.id); }}
+              onkeydown={(e) => {
+                if (isEditing) return;
+                if (e.key === 'F2') { e.preventDefault(); startRename(item.id); }
+                else if (e.key === 'Delete') { e.preventDefault(); deleteEngine(item.id); }
+              }}
+              title={isEditing ? '' : i18n.t('settings.model.renameEngineHint')}
             >
-              <span
-                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
-                title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
-              ></span>
-              <span class="role-tab-name">{i18n.t('settings.model.auxiliaryModel')}</span>
-            </button>
-
-            <!-- 生图模型 -->
-            <button
-              type="button"
-              class="role-tab"
-              class:active={modelConfigTab === 'image'}
-              role="tab"
-              aria-selected={modelConfigTab === 'image'}
-              data-tab-id="image"
-              onclick={() => selectTab('image')}
-            >
-              <span
-                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}"
-                title={getStatusText(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}
-              ></span>
-              <span class="role-tab-name">{i18n.t('settings.model.imageGenerationModel')}</span>
-            </button>
-
-            <!-- 识图模型 -->
-            <button
-              type="button"
-              class="role-tab"
-              class:active={modelConfigTab === 'vision'}
-              role="tab"
-              aria-selected={modelConfigTab === 'vision'}
-              data-tab-id="vision"
-              onclick={() => selectTab('vision')}
-            >
-              <span
-                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('vision', modelStatuses))}"
-                title={getStatusText(resolveModelConfigTabStatus('vision', modelStatuses))}
-              ></span>
-              <span class="role-tab-name">{i18n.t('settings.model.visionModel')}</span>
-            </button>
-
-            <span class="tab-group-divider" aria-hidden="true"></span>
-            <span class="tab-group-label" aria-hidden="true">{i18n.t('settings.model.tabGroup.engines')}</span>
-            <!-- 代理引擎 -->
-            {#each workerModelTabs as workerTab (workerTab)}
-              {@const workerStatus = resolveModelConfigTabStatus(workerTab, modelStatuses)}
-              {@const workerIndicatorVariant = resolveAgentIndicatorVariant(workerStatus)}
-              {@const workerColor = getAgentColor(workerTab)}
-              {@const isActive = modelConfigTab === workerTab}
-              {@const isEditing = editingTab === workerTab}
-              <button
-                type="button"
-                class="role-tab role-tab--worker"
-                class:active={isActive}
-                class:editing={isEditing}
-                role="tab"
-                aria-selected={isActive}
-                data-tab-id={workerTab}
-                style="--worker-brand-color: {workerColor.color}"
-                onclick={() => { if (!isEditing) selectTab(workerTab); }}
-                ondblclick={(e) => { e.stopPropagation(); startRename(workerTab); }}
-                onkeydown={(e) => {
-                  if (isEditing) return;
-                  if (e.key === 'F2') { e.preventDefault(); startRename(workerTab); }
-                  else if (e.key === 'Delete') { e.preventDefault(); deleteEngine(workerTab); }
-                }}
-                title={isEditing ? '' : i18n.t('settings.model.renameEngineHint')}
-              >
+              <span class="rail-dot {item.statusClass}" title={item.statusText}></span>
+              {#if isEditing}
+                <input
+                  bind:this={renameInputEl}
+                  class="rail-rename-input"
+                  type="text"
+                  bind:value={editingName}
+                  onkeydown={onRenameKeydown}
+                  onblur={commitRename}
+                  onclick={(e) => e.stopPropagation()}
+                  onmousedown={(e) => e.stopPropagation()}
+                />
+              {:else}
+                <span class="rail-copy">
+                  <span class="rail-name">{item.name}</span>
+                  <span class="rail-sub">{item.sub}</span>
+                </span>
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span
-                  class="role-tab-status worker-dot"
-                  class:brand={workerIndicatorVariant === 'brand'}
-                  class:disabled={workerIndicatorVariant === 'disabled'}
-                  class:warning={workerIndicatorVariant === 'warning'}
-                  class:error={workerIndicatorVariant === 'error'}
-                  title={getStatusText(workerStatus)}
-                ></span>
-                {#if isEditing}
-                  <input
-                    bind:this={renameInputEl}
-                    class="role-tab-rename-input"
-                    type="text"
-                    bind:value={editingName}
-                    onkeydown={onRenameKeydown}
-                    onblur={commitRename}
-                    onclick={(e) => e.stopPropagation()}
-                    onmousedown={(e) => e.stopPropagation()}
-                  />
-                {:else}
-                  <span class="role-tab-name">{getWorkerDisplayName(workerTab)}</span>
-                  <!-- svelte-ignore a11y_click_events_have_key_events -->
-                  <span
-                    class="role-tab-delete"
-                    role="button"
-                    tabindex="-1"
-                    title={i18n.t('settings.model.deleteEngine')}
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      deleteEngine(workerTab);
-                    }}
-                  >×</span>
-                {/if}
-              </button>
-            {/each}
-
-            <!-- + 新增引擎 -->
-            <button
-              type="button"
-              class="role-tab role-tab--add"
-              title={i18n.t('settings.model.addEngine')}
-              onclick={openAddEngineDialog}
-            >
-              <Icon name="plus" size={12} />
-              <span>{i18n.t('settings.model.addEngine')}</span>
+                  class="rail-delete"
+                  role="button"
+                  tabindex="-1"
+                  title={i18n.t('settings.model.deleteEngine')}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    deleteEngine(item.id);
+                  }}
+                >×</span>
+              {/if}
             </button>
-          </div>
+          {/each}
+
+          <button type="button" class="rail-add" onclick={openAddEngineDialog}>
+            <Icon name="plus" size={12} />
+            <span>{i18n.t('settings.model.addEngine')}</span>
+          </button>
         </div>
-      </div>
 
       <div class="tab-content-area">
         {#if modelConfigTab === 'orch'}
           <ModelConfigForm
             formType="orch"
             statusKey="orch"
+            title={tabTitle(modelConfigTab)}
+            statusClass={tabStatus(modelConfigTab).statusClass}
+            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={orchConfig}
             baselineConfig={modelConfigBaselines.orch}
             bind:keyVisible
@@ -366,6 +309,9 @@
           <ModelConfigForm
             formType="comp"
             statusKey="comp"
+            title={tabTitle(modelConfigTab)}
+            statusClass={tabStatus(modelConfigTab).statusClass}
+            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={compConfig}
             baselineConfig={modelConfigBaselines.comp}
             bind:keyVisible
@@ -390,6 +336,9 @@
           <ModelConfigForm
             formType="image"
             statusKey="image"
+            title={tabTitle(modelConfigTab)}
+            statusClass={tabStatus(modelConfigTab).statusClass}
+            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={imageConfig}
             baselineConfig={modelConfigBaselines.image}
             bind:keyVisible
@@ -414,6 +363,9 @@
           <ModelConfigForm
             formType="vision"
             statusKey="vision"
+            title={tabTitle(modelConfigTab)}
+            statusClass={tabStatus(modelConfigTab).statusClass}
+            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={visionConfig}
             baselineConfig={modelConfigBaselines.vision}
             {visionBuiltinTextModelRules}
@@ -439,6 +391,9 @@
           <ModelConfigForm
             formType="worker"
             statusKey={modelConfigTab}
+            title={tabTitle(modelConfigTab)}
+            statusClass={tabStatus(modelConfigTab).statusClass}
+            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={workerConfigs[modelConfigTab]}
             baselineConfig={modelConfigBaselines[modelConfigTab]}
             bind:keyVisible
@@ -467,6 +422,7 @@
             </div>
           </div>
         {/if}
+      </div>
       </div>
     </div>
 
@@ -593,181 +549,144 @@
     container: settings-model / inline-size;
   }
 
-  /* ===== 统一 tab 条（沿用「角色」tab underline 风格） ===== */
-  .tabbar-wrapper {
-    position: relative;
-    margin-bottom: var(--space-4);
-    --fade-w: 24px;
+  /* ===== 左侧列表 + 右侧详情 ===== */
+  .model-workbench {
+    display: grid;
+    grid-template-columns: 208px minmax(0, 1fr);
+    gap: var(--space-5, 20px);
+    align-items: start;
   }
-  .tabbar-wrapper::before,
-  .tabbar-wrapper::after {
-    content: '';
-    position: absolute;
+
+  .model-rail {
+    position: sticky;
     top: 0;
-    bottom: 0;
-    width: var(--fade-w);
-    pointer-events: none;
-    z-index: 1;
-    opacity: 0;
-    transition: opacity var(--transition-fast);
-  }
-  .tabbar-wrapper::before {
-    left: 0;
-    background: linear-gradient(to right, var(--background), transparent);
-  }
-  .tabbar-wrapper::after {
-    right: 0;
-    background: linear-gradient(to left, var(--background), transparent);
-  }
-  .tabbar-wrapper.can-scroll-left::before { opacity: 1; }
-  .tabbar-wrapper.can-scroll-right::after { opacity: 1; }
-
-  .tabbar-scroll {
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
-    scroll-behavior: smooth;
-    -webkit-overflow-scrolling: touch;
-  }
-  .tabbar-scroll::-webkit-scrollbar { height: 0; }
-
-  .tabbar-track {
     display: flex;
-    align-items: stretch;
+    flex-direction: column;
     gap: 2px;
-    min-width: max-content;
-    border-bottom: 1px solid var(--ind-border-separator);
+    min-width: 0;
   }
 
-  .role-tab {
+  .rail-group-label {
+    padding: var(--space-2) var(--space-3) var(--space-1);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.04em;
+  }
+  .rail-group-label--engines { margin-top: var(--space-2); }
+
+  .rail-item {
     position: relative;
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: 7px;
-    padding: 7px 11px 9px;
-    border: none;
+    gap: var(--space-3);
+    width: 100%;
+    min-width: 0;
+    padding: 7px var(--space-3);
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
     background: transparent;
-    color: var(--ind-foreground-muted);
+    color: var(--foreground-muted);
     font-family: inherit;
-    font-size: 13px;
-    font-weight: 500;
-    letter-spacing: -0.005em;
+    text-align: left;
     cursor: pointer;
-    transition: color 0.15s ease;
-    white-space: nowrap;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
-  .role-tab:hover {
-    color: var(--ind-foreground-secondary);
+  .rail-item:hover { background: var(--surface-hover, color-mix(in srgb, var(--foreground) 6%, transparent)); color: var(--foreground); }
+  .rail-item.active {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+    color: var(--foreground);
   }
-  .role-tab.active {
-    color: var(--ind-foreground);
-    font-weight: 600;
-  }
-  .role-tab.active::after {
-    content: '';
-    position: absolute;
-    left: 11px;
-    right: 11px;
-    bottom: -1px;
-    height: 2px;
-    background: var(--ind-tab-accent);
-    border-radius: 2px;
-  }
-  .role-tab:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 60%, transparent);
-    outline-offset: -3px;
-    border-radius: 4px;
-  }
+  .rail-item:focus-visible { outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent); outline-offset: -2px; }
 
-  .role-tab-name {
-    font-variant-numeric: tabular-nums;
-  }
+  .rail-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+  .rail-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); font-weight: var(--font-medium); }
+  .rail-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: 11px; font-family: var(--font-mono, monospace); }
+  .rail-item.active .rail-name { font-weight: var(--font-semibold); }
 
-  /* 状态指示点：5px 圆点，沿用角色 tab 视觉 */
-  .role-tab-status {
-    width: 5px;
-    height: 5px;
+  .rail-dot {
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     flex-shrink: 0;
-    margin-left: 1px;
-    background: var(--ind-foreground-soft, var(--foreground-muted));
+    background: var(--foreground-muted);
   }
-  .role-tab-status.success { background: var(--success, #34c759); }
-  .role-tab-status.checking { background: var(--warning, #d97706); }
-  .role-tab-status.warning { background: var(--warning, #d97706); }
-  .role-tab-status.error { background: var(--error, #ff3b30); }
-  .role-tab-status.disabled { background: color-mix(in srgb, var(--ind-foreground-soft) 55%, transparent); }
+  .rail-dot.success { background: var(--success, #16a34a); }
+  .rail-dot.checking, .rail-dot.warning { background: var(--warning, #d97706); }
+  .rail-dot.error { background: var(--error, #dc2626); }
+  .rail-dot.disabled { background: color-mix(in srgb, var(--foreground-muted) 55%, transparent); }
 
-  /* 代理引擎 tab 的状态点支持品牌色变体 */
-  .role-tab-status.worker-dot.brand { background: var(--worker-brand-color); }
-
-  /* 删除按钮：hover 浮出 */
-  .role-tab-delete {
+  .rail-delete {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 16px;
-    height: 16px;
+    width: 18px;
+    height: 18px;
     border-radius: 50%;
-    font-size: 13px;
+    flex-shrink: 0;
+    font-size: 14px;
     line-height: 1;
-    color: var(--ind-foreground-muted);
+    color: var(--foreground-muted);
     opacity: 0;
-    transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
     cursor: pointer;
-    margin-left: 2px;
   }
-  .role-tab--worker:hover .role-tab-delete { opacity: 0.7; }
-  .role-tab-delete:hover {
+  .rail-item--engine:hover .rail-delete, .rail-item--engine.active .rail-delete { opacity: 0.7; }
+  .rail-delete:hover {
     opacity: 1 !important;
     background: color-mix(in srgb, var(--error, #ff3b30) 12%, transparent);
     color: var(--error, #ff3b30);
   }
 
-  /* + 新增引擎按钮 */
-  .role-tab--add {
-    color: var(--ind-foreground-soft, var(--ind-foreground-muted));
-    padding: 7px 9px 9px;
-    white-space: nowrap;
-  }
-
-  /* 固定角色与自建引擎是两类东西：分组标签 + 分隔线，而不是一排同质的标签。 */
-  .tab-group-label {
-    align-self: center;
-    padding: 0 6px 2px 4px;
-    color: var(--ind-foreground-soft, var(--ind-foreground-muted));
-    font-size: 11px;
-    white-space: nowrap;
-  }
-  .tab-group-divider {
-    align-self: center;
-    width: 1px;
-    height: 16px;
-    margin: 0 6px 2px;
-    background: var(--ind-border-separator);
-  }
-  .role-tab--add:hover {
-    color: var(--ind-tab-accent);
-  }
-
-  /* Inline rename input */
-  .role-tab-rename-input {
+  .rail-add {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: var(--space-1);
+    padding: 7px var(--space-3);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-md);
     background: transparent;
-    border: none;
-    outline: none;
+    color: var(--foreground-muted);
     font-family: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ind-foreground);
-    padding: 0;
-    margin: 0;
-    width: 9ch;
-    min-width: 4ch;
-    border-bottom: 1px dashed var(--ind-tab-accent);
-    border-radius: 0;
-    letter-spacing: -0.005em;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: color var(--transition-fast), border-color var(--transition-fast);
   }
-  .role-tab.editing { cursor: text; }
+  .rail-add:hover { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 50%, var(--border)); }
+
+  .rail-rename-input {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: none;
+    border-bottom: 1px dashed var(--primary);
+    outline: none;
+    background: transparent;
+    color: var(--foreground);
+    font-family: inherit;
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+  }
+
+  /* 窄容器：列表改为横向滑动的一排，详情在下方整宽显示。 */
+  @container settings-model (max-width: 720px) {
+    .model-workbench { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+    .model-rail {
+      position: static;
+      flex-direction: row;
+      align-items: stretch;
+      overflow-x: auto;
+      padding-bottom: var(--space-1);
+      scrollbar-width: none;
+    }
+    .model-rail::-webkit-scrollbar { height: 0; }
+    .rail-group-label { align-self: center; padding: 0 var(--space-1); white-space: nowrap; }
+    .rail-group-label--engines { margin-top: 0; padding-left: var(--space-3); }
+    .rail-item, .rail-add { width: auto; flex: 0 0 auto; }
+    .rail-sub { max-width: 14ch; }
+  }
 
   .tab-content-area {
     display: flex;
@@ -941,7 +860,7 @@
   }
 
   @container settings-model (max-width: 640px) {
-    .role-tab--worker .role-tab-delete { opacity: 1; }
+    .rail-item--engine .rail-delete { opacity: 1; }
     .engine-usage-row {
       grid-template-columns: 34px minmax(0, 1fr);
       column-gap: 12px;
@@ -956,6 +875,6 @@
   }
 
   @media (max-width: 768px) {
-    .role-tab--worker .role-tab-delete { opacity: 1; }
+    .rail-item--engine .rail-delete { opacity: 1; }
   }
 </style>
