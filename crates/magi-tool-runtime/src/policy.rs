@@ -145,7 +145,7 @@ impl ToolRegistry {
 
     pub(crate) fn parse_requested_access_mode(&self, input: &str) -> Option<BuiltinToolAccessMode> {
         parse_json_object(input).and_then(|object| {
-            field_string(&object, &["access_mode"])
+            field_string(&object, "access_mode")
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
     }
@@ -366,7 +366,7 @@ impl ToolRegistry {
 
         if let Some(object) = &request {
             for key in ["path", "source", "destination", "cwd", "root"] {
-                if let Some(value) = field_string(object, &[key])
+                if let Some(value) = field_string(object, key)
                     && let Ok(path) = resolve_path_with_context(&value, context)
                 {
                     paths.push(normalize_path_for_lock(&path));
@@ -380,10 +380,11 @@ impl ToolRegistry {
         let working_directory = if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
             request
                 .as_ref()
-                .and_then(|object| field_string(object, &["cwd"]))
+                .and_then(|object| field_string(object, "cwd"))
                 .map(|value| {
                     resolve_path_with_context(&value, context)
                         .map(|path| normalize_path_for_lock(&path))
+                        .map_err(|error| error.to_string())
                 })
                 .unwrap_or_else(|| {
                     context
@@ -764,12 +765,12 @@ fn shell_exec_command_path_accesses(
     workspace_root_path: Option<&Path>,
     shell_kind: magi_permissions::PathAccessKind,
 ) -> Vec<ToolPathAccessRequest> {
-    let Some(command) = object.and_then(|object| field_string(object, &["command"])) else {
+    let Some(command) = object.and_then(|object| field_string(object, "command")) else {
         return Vec::new();
     };
     let dialect = ShellDialect::from_shell(
         object
-            .and_then(|object| field_string(object, &["shell"]))
+            .and_then(|object| field_string(object, "shell"))
             .as_deref()
             .unwrap_or_default(),
     );

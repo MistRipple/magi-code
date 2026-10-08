@@ -335,7 +335,7 @@ fn search_text_missing_root_reports_not_found_without_internal_details() {
     assert_eq!(payload["tool"], "search_text");
     assert_eq!(payload["status"], "failed");
     assert_eq!(payload["error_code"], "search_text_not_found");
-    assert_eq!(payload["error"], "目标路径不存在，请检查路径");
+    assert!(payload["instruction"].as_str().is_some());
     assert!(
         !output.payload.contains("missing")
             && !output.payload.contains("No such")
@@ -438,7 +438,8 @@ fn run_search_text(root: &std::path::Path, query: &str) -> (ExecutionResultStatu
             tool_call_id: ToolCallId::new("tool-call-search-skip"),
             tool_name: BuiltinToolName::SearchText.as_str().to_string(),
             tool_kind: ToolKind::Builtin,
-            input: serde_json::json!({ "root": root.to_string_lossy(), "query": query }).to_string(),
+            input: serde_json::json!({ "root": root.to_string_lossy(), "query": query })
+                .to_string(),
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
@@ -462,7 +463,11 @@ fn search_text_skips_unreadable_descendants_instead_of_failing_the_whole_search(
     symlink(root.join("missing-target"), root.join("dangling")).expect("dangling symlink");
     let locked = root.join("locked");
     fs::create_dir_all(&locked).expect("locked dir");
-    fs::write(locked.join("hidden.txt"), "needle behind a locked directory").expect("write");
+    fs::write(
+        locked.join("hidden.txt"),
+        "needle behind a locked directory",
+    )
+    .expect("write");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
 
     let (status, payload) = run_search_text(&root, "needle");
@@ -472,10 +477,14 @@ fn search_text_skips_unreadable_descendants_instead_of_failing_the_whole_search(
     assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
     assert!(payload["returned_matches"].as_u64().expect("matches") >= 1);
     assert_eq!(payload["skipped"]["non_text"], 1);
-    let unreadable = payload["skipped"]["unreadable"].as_u64().expect("unreadable");
+    let unreadable = payload["skipped"]["unreadable"]
+        .as_u64()
+        .expect("unreadable");
     if unreadable > 0 {
         assert!(
-            payload["summary"].as_str().is_some_and(|text| text.contains("未搜索")),
+            payload["summary"]
+                .as_str()
+                .is_some_and(|text| text.contains("未搜索")),
             "有未搜索的内容必须在摘要里点明: {payload}"
         );
     }
@@ -484,7 +493,11 @@ fn search_text_skips_unreadable_descendants_instead_of_failing_the_whole_search(
 #[test]
 fn search_text_reports_oversized_files_as_skipped_not_as_absent() {
     let root = unique_temp_dir("magi-tool-search-large");
-    fs::write(root.join("big.txt"), format!("{}\nneedle", "x".repeat(2 * 1024 * 1024 + 1))).expect("write");
+    fs::write(
+        root.join("big.txt"),
+        format!("{}\nneedle", "x".repeat(2 * 1024 * 1024 + 1)),
+    )
+    .expect("write");
     fs::write(root.join("small.txt"), "needle").expect("write");
 
     let (status, payload) = run_search_text(&root, "needle");
@@ -492,7 +505,11 @@ fn search_text_reports_oversized_files_as_skipped_not_as_absent() {
     assert_eq!(status, ExecutionResultStatus::Succeeded);
     assert_eq!(payload["returned_matches"], 1);
     assert_eq!(payload["skipped"]["too_large"], 1);
-    assert!(payload["summary"].as_str().is_some_and(|text| text.contains("超过 2MB")));
+    assert!(
+        payload["summary"]
+            .as_str()
+            .is_some_and(|text| text.contains("超过 2MB"))
+    );
 }
 
 #[test]
@@ -541,7 +558,12 @@ fn search_text_rejects_invalid_regex_without_exposing_engine_details() {
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["error_code"], "search_text_invalid_regex");
-    assert_eq!(payload["error"], "正则表达式无效，请检查 query");
+    assert_eq!(payload["error"], "正则表达式无效");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("literal"))
+    );
     assert!(!output.payload.contains("unclosed"));
 }
 
@@ -783,8 +805,8 @@ fn shell_exec_spawn_failure_uses_public_error_message() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], "shell_exec");
     assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "shell_exec_failed");
-    assert_eq!(payload["error"], "shell 命令暂不可执行，请检查运行环境");
+    assert_eq!(payload["error_code"], "shell_exec_spawn_failed");
+    assert!(payload["instruction"].as_str().is_some());
     assert!(
         !output.payload.contains(missing_shell)
             && !output.payload.contains("No such")
@@ -947,7 +969,11 @@ fn shell_exec_reports_unavailable_workspace_before_starting_shell() {
         payload["error_code"],
         "shell_exec_working_directory_unavailable"
     );
-    assert_eq!(payload["error"], "当前工作区目录不可访问，请重新选择工作区");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("工作区"))
+    );
 }
 
 #[test]
@@ -2274,7 +2300,11 @@ fn blocked_process_write_does_not_hold_the_process_table() {
             "子进程不读输入时写入必须在上限内返回"
         );
         assert_ne!(write.status, ExecutionResultStatus::Succeeded);
-        assert!(write.payload.contains("没有读取输入"), "{}", write.payload);
+        assert!(
+            write.payload.contains("process_write_timeout"),
+            "{}",
+            write.payload
+        );
 
         let kill = run(
             BuiltinToolName::ProcessKill,
@@ -2419,8 +2449,8 @@ fn process_launch_spawn_failure_uses_public_error_message() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::ProcessLaunch.as_str());
     assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "process_launch_failed");
-    assert_eq!(payload["error"], "后台进程暂不可启动，请检查运行环境");
+    assert_eq!(payload["error_code"], "process_launch_spawn_failed");
+    assert!(payload["instruction"].as_str().is_some());
     assert!(
         !output.payload.contains(missing_shell)
             && !output.payload.contains("No such")
@@ -2489,8 +2519,14 @@ fn process_write_failure_uses_public_error_message() {
     let payload: Value = serde_json::from_str(&write.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::ProcessWrite.as_str());
     assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "process_write_failed");
-    assert_eq!(payload["error"], "后台进程暂不可写入，请稍后重试");
+    assert_eq!(payload["error_code"], "process_write_stdin_closed");
+    assert!(
+        !payload["instruction"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("稍后重试"),
+        "失败指引不能让模型原样重试"
+    );
     assert!(
         !write.payload.contains("Broken pipe")
             && !write.payload.contains("os error")
@@ -2667,7 +2703,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
     assert!(
         read_workspace_only
             .payload
-            .contains("进程不属于当前 session/workspace")
+            .contains("process_read_not_owned")
     );
 
     let read_other_session = tool_registry.execute_internal_builtin_with_policy(
@@ -2686,7 +2722,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
     assert!(
         read_other_session
             .payload
-            .contains("进程不属于当前 session/workspace")
+            .contains("process_read_not_owned")
     );
 
     let process_list = tool_registry.execute_internal_builtin_with_policy(
@@ -2919,8 +2955,8 @@ fn diff_preview_source_read_failure_uses_public_error_message() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::DiffPreview.as_str());
     assert_eq!(payload["status"], "failed");
-    assert_eq!(payload["error_code"], "diff_preview_failed");
-    assert_eq!(payload["error"], "差异预览源暂不可读取，请检查路径或权限");
+    assert_eq!(payload["error_code"], "diff_preview_not_found");
+    assert!(payload["instruction"].as_str().is_some());
     assert!(
         !output.payload.contains("missing-before")
             && !output.payload.contains("No such")
@@ -4818,7 +4854,8 @@ fn file_write_filesystem_failure_uses_public_message() {
 
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error"], "文件暂不可写入，请检查路径或权限");
+    assert_eq!(payload["error_code"], "file_write_not_a_directory");
+    assert!(payload["instruction"].as_str().is_some());
     let text = output.payload.to_string();
     assert!(!text.contains("occupied"));
     assert!(!text.contains("Not a directory"));
@@ -4844,10 +4881,13 @@ fn file_write_rejects_overwrite_when_disabled() {
     );
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_write_failed");
-    assert_eq!(payload["error"], "目标路径已存在，请确认是否允许覆盖");
+    assert_eq!(payload["error_code"], "file_write_already_exists");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("overwrite=true"))
+    );
     assert!(!output.payload.contains(file.to_string_lossy().as_ref()));
-    assert!(!output.payload.contains("overwrite=false"));
     assert_eq!(fs::read_to_string(&file).unwrap(), "original");
 }
 
@@ -4977,9 +5017,11 @@ fn file_patch_rejects_ambiguous_match() {
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
     assert_eq!(payload["error_code"], "file_patch_ambiguous_match");
-    assert_eq!(
-        payload["error"],
-        "目标内容在当前文件中不是唯一匹配，请增加上下文后重试"
+    assert_eq!(payload["error"], "目标内容在当前文件中不是唯一匹配");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("增加前后文"))
     );
     assert_eq!(
         payload["errors"][0],
@@ -5009,9 +5051,12 @@ fn file_patch_rejects_missing_match_with_recovery_instruction() {
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
     assert_eq!(payload["error_code"], "file_patch_no_match");
-    assert_eq!(
-        payload["error"],
-        "目标内容与当前文件不匹配，请重新读取文件后再修改"
+    assert_eq!(payload["error"], "目标内容与当前文件不匹配");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("file_read")),
+        "必须指引模型先重新读取文件"
     );
     assert_eq!(payload["errors"][0], "patch[0]: old_string 未在文件中找到");
     assert_eq!(fs::read_to_string(&file).unwrap(), "current content");
@@ -5040,10 +5085,8 @@ fn file_patch_reports_mixed_non_applicable_reasons() {
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
     assert_eq!(payload["error_code"], "file_patch_not_applicable");
-    assert_eq!(
-        payload["error"],
-        "patch 与当前文件内容不匹配，请重新读取文件并生成精确修改"
-    );
+    assert_eq!(payload["error"], "patch 与当前文件内容不匹配");
+    assert!(payload["instruction"].as_str().is_some());
     assert_eq!(payload["errors"].as_array().map(Vec::len), Some(2));
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -5124,8 +5167,8 @@ fn file_patch_read_failure_has_distinct_error_code() {
 
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_patch_read_failed");
-    assert_eq!(payload["error"], "文件暂不可读取，请检查路径或权限");
+    assert_eq!(payload["error_code"], "file_patch_not_found");
+    assert!(payload["instruction"].as_str().is_some());
 }
 
 #[test]
@@ -5250,7 +5293,7 @@ fn file_remove_rejects_workspace_root_even_in_full_access() {
 
     assert_eq!(output.status, ExecutionResultStatus::Rejected);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_remove_rejected");
+    assert_eq!(payload["error_code"], "file_remove_protected_path");
     assert_eq!(payload["error"], "该路径受保护，不能删除");
     assert!(!output.payload.contains(root.to_string_lossy().as_ref()));
     assert!(!output.payload.contains("keep.txt"));
@@ -5281,7 +5324,7 @@ fn file_remove_rejects_absolute_working_directory_even_in_full_access() {
 
     assert_eq!(output.status, ExecutionResultStatus::Rejected);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_remove_rejected");
+    assert_eq!(payload["error_code"], "file_remove_protected_path");
     assert_eq!(payload["error"], "该路径受保护，不能删除");
     assert!(!output.payload.contains(root.to_string_lossy().as_ref()));
     assert!(!output.payload.contains("keep.txt"));
@@ -5312,7 +5355,12 @@ fn file_read_reports_missing_path_without_mislabeling_it_as_permission_failure()
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
     assert_eq!(payload["error_code"], "file_read_not_found");
-    assert_eq!(payload["error"], "目标路径不存在，请检查路径");
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("路径不存在"))
+    );
+    assert!(payload["instruction"].as_str().is_some());
 }
 
 #[test]
@@ -5332,7 +5380,7 @@ fn file_remove_rejects_filesystem_root_even_in_full_access() {
 
     assert_eq!(output.status, ExecutionResultStatus::Rejected);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_remove_rejected");
+    assert_eq!(payload["error_code"], "file_remove_protected_path");
     assert_eq!(payload["error"], "该路径受保护，不能删除");
 }
 
@@ -5404,12 +5452,14 @@ fn file_copy_copies_file_and_directory() {
 }
 
 #[test]
-fn file_copy_failure_uses_public_error() {
+fn file_copy_failures_are_classified_and_never_echo_paths() {
     let root = unique_temp_dir("magi-tool-file-copy-public-error");
     let registry = make_registry();
     let missing = root.join("missing.txt");
     let destination = root.join("destination.txt");
+    let other = root.join("other.txt");
     fs::write(&destination, "existing").unwrap();
+    fs::write(&other, "other").unwrap();
 
     let missing_output = exec_tool(
         &registry,
@@ -5422,8 +5472,8 @@ fn file_copy_failure_uses_public_error() {
     );
     assert_eq!(missing_output.status, ExecutionResultStatus::Failed);
     let missing_payload: Value = serde_json::from_str(&missing_output.payload).unwrap();
-    assert_eq!(missing_payload["error_code"], "file_copy_failed");
-    assert_eq!(missing_payload["error"], "文件暂不可复制，请检查路径或权限");
+    assert_eq!(missing_payload["error_code"], "file_copy_source_not_found");
+    assert!(missing_payload["instruction"].as_str().is_some());
     assert!(
         !missing_output
             .payload
@@ -5434,24 +5484,37 @@ fn file_copy_failure_uses_public_error() {
         &registry,
         BuiltinToolName::FileCopy,
         &serde_json::json!({
-            "source": destination.to_string_lossy(),
+            "source": other.to_string_lossy(),
             "destination": destination.to_string_lossy()
         })
         .to_string(),
     );
     assert_eq!(exists_output.status, ExecutionResultStatus::Failed);
     let exists_payload: Value = serde_json::from_str(&exists_output.payload).unwrap();
-    assert_eq!(exists_payload["error_code"], "file_copy_failed");
-    assert_eq!(
-        exists_payload["error"],
-        "目标路径已存在，请确认是否允许覆盖"
+    assert_eq!(exists_payload["error_code"], "file_copy_already_exists");
+    assert!(
+        exists_payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("overwrite=true"))
     );
     assert!(
         !exists_output
             .payload
             .contains(destination.to_string_lossy().as_ref())
     );
-    assert!(!exists_output.payload.contains("overwrite=false"));
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "existing");
+
+    let same_output = exec_tool(
+        &registry,
+        BuiltinToolName::FileCopy,
+        &serde_json::json!({
+            "source": destination.to_string_lossy(),
+            "destination": destination.to_string_lossy()
+        })
+        .to_string(),
+    );
+    let same_payload: Value = serde_json::from_str(&same_output.payload).unwrap();
+    assert_eq!(same_payload["error_code"], "file_copy_same_path");
 }
 
 #[test]
@@ -5498,11 +5561,14 @@ fn file_move_rejects_existing_destination_without_overwrite() {
     );
     assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["error_code"], "file_move_failed");
-    assert_eq!(payload["error"], "目标路径已存在，请确认是否允许覆盖");
+    assert_eq!(payload["error_code"], "file_move_already_exists");
+    assert!(
+        payload["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("overwrite=true"))
+    );
     assert!(!output.payload.contains(src.to_string_lossy().as_ref()));
     assert!(!output.payload.contains(dst.to_string_lossy().as_ref()));
-    assert!(!output.payload.contains("overwrite=false"));
     assert!(src.exists());
     assert_eq!(fs::read_to_string(&dst).unwrap(), "existing");
 }
@@ -6228,8 +6294,12 @@ fn diagram_render_requires_structured_payload_for_mind_maps() {
     );
     assert_eq!(mermaid_mindmap.status, ExecutionResultStatus::Failed);
     let failed_payload: Value = serde_json::from_str(&mermaid_mindmap.payload).unwrap();
+    assert_eq!(
+        failed_payload["error_code"],
+        "diagram_render_mindmap_unsupported"
+    );
     assert!(
-        failed_payload["error"]
+        failed_payload["instruction"]
             .as_str()
             .unwrap_or_default()
             .contains("kind=flow 或 kind=graph"),
@@ -9083,59 +9153,38 @@ fn code_symbols_definition_and_file_symbols() {
         "工作区内绝对路径必须归一化到符号索引使用的相对路径"
     );
 
-    let action_alias = tool_registry.execute_with_policy(
-        ToolExecutionInput {
-            tool_call_id: ToolCallId::new("tc-list-alias"),
-            tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
-            tool_kind: ToolKind::Builtin,
-            input: serde_json::json!({
-                "action": "list_file_symbols",
-                "path": "src/auth.rs"
-            })
-            .to_string(),
-            approval_requirement: ApprovalRequirement::None,
-            risk_level: RiskLevel::Low,
-        },
-        context.clone(),
-        &ToolExecutionPolicy::default(),
-    );
-    assert_eq!(action_alias.status, ExecutionResultStatus::Succeeded);
-    let alias_payload: Value =
-        serde_json::from_str(&action_alias.payload).expect("action alias json");
-    assert_eq!(alias_payload["action"], "file_symbols");
-    assert_eq!(
-        alias_payload["returned_matches"],
-        list_payload["returned_matches"]
-    );
-
-    let goto = tool_registry.execute_with_policy(
-        ToolExecutionInput {
-            tool_call_id: ToolCallId::new("tc-goto-alias"),
-            tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
-            tool_kind: ToolKind::Builtin,
-            input: serde_json::json!({
-                "action": "goto_definition",
-                "name": "Session"
-            })
-            .to_string(),
-            approval_requirement: ApprovalRequirement::None,
-            risk_level: RiskLevel::Low,
-        },
-        context.clone(),
-        &ToolExecutionPolicy::default(),
-    );
-    assert_eq!(goto.status, ExecutionResultStatus::Succeeded);
-    let goto_payload: Value = serde_json::from_str(&goto.payload).expect("goto json");
-    assert_eq!(goto_payload["action"], "definition");
-    assert!(
-        goto_payload["results"]
-            .as_array()
-            .expect("goto results")
-            .iter()
-            .any(|r| r["name"] == "Session"),
-        "goto_definition alias 应命中 Session，实际: {}",
-        goto_payload["results"]
-    );
+    // 动作名只认 schema 声明的 definition / file_symbols，不再接受旧别名。
+    for (action, extra) in [
+        (
+            "list_file_symbols",
+            serde_json::json!({ "path": "src/auth.rs" }),
+        ),
+        ("goto_definition", serde_json::json!({ "name": "Session" })),
+    ] {
+        let mut input = serde_json::json!({ "action": action });
+        input
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let rejected = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(format!("tc-{action}")),
+                tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: input.to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(rejected.status, ExecutionResultStatus::Failed, "{action}");
+        let payload: Value = serde_json::from_str(&rejected.payload).expect("alias rejection json");
+        assert_eq!(
+            payload["error_code"], "code_symbols_invalid_input",
+            "{action}"
+        );
+    }
 
     for input in [
         serde_json::json!({ "action": "definition", "query": "Session" }),
@@ -9443,4 +9492,296 @@ fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+// ── 内置工具失败合同：见 docs/builtin-tool-failure-contract.md ──
+
+fn payload_of(output: &ToolExecutionOutput) -> Value {
+    serde_json::from_str(&output.payload).expect("tool payload is json")
+}
+
+#[test]
+fn file_read_refuses_binary_content_instead_of_returning_replacement_characters() {
+    let root = unique_temp_dir("magi-tool-file-read-binary");
+    fs::write(
+        root.join("blob.bin"),
+        [0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0xfe],
+    )
+    .unwrap();
+    fs::write(root.join("gbk.txt"), [0xc4, 0xe3, 0xba, 0xc3]).unwrap();
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        ..ToolExecutionContext::default()
+    };
+
+    for name in ["blob.bin", "gbk.txt"] {
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileRead,
+            &serde_json::json!({ "path": name }).to_string(),
+            context.clone(),
+            full_access_policy(),
+        );
+        assert_eq!(output.status, ExecutionResultStatus::Failed, "{name}");
+        let payload = payload_of(&output);
+        assert_eq!(payload["error_code"], "file_read_not_utf8_text", "{name}");
+        assert!(
+            payload["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("view_image"))
+        );
+        assert!(payload.get("content").is_none(), "不能把乱码当内容返回");
+    }
+}
+
+#[cfg(unix)]
+fn session_context(root: &std::path::Path, label: &str) -> ToolExecutionContext {
+    ToolExecutionContext {
+        session_id: Some(SessionId::new(format!("session-{label}"))),
+        workspace_id: Some(WorkspaceId::new(format!("workspace-{label}"))),
+        working_directory: Some(root.to_path_buf()),
+        ..ToolExecutionContext::default()
+    }
+}
+
+#[cfg(unix)]
+fn run_shell(
+    registry: &ToolRegistry,
+    context: &ToolExecutionContext,
+    input: serde_json::Value,
+) -> ToolExecutionOutput {
+    exec_tool_with_context_and_policy(
+        registry,
+        BuiltinToolName::ShellExec,
+        &input.to_string(),
+        context.clone(),
+        full_access_policy(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn background_command_that_exits_immediately_is_reported_as_a_failed_start() {
+    let root = unique_temp_dir("magi-tool-background-early-exit");
+    let registry = make_registry();
+    let context = session_context(&root, "early-exit");
+
+    let output = run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "command": "echo boom >&2; exit 3", "background": true }),
+    );
+
+    assert_eq!(
+        output.status,
+        ExecutionResultStatus::Failed,
+        "{}",
+        output.payload
+    );
+    let payload = payload_of(&output);
+    assert_eq!(payload["error_code"], "shell_exec_exited_early");
+    assert_eq!(payload["startup_status"], "failed");
+    assert_eq!(payload["running"], false);
+    assert_eq!(payload["exit_code"], 3);
+    assert!(
+        payload["stderr"]
+            .as_str()
+            .is_some_and(|text| text.contains("boom"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn background_command_that_keeps_running_is_confirmed_and_read_incrementally() {
+    let root = unique_temp_dir("magi-tool-background-incremental");
+    let registry = make_registry();
+    let context = session_context(&root, "incremental");
+
+    let launch = run_shell(
+        &registry,
+        &context,
+        serde_json::json!({
+            "command": "echo first; sleep 1; echo second; sleep 30",
+            "background": true
+        }),
+    );
+    assert_eq!(
+        launch.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        launch.payload
+    );
+    let launch_payload = payload_of(&launch);
+    assert_eq!(launch_payload["startup_status"], "confirmed");
+    assert_eq!(launch_payload["running"], true);
+    let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
+
+    let first = payload_of(&run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "action": "read", "terminal_id": terminal_id }),
+    ));
+    assert!(
+        first["stdout"]
+            .as_str()
+            .is_some_and(|text| text.contains("first"))
+    );
+    let cursor = first["stdout_next_offset"].as_u64().expect("cursor");
+
+    // 等到第二行输出，再带游标读取：只能拿到新增部分。
+    let mut second_text = String::new();
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(100));
+        let next = payload_of(&run_shell(
+            &registry,
+            &context,
+            serde_json::json!({ "action": "read", "terminal_id": terminal_id, "stdout_offset": cursor }),
+        ));
+        second_text = next["stdout"].as_str().unwrap_or_default().to_string();
+        if !second_text.is_empty() {
+            assert!(next["stdout_next_offset"].as_u64().unwrap() > cursor);
+            break;
+        }
+    }
+    assert_eq!(second_text.trim(), "second", "带游标读取不能重复已读内容");
+
+    let kill = run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "action": "kill", "terminal_id": terminal_id }),
+    );
+    assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_exec_failures_carry_distinct_codes_and_instructions() {
+    let root = unique_temp_dir("magi-tool-shell-failure-codes");
+    let registry = make_registry();
+    let context = session_context(&root, "failure-codes");
+
+    let nonzero = payload_of(&run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "command": "exit 2" }),
+    ));
+    assert_eq!(nonzero["status"], "failed");
+    assert_eq!(nonzero["error_code"], "shell_exec_nonzero_exit");
+    assert!(
+        nonzero["error"]
+            .as_str()
+            .is_some_and(|text| text.contains('2'))
+    );
+    assert!(
+        nonzero["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("不要原样重试"))
+    );
+
+    let timed_out = payload_of(&run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "command": "sleep 30", "timeout_ms": 1000 }),
+    ));
+    assert_eq!(timed_out["error_code"], "shell_exec_timeout");
+    assert!(
+        timed_out["instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("background=true"))
+    );
+
+    let ok = payload_of(&run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "command": "true" }),
+    ));
+    assert_eq!(ok["status"], "succeeded");
+    assert!(ok.get("error_code").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_exec_does_not_infer_a_read_action_from_a_bare_terminal_id() {
+    let root = unique_temp_dir("magi-tool-shell-no-inferred-action");
+    let registry = make_registry();
+    let context = session_context(&root, "no-inferred-action");
+
+    let output = run_shell(&registry, &context, serde_json::json!({ "terminal_id": 1 }));
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    assert_eq!(
+        payload_of(&output)["error_code"],
+        "shell_exec_invalid_input"
+    );
+}
+
+#[test]
+fn shell_exec_rejects_unknown_background_actions_with_invalid_input() {
+    let registry = make_registry();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::ShellExec,
+        &serde_json::json!({ "action": "READ", "terminal_id": 1 }).to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    assert_eq!(
+        payload_of(&output)["error_code"],
+        "shell_exec_invalid_input"
+    );
+}
+
+#[test]
+fn tool_catalog_flags_use_only_the_schema_spelling() {
+    let registry = make_registry();
+
+    let camel_case = exec_tool(
+        &registry,
+        BuiltinToolName::ToolCatalog,
+        &serde_json::json!({ "includeInternal": true }).to_string(),
+    );
+    let snake_case = exec_tool(
+        &registry,
+        BuiltinToolName::ToolCatalog,
+        &serde_json::json!({ "include_internal": true }).to_string(),
+    );
+
+    let count = |output: &ToolExecutionOutput| {
+        payload_of(output)["tools"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default()
+    };
+    assert!(
+        count(&snake_case) > count(&camel_case),
+        "camelCase 拼写不再被识别"
+    );
+}
+
+#[test]
+fn builtin_results_without_a_canonical_status_are_failures_not_successes() {
+    use crate::builtin::execution_status_of;
+
+    assert_eq!(
+        execution_status_of("t", r#"{"status":"succeeded"}"#),
+        ExecutionResultStatus::Succeeded
+    );
+    assert_eq!(
+        execution_status_of("t", r#"{"status":"needs_approval"}"#),
+        ExecutionResultStatus::NeedsApproval
+    );
+    for payload in [
+        r#"{"ok":true}"#,
+        r#"{"status":"ok"}"#,
+        "not json",
+        r#"{"result":1}"#,
+    ] {
+        assert_eq!(
+            execution_status_of("t", payload),
+            ExecutionResultStatus::Failed,
+            "{payload}"
+        );
+    }
 }

@@ -11,7 +11,8 @@
 //! 返回给模型的失败信息只描述失败类别（超时、域名无法解析、HTTP 状态码……），
 //! 不暴露底层错误文本、内部地址或原始响应；完整的错误链只写日志。
 
-use super::{BuiltinToolAccessMode, parse_json_object, required_string_field};
+use super::{failure::ToolFailure, parse_json_object, required_string_field};
+use crate::BuiltinToolAccessMode;
 use base64::Engine as _;
 use reqwest::{
     Url,
@@ -19,7 +20,7 @@ use reqwest::{
     header::RETRY_AFTER,
 };
 use scraper::{ElementRef, Html, Selector};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     error::Error as StdError,
     io::Read,
@@ -266,28 +267,6 @@ fn get_with_retry(tool: &str, url: &str, budget: &Budget) -> Result<(Response, u
 // ══════════════════════════════════════════════════════════════════════════════
 // 失败输出合同
 // ══════════════════════════════════════════════════════════════════════════════
-
-fn failure_payload(
-    tool: &str,
-    error_code: String,
-    error: String,
-    instruction: &str,
-    extra: Value,
-) -> String {
-    let mut payload = json!({
-        "tool": tool,
-        "status": "failed",
-        "error_code": error_code,
-        "error": error,
-        "instruction": instruction,
-    });
-    if let (Some(target), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
-        for (key, value) in extra {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-    payload.to_string()
-}
 
 fn retried_suffix(attempts: u32) -> String {
     if attempts > 1 {
@@ -647,7 +626,7 @@ pub(super) fn execute_web_search(input: &str) -> String {
     let request = parse_json_object(input);
     let query = match required_string_field(
         request.as_ref(),
-        &["query"],
+        "query",
         "web_search",
         "缺少搜索关键词 query",
     ) {
@@ -802,13 +781,10 @@ fn search_failure(failures: &[SourceAttempt]) -> String {
             detail
         })
         .collect::<Vec<_>>();
-    failure_payload(
-        "web_search",
-        code.to_string(),
-        format!("网络搜索失败：{summary}"),
-        instruction,
-        json!({ "sources": details }),
-    )
+    ToolFailure::coded("web_search", code, format!("网络搜索失败：{summary}"))
+        .instruction(instruction)
+        .with("sources", details)
+        .into_payload()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -856,21 +832,16 @@ fn fetch_failure(failure: &WebFailure, attempts: u32) -> String {
         }
         _ => "请核对网址，或换用其他来源。",
     };
-    failure_payload(
-        "web_fetch",
-        format!("web_fetch_{}", failure.slug()),
-        error,
-        instruction,
-        failure
-            .http_status()
-            .map(|status| json!({ "http_status": status }))
-            .unwrap_or_else(|| json!({})),
-    )
+    let mut payload = ToolFailure::new("web_fetch", failure.slug(), error).instruction(instruction);
+    if let Some(status) = failure.http_status() {
+        payload = payload.with("http_status", status);
+    }
+    payload.into_payload()
 }
 
 pub(super) fn execute_web_fetch(input: &str) -> String {
     let request = parse_json_object(input);
-    let url = match required_string_field(request.as_ref(), &["url"], "web_fetch", "缺少 URL") {
+    let url = match required_string_field(request.as_ref(), "url", "web_fetch", "缺少 URL") {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -1064,6 +1035,7 @@ fn extract_main_content(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn result(title: &str, snippet: &str, url: &str) -> SearchResult {
         SearchResult {
@@ -1273,10 +1245,7 @@ mod tests {
 
     // ── 搜索来源调度：用本地服务模拟来源，覆盖「换来源 / 结果校验 / 失败汇总」 ──
 
-    use std::{
-        io::Write as _,
-        net::TcpListener,
-    };
+    use std::{io::Write as _, net::TcpListener};
 
     /// 每个连接回应一份响应的本地服务；`None` 表示端口已关闭（模拟连不上）。
     fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {

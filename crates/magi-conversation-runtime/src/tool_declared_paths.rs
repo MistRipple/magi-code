@@ -123,15 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn derive_declared_paths_reads_apply_patch_raw_payload() {
+    fn derive_declared_paths_ignores_apply_patch_arguments_that_are_not_the_schema_object() {
+        // apply_patch 只接受带 patch 字段的 JSON 对象；裸 patch 文本不是合法调用，
+        // 无法推断路径时交给 ChangeLog 的全树对账。
         let call = tool_call(
             "apply_patch",
             "*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch\n",
         );
 
-        assert_eq!(
-            derive_declared_paths(&call),
-            vec![PathBuf::from("gone.txt")]
-        );
+        assert!(derive_declared_paths(&call).is_empty());
     }
 }

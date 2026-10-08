@@ -80,11 +80,11 @@ fn command_environment_json(
 impl ToolCatalogQuery {
     fn catalog_input(&self) -> serde_json::Value {
         serde_json::json!({
-            "includeInternal": self.include_internal.unwrap_or(false),
-            "includeSchema": self.include_schema.unwrap_or(false),
-            "includeExternal": self.include_external.unwrap_or(true),
-            "includeMcpServers": self.include_mcp_servers.unwrap_or(true),
-            "includeAgentRoles": self.include_agent_roles.unwrap_or(true),
+            "include_internal": self.include_internal.unwrap_or(false),
+            "include_schema": self.include_schema.unwrap_or(false),
+            "include_external": self.include_external.unwrap_or(true),
+            "include_mcp_servers": self.include_mcp_servers.unwrap_or(true),
+            "include_agent_roles": self.include_agent_roles.unwrap_or(true),
         })
     }
 

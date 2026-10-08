@@ -231,15 +231,20 @@ pub fn tool_result_execution_status(result: &str) -> ExecutionResultStatus {
     let explicit = serde_json::from_str::<Value>(result)
         .ok()
         .and_then(|payload| payload.get("status")?.as_str().map(str::to_ascii_lowercase));
+    // 规范标签的映射由 ExecutionResultStatus 自己持有；下面只补外部（skill / MCP）工具
+    // 可能使用的近义词。
+    if let Some(status) = explicit
+        .as_deref()
+        .and_then(ExecutionResultStatus::from_wire_label)
+    {
+        return status;
+    }
     match explicit.as_deref() {
-        Some("succeeded" | "success" | "ok" | "completed" | "degraded") => {
-            ExecutionResultStatus::Succeeded
-        }
-        Some("rejected" | "blocked" | "denied" | "forbidden") => ExecutionResultStatus::Rejected,
-        Some("needs_approval" | "needsapproval") => ExecutionResultStatus::NeedsApproval,
-        Some("cancelled" | "canceled" | "aborted" | "killed") => ExecutionResultStatus::Cancelled,
-        Some("failed" | "error" | "timeout" | "timed_out") => ExecutionResultStatus::Failed,
-        Some("indeterminate") => ExecutionResultStatus::Indeterminate,
+        Some("success" | "ok" | "completed" | "degraded") => ExecutionResultStatus::Succeeded,
+        Some("blocked" | "denied" | "forbidden") => ExecutionResultStatus::Rejected,
+        Some("needsapproval") => ExecutionResultStatus::NeedsApproval,
+        Some("canceled" | "aborted" | "killed") => ExecutionResultStatus::Cancelled,
+        Some("error" | "timeout" | "timed_out") => ExecutionResultStatus::Failed,
         _ if infer_tool_call_status(result) == "success" => ExecutionResultStatus::Succeeded,
         _ => ExecutionResultStatus::Failed,
     }

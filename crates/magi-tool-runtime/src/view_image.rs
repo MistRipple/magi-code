@@ -1,23 +1,23 @@
 use crate::{
     BuiltinToolAccessMode, ToolExecutionContext,
-    builtin::{field_string, parse_json_object, resolve_path_with_context},
+    builtin::{
+        failure::{ToolFailure, filesystem_failure, invalid_input, path_resolution_failure},
+        field_string, parse_json_object, resolve_path_with_context,
+    },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
-use std::fmt::Display;
 use std::fs;
-use std::path::Path;
 
 const TOOL_NAME: &str = "view_image";
 const DEFAULT_MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const HARD_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-const IMAGE_ACCESS_PUBLIC_ERROR: &str = "图片不可读取或不存在";
 
 pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let path_value = match requested_path(request.as_ref()) {
         Ok(path) => path,
-        Err(error) => return view_image_error(error),
+        Err(error) => return invalid_input(TOOL_NAME, error),
     };
     let max_bytes = request
         .as_ref()
@@ -27,37 +27,61 @@ pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) ->
 
     let path = match resolve_path_with_context(&path_value, context) {
         Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(
-                requested_path = %path_value,
-                error = %error,
-                "view_image path resolution failed"
-            );
-            return view_image_error("图片路径不可解析");
-        }
+        Err(error) => return path_resolution_failure(TOOL_NAME, &path_value, &error),
     };
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => return view_image_access_error("读取图片元数据失败", &path, error),
+        Err(error) => {
+            return filesystem_failure(TOOL_NAME, "读取图片信息", &path, &error).into_payload();
+        }
     };
     if !metadata.is_file() {
-        return view_image_error("view_image 只能读取图片文件");
+        return ToolFailure::new(
+            TOOL_NAME,
+            "not_a_file",
+            "目标不是文件，view_image 只能读取图片文件",
+        )
+        .instruction("用 file_read 查看目录内容，再用具体的图片文件路径调用。")
+        .into_payload();
     }
     if metadata.len() > max_bytes {
-        return view_image_error(format!(
-            "图片超过大小限制: {} bytes > {} bytes",
-            metadata.len(),
-            max_bytes
-        ));
+        let instruction = if metadata.len() > HARD_MAX_IMAGE_BYTES {
+            format!("图片超过 {HARD_MAX_IMAGE_BYTES} 字节的硬上限，无法查看；换一张更小的图片。")
+        } else {
+            format!(
+                "图片超过当前 max_bytes；需要查看时调大 max_bytes（上限 {HARD_MAX_IMAGE_BYTES}），或换更小的图片。"
+            )
+        };
+        return ToolFailure::new(
+            TOOL_NAME,
+            "image_too_large",
+            format!(
+                "图片超过大小限制: {} bytes > {} bytes",
+                metadata.len(),
+                max_bytes
+            ),
+        )
+        .instruction(instruction)
+        .into_payload();
     }
 
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) => return view_image_access_error("读取图片失败", &path, error),
+        Err(error) => {
+            return filesystem_failure(TOOL_NAME, "读取图片", &path, &error).into_payload();
+        }
     };
     let mime = match detect_supported_image_mime(&bytes) {
         Some(mime) => mime,
-        None => return view_image_error("不支持或无效的图片格式，支持 png/jpeg/gif/webp"),
+        None => {
+            return ToolFailure::new(
+                TOOL_NAME,
+                "unsupported_format",
+                "不支持或无效的图片格式，支持 png/jpeg/gif/webp",
+            )
+            .instruction("不要重复查看该文件；需要检查它的内容时用 file_read 或 shell_exec。")
+            .into_payload();
+        }
     };
     let data = STANDARD.encode(&bytes);
     let summary = format!(
@@ -95,7 +119,7 @@ pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) ->
 
 fn requested_path(request: Option<&serde_json::Map<String, Value>>) -> Result<String, String> {
     let value = match request {
-        Some(object) => field_string(object, &["path"]),
+        Some(object) => field_string(object, "path"),
         None => None,
     }
     .map(|value| value.trim().to_string())
@@ -123,27 +147,6 @@ fn detect_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
     None
-}
-
-fn view_image_error(message: impl Into<String>) -> String {
-    serde_json::json!({
-        "tool": TOOL_NAME,
-        "status": "failed",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "error_code": "view_image_failed",
-        "error": message.into(),
-    })
-    .to_string()
-}
-
-fn view_image_access_error(action: &'static str, path: &Path, error: impl Display) -> String {
-    tracing::warn!(
-        action,
-        path = %path.display(),
-        error = %error,
-        "view_image file access failed"
-    );
-    view_image_error(IMAGE_ACCESS_PUBLIC_ERROR)
 }
 
 #[cfg(test)]
@@ -235,7 +238,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
-        assert_eq!(payload["error_code"], "view_image_failed");
+        assert_eq!(payload["error_code"], "view_image_unsupported_format");
         assert_eq!(
             payload["error"],
             "不支持或无效的图片格式，支持 png/jpeg/gif/webp"
@@ -257,8 +260,8 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
-        assert_eq!(payload["error_code"], "view_image_failed");
-        assert_eq!(payload["error"], IMAGE_ACCESS_PUBLIC_ERROR);
+        assert_eq!(payload["error_code"], "view_image_not_found");
+        assert!(payload["instruction"].as_str().is_some());
         let text = payload.to_string();
         assert!(
             !text.contains("missing.png")

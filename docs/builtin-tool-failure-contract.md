@@ -15,6 +15,68 @@
 4. **不暴露内部细节**：失败文本只描述类别（超时、域名无法解析、HTTP 503……），
    不带底层错误文本、内部地址或原始响应；完整的错误链只写日志。
 5. **一个负责方**：同一类问题只有一层处理。新增兜底前先确认现有负责层，替换旧实现时同次删除旧代码、常量和测试。
+6. **参数只认 schema 声明的一种写法**：不做别名、大小写或类型的宽松兼容（`timeoutMs`、`"true"`、`goto_definition`、
+   裸 patch 文本都不再接受）。参数形状由调用前的 schema 校验负责，工具内不再各写一份兜底；
+   内部调用方构造工具输入时同样使用 schema 里的键名。
+7. **状态只认规范标签**：内置工具结果的 `status` 必须是 `succeeded` / `failed` / `rejected` / `needs_approval` /
+   `cancelled` / `indeterminate`（`ExecutionResultStatus::from_wire_label` 是唯一映射）；缺失或不认识按失败处理并记录，
+   不会默认成成功。
+
+## 实现入口
+
+- 失败载荷的唯一出口是 `crates/magi-tool-runtime/src/builtin/failure.rs` 的 `ToolFailure`：
+  `error_code`（`{tool}_{类别}`）、`error`、可选 `instruction` 与附加字段；参数问题用 `invalid_input`，
+  文件系统问题用 `filesystem_failure`，路径解析问题用 `path_resolution_failure`。
+- 文件系统失败按 `io::ErrorKind` 归类，各工具共用同一组类别：`not_found`、`permission_denied`、`already_exists`、
+  `not_a_directory`、`is_a_directory`、`directory_not_empty`、`storage_full`、`read_only_filesystem`、`not_utf8_text`、
+  `io_failed`；每类都有对应的 `instruction`。失败载荷不带解析后的绝对路径，也不带系统错误文本。
+- 工具实现按职责分在 `builtin/` 下：`files`（读、写、局部修改、目录、差异预览）、`file_transfer`（复制、移动、删除）、
+  `search`、`shell`、`process`、`web`、`knowledge`、`diagram`；`fs_support` 放原子写入与路径包含关系。
+
+## 文件工具
+
+- `file_read`：内容必须是 UTF-8 文本。含 NUL 或不是 UTF-8 的内容返回 `file_read_not_utf8_text`（图片提示用 `view_image`），
+  不再用替换字符伪装成文本；预览被截断时只丢弃末尾被切开的字符。
+- `file_write` / `file_patch` / `apply_patch`：写入走「同目录临时文件 + rename」，中途失败不会留下半截文件，
+  符号链接写到真实文件，已有文件的权限位保持不变。
+- `file_patch`：整批 patch 要么全部匹配并写入，要么一个都不写；失败结果区分 `no_match` / `ambiguous_match` / `not_applicable`。
+- `apply_patch`：输入必须是带 `patch` 字符串字段的 JSON 对象。`Add File` 目标已存在时返回 `file_exists`
+  （替换已有文件用 `Delete File` + `Add File`）；先整体在内存中匹配，写盘中途失败会把已写入的文件恢复成原样，
+  结果里的 `rolled_back` / `unrestored_paths` 说明恢复情况。patch 里不带前缀的非 ASCII 行是 patch 格式错误，不会 panic。
+- `file_copy`：先检查再动手——源不存在（`source_not_found`）、目标已存在且未覆盖（`already_exists`）、类型不匹配
+  （`type_mismatch`）、目标等于源或落在源目录内部（`same_path` / `destination_inside_source`）都不会改动任何东西。
+  目录复制到已存在目录是合并；符号链接按链接复制，不跟随。
+- `file_move`：覆盖不先删目标。文件覆盖靠 rename 原子替换；目标是已存在的目录时，必须同时设置
+  `overwrite=true` 和 `confirm_replace_directory=true`，否则返回 `directory_overwrite_requires_confirmation`；
+  确认后旧目录先移到备份位置，新内容就位才删除，失败则恢复。跨磁盘移动是复制后删除源，
+  源删除失败时明确报告「目标已写入、源仍在」。
+- `file_remove`：不跟随符号链接（悬空链接、指向目录的链接按链接本身删除）；工作区根、主目录、文件系统根返回
+  `protected_path`（`rejected`）；非空目录且未设置 `recursive` 返回 `directory_not_empty`。
+
+## shell_exec 与后台进程
+
+- 前台命令未成功时必有 `error_code` 与 `instruction`：`shell_exec_timeout`（超时，建议后台启动或调大 `timeout_ms`）、
+  `shell_exec_command_not_found`、`shell_exec_nonzero_exit`；用户取消是 `cancelled`，不是失败。
+  参数 `action` 只认 `run/read/write/kill/list`，不再从 `terminal_id` 推断动作。
+- 前台与后台共用同一份工作目录、Shell 与缺命令预检（`resolve_shell_invocation` / `missing_executables_failure`）。
+- 后台启动会观察约 0.3 秒：立刻退出的命令（命令不存在、端口占用等）返回 `shell_exec_exited_early` 与输出，
+  `startup_status` 为 `failed`；仍在运行为 `confirmed`。
+- 后台输出用滚动缓冲，读取结果带 `stdout_start_offset` / `stdout_next_offset` / `stdout_omitted_bytes` / `stdout_has_more`
+  （stderr 同理），传 `stdout_offset` / `stderr_offset` 只读新增输出；被淘汰的输出明确报告，不静默丢弃。
+- 后台进程的错误分类：`not_found`、`not_owned`、`stdin_closed`、`timeout`（写入超时）、`io_failed`、`terminate_failed`
+  （没停掉的进程仍留在进程表里，不变成孤儿）。失败指引里不再出现「请稍后重试」。
+
+## 索引与知识类工具
+
+- `code_symbols` 的 `action` 只有 `definition` / `file_symbols`；`knowledge_query` 的 `kind` 只认 schema 枚举，`tags` 只认数组。
+- 索引仍在构建（`*_index_building`）、不可用或失败时，指引模型改用 `search_text` / `file_read`，不要立即重复调用。
+
+## Git 工具
+
+- 错误码只有一份映射：`magi_git::GitError::code()`，REST 的 `error.kind` 与结构化 Git 工具的 `error_code` 共用，统一 `git_` 前缀。
+- 命令确实执行并失败（`CommandFailed` / `Io`）是 `failed`，前置条件不满足、被规则拒绝是 `rejected`。
+  stderr 里有确定特征时细分为 `git_network_unreachable`、`git_authentication_failed`、`git_push_rejected`、
+  `git_remote_unavailable`；其余保持 `git_command_failed`（界面据此决定是否用 force 重试）。每类附 `instruction`。
 
 ## web_search
 

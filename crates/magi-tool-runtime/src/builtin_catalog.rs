@@ -924,14 +924,19 @@ impl BuiltinToolName {
                 - 单文件单处精确替换 → 用 file_patch，约束更窄、失败更明确\n\
                 - 整体创建或覆盖一个文件 → 用 file_write\n\n\
                 # 输入格式\n\
-                - 当前 function tool 传 JSON：{ \"patch\": \"*** Begin Patch\\n...\\n*** End Patch\\n\" }\n\
-                - 未来 freeform 通道可直接传 patch 文本\n\
-                - Update File 的上下文必须唯一匹配；不唯一时扩大上下文"
+                - 传 JSON：{ \"patch\": \"*** Begin Patch\\n...\\n*** End Patch\\n\" }\n\
+                - Update File 的上下文必须唯一匹配；不唯一时扩大上下文\n\
+                - Add File 的目标必须不存在；要替换已有文件，先 Delete File 再 Add File\n\
+                - 整份 patch 先全部匹配成功才会写入；写入中途失败会恢复已写入的文件，结果里的 rolled_back 说明恢复情况"
             }
             Self::FileRemove => "删除一个文件或目录",
             Self::FileMkdir => "创建一个目录（包含父目录）",
-            Self::FileCopy => "把文件或目录复制到新位置",
-            Self::FileMove => "移动或重命名文件 / 目录",
+            Self::FileCopy => {
+                "把文件或目录复制到新位置。目标已存在时需要 overwrite=true：文件被覆盖；目录与已存在目录合并，同名文件被覆盖、目标里多出的文件保留。不能把目录复制到它自己内部。"
+            }
+            Self::FileMove => {
+                "移动或重命名文件 / 目录。目标已存在时需要 overwrite=true：文件被原子替换；目标是已存在的目录时还必须设置 confirm_replace_directory=true，整个旧目录会被替换（失败时自动恢复）。不能把目录移动到它自己内部。"
+            }
             Self::SearchText => {
                 "在当前工作区或指定目录下跨文件搜索文本。默认按字面量匹配；多关键词、分组或模式搜索使用 query_mode=regex。该能力跨 macOS、Windows、Linux 一致，文本检索禁止改用 shell_exec 调用 rg/grep。query 必填且不得为空。"
             }
@@ -942,6 +947,8 @@ impl BuiltinToolName {
                 - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、查 PID\n\
                 - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
                 - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\
+                - 后台启动会观察约 0.3 秒：命令立刻退出（命令不存在、端口被占用等）会以失败返回并附带输出；action=read 返回 stdout_next_offset / stderr_next_offset，下次传 stdout_offset / stderr_offset 只读新增输出\n\
+                - 前台命令超时返回 shell_exec_timeout，非零退出返回 shell_exec_nonzero_exit，按 instruction 处理，不要原样重复执行\n\
                 - 验证 Web 项目时，用 background=true 启动项目已有的开发服务，从输出确认真实监听 URL，再用 browser_navigate 和其他 browser_* 工具完成页面验收\n\n\
                 # 命令准确性\n\
                 - 执行项目测试或构建前，先读取 package.json、Cargo.toml 等项目清单确认已有脚本和参数\n\
@@ -990,7 +997,7 @@ impl BuiltinToolName {
                 "查询当前工作区知识图谱：按焦点节点读取有限深度的邻居、关系、来源、状态和证据"
             }
             Self::CodeSymbols => {
-                "代码符号导航：按符号名查定义（goto_definition），或列出某文件的全部符号（list_file_symbols）"
+                "代码符号导航：按符号名查定义（action=definition），或列出某文件的全部符号（action=file_symbols）"
             }
             Self::ToolCatalog => {
                 "列出 Magi 工具目录与健康状态。\n\n\
@@ -1270,7 +1277,7 @@ impl BuiltinToolName {
                 "properties": {
                     "source": { "type": "string", "description": "源文件或目录的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "destination": { "type": "string", "description": "目标位置的工作区相对路径（推荐）或当前平台原生绝对路径" },
-                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
+                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）。目录复制到已存在目录时合并内容" }
                 },
                 "required": ["source", "destination"]
             }),
@@ -1279,7 +1286,8 @@ impl BuiltinToolName {
                 "properties": {
                     "source": { "type": "string", "description": "源文件或目录的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "destination": { "type": "string", "description": "目标位置的工作区相对路径（推荐）或当前平台原生绝对路径" },
-                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
+                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" },
+                    "confirm_replace_directory": { "type": "boolean", "description": "目标是已存在的目录时，必须与 overwrite=true 同时设置才会整体替换该目录（默认：false）" }
                 },
                 "required": ["source", "destination"]
             }),
@@ -1325,6 +1333,8 @@ impl BuiltinToolName {
                     "terminal_id": { "type": "integer", "description": "background=true 返回的受管终端 / 进程 ID；action=read/write/kill 时必填" },
                     "input": { "type": "string", "description": "action=write 时写入后台进程 stdin 的文本" },
                     "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
+                    "stdout_offset": { "type": "integer", "minimum": 0, "description": "action=read 时的增量读取位置：传上次结果里的 stdout_next_offset，只返回其后的新输出；省略时返回最近的输出" },
+                    "stderr_offset": { "type": "integer", "minimum": 0, "description": "action=read 时 stderr 的增量读取位置，用法同 stdout_offset（传 stderr_next_offset）" },
                     "access_mode": {
                         "type": "string",
                         "description": "声明命令访问模式：read_only / maybe_write / explicit_write。git status、git diff、不会改文件的测试等只读探查请用 read_only。read_only 必须实际不写文件：不得创建、修改、删除文件，不得把输出重定向到普通文件或临时文件，不得执行创建、删除、复制、移动类命令；仅允许在条件探测中把输出丢弃到当前平台空设备（Windows 为 NUL，Linux/macOS 为 /dev/null）。需要临时文件、缓存结果或任何写入时必须声明 maybe_write 或 explicit_write，或改用管道/标准输出完成验证。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须使用当前 Shell 的条件语法保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
@@ -1550,11 +1560,11 @@ impl BuiltinToolName {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["definition", "goto_definition", "file_symbols", "list_file_symbols"],
-                        "description": "definition/goto_definition：按符号名查定义；file_symbols/list_file_symbols：列出某文件的全部符号"
+                        "enum": ["definition", "file_symbols"],
+                        "description": "definition：按符号名查定义；file_symbols：列出某文件的全部符号"
                     },
-                    "name": { "type": "string", "description": "action=definition/goto_definition 时的符号名（函数/类/接口/类型等）" },
-                    "path": { "type": "string", "description": "action=file_symbols/list_file_symbols 时的文件路径（相对工作区根）" },
+                    "name": { "type": "string", "description": "action=definition 时的符号名（函数/类/接口/类型等）" },
+                    "path": { "type": "string", "description": "action=file_symbols 时的文件路径（相对工作区根）" },
                     "limit": { "type": "integer", "description": "definition 最多返回多少个匹配（默认 20）" }
                 },
                 "required": ["action"]
@@ -2171,14 +2181,9 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
         return medium_risk_policy();
     };
 
-    let action =
-        json_field_string(&request, &["action"]).map(|value| value.trim().to_ascii_lowercase());
-    let has_terminal_id = request.get("terminal_id").is_some();
-    let has_command =
-        json_field_string(&request, &["command"]).is_some_and(|value| !value.trim().is_empty());
+    let action = json_field_string(&request, "action");
 
     match action.as_deref() {
-        None if has_terminal_id && !has_command => return low_risk_policy(),
         Some("read" | "list" | "kill") => return low_risk_policy(),
         Some("write") => {
             return medium_risk_policy();
@@ -2187,7 +2192,7 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
         Some(_) => return medium_risk_policy(),
     }
 
-    match json_field_string(&request, &["access_mode"])
+    match json_field_string(&request, "access_mode")
         .and_then(|value| BuiltinToolAccessMode::from_str(&value))
     {
         Some(BuiltinToolAccessMode::ReadOnly)
@@ -2209,7 +2214,7 @@ fn file_remove_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
     else {
         return medium_risk_policy();
     };
-    if json_field_string(&request, &["path"]).is_none_or(|path| path.trim().is_empty()) {
+    if json_field_string(&request, "path").is_none_or(|path| path.trim().is_empty()) {
         return medium_risk_policy();
     }
     high_risk_approval_policy()
@@ -2217,14 +2222,12 @@ fn file_remove_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
 
 fn json_field_string(
     object: &serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
+    key: &str,
 ) -> Option<String> {
-    keys.iter().find_map(|key| {
-        object
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    })
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]

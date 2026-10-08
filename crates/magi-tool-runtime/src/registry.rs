@@ -6,7 +6,7 @@ use crate::{
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
     ToolRuntimeResources,
-    builtin::{self, NormalizedBuiltinTool, infer_execution_status},
+    builtin::{self, NormalizedBuiltinTool, execution_status_of},
     is_public_builtin_tool_surface,
     policy::WriteProtectionClaim,
     tool_catalog, tool_policy_decision_payload,
@@ -420,7 +420,7 @@ impl ToolRegistry {
                     drop(write_guard);
                     ToolExecutionOutput {
                         tool_call_id: input.tool_call_id.clone(),
-                        status: infer_execution_status(&payload),
+                        status: execution_status_of(&input.tool_name, &payload),
                         payload,
                         governance,
                     }

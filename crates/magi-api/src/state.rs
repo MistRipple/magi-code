@@ -3296,9 +3296,9 @@ impl ApiState {
         tool_context: &ToolExecutionContext,
     ) -> serde_json::Value {
         let input = if include_external_dependencies {
-            r#"{"includeExternal":true,"includeMcpServers":true,"includeAgentRoles":false}"#
+            r#"{"include_external":true,"include_mcp_servers":true,"include_agent_roles":false}"#
         } else {
-            r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#
+            r#"{"include_external":false,"include_mcp_servers":false,"include_agent_roles":false}"#
         };
         self.tool_catalog_json(input, tool_context)
             .unwrap_or(serde_json::Value::Null)

@@ -18,56 +18,18 @@ pub(crate) fn build_tool_catalog_value(
     resources: &ToolRuntimeResources,
 ) -> serde_json::Value {
     let request = serde_json::from_str::<serde_json::Value>(input).ok();
-    let include_internal = request
-        .as_ref()
-        .and_then(|value| value.get("include_internal"))
-        .or_else(|| {
-            request
-                .as_ref()
-                .and_then(|value| value.get("includeInternal"))
-        })
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let include_schema = request
-        .as_ref()
-        .and_then(|value| value.get("include_schema"))
-        .or_else(|| {
-            request
-                .as_ref()
-                .and_then(|value| value.get("includeSchema"))
-        })
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let include_external = request
-        .as_ref()
-        .and_then(|value| value.get("include_external"))
-        .or_else(|| {
-            request
-                .as_ref()
-                .and_then(|value| value.get("includeExternal"))
-        })
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let include_mcp_servers = request
-        .as_ref()
-        .and_then(|value| value.get("include_mcp_servers"))
-        .or_else(|| {
-            request
-                .as_ref()
-                .and_then(|value| value.get("includeMcpServers"))
-        })
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let include_agent_roles = request
-        .as_ref()
-        .and_then(|value| value.get("include_agent_roles"))
-        .or_else(|| {
-            request
-                .as_ref()
-                .and_then(|value| value.get("includeAgentRoles"))
-        })
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+    let flag = |name: &str, default: bool| {
+        request
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    };
+    let include_internal = flag("include_internal", false);
+    let include_schema = flag("include_schema", false);
+    let include_external = flag("include_external", true);
+    let include_mcp_servers = flag("include_mcp_servers", true);
+    let include_agent_roles = flag("include_agent_roles", true);
 
     let mut tools = Vec::new();
     let mut builtin_categories = BTreeSet::new();
@@ -1294,7 +1256,7 @@ mod tests {
         };
 
         let output = execute_tool_catalog(
-            r#"{"includeExternal":false,"includeMcpServers":false}"#,
+            r#"{"include_external":false,"include_mcp_servers":false}"#,
             &ToolExecutionContext::default(),
             &resources,
         );
@@ -1303,7 +1265,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "includeExternal=false must not hydrate external tool providers"
+            "include_external=false must not hydrate external tool providers"
         );
         assert_eq!(payload["external_catalog_status"], "disabled");
         assert_eq!(payload["skill_tool_count"], 0);

@@ -79,6 +79,44 @@ impl ExecutionResultStatus {
             Self::Indeterminate => "indeterminate",
         }
     }
+
+    /// `wire_label` 的逆映射：只认规范标签。别名与近义词不在这里兜底，
+    /// 产生 payload 的一方必须直接使用规范标签。
+    pub fn from_wire_label(label: &str) -> Option<Self> {
+        match label {
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "rejected" => Some(Self::Rejected),
+            "needs_approval" => Some(Self::NeedsApproval),
+            "cancelled" => Some(Self::Cancelled),
+            "indeterminate" => Some(Self::Indeterminate),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_result_status_tests {
+    use super::ExecutionResultStatus;
+
+    #[test]
+    fn wire_labels_round_trip_and_aliases_are_not_accepted() {
+        for status in [
+            ExecutionResultStatus::Succeeded,
+            ExecutionResultStatus::Failed,
+            ExecutionResultStatus::Rejected,
+            ExecutionResultStatus::NeedsApproval,
+            ExecutionResultStatus::Cancelled,
+            ExecutionResultStatus::Indeterminate,
+        ] {
+            assert_eq!(
+                ExecutionResultStatus::from_wire_label(status.wire_label()),
+                Some(status)
+            );
+        }
+        assert_eq!(ExecutionResultStatus::from_wire_label("ok"), None);
+        assert_eq!(ExecutionResultStatus::from_wire_label("Succeeded"), None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

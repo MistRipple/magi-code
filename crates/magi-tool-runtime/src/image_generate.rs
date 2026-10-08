@@ -1,7 +1,7 @@
 use crate::{
     BuiltinToolAccessMode, GeneratedImageData, ImageGenerationExecutionContext,
     ImageGenerationRequest, ToolExecutionContext, ToolRuntimeResources,
-    canonicalize_tool_permission_path,
+    builtin::failure::ToolFailure, canonicalize_tool_permission_path,
 };
 use magi_core::ToolCallId;
 use serde_json::Value;
@@ -26,33 +26,27 @@ pub(crate) fn execute_image_generate(
 ) -> String {
     let request = match parse_request(input) {
         Ok(request) => request,
-        Err(error) => return image_generation_error("image_generate_invalid_input", error),
+        Err(error) => return image_generation_error("invalid_input", error),
     };
     if !resources
         .image_generation_readiness_provider
         .as_ref()
         .is_some_and(|provider| provider())
     {
-        return image_generation_error(
-            "image_generate_not_configured",
-            "图片生成模型尚未配置或未启用",
-        );
+        return image_generation_error("not_configured", "图片生成模型尚未配置或未启用");
     }
     let Some(executor) = resources.image_generation_executor.as_ref() else {
-        return image_generation_error(
-            "image_generate_not_configured",
-            "图片生成模型尚未配置或未启用",
-        );
+        return image_generation_error("not_configured", "图片生成模型尚未配置或未启用");
     };
     let workspace_root = match canonical_workspace_root(context) {
         Ok(root) => root,
-        Err(error) => return image_generation_error("image_generate_workspace_required", error),
+        Err(error) => return image_generation_error("workspace_required", error),
     };
     let requested_output_path =
         match resolve_requested_output_path(&workspace_root, request.output_path.as_deref()) {
             Ok(path) => path,
             Err(error) => {
-                return image_generation_error("image_generate_invalid_output_path", error);
+                return image_generation_error("invalid_output_path", error);
             }
         };
 
@@ -71,19 +65,19 @@ pub(crate) fn execute_image_generate(
         Ok(generated) => generated,
         Err(error) => {
             tracing::warn!(error = %error, "image generation provider request failed");
-            return image_generation_error("image_generate_provider_failed", PUBLIC_PROVIDER_ERROR);
+            return image_generation_error("provider_failed", PUBLIC_PROVIDER_ERROR);
         }
     };
 
     let extension = match image_extension(&generated) {
         Ok(extension) => extension,
-        Err(error) => return image_generation_error("image_generate_invalid_result", error),
+        Err(error) => return image_generation_error("invalid_result", error),
     };
     let requested_output_path =
         match resolve_output_path(&workspace_root, requested_output_path.as_deref(), extension) {
             Ok(path) => path,
             Err(error) => {
-                return image_generation_error("image_generate_invalid_output_path", error);
+                return image_generation_error("invalid_output_path", error);
             }
         };
     let output_path = match write_generated_image(
@@ -94,7 +88,7 @@ pub(crate) fn execute_image_generate(
         Ok(path) => path,
         Err(error) => {
             tracing::warn!(path = %requested_output_path.display(), error = %error, "generated image write failed");
-            return image_generation_error("image_generate_write_failed", PUBLIC_WRITE_ERROR);
+            return image_generation_error("write_failed", PUBLIC_WRITE_ERROR);
         }
     };
 
@@ -298,7 +292,12 @@ fn write_generated_image(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         };
-        file.write_all(bytes)?;
+        if let Err(error) = file.write_all(bytes) {
+            // 没写完的图片不能留在工作区里冒充生成结果。
+            drop(file);
+            let _ = fs::remove_file(&candidate);
+            return Err(error);
+        }
         return Ok(candidate);
     }
     Err(std::io::Error::new(
@@ -320,12 +319,20 @@ fn output_path_with_suffix(path: &Path, suffix: u32) -> PathBuf {
     path.with_file_name(file_name)
 }
 
-fn image_generation_error(code: &str, message: impl Into<String>) -> String {
-    serde_json::json!({
-        "tool": TOOL_NAME,
-        "status": "failed",
-        "error_code": code,
-        "error": message.into(),
-    })
-    .to_string()
+fn image_generation_error(kind: &str, message: impl Into<String>) -> String {
+    ToolFailure::new(TOOL_NAME, kind, message)
+        .instruction(instruction_for(kind))
+        .into_payload()
+}
+
+fn instruction_for(kind: &str) -> &'static str {
+    match kind {
+        "invalid_input" | "invalid_output_path" => "按参数要求修正后再调用。",
+        "not_configured" => "图片生成模型尚未配置；告知用户到设置里配置图片模型，不要重试。",
+        "workspace_required" => "需要先选择工作区才能保存生成的图片；告知用户。",
+        "provider_failed" => "图片服务暂不可用；不要立刻用相同参数重试，告知用户检查图片模型配置。",
+        "invalid_result" => "图片服务返回了无法保存的结果；换一个提示词或告知用户。",
+        "write_failed" => "生成的图片没能保存到工作区；检查 output_path 与目录权限，或换一个位置。",
+        _ => "不要用相同参数重复调用。",
+    }
 }
