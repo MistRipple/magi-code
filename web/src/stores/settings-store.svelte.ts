@@ -976,10 +976,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let showLocalSkillFolderPicker = $state(false);
 
   // 通用确认对话框状态
-  let showConfirmDialog = $state(false);
-  let confirmDialogTitle = $state("");
-  let confirmDialogMessage = $state("");
-  let confirmDialogAction: (() => void) | null = $state(null);
 
   function currentSettingsBootstrapBindingKey(): string {
     const workspaceId = typeof appState.currentWorkspaceId === "string"
@@ -1005,27 +1001,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     mcpServersLoading = false;
   });
 
-  // 显示确认对话框
-  function showConfirm(title: string, message: string, action: () => void) {
-    confirmDialogTitle = title;
-    confirmDialogMessage = message;
-    confirmDialogAction = action;
-    showConfirmDialog = true;
-  }
-
-  // 确认操作
-  function handleConfirmYes() {
-    if (confirmDialogAction) {
-      confirmDialogAction();
+  // 破坏性操作：用应用统一的确认对话框，确认后才执行 action。
+  async function confirmThen(title: string, message: string, action: () => Promise<void>): Promise<void> {
+    if (await confirmMessage(message, { title, tone: "danger" })) {
+      await action();
     }
-    showConfirmDialog = false;
-    confirmDialogAction = null;
-  }
-
-  // 取消操作
-  function handleConfirmNo() {
-    showConfirmDialog = false;
-    confirmDialogAction = null;
   }
 
   // 状态文本映射
@@ -1716,7 +1696,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
             count: refs.length,
           })
         : i18n.t("settings.model.confirmDeleteEngine");
-    showConfirm(i18n.t("settings.model.deleteEngine"), msg, async () => {
+    await confirmThen(i18n.t("settings.model.deleteEngine"), msg, async () => {
       try {
         await removeAgentRegistryEngine(engineId);
         await removeAgentWorkerConfig(engineId);
@@ -2618,7 +2598,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   async function deleteMCPServer(serverId: string) {
-    showConfirm(
+    await confirmThen(
       i18n.t("settings.tools.deleteMcpServer"),
       i18n.t("settings.tools.deleteMcpServerConfirm"),
       async () => {
@@ -2823,7 +2803,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   async function deleteRepository(repositoryId: string) {
-    showConfirm(
+    await confirmThen(
       i18n.t("settings.repo.deleteRepo"),
       i18n.t("settings.repo.deleteRepoConfirm"),
       async () => {
@@ -3217,7 +3197,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   // 删除 Skill
-  function deleteSkill(skill: SkillItem) {
+  async function deleteSkill(skill: SkillItem): Promise<void> {
     const isCustom = skill.source === "custom";
     const titleKey = isCustom
       ? "settings.tools.deleteCustomTool"
@@ -3231,7 +3211,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     const errorText = isCustom
       ? i18n.t("settings.toast.action.deleteCustomTool")
       : i18n.t("settings.toast.action.deleteInstructionSkill");
-    showConfirm(
+    await confirmThen(
       i18n.t(titleKey),
       i18n.t(confirmKey, { name: skill.name }),
       async () => {
@@ -4267,15 +4247,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     get showLocalSkillFolderPicker() {
       return showLocalSkillFolderPicker;
     },
-    get showConfirmDialog() {
-      return showConfirmDialog;
-    },
-    get confirmDialogTitle() {
-      return confirmDialogTitle;
-    },
-    get confirmDialogMessage() {
-      return confirmDialogMessage;
-    },
     get statusTexts() {
       return statusTexts;
     },
@@ -4290,8 +4261,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     openModelDropdown,
     closeAllModelDropdowns,
     closeModelDropdown,
-    handleConfirmYes,
-    handleConfirmNo,
     getStatusClass,
     getStatusText,
     getWorkerStats,

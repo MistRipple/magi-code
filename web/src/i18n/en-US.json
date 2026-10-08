@@ -1750,8 +1750,6 @@
   "settings.resetConfirm.irreversible": "This action cannot be undone.",
   "settings.resetConfirm.cancel": "Cancel",
   "settings.resetConfirm.confirm": "Confirm Reset",
-  "settings.confirmDialog.cancel": "Cancel",
-  "settings.confirmDialog.confirm": "Confirm",
   "rightPane.title": "Right pane",
   "rightPane.expand": "Expand right pane",
   "rightPane.collapse": "Collapse right pane (keep tabs)",

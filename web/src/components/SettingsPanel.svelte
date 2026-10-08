@@ -716,22 +716,6 @@ import {
   </Modal>
 {/if}
 
-<!-- 通用确认对话框 -->
-{#if store.showConfirmDialog}
-  <Modal
-    size="sm"
-    closeOnEscape={true}
-    onClose={store.handleConfirmNo}
-    title={store.confirmDialogTitle}
-  >
-    <p style="margin: 0; color: var(--foreground);">{store.confirmDialogMessage}</p>
-    {#snippet footer()}
-      <button class="btn btn--secondary" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.cancel')}</button>
-      <button class="btn btn--primary" onclick={store.handleConfirmYes}>{i18n.t('settings.confirmDialog.confirm')}</button>
-    {/snippet}
-  </Modal>
-{/if}
-
 <style>
   /* ============================================
      Settings Panel - 优化后的样式

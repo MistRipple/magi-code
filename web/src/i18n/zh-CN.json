@@ -1750,8 +1750,6 @@
   "settings.resetConfirm.irreversible": "此操作不可撤销。",
   "settings.resetConfirm.cancel": "取消",
   "settings.resetConfirm.confirm": "确认重置",
-  "settings.confirmDialog.cancel": "取消",
-  "settings.confirmDialog.confirm": "确认",
   "rightPane.title": "右侧面板",
   "rightPane.expand": "展开右侧面板",
   "rightPane.collapse": "折叠右侧面板（保留 tabs）",
