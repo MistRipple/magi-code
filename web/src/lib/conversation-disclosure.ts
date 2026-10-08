@@ -1,6 +1,10 @@
 import type { Message, TimelineRenderItem, ToolCall, ToolCallStatus } from '../types/message';
 import { browserToolSummary } from './browser-tool-display';
-import { inferConversationPresentationRole, type ConversationPresentationRole } from './conversation-presentation';
+import {
+  inferConversationPresentationRole,
+  messageToolNames,
+  type ConversationPresentationRole,
+} from './conversation-presentation';
 import { firstToolDisplayText, resolveToolCardTarget } from './tool-call-display';
 import { resolveToolDisplayName } from './tool-display-name';
 import { parseToolIdentity } from './tool-identity';
@@ -8,7 +12,7 @@ import { parseToolIdentity } from './tool-identity';
 export type ConversationStreamEntry =
   | { kind: 'event'; key: string; item: TimelineRenderItem }
   | { kind: 'tool-group'; key: string; items: TimelineRenderItem[] }
-  | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' }
+  | { kind: 'item'; key: string; item: TimelineRenderItem; role: 'artifact' | 'attention' | 'interaction' }
   | { kind: 'agent-group'; key: string; items: TimelineRenderItem[] };
 
 export interface ConversationPresentationEntry {
@@ -68,6 +72,17 @@ export function buildConversationStreamEntries(
       continue;
     }
     if (isToolLikeMessage(entry.item.message)) {
+      if (messageToolNames(entry.item.message).includes('ask_user_question')) {
+        // 向用户提问本身就是一行有名字的交互记录（向你提问），不再套进「完成操作」这类泛称分组里。
+        flushToolGroup();
+        result.push({
+          kind: 'item',
+          key: `interaction:${entry.item.key}`,
+          item: entry.item,
+          role: 'interaction',
+        });
+        continue;
+      }
       toolGroupItems.push(entry.item);
       continue;
     }

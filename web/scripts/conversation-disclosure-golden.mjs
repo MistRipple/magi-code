@@ -140,6 +140,22 @@ await withGoldenViteServer(async (server) => {
   const extendedKeys = streamKeys(process(textItem('x'), a, textItem('y'), b));
   assert.deepEqual(extendedKeys.slice(0, prefixKeys.length), prefixKeys, '追加条目后，已有条目的 key 保持不变');
 
+  // ---- 向用户提问：自己就是一行「向你提问」，不套进「完成操作」之类的泛称分组，也不并入前后的工具组 ----
+  const q = toolItem('q', 'ask_user_question', { question: '选哪个？' });
+  const questionEntries = disclosure.buildConversationStreamEntries(process(a, q, b));
+  assert.deepEqual(
+    questionEntries.map((entry) => entry.key),
+    ['tool-group:a', 'interaction:q', 'tool-group:b'],
+    '提问独占一行：它前后的工具各自成组，提问不被收进任何工具组',
+  );
+  assert.equal(questionEntries[1].kind, 'item');
+  assert.equal(questionEntries[1].role, 'interaction');
+  const questionBlocks = disclosure.buildConversationDisclosureBlocks(questionEntries);
+  assert.ok(
+    questionBlocks.some((block) => block.kind === 'item' && block.item.key === 'q'),
+    '提问以独立块进入过程流',
+  );
+
   // ---- 紧凑事件：短小纯文字才是紧凑的 ----
   assert.equal(disclosure.isCompactProcessEvent(message({ content: '我先读取入口文件。' })), true);
   assert.equal(disclosure.isCompactProcessEvent(message({ content: 'a\nb' })), false, '含换行不能压成一行');
