@@ -44,7 +44,8 @@
     getAgentColor,
     deleteEngine,
     openAddEngineDialog,
-    renameEngineDisplay
+    renameEngineDisplay,
+    openWebModelSettings
   } = $props<{
     modelConfigTab: string;
     orchConfig: any;
@@ -78,6 +79,8 @@
     getWorkerDisplayName: (workerId: string) => string;
     getAgentColor: (templateId: string, colorToken?: string) => any;
     deleteEngine: (engineId: string) => void;
+    /** 打开 GPT Web 的设置（登录、可用性、工具通道）。它依赖内置浏览器的会话，所以设置在「浏览器」页。 */
+    openWebModelSettings: () => void;
     openAddEngineDialog: () => void;
     renameEngineDisplay: (engineId: string, newName: string) => void;
   }>();
@@ -597,10 +600,43 @@
         {/if}
       </div>
     </div>
+
+    <div class="settings-section web-model-pointer">
+      <div class="settings-section-header">
+        <div class="settings-section-title">{i18n.t('settings.model.webModelTitle')}</div>
+        <div class="settings-section-subtitle">{i18n.t('settings.model.webModelSubtitle')}</div>
+      </div>
+      <button type="button" class="web-model-pointer-button" onclick={openWebModelSettings}>
+        <Icon name="globe" size={14} />
+        <span>{i18n.t('settings.model.webModelOpen')}</span>
+      </button>
+    </div>
   </div>
 </div>
 
 <style>
+  .web-model-pointer {
+    margin-top: var(--space-4);
+  }
+
+  .web-model-pointer-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    font-size: var(--text-xs);
+  }
+
+  .web-model-pointer-button:hover {
+    background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  }
+
   .apple-manager {
     container: settings-model / inline-size;
   }
