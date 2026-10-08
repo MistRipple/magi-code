@@ -1,3 +1,5 @@
+import type { SessionCommandDisabledReason } from './composer-policy';
+
 export interface ComposerSkillOption {
   skillId: string;
   name: string;
@@ -42,6 +44,8 @@ export type ComposerAction =
       name: string;
       description: string;
       aliases: string[];
+      /** 当前不可用的原因；菜单仍展示该项并说明原因，而不是让它凭空消失。 */
+      disabledReason?: SessionCommandDisabledReason;
     }
   | {
       kind: 'skill';
@@ -63,7 +67,7 @@ function fuzzyMatch(text: string, query: string): boolean {
 export function buildComposerActions(
   skills: ComposerSkillOption[],
   labels: ComposerActionLabels,
-  options: { sessionCommandsAvailable: boolean } = { sessionCommandsAvailable: true },
+  options: { sessionCommandDisabledReason?: SessionCommandDisabledReason | null } = {},
 ): ComposerAction[] {
   return [
     {
@@ -79,16 +83,16 @@ export function buildComposerActions(
       description: labels.goal.description,
       aliases: ['goal', 'goal mode', 'goalmode', '目标', '目标模式', '长期目标'],
     },
-    // 会话命令作用于已有会话的上下文；新建草稿会话没有可压缩的历史。
-    ...(options.sessionCommandsAvailable
-      ? [{
-          kind: 'command' as const,
-          id: 'compact' as const,
-          name: labels.compact.name,
-          description: labels.compact.description,
-          aliases: ['compact', 'compress', 'summarize', '压缩', '压缩上下文', '上下文', '总结'],
-        }]
-      : []),
+    {
+      kind: 'command' as const,
+      id: 'compact' as const,
+      name: labels.compact.name,
+      description: labels.compact.description,
+      aliases: ['compact', 'compress', 'summarize', '压缩', '压缩上下文', '上下文', '总结'],
+      ...(options.sessionCommandDisabledReason
+        ? { disabledReason: options.sessionCommandDisabledReason }
+        : {}),
+    },
     ...skills.map<ComposerAction>((skill) => ({
       kind: 'skill',
       id: skill.skillId,

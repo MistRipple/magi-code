@@ -59,6 +59,7 @@
   } from '../shared/session-navigation.svelte';
   import WebModelModeChooser from './WebModelModeChooser.svelte';
   import WebModelSessionBanner from './WebModelSessionBanner.svelte';
+  import ImageAttachmentTray from './ImageAttachmentTray.svelte';
   import { bindWebSavedConversation, materializeSession } from '../web/agent-api';
   import { canFetchModelList } from '../shared/model-governance';
   import {
@@ -75,6 +76,16 @@
     type ComposerSessionCommand,
     type ComposerSkillOption,
   } from '../lib/composer-actions';
+  import {
+    composerAttachmentTotal,
+    MAX_COMPOSER_IMAGE_BYTES,
+    MAX_COMPOSER_IMAGES,
+    queuedMessageEditable,
+    selectDroppedImages,
+    sessionCommandDisabledReason,
+    summarizeQueuedMessage,
+  } from '../lib/composer-policy';
+  import { isDesktopRuntime } from '../lib/desktop-updater';
   import {
     addComposerContextReference,
     MAX_COMPOSER_CONTEXT_REFERENCES,
@@ -93,6 +104,7 @@
     id: string;
     dataUrl: string;
     name: string;
+    size?: number;
   }
 
   type SelectedBrowserAnnotation = Pick<
@@ -234,8 +246,6 @@
   // 输入区组件在会话切换时不会销毁。草稿必须按会话隔离，否则新会话会继承
   // 上一个会话尚未发送的图片、标记或文本，表现为内容串会话和“新会话自带附件”。
   const scopedComposerDrafts = new Map<string, ComposerSubmissionDraft>();
-  const MAX_IMAGES = 5;  // 最多支持 5 张图片
-  const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
   const GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN = /^(clipboard|image|pasted[-_ ]?image)\.[^.]+$/i;
   const CLIPBOARD_IMAGE_TYPE_PRIORITY = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
@@ -455,8 +465,6 @@
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
     if (inputValue.trim().length > 0) return true;
-    // 执行中补充指令不支持图片，避免"有内容可发送"与实际能力不一致
-    if (isSending) return false;
     return selectedImages.length > 0
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
@@ -487,6 +495,18 @@
     return out;
   });
 
+  // 压缩命令与附件互斥：草稿会话没有可压缩的历史，带附件时 daemon 会拒绝，这里提前说明而不是让它消失。
+  const attachmentTotal = $derived(composerAttachmentTotal({
+    images: selectedImages.length + pendingImageReadCount,
+    contextReferences: selectedContextReferences.length,
+    browserAnnotations: selectedBrowserAnnotations.length,
+    browserNodeSelections: selectedBrowserNodeSelections.length,
+  }));
+  const compactDisabledReason = $derived(sessionCommandDisabledReason({
+    sessionCommandsAvailable: !isDraftSession,
+    attachmentTotal,
+  }));
+
   const composerActions = $derived.by<ComposerAction[]>(() => buildComposerActions(
     availableSkills,
     {
@@ -503,7 +523,7 @@
         description: i18n.t('input.add.contextDescription'),
       },
     },
-    { sessionCommandsAvailable: !isDraftSession },
+    { sessionCommandDisabledReason: compactDisabledReason },
   ));
 
   const filteredSlashCommands = $derived.by<Array<Exclude<ComposerAction, { kind: 'resource' }>>>(() => {
@@ -898,12 +918,64 @@
     }
   }
 
+  /** 粘贴和拖入共用：按张数 / 体积上限筛选，被丢弃的原因逐条说明。 */
+  function addImageFiles(files: File[]): void {
+    const selection = selectDroppedImages(files, selectedImages.length + pendingImageReadCount);
+    for (const index of selection.accepted) {
+      readImageFileIntoComposer(files[index]);
+    }
+    if (selection.overLimit > 0) {
+      addToast('warning', i18n.t('input.maxImages', { max: MAX_COMPOSER_IMAGES }));
+    }
+    for (const file of selection.tooLarge) {
+      addToast('warning', i18n.t('input.imageTooLarge', {
+        size: (file.size / 1024 / 1024).toFixed(1),
+      }));
+    }
+    if (selection.ignored > 0 && selection.accepted.length === 0) {
+      addToast('warning', i18n.t('input.drop.imagesOnly'));
+    }
+  }
+
+  // 压缩命令不能带附件：用户主动添加附件时让命令让位并说明，附件不丢。
+  function dropSessionCommandForAttachment(): void {
+    if (selectedSessionCommand === null) return;
+    selectedSessionCommand = null;
+    addToast('info', i18n.t('input.compact.removedForAttachment'), undefined, { forceVisible: true });
+  }
+
+  function activeModeLabel(): string | null {
+    if (selectedGoalMode) return i18n.t('input.goalMode.name');
+    if (selectedSessionCommand) return i18n.t('input.compact.name');
+    if (selectedSkill) return selectedSkill.name;
+    return null;
+  }
+
+  // goal / 压缩 / skill 三选一：选新的会替换旧的，替换时明说，避免芯片悄悄换掉。
+  function noteModeReplaced(previous: string | null, next: string): void {
+    if (previous && previous !== next) {
+      addToast('info', i18n.t('input.mode.replaced', { from: previous, to: next }), undefined, {
+        forceVisible: true,
+      });
+    }
+  }
+
+  function notifyActionDisabled(action: ComposerAction): void {
+    if (action.kind !== 'command' || !action.disabledReason) return;
+    addToast(
+      'info',
+      i18n.t(`input.compact.disabled.${action.disabledReason === 'draft-session' ? 'draft' : 'attachments'}`),
+      undefined,
+      { forceVisible: true },
+    );
+  }
+
   function addImageToComposer(image: { dataUrl: string; name: string; size: number }): boolean {
-    if (selectedImages.length >= MAX_IMAGES) {
-      addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
+    if (selectedImages.length >= MAX_COMPOSER_IMAGES) {
+      addToast('warning', i18n.t('input.maxImages', { max: MAX_COMPOSER_IMAGES }));
       return false;
     }
-    if (image.size > MAX_IMAGE_SIZE) {
+    if (image.size > MAX_COMPOSER_IMAGE_BYTES) {
       addToast('warning', i18n.t('input.imageTooLarge', {
         size: (image.size / 1024 / 1024).toFixed(1),
       }));
@@ -913,10 +985,12 @@
       addToast('error', i18n.t('input.imageReadFailed'));
       return false;
     }
+    dropSessionCommandForAttachment();
     selectedImages = [...selectedImages, {
       id: generateId(),
       dataUrl: image.dataUrl,
       name: image.name,
+      size: image.size,
     }];
     addToast('success', i18n.t('input.imageAdded'));
     return true;
@@ -1126,6 +1200,12 @@
   }
 
   function commitSlashCommand(command: Exclude<ComposerAction, { kind: 'resource' }>) {
+    if (command.kind === 'command' && command.disabledReason) {
+      notifyActionDisabled(command);
+      return;
+    }
+    const previousMode = activeModeLabel();
+    noteModeReplaced(previousMode, command.name);
     if (command.kind === 'goal') {
       selectedGoalMode = true;
       selectedSessionCommand = null;
@@ -1177,6 +1257,12 @@
       contextPickerOpen = true;
       return;
     }
+    if (action.kind === 'command' && action.disabledReason) {
+      notifyActionDisabled(action);
+      return;
+    }
+    const previousMode = activeModeLabel();
+    if (previousMode !== action.name) noteModeReplaced(previousMode, action.name);
     if (action.kind === 'goal') {
       selectedGoalMode = !selectedGoalMode;
       selectedSessionCommand = null;
@@ -1222,6 +1308,7 @@
       }
       return false;
     } else {
+      dropSessionCommandForAttachment();
       selectedContextReferences = next;
     }
     return true;
@@ -1397,6 +1484,7 @@
         addToast('warning', i18n.t('browser.annotation.limit'));
         return;
       }
+      dropSessionCommandForAttachment();
       selectedBrowserAnnotations = [...selectedBrowserAnnotations, annotation];
     }
     function handleBrowserAnnotationUpdated(event: Event) {
@@ -1421,6 +1509,7 @@
         addToast('warning', i18n.t('browser.nodeSelection.limit'));
         return;
       }
+      dropSessionCommandForAttachment();
       selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, cloneBrowserNodeSelection(selection)];
       queueMicrotask(focusEditor);
     }
@@ -1447,8 +1536,8 @@
         || typeof detail.name !== 'string'
         || typeof detail.size !== 'number'
       ) return;
-      if (selectedImages.length + pendingImageReadCount >= MAX_IMAGES) {
-        addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
+      if (selectedImages.length + pendingImageReadCount >= MAX_COMPOSER_IMAGES) {
+        addToast('warning', i18n.t('input.maxImages', { max: MAX_COMPOSER_IMAGES }));
         return;
       }
       if (addImageToComposer({ dataUrl: detail.dataUrl, name: detail.name, size: detail.size })) {
@@ -1609,8 +1698,8 @@
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
-      if (isSending && selectedImages.length > 0) {
-        addToast('warning', i18n.t('input.noImageDuringExecution'));
+      if (selectedSessionCommand !== null && attachmentTotal > 0) {
+        addToast('warning', i18n.t('input.compact.disabled.attachments'));
         return;
       }
       const submissionText = normalizedContent
@@ -1795,21 +1884,49 @@
     });
   }
 
-  // 编辑只回填内容；队列移除仍由服务端权威请求完成，失败时原消息会保留并重新同步。
+  // 编辑 = 把排队消息整条取回输入框（文字、图片、引用、目标 / skill），队列移除仍由服务端权威请求完成，
+  // 失败时原消息会保留并重新同步。输入框里已有草稿时不覆盖，更不能悄悄丢掉排队消息里的附件。
   function editQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
     if (!normalizedId) return;
     const target = messagesState.queuedMessages.find((message) => message.id === normalizedId);
     if (!target) return;
-    const text = (target.text ?? target.content ?? '').toString();
+    if (!queuedMessageEditable(target)) {
+      addToast('info', i18n.t('input.queue.editBlocked'), undefined, { forceVisible: true });
+      return;
+    }
+    if (composerHasDraft()) {
+      addToast('warning', i18n.t('input.queue.editNeedsEmptyComposer'));
+      return;
+    }
+    let references: ComposerContextReference[] = [];
+    for (const reference of target.contextReferences ?? []) {
+      references = addComposerContextReference(references, reference);
+    }
+    const skillId = target.skillName?.trim() ?? '';
+    const restoredSkill = skillId
+      ? availableSkills.find((skill) => skill.skillId === skillId)
+        ?? { skillId, name: skillId, description: '' }
+      : null;
     vscode.postMessage({
       type: 'removeQueuedMessage',
       queuedMessageId: normalizedId,
     });
-    invalidateEnhanceState();
-    pendingCaretOffset = text.length;
-    inputValue = text;
-    queueMicrotask(focusEditor);
+    restoreComposerSubmissionDraft({
+      text: (target.text ?? target.content ?? '').toString(),
+      images: (target.images ?? []).map((image) => ({
+        id: generateId(),
+        dataUrl: image.dataUrl,
+        name: image.name,
+        size: Math.floor((image.dataUrl.length * 3) / 4),
+      })),
+      contextReferences: references,
+      browserAnnotations: [],
+      browserNodeSelections: (target.browserNodeSelections ?? []).map(cloneBrowserNodeSelection),
+      goalMode: target.goalMode === true,
+      sessionCommand: null,
+      skill: restoredSkill,
+    });
   }
 
   // 拖动调整大小
@@ -1837,17 +1954,7 @@
     const imageFiles = collectClipboardImageFiles(event.clipboardData);
     if (imageFiles.length > 0) {
       event.preventDefault();
-      for (const file of imageFiles) {
-        if (selectedImages.length + pendingImageReadCount >= MAX_IMAGES) {
-          addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
-          break;
-        }
-        if (file.size > MAX_IMAGE_SIZE) {
-          addToast('warning', i18n.t('input.imageTooLarge', { size: (file.size / 1024 / 1024).toFixed(1) }));
-          continue;
-        }
-        readImageFileIntoComposer(file);
-      }
+      addImageFiles(imageFiles);
       return;
     }
 
@@ -1865,6 +1972,35 @@
     const current = readEditorText();
     pendingCaretOffset = offset + text.length;
     inputValue = `${current.slice(0, offset)}${text}${current.slice(offset)}`;
+  }
+
+  // 拖入图片：浏览器端直接作为图片附件。桌面端的拖入由原生通道按「文件引用」处理，
+  // 这里不拦截，避免同一次拖放被两条路径各处理一遍。
+  let imageDragActive = $state(false);
+
+  function dragCarriesFiles(event: DragEvent): boolean {
+    return !isDesktopRuntime() && Array.from(event.dataTransfer?.types ?? []).includes('Files');
+  }
+
+  function handleImageDragOver(event: DragEvent) {
+    if (!dragCarriesFiles(event) || sessionInputLocked || isInteractionBlocking) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    imageDragActive = true;
+  }
+
+  function handleImageDragLeave(event: DragEvent) {
+    const related = event.relatedTarget;
+    if (related instanceof Node && (event.currentTarget as Node | null)?.contains(related)) return;
+    imageDragActive = false;
+  }
+
+  function handleImageDrop(event: DragEvent) {
+    imageDragActive = false;
+    if (!dragCarriesFiles(event) || sessionInputLocked || isInteractionBlocking) return;
+    event.preventDefault();
+    addImageFiles(Array.from(event.dataTransfer?.files ?? []));
+    queueMicrotask(focusEditor);
   }
 
   // 🔧 删除已选图片
@@ -2527,9 +2663,23 @@
       <div class="ia-queue-list">
         {#each queuedMessages as queued (queued.id)}
           {@const guideAvailable = canGuideQueuedMessage(queued)}
+          {@const attachments = summarizeQueuedMessage(queued)}
           <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>
-            <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
+            <div class="ia-queue-content" title={queued.content}>
+              {#if attachments.goal}<span class="ia-queue-badge">/goal</span>{/if}
+              {#if attachments.skill}<span class="ia-queue-badge">/{attachments.skill}</span>{/if}
+              {#if attachments.images > 0}
+                <span class="ia-queue-badge">{i18n.t('input.queue.badge.images', { count: attachments.images })}</span>
+              {/if}
+              {#if attachments.references > 0}
+                <span class="ia-queue-badge">{i18n.t('input.queue.badge.references', { count: attachments.references })}</span>
+              {/if}
+              {#if attachments.annotations > 0}
+                <span class="ia-queue-badge">{i18n.t('input.queue.badge.annotations', { count: attachments.annotations })}</span>
+              {/if}
+              {queued.content}
+            </div>
             <div class="ia-queue-actions">
               <button
                 type="button"
@@ -2567,7 +2717,18 @@
     </div>
   {/if}
   <GoalRunDrawers bind:count={drawersCount} />
-  <div class="ia-wrapper" style="min-height: {inputHeight}px">
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="ia-wrapper"
+    class:drag-active={imageDragActive}
+    style="min-height: {inputHeight}px"
+    ondragover={handleImageDragOver}
+    ondragleave={handleImageDragLeave}
+    ondrop={handleImageDrop}
+  >
+    {#if imageDragActive}
+      <div class="ia-drop-hint" aria-hidden="true">{i18n.t('input.drop.hint')}</div>
+    {/if}
     <!-- 拖动调整大小 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
@@ -2701,6 +2862,16 @@
       onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
     />
 
+    {#if selectedImages.length > 0 || pendingImageReadCount > 0}
+      <ImageAttachmentTray
+        images={selectedImages}
+        pendingCount={pendingImageReadCount}
+        disabled={sessionInputLocked || isInteractionBlocking}
+        onRemove={removeImage}
+        onClear={clearAllImages}
+      />
+    {/if}
+
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       bind:this={inputTextareaEl}
@@ -2753,6 +2924,8 @@
               aria-selected={index === slashHighlightIndex}
               class="ia-slash-item"
               class:active={index === slashHighlightIndex}
+              class:disabled={command.kind === 'command' && Boolean(command.disabledReason)}
+              aria-disabled={command.kind === 'command' && Boolean(command.disabledReason)}
               onmouseenter={() => (slashHighlightIndex = index)}
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
@@ -2761,30 +2934,18 @@
               </span>
               <span class="ia-slash-item-content">
                 <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
-                {#if command.description}
+                {#if command.kind === 'command' && command.disabledReason}
+                  <span class="ia-slash-item-description ia-slash-item-reason">
+                    {i18n.t(`input.compact.disabled.${command.disabledReason === 'draft-session' ? 'draft' : 'attachments'}`)}
+                  </span>
+                {:else if command.description}
                   <span class="ia-slash-item-description">{command.description}</span>
                 {/if}
               </span>
             </button>
           {/each}
         </div>
-      </div>
-    {/if}
-
-    <!-- 图片预览 -->
-    {#if selectedImages.length > 0}
-      <div class="ia-images">
-        {#each selectedImages as img (img.id)}
-          <div class="ia-img-item">
-            <img src={img.dataUrl} alt={img.name} class="ia-img-thumb" />
-            <button class="ia-img-remove" onclick={() => removeImage(img.id)} title={i18n.t('input.remove')}>
-              <Icon name="close" size={10} />
-            </button>
-          </div>
-        {/each}
-        {#if selectedImages.length > 1}
-          <button class="ia-img-clear" onclick={clearAllImages} title={i18n.t('input.clearAllImages')}>{i18n.t('input.clearImages')}</button>
-        {/if}
+        <div class="ia-slash-hint" aria-hidden="true">{i18n.t('input.slash.hint')}</div>
       </div>
     {/if}
 
@@ -2820,6 +2981,8 @@
                 <button
                   type="button"
                   class="ia-add-item"
+                  class:disabled={action.kind === 'command' && Boolean(action.disabledReason)}
+                  aria-disabled={action.kind === 'command' && Boolean(action.disabledReason)}
                   class:selected={action.kind === 'goal'
                     ? selectedGoalMode
                     : action.kind === 'command'
@@ -2844,7 +3007,11 @@
                   </span>
                   <span class="ia-add-item-content">
                     <span class="ia-add-item-label">{action.name}</span>
-                    {#if action.description}
+                    {#if action.kind === 'command' && action.disabledReason}
+                      <span class="ia-add-item-description">
+                        {i18n.t(`input.compact.disabled.${action.disabledReason === 'draft-session' ? 'draft' : 'attachments'}`)}
+                      </span>
+                    {:else if action.description}
                       <span class="ia-add-item-description">{action.description}</span>
                     {/if}
                   </span>
@@ -3849,6 +4016,10 @@
   .ia-add-item.selected {
     color: var(--primary);
   }
+  .ia-add-item.disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
   .ia-add-item-icon {
     display: inline-flex;
     align-items: center;
@@ -4344,8 +4515,8 @@
     bottom: calc(100% + 6px);
     left: 8px;
     z-index: 31;
-    width: min(300px, calc(100% - 16px));
-    max-height: 320px;
+    width: min(420px, calc(100% - 16px));
+    max-height: 360px;
     padding: 6px;
     background: color-mix(in srgb, var(--background) 100%, white 6%);
     backdrop-filter: blur(18px);
@@ -4364,10 +4535,26 @@
   .ia-slash-group-label {
     padding: 6px 9px 4px;
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
     line-height: 1;
-    text-transform: uppercase;
+  }
+  .ia-slash-hint {
+    padding: 6px 9px 2px;
+    margin-top: 4px;
+    color: var(--foreground-muted);
+    font-size: 11px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .ia-slash-item.disabled {
+    cursor: not-allowed;
+  }
+  .ia-slash-item.disabled .ia-slash-item-icon,
+  .ia-slash-item.disabled .ia-slash-item-label {
+    opacity: 0.5;
+  }
+  .ia-slash-item-reason {
+    color: var(--warning);
   }
   .ia-slash-item {
     display: flex;
@@ -4417,76 +4604,49 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 描述最多两行：skill 的说明常常较长，单行截断后根本看不出是干什么的。 */
   .ia-slash-item-description {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     color: var(--foreground-muted);
     font-size: 11px;
-    line-height: 1.3;
+    line-height: 1.35;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
-  /* 图片预览 */
-  .ia-images {
-    display: flex;
-    flex-wrap: nowrap;
-    flex-shrink: 0;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    max-height: 90px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    border-top: 1px solid var(--border-subtle);
+  .ia-wrapper.drag-active {
+    outline: 2px dashed color-mix(in srgb, var(--primary) 70%, transparent);
+    outline-offset: -2px;
   }
 
-  .ia-img-item {
-    position: relative;
-    width: 52px;
-    height: 52px;
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    border: 1px solid var(--border);
-  }
-
-  .ia-img-thumb { width: 100%; height: 100%; object-fit: cover; }
-
-  .ia-img-remove {
+  .ia-drop-hint {
     position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 16px;
-    height: 16px;
+    inset: 0;
+    z-index: 5;
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 0;
-    background: rgba(0, 0, 0, 0.6);
-    border: none;
-    border-radius: 50%;
-    color: white;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity var(--transition-fast);
+    color: var(--primary);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    background: color-mix(in srgb, var(--background) 82%, transparent);
+    border-radius: inherit;
+    pointer-events: none;
   }
 
-  .ia-img-item:hover .ia-img-remove { opacity: 1; }
-  .ia-img-remove:hover { background: var(--destructive); }
-
-  .ia-img-clear {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: var(--space-1) var(--space-2);
+  .ia-queue-badge {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 6px;
+    color: var(--primary);
     font-size: var(--text-xs);
-    background: transparent;
-    border: 1px dashed var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
+    line-height: 16px;
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-radius: var(--radius-full, 999px);
+    vertical-align: 1px;
   }
-
-  .ia-img-clear:hover { border-color: var(--destructive); color: var(--destructive); }
 
   .ia-queue-panel {
     overflow: hidden;
