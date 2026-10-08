@@ -730,7 +730,9 @@
     padding: 0 2px 26px;
   }
 
-  .settings-section + .settings-section {
+  /* 分区之间的间距由容器统一给：其中有来自子组件的分区（网页模型），
+     组件内的相邻选择器跨不过组件边界，会让紧随其后的分区丢掉上边距。 */
+  .browser-settings-content > :global(.settings-section + .settings-section) {
     padding-top: 26px;
     border-top: 1px solid var(--ind-border-separator);
   }

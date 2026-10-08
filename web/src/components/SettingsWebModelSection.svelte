@@ -710,11 +710,6 @@
     padding: 0 2px 26px;
   }
 
-  .web-model-section {
-    padding-top: 26px;
-    border-top: 1px solid var(--ind-border-separator);
-  }
-
   .section-heading {
     display: flex;
     align-items: center;
