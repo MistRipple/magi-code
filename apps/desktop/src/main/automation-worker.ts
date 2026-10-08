@@ -73,7 +73,6 @@ const PROCESS_EXIT_TIMEOUT_MS = 5_000;
 export class AutomationWorker {
   readonly #entryPath: string;
   readonly #surfaceManager: BrowserSurfaceManager;
-  readonly #uploadRoot: string | undefined;
   readonly #onFailure: WorkerLifecycleCallback | undefined;
   readonly #onReady: WorkerLifecycleCallback | undefined;
   readonly #fork: UtilityProcessFork;
@@ -104,14 +103,12 @@ export class AutomationWorker {
   constructor(input: {
     entryPath: string;
     surfaceManager: BrowserSurfaceManager;
-    uploadRoot?: string;
     onFailure?: WorkerLifecycleCallback;
     onReady?: WorkerLifecycleCallback;
     fork?: UtilityProcessFork;
   }) {
     this.#entryPath = input.entryPath;
     this.#surfaceManager = input.surfaceManager;
-    this.#uploadRoot = input.uploadRoot;
     this.#onFailure = input.onFailure;
     this.#onReady = input.onReady;
     this.#fork = input.fork ?? ((entryPath, args, options) => (
@@ -165,7 +162,6 @@ export class AutomationWorker {
         stdio: "pipe",
         env: {
           MAGI_BROWSER_WORKER_EPOCH: this.#workerEpoch,
-          ...(this.#uploadRoot ? { MAGI_BROWSER_UPLOAD_ROOT: this.#uploadRoot } : {}),
           // The production adapter accepts only ChatGPT origins. The DOM
           // acceptance harness uses a loopback fixture through this explicit
           // process-level override; propagate it to the isolated Worker,

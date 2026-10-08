@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute } from "node:path";
 import type {
   BrowserCommandOutcome,
   BrowserActionTarget,
@@ -90,19 +90,12 @@ export class BrowserAutomationRuntime {
   readonly #calls = new Map<string, AbortController>();
   readonly #commandLanes = new Map<string, Promise<void>>();
   readonly #annotationLanes = new Map<string, Promise<void>>();
-  readonly #uploadRoot: string | null;
 
   readonly #workerEpoch: string;
 
-  constructor(
-    cdp: CdpClient,
-    workerEpoch: string = randomUUID(),
-    options: { uploadRoot?: string } = {},
-  ) {
+  constructor(cdp: CdpClient, workerEpoch: string = randomUUID()) {
     this.#cdp = cdp;
     this.#workerEpoch = workerEpoch;
-    const configuredUploadRoot = options.uploadRoot ?? process.env.MAGI_BROWSER_UPLOAD_ROOT ?? "";
-    this.#uploadRoot = configuredUploadRoot.trim() ? resolve(configuredUploadRoot) : null;
     cdp.onEvent((binding, method, params, sessionId) => this.onCdpEvent(binding, method, params, sessionId));
   }
 
@@ -1571,42 +1564,30 @@ export class BrowserAutomationRuntime {
     if (!selector) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
     const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
     if (!node.nodeId) throw protocolFailure("browser_upload_target_invalid", "file input is no longer connected");
-    const authorizedPaths = await this.authorizeUploadPaths(paths);
+    const authorizedPaths = await this.validateUploadPaths(paths);
     await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: authorizedPaths });
     await this.#cdp.send(binding, "DOM.focus", { nodeId: node.nodeId });
     return { uploaded: authorizedPaths.map((path) => path.split(/[\\\\/]/).pop() || path), count: authorizedPaths.length };
   }
 
-  private async authorizeUploadPaths(paths: string[]): Promise<string[]> {
-    if (!this.#uploadRoot) {
-      throw protocolFailure(
-        "browser_upload_authorization_required",
-        "browser uploads require an explicit Magi staging directory",
-      );
-    }
-    const root = await realpath(this.#uploadRoot).catch(() => null);
-    if (!root) {
-      throw protocolFailure(
-        "browser_upload_authorization_unavailable",
-        "the configured Magi upload staging directory is unavailable",
-      );
-    }
-    const authorized: string[] = [];
+  /**
+   * 上传的文件路径由 daemon 在工具调用前按当前访问档位的路径范围授权（与 file_read 同一套策略），
+   * 并解析成绝对路径；Worker 只确认它是一个真实存在的普通文件，不再自建第二套授权边界。
+   */
+  private async validateUploadPaths(paths: string[]): Promise<string[]> {
+    const validated: string[] = [];
     for (const requestedPath of paths) {
       if (!isAbsolute(requestedPath)) {
-        throw protocolFailure("browser_upload_path_outside_boundary", "upload paths must be absolute");
+        throw protocolFailure("browser_upload_file_invalid", "upload paths must be absolute");
       }
       const canonicalPath = await realpath(requestedPath).catch(() => null);
-      if (!canonicalPath || !isWithinPath(root, canonicalPath)) {
-        throw protocolFailure("browser_upload_path_outside_boundary", "upload path is outside Magi staging directory");
+      const metadata = canonicalPath ? await stat(canonicalPath).catch(() => null) : null;
+      if (!canonicalPath || !metadata?.isFile()) {
+        throw protocolFailure("browser_upload_file_invalid", "upload path must be an existing regular file");
       }
-      const metadata = await stat(canonicalPath).catch(() => null);
-      if (!metadata?.isFile()) {
-        throw protocolFailure("browser_upload_file_invalid", "upload path must be a regular file");
-      }
-      authorized.push(canonicalPath);
+      validated.push(canonicalPath);
     }
-    return authorized;
+    return validated;
   }
 
   private async thirdParty(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -3060,14 +3041,6 @@ function networkConditions(value: string): Record<string, unknown> {
   const preset = presets[value.toLowerCase()];
   if (!preset) throw protocolFailure("browser_network_preset_invalid", `unknown network preset: ${value}`);
   return { offline: false, ...preset };
-}
-
-function isWithinPath(root: string, candidate: string): boolean {
-  const child = relative(root, candidate);
-  return child !== ""
-    && child !== ".."
-    && !child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
-    && !isAbsolute(child);
 }
 
 function snapshotTarget(args: Record<string, unknown>, prefix = ""): BrowserSnapshotTarget {

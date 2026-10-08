@@ -629,6 +629,30 @@ pub fn tool_path_access_requests(
         crate::BuiltinToolName::FileRead | crate::BuiltinToolName::ViewImage => {
             push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);
         }
+        crate::BuiltinToolName::BrowserUploadFile => {
+            // 把本地文件交给网页上传，等同于读取这些文件：与 file_read 使用同一套路径范围。
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["file_path"],
+                read,
+                workspace_root_path,
+            );
+            let listed = object
+                .and_then(|object| object.get("file_paths"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            for path in listed {
+                paths.push(ToolPathAccessRequest {
+                    absolute_path: resolve_tool_path(path, workspace_root_path),
+                    kind: read,
+                });
+            }
+        }
         crate::BuiltinToolName::FileWrite
         | crate::BuiltinToolName::FilePatch
         | crate::BuiltinToolName::FileRemove => {

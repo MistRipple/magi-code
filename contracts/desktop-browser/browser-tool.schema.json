@@ -761,7 +761,7 @@
       "name": "browser_upload_file",
       "rustVariant": "UploadFile",
       "access": "write",
-      "description": "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。只能上传用户授权的文件：file_path / file_paths 必须是位于 Magi 上传暂存目录内的绝对路径。",
+      "description": "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。file_path / file_paths 可以是相对当前工作目录的路径或绝对路径，和 file_read 受同一套路径范围约束（受限档位只能上传工作区内的文件）。",
       "inputSchema": {
         "type": "object",
         "properties": {

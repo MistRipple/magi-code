@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use magi_browser_authority::{PREVIEW_OPEN_PATH, PREVIEW_PATH_PREFIX};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
@@ -15,12 +16,19 @@ use crate::{change_projection::safe_workspace_path, errors::ApiError, state::Api
 const SITE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'";
 
 pub fn routes() -> Router<ApiState> {
+    // 路径来自 network-policy.json：Electron Main 的网络层与请求守卫按同一份路径放行预览。
+    let open_route = PREVIEW_OPEN_PATH
+        .strip_prefix("/api")
+        .expect("preview open path must live under /api");
+    let asset_route = format!(
+        "{}{{preview_token}}/{{workspace_id}}/{{*file_path}}",
+        PREVIEW_PATH_PREFIX
+            .strip_prefix("/api")
+            .expect("preview path prefix must live under /api"),
+    );
     Router::new()
-        .route("/files/site-open", get(open_site_preview))
-        .route(
-            "/files/site/{preview_token}/{workspace_id}/{*file_path}",
-            get(serve_site_asset),
-        )
+        .route(open_route, get(open_site_preview))
+        .route(&asset_route, get(serve_site_asset))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1217,7 +1217,7 @@ test("文件上传支持单文件和多文件 file input", async () => {
     if (method === "DOM.querySelector") return { nodeId: 2 };
     return {};
   });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   const result = await runtime.execute("upload-files", binding, {
     type: "devtools",
     payload: {
@@ -1255,7 +1255,7 @@ test("文件上传拒绝无法解析为 file input 的快照目标", async () =>
     if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
     return {};
   });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   const result = await runtime.execute("upload-text-input", binding, {
     type: "devtools",
     payload: {
@@ -1269,11 +1269,10 @@ test("文件上传拒绝无法解析为 file input 的快照目标", async () =>
   await rm(uploadRoot, { recursive: true, force: true });
 });
 
-test("文件上传拒绝 Magi staging 目录之外的路径", async () => {
-  const uploadRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-root-"));
-  const outsideRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-outside-"));
-  const outsidePath = join(outsideRoot, "outside.txt");
-  await writeFile(outsidePath, "outside");
+test("文件上传只接受真实存在的绝对路径普通文件", async () => {
+  const root = await mkdtemp(join(tmpdir(), "magi-browser-upload-invalid-"));
+  const directoryPath = join(root, "dir");
+  await mkdir(directoryPath);
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -1289,22 +1288,25 @@ test("文件上传拒绝 Magi staging 目录之外的路径", async () => {
     if (method === "DOM.querySelector") return { nodeId: 2 };
     return {};
   });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
-  const result = await runtime.execute("upload-outside", binding, {
-    type: "devtools",
-    payload: {
-      tab_id: binding.tab_id,
-      operation: "upload_file",
-      arguments: { element_ref: "e:1:1", file_path: outsidePath },
-    },
-  });
-  assert.equal(result.outcome.status, "failed");
-  assert.equal(result.outcome.payload.code, "browser_upload_path_outside_boundary");
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  for (const [name, filePath] of [
+    ["relative", "relative/first.txt"],
+    ["missing", join(root, "missing.txt")],
+    ["directory", directoryPath],
+  ] as const) {
+    const result = await runtime.execute(`upload-${name}`, binding, {
+      type: "devtools",
+      payload: {
+        tab_id: binding.tab_id,
+        operation: "upload_file",
+        arguments: { element_ref: "e:1:1", file_path: filePath },
+      },
+    });
+    assert.equal(result.outcome.status, "failed", name);
+    assert.equal(result.outcome.payload.code, "browser_upload_file_invalid", name);
+  }
   assert.equal(port.requests.some((request) => request.method === "DOM.setFileInputFiles"), false);
-  await Promise.all([
-    rm(uploadRoot, { recursive: true, force: true }),
-    rm(outsideRoot, { recursive: true, force: true }),
-  ]);
+  await rm(root, { recursive: true, force: true });
 });
 
 test("浏览器截图收到快照根节点时必须捕获整页范围而不是把 root 当成 DOM ref", async () => {

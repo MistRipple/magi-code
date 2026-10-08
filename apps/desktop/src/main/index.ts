@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -201,16 +201,10 @@ if (singleInstance) {
         },
       });
       await surfaces.clearDownloads();
-      const browserUploadRoot = join(
-        app.getPath("userData"),
-        "browser-uploads",
-      );
-      mkdirSync(browserUploadRoot, { recursive: true });
       surfaceManager = surfaces;
       worker = new AutomationWorker({
         entryPath: paths.workerEntry,
         surfaceManager: surfaces,
-        uploadRoot: browserUploadRoot,
         onFailure: async (cause) => {
           if (shuttingDown) return;
           workerInvalidatedDesktopConnection =

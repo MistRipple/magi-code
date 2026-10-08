@@ -692,12 +692,19 @@ impl BrowserToolRuntimeDependencies {
         } else {
             None
         };
+        // 上传的文件路径已由工具调用前的访问档位策略授权（与 file_read 同一套路径范围），
+        // 这里只把它解析成 Worker 可直接使用的绝对路径。
+        let host_arguments = if operation == "upload_file" {
+            resolve_upload_file_arguments(arguments, scope.context)?
+        } else {
+            arguments.clone()
+        };
         let reply = client
             .request(BrowserHostCommand::Devtools {
                 tab_id: tab.tab_id.clone(),
                 control,
                 operation: operation.to_string(),
-                arguments: Value::Object(arguments.clone()),
+                arguments: Value::Object(host_arguments),
             })
             .await
             .map_err(browser_host_client_error)?;
@@ -1934,6 +1941,39 @@ fn validate_devtools_arguments(
         _ => {}
     }
     Ok(())
+}
+
+fn resolve_upload_file_arguments(
+    arguments: &Map<String, Value>,
+    context: &magi_tool_runtime::ToolExecutionContext,
+) -> Result<Map<String, Value>, BrowserToolError> {
+    let working_directory = context.working_directory.as_deref().ok_or_else(|| {
+        BrowserToolError::new(
+            "browser_upload_working_directory_unavailable",
+            "当前任务没有工作目录，无法解析要上传的文件路径",
+        )
+    })?;
+    let home = dirs::home_dir();
+    let resolve = |raw: &str| -> Result<String, BrowserToolError> {
+        magi_core::HostPath::resolve_native_input(raw, Some(working_directory), home.as_deref())
+            .map(|path| path.into_path_buf().display().to_string())
+            .map_err(|_| {
+                BrowserToolError::new("invalid_arguments", "browser_upload_file 的文件路径无效")
+            })
+    };
+    let mut resolved = arguments.clone();
+    if let Some(path) = arguments.get("file_path").and_then(Value::as_str) {
+        resolved.insert("file_path".to_string(), Value::String(resolve(path)?));
+    }
+    if let Some(paths) = arguments.get("file_paths").and_then(Value::as_array) {
+        let paths = paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        resolved.insert("file_paths".to_string(), json!(paths));
+    }
+    Ok(resolved)
 }
 
 fn is_supported_fill_value(value: &Value) -> bool {

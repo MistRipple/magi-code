@@ -5153,6 +5153,52 @@ mod tests {
     }
 
     #[test]
+    fn browser_upload_file_uses_the_same_read_scope_as_file_read() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-outside-upload-source.txt");
+        let mut task = test_task(
+            "task-browser-upload-scope",
+            "task-browser-upload-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        let decide = |arguments: serde_json::Value| {
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::BrowserUploadFile.as_str(),
+                &arguments.to_string(),
+                Some(&workspace_root),
+            )
+        };
+
+        assert!(
+            decide(serde_json::json!({
+                "element_ref": "e:1:2",
+                "file_path": "assets/logo.png",
+            }))
+            .is_none(),
+            "工作区内的相对路径可以上传"
+        );
+        for arguments in [
+            serde_json::json!({
+                "element_ref": "e:1:2",
+                "file_path": outside_path.display().to_string(),
+            }),
+            serde_json::json!({
+                "element_ref": "e:1:2",
+                "file_paths": ["assets/logo.png", outside_path.display().to_string()],
+            }),
+        ] {
+            let decision = decide(arguments).expect("工作区外的文件不能被上传");
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        }
+    }
+
+    #[test]
     fn restricted_default_scope_checks_filesystem_alias_paths() {
         let workspace = tempdir().expect("workspace tempdir");
         let workspace_root = workspace.path().to_path_buf();

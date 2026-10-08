@@ -219,7 +219,7 @@ impl BrowserToolKind {
                 "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
             }
             Self::UploadFile => {
-                "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。只能上传用户授权的文件：file_path / file_paths 必须是位于 Magi 上传暂存目录内的绝对路径。"
+                "将一个或多个本地文件设置到当前页面的 file input，元素必须来自当前浏览器快照。file_path / file_paths 可以是相对当前工作目录的路径或绝对路径，和 file_read 受同一套路径范围约束（受限档位只能上传工作区内的文件）。"
             }
             Self::ClickAt => {
                 "在当前浏览器页面的 CSS 坐标位置点击，支持双击；用于快照无法检查的元素，例如跨域 iframe 内的控件。"
