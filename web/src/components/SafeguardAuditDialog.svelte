@@ -2,9 +2,20 @@
   import { onMount } from 'svelte';
   import Modal from './Modal.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { getSafeguardAuditPage, type SafeguardAuditEntry } from '../web/agent-api';
+  import Icon from './Icon.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
+  import { addToast } from '../stores/messages.svelte';
+  import {
+    deleteSafeguardAudit,
+    getSafeguardAuditPage,
+    type SafeguardAuditEntry,
+  } from '../web/agent-api';
 
-  let { onClose } = $props<{ onClose: () => void }>();
+  let { onClose, onCountChange } = $props<{
+    onClose: () => void;
+    /** 删除后把最新总数交回设置页，页面上的「已记录 N 条」随之更新。 */
+    onCountChange: (count: number) => void;
+  }>();
 
   let entries = $state<SafeguardAuditEntry[]>([]);
   let total = $state(0);
@@ -28,6 +39,35 @@
   }
 
   onMount(() => { void load(); });
+
+  let deleting = $state(false);
+
+  async function remove(selection: { eventIds: string[] } | { all: true }): Promise<void> {
+    deleting = true;
+    try {
+      const result = await deleteSafeguardAudit(selection);
+      total = result.total;
+      onCountChange(result.total);
+      if ('all' in selection) {
+        entries = [];
+        nextBefore = null;
+      } else {
+        const removed = new Set(selection.eventIds);
+        entries = entries.filter((entry) => !removed.has(entry.eventId));
+      }
+    } catch (error) {
+      addToast('error', error instanceof Error ? error.message : String(error));
+    } finally {
+      deleting = false;
+    }
+  }
+
+  async function clearAll(): Promise<void> {
+    if (!(await confirmMessage(i18n.t('settings.safeguard.audit.clearConfirm', { count: total }), { tone: 'danger' }))) {
+      return;
+    }
+    await remove({ all: true });
+  }
 
   function decisionLabel(decision: string | null): string {
     switch (decision) {
@@ -64,6 +104,14 @@
             <span class="audit-decision" data-decision={entry.decision}>{decisionLabel(entry.decision)}</span>
             <span class="audit-tool">{entry.toolName ?? '-'}</span>
             <time class="audit-time">{formatTime(entry.occurredAt)}</time>
+            <button
+              type="button"
+              class="btn-icon btn-icon--sm btn-icon--danger"
+              title={i18n.t('settings.safeguard.audit.delete')}
+              aria-label={i18n.t('settings.safeguard.audit.delete')}
+              disabled={deleting}
+              onclick={() => void remove({ eventIds: [entry.eventId] })}
+            ><Icon name="delete" size={12} /></button>
           </div>
           <div class="audit-rules">
             {#each entry.matchedRules as rule}
@@ -86,11 +134,18 @@
 
   <div class="audit-footer">
     <span class="audit-count">{i18n.t('settings.safeguard.audit.shown', { shown: entries.length, total })}</span>
-    {#if nextBefore !== null && !loading}
-      <button type="button" class="btn btn--sm" onclick={() => void load(nextBefore)}>
-        {i18n.t('settings.safeguard.audit.loadMore')}
-      </button>
-    {/if}
+    <span class="audit-footer-actions">
+      {#if nextBefore !== null && !loading}
+        <button type="button" class="btn btn--sm" onclick={() => void load(nextBefore)}>
+          {i18n.t('settings.safeguard.audit.loadMore')}
+        </button>
+      {/if}
+      {#if total > 0}
+        <button type="button" class="btn btn--sm btn--danger" disabled={deleting} onclick={() => void clearAll()}>
+          {i18n.t('settings.safeguard.audit.clearAll')}
+        </button>
+      {/if}
+    </span>
   </div>
 </Modal>
 
@@ -110,5 +165,6 @@
   .audit-rules code { padding: 0 6px; border-radius: 4px; font-size: 12px; background: color-mix(in srgb, var(--foreground) 8%, transparent); }
   .audit-session { color: var(--foreground-muted); font-size: var(--text-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .audit-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-top: var(--space-3); }
+  .audit-footer-actions { display: flex; gap: var(--space-2); }
   .audit-count { color: var(--foreground-muted); font-size: var(--text-xs); }
 </style>

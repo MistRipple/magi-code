@@ -3072,6 +3072,16 @@ export async function getSafeguardAuditPage(before?: number | null): Promise<Saf
   }
 }
 
+export async function deleteSafeguardAudit(
+  selection: { eventIds: string[] } | { all: true },
+): Promise<{ removed: number; total: number }> {
+  return await postGlobalJson<{ removed: number; total: number }>(
+    '/api/settings/safeguard/audit/delete',
+    selection,
+    'delete safeguard audit',
+  );
+}
+
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
     const response = await getTransport().request(agentUrl('/api/settings/stats'));

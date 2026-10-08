@@ -23,6 +23,7 @@ mod performance;
 mod public_canonical;
 mod request_guard;
 mod routes;
+mod safeguard_audit;
 mod scope_binding;
 mod session_activity;
 pub(crate) mod session_continue;

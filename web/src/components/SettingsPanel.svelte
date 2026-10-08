@@ -2,6 +2,7 @@
 import '../styles/settings.css';
 import SettingsStatsTab from './SettingsStatsTab.svelte';
 import SettingsRulesTab from './SettingsRulesTab.svelte';
+import SettingsSafeguardTab from './SettingsSafeguardTab.svelte';
 import SettingsAgentsTab from './SettingsAgentsTab.svelte';
 import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
@@ -211,7 +212,10 @@ import {
         />
       {:else if store.activeTab === 'rules'}
         <!-- 规则 Tab -->
-        <SettingsRulesTab bind:userRules={store.userRules} bind:newCustomRule={store.newCustomRule} SAFEGUARD_CATEGORIES={store.SAFEGUARD_CATEGORIES} getRulesForCategory={store.getRulesForCategory} toggleSafeguardRule={store.toggleSafeguardRule} updateSafeguardRuleAction={store.updateSafeguardRuleAction} removeCustomRule={store.removeCustomRule} addCustomRule={store.addCustomRule} userRulesSaveStatus={store.userRulesSaveStatus} safeguardSaveStatus={store.safeguardSaveStatus} safeguardAuditCount={store.safeguardAuditCount} safeguardAuditPersistenceHealthy={store.safeguardAuditPersistenceHealthy} conversationDisplayMode={store.conversationDisplayMode} conversationDisplaySaveStatus={store.conversationDisplaySaveStatus} saveConversationDisplayMode={store.saveConversationDisplayMode}
+        <SettingsRulesTab bind:userRules={store.userRules} userRulesSaveStatus={store.userRulesSaveStatus} conversationDisplayMode={store.conversationDisplayMode} conversationDisplaySaveStatus={store.conversationDisplaySaveStatus} saveConversationDisplayMode={store.saveConversationDisplayMode}
+        />
+      {:else if store.activeTab === 'safeguard'}
+        <SettingsSafeguardTab bind:newCustomRule={store.newCustomRule} SAFEGUARD_CATEGORIES={store.SAFEGUARD_CATEGORIES} getRulesForCategory={store.getRulesForCategory} toggleSafeguardRule={store.toggleSafeguardRule} updateSafeguardRuleAction={store.updateSafeguardRuleAction} removeCustomRule={store.removeCustomRule} addCustomRule={store.addCustomRule} safeguardSaveStatus={store.safeguardSaveStatus} safeguardAuditCount={store.safeguardAuditCount} safeguardAuditPersistenceHealthy={store.safeguardAuditPersistenceHealthy} setSafeguardAuditCount={store.setSafeguardAuditCount}
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->

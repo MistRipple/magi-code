@@ -738,6 +738,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/safeguard/save", post(save_safeguard_config))
         .route("/settings/safeguard/audit", get(list_safeguard_audit))
         .route(
+            "/settings/safeguard/audit/delete",
+            post(delete_safeguard_audit),
+        )
+        .route(
             "/settings/registry/role-templates",
             get(list_role_templates),
         )
@@ -1590,7 +1594,6 @@ async fn save_user_rules(
 
 /// 安全防护审计记录的分页读取：最新的在前，`before` 是上一页最后一条的 sequence。
 /// 账本只存规则命中的摘要（工具、决策、命中规则），不含命令参数。
-const SAFEGUARD_AUDIT_EVENT_TYPE: &str = "security.safety.evaluated";
 const SAFEGUARD_AUDIT_DEFAULT_PAGE: usize = 50;
 const SAFEGUARD_AUDIT_MAX_PAGE: usize = 100;
 
@@ -1619,12 +1622,7 @@ async fn list_safeguard_audit(
     };
 
     let (total, mut page) = state.event_bus.with_audit_usage_ledger(|ledger| {
-        let matching = || {
-            ledger
-                .audit_entries
-                .iter()
-                .filter(|entry| entry.event_type == SAFEGUARD_AUDIT_EVENT_TYPE)
-        };
+        let matching = || crate::safeguard_audit::visible_entries(ledger);
         let total = matching().count();
         let page = matching()
             .rev()
@@ -1669,6 +1667,36 @@ async fn list_safeguard_audit(
         "total": total,
         "entries": entries,
         "nextBefore": next_before,
+    })))
+}
+
+/// 删除审计记录：`{ "eventIds": [...] }` 删除所选，`{ "all": true }` 清空当前全部。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteSafeguardAuditRequest {
+    #[serde(default, rename = "eventIds")]
+    event_ids: Option<Vec<String>>,
+    #[serde(default)]
+    all: bool,
+}
+
+async fn delete_safeguard_audit(
+    State(state): State<ApiState>,
+    Json(request): Json<DeleteSafeguardAuditRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let selection = match (request.event_ids, request.all) {
+        (Some(ids), false) if !ids.is_empty() => crate::safeguard_audit::AuditSelection::Ids(ids),
+        (None, true) => crate::safeguard_audit::AuditSelection::All,
+        _ => {
+            return Err(ApiError::InvalidInput(
+                "必须且只能指定 eventIds（非空）或 all=true 之一".to_string(),
+            ));
+        }
+    };
+    let removed = crate::safeguard_audit::remove(&state.event_bus, selection);
+    Ok(Json(json!({
+        "removed": removed,
+        "total": crate::safeguard_audit::visible_count(&state.event_bus),
     })))
 }
 
@@ -5967,6 +5995,72 @@ mod tests {
                     .await
                     .is_err()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn safeguard_audit_deletion_hides_records_without_touching_later_ones() {
+        let state = test_state();
+        let publish = |id: &str| {
+            state.event_bus.publish(EventEnvelope::audit(
+                EventId::new(id),
+                "security.safety.evaluated",
+                json!({ "tool_name": "shell", "decision": "audit_only", "matched_rules": [] }),
+            ));
+        };
+        for id in ["audit-a", "audit-b", "audit-c"] {
+            publish(id);
+        }
+        let list = || async {
+            list_safeguard_audit(State(state.clone()), Query(HashMap::new()))
+                .await
+                .expect("list")
+                .0
+        };
+        let delete = |body: serde_json::Value| async {
+            delete_safeguard_audit(
+                State(state.clone()),
+                Json(serde_json::from_value(body).expect("request")),
+            )
+            .await
+        };
+
+        let removed = delete(json!({ "eventIds": ["audit-b", "not-there"] }))
+            .await
+            .expect("delete selected")
+            .0;
+        assert_eq!(removed["removed"], json!(1));
+        assert_eq!(removed["total"], json!(2));
+        let ids = list().await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["eventId"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["audit-c", "audit-a"]);
+
+        let cleared = delete(json!({ "all": true })).await.expect("clear").0;
+        assert_eq!(cleared["removed"], json!(2));
+        assert_eq!(cleared["total"], json!(0));
+        publish("audit-d");
+        let after = list().await;
+        assert_eq!(after["total"], json!(1));
+        assert_eq!(after["entries"][0]["eventId"], json!("audit-d"));
+
+        // 重复清空不产生新的墓碑，也不报错。
+        let again = delete(json!({ "eventIds": ["audit-a"] }))
+            .await
+            .expect("again")
+            .0;
+        assert_eq!(again["removed"], json!(0));
+
+        for invalid in [
+            json!({}),
+            json!({ "eventIds": [] }),
+            json!({ "all": false }),
+            json!({ "all": true, "eventIds": ["audit-d"] }),
+        ] {
+            assert!(delete(invalid).await.is_err());
         }
     }
 

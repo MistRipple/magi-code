@@ -323,7 +323,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let mcpAutoConnectStale = false;
 
   // 当前激活的 Tab
-  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "project">(
+  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "safeguard" | "project">(
     "model",
   );
 
@@ -4071,6 +4071,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     saveConversationDisplayMode,
     get safeguardSaveStatus() {
       return safeguardSaveStatus;
+    },
+    setSafeguardAuditCount(count: number) {
+      safeguardAuditCount = Math.max(0, count);
     },
     get safeguardAuditCount() {
       return safeguardAuditCount;

@@ -3303,13 +3303,7 @@ impl ApiState {
         let public_mcp_servers = public_mcp_servers_section(&snapshot);
         let audit_ledger = self.audit_usage_ledger_dto();
         // 只统计数量：读锁内直接扫描，不克隆整本账本。
-        let safeguard_audit_count = self.event_bus.with_audit_usage_ledger(|ledger| {
-            ledger
-                .audit_entries
-                .iter()
-                .filter(|entry| entry.event_type == "security.safety.evaluated")
-                .count()
-        });
+        let safeguard_audit_count = crate::safeguard_audit::visible_count(&self.event_bus);
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workers"),
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
