@@ -382,6 +382,7 @@ pub fn map_recovery_input_error(
             recovery_id: recovery_id.to_string(),
         },
         magi_core::DomainError::InvalidState { message }
+        | magi_core::DomainError::GoalRejected { message, .. }
         | magi_core::DomainError::Validation { message } => {
             RecoveryValidationError::Mismatch { message }
         }

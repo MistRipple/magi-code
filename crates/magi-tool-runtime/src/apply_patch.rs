@@ -6,12 +6,11 @@
 use crate::{
     BuiltinToolAccessMode, ToolExecutionContext,
     builtin::{
-        failure::{ToolFailure, filesystem_failure, path_resolution_failure},
-        field_string,
-        fs_support::write_file_atomically,
-        resolve_path_with_context,
+        failure::{filesystem_failure, path_resolution_failure},
+        field_string, resolve_path_with_context,
     },
 };
+use magi_core::{ToolFailure, fs_atomic::write_atomic_preserving_target};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -505,7 +504,7 @@ struct AppliedChange {
 
 fn restore_original(change: &AppliedChange) -> io::Result<()> {
     match &change.original {
-        Some(bytes) => write_file_atomically(&change.path, bytes),
+        Some(bytes) => write_atomic_preserving_target(&change.path, bytes),
         None => match fs::remove_file(&change.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
@@ -543,7 +542,7 @@ fn commit_staged_changes(staged: BTreeMap<PathBuf, Option<String>>) -> Result<()
             Some(content) => path
                 .parent()
                 .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| write_file_atomically(path, content.as_bytes())),
+                .and_then(|()| write_atomic_preserving_target(path, content.as_bytes())),
             None => match fs::remove_file(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 other => other,

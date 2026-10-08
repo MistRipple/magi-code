@@ -24,14 +24,17 @@
 
 ## 实现入口
 
-- 失败载荷的唯一出口是 `crates/magi-tool-runtime/src/builtin/failure.rs` 的 `ToolFailure`：
-  `error_code`（`{tool}_{类别}`）、`error`、可选 `instruction` 与附加字段；参数问题用 `invalid_input`，
+- 失败载荷的唯一出口是 `magi_core::ToolFailure`（`crates/magi-core/src/tool_failure.rs`）：
+  `error_code`（`{tool}_{类别}`）、`error`、可选 `instruction` 与附加字段。内置工具运行时、`update_plan`、
+  目标工具（`get_goal` / `create_goal` / `update_goal`）都从它构造失败载荷，不各写一份。
+  `crates/magi-tool-runtime/src/builtin/failure.rs` 在其上提供文件工具的分类：参数问题用 `invalid_input`，
   文件系统问题用 `filesystem_failure`，路径解析问题用 `path_resolution_failure`。
 - 文件系统失败按 `io::ErrorKind` 归类，各工具共用同一组类别：`not_found`、`permission_denied`、`already_exists`、
   `not_a_directory`、`is_a_directory`、`directory_not_empty`、`storage_full`、`read_only_filesystem`、`not_utf8_text`、
   `io_failed`；每类都有对应的 `instruction`。失败载荷不带解析后的绝对路径，也不带系统错误文本。
 - 工具实现按职责分在 `builtin/` 下：`files`（读、写、局部修改、目录、差异预览）、`file_transfer`（复制、移动、删除）、
-  `search`、`shell`、`process`、`web`、`knowledge`、`diagram`；`fs_support` 放原子写入与路径包含关系。
+  `search`、`shell`、`process`、`web`、`knowledge`、`diagram`；`fs_support` 放路径包含关系与临时路径；原子写入只有一份，
+  在 `magi_core::fs_atomic::write_atomic_preserving_target`（保留符号链接目标与权限位）。
 
 ## 文件工具
 
@@ -108,6 +111,19 @@
 - 失败带稳定的 `error_code`（`plan_revision_conflict`、`plan_id_mismatch`、`plan_invalid_transition` ……）和 `instruction`。
 - 失败取决于当前计划（版本冲突、缺 planId / itemId、非法状态转换、移除进行中步骤……）时附带 `current_plan`，
   版本冲突的指引直接写明应当使用的 `expected_revision`。
+
+## 目标工具（get_goal / create_goal / update_goal）
+
+- 目标状态的权威是会话目标存储；工具只做参数校验并转述存储的拒绝原因。存储以 `DomainError::GoalRejected { reason, .. }`
+  （`magi_core::GoalRejection`）给出类别，工具层把它映射成 `{tool}_{reason}`：
+  `already_unfinished`、`not_active`、`terminal`、`not_owned_by_turn`、`revision_conflict`、`plan_missing`、
+  `plan_revision_required`、`plan_revision_conflict`、`plan_unfinished`、`plan_tasks_active`、`evidence_required`、
+  `illegal_transition`、`concurrent_modification`、`no_orchestrator_thread`；参数问题是 `{tool}_invalid_input`，
+  目标不存在是 `{tool}_not_found`，其余存储故障是 `{tool}_failed`。
+- 每个失败都带 `instruction`，如 `control_revision` 冲突时指引先 `get_goal` 取得最新的 `goal_id`、`control_revision`、
+  `plan.revision` 再提交；失败取决于当前目标或计划时附带 `goal` 与 `plan`，模型据此重新提交而不是凭记忆重试。
+- 成功的 `status` 一律是规范标签 `succeeded`；创建 / 更新 / 记录阻塞这类区别放在 `outcome`
+  （`created` / `updated` / `blocker_observed`），不再复用 `status`。
 
 ## 项目状态目录
 

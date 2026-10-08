@@ -21,7 +21,7 @@ use std::{
 
 use super::{
     context_working_directory,
-    failure::{ToolFailure, invalid_input, path_resolution_failure},
+    failure::{invalid_input, path_resolution_failure},
     field_bool, field_string, field_usize, parse_json_object,
     process::ProcessExecutionScope,
     process::{
@@ -31,6 +31,7 @@ use super::{
     },
     required_string_field, resolve_path_with_context,
 };
+use magi_core::ToolFailure;
 
 // Shell 命令可能包含构建、测试或用户明确要求的等待。默认超时必须覆盖常见
 // 的长命令，不能把没有输出但仍在正常运行的命令误判成失败。

@@ -4,7 +4,7 @@
 //! 这里的 `*_with_surface` 函数由它委托，失败码前缀因此是 `shell_exec_*`。
 
 use super::{
-    failure::{ToolFailure, invalid_input},
+    failure::invalid_input,
     field_string, field_usize, parse_json_object, required_string_field,
     shell::{
         ACTIVE_SHELL_EXECUTIONS, SHELL_OUTPUT_MAX_BYTES, ShellInvocation,
@@ -13,6 +13,7 @@ use super::{
     },
 };
 use crate::{BuiltinToolAccessMode, ToolExecutionContext, ToolExecutionContextQuery};
+use magi_core::ToolFailure;
 use magi_core::UtcMillis;
 use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde_json::Value;

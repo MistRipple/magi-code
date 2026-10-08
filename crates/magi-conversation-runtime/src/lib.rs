@@ -19,6 +19,7 @@ pub mod execution_admission;
 pub mod execution_chain_recovery;
 pub mod external_approval;
 pub mod external_tool;
+mod goal_tool_failure;
 pub mod human_wait;
 mod mailbox;
 pub mod model_config;
@@ -59,6 +60,7 @@ pub use builtin_tool_schema::{
 };
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
 pub use driver::{RoundOutcome, TurnDriver};
+pub use human_wait::{HumanWait, HumanWaitGate, HumanWaitHook};
 pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
 pub use registry::{ConversationRegistry, TaskSignalBoundary, TaskSignalCommitError};
 pub use session_turn_coordinator::{
@@ -104,7 +106,6 @@ pub use user_question::{
     PendingUserQuestion, UserQuestion, UserQuestionAnswer, UserQuestionOption,
     UserQuestionRegistry, UserQuestionResponse,
 };
-pub use human_wait::{HumanWait, HumanWaitGate, HumanWaitHook};
 
 #[cfg(test)]
 pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {

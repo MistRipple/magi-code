@@ -1,11 +1,12 @@
 use crate::{
     BuiltinToolAccessMode, ToolExecutionContext,
     builtin::{
-        failure::{ToolFailure, filesystem_failure, invalid_input, path_resolution_failure},
+        failure::{filesystem_failure, invalid_input, path_resolution_failure},
         field_string, parse_json_object, resolve_path_with_context,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use magi_core::ToolFailure;
 use serde_json::Value;
 use std::fs;
 

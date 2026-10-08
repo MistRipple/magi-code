@@ -1,12 +1,11 @@
 //! 文件读取、写入、局部修改与差异预览。复制、移动、删除见 `file_transfer`。
 
 use super::{
-    failure::{ToolFailure, filesystem_failure, invalid_input, path_resolution_failure},
-    field_bool, field_string, field_usize,
-    fs_support::write_file_atomically,
-    parse_json_object, resolve_path_with_context,
+    failure::{filesystem_failure, invalid_input, path_resolution_failure},
+    field_bool, field_string, field_usize, parse_json_object, resolve_path_with_context,
 };
 use crate::{BuiltinToolAccessMode, ToolExecutionContext};
+use magi_core::{ToolFailure, fs_atomic::write_atomic_preserving_target};
 use serde_json::Value;
 use std::{fs, io::Read, path::Path};
 
@@ -211,7 +210,7 @@ pub(super) fn execute_file_write(input: &str, context: &ToolExecutionContext) ->
         }
     }
 
-    if let Err(error) = write_file_atomically(&path, content.as_bytes()) {
+    if let Err(error) = write_atomic_preserving_target(&path, content.as_bytes()) {
         return filesystem_failure("file_write", "写入文件", &path, &error).into_payload();
     }
 
@@ -313,7 +312,7 @@ pub(super) fn execute_file_patch(input: &str, context: &ToolExecutionContext) ->
             .into_payload();
     }
 
-    if let Err(error) = write_file_atomically(&path, result.as_bytes()) {
+    if let Err(error) = write_atomic_preserving_target(&path, result.as_bytes()) {
         return filesystem_failure("file_patch", "写回文件", &path, &error).into_payload();
     }
 

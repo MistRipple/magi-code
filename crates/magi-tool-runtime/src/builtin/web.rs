@@ -11,9 +11,10 @@
 //! 返回给模型的失败信息只描述失败类别（超时、域名无法解析、HTTP 状态码……），
 //! 不暴露底层错误文本、内部地址或原始响应；完整的错误链只写日志。
 
-use super::{failure::ToolFailure, parse_json_object, required_string_field};
+use super::{parse_json_object, required_string_field};
 use crate::BuiltinToolAccessMode;
 use base64::Engine as _;
+use magi_core::ToolFailure;
 use reqwest::{
     Url,
     blocking::{Client, Response},

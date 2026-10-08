@@ -4,78 +4,8 @@
 //! （`{tool}_{类别}`）、面向模型的 `error`（只描述类别，不带底层错误文本）和 `instruction`
 //! （下一步怎么做）。底层错误的完整内容只写日志。
 
-use magi_core::HostPathError;
-use serde_json::{Map, Value};
+use magi_core::{HostPathError, ToolFailure};
 use std::{fmt, io, path::Path};
-
-/// 一次工具失败。`status` 为 `failed`（执行出错）或 `rejected`（被规则拒绝）。
-pub(crate) struct ToolFailure {
-    tool: String,
-    rejected: bool,
-    error_code: String,
-    error: String,
-    instruction: Option<String>,
-    extra: Map<String, Value>,
-}
-
-impl ToolFailure {
-    /// `kind` 是失败类别，`error_code` 为 `{tool}_{kind}`。
-    pub(crate) fn new(tool: &str, kind: &str, error: impl Into<String>) -> Self {
-        Self {
-            tool: tool.to_string(),
-            rejected: false,
-            error_code: format!("{tool}_{kind}"),
-            error: error.into(),
-            instruction: None,
-            extra: Map::new(),
-        }
-    }
-
-    /// 错误码不是 `{tool}_{类别}` 形式时使用：同一领域的多个工具共享错误码前缀（如 `git_*`）。
-    pub(crate) fn coded(tool: &str, error_code: &str, error: impl Into<String>) -> Self {
-        Self {
-            tool: tool.to_string(),
-            rejected: false,
-            error_code: error_code.to_string(),
-            error: error.into(),
-            instruction: None,
-            extra: Map::new(),
-        }
-    }
-
-    pub(crate) fn rejected(mut self) -> Self {
-        self.rejected = true;
-        self
-    }
-
-    pub(crate) fn instruction(mut self, instruction: impl Into<String>) -> Self {
-        self.instruction = Some(instruction.into());
-        self
-    }
-
-    pub(crate) fn with(mut self, key: &str, value: impl Into<Value>) -> Self {
-        self.extra.insert(key.to_string(), value.into());
-        self
-    }
-
-    pub(crate) fn into_payload(self) -> String {
-        let mut payload = Map::new();
-        payload.insert("tool".to_string(), Value::String(self.tool));
-        payload.insert(
-            "status".to_string(),
-            Value::String(if self.rejected { "rejected" } else { "failed" }.to_string()),
-        );
-        payload.insert("error_code".to_string(), Value::String(self.error_code));
-        payload.insert("error".to_string(), Value::String(self.error));
-        if let Some(instruction) = self.instruction {
-            payload.insert("instruction".to_string(), Value::String(instruction));
-        }
-        for (key, value) in self.extra {
-            payload.insert(key, value);
-        }
-        Value::Object(payload).to_string()
-    }
-}
 
 /// 参数缺失或形状不对。模型应按工具 schema 修正参数后重新调用。
 pub(crate) fn invalid_input(tool: &str, error: impl Into<String>) -> String {
@@ -235,34 +165,6 @@ mod tests {
 
     fn payload(raw: String) -> Value {
         serde_json::from_str(&raw).expect("failure payload is json")
-    }
-
-    #[test]
-    fn failure_carries_code_status_error_and_instruction() {
-        let value = payload(
-            ToolFailure::new("file_read", "not_found", "路径不存在")
-                .instruction("先确认路径")
-                .with("extra", "/tmp/x")
-                .into_payload(),
-        );
-
-        assert_eq!(value["tool"], "file_read");
-        assert_eq!(value["status"], "failed");
-        assert_eq!(value["error_code"], "file_read_not_found");
-        assert_eq!(value["instruction"], "先确认路径");
-        assert_eq!(value["extra"], "/tmp/x");
-    }
-
-    #[test]
-    fn rejected_failure_uses_rejected_status() {
-        let value = payload(
-            ToolFailure::new("file_remove", "protected_path", "受保护")
-                .rejected()
-                .into_payload(),
-        );
-
-        assert_eq!(value["status"], "rejected");
-        assert!(value.get("instruction").is_none());
     }
 
     #[test]

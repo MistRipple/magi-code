@@ -8,14 +8,13 @@
 
 use super::{
     context_working_directory,
-    failure::{
-        FsFailureKind, ToolFailure, filesystem_failure, invalid_input, path_resolution_failure,
-    },
+    failure::{FsFailureKind, filesystem_failure, invalid_input, path_resolution_failure},
     field_bool, field_string,
     fs_support::{is_same_or_inside, sibling_temp_path},
     parse_json_object, resolve_path_with_context,
 };
 use crate::{BuiltinToolAccessMode, ToolExecutionContext};
+use magi_core::ToolFailure;
 use std::{
     fs,
     io::{self, ErrorKind},

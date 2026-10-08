@@ -1,9 +1,10 @@
-use self::failure::{PathResolveError, ToolFailure, invalid_input};
+use self::failure::{PathResolveError, invalid_input};
 use crate::{
     BuiltinTool, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext, ToolExecutionProgress,
     ToolRuntimeResources, apply_patch::execute_apply_patch, image_generate::execute_image_generate,
     tool_catalog::execute_tool_catalog, view_image::execute_view_image,
 };
+use magi_core::ToolFailure;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};

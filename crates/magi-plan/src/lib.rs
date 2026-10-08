@@ -818,19 +818,15 @@ impl PlanUpdateError {
 
 /// update_plan 的失败结果：稳定错误码 + 修复指引；取决于当前计划状态的失败附带当前计划。
 fn update_plan_failure_payload(error: &PlanUpdateError, current: Option<SessionPlan>) -> String {
-    let mut payload = serde_json::json!({
-        "tool": "update_plan",
-        "status": "failed",
-        "error_code": error.code(),
-        "error": error.to_string(),
-        "instruction": error.instruction(current.as_ref()),
-    });
+    let instruction = error.instruction(current.as_ref());
+    let mut failure = magi_core::ToolFailure::coded("update_plan", error.code(), error.to_string())
+        .instruction(instruction);
     if error.depends_on_current_plan()
-        && let (Some(plan), Some(object)) = (current, payload.as_object_mut())
+        && let Some(plan) = current
     {
-        object.insert("current_plan".to_string(), serde_json::json!(plan));
+        failure = failure.with("current_plan", serde_json::json!(plan));
     }
-    payload.to_string()
+    failure.into_payload()
 }
 
 pub fn execute_update_plan_tool(
@@ -1597,19 +1593,29 @@ mod tests {
     fn stale_revision_failure_hands_the_model_the_current_plan_to_rebase_on() {
         let store = test_store("stale-revision");
         let (created, _) = tool_update(&store, "stale-revision", None, 0, "in_progress");
-        let plan_id = created["plan"]["planId"].as_str().expect("planId").to_string();
+        let plan_id = created["plan"]["planId"]
+            .as_str()
+            .expect("planId")
+            .to_string();
         // 界面或之前的调用把计划推进到了 revision 2。
         let (second, _) = tool_update(&store, "stale-revision", Some(&plan_id), 1, "in_progress");
         assert_eq!(second["plan"]["revision"], 2);
 
-        let (failure, status) = tool_update(&store, "stale-revision", Some(&plan_id), 1, "completed");
+        let (failure, status) =
+            tool_update(&store, "stale-revision", Some(&plan_id), 1, "completed");
 
         assert_eq!(status, magi_core::ExecutionResultStatus::Failed);
         assert_eq!(failure["error_code"], "plan_revision_conflict");
-        assert_eq!(failure["current_plan"]["revision"], 2, "必须带上当前计划，模型才能基于它重新提交");
+        assert_eq!(
+            failure["current_plan"]["revision"], 2,
+            "必须带上当前计划，模型才能基于它重新提交"
+        );
         assert_eq!(failure["current_plan"]["planId"], plan_id);
         let instruction = failure["instruction"].as_str().expect("instruction");
-        assert!(instruction.contains("expected_revision 传 2"), "{instruction}");
+        assert!(
+            instruction.contains("expected_revision 传 2"),
+            "{instruction}"
+        );
     }
 
     #[test]
@@ -1620,8 +1626,15 @@ mod tests {
 
         assert_eq!(status, magi_core::ExecutionResultStatus::Failed);
         assert_eq!(failure["error_code"], "plan_revision_conflict");
-        assert!(failure.get("current_plan").is_none(), "没有计划时没有可附带的内容");
-        assert!(failure["instruction"].as_str().is_some_and(|text| text.contains("expected_revision 传 0")));
+        assert!(
+            failure.get("current_plan").is_none(),
+            "没有计划时没有可附带的内容"
+        );
+        assert!(
+            failure["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("expected_revision 传 0"))
+        );
     }
 
     #[test]
@@ -1652,7 +1665,10 @@ mod tests {
             PlanUpdateError::EmptyPlan,
             PlanUpdateError::MissingPlanId,
             PlanUpdateError::PlanIdMismatch,
-            PlanUpdateError::RevisionConflict { expected: 1, actual: 2 },
+            PlanUpdateError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+            },
             PlanUpdateError::MissingPlan,
             PlanUpdateError::Store("x".to_string()),
         ];

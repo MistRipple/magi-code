@@ -961,7 +961,7 @@ mod tests {
             &first,
             None,
             &(
-                r#"{"tool":"get_goal","status":"ok","goal":null,"plan":null}"#.to_string(),
+                r#"{"tool":"get_goal","status":"succeeded","goal":null,"plan":null}"#.to_string(),
                 ExecutionResultStatus::Succeeded,
             ),
         );

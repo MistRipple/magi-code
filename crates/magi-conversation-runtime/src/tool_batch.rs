@@ -46,6 +46,7 @@ use crate::agent_spawn_preflight::{
     parse_agent_context_references, preflight_agent_spawn, required_bounded_context_text,
 };
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
+use crate::goal_tool_failure;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::task_execution_registry::SpawnedChildExecutionError;
 use crate::tool_execution_ledger::ToolExecutionLedger;
@@ -1596,14 +1597,10 @@ pub(crate) fn execute_goal_tool(
     let parsed = match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(value) => value,
         Err(error) => {
-            return (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "failed",
-                    "error": format!("目标工具参数不是有效 JSON: {error}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
+            return goal_tool_failure::invalid_input(
+                tool.as_str(),
+                format!("目标工具参数不是有效 JSON: {error}"),
+                "参数必须是 JSON 对象，按工具 schema 重新生成后再调用。",
             );
         }
     };
@@ -1619,7 +1616,7 @@ pub(crate) fn execute_goal_tool(
             (
                 serde_json::json!({
                     "tool": tool.as_str(),
-                    "status": "ok",
+                    "status": "succeeded",
                     "goal": goal,
                     "plan": plan,
                 })
@@ -1638,64 +1635,44 @@ pub(crate) fn execute_goal_tool(
                 Some(value) => match value.as_u64() {
                     Some(budget) => Some(budget),
                     None => {
-                        return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "failed",
-                                "error": "token_budget 必须是正整数；用户没有明确预算时传 null",
-                            })
-                            .to_string(),
-                            ExecutionResultStatus::Failed,
+                        return goal_tool_failure::invalid_input(
+                            tool.as_str(),
+                            "token_budget 必须是正整数；用户没有明确预算时传 null",
+                            "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
                         );
                     }
                 },
                 None => {
-                    return (
-                        serde_json::json!({
-                            "tool": tool.as_str(),
-                            "status": "failed",
-                            "error": "create_goal 必须提供 token_budget；用户没有明确预算时传 null",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Failed,
+                    return goal_tool_failure::invalid_input(
+                        tool.as_str(),
+                        "create_goal 必须提供 token_budget；用户没有明确预算时传 null",
+                        "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
                     );
                 }
             };
             if token_budget == Some(0) {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "token_budget 必须大于 0",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                return goal_tool_failure::invalid_input(
+                    tool.as_str(),
+                    "token_budget 必须大于 0",
+                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
                 );
             }
             if token_budget.is_some_and(|budget| budget < MIN_CREATE_GOAL_TOKEN_BUDGET) {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!(
-                            "token_budget 不能低于 {MIN_CREATE_GOAL_TOKEN_BUDGET}；若用户没有明确给出预算，请传 null"
-                        ),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                return goal_tool_failure::invalid_input(
+                    tool.as_str(),
+                    format!(
+                        "token_budget 不能低于 {MIN_CREATE_GOAL_TOKEN_BUDGET}；若用户没有明确给出预算，请传 null"
+                    ),
+                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
                 );
             }
             if token_budget.is_some_and(|budget| {
                 !objective_text_explicitly_allows_goal_budget(objective, budget)
             }) {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "token_budget 必须来自用户目标原文里的明确预算数值；若用户未明确给预算或要求不要设置预算，请传 null",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                return goal_tool_failure::invalid_input(
+                    tool.as_str(),
+                    "token_budget 必须来自用户目标原文里的明确预算数值；若用户未明确给预算或要求不要设置预算，请传 null",
+                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
                 );
             }
             match session_store.create_goal(
@@ -1709,20 +1686,18 @@ pub(crate) fn execute_goal_tool(
                 Ok(goal) => (
                     serde_json::json!({
                         "tool": tool.as_str(),
-                        "status": "created",
+                        "status": "succeeded",
+                        "outcome": "created",
                         "goal": goal,
                     })
                     .to_string(),
                     ExecutionResultStatus::Succeeded,
                 ),
-                Err(error) => (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": error.to_string(),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                Err(error) => goal_tool_failure::store_failure(
+                    tool.as_str(),
+                    error,
+                    session_store,
+                    session_id,
                 ),
             }
         }
@@ -1731,14 +1706,10 @@ pub(crate) fn execute_goal_tool(
                 Some("complete") => GoalStatus::Complete,
                 Some("blocked") => GoalStatus::Blocked,
                 _ => {
-                    return (
-                        serde_json::json!({
-                            "tool": tool.as_str(),
-                            "status": "failed",
-                            "error": "update_goal status 只能是 complete 或 blocked",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Failed,
+                    return goal_tool_failure::invalid_input(
+                        tool.as_str(),
+                        "update_goal status 只能是 complete 或 blocked",
+                        "先用 get_goal 取得 goal_id、control_revision 与 plan.revision，再按工具参数要求重新调用。",
                     );
                 }
             };
@@ -1747,28 +1718,20 @@ pub(crate) fn execute_goal_tool(
                 .and_then(|value| value.as_str())
                 .map(|value| GoalId::new(value.trim().to_string()));
             let Some(goal_id) = goal_id else {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "update_goal 必须提供 get_goal 返回的 goal_id",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                return goal_tool_failure::invalid_input(
+                    tool.as_str(),
+                    "update_goal 必须提供 get_goal 返回的 goal_id",
+                    "先用 get_goal 取得 goal_id、control_revision 与 plan.revision，再按工具参数要求重新调用。",
                 );
             };
             let Some(expected_revision) = parsed
                 .get("expected_revision")
                 .and_then(|value| value.as_u64())
             else {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "update_goal 必须提供 get_goal 返回的 control_revision",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
+                return goal_tool_failure::invalid_input(
+                    tool.as_str(),
+                    "update_goal 必须提供 get_goal 返回的 control_revision",
+                    "先用 get_goal 取得 goal_id、control_revision 与 plan.revision，再按工具参数要求重新调用。",
                 );
             };
             let expected_plan_revision = match parsed.get("expected_plan_revision") {
@@ -1776,26 +1739,18 @@ pub(crate) fn execute_goal_tool(
                 Some(value) => match value.as_u64().filter(|revision| *revision > 0) {
                     Some(revision) => Some(revision),
                     None => {
-                        return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "failed",
-                                "error": "update_goal expected_plan_revision 必须是 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
-                            })
-                            .to_string(),
-                            ExecutionResultStatus::Failed,
+                        return goal_tool_failure::invalid_input(
+                            tool.as_str(),
+                            "update_goal expected_plan_revision 必须是 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
+                            "先用 get_goal 取得 goal_id、control_revision 与 plan.revision，再按工具参数要求重新调用。",
                         );
                     }
                 },
                 None => {
-                    return (
-                        serde_json::json!({
-                            "tool": tool.as_str(),
-                            "status": "failed",
-                            "error": "update_goal 必须提供 expected_plan_revision；使用 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Failed,
+                    return goal_tool_failure::invalid_input(
+                        tool.as_str(),
+                        "update_goal 必须提供 expected_plan_revision；使用 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
+                        "先用 get_goal 取得 goal_id、control_revision 与 plan.revision，再按工具参数要求重新调用。",
                     );
                 }
             };
@@ -1845,7 +1800,8 @@ pub(crate) fn execute_goal_tool(
                 Ok(goal) => (
                     serde_json::json!({
                         "tool": tool.as_str(),
-                        "status": if status == GoalStatus::Blocked && goal.status == GoalStatus::Active {
+                        "status": "succeeded",
+                        "outcome": if status == GoalStatus::Blocked && goal.status == GoalStatus::Active {
                             "blocker_observed"
                         } else {
                             "updated"
@@ -1855,15 +1811,7 @@ pub(crate) fn execute_goal_tool(
                     .to_string(),
                     ExecutionResultStatus::Succeeded,
                 ),
-                Err(error) => (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": error.to_string(),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                ),
+                Err(error) => goal_tool_failure::store_failure(tool.as_str(), error, session_store, session_id),
             }
         }
         _ => unreachable!("execute_goal_tool 只接收 goal 工具"),
@@ -4553,6 +4501,123 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         assert_eq!(parsed["status"].as_str(), Some("succeeded"));
         assert!(!plan_store.is_empty(), "只读访问不能阻止会话内部计划更新");
+    }
+
+    #[test]
+    fn goal_tool_failures_are_classified_and_carry_current_state() {
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let plan_store = crate::test_plan_store("test-plan");
+        let session_id = SessionId::new("session-goal-tool-failures");
+        let workspace_id = Some(WorkspaceId::new("workspace-goal-tool-failures"));
+        session_store
+            .create_session(session_id.clone(), "goal tool failures")
+            .expect("session should exist for goal tools");
+        let task = coordinator_task(test_task(
+            "task-goal-tool-failures",
+            "task-goal-tool-failures",
+            None,
+        ));
+        let call = |name: BuiltinToolName, arguments: serde_json::Value| {
+            let tool_call = ChatToolCall {
+                id: format!("tool-call-{}", name.as_str()),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: name.as_str().to_string(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let (payload, status) = execute_task_tool_call(
+                &event_bus,
+                None,
+                &agent_role_registry,
+                None,
+                None,
+                None,
+                &task_store,
+                &session_store,
+                &execution_registry,
+                &conversation_registry,
+                None,
+                &plan_store,
+                None,
+                &task,
+                &session_id,
+                &workspace_id,
+                None,
+                None,
+                None,
+                &tool_call,
+                None,
+            );
+            (
+                serde_json::from_str::<serde_json::Value>(&payload).expect("payload is json"),
+                status,
+            )
+        };
+
+        let (created, created_status) = call(
+            BuiltinToolName::CreateGoal,
+            serde_json::json!({ "objective": "失败分类", "token_budget": null }),
+        );
+        assert_eq!(created_status, ExecutionResultStatus::Succeeded);
+        assert_eq!(created["status"], "succeeded", "状态只用规范标签");
+        assert_eq!(created["outcome"], "created");
+        let goal_id = created["goal"]["goalId"]
+            .as_str()
+            .expect("goal id")
+            .to_string();
+        let control_revision = created["goal"]["controlRevision"]
+            .as_u64()
+            .expect("revision");
+
+        // 已有未结束的目标：不能再创建，并带回当前目标。
+        let (duplicate, duplicate_status) = call(
+            BuiltinToolName::CreateGoal,
+            serde_json::json!({ "objective": "再来一个", "token_budget": null }),
+        );
+        assert_eq!(duplicate_status, ExecutionResultStatus::Failed);
+        assert_eq!(duplicate["error_code"], "create_goal_already_unfinished");
+        assert_eq!(duplicate["goal"]["goalId"], goal_id.as_str());
+        assert!(duplicate["instruction"].as_str().is_some());
+
+        // 版本过期：带回当前版本，指引用它重新调用。
+        let (stale, stale_status) = call(
+            BuiltinToolName::UpdateGoal,
+            serde_json::json!({
+                "goal_id": goal_id,
+                "status": "complete",
+                "expected_revision": control_revision + 5,
+                "expected_plan_revision": null,
+                "completion_summary": "done",
+                "evidence_refs": []
+            }),
+        );
+        assert_eq!(stale_status, ExecutionResultStatus::Failed);
+        assert_eq!(stale["error_code"], "update_goal_revision_conflict");
+        assert_eq!(stale["goal"]["controlRevision"], control_revision);
+        assert!(
+            stale["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("control_revision"))
+        );
+
+        // 参数缺失是 invalid_input，并指引先 get_goal。
+        let (missing, missing_status) = call(
+            BuiltinToolName::UpdateGoal,
+            serde_json::json!({ "status": "complete" }),
+        );
+        assert_eq!(missing_status, ExecutionResultStatus::Failed);
+        assert_eq!(missing["error_code"], "update_goal_invalid_input");
+        assert!(
+            missing["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("get_goal"))
+        );
     }
 
     #[test]

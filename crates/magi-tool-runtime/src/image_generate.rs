@@ -1,9 +1,9 @@
 use crate::{
     BuiltinToolAccessMode, GeneratedImageData, ImageGenerationExecutionContext,
     ImageGenerationRequest, ToolExecutionContext, ToolRuntimeResources,
-    builtin::failure::ToolFailure, canonicalize_tool_permission_path,
+    canonicalize_tool_permission_path,
 };
-use magi_core::ToolCallId;
+use magi_core::{ToolCallId, ToolFailure};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},

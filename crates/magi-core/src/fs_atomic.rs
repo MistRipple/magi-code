@@ -57,10 +57,36 @@ fn create_unique_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
 /// 不负责创建父目录；调用方应在写前确保父目录存在（与既有 store 行为一致）。
 /// 写入失败时尽量清理残留的临时文件，避免目录里堆积 `.tmp`。
 pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    write_atomic_with_permissions(path, contents.as_ref(), None)
+}
+
+/// 写用户文件：与 `write_atomic` 共用同一套临时文件、fsync 与 rename 机制，另外保证
+/// - 目标是符号链接时写到链接指向的真实文件，链接本身保持不变；
+/// - 已有文件的权限位保持不变（状态文件不需要这些，用户的脚本和配置需要）。
+pub fn write_atomic_preserving_target(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let target = match fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let permissions = fs::metadata(&target)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    write_atomic_with_permissions(&target, contents.as_ref(), permissions)
+}
+
+fn write_atomic_with_permissions(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> io::Result<()> {
     let (temp_path, mut file) = create_unique_temp_file(path)?;
     // 写临时文件并 fsync，确保内容真正落盘后再 rename。
     let flush_result = (|| -> io::Result<()> {
-        file.write_all(contents.as_ref())?;
+        file.write_all(contents)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.sync_all()
     })();
     if let Err(error) = flush_result {
@@ -93,6 +119,46 @@ mod tests {
         let path = dir.path().join("state.json");
         write_atomic(&path, b"hello").expect("write");
         assert_eq!(fs::read_to_string(&path).expect("read"), "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserving_variant_keeps_permissions_and_writes_through_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.sh");
+        fs::write(&real, b"old").expect("seed");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o750)).expect("chmod");
+        let link = dir.path().join("link.sh");
+        symlink(&real, &link).expect("symlink");
+
+        write_atomic_preserving_target(&link, b"new").expect("write through link");
+
+        assert!(fs::symlink_metadata(&link).expect("meta").is_symlink());
+        assert_eq!(fs::read_to_string(&real).expect("read"), "new");
+        assert_eq!(
+            fs::metadata(&real).expect("meta").permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn preserving_variant_creates_missing_files_and_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = dir.path().join("new.txt");
+        write_atomic_preserving_target(&created, b"x").expect("create");
+        assert_eq!(fs::read_to_string(&created).expect("read"), "x");
+
+        // 目标位置是目录：rename 失败，不能留下临时文件。
+        let target_dir = dir.path().join("subdir");
+        fs::create_dir_all(&target_dir).expect("subdir");
+        assert!(write_atomic_preserving_target(&target_dir, b"x").is_err());
+        let leftovers = fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

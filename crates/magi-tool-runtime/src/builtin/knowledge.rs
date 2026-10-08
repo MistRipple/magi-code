@@ -3,10 +3,10 @@ use serde_json::Value;
 use std::{path::Path, time::Duration};
 
 use super::{
-    failure::{ToolFailure, invalid_input},
-    field_bool, field_string, field_string_array, field_usize, parse_json_object,
-    required_string_field,
+    failure::invalid_input, field_bool, field_string, field_string_array, field_usize,
+    parse_json_object, required_string_field,
 };
+use magi_core::ToolFailure;
 
 /// 代码符号导航：按符号名查定义 / 列出文件符号。基于本地索引引擎的符号表。
 pub(super) fn execute_code_symbols(

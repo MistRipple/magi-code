@@ -8,12 +8,13 @@ pub mod public_text;
 pub mod status;
 pub mod task;
 pub mod token_estimate;
+pub mod tool_failure;
 pub mod value_objects;
 
 #[cfg(test)]
 mod tests;
 
-pub use errors::{DomainError, DomainResult};
+pub use errors::{DomainError, DomainResult, GoalRejection};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
 pub use host_path::{HostPath, HostPathError, HostPathRef};
 pub use ids::{
@@ -41,4 +42,5 @@ pub use task::{
     task_output_ref_is_internal_runtime_failure,
 };
 pub use token_estimate::estimate_text_tokens;
+pub use tool_failure::ToolFailure;
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

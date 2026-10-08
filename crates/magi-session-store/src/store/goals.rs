@@ -9,8 +9,8 @@ use crate::models::{
     SessionGoal, SessionPlan, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
-    AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
-    ThreadId, UtcMillis,
+    AccessProfile, DomainError, DomainResult, GoalId, GoalRejection, PlanItemStatus, PlanState,
+    SessionId, TaskId, ThreadId, UtcMillis,
 };
 
 const BLOCKED_TURN_THRESHOLD: u32 = 3;
@@ -146,7 +146,8 @@ impl SessionStore {
                 candidate.session_id == session_id
                     && candidate.role_id == super::ORCHESTRATOR_ROLE_ID
             })
-            .ok_or_else(|| DomainError::InvalidState {
+            .ok_or_else(|| DomainError::GoalRejected {
+                reason: GoalRejection::NoOrchestratorThread,
                 message: "session 尚未建立 orchestrator thread，不能创建 goal".to_string(),
             })?;
         if orchestrator_thread.thread_id != thread_id {
@@ -159,7 +160,8 @@ impl SessionStore {
             .iter()
             .any(|goal| goal.session_id == session_id && goal.status.is_unfinished())
         {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::AlreadyUnfinished,
                 message: "session already has an unfinished goal".to_string(),
             });
         }
@@ -300,7 +302,8 @@ impl SessionStore {
             .ok_or(DomainError::NotFound { entity: "goal" })?;
         validate_control_revision(goal, expected_revision)?;
         if !goal.status.is_unfinished() {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::Terminal,
                 message: "terminal goal objective cannot be edited".to_string(),
             });
         }
@@ -491,12 +494,14 @@ impl SessionStore {
             .find(|plan| &plan.session_id == session_id && plan.goal_id.as_ref() == Some(goal_id));
         validate_bound_plan_revision(bound_plan, expected_plan_revision)?;
         if state.goals[goal_index].status != GoalStatus::Active {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::NotActive,
                 message: "only an active goal can observe a blocker".to_string(),
             });
         }
         if !goal_owned_by_turn(&state.goals[goal_index], turn_id) {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::NotOwnedByTurn,
                 message: "only the goal-owning turn can observe a blocker".to_string(),
             });
         }
@@ -615,12 +620,14 @@ impl SessionStore {
             Some(expected_revisions.goal_control_revision),
         )?;
         if state.goals[goal_index].status != GoalStatus::Active {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::NotActive,
                 message: "only an active goal can be completed".to_string(),
             });
         }
         if !goal_owned_by_turn(&state.goals[goal_index], &turn_id) {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::NotOwnedByTurn,
                 message: "only the goal-owning turn can complete the goal".to_string(),
             });
         }
@@ -636,7 +643,8 @@ impl SessionStore {
                     PlanItemStatus::Pending | PlanItemStatus::InProgress | PlanItemStatus::Blocked
                 )
             }) {
-                return Err(DomainError::InvalidState {
+                return Err(DomainError::GoalRejected {
+                    reason: GoalRejection::PlanUnfinished,
                     message: "goal plan still contains unfinished or blocked work".to_string(),
                 });
             }
@@ -644,7 +652,8 @@ impl SessionStore {
                 task_id.as_str() != turn_id
                     && task_is_active_in_session_execution(&state, session_id, task_id)
             }) {
-                return Err(DomainError::InvalidState {
+                return Err(DomainError::GoalRejected {
+                    reason: GoalRejection::PlanTasksActive,
                     message: "goal plan still has active bound tasks".to_string(),
                 });
             }
@@ -652,7 +661,8 @@ impl SessionStore {
         let plan_revision = bound_plan.map(|plan| plan.revision);
         let evidence_refs = normalize_evidence_refs(evidence_refs);
         if bound_plan.is_some() && evidence_refs.is_empty() {
-            return Err(DomainError::Validation {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::EvidenceRequired,
                 message: "completed goal with a bound plan requires evidence_refs".to_string(),
             });
         }
@@ -783,7 +793,8 @@ impl SessionStore {
             _ => false,
         };
         if !allowed {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::IllegalTransition,
                 message: format!(
                     "illegal goal transition: {:?} -> {:?}",
                     current_status, next_status
@@ -862,7 +873,8 @@ impl SessionStore {
             || current_goal.status != GoalStatus::Active
             || current_goal.continuation.phase != GoalContinuationPhase::Waiting
         {
-            return Err(DomainError::InvalidState {
+            return Err(DomainError::GoalRejected {
+                reason: GoalRejection::ConcurrentModification,
                 message: "恢复请求后的 Goal 已被并发修改，拒绝覆盖回滚".to_string(),
             });
         }
@@ -874,7 +886,8 @@ impl SessionStore {
                     .position(|plan| plan.plan_id == plan_before.plan_id)
                     .ok_or(DomainError::NotFound { entity: "plan" })?;
                 if Some(state.plans[plan_index].revision) != checkpoint.applied_plan_revision {
-                    return Err(DomainError::InvalidState {
+                    return Err(DomainError::GoalRejected {
+                        reason: GoalRejection::ConcurrentModification,
                         message: "恢复请求后的 plan 已被并发修改，拒绝覆盖回滚".to_string(),
                     });
                 }
@@ -885,7 +898,8 @@ impl SessionStore {
                     plan.session_id == checkpoint.goal_before.session_id
                         && plan.goal_id.as_ref() == Some(&checkpoint.goal_before.goal_id)
                 }) {
-                    return Err(DomainError::InvalidState {
+                    return Err(DomainError::GoalRejected {
+                        reason: GoalRejection::ConcurrentModification,
                         message: "恢复请求后出现新的绑定 plan，拒绝覆盖回滚".to_string(),
                     });
                 }
@@ -977,7 +991,8 @@ fn validate_control_revision(
     if let Some(expected_revision) = expected_revision
         && goal.control_revision != expected_revision
     {
-        return Err(DomainError::InvalidState {
+        return Err(DomainError::GoalRejected {
+            reason: GoalRejection::ControlRevisionConflict,
             message: format!(
                 "goal revision conflict: expected {}, current {}",
                 expected_revision, goal.control_revision
@@ -993,17 +1008,20 @@ fn validate_bound_plan_revision(
 ) -> DomainResult<()> {
     match (plan, expected_revision) {
         (None, None) => Ok(()),
-        (None, Some(_)) => Err(DomainError::InvalidState {
+        (None, Some(_)) => Err(DomainError::GoalRejected {
+            reason: GoalRejection::PlanMissing,
             message: "goal plan no longer exists".to_string(),
         }),
-        (Some(plan), None) => Err(DomainError::InvalidState {
+        (Some(plan), None) => Err(DomainError::GoalRejected {
+            reason: GoalRejection::PlanRevisionRequired,
             message: format!(
                 "goal plan revision is required; current revision is {}",
                 plan.revision
             ),
         }),
         (Some(plan), Some(expected_revision)) if plan.revision != expected_revision => {
-            Err(DomainError::InvalidState {
+            Err(DomainError::GoalRejected {
+                reason: GoalRejection::PlanRevisionConflict,
                 message: format!(
                     "goal plan revision conflict: expected {}, current {}",
                     expected_revision, plan.revision
@@ -1170,7 +1188,10 @@ mod tests {
             .expect_err("goal must not exist before orchestrator thread registration");
         assert!(matches!(
             missing_thread_error,
-            DomainError::InvalidState { .. }
+            DomainError::GoalRejected {
+                reason: GoalRejection::NoOrchestratorThread,
+                ..
+            }
         ));
 
         store.ensure_session_mission(&session_id, UtcMillis::now(), || {
@@ -1319,7 +1340,13 @@ mod tests {
                 None,
             )
             .expect_err("completed goal must not reopen");
-        assert!(matches!(error, DomainError::InvalidState { .. }));
+        assert!(matches!(
+            error,
+            DomainError::GoalRejected {
+                reason: GoalRejection::IllegalTransition,
+                ..
+            }
+        ));
     }
 
     #[test]

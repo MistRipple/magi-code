@@ -1,10 +1,8 @@
 use crate::BuiltinToolAccessMode;
 use serde_json::Value;
 
-use super::{
-    failure::{ToolFailure, invalid_input},
-    field_bool, field_string, parse_json_object,
-};
+use super::{failure::invalid_input, field_bool, field_string, parse_json_object};
+use magi_core::ToolFailure;
 
 pub(super) fn execute_diagram_render(input: &str) -> String {
     let request = match parse_json_object(input) {

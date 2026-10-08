@@ -1112,7 +1112,13 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             None,
         )
         .expect_err("second unfinished goal must be rejected");
-    assert!(matches!(err, DomainError::InvalidState { .. }));
+    assert!(matches!(
+        err,
+        DomainError::GoalRejected {
+            reason: magi_core::GoalRejection::AlreadyUnfinished,
+            ..
+        }
+    ));
 
     let completed = store
         .complete_goal(

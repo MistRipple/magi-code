@@ -6,10 +6,11 @@ use std::{
 };
 
 use super::{
-    failure::{ToolFailure, filesystem_failure, invalid_input, path_resolution_failure},
+    failure::{filesystem_failure, invalid_input, path_resolution_failure},
     field_bool, field_string, field_usize, parse_json_object, required_string_field,
     resolve_path_with_context,
 };
+use magi_core::ToolFailure;
 
 pub(super) fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
