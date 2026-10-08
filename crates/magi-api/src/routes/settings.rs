@@ -736,6 +736,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/settings/user-rules/save", post(save_user_rules))
         .route("/settings/safeguard/save", post(save_safeguard_config))
+        .route("/settings/safeguard/audit", get(list_safeguard_audit))
         .route(
             "/settings/registry/role-templates",
             get(list_role_templates),
@@ -1585,6 +1586,90 @@ async fn save_user_rules(
         .set_section("userRules", scoped_settings_section_request(&request)?)
         .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "saved": true })))
+}
+
+/// 安全防护审计记录的分页读取：最新的在前，`before` 是上一页最后一条的 sequence。
+/// 账本只存规则命中的摘要（工具、决策、命中规则），不含命令参数。
+const SAFEGUARD_AUDIT_EVENT_TYPE: &str = "security.safety.evaluated";
+const SAFEGUARD_AUDIT_DEFAULT_PAGE: usize = 50;
+const SAFEGUARD_AUDIT_MAX_PAGE: usize = 100;
+
+async fn list_safeguard_audit(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = match query.get("limit") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=SAFEGUARD_AUDIT_MAX_PAGE).contains(value))
+            .ok_or_else(|| {
+                ApiError::InvalidInput(format!(
+                    "limit 必须是 1 到 {SAFEGUARD_AUDIT_MAX_PAGE} 之间的整数"
+                ))
+            })?,
+        None => SAFEGUARD_AUDIT_DEFAULT_PAGE,
+    };
+    let before = match query.get("before") {
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .map_err(|_| ApiError::InvalidInput("before 必须是账本序号".to_string()))?,
+        ),
+        None => None,
+    };
+
+    let (total, mut page) = state.event_bus.with_audit_usage_ledger(|ledger| {
+        let matching = || {
+            ledger
+                .audit_entries
+                .iter()
+                .filter(|entry| entry.event_type == SAFEGUARD_AUDIT_EVENT_TYPE)
+        };
+        let total = matching().count();
+        let page = matching()
+            .rev()
+            .filter(|entry| before.is_none_or(|before| entry.sequence < before))
+            .take(limit + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        (total, page)
+    });
+    let has_more = page.len() > limit;
+    page.truncate(limit);
+    let next_before = if has_more {
+        page.last().map(|entry| entry.sequence)
+    } else {
+        None
+    };
+    let entries = page
+        .iter()
+        .map(|entry| {
+            let session_id = entry.context.session_id.as_ref();
+            let session_title = session_id
+                .and_then(|id| state.session_store.session(id))
+                .map(|session| session.title);
+            json!({
+                "eventId": entry.event_id,
+                "sequence": entry.sequence,
+                "occurredAt": entry.occurred_at.0,
+                "toolName": entry.payload.get("tool_name").cloned().unwrap_or(Value::Null),
+                "decision": entry.payload.get("decision").cloned().unwrap_or(Value::Null),
+                "accessProfile": entry.payload.get("access_profile").cloned().unwrap_or(Value::Null),
+                "matchedRules": entry
+                    .payload
+                    .get("matched_rules")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "sessionId": session_id.map(|id| id.as_str()),
+                "sessionTitle": session_title,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "total": total,
+        "entries": entries,
+        "nextBefore": next_before,
+    })))
 }
 
 async fn save_safeguard_config(
@@ -5790,6 +5875,98 @@ mod tests {
                 assert!(message.contains("unexpected"));
             }
             other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn safeguard_audit_pages_newest_first_and_validates_query() {
+        let state = test_state();
+        for index in 0..3 {
+            state.event_bus.publish(
+                EventEnvelope::audit(
+                    EventId::new(format!("event-safeguard-audit-{index}")),
+                    "security.safety.evaluated",
+                    json!({
+                        "tool_name": "shell",
+                        "decision": "hard_block",
+                        "access_profile": "FullAccess",
+                        "matched_rules": [{
+                            "category": "git_history",
+                            "pattern": format!("git push --force {index}"),
+                            "action": "hard_block",
+                        }],
+                    }),
+                )
+                .with_context(EventContext {
+                    session_id: Some(SessionId::new("session-without-record")),
+                    ..EventContext::default()
+                }),
+            );
+        }
+        state.event_bus.publish(EventEnvelope::audit(
+            EventId::new("event-safeguard-audit-unrelated"),
+            "context.reference.read",
+            json!({"path": "README.md"}),
+        ));
+
+        let query = |pairs: &[(&str, &str)]| {
+            Query(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        };
+        let first = list_safeguard_audit(State(state.clone()), query(&[("limit", "2")]))
+            .await
+            .expect("first page")
+            .0;
+        assert_eq!(first["total"], json!(3));
+        let first_entries = first["entries"].as_array().expect("entries");
+        assert_eq!(first_entries.len(), 2);
+        assert_eq!(
+            first_entries[0]["eventId"],
+            json!("event-safeguard-audit-2")
+        );
+        assert_eq!(first_entries[0]["toolName"], json!("shell"));
+        assert_eq!(first_entries[0]["decision"], json!("hard_block"));
+        assert_eq!(
+            first_entries[0]["matchedRules"][0]["pattern"],
+            json!("git push --force 2")
+        );
+        assert_eq!(
+            first_entries[0]["sessionId"],
+            json!("session-without-record")
+        );
+        assert_eq!(first_entries[0]["sessionTitle"], Value::Null);
+        let cursor = first["nextBefore"].as_u64().expect("next cursor");
+
+        let second = list_safeguard_audit(
+            State(state.clone()),
+            query(&[("limit", "2"), ("before", &cursor.to_string())]),
+        )
+        .await
+        .expect("second page")
+        .0;
+        let second_entries = second["entries"].as_array().expect("entries");
+        assert_eq!(second_entries.len(), 1);
+        assert_eq!(
+            second_entries[0]["eventId"],
+            json!("event-safeguard-audit-0")
+        );
+        assert_eq!(second["nextBefore"], Value::Null);
+
+        for invalid in [
+            query(&[("limit", "0")]),
+            query(&[("limit", "101")]),
+            query(&[("limit", "x")]),
+            query(&[("before", "x")]),
+        ] {
+            assert!(
+                list_safeguard_audit(State(state.clone()), invalid)
+                    .await
+                    .is_err()
+            );
         }
     }
 

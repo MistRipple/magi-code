@@ -3,6 +3,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import ConversationDisplayPreference from './ConversationDisplayPreference.svelte';
+  import SafeguardAuditDialog from './SafeguardAuditDialog.svelte';
 
   let {
     userRules = $bindable(),
@@ -37,6 +38,8 @@
     conversationDisplaySaveStatus: 'idle' | 'saving' | 'saved' | 'error';
     saveConversationDisplayMode: (mode: ConversationDisplayMode) => void;
   }>();
+
+  let auditDialogOpen = $state(false);
 
   const SAFEGUARD_ACTIONS = [
     'require_approval_in_restricted',
@@ -149,6 +152,11 @@
       <div class="safeguard-audit-summary" class:unhealthy={!safeguardAuditPersistenceHealthy}>
         {#if safeguardAuditPersistenceHealthy}
           {i18n.t('settings.safeguard.auditSummary', { count: safeguardAuditCount })}
+          {#if safeguardAuditCount > 0}
+            <button type="button" class="safeguard-audit-link" onclick={() => { auditDialogOpen = true; }}>
+              {i18n.t('settings.safeguard.audit.view')}
+            </button>
+          {/if}
         {:else}
           {i18n.t('settings.safeguard.auditUnavailable')}
         {/if}
@@ -218,6 +226,10 @@
 </div>
 </div>
 
+{#if auditDialogOpen}
+  <SafeguardAuditDialog onClose={() => { auditDialogOpen = false; }} />
+{/if}
+
 <style>
   .profile-editor { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-4); }
   .profile-field { display: flex; flex-direction: column; gap: var(--space-2); }
@@ -249,6 +261,20 @@
   .safeguard-audit-summary {
     margin-top: 4px;
     color: var(--foreground);
+  }
+
+  .safeguard-audit-link {
+    margin-left: 8px;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--primary);
+    font-size: inherit;
+    cursor: pointer;
+  }
+
+  .safeguard-audit-link:hover {
+    text-decoration: underline;
   }
 
   .safeguard-audit-summary.unhealthy {

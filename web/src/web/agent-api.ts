@@ -3041,6 +3041,37 @@ export async function resetAgentExecutionStats(): Promise<Record<string, unknown
   }
 }
 
+export interface SafeguardAuditEntry {
+  eventId: string;
+  sequence: number;
+  occurredAt: number;
+  toolName: string | null;
+  decision: string | null;
+  accessProfile: string | null;
+  matchedRules: Array<{ category: string; pattern: string; action: string }>;
+  sessionId: string | null;
+  sessionTitle: string | null;
+}
+
+export interface SafeguardAuditPage {
+  total: number;
+  entries: SafeguardAuditEntry[];
+  nextBefore: number | null;
+}
+
+export async function getSafeguardAuditPage(before?: number | null): Promise<SafeguardAuditPage> {
+  const query = typeof before === 'number' ? `?before=${before}` : '';
+  try {
+    const response = await getTransport().request(agentUrl(`/api/settings/safeguard/audit${query}`));
+    return await parseAgentJson<SafeguardAuditPage>(response, 'load safeguard audit');
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
+}
+
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
     const response = await getTransport().request(agentUrl('/api/settings/stats'));
