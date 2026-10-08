@@ -1142,9 +1142,10 @@
     overflow-wrap: anywhere;
   }
 
+  /* 三项指标等宽平分，内容居中。 */
   .goal-metrics {
     display: grid;
-    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     min-width: 0;
     border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
@@ -1153,22 +1154,20 @@
   .goal-metric {
     display: flex;
     flex-direction: column;
+    align-items: center;
     gap: 3px;
     min-width: 0;
-    padding: 7px 14px;
+    padding: 7px 6px;
+    text-align: center;
     border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  .goal-metric:first-child {
-    padding-left: 0;
-  }
-
   .goal-metric:last-child {
-    padding-right: 0;
     border-right: 0;
   }
 
   .goal-metric strong {
+    max-width: 100%;
     min-width: 0;
     overflow: hidden;
     color: var(--foreground);
@@ -1179,8 +1178,16 @@
     white-space: nowrap;
   }
 
+  /* Token 数值可能很长（已用 / 预算），窄屏下允许换行而不是省略。 */
+  .goal-metric--budget strong {
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
   .goal-budget-bar {
     display: block;
+    align-self: stretch;
     height: 3px;
     overflow: hidden;
     border-radius: 999px;
@@ -1446,22 +1453,6 @@
     .icon-action {
       width: 28px;
       height: 28px;
-    }
-
-    /* 窄屏：执行时间与创建时间并排一行，Token 用量独占下一行（进度条随之拉满）。 */
-    .goal-metrics {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .goal-metric:nth-child(2) {
-      padding-right: 0;
-      border-right: 0;
-    }
-
-    .goal-metric--budget {
-      grid-column: 1 / -1;
-      padding-left: 0;
-      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     }
   }
 </style>
