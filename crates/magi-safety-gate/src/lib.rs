@@ -27,7 +27,7 @@ pub enum SafetyCategory {
     GitHistory,
     /// 丢弃本地修改：`git checkout --` / `git restore` / `git clean` / `git stash drop` 等。
     GitDiscard,
-    /// 发布制品：`npm publish` / `cargo publish` / `pip upload` 等。
+    /// 发布制品：`npm publish` / `cargo publish` / `twine upload` 等。
     PackagePublish,
     /// 批量删除：`rm -rf` / `rimraf` 等。
     BulkDelete,
@@ -270,17 +270,25 @@ impl SafetyGate {
     }
 
     pub fn evaluate_text_with_evidence(&self, command: &str) -> SafetyEvaluation {
-        let command = expand_command_aliases(command);
-        let mut matches = self
-            .rules
-            .iter()
-            .filter(|rule| rule.matches(&command))
-            .map(|rule| SafetyMatch {
-                category: rule.category,
-                pattern: rule.pattern.trim().to_string(),
-                action: rule.action,
-            })
-            .collect::<Vec<_>>();
+        // 按 shell 分隔符逐段判定：豁免条件（如 `git clean -n`）只对它所在的那一段生效，
+        // 不会被同一行里的另一条危险命令借用。
+        let mut matches: Vec<SafetyMatch> = Vec::new();
+        for segment in split_command_segments(command) {
+            let tokens = strip_git_global_options(&shell_tokens(&segment));
+            let operation = expand_command_aliases(&tokens.join(" "), &tokens);
+            for rule in &self.rules {
+                if rule.matches(&operation) && builtin_rule_applies(rule, &tokens) {
+                    let matched = SafetyMatch {
+                        category: rule.category,
+                        pattern: rule.pattern.trim().to_string(),
+                        action: rule.action,
+                    };
+                    if !matches.contains(&matched) {
+                        matches.push(matched);
+                    }
+                }
+            }
+        }
         matches.sort_by(|left, right| {
             right
                 .action
@@ -315,6 +323,14 @@ pub fn rules_from_settings_value(value: &serde_json::Value) -> Vec<SafetyRule> {
 pub fn merge_rules_with_builtin_defaults(settings_rules: Vec<SafetyRule>) -> Vec<SafetyRule> {
     let mut merged = builtin_rules();
     for rule in settings_rules {
+        let is_builtin_identity = merged
+            .iter()
+            .any(|existing| same_rule_identity(existing, &rule));
+        // 非自定义分类只属于内置规则集：内置集合里已不存在的旧规则（改名、下线）
+        // 不再保留，否则设置页会永远留着一条运行期并不认识的"内置"规则。
+        if rule.category != SafetyCategory::Custom && !is_builtin_identity {
+            continue;
+        }
         if let Some(existing) = merged
             .iter_mut()
             .find(|existing| same_rule_identity(existing, &rule))
@@ -377,7 +393,7 @@ fn operation_text_for_tool(tool_name: &str, arguments_json: &str) -> Option<Stri
     if tool_name == "shell_exec" {
         let command =
             extract_shell_command(arguments_json).unwrap_or_else(|| arguments_json.to_string());
-        return Some(expand_command_aliases(&command));
+        return Some(command);
     }
 
     let tool_is_structured_write = matches!(
@@ -423,7 +439,7 @@ fn operation_text_for_tool(tool_name: &str, arguments_json: &str) -> Option<Stri
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false)
                 {
-                    operation.push_str(" git branch delete --force");
+                    operation.push_str(" git branch -D");
                 }
             }
             operation
@@ -495,15 +511,14 @@ fn normalize_for_match(value: &str) -> String {
         .join(" ")
 }
 
-fn expand_command_aliases(command: &str) -> String {
+/// 把命令里等价的写法补成规则里的规范形态（`rm -fr` → `rm -rf`、`git push origin +main` → `git push --force`）。
+/// 只追加文本，不改原命令；`tokens` 是该段已去掉 git 全局选项的原始词。
+fn expand_command_aliases(command: &str, tokens: &[String]) -> String {
     let mut operation = command.to_string();
     let normalized = normalize_for_match(command);
-    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        let following = &tokens[index.saturating_add(1)..];
-        if *token == "rm" && following.contains(&"r") && following.contains(&"f") {
-            operation.push_str(" rm -rf");
-        }
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in words.iter().enumerate() {
+        let following = &words[index.saturating_add(1)..];
         if *token == "remove"
             && following.first() == Some(&"item")
             && following.contains(&"recurse")
@@ -520,16 +535,172 @@ fn expand_command_aliases(command: &str) -> String {
         if *token == "rmdir" && following.contains(&"s") && following.contains(&"q") {
             operation.push_str(" rmdir /s /q");
         }
-        if *token == "git"
-            && following.first() == Some(&"push")
-            && following
-                .iter()
-                .any(|value| matches!(*value, "f" | "force" | "forcewithlease"))
-        {
+    }
+
+    if let Some(args) = args_after(tokens, &["rm"]) {
+        let recursive = args
+            .iter()
+            .any(|arg| arg == "--recursive" || short_flag_has(arg, &['r', 'R']));
+        let force = args
+            .iter()
+            .any(|arg| arg == "--force" || short_flag_has(arg, &['f']));
+        if recursive && force {
+            operation.push_str(" rm -rf");
+        }
+    }
+    if let Some(args) = args_after(tokens, &["git", "push"]) {
+        let forced = args.iter().any(|arg| {
+            arg.starts_with("--force")
+                || short_flag_has(arg, &['f'])
+                || (arg.len() > 1 && arg.starts_with('+'))
+        });
+        if forced {
             operation.push_str(" git push --force");
+        }
+        let deleting = args
+            .iter()
+            .any(|arg| arg == "--delete" || arg == "-d" || (arg.len() > 1 && arg.starts_with(':')));
+        if deleting {
+            operation.push_str(" git push --delete");
         }
     }
     operation
+}
+
+/// 按 `&&` / `||` / `;` / `|` / 换行把一条命令拆成相互独立的段。
+fn split_command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            ';' | '\n' | '\r' => segments.push(std::mem::take(&mut current)),
+            '&' | '|' => {
+                if chars.peek() == Some(&character) {
+                    chars.next();
+                }
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(character),
+        }
+    }
+    segments.push(current);
+    segments
+        .into_iter()
+        .filter(|segment| !segment.trim().is_empty())
+        .collect()
+}
+
+fn shell_tokens(segment: &str) -> Vec<String> {
+    segment
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// 去掉 `git -C <dir>` / `git -c k=v` / `git --no-pager` 这类全局选项，
+/// 让 `git -C repo push -f` 与 `git push -f` 得到同样的判定。
+fn strip_git_global_options(tokens: &[String]) -> Vec<String> {
+    const WITH_VALUE: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+    const FLAGS: &[&str] = &[
+        "--no-pager",
+        "--paginate",
+        "-p",
+        "-P",
+        "--bare",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+    ];
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        result.push(tokens[index].clone());
+        let is_git = tokens[index] == "git" || tokens[index].ends_with("/git");
+        index += 1;
+        if !is_git {
+            continue;
+        }
+        while index < tokens.len() {
+            let option = tokens[index].as_str();
+            if WITH_VALUE.contains(&option) {
+                index += 2;
+            } else if FLAGS.contains(&option)
+                || ["--git-dir=", "--work-tree=", "--namespace="]
+                    .iter()
+                    .any(|prefix| option.starts_with(prefix))
+            {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// `tokens` 中紧跟在 `sequence`（不区分大小写）之后的参数；找不到则 None。
+fn args_after<'a>(tokens: &'a [String], sequence: &[&str]) -> Option<&'a [String]> {
+    let width = sequence.len();
+    (0..tokens.len().checked_sub(width - 1)?)
+        .find(|&start| {
+            sequence.iter().enumerate().all(|(offset, word)| {
+                let token = tokens[start + offset].as_str();
+                token.eq_ignore_ascii_case(word)
+                    || (offset == 0
+                        && token
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|base| base.eq_ignore_ascii_case(word)))
+            })
+        })
+        .map(|start| &tokens[start + width..])
+}
+
+/// 单横线短选项簇（如 `-fd`、`-rf`）是否含其中任一字母；`--long` 不算。
+fn short_flag_has(arg: &str, letters: &[char]) -> bool {
+    arg.len() > 1
+        && arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg[1..]
+            .chars()
+            .any(|character| letters.contains(&character))
+}
+
+/// 内置规则的适用条件：把只看词序列会误伤的无害用法排除在外
+/// （`git checkout main`、`git restore --staged`、`git clean -n`、`git rebase --abort`、
+/// `npm publish --dry-run`）。自定义规则没有这类条件，按词序列直接匹配。
+fn builtin_rule_applies(rule: &SafetyRule, tokens: &[String]) -> bool {
+    if rule.category == SafetyCategory::Custom {
+        return true;
+    }
+    let has = |args: &[String], long: &str| args.iter().any(|arg| arg == long);
+    match rule.pattern.trim() {
+        "git checkout --" => args_after(tokens, &["git", "checkout"]).is_none_or(|args| {
+            args.iter().any(|arg| {
+                arg == "--" || arg == "." || arg == "--force" || short_flag_has(arg, &['f'])
+            })
+        }),
+        "git restore" => args_after(tokens, &["git", "restore"]).is_none_or(|args| {
+            let staged_only = (has(args, "--staged") || has(args, "-S"))
+                && !(has(args, "--worktree") || has(args, "-W"));
+            !staged_only
+        }),
+        "git clean" => args_after(tokens, &["git", "clean"]).is_none_or(|args| {
+            !(has(args, "--dry-run") || args.iter().any(|arg| short_flag_has(arg, &['n'])))
+        }),
+        "git rebase" => args_after(tokens, &["git", "rebase"])
+            .is_none_or(|args| !(has(args, "--abort") || has(args, "--quit"))),
+        "git branch -D" => args_after(tokens, &["git", "branch"]).is_none_or(|args| {
+            args.iter().any(|arg| short_flag_has(arg, &['D']))
+                || ((has(args, "--delete") || args.iter().any(|arg| short_flag_has(arg, &['d'])))
+                    && (has(args, "--force") || args.iter().any(|arg| short_flag_has(arg, &['f']))))
+        }),
+        "npm publish" | "yarn publish" | "pnpm publish" | "cargo publish" | "twine upload" => {
+            !tokens.iter().any(|token| token == "--dry-run")
+        }
+        _ => true,
+    }
 }
 
 fn contains_token_sequence(haystack: &str, needle: &str) -> bool {
@@ -549,11 +720,15 @@ pub fn builtin_rules() -> Vec<SafetyRule> {
         ("git checkout --", GitDiscard),
         ("git restore", GitDiscard),
         ("git clean", GitDiscard),
+        ("git push --delete", GitHistory),
         ("git stash drop", GitDiscard),
+        ("git stash clear", GitDiscard),
+        ("git branch -D", GitDiscard),
         ("npm publish", PackagePublish),
         ("cargo publish", PackagePublish),
         ("yarn publish", PackagePublish),
-        ("pip upload", PackagePublish),
+        ("pnpm publish", PackagePublish),
+        ("twine upload", PackagePublish),
         ("rm -rf", BulkDelete),
         ("rimraf", BulkDelete),
         ("remove-item -recurse -force", BulkDelete),
@@ -792,10 +967,75 @@ mod tests {
     #[test]
     fn builtin_rules_cover_default_patterns() {
         let rules = builtin_rules();
-        // 默认规则集保持 18 条内置规则。
-        assert_eq!(rules.len(), 18);
+        assert_eq!(rules.len(), 22);
         assert!(rules.iter().all(|r| r.enabled));
         assert!(rules.iter().any(|r| r.pattern == "rm -rf"));
         assert!(rules.iter().any(|r| r.pattern == "cargo publish"));
+    }
+
+    #[test]
+    fn builtin_rules_distinguish_harmless_variants_from_destructive_ones() {
+        let gate = SafetyGate::with_builtin_defaults();
+        let blocked = |command: &str| !matches!(gate.evaluate_text(command), SafetyDecision::Allow);
+
+        // 无害用法不应要求授权。
+        for command in [
+            "git checkout main",
+            "git checkout -b feature/x",
+            "git restore --staged src/a.rs",
+            "git clean -n",
+            "git clean -fdn",
+            "git rebase --abort",
+            "git branch -d merged-branch",
+            "git push -u origin feature/x",
+            "npm publish --dry-run",
+            "cargo publish --dry-run",
+            "rm build/a.txt",
+            "git status && git checkout main",
+        ] {
+            assert!(!blocked(command), "{command} 不应被拦截");
+        }
+
+        // 破坏性用法（含常见等价写法）都必须命中。
+        for command in [
+            "git checkout -- src/a.rs",
+            "git checkout .",
+            "git checkout -f main",
+            "git restore src/a.rs",
+            "git restore --staged --worktree src/a.rs",
+            "git clean -fd",
+            "git rebase main",
+            "git branch -D old",
+            "git branch -d -f old",
+            "git push --delete origin old",
+            "git push origin :old",
+            "git push origin +main",
+            "git push origin main -f",
+            "git push -fu origin main",
+            "git push --force-with-lease",
+            "git -C repo push --force",
+            "git -c core.editor=true rebase main",
+            "git stash clear",
+            "rm -fr build",
+            "rm -r -f build",
+            "rm --recursive --force build",
+            "twine upload dist/*",
+            "pnpm publish",
+            // 豁免只对所在的那一段生效。
+            "git clean -n && git clean -fd",
+            "git checkout main; git reset --hard HEAD~1",
+        ] {
+            assert!(blocked(command), "{command} 应被拦截");
+        }
+    }
+
+    #[test]
+    fn merge_drops_builtin_category_rules_the_builtin_set_no_longer_has() {
+        let stale = SafetyRule::new("pip upload", SafetyCategory::PackagePublish);
+        let custom = SafetyRule::new("aws s3 rm", SafetyCategory::Custom);
+        let merged = merge_rules_with_builtin_defaults(vec![stale, custom]);
+        assert!(!merged.iter().any(|rule| rule.pattern == "pip upload"));
+        assert!(merged.iter().any(|rule| rule.pattern == "aws s3 rm"));
+        assert!(merged.iter().any(|rule| rule.pattern == "twine upload"));
     }
 }

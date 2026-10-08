@@ -5347,46 +5347,24 @@ fn safeguard_rule_json(rule: magi_safety_gate::SafetyRule) -> serde_json::Value 
     })
 }
 
-fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
-    // 单一事实源：magi-safety-gate::builtin_rules() 持有内置危险模式集合。
-    // 这里只做"规则结构 → settings JSON 形态"的转换，便于前端读取与编辑。
-    magi_safety_gate::builtin_rules()
-        .into_iter()
-        .map(safeguard_rule_json)
-        .collect()
-}
-
+/// 设置页看到的规则集 = 运行期 SafetyGate 使用的规则集：已保存的规则与内置规则合并，
+/// 版本升级新增的内置规则会出现在列表里，已下线的旧内置规则会消失（见 safety-gate 的合并规则）。
 fn seed_default_safeguard_rules(snapshot: &mut HashMap<String, serde_json::Value>) {
-    if !snapshot.contains_key("safeguardConfig") {
-        snapshot.insert("safeguardConfig".to_string(), serde_json::json!({}));
-    }
-
     let safeguard = snapshot
-        .get_mut("safeguardConfig")
-        .expect("safeguardConfig just inserted");
+        .entry("safeguardConfig".to_string())
+        .or_insert_with(|| serde_json::json!({}));
     if !safeguard.is_object() {
         *safeguard = serde_json::json!({});
     }
-
-    let existing_rules = safeguard
+    let saved_rules = safeguard
         .get("rules")
-        .and_then(|v| v.as_array())
-        .cloned()
+        .map(magi_safety_gate::rules_from_settings_value)
         .unwrap_or_default();
-
-    let has_builtin = existing_rules.iter().any(|r| {
-        r.get("category")
-            .and_then(|v| v.as_str())
-            .is_some_and(|c| c != "custom")
-    });
-
-    if has_builtin {
-        return;
-    }
-
-    let mut all_rules = builtin_safeguard_rules();
-    all_rules.extend(existing_rules);
-    safeguard["rules"] = serde_json::Value::Array(all_rules);
+    let merged = magi_safety_gate::merge_rules_with_builtin_defaults(saved_rules)
+        .into_iter()
+        .map(safeguard_rule_json)
+        .collect::<Vec<_>>();
+    safeguard["rules"] = serde_json::Value::Array(merged);
 }
 
 fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Value>) {
