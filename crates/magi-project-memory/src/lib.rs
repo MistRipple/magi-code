@@ -94,20 +94,26 @@ pub struct ProjectMemoryStore {
 }
 
 impl ProjectMemoryStore {
-    /// 以显式 magi home 下的 projects 目录初始化。会立即 mkdir -p 目标路径，
-    /// 避免下游每次写入都判断。
+    /// 以显式 magi home 下的 projects 目录初始化。
+    ///
+    /// 只计算路径、不创建目录：目录在第一次写入时才建。打开一个项目（哪怕只是临时目录）
+    /// 就在状态目录里留下一个永远空着的 `memory/`，工作区被移除后也不会有人来清理。
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, ProjectMemoryError> {
         let root = magi_core::paths::project_memory_root(magi_home, workspace_root);
-        fs::create_dir_all(&root).map_err(|source| ProjectMemoryError::Io {
-            path: root.clone(),
-            source,
-        })?;
         Ok(Self {
             root,
             lock: RwLock::new(()),
+        })
+    }
+
+    /// 写入前确保存储目录存在（第一次写入时创建）。
+    fn ensure_root(&self) -> Result<(), ProjectMemoryError> {
+        fs::create_dir_all(&self.root).map_err(|source| ProjectMemoryError::Io {
+            path: self.root.clone(),
+            source,
         })
     }
 
@@ -143,6 +149,7 @@ impl ProjectMemoryStore {
     pub fn save_entry(&self, entry: &MemoryEntry) -> Result<(), ProjectMemoryError> {
         validate_entry(entry)?;
         let _guard = self.lock.write().expect("ProjectMemoryStore lock poisoned");
+        self.ensure_root()?;
         let path = self.entry_path(&entry.file_stem);
         let body = render_entry(entry);
         magi_core::fs_atomic::write_atomic(&path, body).map_err(|source| {
@@ -653,6 +660,29 @@ mod tests {
     fn store(home: &TempDir, ws: &str) -> ProjectMemoryStore {
         ProjectMemoryStore::open_with_home(home.path(), &WorkspaceRootPath::new(ws))
             .expect("open store")
+    }
+
+    #[test]
+    fn opening_a_project_does_not_create_directories_until_the_first_write() {
+        let home = TempDir::new().unwrap();
+        let store = store(&home, "/Users/x/throwaway");
+
+        assert!(!store.root().exists(), "只打开不写入，不能在状态目录里留下空目录");
+        assert!(store.list_entries().unwrap().is_empty());
+        assert!(store.load_index().unwrap().is_none());
+        assert!(!store.delete_entry("missing").unwrap());
+        assert!(!store.root().exists(), "读取和删除不存在的条目同样不创建目录");
+
+        store
+            .save_entry(&MemoryEntry {
+                file_stem: "project_first".into(),
+                name: "第一条".into(),
+                description: "首次写入才建目录".into(),
+                kind: MemoryKind::Project,
+                body: "正文".into(),
+            })
+            .unwrap();
+        assert!(store.root().join("project_first.md").exists());
     }
 
     #[test]
