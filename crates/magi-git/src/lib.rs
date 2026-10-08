@@ -868,6 +868,73 @@ pub enum GitError {
     Io(String),
 }
 
+impl GitError {
+    /// 稳定的错误码。REST 的 `error.kind` 与结构化 Git 工具的 `error_code` 共用这一份映射。
+    ///
+    /// Git 命令自身失败时，按 stderr 里确定无疑的特征区分网络、认证、非快进推送和远端不存在，
+    /// 其余保持 `git_command_failed`（调用方据此判断是否值得用 force 重试）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotRepository { .. } => "git_not_repository",
+            Self::InvalidInput { .. } => "git_invalid_input",
+            Self::DirtyWorkspace { .. } => "git_dirty_workspace",
+            Self::StaleContext { .. } => "git_stale_context",
+            Self::CurrentBranch { .. } => "git_current_branch",
+            Self::BranchInUse { .. } => "git_branch_in_use",
+            Self::ConfirmationRequired { .. } => "git_confirmation_required",
+            Self::MergeConflict { .. } => "git_merge_conflict",
+            Self::ApplyConflict { .. } => "git_apply_conflict",
+            Self::CommandFailed { stderr, .. } => classify_command_failure(stderr),
+            Self::Io(_) => "git_io_error",
+        }
+    }
+
+    /// 命令确实执行并失败（或没能执行）：与「前置条件不满足、被规则拒绝」不同，
+    /// 它是执行失败，不是拒绝。
+    pub fn is_execution_failure(&self) -> bool {
+        matches!(self, Self::CommandFailed { .. } | Self::Io(_))
+    }
+}
+
+fn classify_command_failure(stderr: &str) -> &'static str {
+    let text = stderr.to_ascii_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if contains_any(&[
+        "could not resolve host",
+        "connection timed out",
+        "connection refused",
+        "network is unreachable",
+        "failed to connect to",
+        "operation timed out",
+        "unable to look up",
+    ]) {
+        "git_network_unreachable"
+    } else if contains_any(&[
+        "authentication failed",
+        "permission denied (publickey)",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "invalid username or password",
+    ]) {
+        "git_authentication_failed"
+    } else if contains_any(&[
+        "non-fast-forward",
+        "updates were rejected because the tip",
+        "failed to push some refs",
+    ]) {
+        "git_push_rejected"
+    } else if contains_any(&[
+        "repository not found",
+        "does not appear to be a git repository",
+        "could not read from remote repository",
+    ]) {
+        "git_remote_unavailable"
+    } else {
+        "git_command_failed"
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct GitService {
     repository_mutexes: Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>,
@@ -2321,6 +2388,59 @@ fn is_conflicted_status(index_status: char, worktree_status: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn command_failed(stderr: &str) -> GitError {
+        GitError::CommandFailed {
+            operation: "push".to_string(),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn command_failures_are_classified_by_unambiguous_stderr_markers() {
+        let cases = [
+            (
+                "fatal: unable to access 'x': Could not resolve host: github.com",
+                "git_network_unreachable",
+            ),
+            (
+                "fatal: Authentication failed for 'https://example/x.git'",
+                "git_authentication_failed",
+            ),
+            (
+                "git@host: Permission denied (publickey).",
+                "git_authentication_failed",
+            ),
+            (
+                "! [rejected] main -> main (non-fast-forward)\nerror: failed to push some refs",
+                "git_push_rejected",
+            ),
+            (
+                "fatal: repository 'https://example/x.git/' not found\nRepository not found.",
+                "git_remote_unavailable",
+            ),
+            (
+                "error: The branch 'topic' is not fully merged.",
+                "git_command_failed",
+            ),
+        ];
+        for (stderr, expected) in cases {
+            assert_eq!(command_failed(stderr).code(), expected, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn every_error_code_is_namespaced_and_only_command_errors_are_execution_failures() {
+        let invalid = GitError::InvalidInput {
+            message: "x".to_string(),
+        };
+        assert!(invalid.code().starts_with("git_"));
+        assert!(!invalid.is_execution_failure());
+        assert!(command_failed("boom").is_execution_failure());
+        assert!(GitError::Io("x".to_string()).is_execution_failure());
+    }
+
     use super::*;
     use std::{collections::BTreeSet, fs};
     use tempfile::TempDir;

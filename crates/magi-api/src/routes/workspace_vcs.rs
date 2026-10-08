@@ -302,7 +302,7 @@ impl From<GitError> for GitOperationErrorDto {
     fn from(error: GitError) -> Self {
         let message = error.to_string();
         let mut dto = Self {
-            kind: git_error_kind(&error).to_string(),
+            kind: error.code().to_string(),
             message,
             dirty: None,
             conflicted_paths: Vec::new(),
@@ -341,22 +341,6 @@ impl From<GitError> for GitOperationErrorDto {
             _ => {}
         }
         dto
-    }
-}
-
-fn git_error_kind(error: &GitError) -> &'static str {
-    match error {
-        GitError::NotRepository { .. } => "not_repository",
-        GitError::InvalidInput { .. } => "invalid_input",
-        GitError::DirtyWorkspace { .. } => "dirty_workspace",
-        GitError::StaleContext { .. } => "stale_git_context",
-        GitError::CurrentBranch { .. } => "current_branch",
-        GitError::BranchInUse { .. } => "branch_in_use",
-        GitError::ConfirmationRequired { .. } => "confirmation_required",
-        GitError::MergeConflict { .. } => "merge_conflict",
-        GitError::ApplyConflict { .. } => "apply_conflict",
-        GitError::CommandFailed { .. } => "git_command_failed",
-        GitError::Io(_) => "git_io_error",
     }
 }
 
@@ -423,7 +407,7 @@ async fn accept_git_context(
         .validate_revision(session_id, request.expected_context_revision)
     {
         return Ok(Json(GitOperationResponse::rejected_kind(
-            "stale_context_revision",
+            "git_stale_context_revision",
             error.to_string(),
         )));
     }
@@ -437,7 +421,7 @@ async fn accept_git_context(
         .await
     {
         return Ok(Json(GitOperationResponse::rejected_kind(
-            "snapshot_baseline_rebuild_failed",
+            "git_snapshot_baseline_rebuild_failed",
             format!("接受 Git context 前重建变更基线失败: {error}"),
         )));
     }
@@ -611,7 +595,7 @@ async fn merge_branch(
 ) -> Result<Json<GitOperationResponse>, ApiError> {
     if !request.confirm {
         return Ok(Json(GitOperationResponse::rejected_kind(
-            "confirmation_required",
+            "git_confirmation_required",
             "合并会改变当前分支，必须先展示 merge preview 并由用户确认",
         )));
     }
@@ -723,7 +707,7 @@ async fn worktree_create(
     };
     let Some(base) = request.base.or(observation.head.clone()) else {
         return Ok(Json(GitOperationResponse::rejected_kind(
-            "invalid_input",
+            "git_invalid_input",
             "仓库没有 HEAD，必须显式指定 worktree base commit",
         )));
     };
@@ -792,7 +776,7 @@ async fn worktree_remove(
     let managed_root = managed_worktree_root(&state, &scope);
     if !path_is_within(&request.path, &managed_root) {
         return Ok(Json(GitOperationResponse::rejected_kind(
-            "unmanaged_worktree",
+            "git_unmanaged_worktree",
             "只能移除由 Magi 管理目录创建的 worktree",
         )));
     }
@@ -885,7 +869,7 @@ async fn prepare_mutation(
             .validate_revision(session_id, request.expected_context_revision)
     {
         return Ok(Err(GitOperationResponse::rejected_kind(
-            "stale_context_revision",
+            "git_stale_context_revision",
             error.to_string(),
         )));
     }
@@ -1275,7 +1259,7 @@ mod tests {
             stdout: "merge output".to_string(),
             stderr: "conflict".to_string(),
         });
-        assert_eq!(dto.kind, "merge_conflict");
+        assert_eq!(dto.kind, "git_merge_conflict");
         assert_eq!(dto.conflicted_paths, vec!["src/lib.rs"]);
         assert_eq!(dto.stderr.as_deref(), Some("conflict"));
     }
@@ -1637,7 +1621,7 @@ mod tests {
         )
         .await;
         assert_eq!(conflicted["ok"], false, "{conflicted}");
-        assert_eq!(conflicted["error"]["kind"], "merge_conflict");
+        assert_eq!(conflicted["error"]["kind"], "git_merge_conflict");
         assert_eq!(
             conflicted["error"]["conflictedPaths"],
             serde_json::json!(["README.md"])
@@ -1705,7 +1689,7 @@ mod tests {
         )
         .await;
         assert_eq!(stale["ok"], false);
-        assert_eq!(stale["error"]["kind"], "stale_git_context");
+        assert_eq!(stale["error"]["kind"], "git_stale_context");
         assert!(stale["error"]["actualHead"].is_string());
 
         let drift = post_json(

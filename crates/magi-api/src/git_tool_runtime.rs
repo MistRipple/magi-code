@@ -45,7 +45,7 @@ fn execute_git_tool(
 ) -> (String, ExecutionResultStatus) {
     let arguments = match parse_arguments(input) {
         Ok(arguments) => arguments,
-        Err(message) => return rejected(tool, "invalid_input", message),
+        Err(message) => return rejected(tool, "git_invalid_input", message),
     };
     let binding = match resolve_binding(deps, execution_context, &arguments) {
         Ok(binding) => binding,
@@ -78,7 +78,7 @@ fn execute_git_tool(
         "git_merge_preview" => {
             let target = match required_string(&arguments, "target") {
                 Ok(value) => value,
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             match block_on(deps.git_service.merge_preview(
                 &binding.path,
@@ -104,7 +104,7 @@ fn execute_git_tool(
             execute_mutation(deps, tool, &arguments, binding, execution_context)
         }
         "agent_apply" => execute_agent_apply(deps, tool, &arguments, binding, execution_context),
-        _ => rejected(tool, "unknown_git_tool", "未知的结构化 Git 工具"),
+        _ => rejected(tool, "git_unknown_tool", "未知的结构化 Git 工具"),
     }
 }
 
@@ -128,7 +128,7 @@ fn execute_agent_apply(
     }
     let task_id = match required_string(arguments, "task_id") {
         Ok(value) => value,
-        Err(message) => return rejected(tool, "invalid_input", message),
+        Err(message) => return rejected(tool, "git_invalid_input", message),
     };
     let Some(worktree) = binding
         .context
@@ -174,7 +174,7 @@ fn execute_agent_apply(
                     "tool": tool,
                     "status": "rejected",
                     "ok": false,
-                    "error_code": "apply_conflict",
+                    "error_code": "git_apply_conflict",
                     "error": "代理改动与主线当前工作树冲突，未做任何修改",
                     "conflicted_paths": conflicted_paths,
                     "base": worktree.base_head,
@@ -247,7 +247,7 @@ fn resolve_binding(
         .ok_or_else(|| {
             rejected(
                 "git",
-                "missing_session",
+                "git_missing_session",
                 "Git 工具必须在主对话 session 中调用",
             )
         })?;
@@ -255,25 +255,37 @@ fn resolve_binding(
         .workspace_id
         .as_ref()
         .map(ToString::to_string)
-        .ok_or_else(|| rejected("git", "missing_workspace", "当前 session 未绑定 workspace"))?;
+        .ok_or_else(|| {
+            rejected(
+                "git",
+                "git_missing_workspace",
+                "当前 session 未绑定 workspace",
+            )
+        })?;
     let existing = deps.session_code_contexts.get(&session_id).ok_or_else(|| {
         rejected(
             "git",
-            "missing_git_context",
+            "git_missing_context",
             "当前 session 尚未建立 Git context",
         )
     })?;
     if existing.workspace_id != workspace_id {
         return Err(rejected(
             "git",
-            "workspace_mismatch",
+            "git_workspace_mismatch",
             "工具上下文与 session Git context 不属于同一 workspace",
         ));
     }
     let working_directory = execution_context
         .working_directory
         .as_ref()
-        .ok_or_else(|| rejected("git", "missing_working_directory", "Git 工具缺少执行目录"))?;
+        .ok_or_else(|| {
+            rejected(
+                "git",
+                "git_missing_working_directory",
+                "Git 工具缺少执行目录",
+            )
+        })?;
     if !same_path(working_directory, &existing.execution_root) {
         return Err(rejected(
             "git",
@@ -287,7 +299,11 @@ fn resolve_binding(
             .get("expectedContextRevision")
             .and_then(Value::as_u64),
     ) {
-        return Err(rejected("git", "stale_context_revision", error.to_string()));
+        return Err(rejected(
+            "git",
+            "git_stale_context_revision",
+            error.to_string(),
+        ));
     }
     let observation = block_on(deps.git_service.observe(&existing.execution_root))
         .map_err(|error| git_error("git_status", error))?;
@@ -321,7 +337,7 @@ fn resolve_binding(
             }
             return Err(rejected(
                 "git",
-                "stale_git_context",
+                "git_stale_context",
                 format!(
                     "Git context 发生高风险变化：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}",
                     context.git.desired_ref,
@@ -337,7 +353,7 @@ fn resolve_binding(
         ) {
             return Err(failed(
                 "git",
-                "snapshot_baseline_rebuild_failed",
+                "git_snapshot_baseline_rebuild_failed",
                 format!("Git 快进后重建变更基线失败: {error}"),
             ));
         }
@@ -407,7 +423,7 @@ fn execute_mutation(
         "git_branch_create" => {
             let branch = match required_string(arguments, "branch") {
                 Ok(value) => value,
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             MutationResult::Observation(block_on(deps.git_service.branch_create(
                 &binding.path,
@@ -422,7 +438,7 @@ fn execute_mutation(
         "git_branch_switch" => {
             let branch = match required_string(arguments, "branch") {
                 Ok(value) => value,
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             MutationResult::Observation(block_on(deps.git_service.branch_switch(
                 &binding.path,
@@ -456,13 +472,13 @@ fn execute_mutation(
             if !bool_arg(arguments, "confirm", false) {
                 return rejected(
                     tool,
-                    "confirmation_required",
+                    "git_confirmation_required",
                     "必须先展示 git_merge_preview，并在用户明确确认后传 confirm=true",
                 );
             }
             let target = match required_string(arguments, "target") {
                 Ok(value) => value,
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             MutationResult::Observation(block_on(deps.git_service.merge(
                 &binding.path,
@@ -476,7 +492,7 @@ fn execute_mutation(
         "git_branch_delete" => {
             let branch = match required_string(arguments, "branch") {
                 Ok(value) => value,
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             MutationResult::Observation(block_on(deps.git_service.branch_delete(
                 &binding.path,
@@ -494,9 +510,13 @@ fn execute_mutation(
             let mode = match required_string(arguments, "mode") {
                 Ok(value) if matches!(value.as_str(), "read_only" | "writable") => value,
                 Ok(_) => {
-                    return rejected(tool, "invalid_input", "mode 只能是 read_only 或 writable");
+                    return rejected(
+                        tool,
+                        "git_invalid_input",
+                        "mode 只能是 read_only 或 writable",
+                    );
                 }
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             let allocation_key = sanitize_component(
                 optional_string(arguments, "allocationKey")
@@ -510,7 +530,7 @@ fn execute_mutation(
             if let Some(parent) = path.parent()
                 && let Err(error) = std::fs::create_dir_all(parent)
             {
-                return failed(tool, "worktree_directory_failed", error.to_string());
+                return failed(tool, "git_worktree_directory_failed", error.to_string());
             }
             let detached = mode == "read_only";
             let branch = if detached {
@@ -542,13 +562,13 @@ fn execute_mutation(
         "git_worktree_remove" => {
             let path = match required_string(arguments, "path") {
                 Ok(value) => PathBuf::from(value),
-                Err(message) => return rejected(tool, "invalid_input", message),
+                Err(message) => return rejected(tool, "git_invalid_input", message),
             };
             let managed_root = deps.managed_worktree_root.join(&binding.workspace_id);
             if !path_is_within(&path, &managed_root) {
                 return rejected(
                     tool,
-                    "unmanaged_worktree",
+                    "git_unmanaged_worktree",
                     "只能移除 Magi 管理目录中的 worktree",
                 );
             }
@@ -562,7 +582,7 @@ fn execute_mutation(
                 },
             )))
         }
-        _ => return rejected(tool, "unknown_git_tool", "未知的 Git mutation"),
+        _ => return rejected(tool, "git_unknown_tool", "未知的 Git mutation"),
     };
 
     finish_mutation(deps, tool, binding, operation)
@@ -822,20 +842,40 @@ fn failed(
     )
 }
 
+/// 失败码对应的下一步指引。只给确定知道该怎么做的类别；其余由错误文本自己说明。
+fn git_instruction(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "git_network_unreachable" => {
+            "网络或远端暂时不可达：不要用相同参数立刻重试；告知用户检查网络或代理，稍后再试。"
+        }
+        "git_authentication_failed" => {
+            "凭据缺失或无效：不要重试；告知用户为该远端配置凭据（SSH key 或令牌）。"
+        }
+        "git_push_rejected" => {
+            "远端有本地没有的新提交：先用 git_pull 合并并解决冲突，再重新 git_push；不要强制推送。"
+        }
+        "git_remote_unavailable" => {
+            "远端仓库不存在或没有访问权限：核对 remote 配置，告知用户确认地址。"
+        }
+        "git_dirty_workspace" => "工作区有未提交改动：先让用户提交或暂存，不要丢弃他们的改动。",
+        "git_stale_context" => {
+            "Git 上下文已变化（分支、HEAD 或 worktree 被外部改动）：先调用 git_status 刷新，再重新发起。"
+        }
+        "git_merge_conflict" | "git_apply_conflict" => {
+            "存在冲突：按 conflicted_paths 逐个文件解决冲突，不要重复同一次合并。"
+        }
+        "git_confirmation_required" => {
+            "该操作风险较高：按错误说明显式确认后再调用，或先向用户确认。"
+        }
+        "git_current_branch" => "不能删除当前分支：先切换到其他分支。",
+        "git_branch_in_use" => "该分支正被其他 worktree 使用：先移除对应 worktree，或换一个分支。",
+        "git_not_repository" => "当前目录不在 Git 仓库中；不要重试，改用不依赖 Git 的方式。",
+        _ => return None,
+    })
+}
+
 fn git_error(tool: &str, error: GitError) -> (String, ExecutionResultStatus) {
-    let code = match &error {
-        GitError::NotRepository { .. } => "not_repository",
-        GitError::InvalidInput { .. } => "invalid_input",
-        GitError::DirtyWorkspace { .. } => "dirty_workspace",
-        GitError::StaleContext { .. } => "stale_git_context",
-        GitError::CurrentBranch { .. } => "current_branch",
-        GitError::BranchInUse { .. } => "branch_in_use",
-        GitError::ConfirmationRequired { .. } => "confirmation_required",
-        GitError::MergeConflict { .. } => "merge_conflict",
-        GitError::ApplyConflict { .. } => "apply_conflict",
-        GitError::CommandFailed { .. } => "git_command_failed",
-        GitError::Io(_) => "git_io_error",
-    };
+    let code = error.code();
     let details = match &error {
         GitError::DirtyWorkspace { dirty, .. } => json!({ "dirty": dirty }),
         GitError::StaleContext {
@@ -844,32 +884,40 @@ fn git_error(tool: &str, error: GitError) -> (String, ExecutionResultStatus) {
             actual_worktree_path,
             ..
         } => json!({
-            "actualBranch": actual_branch,
-            "actualHead": actual_head,
-            "actualWorktreePath": actual_worktree_path,
+            "actual_branch": actual_branch,
+            "actual_head": actual_head,
+            "actual_worktree_path": actual_worktree_path,
         }),
-        GitError::BranchInUse { worktree_paths, .. } => json!({ "worktreePaths": worktree_paths }),
+        GitError::BranchInUse { worktree_paths, .. } => json!({ "worktree_paths": worktree_paths }),
         GitError::MergeConflict {
             conflicted_paths, ..
-        } => json!({ "conflictedPaths": conflicted_paths }),
+        } => json!({ "conflicted_paths": conflicted_paths }),
         GitError::ApplyConflict {
             conflicted_paths,
             stderr,
-        } => json!({ "conflictedPaths": conflicted_paths, "stderr": stderr }),
+        } => json!({ "conflicted_paths": conflicted_paths, "stderr": stderr }),
         _ => Value::Null,
     };
-    (
-        json!({
-            "tool": tool,
-            "status": "rejected",
-            "ok": false,
-            "error_code": code,
-            "error": error.to_string(),
-            "details": details,
-        })
-        .to_string(),
-        ExecutionResultStatus::Rejected,
-    )
+    // 命令确实执行并失败是 failed；前置条件不满足、被规则拒绝是 rejected。
+    let (status, label) = if error.is_execution_failure() {
+        (ExecutionResultStatus::Failed, "failed")
+    } else {
+        (ExecutionResultStatus::Rejected, "rejected")
+    };
+    let mut payload = json!({
+        "tool": tool,
+        "status": label,
+        "ok": false,
+        "error_code": code,
+        "error": error.to_string(),
+    });
+    if !details.is_null() {
+        payload["details"] = details;
+    }
+    if let Some(instruction) = git_instruction(code) {
+        payload["instruction"] = Value::String(instruction.to_string());
+    }
+    (payload.to_string(), status)
 }
 
 fn sanitize_component(value: &str) -> String {
