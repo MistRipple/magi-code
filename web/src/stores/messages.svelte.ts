@@ -1142,6 +1142,8 @@ function updateStoredExecutionProjection(
 // LLM 重试运行态（非持久化，仅用于当前活跃消息展示）
 export const retryRuntimeState = $state({
   byMessageId: new Map<string, RetryRuntimeState>(),
+  // 重试发生在模型输出任何内容之前，这时还没有可挂载的助手消息，按会话投影给运行指示。
+  bySessionId: new Map<string, RetryRuntimeState>(),
 });
 
 // 请求超时时间（30秒）
@@ -3006,24 +3008,41 @@ export function createRequestBinding(binding: RequestResponseBinding): void {
   requestBindings = next;
 }
 
-export function setRetryRuntime(messageId: string, runtime: RetryRuntimeState): void {
+export function setRetryRuntime(
+  messageId: string,
+  runtime: RetryRuntimeState,
+  sessionId?: string,
+): void {
   if (!messageId) return;
   const next = new Map(retryRuntimeState.byMessageId);
   next.set(messageId, runtime);
   retryRuntimeState.byMessageId = next;
+  const session = sessionId?.trim();
+  if (session) {
+    const bySession = new Map(retryRuntimeState.bySessionId);
+    bySession.set(session, runtime);
+    retryRuntimeState.bySessionId = bySession;
+  }
 }
 
-export function clearRetryRuntime(messageId: string): void {
-  if (!messageId || !retryRuntimeState.byMessageId.has(messageId)) {
-    return;
+export function clearRetryRuntime(messageId: string, sessionId?: string): void {
+  if (!messageId) return;
+  if (retryRuntimeState.byMessageId.has(messageId)) {
+    const next = new Map(retryRuntimeState.byMessageId);
+    next.delete(messageId);
+    retryRuntimeState.byMessageId = next;
   }
-  const next = new Map(retryRuntimeState.byMessageId);
-  next.delete(messageId);
-  retryRuntimeState.byMessageId = next;
+  const session = sessionId?.trim();
+  if (session && retryRuntimeState.bySessionId.has(session)) {
+    const bySession = new Map(retryRuntimeState.bySessionId);
+    bySession.delete(session);
+    retryRuntimeState.bySessionId = bySession;
+  }
 }
 
 export function clearAllRetryRuntime(): void {
   retryRuntimeState.byMessageId = new Map();
+  retryRuntimeState.bySessionId = new Map();
 }
 
 /**

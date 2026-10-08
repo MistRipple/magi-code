@@ -2095,6 +2095,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'model.retry.runtime' && event.payload) {
     const messageId = trimBridgeString(event.payload.message_id);
+    const retrySessionId = trimBridgeString(event.payload.session_id);
     const phase = trimBridgeString(event.payload.phase);
     if (messageId && (phase === 'scheduled' || phase === 'attempt_started' || phase === 'settled')) {
       const attempt = typeof event.payload.attempt === 'number' && Number.isFinite(event.payload.attempt)
@@ -2108,6 +2109,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         : undefined;
       emitDataMessage('llmRetryRuntime', {
         messageId,
+        ...(retrySessionId ? { sessionId: retrySessionId } : {}),
         phase,
         attempt,
         maxAttempts,

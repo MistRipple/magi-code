@@ -1,7 +1,8 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
   import { formatElapsed } from '../lib/utils';
-  import { messagesState } from '../stores/messages.svelte';
+  import { messagesState, retryRuntimeState } from '../stores/messages.svelte';
+  import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
   import { webModelTurnStage } from '../stores/web-model-runtime.svelte';
   import { getWorkspaceWait } from '../stores/workspace-wait-store.svelte';
   import { resolveCurrentSessionTitle } from '../lib/session-title';
@@ -42,7 +43,36 @@
         })
       : '',
   );
+  // 模型服务暂时不可用、正在退避重试：这时还没有任何输出，运行指示是唯一能说明「没卡住」的地方。
+  const retryRuntime = $derived(
+    ownerSessionId ? retryRuntimeState.bySessionId.get(ownerSessionId) ?? null : null,
+  );
+  const retryScheduled = $derived(retryRuntime?.phase === 'scheduled');
+  $effect(() => {
+    if (!retryScheduled) return;
+    return retainUiClock();
+  });
+  const retryLabel = $derived.by(() => {
+    if (!retryRuntime) return '';
+    if (retryRuntime.phase !== 'scheduled') {
+      return i18n.t('messageItem.retry.startedTitle', {
+        attempt: retryRuntime.attempt,
+        maxAttempts: retryRuntime.maxAttempts,
+      });
+    }
+    // 读取 uiClockState.now 只为随时钟刷新；倒计时本身以真实时间为准，首帧时钟可能还没校准。
+    void uiClockState.now;
+    const seconds = Math.max(
+      0,
+      Math.ceil(((retryRuntime.nextRetryAt ?? Date.now()) - Date.now()) / 1000),
+    );
+    return `${i18n.t('messageItem.retry.scheduledTitle', {
+      attempt: retryRuntime.attempt,
+      maxAttempts: retryRuntime.maxAttempts,
+    })} · ${i18n.t('messageItem.retry.scheduledWait', { seconds })}`;
+  });
   const stageLabel = $derived.by(() => {
+    if (retryLabel) return retryLabel;
     if (workspaceWait) {
       return blockingTitle
         ? i18n.t('isolation.wait.for', { session: blockingTitle })

@@ -53,9 +53,10 @@ export function handleRetryRuntimePayload(payload: Record<string, unknown>): voi
     return;
   }
 
+  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
   const phase = payload.phase;
   if (phase === 'settled') {
-    clearRetryRuntime(messageId);
+    clearRetryRuntime(messageId, sessionId);
     return;
   }
 
@@ -75,7 +76,7 @@ export function handleRetryRuntimePayload(payload: Record<string, unknown>): voi
       attempt,
       maxAttempts,
     };
-    setRetryRuntime(messageId, runtime);
+    setRetryRuntime(messageId, runtime, sessionId);
     return;
   }
 
@@ -90,13 +91,17 @@ export function handleRetryRuntimePayload(payload: Record<string, unknown>): voi
     ? payload.nextRetryAt
     : Date.now() + delayMs;
 
-  setRetryRuntime(messageId, {
-    phase,
-    attempt,
-    maxAttempts,
-    delayMs,
-    nextRetryAt,
-  });
+  setRetryRuntime(
+    messageId,
+    {
+      phase,
+      attempt,
+      maxAttempts,
+      delayMs,
+      nextRetryAt,
+    },
+    sessionId,
+  );
 }
 
 export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
