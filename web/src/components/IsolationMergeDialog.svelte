@@ -8,6 +8,7 @@
   import {
     applyIsolationMerge,
     closeIsolationMergeDialog,
+    discardSessionIsolation,
     isolationMergeDialogState,
     loadIsolationMergePlan,
   } from '../stores/session-isolation-store.svelte';
@@ -98,10 +99,21 @@
             : i18n.t('isolation.merge.done', { applied }),
         );
       }
-      if (left === 0) {
+      const { sessionId, binding, exitAfterMerge } = isolationMergeDialogState;
+      if (left === 0 && !exitAfterMerge) {
         closeIsolationMergeDialog();
       } else {
-        await load(isolationMergeDialogState.sessionId);
+        // 重新读取计划：用户可能取消勾选了部分文件，它们仍留在副本里。
+        await load(sessionId);
+        if (exitAfterMerge && left === 0 && summary.clean + summary.conflict === 0) {
+          // 副本里已经没有未进入主工作区的改动：取消隔离不会丢任何内容。
+          closeIsolationMergeDialog();
+          const exit = await discardSessionIsolation(sessionId, binding, true);
+          addToast(
+            exit.ok ? 'success' : 'error',
+            exit.ok ? i18n.t('isolation.exit.done') : exit.error || i18n.t('isolation.exit.failed'),
+          );
+        }
       }
     } catch (error) {
       addToast('error', error instanceof Error && error.message ? error.message : i18n.t('isolation.merge.failed'));
@@ -125,6 +137,9 @@
     closeOnBackdrop={!applying}
     bodyClass="isolation-merge-body"
   >
+    {#if isolationMergeDialogState.exitAfterMerge}
+      <div class="merge-exit-hint">{i18n.t('isolation.merge.exitHint')}</div>
+    {/if}
     {#if loading}
       <div class="merge-status">{i18n.t('isolation.merge.loading')}</div>
     {:else if loadError}
@@ -227,6 +242,13 @@
     color: var(--foreground-muted);
     font-size: var(--text-sm);
     text-align: center;
+  }
+
+  .merge-exit-hint {
+    padding: 0 0 var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.5;
   }
 
   .merge-status--error {

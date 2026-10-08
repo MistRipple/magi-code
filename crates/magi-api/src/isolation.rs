@@ -266,7 +266,7 @@ impl ApiState {
             .ensure_current_turn_acceptance_available(session_id)
         {
             return Err(ApiError::conflict(
-                "会话正在执行，结束后才能丢弃隔离副本",
+                "会话正在执行，结束后才能取消隔离",
                 session_id.as_str(),
             ));
         }

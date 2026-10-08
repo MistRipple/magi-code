@@ -30,6 +30,15 @@ export const isolationMergeDialogState = $state({
   open: false,
   sessionId: '',
   binding: { workspaceId: '', workspacePath: '' } as IsolationBinding,
+  /** 从「取消隔离」进入：改动全部合并后自动取消隔离；还有留在副本里的改动则保持隔离。 */
+  exitAfterMerge: false,
+});
+
+/** 取消隔离对话框：让用户在「合并」与「丢弃」之间自己选。 */
+export const isolationExitDialogState = $state({
+  open: false,
+  sessionId: '',
+  binding: { workspaceId: '', workspacePath: '' } as IsolationBinding,
 });
 
 let syncRevision = 0;
@@ -118,12 +127,27 @@ export async function applyIsolationMerge(
   return outcome;
 }
 
-export function openIsolationMergeDialog(sessionId: string, binding: IsolationBinding): void {
+export function openIsolationMergeDialog(
+  sessionId: string,
+  binding: IsolationBinding,
+  options: { exitAfterMerge?: boolean } = {},
+): void {
   isolationMergeDialogState.sessionId = sessionId.trim();
   isolationMergeDialogState.binding = { ...binding };
+  isolationMergeDialogState.exitAfterMerge = options.exitAfterMerge === true;
   isolationMergeDialogState.open = true;
 }
 
 export function closeIsolationMergeDialog(): void {
   isolationMergeDialogState.open = false;
+}
+
+export function openIsolationExitDialog(sessionId: string, binding: IsolationBinding): void {
+  isolationExitDialogState.sessionId = sessionId.trim();
+  isolationExitDialogState.binding = { ...binding };
+  isolationExitDialogState.open = true;
+}
+
+export function closeIsolationExitDialog(): void {
+  isolationExitDialogState.open = false;
 }

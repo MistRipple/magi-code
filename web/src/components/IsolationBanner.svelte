@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { messagesState, addToast } from '../stores/messages.svelte';
+  import { messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
-    discardSessionIsolation,
     getSessionIsolation,
+    openIsolationExitDialog,
     openIsolationMergeDialog,
   } from '../stores/session-isolation-store.svelte';
   import { isolationOriginBlockingSession } from '../lib/isolation-merge';
@@ -35,22 +35,6 @@
       ? i18n.t('isolation.banner.descAuto', { session: blockingSessionTitle })
       : i18n.t('isolation.banner.descAutoUnknown');
   });
-  let busy = $state(false);
-
-  async function discard(): Promise<void> {
-    if (busy || !sessionId) return;
-    if (!window.confirm(i18n.t('isolation.discard.confirm'))) return;
-    busy = true;
-    try {
-      const result = await discardSessionIsolation(sessionId, binding, true);
-      addToast(
-        result.ok ? 'success' : 'error',
-        result.ok ? i18n.t('isolation.discard.done') : result.error || i18n.t('isolation.discard.failed'),
-      );
-    } finally {
-      busy = false;
-    }
-  }
 </script>
 
 {#if isolation}
@@ -64,14 +48,13 @@
       <button
         type="button"
         class="isolation-banner-btn primary"
-        disabled={busy}
         onclick={() => openIsolationMergeDialog(sessionId, binding)}
       >
         <Icon name="git-merge" size={12} />
         <span>{i18n.t('isolation.banner.merge')}</span>
       </button>
-      <button type="button" class="isolation-banner-btn" disabled={busy} onclick={() => void discard()}>
-        <span>{i18n.t('isolation.banner.discard')}</span>
+      <button type="button" class="isolation-banner-btn" onclick={() => openIsolationExitDialog(sessionId, binding)}>
+        <span>{i18n.t('isolation.banner.exit')}</span>
       </button>
     </div>
   </div>

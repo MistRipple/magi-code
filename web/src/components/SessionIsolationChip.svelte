@@ -3,9 +3,9 @@
   import { addToast } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
-    discardSessionIsolation,
     enableSessionIsolation,
     getSessionIsolation,
+    openIsolationExitDialog,
     openIsolationMergeDialog,
     type IsolationBinding,
   } from '../stores/session-isolation-store.svelte';
@@ -78,20 +78,10 @@
     openIsolationMergeDialog(sessionId, binding);
   }
 
-  async function discard(): Promise<void> {
-    if (!binding || busy) return;
+  function openExit(): void {
+    if (!binding) return;
     open = false;
-    if (!window.confirm(i18n.t('isolation.discard.confirm'))) return;
-    busy = true;
-    try {
-      const result = await discardSessionIsolation(sessionId, binding, true);
-      addToast(
-        result.ok ? 'success' : 'error',
-        result.ok ? i18n.t('isolation.discard.done') : result.error || i18n.t('isolation.discard.failed'),
-      );
-    } finally {
-      busy = false;
-    }
+    openIsolationExitDialog(sessionId, binding);
   }
 
   $effect(() => {
@@ -122,6 +112,9 @@
       <span class="session-isolation-label">
         {isolation ? i18n.t('isolation.chip.on') : i18n.t('isolation.chip.off')}
       </span>
+      {#if isolation}
+        <Icon name="chevron-down" size={10} />
+      {/if}
     </button>
 
     {#if open && isolation}
@@ -135,10 +128,10 @@
           type="button"
           class="session-isolation-item session-isolation-item--danger"
           role="menuitem"
-          onclick={() => void discard()}
+          onclick={openExit}
         >
-          <Icon name="trash" size={12} />
-          <span>{i18n.t('isolation.menu.discard')}</span>
+          <Icon name="x-circle" size={12} />
+          <span>{i18n.t('isolation.menu.exit')}</span>
         </button>
       </div>
     {/if}

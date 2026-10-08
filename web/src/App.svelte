@@ -4,6 +4,7 @@
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
+  import IsolationExitDialog from './components/IsolationExitDialog.svelte';
   import IsolationMergeDialog from './components/IsolationMergeDialog.svelte';
   import Icon from './components/Icon.svelte';
   import {
@@ -404,6 +405,7 @@
   <!-- Toast 通知容器 -->
   <ToastContainer />
   <IsolationMergeDialog />
+  <IsolationExitDialog />
 </div>
 
 <style>
