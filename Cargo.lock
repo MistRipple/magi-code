@@ -1632,6 +1632,7 @@ dependencies = [
 name = "magi-session-isolation"
 version = "3.0.52"
 dependencies = [
+ "magi-process",
  "magi-snapshot",
  "serde",
  "serde_json",

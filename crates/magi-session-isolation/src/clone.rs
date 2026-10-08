@@ -8,7 +8,6 @@ use crate::error::{IsolationError, IsolationResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Magi 自己的运行态目录（快照账本、会话索引等），属于主工作区本身，不进入副本。
 const STATE_DIR_NAME: &str = ".magi";
@@ -100,11 +99,11 @@ pub(crate) fn create_isolated_copy_with(
 /// 用文件系统的写时复制复制一个顶层条目到 `dest_dir` 下。不支持时返回 `false`。
 fn clone_entry(entry: &Path, dest_dir: &Path) -> bool {
     let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("cp");
+        let mut command = magi_process::std_command("cp");
         command.args(["-c", "-R", "-P", "-p"]);
         command
     } else if cfg!(target_os = "linux") {
-        let mut command = Command::new("cp");
+        let mut command = magi_process::std_command("cp");
         command.args(["-a", "--reflink=always"]);
         command
     } else {
