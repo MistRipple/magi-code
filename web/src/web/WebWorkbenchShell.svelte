@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
+  import ToastContainer from '../components/ToastContainer.svelte';
+  import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
   import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
@@ -3639,6 +3641,11 @@ import {
   {/if}
 
   <ExternalApprovalTray />
+
+  <!-- 全局反馈层：必须在 `main.workbench-content` 之外。进入设置时该区域是 inert，
+       放在里面的确认框和 Toast 会显示出来却点不动，设置页里所有确认都会卡死。 -->
+  <ToastContainer />
+  <ConfirmDialog />
 
   <NotificationCenter
     open={shellUi.popover === 'notifications'}
