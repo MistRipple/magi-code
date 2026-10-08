@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     future::Future,
     sync::{
         Arc, Mutex, RwLock,
@@ -459,7 +458,7 @@ impl BrowserToolRuntimeDependencies {
                 let page = page_state(reply.response.outcome, "浏览器导航失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
-                    let snapshot = self.capture_snapshot(&client, &tab.tab_id).await?;
+                    let snapshot = self.capture_snapshot(&client, &tab.tab_id, None).await?;
                     Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id))
                 } else {
                     None
@@ -473,7 +472,9 @@ impl BrowserToolRuntimeDependencies {
                 .to_string())
             }
             "browser_snapshot" => {
-                let snapshot = self.capture_snapshot(&client, &tab.tab_id).await?;
+                let snapshot = self
+                    .capture_snapshot(&client, &tab.tab_id, optional_string(arguments, "selector"))
+                    .await?;
                 let snapshot = browser_tool_snapshot_value(&snapshot, &tab.tab_id);
                 Ok(serde_json::to_string(&json!({
                     "tool": tool_name,
@@ -523,7 +524,7 @@ impl BrowserToolRuntimeDependencies {
                 let interaction = interaction_result(reply.response.outcome, "浏览器交互失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, interaction.page_state)?;
                 let (snapshot, snapshot_error) = if bool_arg(arguments, "include_snapshot", false) {
-                    match self.capture_snapshot(&client, &tab.tab_id).await {
+                    match self.capture_snapshot(&client, &tab.tab_id, None).await {
                         Ok(snapshot) => (
                             Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id)),
                             None,
@@ -730,7 +731,7 @@ impl BrowserToolRuntimeDependencies {
         };
         let snapshot = if bool_arg(arguments, "include_snapshot", false) {
             Some(browser_tool_snapshot_value(
-                &self.capture_snapshot(client, &tab.tab_id).await?,
+                &self.capture_snapshot(client, &tab.tab_id, None).await?,
                 &tab.tab_id,
             ))
         } else {
@@ -1338,6 +1339,7 @@ impl BrowserToolRuntimeDependencies {
         &self,
         client: &BrowserHostClient,
         tab_id: &BrowserTabId,
+        selector: Option<String>,
     ) -> Result<magi_browser_authority::BrowserHostSnapshot, BrowserToolError> {
         let (navigation_revision, snapshot_revision) =
             self.mutate(|authority| authority.record_snapshot(tab_id, UtcMillis::now()))?;
@@ -1347,6 +1349,7 @@ impl BrowserToolRuntimeDependencies {
                 navigation_revision,
                 snapshot_revision,
                 limits: Default::default(),
+                selector,
             })
             .await
             .map_err(browser_host_client_error)?;
@@ -2766,57 +2769,21 @@ fn browser_tool_snapshot_value(
     snapshot: &BrowserHostSnapshot,
     logical_tab_id: &BrowserTabId,
 ) -> Value {
-    const MODEL_SNAPSHOT_ELEMENT_LIMIT: usize = 96;
-    const MODEL_SNAPSHOT_TEXT_LIMIT_BYTES: usize = 10 * 1024;
     let mut nodes = Vec::new();
     collect_snapshot_nodes(&snapshot.root, &mut nodes);
-
     let mut value = Map::new();
-    // Host 快照属于某个物理 Page，右侧面板存在时该标识为 browser-view-*。
-    // 模型只能持有 Authority 中的逻辑 Tab ID；物理 View ID 不得越过工具边界，
-    // 否则下一次点击会把内部 ID 当成 tab_id 并稳定触发 browser_tab_not_found。
     value.insert("tab_id".to_string(), json!(logical_tab_id));
     value.insert(
         "navigation_revision".to_string(),
         json!(snapshot.navigation_revision),
     );
-    let mut remaining_text_bytes = MODEL_SNAPSHOT_TEXT_LIMIT_BYTES;
-    insert_model_snapshot_string(
-        &mut value,
-        "title",
-        snapshot.root.name.as_deref(),
-        &mut remaining_text_bytes,
-    );
-
-    // 保持页面语义的分层预算：焦点控件、输入控件、操作控件、链接、
-    // 标题和正文都能进入模型上下文，避免 GitHub 这类链接密集页面把
-    // 页面主信息挤出快照。选中的节点按优先级输出，引用仍来自同一快照。
-    const PRIORITY_BUDGETS: [usize; 7] = [4, 16, 20, 28, 12, 12, 4];
-    let mut selected = Vec::with_capacity(MODEL_SNAPSHOT_ELEMENT_LIMIT);
-    let mut selected_refs = HashSet::new();
-    for (priority, budget) in PRIORITY_BUDGETS.iter().copied().enumerate() {
-        for node in nodes
-            .iter()
-            .filter(|node| snapshot_node_priority(node) == priority as u8)
-            .take(budget)
-        {
-            if selected.len() >= MODEL_SNAPSHOT_ELEMENT_LIMIT {
-                break;
-            }
-            selected_refs.insert(node.element_ref.as_str());
-            selected.push(*node);
-        }
-    }
-    for node in &nodes {
-        if selected.len() >= MODEL_SNAPSHOT_ELEMENT_LIMIT {
-            break;
-        }
-        if selected_refs.insert(node.element_ref.as_str()) {
-            selected.push(*node);
-        }
-    }
-
-    let elements = selected
+    value.insert("title".to_string(), json!(snapshot.root.name));
+    value.insert("returned_nodes".to_string(), json!(snapshot.returned_nodes));
+    value.insert("total_nodes".to_string(), json!(snapshot.total_nodes));
+    value.insert("text_bytes".to_string(), json!(snapshot.text_bytes));
+    value.insert("truncated".to_string(), json!(snapshot.truncated));
+    // 采集端是预算与排序的唯一所有者，此处只投影，不能再裁剪而隐瞒节点。
+    let elements = nodes
         .into_iter()
         .map(|node| {
             let mut element = Map::new();
@@ -2824,30 +2791,16 @@ fn browser_tool_snapshot_value(
                 "element_ref".to_string(),
                 Value::String(node.element_ref.clone()),
             );
-            insert_model_snapshot_string(
-                &mut element,
-                "role",
-                node.role.as_deref(),
-                &mut remaining_text_bytes,
-            );
-            insert_model_snapshot_string(
-                &mut element,
-                "name",
-                node.name.as_deref(),
-                &mut remaining_text_bytes,
-            );
-            insert_model_snapshot_string(
-                &mut element,
-                "value",
-                node.value.as_deref(),
-                &mut remaining_text_bytes,
-            );
-            insert_model_snapshot_string(
-                &mut element,
-                "description",
-                node.description.as_deref(),
-                &mut remaining_text_bytes,
-            );
+            for (key, text) in [
+                ("role", node.role.as_ref()),
+                ("name", node.name.as_ref()),
+                ("value", node.value.as_ref()),
+                ("description", node.description.as_ref()),
+            ] {
+                if let Some(text) = text {
+                    element.insert(key.to_string(), json!(text));
+                }
+            }
             if node.disabled {
                 element.insert("disabled".to_string(), Value::Bool(true));
             }
@@ -2879,61 +2832,6 @@ fn collect_snapshot_nodes<'a>(
         output.push(child);
         collect_snapshot_nodes(child, output);
     }
-}
-
-fn snapshot_node_priority(node: &BrowserSnapshotNode) -> u8 {
-    if node.focused {
-        return 0;
-    }
-    if node.editable {
-        return 1;
-    }
-    match node.role.as_deref() {
-        Some("searchbox" | "textbox" | "combobox") => 2,
-        Some("button" | "checkbox" | "radio" | "switch") => 3,
-        Some("link") => 4,
-        Some("heading") => 5,
-        Some("paragraph") => 6,
-        Some(_) => 6,
-        None => 6,
-    }
-}
-
-fn insert_model_snapshot_string(
-    map: &mut Map<String, Value>,
-    key: &str,
-    value: Option<&str>,
-    remaining_bytes: &mut usize,
-) {
-    let Some(value) = value.filter(|value| !value.is_empty()) else {
-        return;
-    };
-    const FIELD_LIMIT_BYTES: usize = 160;
-    let limit = FIELD_LIMIT_BYTES.min(*remaining_bytes);
-    if limit == 0 {
-        return;
-    }
-    let clipped = truncate_utf8(value, limit);
-    if clipped.is_empty() {
-        return;
-    }
-    *remaining_bytes = remaining_bytes.saturating_sub(clipped.len());
-    map.insert(key.to_string(), Value::String(clipped));
-}
-
-fn truncate_utf8(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_string();
-    }
-    let suffix = "…";
-    if limit <= suffix.len() {
-        return value.get(..limit).unwrap_or_default().to_string();
-    }
-    let mut end = limit - suffix.len();
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{}", &value[..end], suffix)
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -4029,7 +3927,7 @@ mod tests {
     }
 
     #[test]
-    fn model_snapshot_is_compact_and_prioritizes_interactive_elements() {
+    fn model_snapshot_preserves_collector_budget_and_truncation() {
         let mut nodes = (1..=200)
             .map(|index| {
                 snapshot_node(
@@ -4074,17 +3972,17 @@ mod tests {
             .as_array()
             .expect("compact snapshot elements should be an array");
 
-        assert_eq!(elements.len(), 96);
+        assert_eq!(elements.len(), 201);
         assert_eq!(value["tab_id"], "browser-logical-tab");
-        assert_eq!(elements[0]["role"], "searchbox");
-        assert_eq!(elements[0]["editable"], true);
+        assert_eq!(elements[200]["role"], "searchbox");
+        assert_eq!(elements[200]["editable"], true);
         assert!(elements[0].get("bounds").is_none());
         assert!(elements[0].get("disabled").is_none());
         assert!(elements[0].get("states").is_none());
         assert!(value.get("accessibility_tree").is_none());
-        assert!(value.get("truncated").is_none());
-        assert!(value.get("returned_nodes").is_none());
-        assert!(value.get("total_nodes").is_none());
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["returned_nodes"], 201);
+        assert_eq!(value["total_nodes"], 201);
     }
 
     #[test]

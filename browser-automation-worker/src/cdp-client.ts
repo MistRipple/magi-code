@@ -219,6 +219,7 @@ function sameBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceBinding):
 function commandError(value: BrowserCommandError): Error {
   const error = new Error(`${value.code}:${value.message}`);
   error.name = "BrowserCdpError";
+  Object.assign(error, { side_effect_started: value.side_effect_started });
   return error;
 }
 

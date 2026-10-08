@@ -888,8 +888,10 @@ test("文本插入触发导航后不再向新文档提交旧按键", async () =>
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate" && String(params.expression).includes(".focus(")) {
-      return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: true, sensitive: null } } };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      const target = { x:10, y:20, bounds:{x:0,y:0,width:20,height:20}, editable:true, sensitive:null };
+      return { result: { value: expression.includes("prepareText") ? {target, expected:"magi"} : {...target, observed:true} } };
     }
     if (method === "Input.insertText") {
       port.emit("Page.frameStartedLoading", {}, nextBinding);
@@ -910,14 +912,15 @@ test("文本插入触发导航后不再向新文档提交旧按键", async () =>
     },
   });
 
-  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(result.outcome.status, "indeterminate");
   assert.equal(
-    port.requests.some((request) => request.method === "Input.dispatchKeyEvent"),
+    port.requests.slice(port.requests.findIndex((request) => request.method === "Input.insertText") + 1)
+      .some((request) => request.method.startsWith("Input.")),
     false,
   );
 });
 
-test("点击触发 JavaScript 对话框时，CDP 鼠标超时不会掩盖已经生效的点击", async () => {
+test("鼠标按下触发对话框时返回结果未确认，不补点且保留对话框状态", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -937,16 +940,17 @@ test("点击触发 JavaScript 对话框时，CDP 鼠标超时不会掩盖已经�
       target: { element_ref: "e:1:dialog" },
     },
   });
-  assert.equal(result.outcome.status, "succeeded");
-  assert.ok(
-    port.requests
-      .filter((request) => request.method === "Runtime.evaluate")
-      .some((request) => String(request.params.expression).includes("scrollIntoView")),
-    "点击前应将目标滚动到当前浏览器视口",
-  );
+  assert.equal(result.outcome.status, "indeterminate");
+  assert.equal(port.requests.filter((request) => request.method === "Input.dispatchMouseEvent"
+    && request.params.type === "mousePressed").length, 1);
+  const dialog = await runtime.execute("dialog-after-click", binding, {
+    type: "devtools", payload: { tab_id: binding.tab_id, operation: "dialog", arguments: { action: "list" } },
+  });
+  assert.equal(dialog.outcome.status, "succeeded");
+  assert.ok(JSON.stringify(dialog.outcome).includes("magi-dialog"));
 });
 
-test("原生鼠标事件未形成 DOM click 时异步回退到元素点击", async () => {
+test("原生鼠标事件未确认时返回 indeterminate 且绝不补点", async () => {
   const port = new ScriptedPort((method) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -962,23 +966,44 @@ test("原生鼠标事件未形成 DOM click 时异步回退到元素点击", asy
       target: { element_ref: "e:1:button" },
     },
   });
-  assert.equal(result.outcome.status, "succeeded");
-  assert.ok(
-    port.requests.some((request) => String(request.params.expression).includes("fallbackClick")),
-    "未观察到 DOM click 时应调度异步元素点击",
-  );
-  assert.deepEqual(
-    result.outcome.status === "succeeded" ? result.outcome.payload : null,
-    { type: "action_target", payload: { role: "button", name: "提交 订单" } },
-    "点击结果应报告实际点击的元素（名称折叠空白）",
-  );
+  assert.equal(result.outcome.status, "indeterminate");
+  assert.equal(port.requests.some((request) => String(request.params.expression).includes("fallbackClick")), false);
+  assert.equal(port.requests.filter((request) => request.method === "Input.dispatchMouseEvent" && request.params.type === "mousePressed").length, 1);
+});
+
+test("输入回读缺失或不匹配时不提交、不补写，清空同样必须确认", async () => {
+  for (const text of ["new", ""]) {
+    for (const applied of [false, undefined, true]) {
+      const port = new ScriptedPort((method, params) => {
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+        if (method !== "Runtime.evaluate") return {};
+        const expression = String(params.expression);
+        if (expression.includes(".verifyText(")) return { result: { value: applied === undefined ? null : { applied } } };
+        if (expression.includes(".finishClick(")) return { result: { value: { observed: true } } };
+        const target = { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: true, sensitive: null };
+        return { result: { value: expression.includes(".prepareText(") ? { target, expected: text } : target } };
+      });
+      const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+      const result = await runtime.execute("verify-input", binding, {
+        type: "type", payload: {
+          tab_id: binding.tab_id, control: { mode: "user", fence: 1 },
+          target: { element_ref: "e:1:input" }, text, replace: true, submit_key: "Enter",
+        },
+      });
+      assert.equal(result.outcome.status, applied === true ? "succeeded" : "indeterminate");
+      assert.equal(port.requests.some((request) => request.method === "Input.dispatchKeyEvent" && request.params.key === "Enter"), applied === true);
+      assert.equal(port.requests.filter((request) => request.method === "Input.insertText").length, text ? 1 : 0);
+      assert.equal(port.requests.some((request) => String(request.params.expression).includes("fillValue")), false);
+    }
+  }
 });
 
 test("点击完成后异步到达的 JavaScript 对话框事件仍可被下一次 list 读取", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null } } };
+    if (method === "Runtime.evaluate") return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 20, height: 20 }, editable: false, sensitive: null, observed:true } } };
     if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
       setTimeout(() => port.emit("Page.javascriptDialogOpening", { type: "alert", message: "magi-dialog" }), 500);
     }
@@ -1130,16 +1155,22 @@ test("网络响应体不可读时保留网络记录并返回结构化不可用�
 });
 
 test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async () => {
+  let clickCount = 0;
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
     if (method === "Runtime.evaluate") {
       const expression = String(params.expression);
-      if (expression.includes("e:1:radio") && expression.includes("element.type === 'radio'")) return { result: { value: { kind: "radio" } } };
-      if (expression.includes("e:1:checkbox") && expression.includes("element.type === 'checkbox'")) return { result: { value: { kind: "checkbox" } } };
-      if (expression.includes("e:1:select") && expression.includes("tag === 'SELECT'")) return { result: { value: { kind: "select", multiple: true } } };
+      if (expression.includes("e:1:radio") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "radio" } } };
+      if (expression.includes("e:1:checkbox") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "checkbox" } } };
+      if (expression.includes("e:1:select") && expression.startsWith("globalThis.__magiBrowserAutomation.formControl")) return { result: { value: { kind: "select", multiple: true } } };
+      if (expression.includes("selectedOptions")) return { result: { value: { applied: true } } };
+      if (expression.includes("prepareClick")) return { result:{ value:{x:10,y:20,role:"checkbox",name:"test"} } };
+      if (expression.includes("finishClick")) return { result:{value:{observed:true}} };
+      if (expression.endsWith(".checked")) return { result:{value:clickCount > 0} };
       return { result: { value: null } };
     }
+    if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") clickCount++;
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -1165,7 +1196,8 @@ test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async 
   assert.equal(fillResult?.filled, 3);
   const evaluateCalls = port.requests.filter((request) => request.method === "Runtime.evaluate");
   assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes("element.options")));
-  assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes("element.click()")));
+  assert.equal(clickCount, 1);
+  assert.ok(!evaluateCalls.some((request) => String(request.params.expression).includes("element.click()")));
 });
 
 test("性能和堆工具拒绝未实现 action，而不是返回空结果", async () => {
@@ -1719,7 +1751,7 @@ test("缓存的执行上下文缺少页面 runtime 时会先重新安装并验�
   assert.equal(probeCount, 3, "安装前后都必须完成 runtime 健康检查");
 });
 
-test("Runtime.evaluate 竞态遇到失效 context 时只重试一次并重建 isolated world", async () => {
+test("Runtime.evaluate 竞态遇到失效 context 时返回错误且不重放脚本", async () => {
   let isolatedWorlds = 0;
   let failedStaleEvaluation = false;
   const port = new ScriptedPort((method, params) => {
@@ -1742,12 +1774,12 @@ test("Runtime.evaluate 竞态遇到失效 context 时只重试一次并重建 is
     payload: { tab_id: binding.tab_id, annotations: [] },
   });
 
-  assert.equal(result.outcome.status, "succeeded");
-  assert.equal(isolatedWorlds, 2, "失效 context 必须重建 isolated world");
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(isolatedWorlds, 1);
   const annotationEvaluations = port.requests.filter((request) =>
     request.method === "Runtime.evaluate"
     && String(request.params.expression).includes("globalThis.__magiBrowserAutomation.setAnnotations("));
-  assert.deepEqual(annotationEvaluations.map((request) => request.params.contextId), [1, 2]);
+  assert.deepEqual(annotationEvaluations.map((request) => request.params.contextId), [1]);
 });
 
 test("浏览器标记层只观察目标布局相关节点，不监听整个页面属性", () => {
@@ -1918,7 +1950,7 @@ test("browser_storage 的 cookie 只返回元数据，清理逐个删除当前�
   assert.equal(port.requests.some((request) => request.method === "Network.clearBrowserCookies"), false);
 });
 
-test("点击把登记监听与聚焦合并为一次页面往返", async () => {
+test("点击不使用固定延时且原生事件后校验目标", async () => {
   const port = new ScriptedPort((method) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -1940,7 +1972,7 @@ test("点击把登记监听与聚焦合并为一次页面往返", async () => {
     .filter((request) => request.method === "Runtime.evaluate")
     .map((request) => String(request.params.expression))
     .filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation."));
-  assert.equal(expressions.filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.prepareAndFocus(")).length, 1);
+  assert.equal(expressions.filter((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.prepareClick(")).length, 1);
   assert.equal(expressions.some((expression) => expression.startsWith("globalThis.__magiBrowserAutomation.focus(")), false, "不再单独往返 focus");
 });
 

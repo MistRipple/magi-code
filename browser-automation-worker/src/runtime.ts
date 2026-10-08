@@ -197,6 +197,7 @@ export class BrowserAutomationRuntime {
               command.payload.limits,
               command.payload.navigation_revision,
               command.payload.snapshot_revision,
+              command.payload.selector,
             ),
           },
         };
@@ -771,18 +772,8 @@ export class BrowserAutomationRuntime {
     returnByValue = true,
   ): Promise<T> {
     const contextId = await this.context(binding);
-    try {
-      return await this.evaluateInContext(binding, contextId, expression, returnByValue);
-    } catch (cause) {
-      // 页面导航和渲染进程重启可能发生在 context() 健康探测之后。
-      // 这时本次 Runtime.evaluate 尚未执行，清掉当前缓存并只重试一次，
-      // 让后续操作使用新文档的 isolated world，避免把一次性 CDP 错误扩散到整条工具链。
-      if (!isExecutionContextFailure(cause)) throw cause;
-      const page = this.currentPage(binding.surface_id);
-      if (page?.executionContextId === contextId) page.executionContextId = null;
-      const refreshedContextId = await this.context(binding);
-      return this.evaluateInContext(binding, refreshedContextId, expression, returnByValue);
-    }
+    // 页面脚本可能聚焦、提交或执行站点逻辑；context 失效时不能自动重放。
+    return this.evaluateInContext(binding, contextId, expression, returnByValue);
   }
 
   private async evaluateInContext<T>(
@@ -817,6 +808,7 @@ export class BrowserAutomationRuntime {
     limits: { max_nodes: number; max_text_bytes: number },
     navigationRevision: number,
     snapshotRevision: number,
+    selector?: string,
   ): Promise<BrowserSnapshot> {
     if (navigationRevision !== binding.navigation_revision) {
       throw protocolFailure(
@@ -829,7 +821,7 @@ export class BrowserAutomationRuntime {
     }
     const value = await this.evaluate<Omit<BrowserSnapshot, "tab_id" | "navigation_revision">>(
       binding,
-      `globalThis.__magiBrowserAutomation.snapshot(${safeInteger(limits.max_nodes, 400)}, ${safeInteger(limits.max_text_bytes, 32768)}, ${snapshotRevision})`,
+      `globalThis.__magiBrowserAutomation.snapshot(${limits.max_nodes}, ${limits.max_text_bytes}, ${snapshotRevision}, ${JSON.stringify(selector ?? null)})`,
     );
     if (value.snapshot_revision !== snapshotRevision) {
       throw protocolFailure(
@@ -854,160 +846,75 @@ export class BrowserAutomationRuntime {
     );
   }
 
-  private async target(
-    binding: BrowserSurfaceBinding,
-    target: BrowserSnapshotTarget,
-    focus = false,
-  ): Promise<PageTarget> {
-    if (target.element_ref === "root") {
-      throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
-    }
-    return this.evaluate(
-      binding,
-      `globalThis.__magiBrowserAutomation.${focus ? "focus" : "target"}(${JSON.stringify(target.element_ref)})`,
-    );
+  private async target(binding: BrowserSurfaceBinding, target: BrowserSnapshotTarget): Promise<PageTarget> {
+    if (target.element_ref === "root") throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
+    return this.evaluate(binding, `globalThis.__magiBrowserAutomation.target(${JSON.stringify(target.element_ref)})`);
   }
 
-  /** 点击并返回实际点击的元素（角色与名称），让模型和用户能确认点中的是什么。 */
-  private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget): Promise<BrowserActionTarget> {
-    const clickToken = `click-${randomUUID()}`;
-    if (ref.element_ref === "root") {
-      throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
-    }
-    // 浏览器视口可能小于文档内容高度。真实鼠标事件发到视口外的坐标
-    // 时，Chromium 不会触发页面 click，但此前命令仍可能返回 succeeded，
-    // 让后续 wait_for 误报为页面异步逻辑失败。先用与输入聚焦相同的
-    // scrollIntoView 路径把目标收敛到当前视口，再读取滚动后的坐标。
-    // 登记 click 监听与聚焦合并为一次页面往返，少一次 CDP 来回。
-    const target = await this.evaluate<PageTarget>(
-      binding,
-      `globalThis.__magiBrowserAutomation.prepareAndFocus(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(clickToken)})`,
-    );
-    await this.dispatchClick(binding, ref, target, clickToken);
-    return actionTarget(target);
-  }
-
-  private async dispatchClick(
-    binding: BrowserSurfaceBinding,
-    ref: BrowserSnapshotTarget,
-    target: PageTarget,
-    clickToken: string,
-  ): Promise<void> {
-    if (!await this.pointer(binding, "mouseMoved", target.x, target.y)) return;
-    if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) return;
-    // mousePressed 可能已经触发了主文档导航。此时点击副作用已经发生，
-    // 不能再用旧文档的 token 做 finish/fallback，也不能把 mouseReleased
-    // 之外的旧 DOM 操作投递到新页面。
-    if (this.navigationAdvanced(binding)) return;
-    if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) return;
-    if (this.navigationAdvanced(binding)) return;
-    // 某些 Electron Chromium guest 的后台/非激活 Surface 会接受 CDP
-    // Input.dispatchMouseEvent 并更新焦点，但不把完整鼠标序列转成 DOM
-    // click。等待一个事件循环后检查捕获监听器；只有确认页面没有观察到
-    // click 时才排队一次异步 HTMLElement.click()，避免原生鼠标成功时
-    // 重复触发提交、导航或对话框。
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    if (this.currentPage(binding.surface_id)?.dialog) return;
-    const observed = await this.evaluate<{ observed?: boolean }>(
-      binding,
-      `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(clickToken)})`,
-    ).catch((cause) => {
-      if (this.currentPage(binding.surface_id)?.dialog || isNavigationStaleError(cause)) {
-        return { observed: true };
-      }
-      throw cause;
-    });
-    if (observed?.observed) return;
-    await this.evaluate(
-      binding,
-      `globalThis.__magiBrowserAutomation.fallbackClick(${JSON.stringify(ref.element_ref)})`,
-    ).catch((cause) => {
-      if (isNavigationStaleError(cause)) return;
-      throw cause;
-    });
-  }
-
-  private async typeText(
-    binding: BrowserSurfaceBinding,
-    ref: BrowserSnapshotTarget,
-    text: string,
-    replace: boolean,
-    submitKey: string | null,
-  ): Promise<BrowserActionTarget> {
-    const target = await this.target(binding, ref, true);
-    if (!target.editable) throw protocolFailure("browser_target_not_editable", "target is not editable");
-    if (target.sensitive) {
-      throw protocolFailure("browser_sensitive_action_requires_user", `sensitive input: ${target.sensitive}`);
-    }
-    await this.insertText(binding, ref, text, replace, submitKey);
-    return actionTarget(target);
-  }
-
-  private async insertText(
-    binding: BrowserSurfaceBinding,
-    ref: BrowserSnapshotTarget,
-    text: string,
-    replace: boolean,
-    submitKey: string | null,
-  ): Promise<void> {
-    if (replace) {
-      if (!await this.key(binding, "keyDown", "a", process.platform === "darwin" ? 4 : 2)) return;
-      if (!await this.key(binding, "keyUp", "a", process.platform === "darwin" ? 4 : 2)) return;
-      if (!await this.press(binding, "Backspace")) return;
-    }
-    const before = replace ? null : await this.elementValue(binding, ref);
-    const inserted = await this.#cdp.send(binding, "Input.insertText", { text });
-    if (isNativeDialogOpenedResult(inserted)) return;
-    if (this.navigationAdvanced(binding)) return;
-    await this.ensureTextApplied(binding, ref, text, replace, before);
-    if (submitKey) await this.press(binding, submitKey);
-  }
-
-  /**
-   * 页面里当前的输入值；无法读取（select、非输入元素、引用已失效）返回 null。
-   * 只用于校验，读不到就不做任何额外动作。
-   */
-  private async elementValue(
-    binding: BrowserSurfaceBinding,
-    ref: BrowserSnapshotTarget,
-  ): Promise<string | null> {
+  /** 滚动、命中检测后，点击始终只发送一组原生鼠标事件。 */
+  private async click(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget, forText = false): Promise<BrowserActionTarget> {
+    const token = `click-${randomUUID()}`;
+    const target = await this.evaluate<PageTarget>(binding,
+      `globalThis.__magiBrowserAutomation.prepareClick(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(token)}, ${forText})`);
+    let started = false;
+    let finished = false;
     try {
-      const result = await this.evaluate<{ value: string | null }>(
-        binding,
-        `globalThis.__magiBrowserAutomation.readValue(${JSON.stringify(ref.element_ref)})`,
-      );
-      return typeof result?.value === "string" ? result.value : null;
-    } catch {
-      return null;
+      if (!await this.pointer(binding, "mouseMoved", target.x, target.y)) throw protocolFailure("browser_click_unconfirmed", "悬停触发对话框，尚未确认目标点击", true);
+      await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyClickPoint(${JSON.stringify(ref.element_ref)}, ${target.x}, ${target.y})`);
+      started = true;
+      if (!await this.pointerOrHandleDialog(binding, "mousePressed", target.x, target.y, { button: "left", buttons: 1, clickCount: 1 })) throw protocolFailure("browser_click_unconfirmed", "按下时打开对话框，点击结果未确认", true);
+      if (this.navigationAdvanced(binding)) throw protocolFailure("browser_click_unconfirmed", "按下时页面发生导航，点击结果未确认", true);
+      if (!await this.pointerOrHandleDialog(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount: 1 })) throw protocolFailure("browser_click_unconfirmed", "点击后打开对话框，请检查对话框状态", true);
+      if (this.navigationAdvanced(binding) || this.currentPage(binding.surface_id)?.dialog) throw protocolFailure("browser_click_unconfirmed", "页面状态已变化，目标点击结果未确认", true);
+      const observed = await this.evaluate<{ observed: boolean }>(binding,
+        `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(token)})`);
+      finished = true;
+      if (observed?.observed !== true) throw protocolFailure("browser_click_unconfirmed", "没有确认目标收到原生点击；检查页面状态，不要直接重试", true);
+      return actionTarget(target);
+    } catch (cause) {
+      if (started) throw sideEffectFailure(cause);
+      throw cause;
+    } finally {
+      if (!finished && !this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted && !this.currentPage(binding.surface_id)?.dialog) {
+        await this.evaluate(binding, `globalThis.__magiBrowserAutomation.finishClick(${JSON.stringify(token)})`).catch(() => undefined);
+      }
     }
   }
 
-  /**
-   * `Input.insertText` 在 guest 失去焦点 / 处于后台时会被静默丢弃，命令却仍返回成功，
-   * 模型随后会基于一个根本没填进去的输入框继续操作。写入之后读回校验：没生效就用
-   * 原生 setter + input/change 事件兜底一次；仍然不生效则明确失败，绝不假成功。
-   */
-  private async ensureTextApplied(
-    binding: BrowserSurfaceBinding,
-    ref: BrowserSnapshotTarget,
-    text: string,
-    replace: boolean,
-    before: string | null,
-  ): Promise<void> {
-    if (text.length === 0) return;
-    const applied = (value: string | null) =>
-      value === null || (replace ? value.includes(text) : value !== before && value.includes(text));
-    const current = await this.elementValue(binding, ref);
-    if (applied(current)) return;
-    const filled = await this.evaluate<{ value: string | null }>(
-      binding,
-      `globalThis.__magiBrowserAutomation.fillValue(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(text)}, ${JSON.stringify(replace)})`,
-    );
-    if (applied(typeof filled?.value === "string" ? filled.value : null)) return;
-    throw protocolFailure(
-      "browser_type_not_applied",
-      "the text was not accepted by the target element; take a snapshot and check the field before retrying",
-    );
+  private async typeText(binding: BrowserSurfaceBinding, ref: BrowserSnapshotTarget, text: string, replace: boolean, submitKey: string | null): Promise<BrowserActionTarget> {
+    // DOM focus 只改变 activeElement，无法把 Chromium 输入路由从宿主切至 guest。
+    // 先通过同一原生点击链获得真实焦点（点击前即检查可编辑性与敏感字段）。
+    await this.click(binding, ref, true);
+    try {
+      const prepared = await this.evaluate<{ target: PageTarget; expected: string }>(
+        binding,
+        `globalThis.__magiBrowserAutomation.prepareText(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(text)}, ${replace})`);
+      if (!prepared || typeof prepared.expected !== "string" || !prepared.target) throw protocolFailure("browser_input_unverifiable", "无法确认输入目标和选择范围");
+      // Chromium 统一管理选择范围，email/number 等不支持 DOM selection API 的输入框也走同一链路。
+      if (!await this.key(binding, "keyDown", "End", 0, "End", [replace ? "selectAll" : "moveToEndOfDocument"])
+        || this.navigationAdvanced(binding)
+        || !await this.key(binding, "keyUp", "End")) {
+        throw protocolFailure("browser_type_unconfirmed", "选择文本时页面状态变化，输入未完成", true);
+      }
+      await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyTextFocus(${JSON.stringify(ref.element_ref)})`);
+      // insertText 原生替换已选择文本；清空使用 Backspace，不存在 DOM setter 旁路。
+      if (text.length > 0) {
+        const inserted = await this.#cdp.send(binding, "Input.insertText", { text });
+        if (isNativeDialogOpenedResult(inserted) || this.navigationAdvanced(binding)) throw protocolFailure("browser_type_unconfirmed", "输入时页面跳转或打开对话框，输入结果未确认", true);
+      } else if (replace && !await this.press(binding, "Backspace")) {
+        throw protocolFailure("browser_type_unconfirmed", "清空结果未确认", true);
+      }
+      const result = await this.evaluate<{ applied: boolean }>(binding,
+        `globalThis.__magiBrowserAutomation.verifyText(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(prepared.expected)})`);
+      if (result?.applied !== true) throw protocolFailure("browser_type_unconfirmed", "输入值与预期不一致；检查页面状态，不要直接重试", true);
+      if (submitKey) await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyTextFocus(${JSON.stringify(ref.element_ref)})`);
+      if (submitKey && !await this.press(binding, submitKey)) {
+        throw protocolFailure("browser_submit_unconfirmed", "文本已输入，提交后的页面状态需要确认", true);
+      }
+      return actionTarget(prepared.target);
+    } catch (cause) {
+      throw sideEffectFailure(cause);
+    }
   }
 
   private async press(binding: BrowserSurfaceBinding, key: string): Promise<boolean> {
@@ -1025,6 +932,7 @@ export class BrowserAutomationRuntime {
     key: string,
     modifiers = 0,
     code?: string,
+    editingCommands?: string[],
   ): Promise<boolean> {
     const description = keyDescription(key, code, modifiers);
     const keyDown = type === "keyDown";
@@ -1043,7 +951,8 @@ export class BrowserAutomationRuntime {
         ? { text: description.text, unmodifiedText: description.text }
         : {}),
       ...(keyDown ? { autoRepeat: false, isKeypad: false, location: 0 } : {}),
-      ...(description.commands.length > 0 ? { commands: description.commands } : {}),
+      ...(keyDown && (editingCommands ?? description.commands).length > 0
+        ? { commands: editingCommands ?? description.commands } : {}),
     });
     return !isNativeDialogOpenedResult(result);
   }
@@ -1647,33 +1556,37 @@ export class BrowserAutomationRuntime {
     }
     const fields = args.fields;
     let filled = 0;
-    for (const raw of fields) {
-      if (!raw || typeof raw !== "object") {
-        throw protocolFailure("browser_fill_form_invalid", "each fields item must be an object");
-      }
-      const field = raw as Record<string, unknown>;
-      if (!Object.prototype.hasOwnProperty.call(field, "value")) {
-        throw protocolFailure("browser_fill_form_invalid", "each fields item must include value");
-      }
-      const target = snapshotTarget(field);
-      const targetExpression = `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)})`;
-      // 一次页面往返判断控件类型，原先 select/checkbox/radio 需要三次串行探测。
-      const probed = await this.evaluate<{ kind: "select"; multiple: boolean } | { kind: "checkbox" } | { kind: "radio" } | null>(
-        binding,
-        `(() => { const element = ${targetExpression}; if (!element) return null; const tag = element.tagName; if (tag === 'SELECT') { if (element.disabled) throw new Error('browser_fill_form_target_disabled'); return { kind: 'select', multiple: element.multiple }; } if (tag === 'INPUT' && (element.type === 'checkbox' || element.type === 'radio')) { if (element.disabled) throw new Error('browser_fill_form_target_disabled'); return { kind: element.type }; } return null; })()`,
-      );
-      const control = probed || { kind: "text" as const };
-      if (control.kind === "text") {
-        if (Array.isArray(field.value)) {
-          throw protocolFailure("browser_fill_form_invalid", "text controls require a scalar value");
+    try {
+      for (const raw of fields) {
+        if (!raw || typeof raw !== "object") {
+          throw protocolFailure("browser_fill_form_invalid", "each fields item must be an object");
         }
-        await this.typeText(binding, target, String(field.value ?? ""), field.replace !== false, null);
-      } else if (control.kind === "select") {
-        await this.setSelectValue(binding, target, field.value, Boolean(control.multiple));
-      } else {
-        await this.setBooleanControl(binding, target, control.kind, field.value);
+        const field = raw as Record<string, unknown>;
+        if (!Object.prototype.hasOwnProperty.call(field, "value")) {
+          throw protocolFailure("browser_fill_form_invalid", "each fields item must include value");
+        }
+        const target = snapshotTarget(field);
+        // 页面运行时统一检查控件可用性与敏感字段。
+        const probed = await this.evaluate<{ kind: "select"; multiple: boolean } | { kind: "checkbox" } | { kind: "radio" } | { kind: "text" }>(
+          binding,
+          `globalThis.__magiBrowserAutomation.formControl(${JSON.stringify(target.element_ref)})`,
+        );
+        const control = probed;
+        if (control.kind === "text") {
+          if (Array.isArray(field.value)) {
+            throw protocolFailure("browser_fill_form_invalid", "text controls require a scalar value");
+          }
+          await this.typeText(binding, target, String(field.value ?? ""), field.replace !== false, null);
+        } else if (control.kind === "select") {
+          await this.setSelectValue(binding, target, field.value, Boolean(control.multiple));
+        } else {
+          await this.setBooleanControl(binding, target, control.kind, field.value);
+        }
+        filled += 1;
       }
-      filled += 1;
+    } catch (cause) {
+      if (filled > 0) throw sideEffectFailure(cause);
+      throw cause;
     }
     return { filled };
   }
@@ -1692,10 +1605,11 @@ export class BrowserAutomationRuntime {
       throw protocolFailure("browser_fill_form_invalid", "select values must be strings or numbers");
     }
     const serialized = values.map(String);
-    await this.evaluate(
+    const result = await this.evaluate<{ applied: boolean }>(
       binding,
       `(() => {
         const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
+        globalThis.__magiBrowserAutomation.formControl(${JSON.stringify(target.element_ref)});
         if (!element || element.tagName !== 'SELECT') throw new Error('browser_fill_form_target_stale');
         const values = ${JSON.stringify(serialized)};
         const options = [...element.options];
@@ -1707,9 +1621,11 @@ export class BrowserAutomationRuntime {
         }
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
-        return { value: element.value };
+        const actual = [...element.selectedOptions].map(option => option.value);
+        return { applied: actual.length === new Set(values).size && actual.every(value => values.includes(value)) };
       })()`,
-    );
+    ).catch((cause) => { throw sideEffectFailure(cause); });
+    if (result?.applied !== true) throw protocolFailure("browser_fill_form_unconfirmed", "选项状态未达到预期", true);
   }
 
   private async setBooleanControl(
@@ -1724,15 +1640,15 @@ export class BrowserAutomationRuntime {
     if (kind === "radio" && value !== true) {
       throw protocolFailure("browser_fill_form_invalid", "radio controls can only be selected with true");
     }
-    await this.evaluate(
-      binding,
-      `(() => {
-        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)});
-        if (!element || element.tagName !== 'INPUT' || element.type !== ${JSON.stringify(kind)}) throw new Error('browser_fill_form_target_stale');
-        if (element.checked !== ${value}) element.click();
-        return { checked: element.checked };
-      })()`,
-    );
+    const checked = await this.evaluate<boolean>(binding,
+      `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}).checked`);
+    if (checked === value) return;
+    await this.click(binding, target);
+    try {
+      const actual = await this.evaluate<boolean>(binding,
+        `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}).checked`);
+      if (actual !== value) throw protocolFailure("browser_fill_form_unconfirmed", "控件状态未达到预期", true);
+    } catch (cause) { throw sideEffectFailure(cause); }
   }
 
   private async waitFor(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -2238,7 +2154,7 @@ function empty(): { result: BrowserCommandResult } {
   return { result: { type: "empty" } };
 }
 
-/** 页面运行时 target()/focus()/prepareAndFocus() 返回的目标信息。 */
+/** 页面运行时 target()/prepareClick() 返回的目标信息。 */
 interface PageTarget {
   x: number;
   y: number;
@@ -2360,11 +2276,12 @@ function normalizeError(cause: unknown) {
   const separator = source.message.indexOf(":");
   const code = separator > 0 ? source.message.slice(0, separator) : "browser_worker_failed";
   const message = separator > 0 ? source.message.slice(separator + 1) : source.message;
+  const sideEffectStarted = (source as Error & { side_effect_started?: boolean }).side_effect_started === true;
   return {
     code,
     message,
-    recoverable: !code.includes("permission") && !code.includes("protocol"),
-    side_effect_started: false,
+    recoverable: !sideEffectStarted && !code.includes("permission") && !code.includes("protocol"),
+    side_effect_started: sideEffectStarted,
     diagnostic: source.stack ?? null,
   };
 }
@@ -2465,10 +2382,16 @@ function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
     && (value.account_hint === null || typeof value.account_hint === "string");
 }
 
-function protocolFailure(code: string, message: string): Error {
+function protocolFailure(code: string, message: string, sideEffectStarted = false): Error {
   const error = new Error(`${code}:${message}`);
   error.name = "BrowserAutomationError";
+  Object.assign(error, { side_effect_started: sideEffectStarted });
   return error;
+}
+
+function sideEffectFailure(cause: unknown): Error {
+  const error = cause instanceof Error ? cause : new Error(String(cause));
+  return Object.assign(error, { side_effect_started: true });
 }
 
 function normalizeWebCommandTimeout(value: number | null | undefined): number {
@@ -3098,6 +3021,7 @@ function keyDescription(
     escape: { key: "Escape", code: "Escape", keyCode: 27 },
     backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
     delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    end: { key: "End", code: "End", keyCode: 35 },
     arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
     arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
     arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },

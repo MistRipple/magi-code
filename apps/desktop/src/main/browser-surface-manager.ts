@@ -1457,6 +1457,14 @@ export class BrowserSurfaceManager {
             // 失败并交给上层使用新的 binding 重试，不能把旧 DOM 操作投递到新页。
             this.recordForBinding(binding);
             const lease = debuggerLease(sessionId);
+            // DOM activeElement 不代表 Chromium 的键盘路由已从 App Renderer
+            // 切至 guest。只在原生写入前聚焦当前 WebContents，不激活宿主窗口。
+            if (method === "Input.insertText"
+              || method === "Input.dispatchKeyEvent"
+              || (method === "Input.dispatchMouseEvent" && params.type === "mousePressed")) {
+              contents.focus();
+              this.recordForBinding(binding);
+            }
             // 光标在输入真正投递前更新：与排队输入同序，用户先看到光标移向
             // 目标，再看到页面响应。
             if (injectsInput && record.agentControlled) {

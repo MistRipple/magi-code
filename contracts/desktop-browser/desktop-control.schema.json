@@ -264,8 +264,8 @@
       "additionalProperties": false,
       "required": ["max_nodes", "max_text_bytes"],
       "properties": {
-        "max_nodes": { "type": "integer", "minimum": 0 },
-        "max_text_bytes": { "type": "integer", "minimum": 0 }
+        "max_nodes": { "type": "integer", "minimum": 1 },
+        "max_text_bytes": { "type": "integer", "minimum": 1 }
       }
     },
     "jsonValue": {},
@@ -348,7 +348,8 @@
         "tab_id": { "$ref": "#/$defs/id" },
         "navigation_revision": { "type": "integer", "minimum": 0 },
         "snapshot_revision": { "type": "integer", "minimum": 0 },
-        "limits": { "$ref": "#/$defs/snapshotLimits" }
+        "limits": { "$ref": "#/$defs/snapshotLimits" },
+        "selector": { "type": "string", "maxLength": 1000 }
       }
     },
     "clickPayload": {

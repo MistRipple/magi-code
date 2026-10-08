@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
 pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 7;
-pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
-pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
+pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 96;
+pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 10 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +180,8 @@ pub enum BrowserHostCommand {
         navigation_revision: u64,
         snapshot_revision: u64,
         limits: BrowserSnapshotLimits,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     Click {
         tab_id: BrowserTabId,

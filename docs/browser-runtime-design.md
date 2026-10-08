@@ -209,6 +209,14 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 每种操作等待自己的条件。DOM 读取等待文档可用，导航等待主文档提交或失败，点击等待目标可操作，不能让每个命令无条件等待所有网络资源完成。资源级 CDP lane 保证同一 guest 的命令顺序、取消、超时和重连恢复。
 
+页面操作和快照遵循以下单一执行规则：
+
+- 节点点击在滚动后检查可见、启用和实际命中（含 open shadow DOM 与同源 iframe 外层遮挡），只发送一组 CDP 原生鼠标事件。用目标捕获到的可信 click 确认结果，不用 DOM click 补点、不等待固定延时；导航、对话框或引用失效导致无法确认时报告 indeterminate，不能直接重试写操作。
+- 文本输入先经同一原生点击获得 guest 焦点，由 Chromium 编辑命令选择文本，再通过 Input.insertText 输入或 Backspace 清空。replace=false 追加到末尾；替换、追加、清空都必须严格回读相等后才允许 submit_key，不用 value setter 补写。读不到、被页面改写或输入中导航均返回结果未确认。
+- Main 在当前 Surface lane 投递原生写入前聚焦受控 guest WebContents，确保键盘路由正确；不激活宿主窗口，也不在导航完成时抢焦点。
+- 快照的节点选择、排序和 UTF-8 文本预算只由 Worker 采集端执行，默认 96 个节点、10 KiB 文本。保留已收集节点；敏感输入值在采集源排除，祖先/标签名称也不能重新带入敏感表单文本。daemon 只投影，不进行第二次裁剪。
+- 快照结果暴露 returned_nodes、total_nodes、text_bytes 和 truncated。total_nodes 是扫描到的元素数（扫描上限 20,000），不是完整页面总数；truncated 也包括单字段和扫描限制。模型可用 browser_snapshot 的 selector 缩小页面区域，每次快照仍统一失效旧引用。
+
 身份与失效边界如下：
 
 - `desktopEpoch` 隔离整个 Desktop Host 生命周期；旧 Desktop 的所有 Surface 事件都被 daemon 丢弃。

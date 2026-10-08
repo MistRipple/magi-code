@@ -20,6 +20,7 @@
     "test:browser-core-live": "node scripts/verify-browser-core-live.mjs",
     "test:electron-browser-permission-matrix": "node scripts/verify-electron-browser-permission-matrix.mjs",
     "test:electron-browser-network-policy": "node scripts/verify-electron-browser-network-policy.mjs",
+    "test:electron-browser-actions": "node scripts/verify-electron-browser-actions.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
     "release:guard": "npm run browser-tool-catalog:check && npm run browser-network-policy:check && npm run protocol:check && node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs",
     "protocol:generate": "node scripts/generate-app-server-protocol.mjs",

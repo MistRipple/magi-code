@@ -179,13 +179,18 @@
       "rustVariant": "Snapshot",
       "access": "read",
       "tier": "core",
-      "description": "读取当前浏览器页面的可交互元素快照：每个元素带 element_ref、角色、名称、值，以及 checked、expanded 等状态（states），同源 iframe 内的元素也包含在内。element_ref（例如 e:3:12，包括结构性节点的 group 引用）只在本次快照内有效；页面发生交互或结构变化后使用最近一次工具结果里的引用，不要复用旧引用。读取正文内容用 browser_read；不要用截图替代快照。",
+      "description": "读取当前页面的可交互元素、区域、标题和状态。敏感输入不返回值。预算在页面采集时统一应用，结果包含 returned_nodes、total_nodes、text_bytes、truncated；truncated=true 时用 selector 缩小范围，total_nodes 是扫描到的元素数。element_ref 仅在本次快照内有效，每次快照使旧引用失效。读取正文用 browser_read。",
       "inputSchema": {
         "type": "object",
         "properties": {
           "tab_id": {
             "type": "string",
             "description": "可选；省略时使用活动标签页"
+          },
+          "selector": {
+            "type": "string",
+            "description": "可选 CSS 选择器，将快照限定到页面区域；截断时缩小范围，不要反复获取相同全页快照",
+            "maxLength": 1000
           }
         },
         "required": []
@@ -196,7 +201,7 @@
       "rustVariant": "Click",
       "access": "write",
       "tier": "core",
-      "description": "点击当前浏览器快照中的元素，传入 browser_snapshot 返回的 element_ref。结果中的 target 是实际点击的元素（角色与名称），可据此确认点中的是预期元素。",
+      "description": "点击最近快照中的 element_ref。先检查可见、启用和未被遮挡，再只发送一组原生鼠标事件。返回 target 表示确认收到点击的目标；结果未确认时先检查页面状态，不要直接重试。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -238,7 +243,7 @@
           },
           "replace": {
             "type": "boolean",
-            "description": "默认 true"
+            "description": "true 替换全部内容（默认），false 追加到末尾；text 为空且 replace=true 时清空。原生输入后必须确认实际值与预期一致。"
           },
           "submit_key": {
             "type": "string",

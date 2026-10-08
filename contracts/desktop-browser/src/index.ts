@@ -225,6 +225,7 @@ export type BrowserHostCommand =
         navigation_revision: number;
         snapshot_revision: number;
         limits: { max_nodes: number; max_text_bytes: number };
+        selector?: string;
       };
     }
   | {

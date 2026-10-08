@@ -29,12 +29,14 @@
 
 | 入口 | 覆盖范围与前置条件 |
 | --- | --- |
+| `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
+| `npm run test:electron-browser-network-policy` | 开发依赖 Electron 的网络边界验收；验证 iframe、fetch、重定向和 localhost 预览来源 |
 | `npm run test:browser-core-live -- --session-id <id>` | 已运行 daemon 的真实会话/Tab；`--app-renderer` 使用已启动 Desktop 的可信 Renderer，`--lifecycle-regression` 覆盖生命周期。环境变量和可写操作开关见 scripts/verify-browser-core-live.mjs |
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、终态、取消、恢复和时序。应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
 | `node scripts/verify-mcp-server.mjs --base <daemon-url> --mcp-bin <magi-mcp-path>` | 在独立状态根运行的 daemon 与已构建 magi-mcp；通过真实 HTTP/stdio 检查令牌、工具、审批与吊销；会注册工作区并修改测试实例设置 |
 
-核心集成只保留上表四个入口，按改动触发，不接入日常 npm test。DOM 入口负责消息、工具、审批、取消和重启恢复；Browser live 检查当前 Tab 的物理生命周期，权限矩阵验证真实工具授权，MCP 入口验证 HTTP/stdio 对外协议。
+核心集成按改动触发，不接入日常 npm test。Browser actions 负责页面交互和快照，network policy 负责 Chromium 网络边界；DOM 入口负责消息、工具、审批、取消和重启恢复；Browser live 检查当前 Tab 的物理生命周期，权限矩阵验证真实工具授权，MCP 入口验证 HTTP/stdio 对外协议。
 
 DOM 的 recovery、Git preflight、approval expiry、compaction 场景仍可单独选择（MAGI_ELECTRON_DOM_*）。压缩场景保留历史预填充和 3 个连续 Turn，至少一次 completed；移除只为统计时延而重复执行的 timing 采样模式。时序原始记录保留用于诊断，性能分析原则见[对话性能验证](conversation-performance-validation.md)。
 

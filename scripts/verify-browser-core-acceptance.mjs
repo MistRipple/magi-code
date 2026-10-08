@@ -112,7 +112,7 @@ ordered(
   [
     "const surfaces = new BrowserSurfaceManager({",
     "await surfaces.clearDownloads();",
-    "const browserUploadRoot = join(",
+    "worker = new AutomationWorker({",
   ],
   "启动下载清理",
 );
