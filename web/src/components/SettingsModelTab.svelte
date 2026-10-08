@@ -620,16 +620,21 @@
     overflow-y: hidden;
     scroll-behavior: smooth;
     -webkit-overflow-scrolling: touch;
-    /* 标签溢出时显示可拖动的横向滚动条（不设 scrollbar-width，否则会盖掉下面的自定义样式）。 */
+    /* 横向滚动条：平时不显示，鼠标移到标签条上才出现；细（与全局 5px 一致）但仍可拖动。
+       不设 scrollbar-width，否则会盖掉下面的自定义样式。 */
   }
-  .tabbar-scroll::-webkit-scrollbar { height: 8px; }
+  .tabbar-scroll::-webkit-scrollbar { height: 5px; }
   .tabbar-scroll::-webkit-scrollbar-track { background: transparent; }
   .tabbar-scroll::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--foreground) 22%, transparent);
+    background: transparent;
     border-radius: var(--radius-full);
+    transition: background var(--transition-fast);
   }
-  .tabbar-scroll::-webkit-scrollbar-thumb:hover {
-    background: color-mix(in srgb, var(--foreground) 42%, transparent);
+  .tabbar-scroll:hover::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--foreground) 24%, transparent);
+  }
+  .tabbar-scroll:hover::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--foreground) 45%, transparent);
   }
 
   .tabbar-track {
