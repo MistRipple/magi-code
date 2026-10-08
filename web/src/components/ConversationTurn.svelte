@@ -25,7 +25,6 @@
     buildConversationDisclosureBlocks,
     buildConversationStreamEntries,
     isConversationFinalMessage,
-    isThinkingOnlyPhase,
     type ConversationDisclosureBlock,
   } from '../lib/conversation-disclosure';
 
@@ -120,12 +119,9 @@
   );
   const streamEntries = $derived(buildConversationStreamEntries(presentationItems));
 
-  // 整轮「已处理」折叠控制的是文字阶段和工具；思考独立展示、自己折叠，不算在里面。
   const hasProcess = $derived(
-    streamEntries.some(
-      (entry) => entry.kind === 'tool-group'
-        || (entry.kind === 'event' && entry.item.message.type !== 'thinking'),
-    ) || runtimeActive,
+    streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
+      || runtimeActive,
   );
   const isLive = $derived(
     runtimeActive
@@ -179,12 +175,16 @@
     if (!isLive) return '';
     for (let index = disclosureBlocks.length - 1; index >= 0; index -= 1) {
       const block = disclosureBlocks[index];
-      // 系统通知独占的“阶段”只是一行静态说明，不是正在进行的模型工作。
-      if (block.kind === 'phase' && !block.phase.entries.every(
-        (entry) => entry.kind === 'event' && entry.item.message.type === 'system-notice',
-      )) {
+      if (block.kind === 'phase') {
+        // 系统通知独占的“阶段”只是一行静态说明，不是正在进行的模型工作。
+        if (block.phase.entries.every(
+          (entry) => entry.kind === 'event' && entry.item.message.type === 'system-notice',
+        )) continue;
         return block.phase.key;
       }
+      // 最后一块是独立的工具组：模型已经从上一段文字 / 思考转去调用工具，
+      // 之前的阶段（例如刚结束的思考）不再是当前阶段，应当自动收起。
+      if (block.kind === 'tool-group') return '';
     }
     return '';
   });
@@ -249,7 +249,7 @@
   <div class="turn-stream" id={`turn-process-${turnId}`}>
     {#each disclosureBlocks as block (block.kind === 'phase' ? block.phase.key : block.key)}
       {#if block.kind === 'phase'}
-        {#if expanded || isThinkingOnlyPhase(block.phase)}
+        {#if expanded}
         <ConversationPhase
           phase={block.phase}
           active={block.phase.key === activePhaseKey}

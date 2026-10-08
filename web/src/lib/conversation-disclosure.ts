@@ -32,7 +32,6 @@ export function buildConversationStreamEntries(
     .map((entry) => entry.item);
   let agentGroupEmitted = false;
   let toolGroupItems: TimelineRenderItem[] = [];
-  let toolSeen = false;
 
   const flushToolGroup = () => {
     if (toolGroupItems.length === 0) return;
@@ -70,12 +69,10 @@ export function buildConversationStreamEntries(
     }
     if (isToolLikeMessage(entry.item.message)) {
       toolGroupItems.push(entry.item);
-      toolSeen = true;
       continue;
     }
-    // 工具调用之间的思考只是模型内部过程，不应把连续工具调用切成多个组，因此省略。
-    // 去留只看它之前是否出现过工具，保证追加新条目不会让已显示的思考消失。
-    if (toolSeen && entry.item.message.type === 'thinking') continue;
+    // 思考、工具、再思考、再工具……严格按出现的先后顺序展示：思考会把前面的连续工具收成一组，
+    // 之后的工具另起一组，不把不同时间的内容汇总到一起。
     flushToolGroup();
     result.push({ kind: 'event', key: `event:${entry.item.key}`, item: entry.item });
   }
@@ -510,16 +507,6 @@ export function thinkingHasVisibleContent(message: Message): boolean {
   return typeof message.content === 'string' && message.content.trim().length > 0;
 }
 
-/**
- * 只有思考的阶段独立展示：不受整轮「已处理」折叠控制，自己决定展开还是收起，
- * 也不算作整轮折叠里的内容。
- */
-export function isThinkingOnlyPhase(phase: ConversationPhase): boolean {
-  return phase.entries.length > 0 && phase.entries.every(
-    (entry) => entry.kind === 'event' && entry.item.message.type === 'thinking',
-  );
-}
-
 export function resolveConversationPhaseSummary(
   phase: ConversationPhase,
   translate: ConversationTranslate,
@@ -567,7 +554,7 @@ export function buildConversationDisclosureBlocks(
     }
 
     if (entry.kind === 'event' && entry.item.message.type === 'thinking') {
-      // 思考是独立的一块：有自己的折叠状态，不随整轮「已处理」一起展开 / 收起。
+      // 思考单独成一块，与工具组同级、各自折叠，按出现的先后顺序排列；
       // 前后的文字与工具仍按原规则成阶段，所以先收住当前阶段。
       flushPhase();
       if (thinkingHasVisibleContent(entry.item.message)) {

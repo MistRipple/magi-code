@@ -121,9 +121,21 @@ await withGoldenViteServer(async (server) => {
     ['event:t1', 'tool-group:a'],
     '第一个工具出现后，之前已显示的思考必须保留',
   );
-  const withMiddleThinking = disclosure.buildConversationStreamEntries(process(t1, a, t2, b));
-  assert.deepEqual(withMiddleThinking.map((entry) => entry.key), ['event:t1', 'tool-group:a'], '工具之间的思考不能把工具组切开');
-  assert.deepEqual(withMiddleThinking[1].items.map((item) => item.key), ['a', 'b']);
+  const chronological = disclosure.buildConversationStreamEntries(process(t1, a, t2, b));
+  assert.deepEqual(
+    chronological.map((entry) => entry.key),
+    ['event:t1', 'tool-group:a', 'event:t2', 'tool-group:b'],
+    '思考、工具、再思考、再工具严格按先后顺序展示，工具之间的思考不能被省略或合并',
+  );
+  assert.deepEqual(chronological[1].items.map((item) => item.key), ['a']);
+  assert.deepEqual(chronological[3].items.map((item) => item.key), ['b']);
+  const consecutiveTools = disclosure.buildConversationStreamEntries(process(t1, a, b));
+  assert.deepEqual(
+    consecutiveTools.map((entry) => entry.key),
+    ['event:t1', 'tool-group:a'],
+    '中间没有思考的连续工具仍然合并成一组',
+  );
+  assert.deepEqual(consecutiveTools[1].items.map((item) => item.key), ['a', 'b']);
   const prefixKeys = streamKeys(process(textItem('x'), a));
   const extendedKeys = streamKeys(process(textItem('x'), a, textItem('y'), b));
   assert.deepEqual(extendedKeys.slice(0, prefixKeys.length), prefixKeys, '追加条目后，已有条目的 key 保持不变');
@@ -347,7 +359,7 @@ await withGoldenViteServer(async (server) => {
     assert.doesNotMatch(streamingText, /conversation-phase-header/u, '流式正文不带重复的标题行');
   }
 
-  // ---- 思考独立成块：自己折叠，不跟整轮「已处理」绑在一起 ----
+  // ---- 思考单独成块：与工具组同级、各自折叠，都在整轮「已处理」里 ----
   const split = disclosure.buildConversationDisclosureBlocks([
     eventEntry('p1', { content: '先看一下。' }),
     eventEntry('th10', thinkingMessage({ status: 'completed', streaming: false })),
@@ -355,9 +367,11 @@ await withGoldenViteServer(async (server) => {
     toolEntry('t40'),
   ]);
   assert.deepEqual(
-    split.map((block) => block.kind === 'phase' && disclosure.isThinkingOnlyPhase(block.phase)),
-    [false, true, false],
-    '思考前后的文字各成阶段，思考单独一块，且被识别为独立展示',
+    split.map((block) => (block.kind === 'phase'
+      ? (block.phase.entries.every((entry) => entry.item?.message.type === 'thinking') ? 'thinking' : 'phase')
+      : block.kind)),
+    ['phase', 'thinking', 'phase'],
+    '思考前后的文字各成阶段，思考单独一块',
   );
   assert.equal(split.length, 3);
   const emptyThinking = disclosure.buildConversationDisclosureBlocks([
@@ -376,7 +390,7 @@ await withGoldenViteServer(async (server) => {
   );
 
   {
-    // 整轮折叠（有最终回答、没有在运行）时，思考仍然作为独立的一行显示，自己决定展开与否。
+    // 思考在整轮「已处理」折叠的内部，与工具组同级：整轮收起时一起收起，展开后各自折叠。
     const { render: renderTurn } = await server.ssrLoadModule('svelte/server');
     const turnComponent = await server.ssrLoadModule('/src/components/ConversationTurn.svelte');
     const turnItems = [
@@ -397,16 +411,39 @@ await withGoldenViteServer(async (server) => {
       },
     }).body.replace(/<!--[\s\S]*?-->/gu, '');
     const collapsedTurn = turnHtml();
-    assert.match(collapsedTurn, /data-conversation-phase=/u, '整轮折叠时思考行仍然显示');
-    assert.match(collapsedTurn, /思考已完成/u);
-    assert.doesNotMatch(collapsedTurn, /turn-disclosure-header/u, '只有思考时没有可折叠的过程，不画整轮折叠的标题');
-    const withTool = turnHtml([{ key: 't50', message: message({ type: 'tool_call', blocks: [] }) }]);
-    assert.doesNotMatch(
-      withTool.replace(/<section class="conversation-phase[\s\S]*?<\/section>/u, ''),
-      /conversation-phase-header/u,
-      '整轮折叠时，文字阶段和工具仍然收在「已处理」里',
-    );
+    assert.doesNotMatch(collapsedTurn, /data-conversation-phase=/u, '整轮收起时，思考和工具一样收在「已处理」里');
+    assert.match(collapsedTurn, /turn-disclosure-header/u, '有思考时整轮折叠标题存在，用来展开它');
+    const expandedTurn = renderTurn(turnComponent.default, {
+      props: {
+        turnId: 'turn-2',
+        items: turnItems,
+        runtimeActive: true,
+        initialExpanded: true,
+        filePreviewScopeForItem: () => undefined,
+        canEditMessage: () => false,
+        editMessage: () => undefined,
+        continueInterruptedSession: () => undefined,
+      },
+    }).body.replace(/<!--[\s\S]*?-->/gu, '');
+    assert.match(expandedTurn, /data-conversation-phase=/u, '整轮展开后思考作为独立的一行出现，与工具组同级');
+    assert.match(expandedTurn, /思考已完成/u);
   }
+
+  // ---- 整体顺序：思考 → 工具 → 思考 → 工具，一块一块按先后顺序排，不汇总 ----
+  const ordered = disclosure.buildConversationDisclosureBlocks(disclosure.buildConversationStreamEntries([
+    { item: { key: 'o-th1', message: thinkingMessage({ status: 'completed', streaming: false }) }, role: 'process' },
+    { item: toolItem('o-a', 'file_read', { path: 'a.ts' }), role: 'process' },
+    { item: { key: 'o-th2', message: thinkingMessage({ status: 'completed', streaming: false }) }, role: 'process' },
+    { item: toolItem('o-b', 'shell_exec', { command: 'ls' }), role: 'process' },
+    { item: { key: 'o-th3', message: thinkingMessage({ status: 'running', streaming: true }) }, role: 'process' },
+  ]));
+  assert.deepEqual(
+    ordered.map((block) => (block.kind === 'phase'
+      ? (block.phase.entries.every((entry) => entry.item?.message.type === 'thinking') ? 'thinking' : 'phase')
+      : block.kind)),
+    ['thinking', 'tool-group', 'thinking', 'tool-group', 'thinking'],
+    '块的顺序就是发生的顺序',
+  );
 
   // ---- Markdown：紧凑列表项里的行内标记必须被解析，而不是显示成原始符号 ----
   // render 必须经由同一个模块运行器加载，才能与组件共用同一份 svelte 服务端上下文。
