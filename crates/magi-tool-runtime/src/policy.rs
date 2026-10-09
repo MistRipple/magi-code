@@ -215,17 +215,12 @@ impl ToolRegistry {
                     effective_access_profile,
                 ));
             }
-            let path_decision = engine.decide(
-                &magi_permissions::PermissionRequest::PathAccess {
-                    absolute_path: path_request.absolute_path.as_path(),
-                    kind: path_request.kind,
-                },
-                &path_access_policy(
-                    &permission_policy,
-                    input.tool_name.trim(),
-                    path_request.kind,
-                    &policy.allowed_paths,
-                ),
+            let path_decision = decide_tool_path_access(
+                &engine,
+                &permission_policy,
+                input.tool_name.trim(),
+                &path_request,
+                &policy.allowed_paths,
                 effective_access_profile,
             );
             if let Some(output) = select_permission_axis_output(
@@ -512,6 +507,18 @@ pub(crate) fn execution_permission_policy(
     }
 }
 
+/// 未显式配置 `allowed_paths` 时，非完全访问任务的默认范围是工作区根目录。
+/// 显式配置的 `allowed_paths` 对读写都生效；默认范围只约束写入和对外发送。
+fn uses_default_workspace_scope(
+    policy: &magi_permissions::PermissionPolicy,
+    explicit_allowed_paths: &[String],
+) -> bool {
+    explicit_allowed_paths
+        .iter()
+        .all(|path| path.trim().is_empty())
+        && !policy.allowed_paths.is_empty()
+}
+
 /// 读取不受默认的「限定在工作区」约束：读工作区之外的文件（`/etc/hosts`、`ls /tmp`、
 /// `git -C 其他仓库 log`）不会改动任何东西；写入仍然只能落在工作区内。
 /// 任务策略里显式配置的 `allowed_paths` / `denied_paths` 对读写都仍然生效。
@@ -524,16 +531,61 @@ pub fn path_access_policy<'a>(
 ) -> std::borrow::Cow<'a, magi_permissions::PermissionPolicy> {
     if kind == magi_permissions::PathAccessKind::Read
         && tool_name != crate::BuiltinToolName::BrowserUploadFile.as_str()
-        && explicit_allowed_paths
-            .iter()
-            .all(|path| path.trim().is_empty())
-        && !policy.allowed_paths.is_empty()
+        && uses_default_workspace_scope(policy, explicit_allowed_paths)
     {
         let mut read_policy = policy.clone();
         read_policy.allowed_paths.clear();
         return std::borrow::Cow::Owned(read_policy);
     }
     std::borrow::Cow::Borrowed(policy)
+}
+
+/// 工具路径访问的统一判定，预检与执行层共用。
+///
+/// `policy.allowed_paths` 已经过 [`effective_tool_policy_allowed_paths`]，可能是显式范围，
+/// 也可能是默认工作区范围。显式范围、`denied_paths` 与只读模式按原规则拒绝；
+/// 越出默认工作区范围时，读取直接放行（见 [`path_access_policy`]），
+/// 受限模式下的写入和对外发送改为等待用户授权，不再直接拒绝。
+pub fn decide_tool_path_access(
+    engine: &magi_permissions::PermissionEngine,
+    policy: &magi_permissions::PermissionPolicy,
+    tool_name: &str,
+    request: &ToolPathAccessRequest,
+    explicit_allowed_paths: &[String],
+    access_profile: AccessProfile,
+) -> magi_permissions::Decision {
+    let permission_request = magi_permissions::PermissionRequest::PathAccess {
+        absolute_path: request.absolute_path.as_path(),
+        kind: request.kind,
+    };
+    if !uses_default_workspace_scope(policy, explicit_allowed_paths) {
+        return engine.decide(&permission_request, policy, access_profile);
+    }
+    let mut unscoped = policy.clone();
+    unscoped.allowed_paths.clear();
+    let decision = engine.decide(&permission_request, &unscoped, access_profile);
+    if !decision.is_allow()
+        || policy
+            .allowed_paths
+            .iter()
+            .any(|root| request.absolute_path.starts_with(root))
+    {
+        return decision;
+    }
+    let sends_outside = tool_name == crate::BuiltinToolName::BrowserUploadFile.as_str();
+    if request.kind == magi_permissions::PathAccessKind::Read && !sends_outside {
+        return decision;
+    }
+    if access_profile == AccessProfile::Restricted {
+        return magi_permissions::Decision::NeedsApproval {
+            reason: format!(
+                "受限执行下{}工作区外的路径需要确认：{}",
+                if sends_outside { "上传" } else { "写入" },
+                request.absolute_path.display()
+            ),
+        };
+    }
+    engine.decide(&permission_request, policy, access_profile)
 }
 
 pub fn effective_tool_policy_allowed_paths(

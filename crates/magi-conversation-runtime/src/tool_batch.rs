@@ -3365,23 +3365,16 @@ pub(crate) fn access_profile_tool_decision(
                 Some(effective_access_profile),
             ));
         }
-        let path_kind = path_request.kind;
-        let path_request = magi_permissions::PermissionRequest::PathAccess {
-            absolute_path: path_request.absolute_path.as_path(),
-            kind: path_kind,
-        };
         if let Some(decision) = select_access_profile_axis_decision(
             &mut pending_decision,
             permission_decision_payload(
                 &canonical_tool_name,
-                engine.decide(
+                magi_tool_runtime::decide_tool_path_access(
+                    &engine,
+                    &canonical_policy,
+                    canonical_tool_name.as_str(),
                     &path_request,
-                    &magi_tool_runtime::path_access_policy(
-                        &canonical_policy,
-                        canonical_tool_name.as_str(),
-                        path_kind,
-                        allowed_paths,
-                    ),
+                    allowed_paths,
                     effective_access_profile,
                 ),
                 effective_access_profile,
@@ -5096,7 +5089,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_default_scope_rejects_paths_outside_workspace() {
+    fn restricted_default_scope_requires_approval_for_paths_outside_workspace() {
         let workspace = tempdir().expect("workspace tempdir");
         let workspace_root = workspace.path().to_path_buf();
         let outside_path = workspace_root
@@ -5130,27 +5123,29 @@ mod tests {
             .to_string(),
             Some(&workspace_root),
         )
-        .expect("restricted default scope should reject outside workspace path");
+        .expect("restricted default scope should gate outside workspace path");
         let payload: serde_json::Value =
             serde_json::from_str(&decision.payload).expect("decision should be json");
 
-        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        // 受限执行写工作区外的路径等待用户授权，而不是直接拒绝让任务失败。
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
         assert_eq!(
-            payload["error"].as_str(),
-            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+            payload["error_code"].as_str(),
+            Some("tool_policy_needs_approval")
         );
-        assert!(payload["required_access_profile"].is_null());
         assert_eq!(
-            payload["retryable_with_same_arguments"].as_bool(),
-            Some(false)
+            payload["required_access_profile"].as_str(),
+            Some("full_access")
         );
         assert!(
             !decision
                 .payload
                 .contains(outside_path.to_string_lossy().as_ref())
         );
-        assert_eq!(payload["restriction_kind"].as_str(), Some("path_scope"));
+        assert_eq!(
+            payload["restriction_kind"].as_str(),
+            Some("approval_required")
+        );
     }
 
     #[cfg(unix)]
@@ -5223,14 +5218,20 @@ mod tests {
                 "{profile:?} 应允许在工作区外搜索"
             );
         }
-        // 写入仍然限定在工作区：只读直接拒绝，受限拒绝越界路径，完全访问不受默认范围约束。
-        for profile in [
-            magi_core::AccessProfile::ReadOnly,
-            magi_core::AccessProfile::Restricted,
+        // 写入仍然限定在工作区：只读直接拒绝，受限对越界路径等待授权，完全访问不受默认范围约束。
+        for (profile, expected) in [
+            (
+                magi_core::AccessProfile::ReadOnly,
+                ExecutionResultStatus::Rejected,
+            ),
+            (
+                magi_core::AccessProfile::Restricted,
+                ExecutionResultStatus::NeedsApproval,
+            ),
         ] {
             let decision = decide(profile, "file_write", write.clone(), &[], &[])
-                .expect("工作区外的写入必须被拒绝");
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+                .expect("工作区外的写入不能直接放行");
+            assert_eq!(decision.status, expected, "{profile:?}");
         }
         // 任务策略里显式配置的范围仍然生效：显式 allowed_paths 之外、denied_paths 之内都不能读。
         let explicit = [root.join("src").to_string_lossy().to_string()];
@@ -5441,8 +5442,8 @@ mod tests {
             "download_id": "d1",
             "destination_path": outside_path.display().to_string(),
         }))
-        .expect("工作区外不能保存");
-        assert_eq!(rejected.status, ExecutionResultStatus::Rejected);
+        .expect("工作区外保存需要授权");
+        assert_eq!(rejected.status, ExecutionResultStatus::NeedsApproval);
     }
 
     #[test]
@@ -5486,8 +5487,8 @@ mod tests {
                 "file_paths": ["assets/logo.png", outside_path.display().to_string()],
             }),
         ] {
-            let decision = decide(arguments).expect("工作区外的文件不能被上传");
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            let decision = decide(arguments).expect("工作区外的文件不能直接上传");
+            assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
         }
     }
 
@@ -5534,24 +5535,19 @@ mod tests {
                 &arguments.to_string(),
                 Some(&workspace_root),
             )
-            .expect("restricted default scope should reject alias path outside workspace");
+            .expect("restricted default scope should gate alias path outside workspace");
             let payload: serde_json::Value =
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
             assert_eq!(
                 payload["error_code"].as_str(),
-                Some("tool_policy_rejected"),
+                Some("tool_policy_needs_approval"),
                 "unexpected payload: {payload}"
             );
             assert_eq!(
-                payload["error"].as_str(),
-                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
-            );
-            assert!(payload["required_access_profile"].is_null());
-            assert_eq!(
-                payload["retryable_with_same_arguments"].as_bool(),
-                Some(false)
+                payload["restriction_kind"].as_str(),
+                Some("approval_required")
             );
             assert!(
                 !decision
@@ -5594,7 +5590,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restricted_default_scope_rejects_symlink_escape_paths() {
+    fn restricted_default_scope_gates_symlink_escape_writes() {
         let workspace = tempdir().expect("workspace tempdir");
         let outside = tempdir().expect("outside tempdir");
         let workspace_root = workspace.path().to_path_buf();
@@ -5612,7 +5608,7 @@ mod tests {
         );
         task.policy_snapshot = Some(default_agent_spawn_policy());
 
-        // 读取指向工作区外的符号链接是允许的（读取不受工作区限制）；写入穿过链接逃出工作区仍被拒绝。
+        // 读取指向工作区外的符号链接是允许的（读取不受工作区限制）；写入穿过链接逃出工作区需要授权。
         assert!(
             task_policy_tool_decision_with_workspace_root(
                 &task,
@@ -5635,24 +5631,19 @@ mod tests {
                 &arguments.to_string(),
                 Some(&workspace_root),
             )
-            .expect("restricted default scope should reject symlink escape path");
+            .expect("restricted default scope should gate symlink escape path");
             let payload: serde_json::Value =
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
             assert_eq!(
                 payload["error_code"].as_str(),
-                Some("tool_policy_rejected"),
+                Some("tool_policy_needs_approval"),
                 "unexpected payload: {payload}"
             );
             assert_eq!(
-                payload["error"].as_str(),
-                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
-            );
-            assert!(payload["required_access_profile"].is_null());
-            assert_eq!(
-                payload["retryable_with_same_arguments"].as_bool(),
-                Some(false)
+                payload["restriction_kind"].as_str(),
+                Some("approval_required")
             );
         }
     }

@@ -33,7 +33,7 @@ use crate::context_reference::{
     SessionContextReference, browser_annotation_artifact_paths,
     browser_annotation_reference_input_refs, browser_annotation_references_metadata,
     browser_node_selection_input_refs, browser_node_selections_metadata,
-    session_context_reference_input_refs, session_context_reference_policy,
+    session_context_reference_input_refs, session_context_reference_paths,
     session_context_references_metadata,
 };
 use crate::session_images::SessionTurnImage;
@@ -574,37 +574,21 @@ pub fn cleanup_materialized_dispatch_submission_if_not_started(
     Ok(())
 }
 
+/// `allowed_paths` 只承载用户显式限定的范围，派发不写入任何默认值：
+/// 非完全访问任务的默认工作区范围由工具权限层按执行根目录推导（只约束写入），
+/// 写进策略会被当作显式范围，连带把读取也锁在工作区内，子代理也会原样继承。
+/// 上下文引用和浏览器标注产物只登记为只读路径。
 fn build_task_policy(
     task_tier: TaskTier,
     access_profile: AccessProfile,
     context_references: &[SessionContextReference],
     browser_annotation_refs: &[serde_json::Value],
-    workspace_root_path: Option<&Path>,
     denied_tools: Vec<String>,
 ) -> magi_core::TaskPolicy {
-    let mut reference_policy = session_context_reference_policy(
-        context_references,
-        workspace_root_path
-            .map(|path| path.to_string_lossy())
-            .as_deref(),
-        access_profile,
-    );
-    if access_profile != AccessProfile::FullAccess
-        && reference_policy.allowed_paths.is_empty()
-        && let Some(workspace_root_path) = workspace_root_path
-    {
-        reference_policy
-            .allowed_paths
-            .push(workspace_root_path.to_string_lossy().into_owned());
-    }
+    let mut read_only_paths = session_context_reference_paths(context_references);
     for artifact_path in browser_annotation_artifact_paths(browser_annotation_refs) {
-        if access_profile != AccessProfile::FullAccess
-            && !reference_policy.allowed_paths.contains(&artifact_path)
-        {
-            reference_policy.allowed_paths.push(artifact_path.clone());
-        }
-        if !reference_policy.read_only_paths.contains(&artifact_path) {
-            reference_policy.read_only_paths.push(artifact_path);
+        if !read_only_paths.contains(&artifact_path) {
+            read_only_paths.push(artifact_path);
         }
     }
     magi_core::TaskPolicy {
@@ -612,9 +596,9 @@ fn build_task_policy(
         access_profile,
         allowed_tools: Vec::new(),
         denied_tools,
-        allowed_paths: reference_policy.allowed_paths,
+        allowed_paths: Vec::new(),
         denied_paths: Vec::new(),
-        read_only_paths: reference_policy.read_only_paths,
+        read_only_paths,
         network_mode: "full".to_string(),
         command_mode: "full".to_string(),
         retry_limit: 1,
@@ -637,7 +621,6 @@ struct DispatchTaskInput<'a> {
     task_tier: TaskTier,
     access_profile: AccessProfile,
     context_references: &'a [SessionContextReference],
-    workspace_root_path: Option<&'a Path>,
     required_tool_chain: Vec<String>,
     goal_mode: bool,
     completion_contract: TaskCompletionContract,
@@ -660,7 +643,6 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         task_tier,
         access_profile,
         context_references,
-        workspace_root_path,
         required_tool_chain,
         goal_mode,
         completion_contract,
@@ -697,7 +679,6 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
             access_profile,
             context_references,
             browser_annotation_refs,
-            workspace_root_path,
             denied_tools,
         )),
         executor_binding: Some(executor_binding),
@@ -846,7 +827,6 @@ fn validate_dispatch_request(
         context_references: &request.context_references,
         browser_annotation_refs: &request.browser_annotation_refs,
         browser_node_selections: &request.browser_node_selections,
-        workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
         goal_mode: request.goal_mode,
         completion_contract: request.completion_contract.clone(),
@@ -2203,12 +2183,9 @@ mod tests {
             .policy_snapshot
             .as_ref()
             .expect("browser annotation task should have policy");
-        assert_eq!(
-            policy.allowed_paths,
-            vec![
-                "/tmp/workspace-dispatch-browser-annotation",
-                "/tmp/browser-artifacts/session-dispatch/annotation.png"
-            ]
+        assert!(
+            policy.allowed_paths.is_empty(),
+            "派发不得把默认工作区范围写成显式 allowed_paths"
         );
         assert_eq!(
             policy.read_only_paths,
@@ -2376,7 +2353,6 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
             context_references: &[],
-            workspace_root_path: None,
             required_tool_chain: vec!["file_read".to_string()],
             goal_mode: false,
             completion_contract: TaskCompletionContract::default(),
@@ -2597,7 +2573,6 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
             context_references: &[],
-            workspace_root_path: None,
             required_tool_chain: vec!["shell_exec".to_string()],
             goal_mode: false,
             completion_contract: TaskCompletionContract::default(),
@@ -3204,12 +3179,9 @@ mod tests {
             .policy_snapshot
             .as_ref()
             .expect("task policy should exist");
-        assert_eq!(
-            policy.allowed_paths,
-            vec![
-                "/tmp/workspace".to_string(),
-                "/tmp/external/reference.md".to_string()
-            ]
+        assert!(
+            policy.allowed_paths.is_empty(),
+            "派发不得把默认工作区范围写成显式 allowed_paths"
         );
         assert_eq!(
             policy.read_only_paths,
