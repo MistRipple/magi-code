@@ -193,6 +193,35 @@ fn active_manifests_are_projected_to_the_requested_scope() {
 }
 
 #[test]
+fn active_commands_are_projected_to_the_requested_scope() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "commands.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle", "workspace:one").unwrap();
+    manager.activate("acme.lifecycle", "workspace:one").unwrap();
+    let commands = manager
+        .command_contributions_for_scope("workspace:one")
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0.id, "acme.lifecycle");
+    assert_eq!(commands[0].1.id, "open");
+    assert!(
+        manager
+            .command_contributions_for_scope("workspace:two")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn workspace_activation_requires_application_scoped_grants_too() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();

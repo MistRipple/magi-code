@@ -6,6 +6,16 @@ export type PluginManifestProjection = PluginManifest;
 
 export type InstalledPluginProjection = PluginInstalled;
 
+export interface PluginContributionProjection {
+  id: string;
+  pluginId: string;
+  contributionId: string;
+  version: string;
+  digest: string;
+  title: string;
+  description: string;
+}
+
 async function pluginRequest(path: string, init?: RequestInit): Promise<Response> {
   return getTransport().request(agentUrl(path), init);
 }
@@ -78,6 +88,13 @@ export async function loadActivePluginManifests(scope = 'application'): Promise<
   if (!response.ok) throw new Error(`插件清单请求失败: ${response.status}`);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
+}
+
+export async function loadActivePluginCommands(scope = 'application'): Promise<PluginContributionProjection[]> {
+  const response = await pluginRequest(`/api/plugins/commands?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error(`插件命令请求失败: ${response.status}`);
+  const payload = await response.json() as unknown;
+  return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
 
 export async function readPluginResource(

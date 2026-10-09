@@ -26,6 +26,7 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/plugins", get(list))
         .route("/plugins/manifests", get(manifests))
+        .route("/plugins/commands", get(commands))
         .route("/plugins/workflows", get(workflows))
         .route("/plugins/{id}/manifest", get(manifest))
         .route("/plugins/{id}/ui/{*path}", get(resource))
@@ -66,6 +67,34 @@ async fn manifests(
         .manifests_for_scope(&query.scope)
         .map_err(plugin_error)?;
     Ok(Json(manifests))
+}
+
+async fn commands(
+    State(state): State<ApiState>,
+    Query(query): Query<ScopeQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let manager = locked(&state, "读取插件命令")?;
+    let entries = manager
+        .command_contributions_for_scope(&query.scope)
+        .map_err(plugin_error)?
+        .into_iter()
+        .map(|(manifest, command)| {
+            let digest = manager
+                .package(&manifest.id)
+                .map(|package| package.digest().to_string())
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": format!("plugin/{}/{}", manifest.id, command.id),
+                "pluginId": manifest.id,
+                "contributionId": command.id,
+                "version": manifest.version,
+                "digest": digest,
+                "title": command.title,
+                "description": command.description,
+            })
+        })
+        .collect();
+    Ok(Json(entries))
 }
 
 async fn workflows(

@@ -451,6 +451,36 @@ impl PluginManager {
         Ok(result)
     }
 
+    pub fn command_contributions_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<
+        Vec<(
+            PluginManifest,
+            magi_app_server_protocol::PluginNamedContribution,
+        )>,
+        PluginError,
+    > {
+        validate_scope_key(scope)?;
+        let mut result = Vec::new();
+        for id in self.state.plugins.keys() {
+            if !self.is_active_for_scope(id, scope)? {
+                continue;
+            }
+            let package = self.package(id)?;
+            result.extend(
+                package
+                    .manifest()
+                    .contributions
+                    .commands
+                    .iter()
+                    .cloned()
+                    .map(|command| (package.manifest().clone(), command)),
+            );
+        }
+        Ok(result)
+    }
+
     pub fn engine_contributions_for_scope(
         &self,
         scope: &str,
