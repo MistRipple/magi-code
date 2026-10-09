@@ -48,6 +48,13 @@ pub(crate) fn build_tool_catalog_value(
     let runtime_health = RuntimeHealth::from_resources(resources, &agent_roles);
     let mut runtime_warning_count = 0usize;
     let access_profile = context.access_profile;
+    // The settings/API catalog is also used as a model self-inspection tool. A
+    // task without a workspace must not report filesystem/process tools as ready:
+    // those tools are intentionally filtered from the actual model tool surface.
+    // Keep the product-wide catalog unchanged for non-task diagnostics, while
+    // making the model-facing snapshot reflect the current execution scope.
+    let model_execution_without_workspace =
+        context.task_id.is_some() && context.workspace_id.is_none();
 
     for tool in BuiltinToolName::ALL {
         let is_public = tool.is_public_tool_surface();
@@ -64,7 +71,15 @@ pub(crate) fn build_tool_catalog_value(
         let schema = tool.parameters_schema();
         let schema_warnings = schema_warnings(&schema);
         schema_warning_count += schema_warnings.len();
-        let runtime_status = runtime_health.tool_status(tool);
+        let runtime_status =
+            if model_execution_without_workspace && tool.requires_workspace_context() {
+                RuntimeToolStatus {
+                    status: "unavailable",
+                    warnings: vec!["当前任务未绑定工作区".to_string()],
+                }
+            } else {
+                runtime_health.tool_status(tool)
+            };
         runtime_warning_count += runtime_status.warnings.len();
         let policy_view = tool_catalog_policy_view(tool, access_profile);
         let model_call_scope = model_call_scope(tool);
@@ -78,6 +93,9 @@ pub(crate) fn build_tool_catalog_value(
             // agent_spawn / agent_wait：模型通过任务编排层调用，不能落到普通
             // BuiltinTool::execute。把可调用范围单独输出，避免模型把两者混为一谈。
             "model_call_scope": model_call_scope,
+            "workspace_required": tool.requires_workspace_context(),
+            "model_available": !(model_execution_without_workspace
+                && tool.requires_workspace_context()),
             "access_mode": access_mode_for_tool(tool).as_str(),
             "policy_scope": policy_view.policy_scope,
             "input_sensitive_policy": policy_view.input_sensitive_policy,
@@ -174,6 +192,7 @@ pub(crate) fn build_tool_catalog_value(
         "status": "succeeded",
         "catalog_access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "current_access_profile": access_profile.as_str(),
+        "workspace_bound": context.workspace_id.is_some(),
         "approval_policy_summary": approval_policy_summary(access_profile),
         "summary": tool_catalog_summary(ToolCatalogSummaryInput {
             public_count,
@@ -1001,6 +1020,47 @@ mod tests {
             file_write["access_profile_behavior"],
             "unavailable_in_read_only"
         );
+    }
+
+    #[test]
+    fn model_catalog_marks_workspace_tools_unavailable_without_workspace_scope() {
+        let context = ToolExecutionContext {
+            task_id: Some(magi_core::TaskId::new("task-no-workspace")),
+            ..ToolExecutionContext::default()
+        };
+        let payload: serde_json::Value = serde_json::from_str(&execute_tool_catalog(
+            r#"{"include_internal":true,"include_external":false}"#,
+            &context,
+            &ToolRuntimeResources::default(),
+        ))
+        .expect("catalog output should be json");
+
+        assert_eq!(payload["workspace_bound"], false);
+        for name in ["file_read", "shell_exec", "search_text", "git_status"] {
+            let tool = payload["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} should be listed"));
+            assert_eq!(tool["workspace_required"], true, "{name}");
+            assert_eq!(tool["model_available"], false, "{name}");
+            assert_eq!(tool["runtime_status"], "unavailable", "{name}");
+            assert_eq!(
+                tool["runtime_warnings"],
+                serde_json::json!(["当前任务未绑定工作区"]),
+                "{name}"
+            );
+        }
+
+        let browser = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "browser_navigate")
+            .expect("browser_navigate should be listed");
+        assert_eq!(browser["workspace_required"], false);
+        assert_eq!(browser["model_available"], true);
     }
 
     #[test]

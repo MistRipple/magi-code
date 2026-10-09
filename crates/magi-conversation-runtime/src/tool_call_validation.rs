@@ -55,6 +55,7 @@ pub(crate) struct ToolCallValidationBatch {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolCallValidationTracker {
     invalid_rounds: usize,
+    unavailable_attempts: usize,
 }
 
 impl ToolCallValidationTracker {
@@ -65,6 +66,20 @@ impl ToolCallValidationTracker {
 
     pub(crate) fn record_valid_round(&mut self) {
         self.invalid_rounds = 0;
+    }
+
+    /// Count unavailable-tool calls independently of valid recovery calls.
+    ///
+    /// A model can otherwise alternate between a valid `tool_catalog`/agent call and
+    /// the same unavailable filesystem tool forever, resetting `invalid_rounds` on
+    /// every valid round. That leaves the UI in a long-running state even though the
+    /// requested capability cannot exist in the current session scope.
+    pub(crate) fn record_unavailable_tool(&mut self, _tool_name: &str) -> usize {
+        self.unavailable_attempts = self.unavailable_attempts.saturating_add(1);
+        // The model may alternate between different missing local tools (for example,
+        // file_read and shell_exec). Keep one shared budget so that changing names
+        // cannot keep the turn alive.
+        self.unavailable_attempts
     }
 }
 
@@ -626,6 +641,17 @@ mod tests {
         tracker.record_valid_round();
         assert_eq!(tracker.record_round(), 1);
         assert_eq!(tracker.record_round(), 2);
+    }
+
+    #[test]
+    fn validation_tracker_keeps_unavailable_tool_attempts_across_valid_rounds() {
+        let mut tracker = ToolCallValidationTracker::default();
+
+        assert_eq!(tracker.record_unavailable_tool("file_read"), 1);
+        tracker.record_valid_round();
+        assert_eq!(tracker.record_unavailable_tool("file_read"), 2);
+        assert_eq!(tracker.record_unavailable_tool("shell_exec"), 3);
+        assert_eq!(tracker.record_unavailable_tool("file_read"), 4);
     }
 
     #[test]

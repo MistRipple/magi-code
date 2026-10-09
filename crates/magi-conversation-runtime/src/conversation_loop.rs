@@ -830,6 +830,11 @@ fn run_conversation_loop_inner(
             PromptFragmentKind::WorkspaceContext,
             workspace_context_system_prompt(&root_path.display().to_string()),
         ));
+    } else {
+        static_context_messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::WorkspaceContext,
+            "当前会话未绑定工作区。file_read、view_image、search_text、search_semantic、code_symbols、shell_exec、Git、进程和其他本地文件/进程工具不会出现在本轮 tools 定义中；不要调用这些缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复尝试。需要本地项目事实时，请先让用户切换到绑定工作区的会话，或基于本轮实际提供的工具完成任务。",
+        ));
     }
     // ---- Cache breakpoint · STATIC → NON-STATIC ----
     // 上面 Tier A 三段同一角色 / workspace / mission 多轮不变，是 prompt
@@ -2906,7 +2911,24 @@ fn run_conversation_loop_inner(
             None
         } else {
             let attempts = tool_call_validation_tracker.record_round();
-            if attempts >= 2 {
+            let mut unavailable_failure = None;
+            for invalid in &invalid_tool_calls {
+                if invalid.issue.reason_code != "tool_not_available" {
+                    continue;
+                }
+                let unavailable_attempts =
+                    tool_call_validation_tracker.record_unavailable_tool(&invalid.issue.tool_name);
+                if unavailable_attempts >= 2 {
+                    unavailable_failure = Some(ToolCallFailureDiagnostic::repeated(
+                        &invalid.issue,
+                        unavailable_attempts.saturating_sub(1),
+                    ));
+                    break;
+                }
+            }
+            if unavailable_failure.is_some() {
+                unavailable_failure
+            } else if attempts >= 2 {
                 invalid_tool_calls.first().map(|invalid| {
                     ToolCallFailureDiagnostic::repeated(&invalid.issue, attempts.saturating_sub(1))
                 })
