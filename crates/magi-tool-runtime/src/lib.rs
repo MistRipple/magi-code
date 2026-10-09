@@ -20,7 +20,8 @@ pub use builtin_catalog::{
 pub(crate) use builtin_catalog::{low_risk_policy, tool_policy_decision_payload};
 pub use policy::{
     ToolPathAccessRequest, browser_action_class, canonicalize_tool_permission_path,
-    effective_tool_policy_allowed_paths, normalize_tool_policy_paths, tool_path_access_requests,
+    effective_tool_policy_allowed_paths, normalize_tool_policy_paths,
+    shell_call_skips_default_path_scope, tool_path_access_requests,
 };
 pub use registry::ToolRegistry;
 pub use types::external_mcp_model_tool_name;

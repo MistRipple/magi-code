@@ -4158,6 +4158,50 @@ fn registry_allows_restricted_read_only_shell() {
 }
 
 #[test]
+fn registry_read_only_profile_runs_undeclared_read_commands_including_outside_the_workspace() {
+    let registry = make_registry();
+    let policy = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::ReadOnly,
+        ..ToolExecutionPolicy::default()
+    };
+    let run = |call_id: &str, input: Value| {
+        registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(call_id),
+                BuiltinToolName::ShellExec.as_str(),
+                input.to_string(),
+            ),
+            test_workspace_context(),
+            &policy,
+        )
+    };
+
+    // 没有声明 access_mode，也没有写入迹象；`2>/dev/null` 与读取工作区之外的路径都不算写入。
+    let outside = std::env::temp_dir();
+    let read = run(
+        "tc-read-only-undeclared-read",
+        serde_json::json!({
+            "command": format!("ls {} >/dev/null 2>&1 && printf ok", outside.display())
+        }),
+    );
+    assert_eq!(
+        read.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        read.payload
+    );
+    let payload: Value = serde_json::from_str(&read.payload).expect("payload json");
+    assert_eq!(payload["stdout"], "ok");
+
+    // 写入迹象仍然被拒绝。
+    let write = run(
+        "tc-read-only-undeclared-write",
+        serde_json::json!({ "command": "printf x > blocked.txt" }),
+    );
+    assert_eq!(write.status, ExecutionResultStatus::Rejected);
+}
+
+#[test]
 fn registry_reclassifies_misdeclared_shell_without_blocking_full_access() {
     let root = unique_temp_dir("magi-tool-full-access-shell-reclassification");
     let target = root.join("created.txt");

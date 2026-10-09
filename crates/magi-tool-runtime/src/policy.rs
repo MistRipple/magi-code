@@ -160,7 +160,15 @@ impl ToolRegistry {
         let effective_access_profile = policy.effective_access_profile();
         let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
-        let permission_policy = execution_permission_policy(&policy, workspace_root_path);
+        let mut permission_policy = execution_permission_policy(&policy, workspace_root_path);
+        if shell_call_skips_default_path_scope(
+            input.tool_name.trim(),
+            &input.input,
+            &policy.allowed_paths,
+            effective_access_profile,
+        ) {
+            permission_policy.allowed_paths.clear();
+        }
         let mut pending_output = None;
 
         let tool_is_writeful = crate::BuiltinToolName::from_name(input.tool_name.trim())
@@ -504,6 +512,29 @@ pub(crate) fn execution_permission_policy(
         ),
         denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
         command_mode: policy.command_mode.clone(),
+    }
+}
+
+/// 只读 shell（命令文本分析确认不写任何文件）不受「默认限定在工作区」约束：
+/// 读取工作区之外的文件（`/etc/hosts`、`ls /tmp`、`git -C 其他仓库 log`）不会改动任何东西。
+/// 任务策略里显式配置的 `allowed_paths` / `denied_paths` 仍然生效。
+pub fn shell_call_skips_default_path_scope(
+    canonical_tool_name: &str,
+    arguments: &str,
+    explicit_allowed_paths: &[String],
+    access_profile: AccessProfile,
+) -> bool {
+    if canonical_tool_name != crate::BuiltinToolName::ShellExec.as_str()
+        || !explicit_allowed_paths
+            .iter()
+            .all(|path| path.trim().is_empty())
+    {
+        return false;
+    }
+    if access_profile == AccessProfile::ReadOnly {
+        magi_permissions::PermissionEngine::shell_arguments_are_read_only(arguments)
+    } else {
+        magi_permissions::PermissionEngine::shell_arguments_request_read_only(arguments)
     }
 }
 

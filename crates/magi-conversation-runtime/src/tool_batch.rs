@@ -3279,11 +3279,20 @@ pub(crate) fn access_profile_tool_decision(
                 canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
             })
             .collect(),
-        allowed_paths: effective_tool_policy_allowed_paths(
-            effective_access_profile,
+        allowed_paths: if magi_tool_runtime::shell_call_skips_default_path_scope(
+            canonical_tool_name.as_str(),
+            arguments,
             allowed_paths,
-            workspace_root_path.map(|path| path.as_path()),
-        ),
+            effective_access_profile,
+        ) {
+            Vec::new()
+        } else {
+            effective_tool_policy_allowed_paths(
+                effective_access_profile,
+                allowed_paths,
+                workspace_root_path.map(|path| path.as_path()),
+            )
+        },
         denied_paths: normalize_tool_policy_paths(
             denied_paths,
             workspace_root_path.map(|path| path.as_path()),
@@ -5168,6 +5177,63 @@ mod tests {
         .expect("restricted write shell inside symlinked workspace should require approval");
 
         assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn read_only_shell_runs_any_command_that_does_not_write() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let root = workspace.path().to_path_buf();
+        let decide = |arguments: &str| {
+            access_profile_tool_decision(AccessProfileToolDecisionInput {
+                access_profile: magi_core::AccessProfile::ReadOnly,
+                command_mode: "",
+                allowed_tools: &[],
+                denied_tools: &[],
+                allowed_paths: &[],
+                denied_paths: &[],
+                read_only_paths: &[],
+                requested_tool_name: "shell_exec",
+                arguments,
+                workspace_root_path: Some(&root),
+            })
+        };
+
+        // 不写文件的命令都能执行：不必声明 access_mode，`2>/dev/null` / 管道不算写入，
+        // 读取工作区之外的路径也可以（只读 shell 不受默认的工作区范围限制）。
+        for command in [
+            "pwd && ls -la",
+            "rg -n foo src | head -20",
+            "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git log --oneline -5 2>/dev/null; git status --short 2>/dev/null | head -30; else echo NO; fi",
+            "cat /etc/hosts",
+            "ls /tmp",
+            "git -C /private/tmp log --oneline -3",
+            "wc -l ../other/file.txt",
+        ] {
+            for arguments in [
+                serde_json::json!({ "command": command }),
+                serde_json::json!({ "command": command, "access_mode": "read_only" }),
+            ] {
+                assert!(
+                    decide(&arguments.to_string()).is_none(),
+                    "只读模式应允许：{arguments}"
+                );
+            }
+        }
+
+        // 会写文件的仍然拒绝：声明了写入、重定向到文件、写类命令、改仓库的 git 子命令。
+        for arguments in [
+            serde_json::json!({ "command": "ls", "access_mode": "explicit_write" }),
+            serde_json::json!({ "command": "echo hi > out.txt" }),
+            serde_json::json!({ "command": "echo hi > out.txt", "access_mode": "read_only" }),
+            serde_json::json!({ "command": "touch out.txt" }),
+            serde_json::json!({ "command": "rm -rf build" }),
+            serde_json::json!({ "command": "git commit -m x" }),
+            serde_json::json!({ "command": "curl -O https://example.test/a.bin" }),
+        ] {
+            let decision = decide(&arguments.to_string())
+                .unwrap_or_else(|| panic!("只读模式应拒绝写入：{arguments}"));
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        }
     }
 
     #[test]

@@ -268,13 +268,18 @@ impl PermissionEngine {
         if !Self::shell_arguments_have_permission_relevant_operation(arguments_json) {
             return Decision::Allow;
         }
-        let is_read_only = Self::shell_arguments_request_read_only(arguments_json);
+        let is_read_only =
+            if access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode() {
+                Self::shell_arguments_are_read_only(arguments_json)
+            } else {
+                Self::shell_arguments_request_read_only(arguments_json)
+            };
         if !is_read_only
             && (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
         {
             return Decision::Deny {
                 reason:
-                    "只读任务中的 shell_exec 必须声明 access_mode=read_only，且命令不能包含写入迹象"
+                    "只读任务中的 shell_exec 只能执行不写文件的命令（命令含写入迹象或声明了写入）"
                         .to_string(),
             };
         }
@@ -286,11 +291,23 @@ impl PermissionEngine {
         }
     }
 
-    /// 检查 arguments JSON 是否表达了只读 shell。
+    /// 检查 arguments JSON 是否表达了只读 shell（受限 / 完全访问下用于免审批与并发判定）。
     ///
     /// 只读判定不能只相信模型声明：`access_mode=read_only` 只是必要条件，命令文本中
     /// 出现重定向或常见写类命令时仍然视为写类 shell。
     pub fn shell_arguments_request_read_only(arguments_json: &str) -> bool {
+        Self::shell_arguments_read_only_analysis(arguments_json, true)
+    }
+
+    /// 只读访问模式下 shell 能否执行：不要求声明 `access_mode`，只看命令文本有没有写入迹象
+    /// （重定向到文件、写类命令、会落盘的下载、会改仓库的 git 子命令等）。
+    /// 只读模式本来就禁止一切写入，没写入迹象的命令都可以跑；明确声明了写入的仍按写类处理。
+    /// 受限 / 完全访问下的免审批判定仍要求声明，见 [`Self::shell_arguments_request_read_only`]。
+    pub fn shell_arguments_are_read_only(arguments_json: &str) -> bool {
+        Self::shell_arguments_read_only_analysis(arguments_json, false)
+    }
+
+    fn shell_arguments_read_only_analysis(arguments_json: &str, require_declaration: bool) -> bool {
         let Some(object) = serde_json::from_str::<serde_json::Value>(arguments_json)
             .ok()
             .and_then(|value| value.as_object().cloned())
@@ -316,13 +333,18 @@ impl PermissionEngine {
             Some(_) => return false,
         }
 
-        if !json_string(&object, &["access_mode", "write_mode", "intent"]).is_some_and(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "read" | "read_only" | "readonly"
-            )
-        }) {
-            return false;
+        let declared_mode = json_string(&object, &["access_mode", "write_mode", "intent"]);
+        match declared_mode {
+            Some(mode)
+                if !matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "read" | "read_only" | "readonly"
+                ) =>
+            {
+                return false;
+            }
+            None if require_declaration => return false,
+            _ => {}
         }
         let Some(command) = json_string(&object, &["command", "script", "line"]) else {
             return false;
