@@ -871,31 +871,6 @@ impl TaskStore {
         Ok(package)
     }
 
-    /// 持久化当前工作流核心的检查点。检查点更新与执行租约绑定，只有仍持有
-    /// 当前租约的运行才能推进阶段，避免旧 Worker 的迟到结果覆盖恢复后的状态。
-    pub fn update_workflow_checkpoint(
-        &self,
-        task_id: &TaskId,
-        root_task_id: &TaskId,
-        lease_id: &LeaseId,
-        workflow_id: &str,
-        stage: &str,
-        checkpoint_version_value: u32,
-        checkpoint: serde_json::Value,
-    ) -> DomainResult<bool> {
-        self.update_workflow_state(
-            task_id,
-            root_task_id,
-            lease_id,
-            workflow_id,
-            stage,
-            checkpoint_version_value,
-            checkpoint,
-            None,
-            None,
-        )
-    }
-
     /// 原子持久化工作流阶段、检查点、待结算动作和最近结果。动作记录与租约
     /// 同一事务提交，恢复时可以区分“尚未执行”与“已执行但尚未进入下一决策”。
     pub fn update_workflow_state(
@@ -909,7 +884,7 @@ impl TaskStore {
         checkpoint: serde_json::Value,
         pending_action: Option<serde_json::Value>,
         last_result: Option<serde_json::Value>,
-    ) -> DomainResult<bool> {
+    ) -> DomainResult<()> {
         if checkpoint_version_value == 0 || workflow_id.trim().is_empty() || stage.trim().is_empty()
         {
             return Err(DomainError::InvalidState {
@@ -928,7 +903,9 @@ impl TaskStore {
             .clone();
         Self::validate_task_root(&tasks, task_id, root_task_id)?;
         let Some(lease) = leases.get(lease_id) else {
-            return Ok(false);
+            return Err(DomainError::InvalidState {
+                message: "工作流执行租约已失效".into(),
+            });
         };
         if lease.task_id != *task_id || lease.root_task_id != *root_task_id {
             return Err(DomainError::InvalidState {
@@ -936,13 +913,17 @@ impl TaskStore {
             });
         }
         if lease.lease_status != TaskLeaseState::Active {
-            return Ok(false);
+            return Err(DomainError::InvalidState {
+                message: "工作流执行租约已失效".into(),
+            });
         }
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         if task.status != TaskStatus::Running {
-            return Ok(false);
+            return Err(DomainError::InvalidState {
+                message: "工作流执行租约已失效".into(),
+            });
         }
         let TaskRuntimePayload::Workflow {
             workflow_id: current_workflow_id,
@@ -973,7 +954,7 @@ impl TaskStore {
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         *self.leases.write().expect("leases write lock poisoned") = leases;
-        Ok(true)
+        Ok(())
     }
 
     /// 将工作流交回用户：保存等待动作、释放执行租约并将任务置回 Pending。
@@ -1077,6 +1058,7 @@ impl TaskStore {
         if lease.lease_status != TaskLeaseState::Active {
             return Ok(false);
         }
+        Self::validate_lease_contract(&tasks, &lease)?;
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
@@ -3117,7 +3099,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_workflow_checkpoint(
+                .update_workflow_state(
                     &task_id,
                     &task_id,
                     &lease.lease_id,
@@ -3125,22 +3107,24 @@ mod tests {
                     "start",
                     0,
                     serde_json::json!({"step": 0}),
+                    None,
+                    None,
                 )
                 .is_err()
         );
-        assert!(
-            store
-                .update_workflow_checkpoint(
-                    &task_id,
-                    &task_id,
-                    &lease.lease_id,
-                    "plugin/example/flow",
-                    "execute",
-                    2,
-                    serde_json::json!({"step": 1}),
-                )
-                .unwrap()
-        );
+        store
+            .update_workflow_state(
+                &task_id,
+                &task_id,
+                &lease.lease_id,
+                "plugin/example/flow",
+                "execute",
+                2,
+                serde_json::json!({"step": 1}),
+                None,
+                None,
+            )
+            .unwrap();
         let updated = store.get_task(&task_id).unwrap();
         assert!(matches!(
             updated.runtime_payload,
@@ -3150,6 +3134,74 @@ mod tests {
                 checkpoint,
                 ..
             } if stage == "execute" && checkpoint == serde_json::json!({"step": 1})
+        ));
+    }
+
+    #[test]
+    fn workflow_user_wait_releases_lease_and_requires_matching_operation() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("workflow-user-wait-task");
+        let mut task = task(task_id.as_str(), TaskStatus::Pending);
+        task.root_task_id = task_id.clone();
+        task.kind = TaskKind::LocalWorkflow;
+        task.runtime_payload = TaskRuntimePayload::Workflow {
+            workflow_id: "plugin/example/flow".into(),
+            checkpoint_version: 1,
+            stage: "start".into(),
+            checkpoint: serde_json::Value::Null,
+            pending_action: None,
+            last_result: None,
+        };
+        store.insert_task(task).unwrap();
+        let lease = store
+            .grant_lease_and_start_task(
+                &task_id,
+                &task_id,
+                &WorkerId::new("workflow-worker"),
+                "executor",
+                10_000,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .requeue_workflow_for_user(
+                    &task_id,
+                    &task_id,
+                    &lease.lease_id,
+                    "plugin/example/flow",
+                    "ask",
+                    2,
+                    serde_json::json!({"step": 1}),
+                    "lease-1:0".into(),
+                    "需要确认".into(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&task_id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert!(store.get_active_lease(&task_id).is_none());
+        assert!(store.has_pending_user_input(&task_id));
+        assert!(
+            store
+                .resume_workflow_with_user_input(&task_id, "wrong", "回答".into())
+                .is_err()
+        );
+        store
+            .resume_workflow_with_user_input(&task_id, "lease-1:0", "回答".into())
+            .unwrap();
+        let resumed = store.get_task(&task_id).unwrap();
+        assert!(!store.has_pending_user_input(&task_id));
+        assert!(matches!(
+            resumed.runtime_payload,
+            TaskRuntimePayload::Workflow {
+                pending_action: None,
+                last_result: Some(ref value),
+                ..
+            } if value.get("kind").and_then(serde_json::Value::as_str) == Some("user_input")
         ));
     }
 

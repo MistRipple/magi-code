@@ -44,7 +44,18 @@ async fn answer_workflow(
             "operationId 和 input 不能为空".into(),
         ));
     }
-    let (scope, task) = require_session_owned_task(
+    let scope = require_task_request_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.scope,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("回答工作流", "runner_manager 未配置"))?;
+    let _session_guard = manager.lock_session_lifecycle(&scope.session_id).await;
+    let (_, task) = require_session_owned_task(
         &state,
         request.session_id.as_deref(),
         request.scope,
@@ -52,22 +63,23 @@ async fn answer_workflow(
         request.workspace_path.as_deref(),
         request.task_id.trim(),
     )?;
+    let _restart_guard = manager.lock_for_restart(task.root_task_id.as_str()).await;
+    // 用户可能在挂起 dispatch 尚未退出时回答；先等待旧执行链结算。
+    manager
+        .quiesce_for_restart(task.root_task_id.as_str())
+        .await;
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("回答工作流", "task_store 未配置"))?;
     store
         .resume_workflow_with_user_input(&task.task_id, &request.operation_id, request.input)
         .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("回答工作流", "runner_manager 未配置"))?;
     manager
-        .start(task.root_task_id.as_str(), Some(scope.session_id.clone()))
-        .await
+        .start_after_quiesce(task.root_task_id.as_str(), Some(scope.session_id.clone()))
         .map_err(|error| {
             let message = match error {
                 crate::state::RunnerStartError::NotFound => "根任务不存在",
-                crate::state::RunnerStartError::AlreadyRunning => "工作流已经在运行",
+                crate::state::RunnerStartError::AlreadyRunning => "恢复锁内仍存在活动 runner",
                 crate::state::RunnerStartError::SessionUnavailable => "当前会话不可用",
             };
             ApiError::internal_assembly("恢复工作流失败", message)

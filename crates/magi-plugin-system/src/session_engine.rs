@@ -98,7 +98,6 @@ impl PluginSessionEngineFactory {
     fn identity(engine_id: &str) -> Result<(String, String), String> {
         let rest = engine_id
             .strip_prefix("plugin/")
-            .or_else(|| engine_id.strip_prefix("plugin:"))
             .ok_or_else(|| "插件会话引擎身份无效".to_string())?;
         let (plugin_id, contribution_id) = rest
             .rsplit_once('/')
@@ -110,7 +109,7 @@ impl PluginSessionEngineFactory {
 
 impl SessionEngineFactory for PluginSessionEngineFactory {
     fn supports(&self, engine_id: &str) -> bool {
-        engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:")
+        engine_id.starts_with("plugin/")
     }
 
     fn build_session_engine(
@@ -375,6 +374,7 @@ mod tests {
         let router = SessionEngineRouter::new(vec![Arc::new(NamespaceFactory("plugin/"))])
             .expect("router should have one factory");
         assert!(router.supports("plugin/example/engine"));
+        assert!(!router.supports("plugin:example:engine"));
         assert!(!router.supports("chatgpt-web/default"));
         let error = match router.build_session_engine(SessionEngineInvocationSpec {
             session_id: String::new(),

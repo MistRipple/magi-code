@@ -545,7 +545,9 @@ pub fn path_access_policy<'a>(
 /// `policy.allowed_paths` 已经过 [`effective_tool_policy_allowed_paths`]，可能是显式范围，
 /// 也可能是默认工作区范围。显式范围、`denied_paths` 与只读模式按原规则拒绝；
 /// 越出默认工作区范围时，读取直接放行（见 [`path_access_policy`]），
-/// 受限模式下的写入和对外发送改为等待用户授权，不再直接拒绝。
+/// 受限模式下越出默认工作区范围的写入和对外发送直接拒绝；工作区内是否需要
+/// 授权仍由工具风险策略决定。这样路径范围先于审批结算，避免为永远不能执行的
+/// 越界副作用创建悬挂 approval。
 pub fn decide_tool_path_access(
     engine: &magi_permissions::PermissionEngine,
     policy: &magi_permissions::PermissionPolicy,
@@ -577,9 +579,9 @@ pub fn decide_tool_path_access(
         return decision;
     }
     if access_profile == AccessProfile::Restricted {
-        return magi_permissions::Decision::NeedsApproval {
+        return magi_permissions::Decision::Deny {
             reason: format!(
-                "受限执行下{}工作区外的路径需要确认：{}",
+                "受限执行不允许{}工作区外的路径：{}",
                 if sends_outside { "上传" } else { "写入" },
                 request.absolute_path.display()
             ),

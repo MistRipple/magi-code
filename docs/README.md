@@ -56,7 +56,7 @@ npm run desktop:dev
 
 ## 架构与维护文档
 
-- [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：阶段 B/C/D 实施中；统一安装、授权、生命周期、版本化资源、插件工具目录、唯一会话引擎路由、工作流模型/工具动作、用户等待恢复、统一子任务派发与租约绑定检查点、插件引擎只读设置投影和隔离右栏视图已接入，GPT Web 可选插件迁移仍按阶段计划推进。
+- [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：阶段 B/C/D 实施中；统一安装、授权、生命周期、版本化资源、插件工具目录、唯一会话引擎路由、工作流模型/工具动作、用户等待恢复、统一子任务派发、租约绑定检查点与未知副作用恢复阻塞、插件引擎只读设置投影和隔离右栏视图已接入，GPT Web 可选插件迁移仍按阶段计划推进。
 - [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。

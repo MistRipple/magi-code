@@ -12,8 +12,7 @@ use crate::mcp_config::{
     normalize_mcp_server_snapshot_entry,
 };
 use crate::routes::settings::{
-    load_registry_engines, registered_role_template_ids, resolve_registry_agents,
-    role_templates_for_registry,
+    registered_role_template_ids, resolve_registry_agents, role_templates_for_registry,
 };
 use crate::scope_binding::strip_scope_binding_fields;
 use crate::skill_loader;
@@ -3350,7 +3349,10 @@ impl ApiState {
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": role_templates_for_registry(self.agent_role_registry.as_ref()),
-            "registryEngines": load_registry_engines(self),
+            "registryEngines": crate::routes::settings::load_registry_engines_for_scope(
+                self,
+                tool_context.workspace_id.as_ref(),
+            ),
             "registryAgents": resolve_registry_agents(self),
             "bootstrapScope": if hydrate_mcp_servers { "full" } else { "core" },
             "mcpServersHydrated": hydrate_mcp_servers,

@@ -32,7 +32,8 @@ use crate::{
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
-    tool_batch::{CoordinatorToolContext, execute_workflow_dispatch_task},
+    tool_batch::execute_task_tool_call_batch,
+    tool_execution_ledger::ToolExecutionLedger,
     tool_surface_state::{
         RefreshLiveMcpToolDefinitionsInput, refresh_live_mcp_tool_definitions_with_mode,
     },
@@ -41,7 +42,9 @@ use crate::{
         model_usage_binding_for_worker_with_settings,
     },
 };
-use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
+use magi_bridge_client::{
+    ChatToolCall, ChatToolDefinition, ChatToolFunction, ModelBridgeClient, ModelInvocationRequest,
+};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
     FileSummaryItem, FileSummaryRecord, KnowledgeConsumer, KnowledgeContextRequest,
@@ -49,8 +52,7 @@ use magi_context_runtime::{
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, SessionId, TaskId,
-    TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId, estimate_text_tokens,
-    public_runtime_excerpt,
+    TaskKind, UtcMillis, WorkerId, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -62,9 +64,7 @@ use magi_orchestrator::{
 use magi_plugin_system::RunCancellation;
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
-use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
-};
+use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_usage_authority::UsagePhase;
 use magi_workspace::WorkspaceStore;
 use std::{
@@ -264,10 +264,14 @@ struct ExecutionPlanCleanup<'a> {
     registry: &'a TaskExecutionRegistry,
     task_id: &'a TaskId,
     turn_id: String,
+    retained: bool,
 }
 
 impl Drop for ExecutionPlanCleanup<'_> {
     fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
         let _ = self
             .registry
             .remove_if_turn_matches(self.task_id, &self.turn_id);
@@ -361,21 +365,50 @@ impl WorkflowCoreDecisionRunner {
     fn run(
         core: Arc<dyn magi_plugin_system::workflow::WorkflowCore>,
         input: magi_plugin_system::workflow::WorkflowInput,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<magi_plugin_system::workflow::WorkflowDecision, String> {
-        let cancellation = RunCancellation::default();
-        std::thread::Builder::new()
-            .name("magi-workflow-core".into())
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("工作流运行时不可用：{error}"))?
-                    .block_on(core.decide(input, &cancellation))
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(|error| format!("启动工作流核心失败：{error}"))?
-            .join()
-            .map_err(|_| "工作流核心线程异常退出".to_string())?
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("magi-workflow-core".into())
+                .spawn_scoped(scope, move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| format!("工作流运行时不可用：{error}"))?
+                        .block_on(async move {
+                            let cancellation = RunCancellation::default();
+                            if cancelled() {
+                                cancellation.cancel();
+                                return Err("工作流执行租约已失效".into());
+                            }
+                            let decision = core.decide(input, &cancellation);
+                            tokio::pin!(decision);
+                            let mut poll = tokio::time::interval(std::time::Duration::from_millis(50));
+                            loop {
+                                tokio::select! {
+                                    result = &mut decision => return result.map_err(|error| error.to_string()),
+                                    _ = poll.tick() => {
+                                        if cancelled() {
+                                            cancellation.cancel();
+                                            return match tokio::time::timeout(
+                                                std::time::Duration::from_millis(100),
+                                                &mut decision,
+                                            )
+                                            .await
+                                            {
+                                                Ok(result) => result.map_err(|error| error.to_string()),
+                                                Err(_) => Err("工作流执行租约已失效".into()),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                })
+                .map_err(|error| format!("启动工作流核心失败：{error}"))?
+                .join()
+                .map_err(|_| "工作流核心线程异常退出".to_string())?
+        })
     }
 }
 
@@ -2622,6 +2655,7 @@ impl LlmTaskDispatcher {
             workspace_id,
             execution_root,
             worker_id,
+            is_sidechain,
             execution_role_id,
             thread_id,
             execution_settings_snapshot,
@@ -2665,8 +2699,37 @@ impl LlmTaskDispatcher {
                 );
             }
         };
+        let execution_cancelled = || {
+            self.pipeline
+                .execution_runtime
+                .task_store()
+                .get_active_lease(&task.task_id)
+                .is_none_or(|lease| lease.lease_id != *lease_id)
+        };
+        let workspace_identity_root = workspace_id
+            .as_ref()
+            .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
+        let resolved_root = match self.resolve_task_execution_root(
+            task,
+            lease_id,
+            session_id,
+            workspace_id,
+            execution_root,
+            is_sidechain,
+            worker_id,
+        ) {
+            Ok(root) => root,
+            Err(error) => return (TaskOutcome::Failed { error }, None),
+        };
+        let execution_task = Self::task_for_execution_root(
+            task,
+            workspace_identity_root.as_ref(),
+            resolved_root.as_ref(),
+        );
+        let execution_root = resolved_root.as_ref();
+        let mut tool_ledger = ToolExecutionLedger::for_task_goal(&task.goal);
         const MAX_WORKFLOW_STEPS: usize = 32;
-        let attempt_id = task.task_id.to_string();
+        let attempt_id = lease_id.to_string();
         let mut stage = initial_stage.clone();
         let mut checkpoint_value = checkpoint.clone();
         let mut model_result = last_result.as_ref().and_then(|result| {
@@ -2736,6 +2799,17 @@ impl LlmTaskDispatcher {
                     None,
                 );
             };
+            if child.parent_task_id.as_ref() != Some(&task.task_id)
+                || child.root_task_id != task.root_task_id
+                || child.mission_id != task.mission_id
+            {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流检查点中的子任务归属无效".into(),
+                    },
+                    None,
+                );
+            }
             if !matches!(
                 child.status,
                 magi_core::TaskStatus::Completed
@@ -2744,10 +2818,13 @@ impl LlmTaskDispatcher {
             ) {
                 return (TaskOutcome::Yielded, None);
             }
-            let child_value = serde_json::json!({
-                "status": format!("{:?}", child.status).to_lowercase(),
-                "output_refs": child.output_refs,
-            });
+            let receipt = crate::agent_receipt::AgentReceipt::from_terminal_task(&child)
+                .expect("已核验子任务终态");
+            let child_value = crate::agent_receipt::render_receipts(
+                vec![receipt],
+                crate::agent_receipt::AGENT_WAIT_FINAL_TEXT_BUDGET_BYTES,
+            )
+            .remove(0);
             tool_result = Some(child_value.clone());
             if let Err(error) = self
                 .pipeline
@@ -2786,10 +2863,30 @@ impl LlmTaskDispatcher {
                 None,
             );
         }
-        for _ in 0..MAX_WORKFLOW_STEPS {
+        if let Some(action) = pending_action
+            && action.get("kind").and_then(serde_json::Value::as_str) != Some("dispatch_task")
+        {
+            return (
+                TaskOutcome::Failed {
+                    error: "工作流存在结果未确认的动作，必须核对原生执行记录后恢复，禁止自动重放"
+                        .into(),
+                },
+                None,
+            );
+        }
+        for step in 0..MAX_WORKFLOW_STEPS {
+            if execution_cancelled() {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流执行租约已失效".into(),
+                    },
+                    None,
+                );
+            }
             let input = magi_plugin_system::workflow::WorkflowInput {
                 run_id: task.task_id.to_string(),
                 attempt_id: attempt_id.clone(),
+                action_id: format!("{attempt_id}:{step}"),
                 stage: stage.clone(),
                 user_input: user_input.clone(),
                 model_result: model_result.take(),
@@ -2797,7 +2894,11 @@ impl LlmTaskDispatcher {
                 context_summary: context_summary.clone(),
                 config: checkpoint_value.clone(),
             };
-            let decision = match WorkflowCoreDecisionRunner::run(core.clone(), input.clone()) {
+            let decision = match WorkflowCoreDecisionRunner::run(
+                core.clone(),
+                input.clone(),
+                &execution_cancelled,
+            ) {
                 Ok(decision) => decision,
                 Err(error) => {
                     return (
@@ -2930,17 +3031,18 @@ impl LlmTaskDispatcher {
                         tools: None,
                         tool_choice: None,
                     };
-                    let result = match client.invoke_with_cancellation(request, &|| false) {
-                        Ok(response) => response.content.unwrap_or_default(),
-                        Err(error) => {
-                            return (
-                                TaskOutcome::Failed {
-                                    error: format!("工作流模型请求失败：{error}"),
-                                },
-                                None,
-                            );
-                        }
-                    };
+                    let result =
+                        match client.invoke_with_cancellation(request, &execution_cancelled) {
+                            Ok(response) => response.content.unwrap_or_default(),
+                            Err(error) => {
+                                return (
+                                    TaskOutcome::Failed {
+                                        error: format!("工作流模型请求失败：{error}"),
+                                    },
+                                    None,
+                                );
+                            }
+                        };
                     model_result = Some(serde_json::Value::String(result));
                     if let Err(error) = self.pipeline.execution_runtime.task_store().update_workflow_state(
                         &task.task_id, &task.root_task_id, lease_id, workflow_id, &stage,
@@ -2980,7 +3082,7 @@ impl LlmTaskDispatcher {
                         );
                     }
                     let (result, status) = self.execute_workflow_tool(
-                        task,
+                        &execution_task,
                         session_id,
                         workspace_id,
                         execution_root,
@@ -2988,6 +3090,7 @@ impl LlmTaskDispatcher {
                         &action_id,
                         &tool,
                         input,
+                        &mut tool_ledger,
                     );
                     context_summary =
                         serde_json::json!({"last_tool": tool, "status": status.wire_label()});
@@ -3081,24 +3184,30 @@ impl LlmTaskDispatcher {
                             None,
                         );
                     }
-                    let plan_store =
-                        magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
-                    let (result, status) = execute_workflow_dispatch_task(
-                        CoordinatorToolContext {
-                            event_bus: self.event_bus.as_ref(),
-                            agent_role_registry: self.agent_role_registry.as_ref(),
-                            task_store: self.pipeline.execution_runtime.task_store(),
-                            session_store: self.session_store.as_ref(),
-                            execution_registry: &self.execution_registry,
-                            conversation_registry: self.conversation_registry.as_ref(),
-                            plan_store: &plan_store,
-                            task,
-                            session_id,
-                            workspace_id,
-                        },
+                    use sha2::{Digest, Sha256};
+                    let action_digest = format!("{:x}", Sha256::digest(action_id.as_bytes()));
+                    let task_name = format!("workflow_{}", &action_digest[..32]);
+                    let (result, status) = self.execute_workflow_tool(
+                        &execution_task,
+                        session_id,
+                        workspace_id,
+                        execution_root,
+                        worker_id,
                         &action_id,
-                        &role,
-                        &instruction,
+                        "agent_spawn",
+                        serde_json::json!({
+                            "task_name": task_name,
+                            "role": role,
+                            "display_name": "工作流子任务",
+                            "goal": instruction,
+                            "context_package": {
+                                "summary": instruction,
+                                "constraints": [],
+                                "expected_output": "返回可供工作流继续决策的最终结果",
+                                "references": [],
+                            },
+                        }),
+                        &mut tool_ledger,
                     );
                     if !matches!(status, ExecutionResultStatus::Succeeded) {
                         return (
@@ -3179,49 +3288,57 @@ impl LlmTaskDispatcher {
         action_id: &str,
         tool: &str,
         input: serde_json::Value,
+        ledger: &mut ToolExecutionLedger,
     ) -> (String, ExecutionResultStatus) {
-        let Some(registry) = self.tool_registry.as_ref() else {
-            return (
-                "工作流工具注册表未装配".into(),
-                ExecutionResultStatus::Failed,
-            );
+        let call = ChatToolCall {
+            id: format!("workflow-tool-{}-{action_id}", task.task_id),
+            kind: "function".into(),
+            function: ChatToolFunction {
+                name: tool.into(),
+                arguments: input.to_string(),
+            },
         };
-        let arguments = input.to_string();
-        let access_profile = task
-            .policy_snapshot
-            .as_ref()
-            .map(magi_core::TaskPolicy::effective_access_profile)
-            .unwrap_or_default();
-        let context = ToolExecutionContext {
-            worker_id: worker_id.cloned(),
-            task_id: Some(task.task_id.clone()),
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            access_profile,
-            working_directory: execution_root.cloned(),
-            browser_capability_snapshot: registry.browser_capability_snapshot(),
-            browser_execution_id: Some(format!("workflow:{}", task.task_id)),
-        };
-        if let Some(result) =
-            registry.execute_plugin_tool(tool, &arguments, &context, access_profile)
-        {
-            return result;
-        }
-        if let Some(result) = registry.execute_external_mcp_tool(tool, &arguments, access_profile) {
-            return result;
-        }
-        let input = ToolExecutionInput::for_builtin_invocation(
-            ToolCallId::new(format!("workflow-tool-{}-{action_id}", task.task_id)),
-            tool,
-            arguments,
-        );
-        let policy = task
-            .policy_snapshot
-            .as_ref()
-            .map(ToolExecutionPolicy::from_task_policy)
-            .unwrap_or_default();
-        let output = registry.execute_with_policy(input, context, &policy);
-        (output.payload, output.status)
+        let plan_store = magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
+        let safety_gate = self.build_safety_gate(self.settings_store.as_ref());
+        let snapshot_session = self.snapshot_manager.as_ref().and_then(|manager| {
+            self.resolve_workspace_root_path(session_id, workspace_id)
+                .as_ref()
+                .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
+        });
+        let project_memory = execution_root.and_then(|root| {
+            self.project_memory_registry
+                .get_or_open(&magi_core::WorkspaceRootPath::new(root.to_string_lossy()))
+                .ok()
+        });
+        execute_task_tool_call_batch(
+            self.event_bus.as_ref(),
+            self.tool_registry.as_ref(),
+            self.agent_role_registry.as_ref(),
+            self.skill_runtime.as_deref(),
+            self.skill_dispatch_runtime.as_deref(),
+            task.executor_binding_active_skill_id(),
+            self.pipeline.execution_runtime.task_store(),
+            self.session_store.as_ref(),
+            &self.execution_registry,
+            self.conversation_registry.as_ref(),
+            safety_gate.as_ref(),
+            &plan_store,
+            project_memory.as_deref(),
+            task,
+            session_id,
+            workspace_id,
+            execution_root,
+            worker_id,
+            self.tool_registry
+                .as_ref()
+                .and_then(ToolRegistry::browser_capability_snapshot),
+            &[call],
+            ledger,
+            None,
+            snapshot_session,
+            Some(task.mission_id.to_string()),
+        )
+        .remove(0)
     }
 
     /// Synchronous inner dispatch logic; invoked either directly or inside
@@ -3254,10 +3371,11 @@ impl LlmTaskDispatcher {
         let plan_turn_id = match &plan {
             TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
         };
-        let _plan_cleanup = ExecutionPlanCleanup {
+        let mut plan_cleanup = ExecutionPlanCleanup {
             registry: &self.execution_registry,
             task_id: &task.task_id,
             turn_id: plan_turn_id,
+            retained: false,
         };
 
         match plan {
@@ -3341,7 +3459,8 @@ impl LlmTaskDispatcher {
                 });
                 // 完成通知可能立即触发 session 队列出队。先释放当前任务的
                 // execution plan，再提交 TaskStore 终态，避免下一轮观察到旧计划。
-                drop(_plan_cleanup);
+                plan_cleanup.retained = matches!(&outcome, TaskOutcome::Yielded);
+                drop(plan_cleanup);
                 self.push_result(&task.task_id, &lease.lease_id, outcome);
             }
         }

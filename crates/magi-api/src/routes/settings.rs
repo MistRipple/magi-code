@@ -943,13 +943,26 @@ fn align_engine_llm_with_worker_configs(
 }
 
 pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
+    load_registry_engines_for_scope(state, None)
+}
+
+/// 返回当前作用域真正可用的引擎投影。插件引擎的激活状态按工作区隔离；只有
+/// 将工作区作用域带入投影，设置页和角色绑定才会看到与执行入口相同的能力集合。
+pub(crate) fn load_registry_engines_for_scope(
+    state: &ApiState,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+) -> Vec<Value> {
     let raw_engines = state.settings_store.get_section("engines");
     let mut normalized = normalize_engine_entries(&raw_engines);
     let worker_configs =
         normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
     align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
     if let Ok(manager) = state.plugin_manager.lock()
-        && let Ok(contributions) = manager.engine_contributions_for_scope("application")
+        && let Ok(contributions) = manager.engine_contributions_for_scope(
+            &workspace_id
+                .map(|id| format!("workspace:{id}"))
+                .unwrap_or_else(|| "application".to_string()),
+        )
     {
         for (manifest, engine) in contributions {
             let id = format!("plugin/{}/{}", manifest.id, engine.id);
@@ -989,7 +1002,7 @@ fn load_user_registry_engines(state: &ApiState) -> Vec<Value> {
             && entry
                 .get("id")
                 .and_then(Value::as_str)
-                .is_none_or(|id| !id.starts_with("plugin/") && !id.starts_with("plugin:"))
+                .is_none_or(|id| !id.starts_with("plugin/"))
     });
     normalized
 }
@@ -2352,7 +2365,7 @@ async fn upsert_engine(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?
         .to_string();
-    if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+    if engine_id.starts_with("plugin/") {
         return Err(ApiError::InvalidInput(
             "插件会话引擎由插件清单管理，不能通过模型设置改写".to_string(),
         ));
@@ -2383,7 +2396,7 @@ async fn remove_engine(
         .get("engineId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+    if engine_id.starts_with("plugin/") {
         return Err(ApiError::InvalidInput(
             "插件会话引擎由插件清单管理，不能通过模型设置移除".to_string(),
         ));

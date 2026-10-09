@@ -84,7 +84,6 @@ impl PluginWorkflowCoreFactory {
     fn identity(workflow_id: &str) -> Result<(String, String), String> {
         let rest = workflow_id
             .strip_prefix("plugin/")
-            .or_else(|| workflow_id.strip_prefix("plugin:"))
             .ok_or_else(|| "插件工作流身份无效".to_string())?;
         let (plugin_id, contribution_id) = rest
             .rsplit_once('/')
@@ -96,7 +95,7 @@ impl PluginWorkflowCoreFactory {
 
 impl WorkflowCoreFactory for PluginWorkflowCoreFactory {
     fn supports(&self, workflow_id: &str) -> bool {
-        workflow_id.starts_with("plugin/") || workflow_id.starts_with("plugin:")
+        workflow_id.starts_with("plugin/")
     }
 
     fn build_workflow_core(
@@ -174,6 +173,7 @@ mod tests {
         let router = WorkflowCoreRouter::new(vec![Arc::new(NamespaceFactory("plugin/"))])
             .expect("router should have a factory");
         assert!(router.supports("plugin/example/workflow"));
+        assert!(!router.supports("plugin:example:workflow"));
         let spec = WorkflowCoreInvocationSpec {
             session_id: String::new(),
             project_id: String::new(),

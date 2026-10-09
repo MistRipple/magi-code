@@ -5,6 +5,7 @@ fn input() -> WorkflowInput {
     WorkflowInput {
         run_id: "run-1".into(),
         attempt_id: "attempt-1".into(),
+        action_id: "attempt-1:0".into(),
         stage: "plan".into(),
         user_input: "继续".into(),
         model_result: None,
@@ -21,7 +22,7 @@ fn action_must_be_bound_to_current_attempt_and_decision_is_typed() {
         checkpoint_version: 1,
         stage: "execute".into(),
         action: WorkflowAction::ToolCall {
-            action_id: "attempt-1".into(),
+            action_id: "attempt-1:0".into(),
             tool: "files.read".into(),
             input: json!({"path":"README.md"}),
         },
@@ -45,7 +46,7 @@ fn forged_run_or_action_id_is_rejected_without_fallback_core() {
     };
     assert!(decision.validate("run-1", &input).is_err());
     decision.action = WorkflowAction::Complete {
-        action_id: "attempt-1".into(),
+        action_id: "attempt-1:0".into(),
         summary: "done".into(),
     };
     assert!(decision.validate("other-run", &input).is_err());

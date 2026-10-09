@@ -56,6 +56,8 @@ pub struct WorkflowDecision {
 pub struct WorkflowInput {
     pub run_id: String,
     pub attempt_id: String,
+    /// 宿主签发本次决策的唯一动作身份；插件只能回传，不能重复选择历史动作。
+    pub action_id: String,
     pub stage: String,
     pub user_input: String,
     pub model_result: Option<Value>,
@@ -105,9 +107,9 @@ impl WorkflowDecision {
             | WorkflowAction::SaveStage { action_id, .. }
             | WorkflowAction::Complete { action_id, .. } => action_id,
         };
-        if id.is_empty() || id.len() > 128 || id != &input.attempt_id {
+        if id.is_empty() || id.len() > 128 || id != &input.action_id {
             return Err(WorkflowError {
-                message: "动作 ID 必须绑定当前 attempt".into(),
+                message: "动作 ID 必须匹配宿主签发的当前决策身份".into(),
             });
         }
         Ok(())

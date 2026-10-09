@@ -654,7 +654,7 @@ pub fn resolve_orchestrator_model_config(
         let mut config = if magi_web_model::is_chatgpt_web_engine_id(&engine_id) {
             // GPT Web 是固定入口，不在引擎注册表里：引擎 id 命名空间就是它的全部事实。
             chatgpt_web_engine_config(&engine_id)
-        } else if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+        } else if engine_id.starts_with("plugin/") {
             serde_json::json!({ "apiProtocol": "plugin", "model": engine_id })
         } else {
             let entry = engine_entry(settings_store, &engine_id)

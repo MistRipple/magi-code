@@ -4266,7 +4266,7 @@ fn registry_read_only_and_restricted_profiles_read_files_outside_the_workspace()
         );
         assert!(read.payload.contains("outside-content"));
 
-        // 写入仍然限定在工作区内：只读模式直接拒绝，受限模式改为等待用户授权。
+        // 写入仍然限定在工作区内：两种非完全访问档位都直接拒绝越界路径。
         let write = registry.execute_with_policy(
             ToolExecutionInput::for_builtin_invocation(
                 ToolCallId::new("tc-write-outside-workspace"),
@@ -4278,8 +4278,10 @@ fn registry_read_only_and_restricted_profiles_read_files_outside_the_workspace()
             &policy,
         );
         let expected = match profile {
-            magi_core::AccessProfile::ReadOnly => ExecutionResultStatus::Rejected,
-            _ => ExecutionResultStatus::NeedsApproval,
+            magi_core::AccessProfile::ReadOnly | magi_core::AccessProfile::Restricted => {
+                ExecutionResultStatus::Rejected
+            }
+            magi_core::AccessProfile::FullAccess => unreachable!(),
         };
         assert_eq!(write.status, expected, "{profile:?}");
         assert!(!outside.join("new.txt").exists());
@@ -4664,7 +4666,7 @@ fn exec_tool_with_context_and_policy(
 }
 
 #[test]
-fn registry_requires_approval_for_restricted_file_write_outside_workspace_root() {
+fn registry_rejects_restricted_file_write_outside_workspace_root() {
     let workspace = unique_temp_dir("magi-tool-runtime-policy-workspace");
     let outside = unique_temp_dir("magi-tool-runtime-policy-outside").join("blocked.txt");
     let inside = workspace.join("allowed.txt");
@@ -4692,16 +4694,16 @@ fn registry_requires_approval_for_restricted_file_write_outside_workspace_root()
         policy.clone(),
     );
 
-    assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
     assert!(!outside.exists());
     let blocked_payload: Value =
         serde_json::from_str(&blocked.payload).expect("blocked payload json");
     assert_eq!(blocked_payload["tool"], BuiltinToolName::FileWrite.as_str());
     assert_eq!(
         blocked_payload["error_code"].as_str(),
-        Some("tool_policy_needs_approval")
+        Some("tool_policy_rejected")
     );
-    assert_eq!(blocked_payload["approval_resume_safe"], true);
+    assert_eq!(blocked_payload["approval_resume_safe"], false);
     assert!(!blocked.payload.contains(outside.to_string_lossy().as_ref()));
 
     let allowed = exec_tool_with_context_and_policy(
@@ -4771,7 +4773,7 @@ fn referenced_external_paths_are_readable_but_never_writable() {
 }
 
 #[test]
-fn registry_requires_approval_for_restricted_outside_shell_path() {
+fn registry_rejects_restricted_outside_shell_path() {
     let workspace = unique_temp_dir("magi-tool-runtime-shell-workspace");
     let outside = unique_temp_dir("magi-tool-runtime-shell-outside");
     let registry = make_registry();
@@ -4799,15 +4801,12 @@ fn registry_requires_approval_for_restricted_outside_shell_path() {
         },
     );
 
-    assert_eq!(output.status, ExecutionResultStatus::NeedsApproval);
-    assert_eq!(output.governance.outcome, GovernanceOutcome::NeedsApproval);
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    assert_eq!(output.governance.outcome, GovernanceOutcome::Rejected);
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::ShellExec.as_str());
-    assert_eq!(
-        payload["error_code"].as_str(),
-        Some("tool_policy_needs_approval")
-    );
-    assert_eq!(payload["approval_resume_safe"], true);
+    assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+    assert_eq!(payload["approval_resume_safe"], false);
 }
 
 #[test]
