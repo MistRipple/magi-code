@@ -3684,7 +3684,7 @@ fn registry_reports_read_only_command_mode_as_effective_profile() {
 }
 
 #[test]
-fn registry_enforces_effective_read_only_profile_default_path_scope() {
+fn registry_effective_read_only_profile_reads_outside_the_workspace_but_never_writes() {
     let workspace = unique_temp_dir("magi-tool-runtime-effective-profile-workspace");
     let outside = unique_temp_dir("magi-tool-runtime-effective-profile-outside");
     let outside_file = outside.join("secret.txt");
@@ -3714,10 +3714,37 @@ fn registry_enforces_effective_read_only_profile_default_path_scope() {
         },
     );
 
-    assert_eq!(output.status, ExecutionResultStatus::Rejected);
-    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-    assert_eq!(payload["tool"], BuiltinToolName::FileRead.as_str());
-    assert_eq!(payload["access_profile"], "read_only");
+    // 读取不受默认的工作区范围约束；只读模式下写入（包括工作区外）仍然一律拒绝。
+    assert_eq!(
+        output.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        output.payload
+    );
+    assert!(output.payload.contains("outside"));
+    let write = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-effective-read-only-write"),
+            BuiltinToolName::FileWrite.as_str(),
+            serde_json::json!({
+                "path": outside_file.to_string_lossy(),
+                "content": "changed"
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
+            working_directory: Some(unique_temp_dir("magi-tool-runtime-effective-profile-ws2")),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            command_mode: "read_only".to_string(),
+            ..ToolExecutionPolicy::default()
+        },
+    );
+    assert_eq!(write.status, ExecutionResultStatus::Rejected);
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
 }
 
 #[test]
@@ -4199,6 +4226,60 @@ fn registry_read_only_profile_runs_undeclared_read_commands_including_outside_th
         serde_json::json!({ "command": "printf x > blocked.txt" }),
     );
     assert_eq!(write.status, ExecutionResultStatus::Rejected);
+}
+
+#[test]
+fn registry_read_only_and_restricted_profiles_read_files_outside_the_workspace() {
+    let workspace = unique_temp_dir("magi-tool-read-outside-workspace");
+    let outside = unique_temp_dir("magi-tool-read-outside-other");
+    let note = outside.join("note.txt");
+    fs::write(&note, "outside-content").expect("write outside file");
+    let registry = make_registry();
+    let context = || ToolExecutionContext {
+        workspace_id: Some(WorkspaceId::new("unit-test-workspace")),
+        working_directory: Some(workspace.clone()),
+        ..ToolExecutionContext::default()
+    };
+
+    for profile in [
+        magi_core::AccessProfile::ReadOnly,
+        magi_core::AccessProfile::Restricted,
+    ] {
+        let policy = ToolExecutionPolicy {
+            access_profile: profile,
+            ..ToolExecutionPolicy::default()
+        };
+        let read = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-read-outside-workspace"),
+                BuiltinToolName::FileRead.as_str(),
+                serde_json::json!({ "path": note.to_string_lossy() }).to_string(),
+            ),
+            context(),
+            &policy,
+        );
+        assert_eq!(
+            read.status,
+            ExecutionResultStatus::Succeeded,
+            "{profile:?}: {}",
+            read.payload
+        );
+        assert!(read.payload.contains("outside-content"));
+
+        // 写入仍然限定在工作区内。
+        let write = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-write-outside-workspace"),
+                BuiltinToolName::FileWrite.as_str(),
+                serde_json::json!({ "path": outside.join("new.txt").to_string_lossy(), "content": "x" })
+                    .to_string(),
+            ),
+            context(),
+            &policy,
+        );
+        assert_eq!(write.status, ExecutionResultStatus::Rejected, "{profile:?}");
+        assert!(!outside.join("new.txt").exists());
+    }
 }
 
 #[test]
@@ -4733,6 +4814,7 @@ fn registry_applies_path_policy_to_code_symbols_path() {
     let workspace = unique_temp_dir("magi-tool-runtime-code-symbols-policy-workspace");
     let outside = unique_temp_dir("magi-tool-runtime-code-symbols-policy-outside");
     let registry = make_registry();
+    let allowed_root = workspace.to_string_lossy().to_string();
 
     let output = registry.execute_with_policy(
         ToolExecutionInput::for_builtin_invocation(
@@ -4753,6 +4835,8 @@ fn registry_applies_path_policy_to_code_symbols_path() {
         },
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::Restricted,
+            // 显式配置的路径范围对读取同样生效（未配置时读取不受工作区限制）。
+            allowed_paths: vec![allowed_root.clone()],
             ..ToolExecutionPolicy::default()
         },
     );
@@ -9863,6 +9947,7 @@ fn native_search_shares_ignore_and_permission_boundaries_for_paths_and_content()
         ..test_workspace_context()
     };
     let policy = ToolExecutionPolicy {
+        allowed_paths: vec![root.to_string_lossy().to_string()],
         denied_paths: vec!["secret".into()],
         ..ToolExecutionPolicy::default()
     };
@@ -9966,8 +10051,12 @@ fn native_search_does_not_follow_links_or_read_special_files() {
         BuiltinToolName::FileRead,
         r#"{"path":"linked-file"}"#,
         context,
-        ToolExecutionPolicy::default(),
+        ToolExecutionPolicy {
+            allowed_paths: vec![root.to_string_lossy().to_string()],
+            ..ToolExecutionPolicy::default()
+        },
     );
+    // 显式限定在工作区时，指向工作区外的符号链接不能读。
     assert_eq!(result.status, ExecutionResultStatus::Rejected);
     let result = exec_tool(
         &registry,

@@ -3279,20 +3279,11 @@ pub(crate) fn access_profile_tool_decision(
                 canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
             })
             .collect(),
-        allowed_paths: if magi_tool_runtime::shell_call_skips_default_path_scope(
-            canonical_tool_name.as_str(),
-            arguments,
-            allowed_paths,
+        allowed_paths: effective_tool_policy_allowed_paths(
             effective_access_profile,
-        ) {
-            Vec::new()
-        } else {
-            effective_tool_policy_allowed_paths(
-                effective_access_profile,
-                allowed_paths,
-                workspace_root_path.map(|path| path.as_path()),
-            )
-        },
+            allowed_paths,
+            workspace_root_path.map(|path| path.as_path()),
+        ),
         denied_paths: normalize_tool_policy_paths(
             denied_paths,
             workspace_root_path.map(|path| path.as_path()),
@@ -3374,15 +3365,25 @@ pub(crate) fn access_profile_tool_decision(
                 Some(effective_access_profile),
             ));
         }
+        let path_kind = path_request.kind;
         let path_request = magi_permissions::PermissionRequest::PathAccess {
             absolute_path: path_request.absolute_path.as_path(),
-            kind: path_request.kind,
+            kind: path_kind,
         };
         if let Some(decision) = select_access_profile_axis_decision(
             &mut pending_decision,
             permission_decision_payload(
                 &canonical_tool_name,
-                engine.decide(&path_request, &canonical_policy, effective_access_profile),
+                engine.decide(
+                    &path_request,
+                    &magi_tool_runtime::path_access_policy(
+                        &canonical_policy,
+                        canonical_tool_name.as_str(),
+                        path_kind,
+                        allowed_paths,
+                    ),
+                    effective_access_profile,
+                ),
                 effective_access_profile,
             ),
         ) {
@@ -5180,6 +5181,84 @@ mod tests {
     }
 
     #[test]
+    fn reads_outside_the_workspace_are_allowed_but_writes_stay_scoped() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let root = workspace.path().to_path_buf();
+        let outside_file = outside.path().join("note.txt");
+        let outside_dir = outside.path().to_string_lossy().to_string();
+        let decide = |profile: magi_core::AccessProfile,
+                      tool: &str,
+                      arguments: serde_json::Value,
+                      allowed: &[String],
+                      denied: &[String]| {
+            access_profile_tool_decision(AccessProfileToolDecisionInput {
+                access_profile: profile,
+                command_mode: "",
+                allowed_tools: &[],
+                denied_tools: &[],
+                allowed_paths: allowed,
+                denied_paths: denied,
+                read_only_paths: &[],
+                requested_tool_name: tool,
+                arguments: &arguments.to_string(),
+                workspace_root_path: Some(&root),
+            })
+        };
+        let read = serde_json::json!({ "path": outside_file.to_string_lossy() });
+        let search = serde_json::json!({ "query": "x", "root": outside_dir });
+        let write = serde_json::json!({ "path": outside_file.to_string_lossy(), "content": "x" });
+
+        for profile in [
+            magi_core::AccessProfile::ReadOnly,
+            magi_core::AccessProfile::Restricted,
+            magi_core::AccessProfile::FullAccess,
+        ] {
+            assert!(
+                decide(profile, "file_read", read.clone(), &[], &[]).is_none(),
+                "{profile:?} 应允许读取工作区外的文件"
+            );
+            assert!(
+                decide(profile, "search_text", search.clone(), &[], &[]).is_none(),
+                "{profile:?} 应允许在工作区外搜索"
+            );
+        }
+        // 写入仍然限定在工作区：只读直接拒绝，受限拒绝越界路径，完全访问不受默认范围约束。
+        for profile in [
+            magi_core::AccessProfile::ReadOnly,
+            magi_core::AccessProfile::Restricted,
+        ] {
+            let decision = decide(profile, "file_write", write.clone(), &[], &[])
+                .expect("工作区外的写入必须被拒绝");
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        }
+        // 任务策略里显式配置的范围仍然生效：显式 allowed_paths 之外、denied_paths 之内都不能读。
+        let explicit = [root.join("src").to_string_lossy().to_string()];
+        assert!(
+            decide(
+                magi_core::AccessProfile::Restricted,
+                "file_read",
+                read.clone(),
+                &explicit,
+                &[]
+            )
+            .is_some(),
+            "显式 allowed_paths 之外不能读"
+        );
+        assert!(
+            decide(
+                magi_core::AccessProfile::Restricted,
+                "file_read",
+                read,
+                &[],
+                &[outside_dir]
+            )
+            .is_some(),
+            "denied_paths 之内不能读"
+        );
+    }
+
+    #[test]
     fn read_only_shell_runs_any_command_that_does_not_write() {
         let workspace = tempdir().expect("workspace tempdir");
         let root = workspace.path().to_path_buf();
@@ -5483,7 +5562,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_default_scope_checks_read_alias_and_raw_paths() {
+    fn restricted_default_scope_allows_reading_paths_outside_the_workspace() {
         let workspace = tempdir().expect("workspace tempdir");
         let workspace_root = workspace.path().to_path_buf();
         let outside_path = workspace_root
@@ -5497,51 +5576,18 @@ mod tests {
         );
         task.policy_snapshot = Some(default_agent_spawn_policy());
 
-        for (tool, arguments) in [
-            (
-                BuiltinToolName::ViewImage,
-                serde_json::json!({
-                    "path": outside_path.display().to_string()
-                })
-                .to_string(),
-            ),
-            (
-                BuiltinToolName::FileRead,
-                serde_json::json!({
-                    "path": outside_path.display().to_string()
-                })
-                .to_string(),
-            ),
-        ] {
-            let decision = task_policy_tool_decision_with_workspace_root(
-                &task,
-                tool.as_str(),
-                &arguments,
-                Some(&workspace_root),
-            )
-            .expect("restricted default scope should reject outside read path");
-            let payload: serde_json::Value =
-                serde_json::from_str(&decision.payload).expect("decision should be json");
-
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-            assert_eq!(
-                payload["error_code"].as_str(),
-                Some("tool_policy_rejected"),
-                "unexpected payload: {payload}"
-            );
-            assert_eq!(
-                payload["error"].as_str(),
-                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
-            );
-            assert!(payload["required_access_profile"].is_null());
-            assert_eq!(
-                payload["retryable_with_same_arguments"].as_bool(),
-                Some(false)
-            );
+        // 默认范围只约束写入；读取（含 view_image）不受工作区限制。
+        for tool in [BuiltinToolName::ViewImage, BuiltinToolName::FileRead] {
             assert!(
-                !decision
-                    .payload
-                    .contains(outside_path.to_string_lossy().as_ref())
+                task_policy_tool_decision_with_workspace_root(
+                    &task,
+                    tool.as_str(),
+                    &serde_json::json!({ "path": outside_path.display().to_string() }).to_string(),
+                    Some(&workspace_root),
+                )
+                .is_none(),
+                "{} 应允许读取工作区外的路径",
+                tool.as_str()
             );
         }
     }
@@ -5566,19 +5612,23 @@ mod tests {
         );
         task.policy_snapshot = Some(default_agent_spawn_policy());
 
-        for (tool, arguments) in [
-            (
-                BuiltinToolName::FileRead,
-                serde_json::json!({ "path": "linked-secret.txt" }),
-            ),
-            (
-                BuiltinToolName::FileWrite,
-                serde_json::json!({
-                    "path": "linked-dir/new-file.txt",
-                    "content": "outside"
-                }),
-            ),
-        ] {
+        // 读取指向工作区外的符号链接是允许的（读取不受工作区限制）；写入穿过链接逃出工作区仍被拒绝。
+        assert!(
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::FileRead.as_str(),
+                &serde_json::json!({ "path": "linked-secret.txt" }).to_string(),
+                Some(&workspace_root),
+            )
+            .is_none()
+        );
+        for (tool, arguments) in [(
+            BuiltinToolName::FileWrite,
+            serde_json::json!({
+                "path": "linked-dir/new-file.txt",
+                "content": "outside"
+            }),
+        )] {
             let decision = task_policy_tool_decision_with_workspace_root(
                 &task,
                 tool.as_str(),
@@ -5657,16 +5707,27 @@ mod tests {
         policy.command_mode = "read_only".to_string();
         task.policy_snapshot = Some(policy);
 
+        // 读取不受工作区限制；只读命令模式下写入（含工作区外）一律拒绝。
+        assert!(
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::FileRead.as_str(),
+                &serde_json::json!({ "path": outside_path.display().to_string() }).to_string(),
+                Some(&workspace_root),
+            )
+            .is_none()
+        );
         let decision = task_policy_tool_decision_with_workspace_root(
             &task,
-            BuiltinToolName::FileRead.as_str(),
+            BuiltinToolName::FileWrite.as_str(),
             &serde_json::json!({
-                "path": outside_path.display().to_string()
+                "path": outside_path.display().to_string(),
+                "content": "x"
             })
             .to_string(),
             Some(&workspace_root),
         )
-        .expect("read_only command mode should keep reads inside workspace scope");
+        .expect("read_only command mode should reject writes");
         let payload: serde_json::Value =
             serde_json::from_str(&decision.payload).expect("decision should be json");
 

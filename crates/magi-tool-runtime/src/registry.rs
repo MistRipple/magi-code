@@ -401,10 +401,18 @@ impl ToolRegistry {
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
                     let mut resources = self.runtime_resources.clone();
-                    resources.file_read_policy = crate::policy::execution_permission_policy(
+                    // 读工具只做读取：与权限预检同一规则，读取不受默认的工作区范围约束。
+                    let execution_policy = crate::policy::execution_permission_policy(
                         policy,
                         context.working_directory.as_deref(),
                     );
+                    resources.file_read_policy = crate::policy::path_access_policy(
+                        &execution_policy,
+                        input.tool_name.trim(),
+                        magi_permissions::PathAccessKind::Read,
+                        &policy.allowed_paths,
+                    )
+                    .into_owned();
                     let payload = match on_progress {
                         Some(on_progress) => tool.execute_with_progress(
                             &input.tool_call_id,

@@ -160,15 +160,7 @@ impl ToolRegistry {
         let effective_access_profile = policy.effective_access_profile();
         let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
-        let mut permission_policy = execution_permission_policy(&policy, workspace_root_path);
-        if shell_call_skips_default_path_scope(
-            input.tool_name.trim(),
-            &input.input,
-            &policy.allowed_paths,
-            effective_access_profile,
-        ) {
-            permission_policy.allowed_paths.clear();
-        }
+        let permission_policy = execution_permission_policy(&policy, workspace_root_path);
         let mut pending_output = None;
 
         let tool_is_writeful = crate::BuiltinToolName::from_name(input.tool_name.trim())
@@ -228,7 +220,12 @@ impl ToolRegistry {
                     absolute_path: path_request.absolute_path.as_path(),
                     kind: path_request.kind,
                 },
-                &permission_policy,
+                &path_access_policy(
+                    &permission_policy,
+                    input.tool_name.trim(),
+                    path_request.kind,
+                    &policy.allowed_paths,
+                ),
                 effective_access_profile,
             );
             if let Some(output) = select_permission_axis_output(
@@ -515,27 +512,28 @@ pub(crate) fn execution_permission_policy(
     }
 }
 
-/// 只读 shell（命令文本分析确认不写任何文件）不受「默认限定在工作区」约束：
-/// 读取工作区之外的文件（`/etc/hosts`、`ls /tmp`、`git -C 其他仓库 log`）不会改动任何东西。
-/// 任务策略里显式配置的 `allowed_paths` / `denied_paths` 仍然生效。
-pub fn shell_call_skips_default_path_scope(
-    canonical_tool_name: &str,
-    arguments: &str,
+/// 读取不受默认的「限定在工作区」约束：读工作区之外的文件（`/etc/hosts`、`ls /tmp`、
+/// `git -C 其他仓库 log`）不会改动任何东西；写入仍然只能落在工作区内。
+/// 任务策略里显式配置的 `allowed_paths` / `denied_paths` 对读写都仍然生效。
+/// 例外：`browser_upload_file` 是把本地文件交给网页，属于对外发送，不算单纯读取，保持限定在工作区。
+pub fn path_access_policy<'a>(
+    policy: &'a magi_permissions::PermissionPolicy,
+    tool_name: &str,
+    kind: magi_permissions::PathAccessKind,
     explicit_allowed_paths: &[String],
-    access_profile: AccessProfile,
-) -> bool {
-    if canonical_tool_name != crate::BuiltinToolName::ShellExec.as_str()
-        || !explicit_allowed_paths
+) -> std::borrow::Cow<'a, magi_permissions::PermissionPolicy> {
+    if kind == magi_permissions::PathAccessKind::Read
+        && tool_name != crate::BuiltinToolName::BrowserUploadFile.as_str()
+        && explicit_allowed_paths
             .iter()
             .all(|path| path.trim().is_empty())
+        && !policy.allowed_paths.is_empty()
     {
-        return false;
+        let mut read_policy = policy.clone();
+        read_policy.allowed_paths.clear();
+        return std::borrow::Cow::Owned(read_policy);
     }
-    if access_profile == AccessProfile::ReadOnly {
-        magi_permissions::PermissionEngine::shell_arguments_are_read_only(arguments)
-    } else {
-        magi_permissions::PermissionEngine::shell_arguments_request_read_only(arguments)
-    }
+    std::borrow::Cow::Borrowed(policy)
 }
 
 pub fn effective_tool_policy_allowed_paths(
