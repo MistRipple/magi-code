@@ -5618,34 +5618,30 @@ mod tests {
             )
             .is_none()
         );
-        for (tool, arguments) in [(
-            BuiltinToolName::FileWrite,
-            serde_json::json!({
-                "path": "linked-dir/new-file.txt",
-                "content": "outside"
-            }),
-        )] {
-            let decision = task_policy_tool_decision_with_workspace_root(
-                &task,
-                tool.as_str(),
-                &arguments.to_string(),
-                Some(&workspace_root),
-            )
-            .expect("restricted default scope should gate symlink escape path");
-            let payload: serde_json::Value =
-                serde_json::from_str(&decision.payload).expect("decision should be json");
+        let arguments = serde_json::json!({
+            "path": "linked-dir/new-file.txt",
+            "content": "outside"
+        });
+        let decision = task_policy_tool_decision_with_workspace_root(
+            &task,
+            BuiltinToolName::FileWrite.as_str(),
+            &arguments.to_string(),
+            Some(&workspace_root),
+        )
+        .expect("restricted default scope should gate symlink escape path");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
 
-            assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
-            assert_eq!(
-                payload["error_code"].as_str(),
-                Some("tool_policy_needs_approval"),
-                "unexpected payload: {payload}"
-            );
-            assert_eq!(
-                payload["restriction_kind"].as_str(),
-                Some("approval_required")
-            );
-        }
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("tool_policy_needs_approval"),
+            "unexpected payload: {payload}"
+        );
+        assert_eq!(
+            payload["restriction_kind"].as_str(),
+            Some("approval_required")
+        );
     }
 
     #[test]

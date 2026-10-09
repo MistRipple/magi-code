@@ -1885,6 +1885,17 @@ mod tests {
             .root_task_id
             .clone()
             .expect("restricted outside file tool should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, tool_name);
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "deny",
+        )
+        .await;
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
@@ -1894,7 +1905,7 @@ mod tests {
         assert_eq!(
             non_classifier_provider_request_count(&harness),
             2,
-            "工作区外 {tool_name} 被确定性拒绝后不得重试 Provider"
+            "拒绝越界写入审批后应由 Provider 完成本轮"
         );
         assert!(
             harness
@@ -1903,14 +1914,14 @@ mod tests {
                 .tool_approvals()
                 .pending_for_session(&session_id)
                 .is_empty(),
-            "工作区外 {tool_name} 不得创建 pending approval"
+            "拒绝越界写入后不得遗留 pending approval"
         );
         assert!(
             harness
                 .events_for(&session_id)
                 .iter()
-                .all(|event| event.event_type != "tool.approval.requested"),
-            "工作区外 {tool_name} 不得发布审批请求"
+                .any(|event| event.event_type == "tool.approval.requested"),
+            "工作区外 {tool_name} 必须请求审批"
         );
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
@@ -1927,11 +1938,11 @@ mod tests {
                 "access_profile": "Restricted",
                 "scope": "workspace_external",
                 "lifecycle": "deny",
-                "approval_requested": false,
-                "approval_resolved": false,
+                "approval_requested": true,
+                "approval_resolved": true,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "external_path_blocked",
             }),
             &turn,
@@ -11114,7 +11125,7 @@ done
     }
 
     #[tokio::test]
-    async fn restricted_profile_rejects_write_outside_workspace_without_approval() {
+    async fn restricted_profile_outside_write_respects_approval_denial() {
         let harness = MagiTurnHarness::new_task("越界写入被拒绝");
         let workspace_root = tempfile::tempdir().expect("workspace should create");
         let outside_root = tempfile::tempdir().expect("outside workspace should create");
@@ -11162,6 +11173,17 @@ done
             .root_task_id
             .clone()
             .expect("task should have root task");
+        let pending = wait_for_pending_tool_approval(&harness, &session_id).await;
+        assert_eq!(pending.tool_name, "file_write");
+        resolve_tool_approval_via_http(
+            &harness,
+            &session_id,
+            &workspace_id,
+            workspace_root.path(),
+            &pending.approval_id,
+            "deny",
+        )
+        .await;
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
@@ -11177,20 +11199,28 @@ done
                 .tool_approvals()
                 .pending_for_session(&session_id)
                 .is_empty(),
-            "路径拒绝不应创建 pending approval"
+            "拒绝审批后不应遗留 pending approval"
         );
         assert!(
             harness
                 .events_for(&session_id)
                 .iter()
-                .all(|event| event.event_type != "tool.approval.requested"),
-            "确定性的路径拒绝不应发布审批请求"
+                .any(|event| event.event_type == "tool.approval.requested"),
+            "越界写入必须先请求审批"
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
             2,
-            "确定性的路径拒绝后不得重试 Provider"
+            "拒绝审批后应由 Provider 完成本轮"
         );
+        assert!(harness.events_for(&session_id).iter().any(|event| {
+            event.event_type == "tool.approval.resolved"
+                && event
+                    .payload
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("deny")
+        }));
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
                 && item
@@ -11206,11 +11236,11 @@ done
                 "access_profile": "Restricted",
                 "scope": "workspace_external",
                 "lifecycle": "deny",
-                "approval_requested": false,
-                "approval_resolved": false,
+                "approval_requested": true,
+                "approval_resolved": true,
                 "provider_requests": non_classifier_provider_request_count(&harness),
-                "turn_status": "failed",
-                "task_status": "failed",
+                "turn_status": "completed",
+                "task_status": "completed",
                 "side_effect": "external_path_blocked",
             }),
             &turn,
