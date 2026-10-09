@@ -2,7 +2,8 @@ use crate::{
     AgentRoleCatalogProvider, BrowserCapabilityProvider, BrowserToolExecutor, BuiltinTool,
     BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ExternalMcpToolExecutor,
     ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GitToolExecutor,
-    ImageGenerationExecutor, ImageGenerationReadinessProvider, RuntimeCapabilityDependencyProvider,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, PluginToolCatalogEntry,
+    PluginToolCatalogProvider, PluginToolExecutor, RuntimeCapabilityDependencyProvider,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
     ToolRuntimeResources,
@@ -66,6 +67,60 @@ impl ToolRegistry {
     pub fn with_external_mcp_tool_executor(mut self, executor: ExternalMcpToolExecutor) -> Self {
         self.runtime_resources.external_mcp_tool_executor = Some(executor);
         self
+    }
+
+    pub fn with_plugin_tools(
+        mut self,
+        provider: PluginToolCatalogProvider,
+        executor: PluginToolExecutor,
+    ) -> Self {
+        self.runtime_resources.plugin_tool_catalog_provider = Some(provider);
+        self.runtime_resources.plugin_tool_executor = Some(executor);
+        self
+    }
+
+    pub fn plugin_tool_catalog(
+        &self,
+        workspace_id: Option<&magi_core::WorkspaceId>,
+    ) -> Vec<PluginToolCatalogEntry> {
+        self.runtime_resources
+            .plugin_tool_catalog_provider
+            .as_ref()
+            .map(|provider| provider(workspace_id))
+            .unwrap_or_default()
+    }
+
+    pub fn execute_plugin_tool(
+        &self,
+        model_tool_name: &str,
+        arguments: &str,
+        context: &ToolExecutionContext,
+        access_profile: AccessProfile,
+    ) -> Option<(String, ExecutionResultStatus)> {
+        let entry = self
+            .plugin_tool_catalog(context.workspace_id.as_ref())
+            .into_iter()
+            .find(|entry| entry.model_tool_name == model_tool_name)?;
+        if !entry.read_only && access_profile != AccessProfile::FullAccess {
+            return Some((
+                serde_json::json!({
+                    "tool": model_tool_name,
+                    "status": if access_profile == AccessProfile::Restricted { "needs_approval" } else { "rejected" },
+                    "error_code": "plugin_tool_requires_full_access",
+                    "error": "该插件工具需要确认并在完整访问模式下执行",
+                })
+                .to_string(),
+                if access_profile == AccessProfile::Restricted {
+                    ExecutionResultStatus::NeedsApproval
+                } else {
+                    ExecutionResultStatus::Rejected
+                },
+            ));
+        }
+        self.runtime_resources
+            .plugin_tool_executor
+            .as_ref()
+            .map(|executor| executor(&entry.model_tool_name, arguments, context))
     }
 
     pub fn external_tool_catalog_snapshot(&self) -> ExternalToolCatalogSnapshot {

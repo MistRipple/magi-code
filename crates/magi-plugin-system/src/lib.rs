@@ -7,6 +7,7 @@ mod package;
 pub mod resource;
 pub mod workflow;
 pub mod workflow_runtime;
+use sha2::Digest;
 
 pub use engine::{
     EngineEvent, EngineReadiness, PluginSessionEngine, SessionEngineAdapter, SessionEngineRequest,
@@ -19,6 +20,15 @@ pub use magi_app_server_protocol::{
 };
 pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
+
+pub fn model_tool_name(plugin_id: &str, contribution_id: &str) -> String {
+    let full = format!("plugin__{plugin_id}__{contribution_id}");
+    if full.len() <= 64 {
+        return full;
+    }
+    let digest = sha2::Sha256::digest(full.as_bytes());
+    format!("plugin__{:x}", digest)[..64].to_string()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {

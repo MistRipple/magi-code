@@ -165,6 +165,7 @@ pub(crate) struct RefreshLiveMcpToolDefinitionsInput<'a> {
     pub allowed_tools: Option<&'a [String]>,
     pub denied_tools: &'a [String],
     pub include_external: bool,
+    pub workspace_id: Option<&'a magi_core::WorkspaceId>,
 }
 
 pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
@@ -179,11 +180,12 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         allowed_tools,
         denied_tools,
         include_external,
+        workspace_id,
     } = input;
-    definitions.retain(|definition| !definition.function.name.starts_with("mcp__"));
-    if !include_external {
-        return definitions;
-    }
+    definitions.retain(|definition| {
+        !definition.function.name.starts_with("mcp__")
+            && !definition.function.name.starts_with("plugin__")
+    });
     let skill_allowed_tools = active_skill_id.and_then(|skill_id| {
         skill_runtime.and_then(|runtime| {
             let policy = runtime
@@ -195,7 +197,54 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
             (!policy.source_skill_ids.is_empty()).then_some(policy.allowed_tool_names)
         })
     });
-    for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
+    if include_external {
+        for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
+            if (access_profile == AccessProfile::ReadOnly && !tool.read_only)
+                || denied_tools
+                    .iter()
+                    .any(|denied| denied == &tool.model_tool_name)
+                || allowed_tools.is_some_and(|allowed| {
+                    !allowed.iter().any(|name| name == &tool.model_tool_name)
+                })
+                || skill_allowed_tools.as_ref().is_some_and(|allowed| {
+                    !allowed.iter().any(|name| name == &tool.model_tool_name)
+                })
+                || definitions
+                    .iter()
+                    .any(|definition| definition.function.name == tool.model_tool_name)
+            {
+                continue;
+            }
+            let mut parameters = tool.input_schema;
+            if let Some(object) = parameters.as_object_mut()
+                && object
+                    .get("properties")
+                    .is_none_or(serde_json::Value::is_null)
+            {
+                object.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+            }
+            if !parameters.is_object() {
+                parameters = serde_json::json!({ "type": "object", "properties": {} });
+            }
+            definitions.push(ChatToolDefinition {
+                kind: "function".to_string(),
+                function: ChatToolFunctionDefinition {
+                    name: tool.model_tool_name,
+                    description: if tool.description.trim().is_empty() {
+                        format!("MCP tool {} from {}", tool.tool_name, tool.server_name)
+                    } else {
+                        tool.description
+                    },
+                    parameters,
+                },
+                origin: ChatToolOrigin::ExternalMcp,
+            });
+        }
+    }
+    for tool in tool_registry.plugin_tool_catalog(workspace_id) {
         if (access_profile == AccessProfile::ReadOnly && !tool.read_only)
             || denied_tools
                 .iter()
@@ -211,32 +260,23 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         {
             continue;
         }
-        let mut parameters = tool.input_schema;
-        if let Some(object) = parameters.as_object_mut()
-            && object
-                .get("properties")
-                .is_none_or(serde_json::Value::is_null)
-        {
-            object.insert(
-                "properties".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
-        if !parameters.is_object() {
-            parameters = serde_json::json!({ "type": "object", "properties": {} });
-        }
+        let parameters = if tool.input_schema.is_object() {
+            tool.input_schema
+        } else {
+            serde_json::json!({ "type": "object", "properties": {} })
+        };
         definitions.push(ChatToolDefinition {
             kind: "function".to_string(),
             function: ChatToolFunctionDefinition {
                 name: tool.model_tool_name,
                 description: if tool.description.trim().is_empty() {
-                    format!("MCP tool {} from {}", tool.tool_name, tool.server_name)
+                    tool.title
                 } else {
                     tool.description
                 },
                 parameters,
             },
-            origin: ChatToolOrigin::ExternalMcp,
+            origin: ChatToolOrigin::Plugin,
         });
     }
     definitions
@@ -525,6 +565,7 @@ mod tests {
                 allowed_tools: None,
                 denied_tools: &[],
                 include_external: true,
+                workspace_id: None,
             });
         let names = definitions
             .iter()
@@ -565,6 +606,7 @@ mod tests {
                 allowed_tools: None,
                 denied_tools: &[],
                 include_external: false,
+                workspace_id: None,
             });
         assert!(first_round.is_empty(), "首轮不应注入完整 MCP schema");
 
@@ -578,6 +620,7 @@ mod tests {
                 allowed_tools: None,
                 denied_tools: &[],
                 include_external: true,
+                workspace_id: None,
             });
         assert_eq!(
             after_catalog

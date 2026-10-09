@@ -1,6 +1,6 @@
 # Magi 插件系统：需求与方案设计
 
-> 状态：阶段 B 实施中；包合同、隔离执行、daemon 安装/授权/生命周期、版本化资源和按作用域投影的右栏隔离视图已有实现，原生工具/设置/工作流目录与 GPT Web 迁移仍未完成。
+> 状态：阶段 B/C 实施中；包合同、隔离执行、daemon 安装/授权/生命周期、按作用域资源与设置存储、插件工具目录桥接和隔离 UI 视图已有实现；可替换工作流/会话引擎接入与 GPT Web 迁移仍未完成。
 > 日期：2026-10-09。
 > 本文统一记录插件系统的产品需求、目标架构与验收条件。已进入源码的插件字段和 DTO 以 App Server schema 及生成物为准；尚未实施的部分仍以方案约束为准，不得据此伪造可用入口。
 > 现有功能继续遵循当前架构文档；插件化切换时同步修订相关基线，不保留相互冲突的两套实现说明。
@@ -50,11 +50,11 @@
 | [`settings-tabs.ts`](../web/src/lib/settings-tabs.ts)、[`SettingsPanel.svelte`](../web/src/components/SettingsPanel.svelte) | 设置分类静态清单和内容分支 | 受控的贡献注册、动态导航和统一设置存储 |
 | [`right-pane.svelte.ts`](../web/src/stores/right-pane.svelte.ts) | 右侧 Tab、作用域、布局和实体引用 | 通用插件视图身份与承载接口，不再为每个插件增加业务 kind |
 | [`daemon/runtime.rs`](../crates/magi-daemon/src/daemon/runtime.rs) | 工具、Skill、任务运行及状态装配 | 插件安装、激活、资源释放和能力桥接的统一所有者 |
-| [`magi-tool-runtime`](../crates/magi-tool-runtime/src/lib.rs) | 工具目录、调用上下文、治理和执行 | 插件工具注册适配，继续复用原工具治理入口 |
+| [`magi-tool-runtime`](../crates/magi-tool-runtime/src/lib.rs) | 工具目录、调用上下文、治理和执行 | 插件工具按工作区作用域注册，继续复用原工具治理入口 |
 | [`task_execution_dispatcher.rs`](../crates/magi-conversation-runtime/src/task_execution_dispatcher.rs) | 现有任务执行入口；同一文件内还承担 GPT Web 引擎解析（`WebModelResolutionContext`、Web 客户端工厂注入）、上下文预算、Skill 调度与 worktree 清理 | 先盘点真实职责，再分别提取工作流决策合同与会话引擎解析接口，保留既有调度和终态责任 |
 | [`magi-web-model`](../crates/magi-web-model/src/lib.rs) | GPT Web 功能实现 | 划分可选功能与原生浏览器/MCP 边界，完成单次切换 |
 
-当前已接入的实现入口：`magi-plugin-system::PluginManager` 由 daemon 恢复并通过 `/api/plugins/*` 提供唯一安装、升级、授权、启用、激活、停用、禁用和卸载入口；`PluginResourceStore` 由同一管理器持有，资源键包含插件、作用域和资源 ID，并执行版本冲突检查；`/api/plugins/{id}/ui/{path}` 只服务已激活包内的 `ui/` 资源。Web 右栏对 active manifest 的 `rightPane` 视图提供隔离 iframe 承载，设置页展示插件声明的权限后再执行授权激活。未声明或未桥接的贡献仍不会自动注册到工具目录、设置导航或工作流选择器。
+当前已接入的实现入口：`magi-plugin-system::PluginManager` 由 daemon 恢复并通过 `/api/plugins/*` 提供唯一安装、升级、授权、启用、激活、停用、禁用和卸载入口；`PluginResourceStore` 由同一管理器持有，资源键包含插件、作用域和资源 ID，并执行版本冲突检查；插件设置使用同一版本化资源服务并按声明 schema 校验；激活插件的工具贡献按工作区作用域进入 `ToolRegistry`，模型调用和实际执行使用同一工具目录与插件 Worker。`/api/plugins/{id}/ui/{path}` 只服务已激活包内的 `ui/` 资源，隔离 iframe 通过受控消息桥读取和提交资源。Web 右栏对 active manifest 的 `rightPane` 视图提供隔离 iframe 承载，设置页展示插件声明的权限后再执行授权激活。未声明的贡献仍不会注册到任何目录或入口。
 
 必须延续的基线：
 
@@ -399,14 +399,14 @@ GPT Web 插件必须显式声明应用级能力：登录态、Cookie、单槽位
 | 阶段 | 工作 | 完成条件 |
 | --- | --- | --- |
 | A：合同和执行边界 | 定义贡献、身份、权限、包与 SDK；选定唯一执行环境、构建链和后台产物格式 | 隔离、终止、取消、跨平台装载均有证据，冻结唯一加载合同后再进入阶段 B |
-| B：管理与基础扩展 | 统一安装、激活、工具/命令、设置、版本与释放 | 已完成统一包安装/升级、授权、作用域启用/激活、资源版本冲突和 API 管理入口；工具/命令/设置仍待桥接原生目录 |
+| B：管理与基础扩展 | 统一安装、激活、工具/命令、设置、版本与释放 | 已完成统一包安装/升级、授权、作用域启用/激活、资源/设置版本冲突、插件工具目录桥接和 API 管理入口；命令与工作流选择仍待接入 |
 | C：界面和资源 | 设置 Tab、主页入口、主内容区、右侧面板、资源订阅和上下文引用 | 独立插件无需修改 Magi 源码即可展示与同步数据 |
 | D：工作流与会话引擎接口 | 抽取默认工作流核心和 GPT Web 引擎解析，接入自定义核心、会话引擎适配和恢复合同 | 原生与自定义实现共用接口，单次运行只有一个负责人；调度器内不再有按引擎分支的解析代码 |
 | E：功能迁移与分发 | GPT Web 迁出、Tunnel 托管迁入受控资源服务、插件中心目录接入、旧代码与文档清理 | 未安装不加载，安装后功能闭合，第 9 节清单中的旧实现删除 |
 
 工作流接口和会话引擎接口都必须在阶段 A 中定义并验证边界，不能等工具和界面完成后再靠通用钩子绕过执行内核。阶段 A 的接口定义以对 `task_execution_dispatcher.rs` 与 `daemon/runtime.rs` 当前真实职责的盘点为输入：两者都是单文件大体量实现，混合了调度、引擎解析、上下文预算、Skill 调度和资源清理，接口必须按盘点结果划定哪些职责留在宿主、哪些交给核心或引擎，而不是先写合同再到阶段 D 发现切不进去。插件中心的服务端托管、发布审核和作者身份方案在阶段 E 前完成定案。
 
-当前实施证据：插件清单复用 App Server schema 生成的 Rust/TypeScript 合同，包校验完成 6 项核心回归；QuickJS 受管 Worker 完成 10 项执行回归，构建、资源哈希、许可正文与发行 preflight 已接入。macOS Apple Silicon 的 Desktop 目录包已生成，最终 `.app` 内 Worker 实际执行与解包资源检查通过。安装/升级/授权/生命周期、按作用域资源隔离与版本冲突、工作流动作身份和隔离右栏视图已有定向回归；取消会先通知能力处理器并在有限窗口内结算，超时后终止受管 Worker。原生工具目录桥接、设置 schema 存储、会话引擎流式适配、daemon SDK 的真实副作用结算、Windows 实际执行和三平台正式安装器验收仍未完成。
+当前实施证据：插件清单复用 App Server schema 生成的 Rust/TypeScript 合同，包校验完成 6 项核心回归；QuickJS 受管 Worker 完成 10 项执行回归，构建、资源哈希、许可正文与发行 preflight 已接入。macOS Apple Silicon 的 Desktop 目录包已生成，最终 `.app` 内 Worker 实际执行与解包资源检查通过。安装/升级/授权/生命周期、按作用域资源和设置隔离与版本冲突、插件工具目录过滤、工作流动作身份和隔离右栏视图已有定向回归；取消会先通知能力处理器并在有限窗口内结算，超时后终止受管 Worker。命令注册、默认工作流接入、会话引擎流式适配、daemon SDK 的真实副作用结算、GPT Web 迁移、Windows 实际执行和三平台正式安装器验收仍未完成。
 
 ## 11. 最小充分验收
 

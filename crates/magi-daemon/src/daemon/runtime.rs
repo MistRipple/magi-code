@@ -49,6 +49,10 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
+use magi_plugin_runtime::{
+    CapabilityHandler, CapabilityRequest, ExecutionError, ExecutionErrorCode, Invocation,
+    InvocationIdentity, PluginHost, RunCancellation, RuntimeLimits,
+};
 use magi_plugin_system::PluginManager;
 use magi_process::ManagedProcessGroup;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
@@ -59,8 +63,8 @@ use magi_tool_runtime::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
     ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData,
-    ImageGenerationExecutor, ImageGenerationReadinessProvider, ToolRegistry,
-    external_mcp_model_tool_name,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, PluginToolCatalogEntry,
+    PluginToolCatalogProvider, PluginToolExecutor, ToolRegistry, external_mcp_model_tool_name,
 };
 use magi_usage_authority::UsageCallStatus;
 use magi_worker_runtime::WorkerRuntime;
@@ -172,6 +176,298 @@ fn build_external_tool_catalog_provider(
             skill_tools,
             mcp_servers,
             mcp_tools,
+        }
+    })
+}
+
+fn build_plugin_tool_catalog_provider(
+    plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+) -> PluginToolCatalogProvider {
+    Arc::new(move |workspace_id| {
+        let scope = workspace_id
+            .map(|id| format!("workspace:{id}"))
+            .unwrap_or_else(|| "application".to_string());
+        let Ok(manager) = plugin_manager.lock() else {
+            return Vec::new();
+        };
+        let Ok(contributions) = manager.tool_contributions_for_scope(&scope) else {
+            return Vec::new();
+        };
+        contributions
+            .into_iter()
+            .map(|(manifest, tool)| PluginToolCatalogEntry {
+                plugin_id: manifest.id.clone(),
+                contribution_id: tool.id.clone(),
+                model_tool_name: magi_plugin_system::model_tool_name(&manifest.id, &tool.id),
+                title: tool.title,
+                description: tool.description,
+                input_schema: tool.input_schema,
+                read_only: tool.read_only,
+            })
+            .collect()
+    })
+}
+
+struct PluginCapabilityHandler {
+    plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+}
+
+impl CapabilityHandler for PluginCapabilityHandler {
+    fn call(
+        &self,
+        request: CapabilityRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<serde_json::Value, ExecutionError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async move {
+            if request.cancellation.is_cancelled() {
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::Cancelled,
+                    "插件能力调用已取消",
+                ));
+            }
+            let scope = request
+                .identity
+                .workspace_id
+                .as_deref()
+                .map(|id| format!("workspace:{id}"))
+                .unwrap_or_else(|| "application".to_string());
+            let mut manager = self.plugin_manager.lock().map_err(|_| {
+                ExecutionError::new(ExecutionErrorCode::CapabilityRejected, "插件管理器不可用")
+            })?;
+            let plugin_id = &request.identity.plugin_id;
+            if !manager
+                .is_active_for_scope(plugin_id, &scope)
+                .map_err(|_| {
+                    ExecutionError::new(ExecutionErrorCode::CapabilityRejected, "插件未激活")
+                })?
+            {
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::CapabilityRejected,
+                    "插件作用域未激活",
+                ));
+            }
+            match request.operation.as_str() {
+                "resource.read" => {
+                    let resource = request
+                        .arguments
+                        .get("resourceId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if !manager
+                        .permission_allowed(
+                            plugin_id,
+                            &scope,
+                            magi_plugin_system::PluginPermissionKind::Storage,
+                            resource,
+                        )
+                        .unwrap_or(false)
+                    {
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件未获资源读取权限",
+                        ));
+                    }
+                    Ok(manager
+                        .resources()
+                        .read(plugin_id, &scope, resource)
+                        .map(|value| serde_json::json!(value))
+                        .unwrap_or(serde_json::Value::Null))
+                }
+                "resource.write" => {
+                    let resource = request
+                        .arguments
+                        .get("resourceId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if !manager
+                        .permission_allowed(
+                            plugin_id,
+                            &scope,
+                            magi_plugin_system::PluginPermissionKind::Storage,
+                            resource,
+                        )
+                        .unwrap_or(false)
+                    {
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件未获资源写入权限",
+                        ));
+                    }
+                    let expected = request
+                        .arguments
+                        .get("expectedVersion")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(u64::MAX);
+                    let value = request
+                        .arguments
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    manager
+                        .resources_mut()
+                        .write(plugin_id, &scope, resource, expected, value)
+                        .map(|resource| serde_json::json!(resource))
+                        .map_err(|_| {
+                            ExecutionError::new(
+                                ExecutionErrorCode::CapabilityRejected,
+                                "插件资源写入被拒绝",
+                            )
+                        })
+                }
+                "settings.read" | "settings.write" => {
+                    if !manager
+                        .permission_allowed(
+                            plugin_id,
+                            &scope,
+                            magi_plugin_system::PluginPermissionKind::Storage,
+                            "__settings",
+                        )
+                        .unwrap_or(false)
+                    {
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件未获设置存储权限",
+                        ));
+                    }
+                    if request.operation == "settings.read" {
+                        return Ok(serde_json::json!(
+                            manager.read_settings(plugin_id, &scope).map_err(|_| {
+                                ExecutionError::new(
+                                    ExecutionErrorCode::CapabilityRejected,
+                                    "插件设置不可用",
+                                )
+                            })?
+                        ));
+                    }
+                    let expected = request
+                        .arguments
+                        .get("expectedVersion")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(u64::MAX);
+                    let value = request
+                        .arguments
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    Ok(serde_json::json!(
+                        manager
+                            .write_settings(plugin_id, &scope, expected, value)
+                            .map_err(|_| ExecutionError::new(
+                                ExecutionErrorCode::CapabilityRejected,
+                                "插件设置写入被拒绝"
+                            ))?
+                    ))
+                }
+                _ => Err(ExecutionError::new(
+                    ExecutionErrorCode::CapabilityRejected,
+                    "插件能力未注册",
+                )),
+            }
+        })
+    }
+}
+
+fn build_plugin_tool_executor(
+    plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+    plugin_host: PluginHost,
+) -> PluginToolExecutor {
+    let handler = Arc::new(PluginCapabilityHandler {
+        plugin_manager: Arc::clone(&plugin_manager),
+    });
+    Arc::new(move |model_tool_name, arguments, context| {
+        let scope = context
+            .workspace_id
+            .as_ref()
+            .map(|id| format!("workspace:{id}"))
+            .unwrap_or_else(|| "application".to_string());
+        let Ok(manager) = plugin_manager.lock() else {
+            return (
+                "{\"status\":\"failed\",\"error\":\"插件管理器不可用\"}".into(),
+                magi_core::ExecutionResultStatus::Failed,
+            );
+        };
+        let entries = manager
+            .tool_contributions_for_scope(&scope)
+            .unwrap_or_default();
+        let Some((manifest, tool)) = entries.into_iter().find(|(manifest, tool)| {
+            magi_plugin_system::model_tool_name(&manifest.id, &tool.id) == model_tool_name
+        }) else {
+            return (
+                "{\"status\":\"rejected\",\"error\":\"插件工具未激活\"}".into(),
+                magi_core::ExecutionResultStatus::Rejected,
+            );
+        };
+        if !manager
+            .permission_allowed(
+                &manifest.id,
+                &scope,
+                magi_plugin_system::PluginPermissionKind::Tools,
+                &tool.id,
+            )
+            .unwrap_or(false)
+        {
+            return (
+                "{\"status\":\"rejected\",\"error\":\"插件工具未授权\"}".into(),
+                magi_core::ExecutionResultStatus::Rejected,
+            );
+        }
+        let package = match manager.package(&manifest.id) {
+            Ok(package) => package,
+            Err(_) => {
+                return (
+                    "{\"status\":\"failed\",\"error\":\"插件包不可用\"}".into(),
+                    magi_core::ExecutionResultStatus::Failed,
+                );
+            }
+        };
+        let identity = InvocationIdentity {
+            plugin_id: manifest.id.clone(),
+            package_digest: package.digest().to_string(),
+            instance_id: scope.clone(),
+            invocation_id: format!("{model_tool_name}:{}", magi_core::UtcMillis::now().0),
+            workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
+            run_id: context.task_id.as_ref().map(ToString::to_string),
+            attempt_id: context.session_id.as_ref().map(ToString::to_string),
+        };
+        let invocation = Invocation {
+            identity,
+            source: package.source().to_string(),
+            input: serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null),
+            limits: RuntimeLimits::default(),
+        };
+        drop(manager);
+        let host = plugin_host.clone();
+        let capability_handler = Arc::clone(&handler);
+        let result = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    ExecutionError::new(ExecutionErrorCode::WorkerUnavailable, "插件执行器不可用")
+                })
+                .and_then(|runtime| {
+                    runtime.block_on(host.invoke(
+                        invocation,
+                        capability_handler.as_ref(),
+                        &RunCancellation::default(),
+                    ))
+                })
+        })
+        .join()
+        .ok()
+        .and_then(Result::ok);
+        match result {
+            Some(value) => (
+                value.to_string(),
+                magi_core::ExecutionResultStatus::Succeeded,
+            ),
+            None => (
+                "{\"status\":\"failed\",\"error\":\"插件执行失败\"}".into(),
+                magi_core::ExecutionResultStatus::Failed,
+            ),
         }
     })
 }
@@ -991,6 +1287,7 @@ pub(crate) struct DaemonRuntime {
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
     /// 插件安装、授权和生命周期的唯一 daemon 所有者；UI 只通过 API 投影访问。
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+    plugin_host: PluginHost,
 }
 
 impl DaemonRuntime {
@@ -1068,6 +1365,20 @@ impl DaemonRuntime {
         );
         runtime_maintenance.publish_runtime_status_event("system-runtime-maintenance-ready");
 
+        let managed_process_group = ManagedProcessGroup::new();
+        let worker_name = if cfg!(windows) {
+            "magi-plugin-worker.exe"
+        } else {
+            "magi-plugin-worker"
+        };
+        let worker_path = env::var_os("MAGI_PLUGIN_WORKER_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|parent| parent.join(worker_name)))
+            })
+            .unwrap_or_else(|| PathBuf::from(worker_name));
         Ok(Self {
             state_root: config.state_root.clone(),
             state_repository,
@@ -1080,9 +1391,10 @@ impl DaemonRuntime {
             governance: Arc::new(GovernanceService::default()),
             worker_runtime,
             runtime_maintenance,
-            managed_process_group: ManagedProcessGroup::new(),
+            managed_process_group: managed_process_group.clone(),
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
             plugin_manager: Arc::new(std::sync::Mutex::new(plugin_manager)),
+            plugin_host: PluginHost::new(worker_path, managed_process_group),
         })
     }
 
@@ -1381,6 +1693,10 @@ impl DaemonRuntime {
         );
         let external_mcp_tool_executor =
             build_external_mcp_tool_executor(settings_store.clone(), mcp_connections.clone());
+        let plugin_tool_catalog_provider =
+            build_plugin_tool_catalog_provider(self.plugin_manager.clone());
+        let plugin_tool_executor =
+            build_plugin_tool_executor(self.plugin_manager.clone(), self.plugin_host.clone());
         let agent_role_catalog_provider = build_agent_role_catalog_provider(
             agent_role_registry.clone(),
             settings_store.clone(),
@@ -1541,6 +1857,7 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
+            .with_plugin_tools(plugin_tool_catalog_provider, plugin_tool_executor)
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,

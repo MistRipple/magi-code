@@ -79,3 +79,60 @@ export async function loadActivePluginManifests(scope = 'application'): Promise<
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
 }
+
+export async function readPluginResource(
+  pluginId: string,
+  resourceId: string,
+  scope: string,
+): Promise<unknown> {
+  const response = await pluginRequest(
+    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}?scope=${encodeURIComponent(scope)}`,
+  );
+  if (!response.ok) throw new Error(`读取插件资源失败: ${response.status}`);
+  return await response.json();
+}
+
+export async function writePluginResource(
+  pluginId: string,
+  resourceId: string,
+  scope: string,
+  expectedVersion: number,
+  value: unknown,
+): Promise<unknown> {
+  const response = await pluginRequest(
+    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}?scope=${encodeURIComponent(scope)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedVersion, value }),
+    },
+  );
+  if (!response.ok) throw new Error(`写入插件资源失败: ${response.status}`);
+  return await response.json();
+}
+
+export async function readPluginSettings(pluginId: string, scope: string): Promise<unknown> {
+  const response = await pluginRequest(
+    `/api/plugins/${encodeURIComponent(pluginId)}/settings?scope=${encodeURIComponent(scope)}`,
+  );
+  if (!response.ok) throw new Error(`读取插件设置失败: ${response.status}`);
+  return await response.json();
+}
+
+export async function writePluginSettings(
+  pluginId: string,
+  scope: string,
+  expectedVersion: number,
+  value: unknown,
+): Promise<unknown> {
+  const response = await pluginRequest(
+    `/api/plugins/${encodeURIComponent(pluginId)}/settings?scope=${encodeURIComponent(scope)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedVersion, value }),
+    },
+  );
+  if (!response.ok) throw new Error(`写入插件设置失败: ${response.status}`);
+  return await response.json();
+}

@@ -1597,7 +1597,7 @@ pub(crate) fn estimate_context_usage_breakdown(
     }
 
     if let Some(definitions) = tools.filter(|definitions| !definitions.is_empty()) {
-        let mut raw_by_origin = [0usize; 4];
+        let mut raw_by_origin = [0usize; 5];
         for definition in definitions {
             let visible = serde_json::json!({
                 "type": definition.kind,
@@ -1610,7 +1610,8 @@ pub(crate) fn estimate_context_usage_breakdown(
                 ChatToolOrigin::Builtin => 0,
                 ChatToolOrigin::ExternalMcp => 1,
                 ChatToolOrigin::Skill => 2,
-                ChatToolOrigin::Unspecified => 3,
+                ChatToolOrigin::Plugin => 3,
+                ChatToolOrigin::Unspecified => 4,
             };
             raw_by_origin[index] = raw_by_origin[index].saturating_add(estimate);
         }
@@ -2014,6 +2015,7 @@ mod tests {
             ChatToolOrigin::Builtin,
             ChatToolOrigin::ExternalMcp,
             ChatToolOrigin::Skill,
+            ChatToolOrigin::Plugin,
         ]
         .into_iter()
         .map(|origin| ChatToolDefinition {

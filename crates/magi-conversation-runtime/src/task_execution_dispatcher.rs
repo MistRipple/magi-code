@@ -1288,6 +1288,7 @@ impl LlmTaskDispatcher {
                 .map(|policy| policy.denied_tools.as_slice())
                 .unwrap_or_default(),
             include_external: false,
+            workspace_id,
         })
     }
 

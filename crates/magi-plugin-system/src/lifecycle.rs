@@ -1,7 +1,10 @@
-use crate::{PluginError, PluginPackage, PluginResourceStore};
-use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginScopeKind};
+use crate::{PluginError, PluginPackage, PluginResource, PluginResourceStore, invalid};
+use magi_app_server_protocol::{
+    PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,
+};
 use magi_core::fs_atomic::write_atomic;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -98,6 +101,80 @@ impl PluginManager {
     }
     pub fn resources_mut(&mut self) -> &mut PluginResourceStore {
         &mut self.resources
+    }
+
+    pub fn validate_settings(&self, id: &str, value: &Value) -> Result<(), PluginError> {
+        let package = self.package(id)?;
+        let validator = jsonschema::validator_for(&package.manifest().settings_schema)
+            .map_err(|error| invalid(format!("插件设置 schema 无效：{error}")))?;
+        if validator.is_valid(value) {
+            Ok(())
+        } else {
+            Err(invalid("插件设置不符合清单声明的 schema"))
+        }
+    }
+
+    pub fn permission_allowed(
+        &self,
+        id: &str,
+        scope: &str,
+        kind: magi_app_server_protocol::PluginPermissionKind,
+        target: &str,
+    ) -> Result<bool, PluginError> {
+        validate_scope_key(scope)?;
+        let package = self.package(id)?;
+        let installed = self
+            .state
+            .plugins
+            .get(id)
+            .ok_or_else(|| PluginError::Conflict("插件未安装".into()))?;
+        Ok(package.manifest().permissions.iter().any(|permission| {
+            if permission.kind != kind || !permission.targets.iter().any(|item| item == target) {
+                return false;
+            }
+            let grants = installed
+                .grants
+                .get(if permission.scope == PluginScopeKind::Application {
+                    "application"
+                } else {
+                    scope
+                })
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            permission_granted(permission, grants)
+        }))
+    }
+
+    pub fn read_settings(&self, id: &str, scope: &str) -> Result<PluginResource, PluginError> {
+        validate_scope_key(scope)?;
+        self.package(id)?;
+        if !self.permission_allowed(id, scope, PluginPermissionKind::Storage, "__settings")? {
+            return Err(PluginError::NotAuthorized("插件未获设置存储权限".into()));
+        }
+        Ok(self
+            .resources
+            .read(id, scope, "__settings")
+            .unwrap_or(PluginResource {
+                version: 0,
+                value: Value::Object(Default::default()),
+            }))
+    }
+
+    pub fn write_settings(
+        &mut self,
+        id: &str,
+        scope: &str,
+        expected_version: u64,
+        value: Value,
+    ) -> Result<PluginResource, PluginError> {
+        validate_scope_key(scope)?;
+        self.validate_settings(id, &value)?;
+        if !self.permission_allowed(id, scope, PluginPermissionKind::Storage, "__settings")? {
+            return Err(PluginError::NotAuthorized("插件未获设置存储权限".into()));
+        }
+        self.resources
+            .write(id, scope, "__settings", expected_version, value)
+            .map_err(PluginError::Resource)
     }
 
     pub fn package(&self, id: &str) -> Result<PluginPackage, PluginError> {
@@ -342,6 +419,36 @@ impl PluginManager {
                 Err(error) => Some(Err(error)),
             })
             .collect()
+    }
+
+    pub fn tool_contributions_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<
+        Vec<(
+            PluginManifest,
+            magi_app_server_protocol::PluginToolContribution,
+        )>,
+        PluginError,
+    > {
+        validate_scope_key(scope)?;
+        let mut result = Vec::new();
+        for id in self.state.plugins.keys() {
+            if !self.is_active_for_scope(id, scope)? {
+                continue;
+            }
+            let package = self.package(id)?;
+            result.extend(
+                package
+                    .manifest()
+                    .contributions
+                    .tools
+                    .iter()
+                    .cloned()
+                    .map(|tool| (package.manifest().clone(), tool)),
+            );
+        }
+        Ok(result)
     }
 
     pub fn projection(

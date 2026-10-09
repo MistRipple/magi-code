@@ -32,6 +32,10 @@ pub fn routes() -> Router<ApiState> {
             "/plugins/{id}/resources/{resource}",
             get(read_resource).put(write_resource),
         )
+        .route(
+            "/plugins/{id}/settings",
+            get(read_settings).put(write_settings),
+        )
         .route("/plugins/install", post(install))
         .route("/plugins/upgrade", post(upgrade))
         .route("/plugins/{id}/enable", post(enable))
@@ -165,6 +169,43 @@ async fn write_resource(
             ApiError::internal_assembly("写入插件资源失败", message)
         }
     })
+}
+
+async fn read_settings(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ScopeQuery>,
+) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
+    let manager = locked(&state, "读取插件设置")?;
+    if !manager
+        .is_active_for_scope(&id, &query.scope)
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未激活".into()));
+    }
+    manager
+        .read_settings(&id, &query.scope)
+        .map(Json)
+        .map_err(plugin_error)
+}
+
+async fn write_settings(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ScopeQuery>,
+    Json(request): Json<ResourceWriteRequest>,
+) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
+    let mut manager = locked(&state, "写入插件设置")?;
+    if !manager
+        .is_active_for_scope(&id, &query.scope)
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未激活".into()));
+    }
+    manager
+        .write_settings(&id, &query.scope, request.expected_version, request.value)
+        .map(Json)
+        .map_err(plugin_error)
 }
 
 async fn install(
@@ -328,6 +369,15 @@ fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {
         magi_plugin_system::PluginError::Conflict(message) => ApiError::Conflict(message),
         magi_plugin_system::PluginError::NotAuthorized(message) => ApiError::Forbidden(message),
         magi_plugin_system::PluginError::InvalidPackage(message) => ApiError::InvalidInput(message),
+        err @ magi_plugin_system::PluginError::Resource(
+            magi_plugin_system::ResourceError::Conflict { .. },
+        ) => ApiError::Conflict(err.to_string()),
+        magi_plugin_system::PluginError::Resource(magi_plugin_system::ResourceError::Invalid(
+            message,
+        )) => ApiError::InvalidInput(message),
+        magi_plugin_system::PluginError::Resource(magi_plugin_system::ResourceError::Storage(
+            message,
+        )) => ApiError::internal_assembly("插件资源操作失败", message),
         other => ApiError::internal_assembly("插件操作失败", other),
     }
 }
