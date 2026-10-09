@@ -5,6 +5,7 @@ pub mod engine;
 mod lifecycle;
 mod package;
 pub mod resource;
+mod session_engine;
 pub mod workflow;
 pub mod workflow_runtime;
 use sha2::Digest;
@@ -20,6 +21,10 @@ pub use magi_app_server_protocol::{
 };
 pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
+pub use session_engine::{
+    PluginSessionEngineFactory, SessionEngineFactory, SessionEngineInvocationSpec,
+    SessionEngineModelClient, SessionEngineRouter,
+};
 
 pub fn model_tool_name(plugin_id: &str, contribution_id: &str) -> String {
     let full = format!("plugin__{plugin_id}__{contribution_id}");

@@ -132,6 +132,8 @@ pub enum ModelApiProtocol {
     /// 它不写 `llm`、不带 `baseUrl / apiKey / model`，因此任何把协议当 HTTP
     /// 处理的分支都必须显式拒绝它，不得回退到 `openai_chat`（设计基线 §5.6、A7）。
     ChatGptWeb,
+    /// 插件会话引擎：消息由已注册插件工厂承载，没有 HTTP 传输。
+    Plugin,
 }
 
 impl ModelApiProtocol {
@@ -141,6 +143,7 @@ impl ModelApiProtocol {
             "openai_responses" => Some(Self::OpenAiResponses),
             "anthropic_messages" => Some(Self::AnthropicMessages),
             "chatgpt_web" => Some(Self::ChatGptWeb),
+            "plugin" => Some(Self::Plugin),
             _ => None,
         }
     }
@@ -154,6 +157,7 @@ impl ModelApiProtocol {
             Self::OpenAiResponses => Some(HttpModelBridgeProtocol::Responses),
             Self::AnthropicMessages => Some(HttpModelBridgeProtocol::AnthropicMessages),
             Self::ChatGptWeb => None,
+            Self::Plugin => None,
         }
     }
 
@@ -163,6 +167,7 @@ impl ModelApiProtocol {
             Self::OpenAiResponses => "openai",
             Self::AnthropicMessages => "anthropic",
             Self::ChatGptWeb => "chatgpt_web",
+            Self::Plugin => "plugin",
         }
     }
 }
@@ -257,7 +262,7 @@ impl NormalizedModelConfig {
             .any(|field| value.get(*field).is_some());
         let api_protocol = match string_field(value, "apiProtocol") {
             Some(label) => ModelApiProtocol::from_label(&label).ok_or_else(|| {
-                "apiProtocol 无效，必须是 openai_chat、openai_responses、anthropic_messages 或 chatgpt_web"
+                "apiProtocol 无效，必须是 openai_chat、openai_responses、anthropic_messages、chatgpt_web 或 plugin"
                     .to_string()
             })?,
             None if has_connection_fields => {
@@ -320,6 +325,10 @@ impl NormalizedModelConfig {
     /// 该配置是否就是非 HTTP 的 GPT Web 引擎。
     pub fn is_chatgpt_web(&self) -> bool {
         self.api_protocol == ModelApiProtocol::ChatGptWeb
+    }
+
+    pub fn is_plugin(&self) -> bool {
+        self.api_protocol == ModelApiProtocol::Plugin
     }
 
     pub fn context_window_tokens(&self) -> Option<u64> {
@@ -645,6 +654,8 @@ pub fn resolve_orchestrator_model_config(
         let mut config = if magi_web_model::is_chatgpt_web_engine_id(&engine_id) {
             // GPT Web 是固定入口，不在引擎注册表里：引擎 id 命名空间就是它的全部事实。
             chatgpt_web_engine_config(&engine_id)
+        } else if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+            serde_json::json!({ "apiProtocol": "plugin", "model": engine_id })
         } else {
             let entry = engine_entry(settings_store, &engine_id)
                 .ok_or_else(|| format!("会话绑定的模型引擎不存在：{engine_id}"))?;
@@ -1078,6 +1089,19 @@ mod tests {
             config.to_http_image_generation_client().is_err(),
             "Web 引擎不得构造 HTTP 图片生成客户端"
         );
+    }
+
+    #[test]
+    fn plugin_engine_has_no_http_transport() {
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "apiProtocol": "plugin",
+            "model": "plugin/example/engine"
+        }))
+        .expect("plugin protocol is a valid session engine");
+        assert!(config.is_plugin());
+        assert_eq!(config.api_protocol(), None);
+        assert_eq!(config.provider(), "plugin");
+        assert!(config.to_http_model_client().is_none());
     }
 
     #[test]

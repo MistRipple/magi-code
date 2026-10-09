@@ -40,9 +40,9 @@ pub trait SessionEngineAdapter: Send + Sync {
     fn invoke<'a>(
         &'a self,
         request: SessionEngineRequest,
-        emit: &'a mut (dyn FnMut(EngineEvent) + Send),
-        cancelled: &'a (dyn Fn() -> bool + Send + Sync),
-    ) -> Pin<Box<dyn Future<Output = Result<(), EngineEvent>> + Send + 'a>>;
+        emit: &'a mut dyn FnMut(EngineEvent),
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EngineEvent>> + 'a>>;
 }
 
 /// 由唯一 QuickJS Worker 承载的插件会话引擎适配器。
@@ -84,9 +84,9 @@ impl SessionEngineAdapter for PluginSessionEngine {
     fn invoke<'a>(
         &'a self,
         request: SessionEngineRequest,
-        emit: &'a mut (dyn FnMut(EngineEvent) + Send),
-        cancelled: &'a (dyn Fn() -> bool + Send + Sync),
-    ) -> Pin<Box<dyn Future<Output = Result<(), EngineEvent>> + Send + 'a>> {
+        emit: &'a mut dyn FnMut(EngineEvent),
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EngineEvent>> + 'a>> {
         Box::pin(async move {
             if cancelled() {
                 return Err(EngineEvent::Failed {

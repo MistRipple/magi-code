@@ -948,6 +948,29 @@ pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
     let worker_configs =
         normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
     align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
+    if let Ok(manager) = state.plugin_manager.lock()
+        && let Ok(contributions) = manager.engine_contributions_for_scope("application")
+    {
+        for (manifest, engine) in contributions {
+            let id = format!("plugin/{}/{}", manifest.id, engine.id);
+            if normalized
+                .iter()
+                .any(|entry| entry.get("id") == Some(&Value::String(id.clone())))
+            {
+                continue;
+            }
+            normalized.push(serde_json::json!({
+                "id": id,
+                "displayName": engine.title,
+                "description": engine.description,
+                "source": "plugin",
+                "llm": {
+                    "apiProtocol": "plugin",
+                    "model": format!("plugin/{}/{}", manifest.id, engine.id),
+                },
+            }));
+        }
+    }
     normalized
 }
 
@@ -2309,6 +2332,11 @@ async fn upsert_engine(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?
         .to_string();
+    if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+        return Err(ApiError::InvalidInput(
+            "插件会话引擎由插件清单管理，不能通过模型设置改写".to_string(),
+        ));
+    }
     let mut engines = load_registry_engines(&state);
     if let Some(position) = engines.iter().position(|entry| {
         entry
@@ -2335,6 +2363,11 @@ async fn remove_engine(
         .get("engineId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    if engine_id.starts_with("plugin/") || engine_id.starts_with("plugin:") {
+        return Err(ApiError::InvalidInput(
+            "插件会话引擎由插件清单管理，不能通过模型设置移除".to_string(),
+        ));
+    }
     let mut engines = load_registry_engines(&state);
     engines.retain(|entry| {
         entry

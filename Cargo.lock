@@ -1538,6 +1538,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-permissions",
  "magi-plan",
+ "magi-plugin-system",
  "magi-process",
  "magi-project-memory",
  "magi-safety-gate",
@@ -1762,6 +1763,7 @@ version = "3.0.52"
 dependencies = [
  "jsonschema",
  "magi-app-server-protocol",
+ "magi-bridge-client",
  "magi-core",
  "magi-plugin-runtime",
  "semver",

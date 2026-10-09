@@ -16,6 +16,7 @@ magi-orchestrator = { path = "../magi-orchestrator" }
 tokio.workspace = true
 magi-safety-gate = { path = "../magi-safety-gate" }
 magi-plan = { path = "../magi-plan" }
+magi-plugin-system = { path = "../magi-plugin-system" }
 magi-project-memory = { path = "../magi-project-memory" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-governance = { path = "../magi-governance" }

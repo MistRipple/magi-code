@@ -29,7 +29,7 @@ pub use driver::{
     SubmitOutcome, TurnState, WebMessage, WebModelPageDriver, WriteOutcome,
 };
 pub use errors::{EngineState, WebModelError, WebModelErrorCode};
-pub use factory::{WebModelClientFactory, WebModelInvocationSpec, new_web_slot_table};
+pub use factory::new_web_slot_table;
 pub use images::{
     PageImageRef, WebImage, WebImageSink, page_image_refs, rewrite_page_images, strip_page_images,
 };

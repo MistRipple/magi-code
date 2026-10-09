@@ -212,6 +212,12 @@ struct PluginCapabilityHandler {
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
 }
 
+fn build_plugin_capability_handler(
+    plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+) -> Arc<PluginCapabilityHandler> {
+    Arc::new(PluginCapabilityHandler { plugin_manager })
+}
+
 impl CapabilityHandler for PluginCapabilityHandler {
     fn call(
         &self,
@@ -374,9 +380,7 @@ fn build_plugin_tool_executor(
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
     plugin_host: PluginHost,
 ) -> PluginToolExecutor {
-    let handler = Arc::new(PluginCapabilityHandler {
-        plugin_manager: Arc::clone(&plugin_manager),
-    });
+    let handler = build_plugin_capability_handler(Arc::clone(&plugin_manager));
     Arc::new(move |model_tool_name, arguments, context| {
         let scope = context
             .workspace_id
@@ -2268,7 +2272,7 @@ impl DaemonRuntime {
         );
         // GPT Web 引擎的 client 工厂：宿主实现把驱动映射到 Desktop 宿主命令。
         // 应用级浏览器会话按需创建，因此这里只装配共享引用，不固定会话 id。
-        let web_model_factory: Option<Arc<dyn magi_web_model::WebModelClientFactory>> = {
+        let web_model_factory: Option<Arc<dyn magi_plugin_system::SessionEngineFactory>> = {
             let browser_dependencies = state.browser_tool_runtime_dependencies();
             match magi_api::WebModelHostFactory::new(
                 Arc::clone(&browser_dependencies.host_client),
@@ -2293,10 +2297,24 @@ impl DaemonRuntime {
                 }
             }
         };
-        let mut llm_task_dispatcher = llm_task_dispatcher;
+        let plugin_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> =
+            Arc::new(magi_plugin_system::PluginSessionEngineFactory::new(
+                self.plugin_manager.clone(),
+                self.plugin_host.clone(),
+                build_plugin_capability_handler(self.plugin_manager.clone()),
+                RuntimeLimits::default(),
+            ));
+        let mut engine_factories = vec![plugin_engine_factory];
         if let Some(factory) = web_model_factory {
-            llm_task_dispatcher = llm_task_dispatcher.with_web_model_client_factory(factory);
+            engine_factories.push(factory);
         }
+        let session_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> = Arc::new(
+            magi_plugin_system::SessionEngineRouter::new(engine_factories)
+                .map_err(|error| DaemonError::internal(format!("注册会话引擎失败: {error}")))?,
+        );
+        let mut llm_task_dispatcher = llm_task_dispatcher;
+        llm_task_dispatcher =
+            llm_task_dispatcher.with_session_engine_factory(session_engine_factory);
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())
