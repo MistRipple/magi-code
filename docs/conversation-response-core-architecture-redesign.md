@@ -109,7 +109,7 @@ TaskStore 的父子关系是任务树的唯一来源。父任务进入终态时�
 
 代理工作区从父工作树的派发时快照建立，包含未提交与未跟踪文件，不改变用户 index 和工作树。产出在代理分支提交后写入回执，通过 agent_apply 合入主线；冲突必须返回明确事实。详见[会话 Git 工作流](session-git-workflow.md)。
 
-容量、角色和能力来自现有准入与角色注册表。只读角色的限制在工具权限层执行；子代理不隐式继承父任务的 Skill，排队代理的补充消息在启动时读取。相关回归位于 task_store、tool_batch、agent_spawn_preflight 和 task_execution_dispatcher。
+容量、角色和能力来自现有准入与角色注册表。子代理的访问模式与父任务（主对话）完全一致，不因角色收紧；只读角色（explorer、reviewer）的只读职责由角色提示词约束，不再把访问模式强制降为只读；子代理不隐式继承父任务的 Skill，排队代理的补充消息在启动时读取。相关回归位于 task_store、tool_batch、agent_spawn_preflight 和 task_execution_dispatcher。
 
 ### 3.4 `CanonicalTurnEventSink`
 

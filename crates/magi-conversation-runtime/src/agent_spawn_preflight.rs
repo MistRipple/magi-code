@@ -317,7 +317,7 @@ pub(crate) fn preflight_agent_spawn(
     );
 
     let child_policy_snapshot =
-        child_policy_for_role(parent_task.policy_snapshot.as_ref(), &role_definition);
+        agent_spawn_child_policy_snapshot(parent_task.policy_snapshot.as_ref());
     let child_access_profile = child_policy_snapshot.effective_access_profile();
     let child_dependency_ids = agent_spawn_child_dependency_ids(parent_task);
     let child_input_refs = context_package
@@ -917,23 +917,11 @@ pub(crate) fn child_canonical_task_name(parent_name: &str, task_name: &str) -> S
     format!("{parent_name}/{task_name}")
 }
 
+/// 子代理的任务策略完全继承父任务（访问模式、路径与命令模式都不因角色而收紧）。
 pub(crate) fn agent_spawn_child_policy_snapshot(parent_policy: Option<&TaskPolicy>) -> TaskPolicy {
     parent_policy
         .cloned()
         .unwrap_or_else(default_agent_spawn_policy)
-}
-
-/// 子代理继承父任务的策略；角色声明只读时由运行时收紧为只读访问模式，写类工具被拒绝、
-/// worktree 以只读方式检出。访问模式只能收紧，不能借角色放宽用户选择的模式。
-fn child_policy_for_role(
-    parent_policy: Option<&TaskPolicy>,
-    role: &magi_agent_role::AgentRole,
-) -> TaskPolicy {
-    let mut policy = agent_spawn_child_policy_snapshot(parent_policy);
-    if role.is_read_only() {
-        policy.access_profile = AccessProfile::ReadOnly;
-    }
-    policy
 }
 
 pub(crate) fn agent_spawn_child_dependency_ids(parent: &Task) -> Vec<TaskId> {
@@ -1166,26 +1154,21 @@ mod tests {
     use magi_orchestrator::task_store::TaskStore;
 
     #[test]
-    fn read_only_roles_run_with_read_only_access_and_writable_roles_inherit() {
-        let roles = magi_agent_role::AgentRoleRegistry::builtin();
-        let mut parent = agent_spawn_child_policy_snapshot(None);
-        parent.access_profile = AccessProfile::FullAccess;
-        let reviewer = roles.get("reviewer").expect("reviewer role");
-        let executor = roles.get("executor").expect("executor role");
-        assert_eq!(
-            child_policy_for_role(Some(&parent), &reviewer).access_profile,
-            AccessProfile::ReadOnly
-        );
-        assert_eq!(
-            child_policy_for_role(Some(&parent), &executor).access_profile,
-            AccessProfile::FullAccess
-        );
-        parent.access_profile = AccessProfile::ReadOnly;
-        assert_eq!(
-            child_policy_for_role(Some(&parent), &executor).access_profile,
+    fn child_policy_inherits_the_parents_access_profile_for_every_role() {
+        // 子代理的访问模式与主对话一致：只读角色（explorer / reviewer）也不再被收紧，
+        // 它们“只读”的职责由角色提示词约束，而不是把任务连同一次 shell 调用一起拒绝掉。
+        for access_profile in [
             AccessProfile::ReadOnly,
-            "角色不能放宽用户选择的只读模式"
-        );
+            AccessProfile::Restricted,
+            AccessProfile::FullAccess,
+        ] {
+            let mut parent = agent_spawn_child_policy_snapshot(None);
+            parent.access_profile = access_profile;
+            assert_eq!(
+                agent_spawn_child_policy_snapshot(Some(&parent)).access_profile,
+                access_profile
+            );
+        }
     }
 
     fn package_with_references(references: serde_json::Value) -> AgentContextPackage {
