@@ -1226,7 +1226,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magi-agent-role"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "dirs",
  "magi-core",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "magi-api"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "arboard",
  "axum",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "magi-app-server-protocol"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "serde",
  "serde_json",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "magi-appearance"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "base64",
  "image",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "magi-bridge-client"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "base64",
  "httpdate",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "magi-browser-authority"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "futures-util",
  "magi-core",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "magi-context-runtime"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "magi-knowledge-store",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "magi-conversation-runtime"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "insta",
  "magi-agent-role",
@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "magi-core"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "base64",
  "dunce",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon-app"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-daemon",
  "magi-mcp-server",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "magi-event-bus"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "magi-usage-authority",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "magi-git"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-process",
  "serde",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "magi-governance"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "magi-knowledge-store"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "flate2",
  "magi-core",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "magi-mcp-server"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "magi-memory-store"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "magi-orchestrator"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-agent-role",
  "magi-context-runtime",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "magi-permissions"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "magi-plan"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "magi-process"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "libc",
  "sysinfo",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "magi-project-memory"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "magi-runtime-state"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "dirs",
  "serde",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "magi-safety-gate"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "serde",
  "serde_json",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "magi-session-isolation"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-process",
  "magi-snapshot",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "magi-session-store"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "getrandom 0.3.4",
  "magi-core",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "magi-settings-store"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde_json",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "magi-skill-runtime"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-bridge-client",
  "magi-core",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "magi-snapshot"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "ignore",
  "magi-process",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "magi-tool-runtime"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "base64",
  "dirs",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "magi-usage-authority"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "magi-web-model"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-bridge-client",
  "magi-process",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "magi-worker-runtime"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "magi-workspace"
-version = "3.0.53"
+version = "3.0.54"
 dependencies = [
  "magi-core",
  "serde",

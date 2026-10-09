@@ -2799,7 +2799,7 @@ fn run_conversation_loop_inner(
             {
                 deferred_mcp_tools_loaded = true;
             }
-            if discovery_tool_name(&canonical_tool_name) {
+            if discovery_tool_call(tool_call) {
                 round_had_discovery_tool = true;
             } else if matches!(tool_status, ExecutionResultStatus::Succeeded)
                 && !tool_result_execution_was_skipped(&result)
@@ -2882,7 +2882,7 @@ fn run_conversation_loop_inner(
             discovery_tool_calls = discovery_tool_calls.saturating_add(
                 valid_tool_calls
                     .iter()
-                    .filter(|call| discovery_tool_name(&call.function.name))
+                    .filter(|call| discovery_tool_call(call))
                     .count(),
             );
         }
@@ -3183,11 +3183,24 @@ fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage], context_w
     }
 }
 
-fn discovery_tool_name(name: &str) -> bool {
-    matches!(
-        canonical_tool_call_name(name).as_str(),
+fn discovery_tool_call(tool_call: &ChatToolCall) -> bool {
+    let canonical_name = canonical_tool_call_name(&tool_call.function.name);
+    if matches!(
+        canonical_name.as_str(),
         "file_read" | "search_text" | "search_semantic" | "code_symbols" | "git_status"
-    )
+    ) {
+        return true;
+    }
+
+    // `shell_exec` is also a discovery tool when the command is read-only. Reuse the
+    // permissions parser because read-only shell commands are allowed to omit
+    // `access_mode`; checking only that field would let the new read-only shell path
+    // bypass the discovery budget. Commands with write indicators remain in the
+    // ordinary task flow and are not force-stopped by the discovery budget.
+    if canonical_name != "shell_exec" {
+        return false;
+    }
+    magi_permissions::PermissionEngine::shell_arguments_are_read_only(&tool_call.function.arguments)
 }
 
 fn render_mailbox_items_for_prompt(items: &[MailboxItem]) -> Option<String> {
@@ -4306,6 +4319,41 @@ mod tests {
             },
             origin: magi_bridge_client::ChatToolOrigin::Builtin,
         }
+    }
+
+    fn discovery_tool_call_for_test(name: &str, arguments: &str) -> ChatToolCall {
+        ChatToolCall {
+            id: format!("call-{name}"),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn read_only_shell_calls_count_toward_discovery_budget() {
+        assert!(discovery_tool_call(&discovery_tool_call_for_test(
+            "file_read",
+            r#"{"path":"README.md"}"#,
+        )));
+        assert!(discovery_tool_call(&discovery_tool_call_for_test(
+            "shell_exec",
+            r#"{"command":"rg --files"}"#,
+        )));
+        assert!(discovery_tool_call(&discovery_tool_call_for_test(
+            "shell_exec",
+            r#"{"command":"rg --files","access_mode":"read_only"}"#,
+        )));
+        assert!(!discovery_tool_call(&discovery_tool_call_for_test(
+            "shell_exec",
+            r#"{"command":"printf x > result.txt","access_mode":"read_only"}"#,
+        )));
+        assert!(!discovery_tool_call(&discovery_tool_call_for_test(
+            "shell_exec",
+            r#"{"command":"printf x > result.txt","access_mode":"maybe_write"}"#,
+        )));
     }
 
     fn test_thread_message(role: &str, content: impl Into<String>) -> ThreadChatMessage {
