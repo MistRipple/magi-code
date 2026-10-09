@@ -1889,11 +1889,11 @@ mod tests {
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
+            2,
             "工作区外 {tool_name} 被确定性拒绝后不得重试 Provider"
         );
         assert!(
@@ -3718,7 +3718,8 @@ done
     }
 
     #[tokio::test]
-    async fn task_profile_permission_block_stops_write_tool_without_provider_loop() {
+    async fn task_profile_permission_block_returns_the_rejection_to_the_model_without_side_effect()
+    {
         let harness = MagiTurnHarness::new_task("不会执行受限写入");
         let workspace_root = tempfile::tempdir().expect("permission workspace should create");
         let workspace_id = magi_core::WorkspaceId::new("harness-permission-workspace");
@@ -3770,6 +3771,79 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
+        assert!(!target.exists(), "只读访问模式下写工具不得产生文件副作用");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == CanonicalTurnItemKind::ToolCall
+                && item
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "shell_exec")
+        }));
+        // 单次拒绝不终止任务：拒绝结果交回模型，它改为直接答复，多出一次 Provider 请求。
+        assert_eq!(harness.provider.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn task_profile_repeated_permission_blocks_fail_the_task_after_the_limit() {
+        let harness = MagiTurnHarness::new_task("不会执行受限写入");
+        let workspace_root = tempfile::tempdir().expect("permission workspace should create");
+        let workspace_id = magi_core::WorkspaceId::new("harness-permission-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace_id.clone(), workspace_root.path().to_path_buf())
+            .expect("permission workspace should register");
+        let session_id = SessionId::new("harness-permission-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "权限阻塞验收",
+                Some(workspace_id.to_string()),
+            )
+            .expect("permission session should create");
+        let target = workspace_root.path().join("should-not-write.txt");
+        harness.provider.set_tool_sequence_then_completed(
+            (0..5)
+                .map(|index| {
+                    (
+                        "shell_exec".to_string(),
+                        serde_json::json!({
+                            "command": format!("printf blocked > {}.{index}", target.display())
+                        })
+                        .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "不会执行受限写入",
+        );
+        let response = harness
+            .submit_workspace_task_with_access_profile(
+                &session_id,
+                &workspace_id,
+                workspace_root.path(),
+                "执行一个任务：写入文件并汇总结果",
+                "harness-permission-request",
+                "harness-permission-user",
+                Some(AccessProfile::ReadOnly),
+            )
+            .await
+            .expect("permission-blocked task should be accepted");
+        let turn_id = response
+            .turn_id
+            .clone()
+            .expect("permission task should have turn");
+        let root_task_id = response
+            .root_task_id
+            .clone()
+            .expect("permission task should have root task");
+        let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
+            .await;
         assert_eq!(turn.status, CanonicalTurnStatus::Failed);
         assert_eq!(task.status, magi_core::TaskStatus::Failed);
         assert!(!target.exists(), "只读访问模式下写工具不得产生文件副作用");
@@ -3780,7 +3854,8 @@ done
                     .as_ref()
                     .is_some_and(|tool| tool.name == "shell_exec")
         }));
-        assert_eq!(harness.provider.requests().len(), 1);
+        // 累计第 3 次被策略拒绝时终止任务，不再请求第 4 次。
+        assert_eq!(harness.provider.requests().len(), 3);
     }
 
     #[tokio::test]
@@ -3839,12 +3914,12 @@ done
         let task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(!target.exists(), "ReadOnly 后台进程不得产生文件副作用");
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
+            2,
             "ReadOnly shell_exec 仍是可用的只读工具面；后台写操作应在工具执行前被拒绝"
         );
         assert!(
@@ -11092,8 +11167,8 @@ done
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
             .await;
 
-        assert_eq!(turn.status, CanonicalTurnStatus::Failed);
-        assert_eq!(task.status, magi_core::TaskStatus::Failed);
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert_eq!(task.status, magi_core::TaskStatus::Completed);
         assert!(!target.exists(), "工作区外路径不得产生文件副作用");
         assert!(
             harness
@@ -11113,7 +11188,7 @@ done
         );
         assert_eq!(
             non_classifier_provider_request_count(&harness),
-            1,
+            2,
             "确定性的路径拒绝后不得重试 Provider"
         );
         assert!(turn.items.iter().any(|item| {
