@@ -481,6 +481,36 @@ impl PluginManager {
         Ok(result)
     }
 
+    pub fn workflow_contributions_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<
+        Vec<(
+            PluginManifest,
+            magi_app_server_protocol::PluginNamedContribution,
+        )>,
+        PluginError,
+    > {
+        validate_scope_key(scope)?;
+        let mut result = Vec::new();
+        for id in self.state.plugins.keys() {
+            if !self.is_active_for_scope(id, scope)? {
+                continue;
+            }
+            let package = self.package(id)?;
+            result.extend(
+                package
+                    .manifest()
+                    .contributions
+                    .workflows
+                    .iter()
+                    .cloned()
+                    .map(|workflow| (package.manifest().clone(), workflow)),
+            );
+        }
+        Ok(result)
+    }
+
     pub fn projection(
         &self,
     ) -> Result<magi_app_server_protocol::generated::PluginList, PluginError> {

@@ -2312,9 +2312,21 @@ impl DaemonRuntime {
             magi_plugin_system::SessionEngineRouter::new(engine_factories)
                 .map_err(|error| DaemonError::internal(format!("注册会话引擎失败: {error}")))?,
         );
+        let workflow_core_factory: Arc<dyn magi_plugin_system::WorkflowCoreFactory> = Arc::new(
+            magi_plugin_system::WorkflowCoreRouter::new(vec![Arc::new(
+                magi_plugin_system::PluginWorkflowCoreFactory::new(
+                    self.plugin_manager.clone(),
+                    self.plugin_host.clone(),
+                    build_plugin_capability_handler(self.plugin_manager.clone()),
+                    RuntimeLimits::default(),
+                ),
+            )])
+            .map_err(|error| DaemonError::internal(format!("注册工作流核心失败: {error}")))?,
+        );
         let mut llm_task_dispatcher = llm_task_dispatcher;
-        llm_task_dispatcher =
-            llm_task_dispatcher.with_session_engine_factory(session_engine_factory);
+        llm_task_dispatcher = llm_task_dispatcher
+            .with_session_engine_factory(session_engine_factory)
+            .with_workflow_core_factory(workflow_core_factory);
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())

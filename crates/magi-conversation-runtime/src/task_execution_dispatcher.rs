@@ -57,6 +57,7 @@ use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
     task_worker_catalog::WorkerInfo,
 };
+use magi_plugin_system::RunCancellation;
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
@@ -142,6 +143,7 @@ pub struct LlmTaskDispatcher {
     ///
     /// 未装配时命中 Web 引擎会失败关闭（不退回 HTTP 模型，A19、§5.6）。
     session_engine_factory: Option<Arc<dyn magi_plugin_system::SessionEngineFactory>>,
+    workflow_core_factory: Option<Arc<dyn magi_plugin_system::WorkflowCoreFactory>>,
     /// 按设置事实源代际复用角色模型客户端。HTTP 连接池由 bridge-client 继续统一持有，
     /// 这里只避免每个 Turn 重复解析配置和构造同一角色包装器。
     model_client_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelBridgeClient>>>>,
@@ -348,6 +350,30 @@ pub enum RoleTarget<'a> {
 /// 线程维度是 Web 引擎绑定键的一部分（R50）：编排者与每个子代理各用一条
 /// ChatGPT 临时对话，绝不复用同一条。
 pub const ORCHESTRATOR_THREAD_ID: &str = "orchestrator";
+
+struct WorkflowCoreDecisionRunner;
+
+impl WorkflowCoreDecisionRunner {
+    fn run(
+        core: Arc<dyn magi_plugin_system::workflow::WorkflowCore>,
+        input: magi_plugin_system::workflow::WorkflowInput,
+    ) -> Result<magi_plugin_system::workflow::WorkflowDecision, String> {
+        let cancellation = RunCancellation::default();
+        std::thread::Builder::new()
+            .name("magi-workflow-core".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("工作流运行时不可用：{error}"))?
+                    .block_on(core.decide(input, &cancellation))
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| format!("启动工作流核心失败：{error}"))?
+            .join()
+            .map_err(|_| "工作流核心线程异常退出".to_string())?
+    }
+}
 
 /// Web 引擎解析上下文：浏览器 client 工厂 + 本次调用的线程 id。
 ///
@@ -580,6 +606,7 @@ impl LlmTaskDispatcher {
             completion_notifier: None,
             model_bridge_client: None,
             session_engine_factory: None,
+            workflow_core_factory: None,
             model_client_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_definition_cache: Arc::new(Mutex::new(HashMap::new())),
             dispatch_quiesce: Arc::new(DispatchQuiesceState::default()),
@@ -618,6 +645,25 @@ impl LlmTaskDispatcher {
     ) -> Self {
         self.session_engine_factory = Some(factory);
         self
+    }
+
+    pub fn with_workflow_core_factory(
+        mut self,
+        factory: Arc<dyn magi_plugin_system::WorkflowCoreFactory>,
+    ) -> Self {
+        self.workflow_core_factory = Some(factory);
+        self
+    }
+
+    pub fn build_workflow_core(
+        &self,
+        spec: magi_plugin_system::WorkflowCoreInvocationSpec,
+    ) -> Result<Arc<dyn magi_plugin_system::workflow::WorkflowCore>, String> {
+        let factory = self
+            .workflow_core_factory
+            .as_ref()
+            .ok_or_else(|| "工作流核心工厂未装配".to_string())?;
+        factory.build_workflow_core(spec)
     }
 
     /// 配置主动 Task 完成通知。生产 daemon 在 Worker 结果到达时先提交 TaskStore，
@@ -2398,6 +2444,9 @@ impl LlmTaskDispatcher {
         &self,
         input: TaskLlmInvocationInput<'_>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
+        if input.task.kind == TaskKind::LocalWorkflow {
+            return self.invoke_workflow_once(input);
+        }
         let TaskLlmInvocationInput {
             task,
             lease_id,
@@ -2556,6 +2605,154 @@ impl LlmTaskDispatcher {
             execution_group_id: Some(task.mission_id.to_string()),
             persist_session_state: self.session_state_persist_callback.as_deref(),
         })
+    }
+
+    fn invoke_workflow_once(
+        &self,
+        input: TaskLlmInvocationInput<'_>,
+    ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
+        let TaskLlmInvocationInput {
+            task,
+            session_id,
+            workspace_id,
+            execution_role_id,
+            thread_id,
+            execution_settings_snapshot,
+            ..
+        } = input;
+        let magi_core::TaskRuntimePayload::Workflow {
+            workflow_id,
+            checkpoint_version,
+            checkpoint,
+        } = &task.runtime_payload
+        else {
+            return (
+                TaskOutcome::Failed {
+                    error: "LocalWorkflow 缺少持久化工作流核心身份".into(),
+                },
+                None,
+            );
+        };
+        let spec = magi_plugin_system::WorkflowCoreInvocationSpec {
+            session_id: session_id.to_string(),
+            project_id: workspace_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            run_id: task.task_id.to_string(),
+            workflow_id: workflow_id.clone(),
+            checkpoint_version: *checkpoint_version,
+            config: checkpoint.clone(),
+        };
+        let core = match self.build_workflow_core(spec) {
+            Ok(core) => core,
+            Err(error) => {
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("工作流核心不可用：{error}"),
+                    },
+                    None,
+                );
+            }
+        };
+        let attempt_id = task.task_id.to_string();
+        let decision = WorkflowCoreDecisionRunner::run(
+            core,
+            magi_plugin_system::workflow::WorkflowInput {
+                run_id: task.task_id.to_string(),
+                attempt_id: attempt_id.clone(),
+                stage: "start".into(),
+                user_input: task.goal.clone(),
+                model_result: None,
+                tool_result: None,
+                context_summary: serde_json::json!({}),
+            },
+        );
+        let decision = match decision {
+            Ok(decision) => decision,
+            Err(error) => {
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("工作流决策失败：{error}"),
+                    },
+                    None,
+                );
+            }
+        };
+        let response = match decision.action {
+            magi_plugin_system::workflow::WorkflowAction::Complete { summary, .. } => summary,
+            magi_plugin_system::workflow::WorkflowAction::WaitUser { .. } => {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流等待用户动作尚未接入宿主等待状态".into(),
+                    },
+                    None,
+                );
+            }
+            magi_plugin_system::workflow::WorkflowAction::SaveStage { .. } => {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流检查点提交尚未接入 TaskStore".into(),
+                    },
+                    None,
+                );
+            }
+            magi_plugin_system::workflow::WorkflowAction::ModelRequest { system, .. } => {
+                let client = match self.resolve_model_client_for_task(
+                    self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
+                    Some(task),
+                    execution_role_id,
+                    Some(session_id),
+                ) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        return (TaskOutcome::Failed { error }, None);
+                    }
+                };
+                let request = ModelInvocationRequest {
+                    provider: "workflow".into(),
+                    prompt: format!("{system}\n\n{}", task.goal),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                };
+                match client.invoke_with_cancellation(request, &|| false) {
+                    Ok(response) => response.content.unwrap_or_default(),
+                    Err(error) => {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流模型请求失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
+                }
+            }
+            magi_plugin_system::workflow::WorkflowAction::ToolCall { tool, .. }
+            | magi_plugin_system::workflow::WorkflowAction::DispatchTask { role: tool, .. } => {
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("工作流动作需要宿主执行器：{tool}"),
+                    },
+                    None,
+                );
+            }
+        };
+        let attempt = magi_core::TaskCompletionAttempt {
+            output_refs: vec![format!("workflow-stage:{}", decision.stage)],
+            final_response: Some(response),
+            evidence: Vec::new(),
+        };
+        if let Err(error) = task.completion_contract.validate(&attempt) {
+            return (
+                TaskOutcome::Failed {
+                    error: format!("工作流完成合同校验失败：{error}"),
+                },
+                None,
+            );
+        }
+        let _ = thread_id;
+        (TaskOutcome::Completed { attempt }, None)
     }
 
     /// Synchronous inner dispatch logic; invoked either directly or inside

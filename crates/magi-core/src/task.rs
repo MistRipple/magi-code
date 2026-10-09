@@ -515,6 +515,14 @@ pub enum TaskRuntimePayload {
         #[serde(default)]
         node_selections: Vec<serde_json::Value>,
     },
+    /// 固定的可替换工作流核心及其检查点。工作流实现不能把检查点藏在
+    /// Worker 内存中，恢复必须使用任务持久化的这份事实。
+    Workflow {
+        workflow_id: String,
+        checkpoint_version: u32,
+        #[serde(default)]
+        checkpoint: serde_json::Value,
+    },
 }
 
 /// 任务完成合同。
@@ -874,21 +882,27 @@ impl Task {
     pub fn agent_context_package(&self) -> Option<&AgentContextPackage> {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { package, .. } => Some(package.as_ref()),
-            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => None,
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::BrowserAnnotations { .. }
+            | TaskRuntimePayload::Workflow { .. } => None,
         }
     }
 
     pub fn agent_context_accesses(&self) -> &[AgentContextAccessRecord] {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { accesses, .. } => accesses,
-            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => &[],
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::BrowserAnnotations { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 
     pub fn browser_annotation_references(&self) -> &[serde_json::Value] {
         match &self.runtime_payload {
             TaskRuntimePayload::BrowserAnnotations { references, .. } => references,
-            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::AgentContext { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 
@@ -897,7 +911,9 @@ impl Task {
             TaskRuntimePayload::BrowserAnnotations {
                 node_selections, ..
             } => node_selections,
-            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::AgentContext { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 

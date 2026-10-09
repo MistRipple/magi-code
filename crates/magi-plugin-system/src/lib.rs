@@ -7,6 +7,7 @@ mod package;
 pub mod resource;
 mod session_engine;
 pub mod workflow;
+mod workflow_factory;
 pub mod workflow_runtime;
 use sha2::Digest;
 
@@ -19,11 +20,15 @@ pub use lifecycle::{
 pub use magi_app_server_protocol::{
     PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,
 };
+pub use magi_plugin_runtime::RunCancellation;
 pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
 pub use session_engine::{
     PluginSessionEngineFactory, SessionEngineFactory, SessionEngineInvocationSpec,
     SessionEngineModelClient, SessionEngineRouter,
+};
+pub use workflow_factory::{
+    PluginWorkflowCoreFactory, WorkflowCoreFactory, WorkflowCoreInvocationSpec, WorkflowCoreRouter,
 };
 
 pub fn model_tool_name(plugin_id: &str, contribution_id: &str) -> String {

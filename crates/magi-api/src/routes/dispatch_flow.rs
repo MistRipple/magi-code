@@ -209,6 +209,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         goal_mode: true,
         use_tools: true,
         target_role: None,
+        workflow_id: None,
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
@@ -399,6 +400,10 @@ async fn execute_dispatch_submission(
         goal_mode: request.goal_mode,
         use_tools,
         target_role,
+        workflow_id: user_message_metadata
+            .get("magi.workflowId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         request_id: request.request_id(),
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
@@ -1389,6 +1394,7 @@ mod tests {
                 goal_mode: false,
                 use_tools: true,
                 target_role: None,
+                workflow_id: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,

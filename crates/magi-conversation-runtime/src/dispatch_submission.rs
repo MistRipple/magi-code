@@ -344,6 +344,8 @@ pub struct DispatchSubmissionRequest {
     #[serde(default = "default_use_tools")]
     pub use_tools: bool,
     pub target_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
@@ -617,6 +619,7 @@ struct DispatchTaskInput<'a> {
     goal: String,
     now: UtcMillis,
     target_role: &'a str,
+    workflow_id: Option<String>,
     active_skill_id: Option<&'a str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
@@ -639,6 +642,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         goal,
         now,
         target_role,
+        workflow_id,
         active_skill_id,
         task_tier,
         access_profile,
@@ -668,7 +672,11 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         mission_id,
         root_task_id: task_id,
         parent_task_id: None,
-        kind: TaskKind::LocalAgent,
+        kind: if workflow_id.is_some() {
+            TaskKind::LocalWorkflow
+        } else {
+            TaskKind::LocalAgent
+        },
         title,
         goal,
         status: TaskStatus::Pending,
@@ -691,8 +699,13 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        runtime_payload: if browser_annotation_refs.is_empty() && browser_node_selections.is_empty()
-        {
+        runtime_payload: if let Some(workflow_id) = workflow_id {
+            magi_core::TaskRuntimePayload::Workflow {
+                workflow_id,
+                checkpoint_version: 1,
+                checkpoint: serde_json::Value::Null,
+            }
+        } else if browser_annotation_refs.is_empty() && browser_node_selections.is_empty() {
             magi_core::TaskRuntimePayload::None
         } else {
             magi_core::TaskRuntimePayload::BrowserAnnotations {
@@ -821,6 +834,7 @@ fn validate_dispatch_request(
         goal: execution_goal.to_string(),
         now,
         target_role,
+        workflow_id: request.workflow_id.clone(),
         active_skill_id: request.skill_name.as_deref(),
         task_tier: request.task_tier,
         access_profile: request.access_profile,
@@ -2349,6 +2363,7 @@ mod tests {
             goal: "验证中断任务恢复".to_string(),
             now,
             target_role: "coordinator",
+            workflow_id: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
@@ -2569,6 +2584,7 @@ mod tests {
             goal: "验证恢复校验".to_string(),
             now,
             target_role: "coordinator",
+            workflow_id: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,

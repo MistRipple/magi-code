@@ -193,6 +193,18 @@ fn task_runtime_payload_none_serialization_roundtrip() {
 }
 
 #[test]
+fn task_runtime_payload_workflow_serialization_roundtrip() {
+    let payload = TaskRuntimePayload::Workflow {
+        workflow_id: "plugin/example/workflow".into(),
+        checkpoint_version: 1,
+        checkpoint: serde_json::json!({"stage":"start"}),
+    };
+    let encoded = serde_json::to_string(&payload).expect("工作流负载应可序列化");
+    let decoded: TaskRuntimePayload = serde_json::from_str(&encoded).expect("工作流负载应可恢复");
+    assert_eq!(decoded, payload);
+}
+
+#[test]
 fn progress_summary_default() {
     let summary = ProgressSummary::default();
     assert_eq!(summary.total_tasks, 0);
