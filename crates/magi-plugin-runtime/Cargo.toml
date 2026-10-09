@@ -1,0 +1,19 @@
+[package]
+name = "magi-plugin-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-process = { path = "../magi-process" }
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "magi-plugin-worker"
+path = "src/main.rs"

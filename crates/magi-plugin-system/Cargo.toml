@@ -1,0 +1,20 @@
+[package]
+name = "magi-plugin-system"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-app-server-protocol = { path = "../magi-app-server-protocol" }
+magi-core = { path = "../magi-core" }
+magi-plugin-runtime = { path = "../magi-plugin-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zip.workspace = true
+semver = "1"
+jsonschema = { version = "0.58.6", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

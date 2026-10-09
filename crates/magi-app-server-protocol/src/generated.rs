@@ -1240,6 +1240,128 @@ pub type ServerNotification = JsonRpcServerNotification;
 pub type ServerResponse = JsonRpcServerResponse;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginScopeKind {
+    #[serde(rename = "workspace")]
+    Workspace,
+    #[serde(rename = "application")]
+    Application,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginPermissionKind {
+    #[serde(rename = "storage")]
+    Storage,
+    #[serde(rename = "filesRead")]
+    FilesRead,
+    #[serde(rename = "filesWrite")]
+    FilesWrite,
+    #[serde(rename = "network")]
+    Network,
+    #[serde(rename = "tools")]
+    Tools,
+    #[serde(rename = "models")]
+    Models,
+    #[serde(rename = "browser")]
+    Browser,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginPermission {
+    pub kind: PluginPermissionKind,
+    pub scope: PluginScopeKind,
+    pub targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginToolContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+    #[serde(rename = "readOnly")]
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginViewPlacement {
+    #[serde(rename = "settings")]
+    Settings,
+    #[serde(rename = "home")]
+    Home,
+    #[serde(rename = "main")]
+    Main,
+    #[serde(rename = "rightPane")]
+    RightPane,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginViewContribution {
+    pub id: String,
+    pub title: String,
+    pub entry: String,
+    pub placements: Vec<PluginViewPlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginNamedContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginContributions {
+    #[serde(default)]
+    pub tools: Vec<PluginToolContribution>,
+    #[serde(default)]
+    pub commands: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub views: Vec<PluginViewContribution>,
+    #[serde(default)]
+    pub workflows: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub engines: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub resources: Vec<PluginNamedContribution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginBackendEntry {
+    #[serde(rename = "plugin.mjs")]
+    PluginMjs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginManifest {
+    #[serde(rename = "sdkVersion")]
+    pub sdk_version: u16,
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub backend: PluginBackendEntry,
+    #[serde(rename = "applicationInstance")]
+    pub application_instance: bool,
+    pub permissions: Vec<PluginPermission>,
+    pub contributions: PluginContributions,
+    #[serde(rename = "settingsSchema")]
+    pub settings_schema: Value,
+    #[serde(rename = "dataSchemaVersion")]
+    pub data_schema_version: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     Request(JsonRpcRequest),

@@ -545,4 +545,62 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
+export type PluginScopeKind = "workspace" | "application";
+
+export type PluginPermissionKind = "storage" | "filesRead" | "filesWrite" | "network" | "tools" | "models" | "browser";
+
+export interface PluginPermission {
+  kind: PluginPermissionKind;
+  scope: PluginScopeKind;
+  targets: Array<string>;
+}
+
+export interface PluginToolContribution {
+  id: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+}
+
+export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane";
+
+export interface PluginViewContribution {
+  id: string;
+  title: string;
+  entry: string;
+  placements: Array<PluginViewPlacement>;
+}
+
+export interface PluginNamedContribution {
+  id: string;
+  title: string;
+  description: string;
+}
+
+export interface PluginContributions {
+  tools?: Array<PluginToolContribution>;
+  commands?: Array<PluginNamedContribution>;
+  views?: Array<PluginViewContribution>;
+  workflows?: Array<PluginNamedContribution>;
+  engines?: Array<PluginNamedContribution>;
+  resources?: Array<PluginNamedContribution>;
+}
+
+export type PluginBackendEntry = "plugin.mjs";
+
+export interface PluginManifest {
+  sdkVersion: number;
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  backend: PluginBackendEntry;
+  applicationInstance: boolean;
+  permissions: Array<PluginPermission>;
+  contributions: PluginContributions;
+  settingsSchema: Record<string, unknown>;
+  dataSchemaVersion: number;
+}
+
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;

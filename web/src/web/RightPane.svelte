@@ -7,6 +7,7 @@
   import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
   import TerminalTabContent from '../components/tabs/TerminalTabContent.svelte';
   import WebModelTabContent from '../components/tabs/WebModelTabContent.svelte';
+  import PluginTabContent from '../components/tabs/PluginTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
   import {
@@ -38,10 +39,12 @@
     type BrowserTabPayload,
     type TerminalTabPayload,
     type WebModelTabPayload,
+    type PluginTabPayload,
     type WebModelHost,
     openBrowserTab,
     synchronizeBrowserSessionSnapshot,
     openTerminalTab,
+    openPluginTab,
     openWebModelTab,
     hideWebModelTabView,
     orderPaneTabsForDisplay,
@@ -68,6 +71,7 @@
   import { WEB_MODEL_HOME_TAB_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
   import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
+  import { loadActivePluginManifests, type PluginManifestProjection } from './plugin-api';
   import { openSettings } from '../stores/shell-ui.svelte';
   import {
     WEB_MODEL_ACTION_EVENT,
@@ -204,6 +208,8 @@
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let domAddPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
+  let pluginManifests = $state<PluginManifestProjection[]>([]);
+  let pluginManifestRequest = 0;
   const addPaneMenuOpen = $derived(domAddPaneMenuOpen);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
@@ -240,6 +246,18 @@
     } else if (menu.matches(':popover-open')) {
       menu.hidePopover?.();
     }
+  });
+
+  $effect(() => {
+    const scope = rightPaneState.activeWorkspaceId.trim()
+      ? `workspace:${rightPaneState.activeWorkspaceId.trim()}`
+      : 'application';
+    const request = ++pluginManifestRequest;
+    void loadActivePluginManifests(scope).then((manifests) => {
+      if (request === pluginManifestRequest) pluginManifests = manifests;
+    }).catch(() => {
+      if (request === pluginManifestRequest) pluginManifests = [];
+    });
   });
 
   onMount(() => {
@@ -563,12 +581,13 @@
    */
   const webModelRunningBadgeCount = $derived(webModelActiveTurnCount());
 
-  type RightPaneCreationKind = 'browser' | 'terminal' | 'webSession';
+  type RightPaneCreationKind = 'browser' | 'terminal' | 'webSession' | 'plugin';
   /**
    * 「新增」菜单**始终渲染三项**，用 `enabled` + `disabledReason` 表达不可用
    * （设计基线 §5.2）：现有实现让 browser 项在不可用时整项不渲染，等于在
    * Web / 手机 Web 上功能完全消失且没有解释。
    */
+  const pluginViews = $derived.by(() => pluginManifests.flatMap((manifest) => manifest.contributions?.views?.filter((view) => view.placements.includes('rightPane')).map((view) => ({ manifest, view })) ?? []));
   const addablePaneKinds = $derived([
     {
       kind: 'terminal' as const,
@@ -577,6 +596,15 @@
       enabled: canCreateTerminalPane,
       disabledReason: i18n.t('rightPane.addPanelTerminalDisabled'),
     },
+    ...pluginViews.map(({ manifest, view }) => ({
+      kind: 'plugin' as const,
+      label: `${manifest.name} · ${view.title}`,
+      icon: 'settings' as const,
+      enabled: true,
+      disabledReason: '',
+      pluginId: manifest.id,
+      contributionId: view.id,
+    })),
     {
       kind: 'browser' as const,
       label: i18n.t('rightPane.addPanelBrowser'),
@@ -605,7 +633,7 @@
     domAddPaneMenuOpen = event.newState === 'open';
   }
 
-  async function chooseAddPane(kind: RightPaneCreationKind): Promise<void> {
+  async function chooseAddPane(kind: RightPaneCreationKind, pluginId?: string, contributionId?: string): Promise<void> {
     domAddPaneMenuOpen = false;
     if (kind === 'browser') {
       await createBrowserPane();
@@ -613,6 +641,11 @@
     }
     if (kind === 'webSession') {
       await createWebModelPane();
+      return;
+    }
+    if (kind === 'plugin') {
+      const item = pluginViews.find(({ manifest, view }) => manifest.id === pluginId && view.id === contributionId);
+      if (item) openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name} · ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
       return;
     }
     createTerminalPane();
@@ -633,6 +666,7 @@
       ? state?.openTabs.find((tab) => tab.id === activeTabId) ?? null
       : null;
   });
+
 
   // ============ Code tab：内容拉取 ============
   /** filepath → 异步加载的源码内容（仅用于补全 store 中没有 content 时） */
@@ -1407,7 +1441,7 @@
             role="menuitem"
             disabled={!item.enabled}
             title={item.enabled ? item.label : item.disabledReason}
-            onclick={() => chooseAddPane(item.kind)}
+            onclick={() => chooseAddPane(item.kind, 'pluginId' in item ? item.pluginId : undefined, 'contributionId' in item ? item.contributionId : undefined)}
           >
             <Icon name={item.icon} size={14} />
             <span>{item.label}</span>
@@ -1463,6 +1497,7 @@
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
     class:right-pane-body--web-model={activeTab?.kind === 'webSession'}
+    class:right-pane-body--plugin={activeTab?.kind === 'plugin'}
   >
     {#each browserHosts as host (host.tabId)}
       {@const retainedInBackground = !host.visible && retainedTabIds.has(host.tabId)}
@@ -1532,6 +1567,14 @@
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
     {:else if activeTab.kind === 'webSession'}
       <!-- WebModelTabContent 已在上方的内容槽中始终挂载；这里同样不能进入文件预览分支。 -->
+    {:else if activeTab.kind === 'plugin'}
+      {@const pluginPayload = activeTab.payload as PluginTabPayload}
+      <PluginTabContent
+        pluginId={pluginPayload.pluginId}
+        entry={pluginPayload.entry}
+        label={activeTab.label}
+        scope={pluginPayload.workspaceId ? `workspace:${pluginPayload.workspaceId}` : 'application'}
+      />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
@@ -2059,6 +2102,14 @@
     overflow: hidden;
     padding: 0;
   }
+
+  .right-pane-body--plugin {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0;
+  }
+
 
   .right-pane-source {
     min-height: 0;

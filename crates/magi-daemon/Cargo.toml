@@ -31,6 +31,7 @@ magi-memory-store = { path = "../magi-memory-store" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-plan = { path = "../magi-plan" }
 magi-process = { path = "../magi-process" }
+magi-plugin-system = { path = "../magi-plugin-system" }
 magi-session-store = { path = "../magi-session-store" }
 magi-settings-store = { path = "../magi-settings-store" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }

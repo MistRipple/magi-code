@@ -15,7 +15,7 @@
 
 import type { BrowserSessionSnapshot } from '../web/agent-api';
 
-export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'webSession';
+export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal' | 'webSession' | 'plugin';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
 export interface AgentTabPayload {
@@ -120,6 +120,16 @@ export interface WebModelTabPayload {
   viewHidden: boolean;
 }
 
+/** 插件视图只保存已校验包内资源身份，不保存页面 DOM 或业务数据。 */
+export interface PluginTabPayload {
+  pluginId: string;
+  contributionId: string;
+  entry: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
+}
+
 export interface BrowserAuthorityTabProjection {
   tabId: string;
   lifecycle: 'creating' | 'ready' | 'suspended' | 'crashed' | 'closed';
@@ -136,7 +146,7 @@ export interface BrowserAuthoritySessionProjection {
   tabs: BrowserAuthorityTabProjection[];
 }
 
-export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload | WebModelTabPayload;
+export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload | WebModelTabPayload | PluginTabPayload;
 
 export interface RightPaneTab {
   id: string;
@@ -310,7 +320,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
 function tabsForPersist(tabs: RightPaneTab[]): RightPaneTab[] {
   // BrowserAuthority 在 daemon 重启和运行组件升级时负责恢复浏览器 Tab。
   // 不把浏览器实体复制到前端存储，避免先挂载已经失效的 Host 引用。
-  return tabs.filter((tab) => tab.kind !== 'browser').map(sanitizeTabForPersist);
+  return tabs.filter((tab) => tab.kind !== 'browser' && tab.kind !== 'plugin').map(sanitizeTabForPersist);
 }
 
 function isRestorableTab(tab: RightPaneTab): boolean {
@@ -332,6 +342,7 @@ function isRestorableTab(tab: RightPaneTab): boolean {
       && payload?.sessionId?.trim(),
     );
   }
+  if (tab.kind === 'plugin') return false;
   return false;
 }
 
@@ -526,6 +537,10 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   if (kind === 'webSession') {
     // 应用级视图全局单例：同 kind 同 key 再次打开只激活既有视图。
     return `webSession:${(payload as WebModelTabPayload).viewId}`;
+  }
+  if (kind === 'plugin') {
+    const plugin = payload as PluginTabPayload;
+    return `plugin:${plugin.pluginId}:${plugin.contributionId}`;
   }
   const browserPayload = payload as BrowserTabPayload;
   return `browser:${browserPayload.browserSessionId}:${browserPayload.tabId}`;
@@ -997,6 +1012,38 @@ export function openTerminalTab(options: {
     null,
   );
   return terminalTabId;
+}
+
+/** 打开已激活插件的隔离视图；入口和身份由 daemon 清单提供。 */
+export function openPluginTab(options: {
+  pluginId: string;
+  contributionId: string;
+  entry: string;
+  label: string;
+  workspaceId?: string | null;
+  workspacePath?: string;
+  sessionId?: string | null;
+}): string | null {
+  const pluginId = options.pluginId.trim();
+  const contributionId = options.contributionId.trim();
+  const entry = options.entry.trim();
+  const scopeKey = sessionScopeKey(options.workspaceId, options.sessionId);
+  if (!pluginId || !contributionId || !entry || !scopeKey) return null;
+  const tab = upsertTab(
+    scopeKey,
+    'plugin',
+    {
+      pluginId,
+      contributionId,
+      entry,
+      workspaceId: normalizeWorkspaceId(options.workspaceId),
+      workspacePath: options.workspacePath?.trim() || undefined,
+      sessionId: normalizeSessionId(options.sessionId),
+    },
+    options.label.trim() || pluginId,
+    'plugin',
+  );
+  return tab?.id ?? null;
 }
 
 /**

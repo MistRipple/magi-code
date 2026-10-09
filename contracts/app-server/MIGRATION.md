@@ -18,3 +18,8 @@ TypeScript 侧的 App Server 客户端必须从 `app-server-protocol.generated.t
 导入 envelope 和方法参数类型。HTTP、SSE、Desktop WebSocket 和 Renderer
 Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire DTO；事件 payload
 也必须沿用 canonical session/turn/item 语义。
+
+插件系统的 `Plugin*` 清单与 DTO 也定义于本 schema，复用同一生成入口。当前新增
+定义用于插件包合同，不增加可调用的 App Server method，也不表示运行时已经注册
+插件能力。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
+在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。

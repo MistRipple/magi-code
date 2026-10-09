@@ -3,6 +3,7 @@ import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 import { runBridgePreflight } from "./bridge-preflight.mjs";
+import { pluginWorkerFileName, runPluginWorkerPreflight } from "./plugin-worker-preflight.mjs";
 
 export async function afterPack(context) {
   const resources = context.electronPlatformName === "darwin"
@@ -40,6 +41,11 @@ export async function afterPack(context) {
     }
   }
   await runBridgePreflight(join(resources, "daemon"), "Electron resources bridge");
+  if (manifest.components.pluginWorker?.path !== `daemon/${pluginWorkerFileName}`
+      || !manifest.files.some((file) => file.path === `daemon/${pluginWorkerFileName}`)) {
+    throw new Error("发行资源清单缺少插件 Worker");
+  }
+  await runPluginWorkerPreflight(join(resources, "daemon"), manifest.productVersion);
 
   const packagedPaths = [
     ...listPackage(asarPath).map((path) => `app.asar/${path}`),

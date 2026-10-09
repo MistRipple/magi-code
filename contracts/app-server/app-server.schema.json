@@ -883,6 +883,86 @@
     "ServerResponse": {
       "$ref": "#/$defs/JsonRpcServerResponse"
     },
+    "PluginScopeKind": {
+      "type": "string", "enum": ["workspace", "application"]
+    },
+    "PluginPermissionKind": {
+      "type": "string", "enum": ["storage", "filesRead", "filesWrite", "network", "tools", "models", "browser"]
+    },
+    "PluginPermission": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "scope", "targets"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/PluginPermissionKind" },
+        "scope": { "$ref": "#/$defs/PluginScopeKind" },
+        "targets": { "type": "array", "items": { "type": "string" }, "maxItems": 64 }
+      }
+    },
+    "PluginToolContribution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "description", "inputSchema", "readOnly"],
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 4096 },
+        "inputSchema": { "type": "object" },
+        "readOnly": { "type": "boolean" }
+      }
+    },
+    "PluginViewPlacement": {
+      "type": "string", "enum": ["settings", "home", "main", "rightPane"]
+    },
+    "PluginViewContribution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "entry", "placements"],
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 128 },
+        "entry": { "type": "string", "maxLength": 256 },
+        "placements": { "type": "array", "items": { "$ref": "#/$defs/PluginViewPlacement" }, "minItems": 1, "maxItems": 4 }
+      }
+    },
+    "PluginNamedContribution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "description"],
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 4096 }
+      }
+    },
+    "PluginContributions": {
+      "type": "object", "additionalProperties": false,
+      "x-rust-derive-default": true,
+      "properties": {
+        "tools": { "type": "array", "items": { "$ref": "#/$defs/PluginToolContribution" }, "x-rust-default": true },
+        "commands": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
+        "views": { "type": "array", "items": { "$ref": "#/$defs/PluginViewContribution" }, "x-rust-default": true },
+        "workflows": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
+        "engines": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
+        "resources": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true }
+      }
+    },
+    "PluginBackendEntry": {
+      "type": "string", "enum": ["plugin.mjs"]
+    },
+    "PluginManifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sdkVersion", "id", "version", "name", "description", "backend", "applicationInstance", "permissions", "contributions", "settingsSchema", "dataSchemaVersion"],
+      "properties": {
+        "sdkVersion": { "type": "integer", "minimum": 1, "maximum": 1 },
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$", "maxLength": 96 },
+        "version": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 4096 },
+        "backend": { "$ref": "#/$defs/PluginBackendEntry" },
+        "applicationInstance": { "type": "boolean" },
+        "permissions": { "type": "array", "items": { "$ref": "#/$defs/PluginPermission" }, "maxItems": 64 },
+        "contributions": { "$ref": "#/$defs/PluginContributions" },
+        "settingsSchema": { "type": "object" },
+        "dataSchemaVersion": { "type": "integer", "minimum": 1 }
+      }
+    },
     "JsonRpcMessage": {
       "oneOf": [
         { "$ref": "#/$defs/JsonRpcRequest" },

@@ -47,6 +47,12 @@ jobs:
       - name: 执行发布前置校验
         run: npm run release:preflight
 
+      - name: 验证插件隔离执行与取消
+        run: |
+          cargo test -p magi-plugin-runtime -p magi-plugin-system --all-targets --locked
+          cargo build -p magi-plugin-runtime --bin magi-plugin-worker --locked
+          ./target/debug/magi-plugin-worker --preflight
+
   windows-desktop:
     name: Windows 桌面与进程策略
     runs-on: windows-2022
@@ -82,6 +88,10 @@ jobs:
           cargo test -p magi-core --test host_path --locked
           cargo test -p magi-workspace native_workspace_registration_keeps_authoritative_path_ref --locked
           cargo test -p magi-process --all-targets --locked
+          cargo test -p magi-plugin-runtime --all-targets --locked
+          cargo test -p magi-plugin-system --all-targets --locked
+          cargo build -p magi-plugin-runtime --bin magi-plugin-worker --locked
+          ./target/debug/magi-plugin-worker.exe --preflight
           cargo test -p magi-permissions --all-targets --locked
           cargo test -p magi-tool-runtime process_inspect_reports_current_process --locked
           cargo test -p magi-tool-runtime shell_path_parser_tests --locked
@@ -125,4 +135,8 @@ jobs:
         run: |
           cargo test -p magi-core --test host_path --locked
           cargo test -p magi-process --all-targets --locked
+          cargo test -p magi-plugin-runtime --all-targets --locked
+          cargo test -p magi-plugin-system --all-targets --locked
+          cargo build -p magi-plugin-runtime --bin magi-plugin-worker --locked
+          ./target/debug/magi-plugin-worker --preflight
           cargo check -p magi-daemon --all-targets --locked

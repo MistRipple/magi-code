@@ -14,6 +14,7 @@ import {
   bridgeBinaryPath,
   runBridgePreflight,
 } from "./bridge-preflight.mjs";
+import { assertPluginWorker, pluginWorkerFileName, runPluginWorkerPreflight } from "./plugin-worker-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -105,6 +106,8 @@ export async function buildDaemon(profile) {
     "magi-daemon-app",
     "-p",
     "magi-bridge-client",
+    "-p",
+    "magi-plugin-runtime",
     "--bins",
   ];
   if (profile === "release") args.push("--release");
@@ -112,6 +115,7 @@ export async function buildDaemon(profile) {
   await Promise.all([
     assertFile(daemonBinary(profile), "Rust daemon sidecar"),
     assertBridgeBinaries(bridgeBinariesRoot(profile), `Rust ${profile} bridge`),
+    assertPluginWorker(bridgeBinariesRoot(profile)),
   ]);
 }
 
@@ -131,6 +135,7 @@ export async function prepareReleaseMetadata() {
 
   await cp(join(repositoryRoot, "LICENSE"), join(resources, "licenses", "Magi-LICENSE"));
   await stageRuntimeLicenses(join(resources, "licenses"));
+  await stagePluginRuntimeLicenses(join(resources, "licenses"));
 
   const [productVersion, electronVersions, git, protocolVersion] = await Promise.all([
     readProductVersion(),
@@ -143,6 +148,7 @@ export async function prepareReleaseMetadata() {
 
   const files = [];
   await appendFileHash(files, daemonBinary("release"), daemonResourcePath());
+  await appendFileHash(files, join(bridgeBinariesRoot("release"), pluginWorkerFileName), `daemon/${pluginWorkerFileName}`);
   for (const binaryName of bridgeBinaryNames) {
     await appendFileHash(
       files,
@@ -164,6 +170,7 @@ export async function prepareReleaseMetadata() {
       "browser-automation-worker/index.cjs",
     ),
     daemon: await componentHash(daemonBinary("release"), daemonResourcePath()),
+    pluginWorker: await componentHash(join(bridgeBinariesRoot("release"), pluginWorkerFileName), `daemon/${pluginWorkerFileName}`),
     bridgeBinaries: Object.fromEntries(
       await Promise.all(bridgeBinaryNames.map(async (binaryName) => [
         binaryName,
@@ -233,8 +240,33 @@ export async function assertReleaseInputs() {
     assertFile(daemonBinary("release"), "Rust daemon sidecar"),
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
     assertBridgeBinaries(bridgeBinariesRoot("release"), "Rust release bridge"),
+    assertPluginWorker(bridgeBinariesRoot("release")),
   ]);
   await runBridgePreflight(bridgeBinariesRoot("release"), "Rust release bridge");
+  await runPluginWorkerPreflight(bridgeBinariesRoot("release"), await readProductVersion());
+}
+
+export async function stagePluginRuntimeLicenses(destination) {
+  const { stdout } = await execFileAsync("cargo", ["metadata", "--locked", "--format-version", "1"], {
+    cwd: repositoryRoot, maxBuffer: 64 * 1024 * 1024,
+  });
+  const metadata = JSON.parse(stdout);
+  const binding = metadata.packages.find((entry) => entry.name === "rquickjs");
+  if (!binding || binding.license !== "MIT") throw new Error("插件执行引擎的许可证合同发生变化");
+  // 三个 crate 同属 rquickjs 仓库；发布包只有顶层 crate 携带共同 MIT 许可正文。
+  await cp(join(dirname(binding.manifest_path), "LICENSE"), join(destination, "rquickjs-LICENSE"));
+  const notices = [];
+  for (const name of ["rquickjs", "rquickjs-core", "rquickjs-sys"]) {
+    const pkg = metadata.packages.find((entry) => entry.name === name);
+    if (!pkg || pkg.license !== binding.license || pkg.repository !== binding.repository
+        || pkg.version !== binding.version) throw new Error(`插件执行引擎的共同许可证合同发生变化: ${name}`);
+    const root = dirname(pkg.manifest_path);
+    notices.push({ name, version: pkg.version, license: pkg.license, repository: pkg.repository });
+    if (name === "rquickjs-sys") {
+      await cp(join(root, "quickjs", "LICENSE"), join(destination, "QuickJS-LICENSE"));
+    }
+  }
+  await writeFile(join(destination, "PLUGIN-RUNTIME-NOTICES.json"), `${JSON.stringify(notices, null, 2)}\n`, "utf8");
 }
 
 export async function run(command, args, cwd = repositoryRoot, options = {}) {

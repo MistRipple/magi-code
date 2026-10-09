@@ -560,7 +560,7 @@ import {
         browser,
       };
     }
-    if (activeTab.kind === 'webSession') {
+    if (activeTab.kind === 'webSession' || activeTab.kind === 'plugin') {
       // 防御分支：应用级视图不应出现在 perSession 容器里。
       return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
     }

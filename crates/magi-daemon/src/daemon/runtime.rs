@@ -49,6 +49,7 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
+use magi_plugin_system::PluginManager;
 use magi_process::ManagedProcessGroup;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
 use magi_settings_store::SettingsStore;
@@ -988,11 +989,15 @@ pub(crate) struct DaemonRuntime {
     runtime_maintenance: RuntimeMaintenance,
     managed_process_group: ManagedProcessGroup,
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
+    /// 插件安装、授权和生命周期的唯一 daemon 所有者；UI 只通过 API 投影访问。
+    plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
 }
 
 impl DaemonRuntime {
     pub(crate) fn restore(config: &DaemonConfig) -> Result<Self, DaemonError> {
         let state_repository = StateRepository::new(config.state_root.clone());
+        let plugin_manager = PluginManager::open(config.state_root.join("plugins"))
+            .map_err(|error| DaemonError::internal(format!("加载插件状态失败: {error}")))?;
 
         // 先加载工作区注册表（需要工作区路径来定位会话文件）
         let workspace_durable_state = state_repository.load_workspace_durable_state()?;
@@ -1077,6 +1082,7 @@ impl DaemonRuntime {
             runtime_maintenance,
             managed_process_group: ManagedProcessGroup::new(),
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
+            plugin_manager: Arc::new(std::sync::Mutex::new(plugin_manager)),
         })
     }
 
@@ -1853,6 +1859,7 @@ impl DaemonRuntime {
         .with_task_execution_registry(task_execution_registry)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
+        .with_plugin_manager(self.plugin_manager.clone())
         .with_runtime_persistence(runtime_persistence)
         .with_canonical_event_next_sequence_provider({
             let repository = self.state_repository.clone();

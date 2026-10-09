@@ -1381,6 +1381,8 @@ pub struct ApiState {
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
+    /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
+    pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     /// GPT Web 工具通道（OpenAI Tunnel 托管 + 槽位端点装配）。通道状态与槽位只驻进程内存。
     pub web_model: Arc<crate::web_model_channel::WebModelChannelRuntime>,
     /// 统一 Magi MCP 服务。GPT Web、OpenAI Tunnel 与其他 MCP 客户端都只能
@@ -2166,6 +2168,14 @@ impl ApiState {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
+            plugin_manager: Arc::new(Mutex::new(
+                magi_plugin_system::PluginManager::open(std::env::temp_dir().join(format!(
+                    "magi-api-plugin-state-{}-{}",
+                    std::process::id(),
+                    UtcMillis::now().0
+                )))
+                .expect("in-memory ApiState plugin manager should initialize"),
+            )),
             web_model: Arc::new(crate::web_model_channel::WebModelChannelRuntime::new()),
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             web_model_probe: Arc::new(RwLock::new(None)),
@@ -2480,6 +2490,14 @@ impl ApiState {
 
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
+        self
+    }
+
+    pub fn with_plugin_manager(
+        mut self,
+        manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
+    ) -> Self {
+        self.plugin_manager = manager;
         self
     }
 
