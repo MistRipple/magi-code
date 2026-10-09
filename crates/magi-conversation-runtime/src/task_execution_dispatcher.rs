@@ -32,6 +32,7 @@ use crate::{
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
+    tool_batch::{CoordinatorToolContext, execute_workflow_dispatch_task},
     tool_surface_state::{
         RefreshLiveMcpToolDefinitionsInput, refresh_live_mcp_tool_definitions_with_mode,
     },
@@ -2631,6 +2632,8 @@ impl LlmTaskDispatcher {
             checkpoint_version,
             stage: initial_stage,
             checkpoint,
+            pending_action,
+            last_result,
         } = &task.runtime_payload
         else {
             return (
@@ -2666,15 +2669,129 @@ impl LlmTaskDispatcher {
         let attempt_id = task.task_id.to_string();
         let mut stage = initial_stage.clone();
         let mut checkpoint_value = checkpoint.clone();
-        let mut model_result = None;
-        let mut tool_result = None;
+        let mut model_result = last_result.as_ref().and_then(|result| {
+            (result.get("kind").and_then(serde_json::Value::as_str) == Some("model")).then(|| {
+                result
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        });
+        let user_input = last_result
+            .as_ref()
+            .and_then(|result| {
+                (result.get("kind").and_then(serde_json::Value::as_str) == Some("user_input")).then(
+                    || {
+                        result
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    },
+                )
+            })
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| task.goal.clone());
+        let mut tool_result = last_result.as_ref().and_then(|result| {
+            matches!(
+                result.get("kind").and_then(serde_json::Value::as_str),
+                Some("tool") | Some("child_task")
+            )
+            .then(|| {
+                result
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        });
         let mut context_summary = serde_json::json!({});
+        if pending_action
+            .as_ref()
+            .and_then(|action| action.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dispatch_task")
+        {
+            let child_task_id = pending_action
+                .as_ref()
+                .and_then(|action| action.get("childTaskId"))
+                .and_then(serde_json::Value::as_str)
+                .map(TaskId::new);
+            let Some(child_task_id) = child_task_id else {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流派发检查点缺少 childTaskId".into(),
+                    },
+                    None,
+                );
+            };
+            let Some(child) = self
+                .pipeline
+                .execution_runtime
+                .task_store()
+                .get_task(&child_task_id)
+            else {
+                return (
+                    TaskOutcome::Failed {
+                        error: "工作流派发的子任务不存在".into(),
+                    },
+                    None,
+                );
+            };
+            if !matches!(
+                child.status,
+                magi_core::TaskStatus::Completed
+                    | magi_core::TaskStatus::Failed
+                    | magi_core::TaskStatus::Killed
+            ) {
+                return (TaskOutcome::Yielded, None);
+            }
+            let child_value = serde_json::json!({
+                "status": format!("{:?}", child.status).to_lowercase(),
+                "output_refs": child.output_refs,
+            });
+            tool_result = Some(child_value.clone());
+            if let Err(error) = self
+                .pipeline
+                .execution_runtime
+                .task_store()
+                .update_workflow_state(
+                    &task.task_id,
+                    &task.root_task_id,
+                    lease_id,
+                    workflow_id,
+                    &stage,
+                    *checkpoint_version,
+                    checkpoint_value.clone(),
+                    None,
+                    Some(serde_json::json!({"kind":"child_task","value":child_value})),
+                )
+            {
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("工作流子任务结果持久化失败：{error}"),
+                    },
+                    None,
+                );
+            }
+        }
+        if pending_action
+            .as_ref()
+            .and_then(|action| action.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("wait_user")
+        {
+            return (
+                TaskOutcome::Failed {
+                    error: "工作流仍在等待用户输入，必须通过恢复入口提交回答".into(),
+                },
+                None,
+            );
+        }
         for _ in 0..MAX_WORKFLOW_STEPS {
             let input = magi_plugin_system::workflow::WorkflowInput {
                 run_id: task.task_id.to_string(),
                 attempt_id: attempt_id.clone(),
                 stage: stage.clone(),
-                user_input: task.goal.clone(),
+                user_input: user_input.clone(),
                 model_result: model_result.take(),
                 tool_result: tool_result.take(),
                 context_summary: context_summary.clone(),
@@ -2701,32 +2818,31 @@ impl LlmTaskDispatcher {
             }
             let decision_checkpoint_version = decision.checkpoint_version;
             stage = decision.stage.clone();
-            if !matches!(
-                &decision.action,
-                magi_plugin_system::workflow::WorkflowAction::SaveStage { .. }
-            ) && let Err(error) = self
-                .pipeline
-                .execution_runtime
-                .task_store()
-                .update_workflow_checkpoint(
-                    &task.task_id,
-                    &task.root_task_id,
-                    lease_id,
-                    workflow_id,
-                    &stage,
-                    decision_checkpoint_version,
-                    checkpoint_value.clone(),
-                )
-            {
-                return (
-                    TaskOutcome::Failed {
-                        error: format!("工作流阶段持久化失败：{error}"),
-                    },
-                    None,
-                );
-            }
             match decision.action {
                 magi_plugin_system::workflow::WorkflowAction::Complete { summary, .. } => {
+                    if let Err(error) = self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .update_workflow_state(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            None,
+                            None,
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流终态持久化失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
                     let attempt = magi_core::TaskCompletionAttempt {
                         output_refs: vec![format!("workflow-stage:{stage}")],
                         final_response: Some(summary),
@@ -2749,7 +2865,7 @@ impl LlmTaskDispatcher {
                         .pipeline
                         .execution_runtime
                         .task_store()
-                        .update_workflow_checkpoint(
+                        .update_workflow_state(
                             &task.task_id,
                             &task.root_task_id,
                             lease_id,
@@ -2757,6 +2873,8 @@ impl LlmTaskDispatcher {
                             &stage,
                             decision_checkpoint_version,
                             checkpoint,
+                            None,
+                            None,
                         )
                     {
                         return (
@@ -2767,7 +2885,35 @@ impl LlmTaskDispatcher {
                         );
                     }
                 }
-                magi_plugin_system::workflow::WorkflowAction::ModelRequest { system, .. } => {
+                magi_plugin_system::workflow::WorkflowAction::ModelRequest {
+                    action_id,
+                    system,
+                    ..
+                } => {
+                    let pending = serde_json::json!({"kind":"model","actionId":action_id,"system":system.clone()});
+                    if let Err(error) = self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .update_workflow_state(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            Some(pending),
+                            None,
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流模型动作持久化失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
                     let client = match self.resolve_model_client_for_task(
                         self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
                         Some(task),
@@ -2796,12 +2942,43 @@ impl LlmTaskDispatcher {
                         }
                     };
                     model_result = Some(serde_json::Value::String(result));
+                    if let Err(error) = self.pipeline.execution_runtime.task_store().update_workflow_state(
+                        &task.task_id, &task.root_task_id, lease_id, workflow_id, &stage,
+                        decision_checkpoint_version, checkpoint_value.clone(), None,
+                        Some(serde_json::json!({"kind":"model","value":model_result.clone().unwrap_or(serde_json::Value::Null)})),
+                    ) {
+                        return (TaskOutcome::Failed { error: format!("工作流模型结果持久化失败：{error}") }, None);
+                    }
                 }
                 magi_plugin_system::workflow::WorkflowAction::ToolCall {
                     action_id,
                     tool,
                     input,
                 } => {
+                    let pending = serde_json::json!({"kind":"tool","actionId":action_id,"tool":tool.clone(),"input":input.clone()});
+                    if let Err(error) = self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .update_workflow_state(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            Some(pending),
+                            None,
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流工具动作持久化失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
                     let (result, status) = self.execute_workflow_tool(
                         task,
                         session_id,
@@ -2824,24 +3001,163 @@ impl LlmTaskDispatcher {
                             None,
                         );
                     }
+                    if let Err(error) = self.pipeline.execution_runtime.task_store().update_workflow_state(
+                        &task.task_id, &task.root_task_id, lease_id, workflow_id, &stage,
+                        decision_checkpoint_version, checkpoint_value.clone(), None,
+                        Some(serde_json::json!({"kind":"tool","value":tool_result.clone().unwrap_or(serde_json::Value::Null)})),
+                    ) {
+                        return (TaskOutcome::Failed { error: format!("工作流工具结果持久化失败：{error}") }, None);
+                    }
                 }
-                magi_plugin_system::workflow::WorkflowAction::WaitUser { question, .. } => {
-                    return (
-                        TaskOutcome::Failed {
-                            error: format!(
-                                "工作流请求用户输入但当前任务入口不支持挂起：{question}"
-                            ),
-                        },
-                        None,
-                    );
+                magi_plugin_system::workflow::WorkflowAction::WaitUser {
+                    action_id,
+                    question,
+                } => {
+                    match self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .requeue_workflow_for_user(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            action_id,
+                            question,
+                        ) {
+                        Ok(true) => return (TaskOutcome::Yielded, None),
+                        Ok(false) => {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: "工作流租约已失效，无法等待用户".into(),
+                                },
+                                None,
+                            );
+                        }
+                        Err(error) => {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: format!("工作流等待状态持久化失败：{error}"),
+                                },
+                                None,
+                            );
+                        }
+                    }
                 }
-                magi_plugin_system::workflow::WorkflowAction::DispatchTask { role, .. } => {
-                    return (
-                        TaskOutcome::Failed {
-                            error: format!("工作流派发子任务尚未接入统一任务接纳入口：{role}"),
+                magi_plugin_system::workflow::WorkflowAction::DispatchTask {
+                    action_id,
+                    role,
+                    instruction,
+                } => {
+                    let pending = serde_json::json!({
+                        "kind": "dispatch_task",
+                        "actionId": action_id,
+                        "role": role,
+                        "instruction": instruction,
+                    });
+                    if let Err(error) = self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .update_workflow_state(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            Some(pending),
+                            None,
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流派发动作持久化失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
+                    let plan_store =
+                        magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
+                    let (result, status) = execute_workflow_dispatch_task(
+                        CoordinatorToolContext {
+                            event_bus: self.event_bus.as_ref(),
+                            agent_role_registry: self.agent_role_registry.as_ref(),
+                            task_store: self.pipeline.execution_runtime.task_store(),
+                            session_store: self.session_store.as_ref(),
+                            execution_registry: &self.execution_registry,
+                            conversation_registry: self.conversation_registry.as_ref(),
+                            plan_store: &plan_store,
+                            task,
+                            session_id,
+                            workspace_id,
                         },
-                        None,
+                        &action_id,
+                        &role,
+                        &instruction,
                     );
+                    if !matches!(status, ExecutionResultStatus::Succeeded) {
+                        return (
+                            TaskOutcome::Failed {
+                                error: "工作流派发子任务未成功".into(),
+                            },
+                            None,
+                        );
+                    }
+                    let child_task_id = serde_json::from_str::<serde_json::Value>(&result)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("child_task_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                        .map(TaskId::new);
+                    let Some(child_task_id) = child_task_id else {
+                        return (
+                            TaskOutcome::Failed {
+                                error: "工作流派发回执缺少 child_task_id".into(),
+                            },
+                            None,
+                        );
+                    };
+                    match self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .requeue_workflow_for_child(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint_value.clone(),
+                            action_id,
+                            child_task_id,
+                        ) {
+                        Ok(true) => return (TaskOutcome::Yielded, None),
+                        Ok(false) => {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: "工作流租约已失效，无法等待子任务".into(),
+                                },
+                                None,
+                            );
+                        }
+                        Err(error) => {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: format!("工作流等待子任务失败：{error}"),
+                                },
+                                None,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -4351,6 +4667,7 @@ mod tests {
                 assert!(error.contains("模拟模型执行线程 panic"));
             }
             TaskOutcome::Completed { .. } => panic!("panic 不得被记录为成功"),
+            TaskOutcome::Yielded => panic!("panic 不得被记录为等待用户"),
         }
     }
 

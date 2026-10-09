@@ -199,6 +199,8 @@ fn task_runtime_payload_workflow_serialization_roundtrip() {
         checkpoint_version: 1,
         stage: "start".into(),
         checkpoint: serde_json::json!({"stage":"start"}),
+        pending_action: None,
+        last_result: None,
     };
     let encoded = serde_json::to_string(&payload).expect("工作流负载应可序列化");
     let decoded: TaskRuntimePayload = serde_json::from_str(&encoded).expect("工作流负载应可恢复");

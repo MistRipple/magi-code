@@ -524,6 +524,13 @@ pub enum TaskRuntimePayload {
         stage: String,
         #[serde(default)]
         checkpoint: serde_json::Value,
+        /// 已提交但尚未结算的动作身份。存在时恢复入口必须先处理该动作记录，
+        /// 不能把插件下一次决策误当成新的动作。
+        #[serde(default)]
+        pending_action: Option<serde_json::Value>,
+        /// 最近一次已结算的动作结果，供进程重启后的下一次决策读取。
+        #[serde(default)]
+        last_result: Option<serde_json::Value>,
     },
 }
 

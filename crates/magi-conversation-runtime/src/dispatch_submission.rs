@@ -705,6 +705,8 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
                 checkpoint_version: 1,
                 stage: "start".into(),
                 checkpoint: serde_json::Value::Null,
+                pending_action: None,
+                last_result: None,
             }
         } else if browser_annotation_refs.is_empty() && browser_node_selections.is_empty() {
             magi_core::TaskRuntimePayload::None

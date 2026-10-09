@@ -16,7 +16,7 @@ use std::{
 };
 
 use magi_bridge_client::{
-    ChatToolCall,
+    ChatToolCall, ChatToolFunction,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_browser_authority::BrowserCapabilitySnapshot;
@@ -441,17 +441,17 @@ pub(crate) fn run_tool_call_batches(
 /// S7-E：协调器工具（agent_spawn）的统一拦截入口。返回 (payload_json, status)，与
 /// `execute_task_tool_call` 的常规工具路径形状一致，便于上层把回执拼回 LLM 消息流。
 #[derive(Clone, Copy)]
-struct CoordinatorToolContext<'a> {
-    event_bus: &'a InMemoryEventBus,
-    agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
-    task_store: &'a TaskStore,
-    session_store: &'a SessionStore,
-    execution_registry: &'a TaskExecutionRegistry,
-    conversation_registry: &'a ConversationRegistry,
-    plan_store: &'a magi_plan::PlanStore,
-    task: &'a magi_core::Task,
-    session_id: &'a SessionId,
-    workspace_id: &'a Option<WorkspaceId>,
+pub(crate) struct CoordinatorToolContext<'a> {
+    pub(crate) event_bus: &'a InMemoryEventBus,
+    pub(crate) agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
+    pub(crate) task_store: &'a TaskStore,
+    pub(crate) session_store: &'a SessionStore,
+    pub(crate) execution_registry: &'a TaskExecutionRegistry,
+    pub(crate) conversation_registry: &'a ConversationRegistry,
+    pub(crate) plan_store: &'a magi_plan::PlanStore,
+    pub(crate) task: &'a magi_core::Task,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) workspace_id: &'a Option<WorkspaceId>,
 }
 
 /// `agent_spawn` 在创建前失败时仍要返回可被模型、前端和通知中心共同消费的诊断合同。
@@ -511,7 +511,7 @@ fn agent_spawn_failure_payload_for_child(
     .to_string()
 }
 
-fn execute_coordinator_tool(
+pub(crate) fn execute_coordinator_tool(
     context: CoordinatorToolContext<'_>,
     tool: magi_tool_runtime::BuiltinToolName,
     tool_call: &ChatToolCall,
@@ -618,6 +618,60 @@ fn execute_coordinator_tool(
         }
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
+}
+
+/// 工作流派发子任务复用 agent_spawn 的唯一接纳、权限、注册和回执链路。
+pub(crate) fn execute_workflow_dispatch_task(
+    context: CoordinatorToolContext<'_>,
+    action_id: &str,
+    role: &str,
+    instruction: &str,
+) -> (String, ExecutionResultStatus) {
+    let suffix = action_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let suffix = suffix.trim_matches('_');
+    let task_name = format!(
+        "workflow_{}",
+        suffix
+            .chars()
+            .take(39)
+            .collect::<String>()
+            .trim_matches('_')
+    );
+    let task_name = if task_name.len() > 48 || task_name == "workflow_" {
+        "workflow_child".to_string()
+    } else {
+        task_name
+    };
+    let tool_call = ChatToolCall {
+        id: format!("workflow-dispatch-{action_id}"),
+        kind: "function".to_string(),
+        function: ChatToolFunction {
+            name: BuiltinToolName::AgentSpawn.as_str().to_string(),
+            arguments: serde_json::json!({
+                "task_name": task_name,
+                "role": role,
+                "display_name": "Workflow child",
+                "goal": instruction,
+                "context_package": {
+                    "summary": instruction,
+                    "constraints": [],
+                    "expected_output": "返回可供工作流继续决策的最终结果",
+                    "references": []
+                }
+            })
+            .to_string(),
+        },
+    };
+    execute_coordinator_tool(context, BuiltinToolName::AgentSpawn, &tool_call)
 }
 
 fn execute_agent_spawn(

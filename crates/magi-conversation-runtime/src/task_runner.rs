@@ -115,6 +115,11 @@ pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, 
             }
             Ok(changed)
         }
+        TaskOutcome::Yielded => {
+            // Dispatcher 已在同一 TaskStore 事务中释放租约并写入 Pending/等待动作。
+            // 这里不再重复写状态，也不把等待当作失败或完成。
+            Ok(true)
+        }
     }
 }
 
@@ -245,7 +250,11 @@ impl TaskRunner {
             }
             let task_ids = self.collect_non_terminal_task_ids(root_task_id);
             return if task_ids.is_empty() {
-                RunCycleOutcome::Waiting
+                if self.store.has_pending_user_input(root_task_id) {
+                    RunCycleOutcome::UserInputRequired
+                } else {
+                    RunCycleOutcome::Waiting
+                }
             } else {
                 RunCycleOutcome::Unrunnable(task_ids)
             };
@@ -369,7 +378,11 @@ impl TaskRunner {
                 reason,
             }
         } else if unmatched.is_empty() {
-            RunCycleOutcome::Waiting
+            if self.store.has_pending_user_input(root_task_id) {
+                RunCycleOutcome::UserInputRequired
+            } else {
+                RunCycleOutcome::Waiting
+            }
         } else {
             RunCycleOutcome::Unrunnable(unmatched)
         }

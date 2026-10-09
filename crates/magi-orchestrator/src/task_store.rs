@@ -883,6 +883,33 @@ impl TaskStore {
         checkpoint_version_value: u32,
         checkpoint: serde_json::Value,
     ) -> DomainResult<bool> {
+        self.update_workflow_state(
+            task_id,
+            root_task_id,
+            lease_id,
+            workflow_id,
+            stage,
+            checkpoint_version_value,
+            checkpoint,
+            None,
+            None,
+        )
+    }
+
+    /// 原子持久化工作流阶段、检查点、待结算动作和最近结果。动作记录与租约
+    /// 同一事务提交，恢复时可以区分“尚未执行”与“已执行但尚未进入下一决策”。
+    pub fn update_workflow_state(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: &LeaseId,
+        workflow_id: &str,
+        stage: &str,
+        checkpoint_version_value: u32,
+        checkpoint: serde_json::Value,
+        pending_action: Option<serde_json::Value>,
+        last_result: Option<serde_json::Value>,
+    ) -> DomainResult<bool> {
         if checkpoint_version_value == 0 || workflow_id.trim().is_empty() || stage.trim().is_empty()
         {
             return Err(DomainError::InvalidState {
@@ -922,6 +949,8 @@ impl TaskStore {
             checkpoint_version: current_version,
             stage: current_stage,
             checkpoint: current_checkpoint,
+            pending_action: current_pending_action,
+            last_result: current_last_result,
         } = &mut task.runtime_payload
         else {
             return Err(DomainError::InvalidState {
@@ -936,12 +965,238 @@ impl TaskStore {
         *current_version = checkpoint_version_value;
         *current_stage = stage.to_string();
         *current_checkpoint = checkpoint;
+        *current_pending_action = pending_action;
+        *current_last_result = last_result;
         task.updated_at = UtcMillis::now();
         let root_id = task.root_task_id.clone();
         let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_id]);
         self.fire_checkpoint(&snapshot)?;
         *self.tasks.write().expect("tasks write lock poisoned") = tasks;
         *self.leases.write().expect("leases write lock poisoned") = leases;
+        Ok(true)
+    }
+
+    /// 将工作流交回用户：保存等待动作、释放执行租约并将任务置回 Pending。
+    pub fn requeue_workflow_for_user(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: &LeaseId,
+        workflow_id: &str,
+        stage: &str,
+        checkpoint_version: u32,
+        checkpoint: serde_json::Value,
+        action_id: String,
+        question: String,
+    ) -> DomainResult<bool> {
+        if action_id.trim().is_empty() {
+            return Err(DomainError::InvalidState {
+                message: "工作流等待动作缺少 action_id".into(),
+            });
+        }
+        self.requeue_workflow_action(
+            task_id,
+            root_task_id,
+            lease_id,
+            workflow_id,
+            stage,
+            checkpoint_version,
+            checkpoint,
+            serde_json::json!({"kind":"wait_user","actionId":action_id,"question":question}),
+        )
+    }
+
+    pub fn requeue_workflow_for_child(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: &LeaseId,
+        workflow_id: &str,
+        stage: &str,
+        checkpoint_version: u32,
+        checkpoint: serde_json::Value,
+        action_id: String,
+        child_task_id: TaskId,
+    ) -> DomainResult<bool> {
+        if action_id.trim().is_empty() {
+            return Err(DomainError::InvalidState {
+                message: "工作流派发动作缺少 action_id".into(),
+            });
+        }
+        self.requeue_workflow_action(
+            task_id,
+            root_task_id,
+            lease_id,
+            workflow_id,
+            stage,
+            checkpoint_version,
+            checkpoint,
+            serde_json::json!({
+                "kind": "dispatch_task",
+                "actionId": action_id,
+                "childTaskId": child_task_id,
+            }),
+        )
+    }
+
+    fn requeue_workflow_action(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: &LeaseId,
+        workflow_id: &str,
+        stage: &str,
+        checkpoint_version: u32,
+        checkpoint: serde_json::Value,
+        pending_value: serde_json::Value,
+    ) -> DomainResult<bool> {
+        if checkpoint_version == 0 || workflow_id.trim().is_empty() || stage.trim().is_empty() {
+            return Err(DomainError::InvalidState {
+                message: "工作流等待动作缺少有效身份或版本".into(),
+            });
+        }
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
+        let mut leases = self
+            .leases
+            .read()
+            .expect("leases read lock poisoned")
+            .clone();
+        Self::validate_task_root(&tasks, task_id, root_task_id)?;
+        let Some(lease) = leases.get(lease_id).cloned() else {
+            return Ok(false);
+        };
+        if lease.task_id != *task_id || lease.root_task_id != *root_task_id {
+            return Err(DomainError::InvalidState {
+                message: format!("租约 {} 不属于工作流任务 {}", lease_id, task_id),
+            });
+        }
+        if lease.lease_status != TaskLeaseState::Active {
+            return Ok(false);
+        }
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let TaskRuntimePayload::Workflow {
+            workflow_id: current_workflow_id,
+            checkpoint_version: current_version,
+            stage: current_stage,
+            checkpoint: current_checkpoint,
+            pending_action,
+            last_result,
+        } = &mut task.runtime_payload
+        else {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {} 没有工作流负载", task_id),
+            });
+        };
+        if current_workflow_id != workflow_id || checkpoint_version < *current_version {
+            return Err(DomainError::InvalidState {
+                message: "工作流检查点身份或版本回退".into(),
+            });
+        }
+        *current_version = checkpoint_version;
+        *current_stage = stage.to_string();
+        *current_checkpoint = checkpoint;
+        *pending_action = Some(pending_value);
+        *last_result = None;
+        task.status = TaskStatus::Pending;
+        task.updated_at = UtcMillis::now();
+        leases
+            .get_mut(lease_id)
+            .expect("lease should still exist")
+            .lease_status = TaskLeaseState::Completed;
+        let cloned_task = task.clone();
+        let root_id = cloned_task.root_task_id.clone();
+        let mission_index = self
+            .mission_index
+            .read()
+            .expect("mission_index read lock poisoned")
+            .clone();
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_id]);
+        self.fire_checkpoint(&snapshot)?;
+        self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
+        self.emit_status_change(
+            task_id,
+            TaskStatus::Running,
+            TaskStatus::Pending,
+            cloned_task,
+        );
+        Ok(true)
+    }
+
+    /// 写入用户回答并解除 wait_user 阻塞；任务仍由原 Runner 入口重新派发。
+    pub fn resume_workflow_with_user_input(
+        &self,
+        task_id: &TaskId,
+        operation_id: &str,
+        input: String,
+    ) -> DomainResult<bool> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if task.status != TaskStatus::Pending {
+            return Err(DomainError::InvalidState {
+                message: "只有等待用户的 Pending 工作流可以回答".into(),
+            });
+        }
+        let TaskRuntimePayload::Workflow {
+            pending_action,
+            last_result,
+            ..
+        } = &mut task.runtime_payload
+        else {
+            return Err(DomainError::InvalidState {
+                message: "任务不是工作流".into(),
+            });
+        };
+        let pending = pending_action.as_ref().ok_or(DomainError::InvalidState {
+            message: "工作流当前没有等待用户动作".into(),
+        })?;
+        if pending.get("kind").and_then(serde_json::Value::as_str) != Some("wait_user") {
+            return Err(DomainError::InvalidState {
+                message: "工作流当前没有等待用户动作".into(),
+            });
+        }
+        if pending.get("actionId").and_then(serde_json::Value::as_str) != Some(operation_id) {
+            return Err(DomainError::InvalidState {
+                message: "工作流等待动作已变更，回答 operationId 不匹配".into(),
+            });
+        }
+        *pending_action = None;
+        *last_result = Some(serde_json::json!({"kind":"user_input","value":input}));
+        task.updated_at = UtcMillis::now();
+        let cloned_task = task.clone();
+        let root_id = cloned_task.root_task_id.clone();
+        let leases = self
+            .leases
+            .read()
+            .expect("leases read lock poisoned")
+            .clone();
+        let mission_index = self
+            .mission_index
+            .read()
+            .expect("mission_index read lock poisoned")
+            .clone();
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_id]);
+        self.fire_checkpoint(&snapshot)?;
+        self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
+        self.emit_status_change(
+            task_id,
+            TaskStatus::Pending,
+            TaskStatus::Pending,
+            cloned_task,
+        );
         Ok(true)
     }
 
@@ -963,6 +1218,25 @@ impl TaskStore {
     pub fn collect_subtree_ids(&self, root_id: &TaskId) -> Vec<TaskId> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         collect_subtree_ids_from_tasks(&tasks, root_id)
+    }
+
+    /// 返回任务树是否存在等待用户回答的工作流节点。
+    pub fn has_pending_user_input(&self, root_id: &TaskId) -> bool {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        collect_subtree_ids_from_tasks(&tasks, root_id)
+            .into_iter()
+            .filter_map(|task_id| tasks.get(&task_id))
+            .any(|task| {
+                task.status == TaskStatus::Pending
+                    && matches!(
+                        &task.runtime_payload,
+                        TaskRuntimePayload::Workflow {
+                            pending_action: Some(action),
+                            ..
+                        } if action.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("wait_user")
+                    )
+            })
     }
 
     /// 获取某个父任务的所有子任务。
@@ -1023,6 +1297,13 @@ impl TaskStore {
             .into_iter()
             .filter(|task| {
                 task.status == TaskStatus::Pending
+                    && !matches!(
+                        &task.runtime_payload,
+                        TaskRuntimePayload::Workflow {
+                            pending_action: Some(action),
+                            ..
+                        } if action.get("kind").and_then(serde_json::Value::as_str) == Some("wait_user")
+                    )
                     && task.dependency_ids.iter().all(|dep_id| {
                         tasks
                             .get(dep_id)
@@ -1044,7 +1325,18 @@ impl TaskStore {
                 return false;
             };
             if parent.status != TaskStatus::Running {
-                return false;
+                let workflow_waiting_for_child = parent.status == TaskStatus::Pending
+                    && matches!(
+                        &parent.runtime_payload,
+                        TaskRuntimePayload::Workflow {
+                            pending_action: Some(action),
+                            ..
+                        } if action.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("dispatch_task")
+                    );
+                if !workflow_waiting_for_child {
+                    return false;
+                }
             }
             current = parent.parent_task_id.as_ref();
         }
@@ -2809,6 +3101,8 @@ mod tests {
             checkpoint_version: 1,
             stage: "start".into(),
             checkpoint: serde_json::json!({"step": 0}),
+            pending_action: None,
+            last_result: None,
         };
         store.insert_task(task).unwrap();
         let lease = store

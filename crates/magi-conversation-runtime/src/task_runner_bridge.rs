@@ -28,6 +28,8 @@ pub enum RunCycleOutcome {
     },
     /// 其他 Runner 抢先取得租约，本轮未派发任务，等待下一轮重试。
     Waiting,
+    /// 工作流明确请求用户输入；Runner 退出等待，由恢复入口重新启动。
+    UserInputRequired,
     /// 当前任务图仍有非终态任务，但这些任务在现有结构下无法进入可运行状态。
     Unrunnable(Vec<TaskId>),
     /// An unexpected error occurred during the cycle.
@@ -82,6 +84,8 @@ pub struct TaskResult {
 pub enum TaskOutcome {
     /// 执行器提交完成尝试；只有统一完成门验证合同后才会进入 Completed。
     Completed { attempt: TaskCompletionAttempt },
+    /// 当前动作已持久化但任务回到 Pending，等待外部输入后由同一执行链继续。
+    Yielded,
     /// Execution failed with the given error description.
     Failed { error: String },
 }
@@ -503,6 +507,7 @@ mod tests {
                 assert_eq!(attempt.output_refs, vec!["current result".to_string()]);
             }
             TaskOutcome::Failed { error } => panic!("不应消费旧失败结果: {error}"),
+            TaskOutcome::Yielded => panic!("等待用户结果不应替换当前终态结果"),
         }
     }
 
