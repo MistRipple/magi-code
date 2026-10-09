@@ -11,6 +11,14 @@ export async function afterPack(context) {
   const manifest = JSON.parse(
     await readFile(join(resources, "browser-capability-manifest.json"), "utf8"),
   );
+  const iconResources = ["magi-app.png", "magi-tray.png"];
+  if (context.electronPlatformName === "darwin") {
+    iconResources.push("tray/magiTemplate.png", "tray/magiTemplate@2x.png");
+  }
+  for (const icon of iconResources) {
+    const bytes = await readFile(join(resources, icon));
+    if (bytes.length === 0) throw new Error("发行包图标为空: " + icon);
+  }
   const asarPath = join(resources, "app.asar");
   const packageMetadata = JSON.parse(extractFile(asarPath, "package.json").toString("utf8"));
   if (packageMetadata.version !== manifest.productVersion) {

@@ -1198,11 +1198,9 @@ function createSystemTray(iconPath: string): void {
     console.error("Magi 状态栏图标加载失败", { iconPath });
     return;
   }
-  const trayImage =
-    process.platform === "darwin"
-      ? image.resize({ width: 18, height: 18, quality: "best" })
-      : image;
-  tray = new Tray(trayImage);
+  // 保留 1x / 2x 表示，由 macOS 按状态栏外观渲染单色模板。
+  if (process.platform === "darwin") image.setTemplateImage(true);
+  tray = new Tray(image);
   tray.setToolTip("Magi");
   tray.on("click", () => showMainWindow());
   tray.setContextMenu(
@@ -1539,7 +1537,9 @@ function resolveRuntimePaths(): {
       webDist: join(process.resourcesPath, "web", "dist"),
       webRoot: join(process.resourcesPath, "web"),
       appIcon: join(process.resourcesPath, "magi-app.png"),
-      trayIcon: join(process.resourcesPath, "magi-tray.png"),
+      trayIcon: process.platform === "darwin"
+        ? join(process.resourcesPath, "tray", "magiTemplate.png")
+        : join(process.resourcesPath, "magi-tray.png"),
     };
   }
   const root = resolve(moduleDirectory, "../../../..");
@@ -1555,7 +1555,9 @@ function resolveRuntimePaths(): {
     webDist: join(root, "web", "dist"),
     webRoot: join(root, "web"),
     appIcon: join(root, "apps", "desktop", "icons", "512x512.png"),
-    trayIcon: join(root, "apps", "desktop", "icons", "32x32.png"),
+    trayIcon: process.platform === "darwin"
+      ? join(root, "apps", "desktop", "resources", "tray", "magiTemplate.png")
+      : join(root, "apps", "desktop", "icons", "32x32.png"),
   };
 }
 
