@@ -104,7 +104,8 @@ pub struct AgentRole {
 }
 
 impl AgentRole {
-    /// 角色在 constraints 中声明 `read-only` 时，运行时以只读访问模式派发该角色。
+    /// 角色在 constraints 中声明 `read-only`：表达该角色的职责只读（提示词里标注「只读」，
+    /// 角色自身的提示词约束它不改文件）。它不改变子代理的访问模式——子代理始终继承主对话的访问模式。
     pub fn is_read_only(&self) -> bool {
         self.constraints
             .iter()

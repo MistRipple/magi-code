@@ -27,11 +27,11 @@ use crate::tool_call_validation::{
 };
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    DEFAULT_TOOL_RETRY_LIMIT, bound_model_visible_tool_history, infer_tool_call_status,
-    model_round_limit_failure, model_visible_tool_history_budget_bytes, model_visible_tool_result,
-    non_retryable_tool_failure, summarize_tool_result, tool_interrupted_before_execution_payload,
-    tool_payload_is_awaiting_approval, tool_result_is_awaiting_approval,
-    turn_item_status_for_tool_result,
+    DEFAULT_TOOL_RETRY_LIMIT, MAX_POLICY_REJECTIONS_PER_TASK, bound_model_visible_tool_history,
+    infer_tool_call_status, model_round_limit_failure, model_visible_tool_history_budget_bytes,
+    model_visible_tool_result, non_retryable_tool_failure, summarize_tool_result,
+    tool_interrupted_before_execution_payload, tool_payload_is_awaiting_approval,
+    tool_result_is_awaiting_approval, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, RefreshLiveMcpToolDefinitionsInput, activate_skill_tool_definitions,
@@ -1183,6 +1183,8 @@ fn run_conversation_loop_inner(
         Vec::new()
     };
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
+    // 本任务累计被策略拒绝（相同调用不可重试）的次数；达到上限才把拒绝升级为任务失败。
+    let mut policy_rejection_count = 0usize;
     let mut tool_execution_ledger = if recovery_history {
         ToolExecutionLedger::from_thread_history(
             &task.goal,
@@ -2833,7 +2835,12 @@ fn run_conversation_loop_inner(
             if let Some(failure) =
                 non_retryable_tool_failure(&canonical_tool_name, &result, tool_status)
             {
-                terminal_tool_failure.get_or_insert(failure);
+                // 单次策略拒绝只是模型这一步选错了工具或路径：结果已交回模型，让它换个方式继续；
+                // 同一任务里反复撞策略才终止，避免空转。
+                policy_rejection_count += 1;
+                if policy_rejection_count >= MAX_POLICY_REJECTIONS_PER_TASK {
+                    terminal_tool_failure.get_or_insert(failure);
+                }
             }
             if let Some(skill_id) =
                 activated_skill_id_from_tool_result(&tool_call.function.name, &result, tool_status)

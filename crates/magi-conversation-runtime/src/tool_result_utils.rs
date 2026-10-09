@@ -49,11 +49,16 @@ pub struct DeterministicToolFailure {
     pub detail: String,
 }
 
-/// 判断工具结果是否明确声明“相同调用不可重试”，并把它提升为当前任务的终止信号。
+/// 单个任务允许累计被策略拒绝（相同调用不可重试）的次数。一次拒绝只是模型这一步选错了
+/// 工具或路径，结果会交回模型让它换个方式；累计达到上限才把拒绝升级为任务失败。
+pub(crate) const MAX_POLICY_REJECTIONS_PER_TASK: usize = 3;
+
+/// 判断工具结果是否明确声明“相同调用不可重试”，并给出对应的确定性失败描述。
 ///
-/// 权限/策略拒绝不是普通的模型纠错失败。若只把拒绝结果继续交回模型，模型可能
-/// 改换工具名或参数反复尝试同一个不可能成功的副作用，导致一轮任务长时间空转。
-/// 只有结果携带明确的 `retryable_with_same_arguments=false` 契约时才在这里终止，
+/// 权限/策略拒绝不是普通的模型纠错失败。模型可能改换工具名或参数反复尝试同一个
+/// 不可能成功的副作用，导致一轮任务长时间空转，所以调用方在同一任务里累计达到
+/// `MAX_POLICY_REJECTIONS_PER_TASK` 次后才用它终止任务。
+/// 只有结果携带明确的 `retryable_with_same_arguments=false` 契约时才返回，
 /// 不影响需要用户授权的 NeedsApproval 流程和可恢复的普通工具失败。
 pub fn non_retryable_tool_failure(
     tool_name: &str,
