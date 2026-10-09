@@ -320,12 +320,15 @@ impl PluginManager {
     /// 应用级实例与工作区准入分别记录；应用级激活不授予其他工作区权限。
     pub fn is_active_for_scope(&self, id: &str, scope: &str) -> Result<bool, PluginError> {
         validate_scope_key(scope)?;
+        let package = self.package(id)?;
         let installed = self
             .state
             .plugins
             .get(id)
             .ok_or_else(|| conflict("插件未安装"))?;
-        Ok(installed.active_scopes.contains(scope) && installed.enabled_scopes.contains(scope))
+        Ok(installed.active_scopes.contains(scope)
+            && installed.enabled_scopes.contains(scope)
+            && permissions_granted_for_scope(package.manifest(), installed, scope))
     }
 
     pub fn manifests_for_scope(&self, scope: &str) -> Result<Vec<PluginManifest>, PluginError> {
