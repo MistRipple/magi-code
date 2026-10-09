@@ -61,6 +61,9 @@ pub struct WorkflowInput {
     pub model_result: Option<Value>,
     pub tool_result: Option<Value>,
     pub context_summary: Value,
+    /// 插件工作流的固定配置和上次持久化检查点。
+    #[serde(default)]
+    pub config: Value,
 }
 
 pub trait WorkflowCore: Send + Sync {

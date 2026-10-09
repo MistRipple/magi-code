@@ -47,8 +47,9 @@ use magi_context_runtime::{
     KnowledgeContextSelection, RecentTurnSource,
 };
 use magi_core::{
-    AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
-    WorkerId, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
+    AccessProfile, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, SessionId, TaskId,
+    TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId, estimate_text_tokens,
+    public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -60,7 +61,9 @@ use magi_orchestrator::{
 use magi_plugin_system::RunCancellation;
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
-use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
+use magi_tool_runtime::{
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+};
 use magi_usage_authority::UsagePhase;
 use magi_workspace::WorkspaceStore;
 use std::{
@@ -2613,8 +2616,11 @@ impl LlmTaskDispatcher {
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let TaskLlmInvocationInput {
             task,
+            lease_id,
             session_id,
             workspace_id,
+            execution_root,
+            worker_id,
             execution_role_id,
             thread_id,
             execution_settings_snapshot,
@@ -2623,6 +2629,7 @@ impl LlmTaskDispatcher {
         let magi_core::TaskRuntimePayload::Workflow {
             workflow_id,
             checkpoint_version,
+            stage: initial_stage,
             checkpoint,
         } = &task.runtime_payload
         else {
@@ -2655,104 +2662,250 @@ impl LlmTaskDispatcher {
                 );
             }
         };
+        const MAX_WORKFLOW_STEPS: usize = 32;
         let attempt_id = task.task_id.to_string();
-        let decision = WorkflowCoreDecisionRunner::run(
-            core,
-            magi_plugin_system::workflow::WorkflowInput {
+        let mut stage = initial_stage.clone();
+        let mut checkpoint_value = checkpoint.clone();
+        let mut model_result = None;
+        let mut tool_result = None;
+        let mut context_summary = serde_json::json!({});
+        for _ in 0..MAX_WORKFLOW_STEPS {
+            let input = magi_plugin_system::workflow::WorkflowInput {
                 run_id: task.task_id.to_string(),
                 attempt_id: attempt_id.clone(),
-                stage: "start".into(),
+                stage: stage.clone(),
                 user_input: task.goal.clone(),
-                model_result: None,
-                tool_result: None,
-                context_summary: serde_json::json!({}),
-            },
-        );
-        let decision = match decision {
-            Ok(decision) => decision,
-            Err(error) => {
+                model_result: model_result.take(),
+                tool_result: tool_result.take(),
+                context_summary: context_summary.clone(),
+                config: checkpoint_value.clone(),
+            };
+            let decision = match WorkflowCoreDecisionRunner::run(core.clone(), input.clone()) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return (
+                        TaskOutcome::Failed {
+                            error: format!("工作流决策失败：{error}"),
+                        },
+                        None,
+                    );
+                }
+            };
+            if let Err(error) = decision.validate(&task.task_id.to_string(), &input) {
                 return (
                     TaskOutcome::Failed {
-                        error: format!("工作流决策失败：{error}"),
+                        error: format!("工作流决策不符合合同：{error}"),
                     },
                     None,
                 );
             }
-        };
-        let response = match decision.action {
-            magi_plugin_system::workflow::WorkflowAction::Complete { summary, .. } => summary,
-            magi_plugin_system::workflow::WorkflowAction::WaitUser { .. } => {
+            let decision_checkpoint_version = decision.checkpoint_version;
+            stage = decision.stage.clone();
+            if !matches!(
+                &decision.action,
+                magi_plugin_system::workflow::WorkflowAction::SaveStage { .. }
+            ) && let Err(error) = self
+                .pipeline
+                .execution_runtime
+                .task_store()
+                .update_workflow_checkpoint(
+                    &task.task_id,
+                    &task.root_task_id,
+                    lease_id,
+                    workflow_id,
+                    &stage,
+                    decision_checkpoint_version,
+                    checkpoint_value.clone(),
+                )
+            {
                 return (
                     TaskOutcome::Failed {
-                        error: "工作流等待用户动作尚未接入宿主等待状态".into(),
+                        error: format!("工作流阶段持久化失败：{error}"),
                     },
                     None,
                 );
             }
-            magi_plugin_system::workflow::WorkflowAction::SaveStage { .. } => {
-                return (
-                    TaskOutcome::Failed {
-                        error: "工作流检查点提交尚未接入 TaskStore".into(),
-                    },
-                    None,
-                );
-            }
-            magi_plugin_system::workflow::WorkflowAction::ModelRequest { system, .. } => {
-                let client = match self.resolve_model_client_for_task(
-                    self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
-                    Some(task),
-                    execution_role_id,
-                    Some(session_id),
-                ) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        return (TaskOutcome::Failed { error }, None);
-                    }
-                };
-                let request = ModelInvocationRequest {
-                    provider: "workflow".into(),
-                    prompt: format!("{system}\n\n{}", task.goal),
-                    messages: None,
-                    tools: None,
-                    tool_choice: None,
-                };
-                match client.invoke_with_cancellation(request, &|| false) {
-                    Ok(response) => response.content.unwrap_or_default(),
-                    Err(error) => {
+            match decision.action {
+                magi_plugin_system::workflow::WorkflowAction::Complete { summary, .. } => {
+                    let attempt = magi_core::TaskCompletionAttempt {
+                        output_refs: vec![format!("workflow-stage:{stage}")],
+                        final_response: Some(summary),
+                        evidence: Vec::new(),
+                    };
+                    if let Err(error) = task.completion_contract.validate(&attempt) {
                         return (
                             TaskOutcome::Failed {
-                                error: format!("工作流模型请求失败：{error}"),
+                                error: format!("工作流完成合同校验失败：{error}"),
+                            },
+                            None,
+                        );
+                    }
+                    let _ = thread_id;
+                    return (TaskOutcome::Completed { attempt }, None);
+                }
+                magi_plugin_system::workflow::WorkflowAction::SaveStage { checkpoint, .. } => {
+                    checkpoint_value = checkpoint.clone();
+                    if let Err(error) = self
+                        .pipeline
+                        .execution_runtime
+                        .task_store()
+                        .update_workflow_checkpoint(
+                            &task.task_id,
+                            &task.root_task_id,
+                            lease_id,
+                            workflow_id,
+                            &stage,
+                            decision_checkpoint_version,
+                            checkpoint,
+                        )
+                    {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流检查点持久化失败：{error}"),
                             },
                             None,
                         );
                     }
                 }
+                magi_plugin_system::workflow::WorkflowAction::ModelRequest { system, .. } => {
+                    let client = match self.resolve_model_client_for_task(
+                        self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
+                        Some(task),
+                        execution_role_id,
+                        Some(session_id),
+                    ) {
+                        Ok(client) => client,
+                        Err(error) => return (TaskOutcome::Failed { error }, None),
+                    };
+                    let request = ModelInvocationRequest {
+                        provider: "workflow".into(),
+                        prompt: format!("{system}\n\n{}", task.goal),
+                        messages: None,
+                        tools: None,
+                        tool_choice: None,
+                    };
+                    let result = match client.invoke_with_cancellation(request, &|| false) {
+                        Ok(response) => response.content.unwrap_or_default(),
+                        Err(error) => {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: format!("工作流模型请求失败：{error}"),
+                                },
+                                None,
+                            );
+                        }
+                    };
+                    model_result = Some(serde_json::Value::String(result));
+                }
+                magi_plugin_system::workflow::WorkflowAction::ToolCall {
+                    action_id,
+                    tool,
+                    input,
+                } => {
+                    let (result, status) = self.execute_workflow_tool(
+                        task,
+                        session_id,
+                        workspace_id,
+                        execution_root,
+                        worker_id,
+                        &action_id,
+                        &tool,
+                        input,
+                    );
+                    context_summary =
+                        serde_json::json!({"last_tool": tool, "status": status.wire_label()});
+                    tool_result =
+                        Some(serde_json::json!({"status": status.wire_label(), "output": result}));
+                    if !matches!(status, ExecutionResultStatus::Succeeded) {
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("工作流工具调用未成功：{result}"),
+                            },
+                            None,
+                        );
+                    }
+                }
+                magi_plugin_system::workflow::WorkflowAction::WaitUser { question, .. } => {
+                    return (
+                        TaskOutcome::Failed {
+                            error: format!(
+                                "工作流请求用户输入但当前任务入口不支持挂起：{question}"
+                            ),
+                        },
+                        None,
+                    );
+                }
+                magi_plugin_system::workflow::WorkflowAction::DispatchTask { role, .. } => {
+                    return (
+                        TaskOutcome::Failed {
+                            error: format!("工作流派发子任务尚未接入统一任务接纳入口：{role}"),
+                        },
+                        None,
+                    );
+                }
             }
-            magi_plugin_system::workflow::WorkflowAction::ToolCall { tool, .. }
-            | magi_plugin_system::workflow::WorkflowAction::DispatchTask { role: tool, .. } => {
-                return (
-                    TaskOutcome::Failed {
-                        error: format!("工作流动作需要宿主执行器：{tool}"),
-                    },
-                    None,
-                );
-            }
-        };
-        let attempt = magi_core::TaskCompletionAttempt {
-            output_refs: vec![format!("workflow-stage:{}", decision.stage)],
-            final_response: Some(response),
-            evidence: Vec::new(),
-        };
-        if let Err(error) = task.completion_contract.validate(&attempt) {
-            return (
-                TaskOutcome::Failed {
-                    error: format!("工作流完成合同校验失败：{error}"),
-                },
-                None,
-            );
         }
-        let _ = thread_id;
-        (TaskOutcome::Completed { attempt }, None)
+        (
+            TaskOutcome::Failed {
+                error: format!("工作流超过最大步骤数 {MAX_WORKFLOW_STEPS}"),
+            },
+            None,
+        )
+    }
+
+    fn execute_workflow_tool(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        execution_root: Option<&PathBuf>,
+        worker_id: Option<&WorkerId>,
+        action_id: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> (String, ExecutionResultStatus) {
+        let Some(registry) = self.tool_registry.as_ref() else {
+            return (
+                "工作流工具注册表未装配".into(),
+                ExecutionResultStatus::Failed,
+            );
+        };
+        let arguments = input.to_string();
+        let access_profile = task
+            .policy_snapshot
+            .as_ref()
+            .map(magi_core::TaskPolicy::effective_access_profile)
+            .unwrap_or_default();
+        let context = ToolExecutionContext {
+            worker_id: worker_id.cloned(),
+            task_id: Some(task.task_id.clone()),
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            access_profile,
+            working_directory: execution_root.cloned(),
+            browser_capability_snapshot: registry.browser_capability_snapshot(),
+            browser_execution_id: Some(format!("workflow:{}", task.task_id)),
+        };
+        if let Some(result) =
+            registry.execute_plugin_tool(tool, &arguments, &context, access_profile)
+        {
+            return result;
+        }
+        if let Some(result) = registry.execute_external_mcp_tool(tool, &arguments, access_profile) {
+            return result;
+        }
+        let input = ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new(format!("workflow-tool-{}-{action_id}", task.task_id)),
+            tool,
+            arguments,
+        );
+        let policy = task
+            .policy_snapshot
+            .as_ref()
+            .map(ToolExecutionPolicy::from_task_policy)
+            .unwrap_or_default();
+        let output = registry.execute_with_policy(input, context, &policy);
+        (output.payload, output.status)
     }
 
     /// Synchronous inner dispatch logic; invoked either directly or inside

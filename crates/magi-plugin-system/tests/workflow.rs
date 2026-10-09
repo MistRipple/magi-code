@@ -10,6 +10,7 @@ fn input() -> WorkflowInput {
         model_result: None,
         tool_result: None,
         context_summary: json!({"used": 12}),
+        config: json!({}),
     }
 }
 

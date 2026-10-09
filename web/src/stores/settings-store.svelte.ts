@@ -864,6 +864,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     };
 
     for (const engine of registryEngines) {
+      if (engine.source === 'plugin') continue;
       append(engine.id);
     }
     for (const workerId of Object.keys(workerConfigs)) {
@@ -880,6 +881,10 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   const workerModelTabs = $derived.by(() => {
     return deriveWorkerModelTabs();
   });
+
+  const pluginEngines = $derived.by(() =>
+    registryEngines.filter((engine) => engine.source === 'plugin'),
+  );
 
   // 确保 workerConfigs 对每个 worker 都有初始值（副作用必须在 $effect 中执行）
   $effect(() => {
@@ -4046,6 +4051,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     },
     get registryEngines() {
       return registryEngines;
+    },
+    get pluginEngines() {
+      return pluginEngines;
     },
     get registryAgents() {
       return registryAgents;

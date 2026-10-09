@@ -964,6 +964,8 @@ pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
                 "displayName": engine.title,
                 "description": engine.description,
                 "source": "plugin",
+                "pluginId": manifest.id,
+                "pluginContributionId": engine.id,
                 "llm": {
                     "apiProtocol": "plugin",
                     "model": format!("plugin/{}/{}", manifest.id, engine.id),
@@ -971,6 +973,24 @@ pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
             }));
         }
     }
+    normalized
+}
+
+/// 返回模型设置真正拥有的引擎。插件引擎只是插件清单的运行时投影，不能被
+/// 普通模型设置的写入路径带回 `engines` 持久化段，避免卸载后留下影子配置。
+fn load_user_registry_engines(state: &ApiState) -> Vec<Value> {
+    let raw_engines = state.settings_store.get_section("engines");
+    let mut normalized = normalize_engine_entries(&raw_engines);
+    let worker_configs =
+        normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
+    align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
+    normalized.retain(|entry| {
+        entry.get("source").and_then(Value::as_str) != Some("plugin")
+            && entry
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !id.starts_with("plugin/") && !id.starts_with("plugin:"))
+    });
     normalized
 }
 
@@ -2337,7 +2357,7 @@ async fn upsert_engine(
             "插件会话引擎由插件清单管理，不能通过模型设置改写".to_string(),
         ));
     }
-    let mut engines = load_registry_engines(&state);
+    let mut engines = load_user_registry_engines(&state);
     if let Some(position) = engines.iter().position(|entry| {
         entry
             .get("id")
@@ -2352,7 +2372,7 @@ async fn upsert_engine(
         .settings_store
         .set_section("engines", Value::Array(engines.clone()))
         .map_err(settings_persistence_error)?;
-    Ok(Json(json!({ "engines": engines })))
+    Ok(Json(json!({ "engines": load_registry_engines(&state) })))
 }
 
 async fn remove_engine(
@@ -2368,7 +2388,7 @@ async fn remove_engine(
             "插件会话引擎由插件清单管理，不能通过模型设置移除".to_string(),
         ));
     }
-    let mut engines = load_registry_engines(&state);
+    let mut engines = load_user_registry_engines(&state);
     engines.retain(|entry| {
         entry
             .get("id")
@@ -2379,7 +2399,7 @@ async fn remove_engine(
         .settings_store
         .set_section("engines", Value::Array(engines.clone()))
         .map_err(settings_persistence_error)?;
-    Ok(Json(json!({ "engines": engines })))
+    Ok(Json(json!({ "engines": load_registry_engines(&state) })))
 }
 
 async fn list_agents(

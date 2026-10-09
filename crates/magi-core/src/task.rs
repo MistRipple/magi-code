@@ -520,9 +520,15 @@ pub enum TaskRuntimePayload {
     Workflow {
         workflow_id: String,
         checkpoint_version: u32,
+        #[serde(default = "default_workflow_stage")]
+        stage: String,
         #[serde(default)]
         checkpoint: serde_json::Value,
     },
+}
+
+fn default_workflow_stage() -> String {
+    "start".to_string()
 }
 
 /// 任务完成合同。

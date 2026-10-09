@@ -20,6 +20,7 @@
     workerConfigs = $bindable(),
     modelConfigBaselines,
     workerModelTabs,
+    pluginEngines,
     modelStatuses,
     saveStatus,
     testStatus,
@@ -56,6 +57,7 @@
     workerConfigs: Record<string, any>;
     modelConfigBaselines: Record<string, any>;
     workerModelTabs: string[];
+    pluginEngines: Array<{ id: string; displayName: string; description?: string; pluginId?: string }>;
     modelStatuses: Record<string, { status?: string }>;
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
@@ -661,6 +663,28 @@
       </div>
     </div>
 
+    {#if pluginEngines.length > 0}
+      <div class="settings-section plugin-engine-section">
+        <div class="settings-section-header">
+          <div class="settings-section-title">插件会话引擎</div>
+          <div class="settings-section-subtitle">由已激活插件声明并托管，配置与权限请在对应插件设置中管理。</div>
+        </div>
+        <div class="plugin-engine-list">
+          {#each pluginEngines as engine (engine.id)}
+            <div class="plugin-engine-row">
+              <div class="engine-avatar engine-avatar--primary" aria-hidden="true"><Icon name="plug" size={15} /></div>
+              <div class="engine-identity">
+                <span class="engine-name">{engine.displayName || engine.id}</span>
+                <span class="engine-model-tag">{engine.id}</span>
+                {#if engine.description}<span class="plugin-engine-description">{engine.description}</span>{/if}
+              </div>
+              <span class="plugin-engine-readonly">只读注册</span>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
     <div class="settings-section web-model-pointer">
       <div class="settings-section-header">
         <div class="settings-section-title">{i18n.t('settings.model.webModelTitle')}</div>
@@ -677,6 +701,39 @@
 <style>
   .web-model-pointer {
     margin-top: var(--space-4);
+  }
+
+  .plugin-engine-section {
+    margin-top: var(--space-4);
+  }
+  .plugin-engine-list {
+    display: flex;
+    flex-direction: column;
+    background: var(--ind-bg-control, var(--surface-2));
+    border: 1px solid var(--ind-border-control, var(--border));
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .plugin-engine-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+  }
+  .plugin-engine-row + .plugin-engine-row {
+    border-top: 1px solid var(--ind-border-separator, var(--border-subtle, var(--border)));
+  }
+  .plugin-engine-description {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plugin-engine-readonly {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
   }
 
   .web-model-pointer-button {

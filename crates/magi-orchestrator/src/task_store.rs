@@ -871,6 +871,80 @@ impl TaskStore {
         Ok(package)
     }
 
+    /// 持久化当前工作流核心的检查点。检查点更新与执行租约绑定，只有仍持有
+    /// 当前租约的运行才能推进阶段，避免旧 Worker 的迟到结果覆盖恢复后的状态。
+    pub fn update_workflow_checkpoint(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: &LeaseId,
+        workflow_id: &str,
+        stage: &str,
+        checkpoint_version_value: u32,
+        checkpoint: serde_json::Value,
+    ) -> DomainResult<bool> {
+        if checkpoint_version_value == 0 || workflow_id.trim().is_empty() || stage.trim().is_empty()
+        {
+            return Err(DomainError::InvalidState {
+                message: "工作流检查点缺少有效身份或版本".into(),
+            });
+        }
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
+        let leases = self
+            .leases
+            .read()
+            .expect("leases read lock poisoned")
+            .clone();
+        Self::validate_task_root(&tasks, task_id, root_task_id)?;
+        let Some(lease) = leases.get(lease_id) else {
+            return Ok(false);
+        };
+        if lease.task_id != *task_id || lease.root_task_id != *root_task_id {
+            return Err(DomainError::InvalidState {
+                message: format!("租约 {} 不属于工作流任务 {}", lease_id, task_id),
+            });
+        }
+        if lease.lease_status != TaskLeaseState::Active {
+            return Ok(false);
+        }
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if task.status != TaskStatus::Running {
+            return Ok(false);
+        }
+        let TaskRuntimePayload::Workflow {
+            workflow_id: current_workflow_id,
+            checkpoint_version: current_version,
+            stage: current_stage,
+            checkpoint: current_checkpoint,
+        } = &mut task.runtime_payload
+        else {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {} 没有工作流负载", task_id),
+            });
+        };
+        if current_workflow_id != workflow_id || checkpoint_version_value < *current_version {
+            return Err(DomainError::InvalidState {
+                message: "工作流检查点身份或版本回退".into(),
+            });
+        }
+        *current_version = checkpoint_version_value;
+        *current_stage = stage.to_string();
+        *current_checkpoint = checkpoint;
+        task.updated_at = UtcMillis::now();
+        let root_id = task.root_task_id.clone();
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_id]);
+        self.fire_checkpoint(&snapshot)?;
+        *self.tasks.write().expect("tasks write lock poisoned") = tasks;
+        *self.leases.write().expect("leases write lock poisoned") = leases;
+        Ok(true)
+    }
+
     pub fn update_task_goal(&self, task_id: &TaskId, goal: String) -> DomainResult<()> {
         let _mutation_guard = self
             .mutation_lock
@@ -2721,6 +2795,68 @@ mod tests {
                 .lease_status,
             TaskLeaseState::Active
         );
+    }
+
+    #[test]
+    fn workflow_checkpoint_update_is_lease_bound_and_durable() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("workflow-checkpoint-task");
+        let mut task = task(task_id.as_str(), TaskStatus::Pending);
+        task.root_task_id = task_id.clone();
+        task.kind = TaskKind::LocalWorkflow;
+        task.runtime_payload = TaskRuntimePayload::Workflow {
+            workflow_id: "plugin/example/flow".into(),
+            checkpoint_version: 1,
+            stage: "start".into(),
+            checkpoint: serde_json::json!({"step": 0}),
+        };
+        store.insert_task(task).unwrap();
+        let lease = store
+            .grant_lease_and_start_task(
+                &task_id,
+                &task_id,
+                &WorkerId::new("workflow-worker"),
+                "executor",
+                10_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .update_workflow_checkpoint(
+                    &task_id,
+                    &task_id,
+                    &lease.lease_id,
+                    "plugin/example/flow",
+                    "start",
+                    0,
+                    serde_json::json!({"step": 0}),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .update_workflow_checkpoint(
+                    &task_id,
+                    &task_id,
+                    &lease.lease_id,
+                    "plugin/example/flow",
+                    "execute",
+                    2,
+                    serde_json::json!({"step": 1}),
+                )
+                .unwrap()
+        );
+        let updated = store.get_task(&task_id).unwrap();
+        assert!(matches!(
+            updated.runtime_payload,
+            TaskRuntimePayload::Workflow {
+                checkpoint_version: 2,
+                stage,
+                checkpoint,
+                ..
+            } if stage == "execute" && checkpoint == serde_json::json!({"step": 1})
+        ));
     }
 
     #[test]
