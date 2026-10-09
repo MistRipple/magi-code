@@ -135,7 +135,8 @@ impl PluginManager {
             fs::create_dir_all(parent)?;
         }
         write_atomic(&target, package.archive_bytes())?;
-        self.state.plugins.insert(
+        let mut next = self.state.clone();
+        next.plugins.insert(
             manifest.id.clone(),
             InstalledPlugin {
                 id: manifest.id.clone(),
@@ -148,8 +149,7 @@ impl PluginManager {
                 active_scopes: BTreeSet::new(),
             },
         );
-        if let Err(error) = self.persist() {
-            self.state.plugins.remove(&manifest.id);
+        if let Err(error) = self.commit(next) {
             let _ = fs::remove_file(target);
             return Err(error);
         }
@@ -190,13 +190,12 @@ impl PluginManager {
             grants: BTreeMap::new(),
             active_scopes: BTreeSet::new(),
         };
-        let old = self
-            .state
+        let mut next = self.state.clone();
+        let old = next
             .plugins
             .insert(id.to_owned(), replacement)
             .expect("current plugin checked");
-        if let Err(error) = self.persist() {
-            self.state.plugins.insert(id.to_owned(), old);
+        if let Err(error) = self.commit(next) {
             let _ = fs::remove_file(&target);
             return Err(error);
         }
@@ -221,25 +220,33 @@ impl PluginManager {
                 ));
             }
         }
-        self.state
-            .plugins
-            .get_mut(id)
-            .expect("package checked")
-            .grants
-            .insert(scope.to_owned(), grants);
-        self.persist()
+        let mut next = self.state.clone();
+        let installed = next.plugins.get_mut(id).expect("package checked");
+        installed.grants.insert(scope.to_owned(), grants);
+        let complete = permissions_granted_for_scope(package.manifest(), installed, scope);
+        if !complete {
+            installed.active_scopes.remove(scope);
+            if scope == "application" {
+                // Workspace instances may share application-scoped credentials. Revoking
+                // that grant therefore closes every dependent workspace admission too.
+                installed
+                    .active_scopes
+                    .retain(|active_scope| active_scope == "application");
+            }
+        }
+        self.commit(next)
     }
 
     pub fn enable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
-        self.state
-            .plugins
+        let mut next = self.state.clone();
+        next.plugins
             .get_mut(id)
             .expect("package checked")
             .enabled_scopes
             .insert(scope.to_owned());
-        self.persist()
+        self.commit(next)
     }
 
     pub fn activate(&mut self, id: &str, scope: &str) -> Result<ActivePlugin, PluginError> {
@@ -249,16 +256,14 @@ impl PluginManager {
         if !installed.enabled_scopes.contains(scope) {
             return Err(conflict("插件作用域未启用"));
         }
-        let grants = installed.grants.get(scope).cloned().unwrap_or_default();
-        if package.manifest().permissions.iter().any(|permission| {
-            permission.scope == scope_kind(scope) && !permission_granted(permission, &grants)
-        }) {
+        if !permissions_granted_for_scope(package.manifest(), installed, scope) {
             return Err(PluginError::NotAuthorized(
                 "插件声明的权限尚未全部授权".into(),
             ));
         }
+        let mut next = self.state.clone();
         let active = {
-            let installed = self.state.plugins.get_mut(id).expect("package checked");
+            let installed = next.plugins.get_mut(id).expect("package checked");
             installed.active_scopes.insert(scope.to_owned());
             ActivePlugin {
                 id: installed.id.clone(),
@@ -268,23 +273,25 @@ impl PluginManager {
                 package_path: self.root.join(&installed.package_path),
             }
         };
-        self.persist()?;
+        self.commit(next)?;
         Ok(active)
     }
 
     pub fn deactivate(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
-        let installed = self
-            .state
+        validate_scope_key(scope)?;
+        let mut next = self.state.clone();
+        let installed = next
             .plugins
             .get_mut(id)
             .ok_or_else(|| conflict("插件未安装"))?;
         installed.active_scopes.remove(scope);
-        self.persist()
+        self.commit(next)
     }
 
     pub fn disable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
-        let installed = self
-            .state
+        validate_scope_key(scope)?;
+        let mut next = self.state.clone();
+        let installed = next
             .plugins
             .get_mut(id)
             .ok_or_else(|| conflict("插件未安装"))?;
@@ -292,7 +299,7 @@ impl PluginManager {
             return Err(conflict("插件仍处于激活状态"));
         }
         installed.enabled_scopes.remove(scope);
-        self.persist()
+        self.commit(next)
     }
 
     pub fn active(&self, scope: &str) -> Vec<ActivePlugin> {
@@ -310,26 +317,57 @@ impl PluginManager {
             .collect()
     }
 
-    /// 判断插件是否可供一个作用域使用。应用级激活是所有工作区的共享准入，
-    /// 工作区激活只对同一工作区生效；调用方必须先拿到当前作用域再查询。
+    /// 应用级实例与工作区准入分别记录；应用级激活不授予其他工作区权限。
     pub fn is_active_for_scope(&self, id: &str, scope: &str) -> Result<bool, PluginError> {
-        let package = self.package(id)?;
-        validate_scope(package.manifest(), scope)?;
-        let installed = self.state.plugins.get(id).expect("package checked");
-        Ok(installed.active_scopes.contains(scope)
-            || (scope != "application" && installed.active_scopes.contains("application")))
+        validate_scope_key(scope)?;
+        let installed = self
+            .state
+            .plugins
+            .get(id)
+            .ok_or_else(|| conflict("插件未安装"))?;
+        Ok(installed.active_scopes.contains(scope) && installed.enabled_scopes.contains(scope))
     }
 
-    /// 返回当前作用域能看到的清单；应用级插件向所有工作区投影，工作区插件只向
-    /// 自己的工作区投影，避免 UI/API 把一个工作区的贡献泄漏到另一个作用域。
     pub fn manifests_for_scope(&self, scope: &str) -> Result<Vec<PluginManifest>, PluginError> {
-        let mut manifests = Vec::new();
-        for id in self.state.plugins.keys() {
-            if self.is_active_for_scope(id, scope)? {
-                manifests.push(self.package(id)?.manifest().clone());
-            }
-        }
-        Ok(manifests)
+        validate_scope_key(scope)?;
+        self.state
+            .plugins
+            .keys()
+            .filter_map(|id| match self.is_active_for_scope(id, scope) {
+                Ok(true) => Some(self.package(id).map(|p| p.manifest().clone())),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub fn projection(
+        &self,
+    ) -> Result<magi_app_server_protocol::generated::PluginList, PluginError> {
+        use magi_app_server_protocol::generated::{PluginInstalled, PluginList, PluginScopeGrant};
+        Ok(PluginList {
+            plugins: self
+                .state
+                .plugins
+                .values()
+                .map(|installed| {
+                    Ok(PluginInstalled {
+                        manifest: self.package(&installed.id)?.manifest().clone(),
+                        digest: installed.digest.clone(),
+                        enabled_scopes: installed.enabled_scopes.iter().cloned().collect(),
+                        active_scopes: installed.active_scopes.iter().cloned().collect(),
+                        grants: installed
+                            .grants
+                            .iter()
+                            .map(|(scope, permissions)| PluginScopeGrant {
+                                scope: scope.clone(),
+                                permissions: permissions.clone(),
+                            })
+                            .collect(),
+                    })
+                })
+                .collect::<Result<_, PluginError>>()?,
+        })
     }
 
     pub fn uninstall(&mut self, id: &str) -> Result<(), PluginError> {
@@ -342,16 +380,18 @@ impl PluginManager {
             return Err(conflict("插件仍有启用作用域或激活实例"));
         }
         let package_path = self.root.join(&installed.package_path);
-        self.state.plugins.remove(id);
-        self.persist()?;
+        let mut next = self.state.clone();
+        next.plugins.remove(id);
+        self.commit(next)?;
         let _ = fs::remove_file(package_path);
         Ok(())
     }
 
-    fn persist(&self) -> Result<(), PluginError> {
-        let bytes = serde_json::to_vec_pretty(&self.state)
+    fn commit(&mut self, next: PluginManagerState) -> Result<(), PluginError> {
+        let bytes = serde_json::to_vec_pretty(&next)
             .map_err(|error| PluginError::CorruptState(error.to_string()))?;
         write_atomic(&self.root.join(STATE_FILE), bytes)?;
+        self.state = next;
         Ok(())
     }
 }
@@ -372,10 +412,22 @@ fn validate_plugin_path(root: &Path, plugin: &InstalledPlugin) -> Result<(), Plu
     }
     Ok(())
 }
-fn validate_scope(manifest: &PluginManifest, scope: &str) -> Result<(), PluginError> {
-    if scope.is_empty() || (scope != "application" && !scope.starts_with("workspace:")) {
+fn validate_scope_key(scope: &str) -> Result<(), PluginError> {
+    let valid = scope == "application"
+        || scope.strip_prefix("workspace:").is_some_and(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        });
+    if !valid {
         return Err(conflict("作用域标识无效"));
     }
+    Ok(())
+}
+fn validate_scope(manifest: &PluginManifest, scope: &str) -> Result<(), PluginError> {
+    validate_scope_key(scope)?;
     if scope == "application" && !manifest.application_instance {
         return Err(conflict("插件未声明应用级实例"));
     }
@@ -401,6 +453,33 @@ fn permission_granted(permission: &PluginPermission, grants: &[PluginPermission]
             && g.scope == permission.scope
             && permission.targets.iter().all(|t| g.targets.contains(t))
     })
+}
+
+fn permissions_granted_for_scope(
+    manifest: &PluginManifest,
+    installed: &InstalledPlugin,
+    scope: &str,
+) -> bool {
+    let scope_grants = installed
+        .grants
+        .get(scope)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let application_grants = installed
+        .grants
+        .get("application")
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    manifest
+        .permissions
+        .iter()
+        .all(|permission| match permission.scope {
+            PluginScopeKind::Application => permission_granted(permission, application_grants),
+            PluginScopeKind::Workspace if scope != "application" => {
+                permission_granted(permission, scope_grants)
+            }
+            PluginScopeKind::Workspace => true,
+        })
 }
 fn conflict(message: impl Into<String>) -> PluginError {
     PluginError::Conflict(message.into())

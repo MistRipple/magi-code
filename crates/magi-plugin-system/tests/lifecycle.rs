@@ -192,6 +192,55 @@ fn active_manifests_are_projected_to_the_requested_scope() {
     );
 }
 
+#[test]
+fn workspace_activation_requires_application_scoped_grants_too() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package_from_manifest(json!({
+        "sdkVersion":1,"id":"acme.shared","version":"1.0.0","name":"Shared","description":"",
+        "backend":"plugin.mjs","applicationInstance":true,
+        "permissions":[
+            {"kind":"storage","scope":"application","targets":["session"]},
+            {"kind":"storage","scope":"workspace","targets":["cache"]}
+        ],
+        "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
+        "contributions":{"commands":[{"id":"open","title":"Open","description":""}]}
+    }));
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "shared.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.shared", "workspace:one").unwrap();
+    manager
+        .authorize(
+            "acme.shared",
+            "workspace:one",
+            vec![magi_plugin_system::PluginPermission {
+                kind: magi_plugin_system::PluginPermissionKind::Storage,
+                scope: magi_plugin_system::PluginScopeKind::Workspace,
+                targets: vec!["cache".into()],
+            }],
+        )
+        .unwrap();
+    assert!(manager.activate("acme.shared", "workspace:one").is_err());
+    manager
+        .authorize(
+            "acme.shared",
+            "application",
+            vec![magi_plugin_system::PluginPermission {
+                kind: magi_plugin_system::PluginPermissionKind::Storage,
+                scope: magi_plugin_system::PluginScopeKind::Application,
+                targets: vec!["session".into()],
+            }],
+        )
+        .unwrap();
+    manager.activate("acme.shared", "workspace:one").unwrap();
+}
+
 fn package_from_manifest(manifest: Value) -> PluginPackage {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in [

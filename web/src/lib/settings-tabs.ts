@@ -9,7 +9,8 @@ export type SettingsTabId =
   | 'safeguard'
   | 'stats'
   | 'appearance'
-  | 'project';
+  | 'project'
+  | 'plugins';
 
 export interface SettingsTabDefinition {
   id: SettingsTabId;
@@ -29,4 +30,5 @@ export const SETTINGS_TABS: readonly SettingsTabDefinition[] = [
   { id: 'stats', icon: 'stats', titleKey: 'settings.zone.usage', descKey: 'settings.zone.usageDesc' },
   { id: 'appearance', icon: 'sparkles', titleKey: 'settings.zone.appearance', descKey: 'settings.zone.appearanceDesc' },
   { id: 'project', icon: 'git-branch', titleKey: 'settings.zone.project', descKey: 'settings.zone.projectDesc' },
+  { id: 'plugins', icon: 'settings', titleKey: 'settings.zone.plugins', descKey: 'settings.zone.pluginsDesc' },
 ];

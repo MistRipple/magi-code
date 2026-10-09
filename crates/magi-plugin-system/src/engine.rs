@@ -131,6 +131,12 @@ impl SessionEngineAdapter for PluginSessionEngine {
                     detail: "会话引擎未返回 events 数组".into(),
                 })?;
             for value in events {
+                if cancelled() {
+                    return Err(EngineEvent::Failed {
+                        code: "cancelled".into(),
+                        detail: "会话引擎调用已取消".into(),
+                    });
+                }
                 let event: EngineEvent =
                     serde_json::from_value(value.clone()).map_err(|_| EngineEvent::Failed {
                         code: "invalid_response".into(),

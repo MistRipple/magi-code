@@ -9,14 +9,18 @@ import SettingsToolsTab from './SettingsToolsTab.svelte';
 import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
+import SettingsPluginsTab from './SettingsPluginsTab.svelte';
+import PluginTabContent from './tabs/PluginTabContent.svelte';
 import { onMount, tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
 import { i18n } from '../stores/i18n.svelte';
+import { messagesState } from '../stores/messages.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
+import { loadActivePluginManifests, type PluginManifestProjection } from '../web/plugin-api';
 import {
   WEB_MODEL_SETTINGS_READY_EVENT,
   WEB_MODEL_SETTINGS_REQUEST_EVENT,
@@ -49,9 +53,58 @@ import {
     void untrack(() => store.reloadRoleTemplates());
   });
 
-  const activeTabDefinition = $derived(
-    SETTINGS_TABS.find((tab) => tab.id === store.activeTab) ?? SETTINGS_TABS[0],
+  let pluginManifests = $state<PluginManifestProjection[]>([]);
+  let pluginManifestsLoaded = $state(false);
+  let pluginManifestRequest = 0;
+  const pluginScope = $derived(
+    typeof messagesState.currentWorkspaceId === 'string' && messagesState.currentWorkspaceId.trim()
+      ? `workspace:${messagesState.currentWorkspaceId.trim()}`
+      : 'application',
   );
+  const pluginSettingsViews = $derived.by(() => pluginManifests.flatMap((manifest) =>
+    (manifest.contributions.views ?? [])
+      .filter((view) => view.placements.includes('settings'))
+      .map((view) => ({
+        tabId: `plugin:${manifest.id}:${view.id}` as `plugin:${string}`,
+        id: manifest.id,
+        entry: view.entry,
+        label: `${manifest.name} · ${view.title}`,
+        title: view.title,
+        description: manifest.description,
+      }))));
+  const activeTabDefinition = $derived(
+    SETTINGS_TABS.find((tab) => tab.id === store.activeTab)
+      ?? pluginSettingsViews.find((item) => item.tabId === store.activeTab)
+      ?? SETTINGS_TABS[0],
+  );
+  const activeTabTitle = $derived(
+    'titleKey' in activeTabDefinition ? i18n.t(activeTabDefinition.titleKey) : activeTabDefinition.title,
+  );
+  const activeTabDescription = $derived(
+    'descKey' in activeTabDefinition ? i18n.t(activeTabDefinition.descKey) : activeTabDefinition.description,
+  );
+
+  $effect(() => {
+    const scope = pluginScope;
+    const request = ++pluginManifestRequest;
+    void loadActivePluginManifests(scope).then((manifests) => {
+      if (request === pluginManifestRequest) {
+        pluginManifests = manifests;
+        pluginManifestsLoaded = true;
+      }
+    }).catch(() => {
+      if (request === pluginManifestRequest) {
+        pluginManifests = [];
+        pluginManifestsLoaded = true;
+      }
+    });
+  });
+  $effect(() => {
+    if (pluginManifestsLoaded && store.activeTab.startsWith('plugin:')
+      && !pluginSettingsViews.some((item) => item.tabId === store.activeTab)) {
+      store.activeTab = 'model';
+    }
+  });
 
   // 返回要先等待保存队列与清理完成（见 store.closeSettings）；期间禁用，避免重复触发。
   let leaving = $state(false);
@@ -167,6 +220,19 @@ import {
           <span>{i18n.t(tab.titleKey)}</span>
         </button>
       {/each}
+      {#each pluginSettingsViews as tab (tab.tabId)}
+        <button
+          type="button"
+          class="settings-nav-item"
+          class:active={store.activeTab === tab.tabId}
+          aria-current={store.activeTab === tab.tabId ? 'page' : undefined}
+          data-testid={`settings-nav-${tab.tabId}`}
+          onclick={() => store.activeTab = tab.tabId}
+        >
+          <Icon name="settings" size={15} />
+          <span>{tab.label}</span>
+        </button>
+      {/each}
     </nav>
     {#if store.userInfo && store.clientKind === 'vscode'}
       <div class="settings-nav-footer">
@@ -181,8 +247,8 @@ import {
     <header class="main-header">
       <div class="header-breadcrumbs">
         <div class="header-title-group">
-          <h2>{i18n.t(activeTabDefinition.titleKey)}</h2>
-          <span class="header-description">{i18n.t(activeTabDefinition.descKey)}</span>
+          <h2>{activeTabTitle}</h2>
+          <span class="header-description">{activeTabDescription}</span>
         </div>
       </div>
     </header>
@@ -223,6 +289,12 @@ import {
         />
       {:else if store.activeTab === 'browser'}
         <SettingsBrowserTab />
+      {:else if store.activeTab === 'plugins'}
+        <SettingsPluginsTab workspaceId={messagesState.currentWorkspaceId} />
+      {:else}
+        {#each pluginSettingsViews.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
+          <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} scope={pluginScope} />
+        {/each}
       {/if}
     </div>
   </main>

@@ -3,6 +3,7 @@
 //! 核心只能返回动作意图；daemon 负责预算、授权、持久化、执行和终态提交。插件不
 //! 能通过这个合同直接写 TaskStore、审批记录或 canonical Turn。
 
+use magi_plugin_runtime::RunCancellation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{future::Future, pin::Pin};
@@ -66,6 +67,7 @@ pub trait WorkflowCore: Send + Sync {
     fn decide<'a>(
         &'a self,
         input: WorkflowInput,
+        cancellation: &'a RunCancellation,
     ) -> Pin<Box<dyn Future<Output = Result<WorkflowDecision, WorkflowError>> + Send + 'a>>;
 }
 

@@ -30,6 +30,8 @@ pub enum PluginError {
     NotAuthorized(String),
     #[error("插件存储失败：{0}")]
     Storage(#[from] std::io::Error),
+    #[error(transparent)]
+    Resource(#[from] ResourceError),
     #[error("插件状态损坏：{0}")]
     CorruptState(String),
 }

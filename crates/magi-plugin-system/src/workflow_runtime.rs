@@ -36,6 +36,7 @@ impl WorkflowCore for PluginWorkflowCore {
     fn decide<'a>(
         &'a self,
         input: WorkflowInput,
+        cancellation: &'a RunCancellation,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<WorkflowDecision, WorkflowError>> + Send + 'a>,
     > {
@@ -51,11 +52,7 @@ impl WorkflowCore for PluginWorkflowCore {
             };
             let result = self
                 .host
-                .invoke(
-                    invocation,
-                    self.handler.as_ref(),
-                    &RunCancellation::default(),
-                )
+                .invoke(invocation, self.handler.as_ref(), cancellation)
                 .await
                 .map_err(|error| WorkflowError {
                     message: format!("插件工作流执行失败: {error}"),

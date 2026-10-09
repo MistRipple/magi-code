@@ -604,3 +604,44 @@ export interface PluginManifest {
 }
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
+
+export interface PluginScopeRequest {
+  scope: string;
+}
+
+export interface PluginAuthorizeRequest {
+  scope: string;
+  grants: Array<PluginPermission>;
+}
+
+export interface PluginInstallRequest {
+  source: string;
+  archiveBase64?: string;
+}
+
+export interface PluginScopeGrant {
+  scope: string;
+  permissions: Array<PluginPermission>;
+}
+
+export interface PluginInstalled {
+  manifest: PluginManifest;
+  digest: string;
+  enabledScopes: Array<string>;
+  activeScopes: Array<string>;
+  grants: Array<PluginScopeGrant>;
+}
+
+export interface PluginList {
+  plugins: Array<PluginInstalled>;
+}
+
+export interface PluginResource {
+  version: number;
+  value: unknown;
+}
+
+export interface PluginResourceWriteRequest {
+  expectedVersion: number;
+  value: unknown;
+}

@@ -54,7 +54,7 @@
 | [`task_execution_dispatcher.rs`](../crates/magi-conversation-runtime/src/task_execution_dispatcher.rs) | 现有任务执行入口；同一文件内还承担 GPT Web 引擎解析（`WebModelResolutionContext`、Web 客户端工厂注入）、上下文预算、Skill 调度与 worktree 清理 | 先盘点真实职责，再分别提取工作流决策合同与会话引擎解析接口，保留既有调度和终态责任 |
 | [`magi-web-model`](../crates/magi-web-model/src/lib.rs) | GPT Web 功能实现 | 划分可选功能与原生浏览器/MCP 边界，完成单次切换 |
 
-当前已接入的实现入口：`magi-plugin-system::PluginManager` 由 daemon 恢复并通过 `/api/plugins/*` 提供唯一安装、升级、授权、启用、激活、停用、禁用和卸载入口；`PluginResourceStore` 由同一管理器持有并执行版本冲突检查；`/api/plugins/{id}/ui/{path}` 只服务已激活包内的 `ui/` 资源。Web 右栏对 active manifest 的 `rightPane` 视图提供隔离 iframe 承载。未声明或未桥接的贡献仍不会自动注册到工具目录、设置导航或工作流选择器。
+当前已接入的实现入口：`magi-plugin-system::PluginManager` 由 daemon 恢复并通过 `/api/plugins/*` 提供唯一安装、升级、授权、启用、激活、停用、禁用和卸载入口；`PluginResourceStore` 由同一管理器持有，资源键包含插件、作用域和资源 ID，并执行版本冲突检查；`/api/plugins/{id}/ui/{path}` 只服务已激活包内的 `ui/` 资源。Web 右栏对 active manifest 的 `rightPane` 视图提供隔离 iframe 承载，设置页展示插件声明的权限后再执行授权激活。未声明或未桥接的贡献仍不会自动注册到工具目录、设置导航或工作流选择器。
 
 必须延续的基线：
 
@@ -219,6 +219,8 @@ UI 操作和模型工具操作进入同一应用服务方法及权限入口。�
 ### 6.3 唯一资源状态与同步
 
 每个可同步资源必须声明唯一权威来源：插件管理的数据、工作区文件或外部系统之一。不能同时把插件内存、文件和面板副本都当作可独立提交的事实源。
+
+资源键由 `pluginId + scope + resourceId` 组成。应用级和工作区级数据分别存储、分别校验版本；工作区实例不能读取或写入其他工作区的资源，应用级授权也不会把工作区资源合并成全局副本。
 
 ```text
 用户界面操作 / 模型工具调用
@@ -404,7 +406,7 @@ GPT Web 插件必须显式声明应用级能力：登录态、Cookie、单槽位
 
 工作流接口和会话引擎接口都必须在阶段 A 中定义并验证边界，不能等工具和界面完成后再靠通用钩子绕过执行内核。阶段 A 的接口定义以对 `task_execution_dispatcher.rs` 与 `daemon/runtime.rs` 当前真实职责的盘点为输入：两者都是单文件大体量实现，混合了调度、引擎解析、上下文预算、Skill 调度和资源清理，接口必须按盘点结果划定哪些职责留在宿主、哪些交给核心或引擎，而不是先写合同再到阶段 D 发现切不进去。插件中心的服务端托管、发布审核和作者身份方案在阶段 E 前完成定案。
 
-当前实施证据：插件清单复用 App Server schema 生成的 Rust/TypeScript 合同，包校验完成 6 项核心回归；QuickJS 受管 Worker 完成 10 项执行回归，构建、资源哈希、许可正文与发行 preflight 已接入。macOS Apple Silicon 的 Desktop 目录包已生成，最终 `.app` 内 Worker 实际执行与解包资源检查通过。安装/升级/授权/生命周期、资源版本冲突、工作流动作身份和隔离右栏视图已有定向回归；原生工具目录桥接、设置 schema 存储、会话引擎流式适配、daemon SDK 的真实副作用结算、Windows 实际执行和三平台正式安装器验收仍未完成。
+当前实施证据：插件清单复用 App Server schema 生成的 Rust/TypeScript 合同，包校验完成 6 项核心回归；QuickJS 受管 Worker 完成 10 项执行回归，构建、资源哈希、许可正文与发行 preflight 已接入。macOS Apple Silicon 的 Desktop 目录包已生成，最终 `.app` 内 Worker 实际执行与解包资源检查通过。安装/升级/授权/生命周期、按作用域资源隔离与版本冲突、工作流动作身份和隔离右栏视图已有定向回归；取消会先通知能力处理器并在有限窗口内结算，超时后终止受管 Worker。原生工具目录桥接、设置 schema 存储、会话引擎流式适配、daemon SDK 的真实副作用结算、Windows 实际执行和三平台正式安装器验收仍未完成。
 
 ## 11. 最小充分验收
 

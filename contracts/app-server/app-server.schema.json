@@ -2,10 +2,23 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://magi.dev/contracts/app-server/app-server.schema.json",
   "title": "Magi App Server protocol",
-  "x-protocol": { "name": "magi.app-server", "major": 1, "minor": 0, "jsonrpcVersion": "2.0" },
+  "x-protocol": {
+    "name": "magi.app-server",
+    "major": 1,
+    "minor": 0,
+    "jsonrpcVersion": "2.0"
+  },
   "x-methods": [
-    "initialize", "initialized", "ping", "session/list", "session/read", "turn/start",
-    "events/subscribe", "browser/tools/list", "browser/tool", "approval/request",
+    "initialize",
+    "initialized",
+    "ping",
+    "session/list",
+    "session/read",
+    "turn/start",
+    "events/subscribe",
+    "browser/tools/list",
+    "browser/tool",
+    "approval/request",
     "$/cancelRequest"
   ],
   "x-method-signatures": {
@@ -68,12 +81,20 @@
   "$defs": {
     "JsonRpcVersion": {
       "type": "string",
-      "enum": ["2.0"]
+      "enum": [
+        "2.0"
+      ]
     },
     "JsonRpcRequestId": {
       "oneOf": [
-        { "type": "string", "minLength": 1 },
-        { "type": "number", "x-rust-type": "serde_json::Number" }
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "number",
+          "x-rust-type": "serde_json::Number"
+        }
       ]
     },
     "JsonValue": {},
@@ -81,21 +102,47 @@
       "type": "object",
       "x-rust-derive-default": true,
       "additionalProperties": false,
-      "required": ["major", "minor"],
+      "required": [
+        "major",
+        "minor"
+      ],
       "properties": {
-        "major": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+        "major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
       }
     },
     "ClientInfo": {
       "type": "object",
       "x-rust-derive-default": true,
       "additionalProperties": false,
-      "required": ["name"],
+      "required": [
+        "name"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "title": { "type": ["string", "null"] },
-        "version": { "type": ["string", "null"] }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "ClientCapabilities": {
@@ -103,13 +150,32 @@
       "x-rust-derive-default": true,
       "additionalProperties": false,
       "properties": {
-        "desktopBrowserSurface": { "type": "boolean", "default": false, "x-rust-default": true },
-        "browserTools": { "type": "boolean", "default": false, "x-rust-default": true },
-        "approvals": { "type": "boolean", "default": false, "x-rust-default": true },
-        "streaming": { "type": "boolean", "default": false, "x-rust-default": true },
+        "desktopBrowserSurface": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "browserTools": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "approvals": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "streaming": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
         "optOutNotificationMethods": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "default": [],
           "x-rust-default": true
         }
@@ -124,34 +190,63 @@
     "PingResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["runtimeEpoch"],
+      "required": [
+        "runtimeEpoch"
+      ],
       "properties": {
-        "runtimeEpoch": { "type": "string", "minLength": 1 }
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "ServerCapabilities": {
       "type": "object",
       "x-rust-derive-default": true,
       "additionalProperties": false,
-      "required": ["sessions", "turns", "events", "approvals", "browserTools"],
+      "required": [
+        "sessions",
+        "turns",
+        "events",
+        "approvals",
+        "browserTools"
+      ],
       "properties": {
-        "sessions": { "type": "boolean" },
-        "turns": { "type": "boolean" },
-        "events": { "type": "boolean" },
-        "approvals": { "type": "boolean" },
-        "browserTools": { "type": "boolean" }
+        "sessions": {
+          "type": "boolean"
+        },
+        "turns": {
+          "type": "boolean"
+        },
+        "events": {
+          "type": "boolean"
+        },
+        "approvals": {
+          "type": "boolean"
+        },
+        "browserTools": {
+          "type": "boolean"
+        }
       }
     },
     "InitializeParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["clientInfo"],
+      "required": [
+        "clientInfo"
+      ],
       "properties": {
-        "clientInfo": { "$ref": "#/$defs/ClientInfo" },
+        "clientInfo": {
+          "$ref": "#/$defs/ClientInfo"
+        },
         "protocol": {
           "oneOf": [
-            { "$ref": "#/$defs/ProtocolVersion" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/ProtocolVersion"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "capabilities": {
@@ -164,137 +259,352 @@
     "InitializeResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["serverInfo", "protocol", "runtimeEpoch", "capabilities"],
+      "required": [
+        "serverInfo",
+        "protocol",
+        "runtimeEpoch",
+        "capabilities"
+      ],
       "properties": {
-        "serverInfo": { "$ref": "#/$defs/ClientInfo" },
-        "protocol": { "$ref": "#/$defs/ProtocolVersion" },
-        "runtimeEpoch": { "type": "string", "minLength": 1 },
-        "capabilities": { "$ref": "#/$defs/ServerCapabilities" }
+        "serverInfo": {
+          "$ref": "#/$defs/ClientInfo"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ServerCapabilities"
+        }
       }
     },
     "EventSubscribeParams": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "sessionId": { "type": ["string", "null"] },
-        "workspaceId": { "type": ["string", "null"] },
-        "afterSequence": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" }
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "afterSequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        }
       }
     },
     "SessionListParams": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "workspaceId": { "type": ["string", "null"] }
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "SessionReadParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId"],
+      "required": [
+        "sessionId"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "includeTurns": { "type": "boolean", "default": false, "x-rust-default": true }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "includeTurns": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        }
       }
     },
     "SessionScope": {
       "type": "string",
-      "enum": ["personal", "workspace"]
+      "enum": [
+        "personal",
+        "workspace"
+      ]
     },
     "SessionTurnImage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "dataUrl"],
+      "required": [
+        "name",
+        "dataUrl"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "dataUrl": { "type": "string", "minLength": 1 }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dataUrl": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "SessionContextReferenceKind": {
       "type": "string",
-      "enum": ["file", "directory"]
+      "enum": [
+        "file",
+        "directory"
+      ]
     },
     "SessionContextReference": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "path", "name"],
+      "required": [
+        "kind",
+        "path",
+        "name"
+      ],
       "properties": {
-        "kind": { "$ref": "#/$defs/SessionContextReferenceKind" },
-        "path": { "type": "string", "minLength": 1 },
-        "pathRef": { "type": ["string", "null"] },
-        "name": { "type": "string", "minLength": 1 }
+        "kind": {
+          "$ref": "#/$defs/SessionContextReferenceKind"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pathRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "BrowserNodeSelectionBounds": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["x", "y", "width", "height"],
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
       "properties": {
-        "x": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
-        "y": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
-        "width": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" },
-        "height": { "type": "number", "x-rust-type": "f64", "x-ts-type": "number" }
+        "x": {
+          "type": "number",
+          "x-rust-type": "f64",
+          "x-ts-type": "number"
+        },
+        "y": {
+          "type": "number",
+          "x-rust-type": "f64",
+          "x-ts-type": "number"
+        },
+        "width": {
+          "type": "number",
+          "x-rust-type": "f64",
+          "x-ts-type": "number"
+        },
+        "height": {
+          "type": "number",
+          "x-rust-type": "f64",
+          "x-ts-type": "number"
+        }
       }
     },
     "BrowserNodeSelection": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "tabId", "surfaceId", "navigationRevision", "browserSessionId", "url", "title", "frameId",
-        "backendDomNodeId", "domNodeId", "nodeName", "attributes", "textExcerpt",
-        "outerHtml", "outerHtmlTruncated", "ariaRole", "ariaName", "bounds"
+        "tabId",
+        "surfaceId",
+        "navigationRevision",
+        "browserSessionId",
+        "url",
+        "title",
+        "frameId",
+        "backendDomNodeId",
+        "domNodeId",
+        "nodeName",
+        "attributes",
+        "textExcerpt",
+        "outerHtml",
+        "outerHtmlTruncated",
+        "ariaRole",
+        "ariaName",
+        "bounds"
       ],
       "properties": {
-        "tabId": { "type": "string", "minLength": 1 },
-        "surfaceId": { "type": "string", "minLength": 1 },
-        "navigationRevision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "browserSessionId": { "type": "string", "minLength": 1 },
-        "url": { "type": "string", "minLength": 1 },
-        "title": { "type": "string" },
-        "frameId": { "type": ["string", "null"] },
-        "backendDomNodeId": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
-        "domNodeId": { "type": ["integer", "null"], "minimum": 1, "x-rust-type": "Option<u64>" },
-        "nodeName": { "type": "string", "minLength": 1 },
+        "tabId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surfaceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "navigationRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "browserSessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "frameId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backendDomNodeId": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "domNodeId": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "x-rust-type": "Option<u64>"
+        },
+        "nodeName": {
+          "type": "string",
+          "minLength": 1
+        },
         "attributes": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "x-rust-type": "std::collections::BTreeMap<String, String>",
           "x-ts-type": "Record<string, string>"
         },
-        "textExcerpt": { "type": "string" },
-        "outerHtml": { "type": "string" },
-        "outerHtmlTruncated": { "type": "boolean" },
-        "ariaRole": { "type": ["string", "null"] },
-        "ariaName": { "type": ["string", "null"] },
+        "textExcerpt": {
+          "type": "string"
+        },
+        "outerHtml": {
+          "type": "string"
+        },
+        "outerHtmlTruncated": {
+          "type": "boolean"
+        },
+        "ariaRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ariaName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "bounds": {
           "oneOf": [
-            { "$ref": "#/$defs/BrowserNodeSelectionBounds" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/BrowserNodeSelectionBounds"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
     },
     "AccessProfile": {
       "type": "string",
-      "enum": ["read_only", "restricted", "full_access"]
+      "enum": [
+        "read_only",
+        "restricted",
+        "full_access"
+      ]
     },
     "SessionTurnCommand": {
       "type": "string",
-      "enum": ["compact"]
+      "enum": [
+        "compact"
+      ]
     },
     "TurnStartParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["scope"],
+      "required": [
+        "scope"
+      ],
       "properties": {
-        "sessionId": { "type": ["string", "null"] },
-        "scope": { "$ref": "#/$defs/SessionScope" },
-        "workspaceId": { "type": ["string", "null"] },
-        "workspacePath": { "type": ["string", "null"] },
-        "text": { "type": ["string", "null"] },
-        "skillName": { "type": ["string", "null"] },
-        "locale": { "type": ["string", "null"] },
-        "goalMode": { "type": "boolean", "default": false, "x-rust-default": true },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skillName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goalMode": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
         "resume": {
           "type": "boolean",
           "default": false,
@@ -303,372 +613,1011 @@
         },
         "command": {
           "oneOf": [
-            { "$ref": "#/$defs/SessionTurnCommand" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/SessionTurnCommand"
+            },
+            {
+              "type": "null"
+            }
           ],
           "x-rust-default": true
         },
         "images": {
           "type": "array",
-          "items": { "$ref": "#/$defs/SessionTurnImage" },
+          "items": {
+            "$ref": "#/$defs/SessionTurnImage"
+          },
           "default": [],
           "x-rust-default": true
         },
         "contextReferences": {
           "type": "array",
-          "items": { "$ref": "#/$defs/SessionContextReference" },
+          "items": {
+            "$ref": "#/$defs/SessionContextReference"
+          },
           "default": [],
           "x-rust-default": true
         },
         "browserAnnotationRefs": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "default": [],
           "x-rust-default": true
         },
         "browserNodeSelections": {
           "type": "array",
-          "items": { "$ref": "#/$defs/BrowserNodeSelection" },
+          "items": {
+            "$ref": "#/$defs/BrowserNodeSelection"
+          },
           "default": [],
           "x-rust-default": true
         },
         "accessProfile": {
           "oneOf": [
-            { "$ref": "#/$defs/AccessProfile" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/AccessProfile"
+            },
+            {
+              "type": "null"
+            }
           ],
           "x-rust-default": true
         },
         "orchestratorSessionConfig": {
           "oneOf": [
-            { "$ref": "#/$defs/JsonValue" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
           ],
           "x-rust-type": "Option<Value>",
           "x-ts-type": "JsonValue | null",
           "x-rust-default": true
         },
-        "requestId": { "type": ["string", "null"] },
-        "userMessageId": { "type": ["string", "null"] },
-        "placeholderMessageId": { "type": ["string", "null"] },
-        "steerCurrentTurn": { "type": "boolean", "default": false, "x-rust-default": true },
-        "expectedTurnId": { "type": ["string", "null"] },
-        "replaceTurnId": { "type": ["string", "null"] }
+        "requestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "userMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "placeholderMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steerCurrentTurn": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "expectedTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replaceTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "SessionSummary": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "sessionId", "workspaceId", "title", "status", "createdAt", "updatedAt",
-        "messageCount", "isRunning", "runningTaskCount", "hasUnreadCompletion"
+        "sessionId",
+        "workspaceId",
+        "title",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "messageCount",
+        "isRunning",
+        "runningTaskCount",
+        "hasUnreadCompletion"
       ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "workspaceId": { "type": ["string", "null"] },
-        "title": { "type": "string" },
-        "status": { "type": "string", "minLength": 1 },
-        "createdAt": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "updatedAt": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "messageCount": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
-        "isRunning": { "type": "boolean" },
-        "runningTaskCount": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
-        "hasUnreadCompletion": { "type": "boolean" }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "messageCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "isRunning": {
+          "type": "boolean"
+        },
+        "runningTaskCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "hasUnreadCompletion": {
+          "type": "boolean"
+        }
       }
     },
     "SessionListResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessions", "runtimeEpoch"],
+      "required": [
+        "sessions",
+        "runtimeEpoch"
+      ],
       "properties": {
         "sessions": {
           "type": "array",
-          "items": { "$ref": "#/$defs/SessionSummary" }
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          }
         },
-        "runtimeEpoch": { "type": "string", "minLength": 1 }
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "SessionReadResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["session", "turns", "runtimeEpoch"],
+      "required": [
+        "session",
+        "turns",
+        "runtimeEpoch"
+      ],
       "properties": {
-        "session": { "$ref": "#/$defs/SessionSummary" },
+        "session": {
+          "$ref": "#/$defs/SessionSummary"
+        },
         "turns": {
           "type": "array",
-          "items": { "$ref": "#/$defs/CanonicalTurn" }
+          "items": {
+            "$ref": "#/$defs/CanonicalTurn"
+          }
         },
-        "runtimeEpoch": { "type": "string", "minLength": 1 }
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "EventCategory": {
       "type": "string",
-      "enum": ["Domain", "Audit", "Usage", "Projection", "System"]
+      "enum": [
+        "Domain",
+        "Audit",
+        "Usage",
+        "Projection",
+        "System"
+      ]
     },
     "CanonicalTurnStatus": {
       "type": "string",
-      "enum": ["pending", "running", "completed", "blocked", "failed", "interrupted", "cancelled", "superseded"]
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+        "interrupted",
+        "cancelled",
+        "superseded"
+      ]
     },
     "CanonicalTurnItemKind": {
       "type": "string",
-      "enum": ["user_message", "assistant_text", "assistant_thinking", "tool_call", "task_status", "system_notice"]
+      "enum": [
+        "user_message",
+        "assistant_text",
+        "assistant_thinking",
+        "tool_call",
+        "task_status",
+        "system_notice"
+      ]
     },
     "CanonicalTurnItemStatus": {
       "type": "string",
-      "enum": ["pending", "running", "completed", "blocked", "failed", "cancelled", "indeterminate"]
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+        "cancelled",
+        "indeterminate"
+      ]
     },
     "CanonicalTurnVisibility": {
       "type": "object",
       "x-rust-derive-default": true,
       "additionalProperties": false,
       "properties": {
-        "renderable": { "type": "boolean", "default": true, "x-rust-default": true }
+        "renderable": {
+          "type": "boolean",
+          "default": true,
+          "x-rust-default": true
+        }
       }
     },
     "CanonicalToolCall": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["callId", "name"],
+      "required": [
+        "callId",
+        "name"
+      ],
       "properties": {
-        "callId": { "type": "string", "minLength": 1 },
-        "name": { "type": "string", "minLength": 1 },
-        "arguments": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
-        "result": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
-        "error": { "type": ["string", "null"] }
+        "callId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ],
+          "x-rust-type": "Option<Value>",
+          "x-ts-type": "JsonValue | null"
+        },
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ],
+          "x-rust-type": "Option<Value>",
+          "x-ts-type": "JsonValue | null"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "CanonicalWorkerRef": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "taskId": { "type": ["string", "null"] },
-        "workerId": { "type": ["string", "null"] },
-        "roleId": { "type": ["string", "null"] },
-        "title": { "type": ["string", "null"] }
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "roleId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "CanonicalTurnItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "turnId", "turnSeq", "itemId", "itemSeq", "kind", "createdAt", "status", "updatedAt", "sourceThreadId", "visibility"],
+      "required": [
+        "sessionId",
+        "turnId",
+        "turnSeq",
+        "itemId",
+        "itemSeq",
+        "kind",
+        "createdAt",
+        "status",
+        "updatedAt",
+        "sourceThreadId",
+        "visibility"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "turnId": { "type": "string", "minLength": 1 },
-        "turnSeq": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "itemId": { "type": "string", "minLength": 1 },
-        "itemSeq": { "type": "integer", "minimum": 0, "x-rust-type": "usize" },
-        "kind": { "$ref": "#/$defs/CanonicalTurnItemKind" },
-        "createdAt": { "type": "integer", "x-rust-type": "i64" },
-        "status": { "$ref": "#/$defs/CanonicalTurnItemStatus" },
-        "itemVersion": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
-        "updatedAt": { "type": "integer", "x-rust-type": "i64" },
-        "title": { "type": ["string", "null"] },
-        "content": { "type": ["string", "null"] },
-        "blocks": { "type": "array", "items": {}, "default": [], "x-rust-default": true, "x-rust-type": "Vec<Value>" },
-        "tool": { "oneOf": [{ "$ref": "#/$defs/CanonicalToolCall" }, { "type": "null" }] },
-        "worker": { "oneOf": [{ "$ref": "#/$defs/CanonicalWorkerRef" }, { "type": "null" }] },
-        "sourceThreadId": { "type": "string", "minLength": 1 },
-        "visibility": { "$ref": "#/$defs/CanonicalTurnVisibility", "x-rust-default": true },
-        "metadata": { "type": "object", "default": {}, "x-rust-default": true, "x-rust-type": "std::collections::HashMap<String, Value>", "x-ts-type": "Record<string, JsonValue>" }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "itemSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "kind": {
+          "$ref": "#/$defs/CanonicalTurnItemKind"
+        },
+        "createdAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "status": {
+          "$ref": "#/$defs/CanonicalTurnItemStatus"
+        },
+        "itemVersion": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blocks": {
+          "type": "array",
+          "items": {},
+          "default": [],
+          "x-rust-default": true,
+          "x-rust-type": "Vec<Value>"
+        },
+        "tool": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CanonicalToolCall"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CanonicalWorkerRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sourceThreadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "visibility": {
+          "$ref": "#/$defs/CanonicalTurnVisibility",
+          "x-rust-default": true
+        },
+        "metadata": {
+          "type": "object",
+          "default": {},
+          "x-rust-default": true,
+          "x-rust-type": "std::collections::HashMap<String, Value>",
+          "x-ts-type": "Record<string, JsonValue>"
+        }
       }
     },
     "CanonicalTurn": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "turnId", "turnSeq", "acceptedAt", "status", "items"],
+      "required": [
+        "sessionId",
+        "turnId",
+        "turnSeq",
+        "acceptedAt",
+        "status",
+        "items"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "turnId": { "type": "string", "minLength": 1 },
-        "turnSeq": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "acceptedAt": { "type": "integer", "x-rust-type": "i64" },
-        "completedAt": { "type": ["integer", "null"], "x-rust-type": "Option<i64>" },
-        "status": { "$ref": "#/$defs/CanonicalTurnStatus" },
-        "responseDurationMs": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
-        "usage": { "type": ["object", "array", "string", "number", "boolean", "null"], "x-rust-type": "Option<Value>", "x-ts-type": "JsonValue | null" },
-        "items": { "type": "array", "items": { "$ref": "#/$defs/CanonicalTurnItem" }, "default": [], "x-rust-default": true },
-        "metadata": { "type": "object", "default": {}, "x-rust-default": true, "x-rust-type": "std::collections::HashMap<String, Value>", "x-ts-type": "Record<string, JsonValue>" }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "acceptedAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "completedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-rust-type": "Option<i64>"
+        },
+        "status": {
+          "$ref": "#/$defs/CanonicalTurnStatus"
+        },
+        "responseDurationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "usage": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ],
+          "x-rust-type": "Option<Value>",
+          "x-ts-type": "JsonValue | null"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CanonicalTurnItem"
+          },
+          "default": [],
+          "x-rust-default": true
+        },
+        "metadata": {
+          "type": "object",
+          "default": {},
+          "x-rust-default": true,
+          "x-rust-type": "std::collections::HashMap<String, Value>",
+          "x-ts-type": "Record<string, JsonValue>"
+        }
       }
     },
     "TurnStartKind": {
       "type": "string",
-      "enum": ["accepted", "queued"]
+      "enum": [
+        "accepted",
+        "queued"
+      ]
     },
     "TurnStartRoute": {
       "type": "string",
-      "enum": ["chat", "execute", "continue", "steer"]
+      "enum": [
+        "chat",
+        "execute",
+        "continue",
+        "steer"
+      ]
     },
     "TurnQueueInfo": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["queueId", "queuePosition"],
+      "required": [
+        "queueId",
+        "queuePosition"
+      ],
       "properties": {
-        "queueId": { "type": "string", "minLength": 1 },
-        "queuePosition": { "type": "integer", "minimum": 0, "x-rust-type": "usize" }
+        "queueId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "queuePosition": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        }
       }
     },
     "TurnStartResult": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "kind", "replayed", "requestId", "sessionId", "turnId", "entryId", "eventId",
-        "acceptedAt", "runtimeEpoch", "eventStreamNextSequence", "createdSession", "route",
-        "sessionSummary", "userMessageItemId", "canonicalTurn", "canonicalItem", "queue",
-        "executionProfile", "status", "eventSequence"
+        "kind",
+        "replayed",
+        "requestId",
+        "sessionId",
+        "turnId",
+        "entryId",
+        "eventId",
+        "acceptedAt",
+        "runtimeEpoch",
+        "eventStreamNextSequence",
+        "createdSession",
+        "route",
+        "sessionSummary",
+        "userMessageItemId",
+        "canonicalTurn",
+        "canonicalItem",
+        "queue",
+        "executionProfile",
+        "status",
+        "eventSequence"
       ],
       "properties": {
-        "kind": { "$ref": "#/$defs/TurnStartKind" },
-        "replayed": { "type": "boolean" },
-        "requestId": { "type": ["string", "null"] },
-        "sessionId": { "type": "string", "minLength": 1 },
-        "turnId": { "type": ["string", "null"] },
-        "entryId": { "type": "string", "minLength": 1 },
-        "eventId": { "type": "string", "minLength": 1 },
-        "acceptedAt": { "type": "integer", "x-rust-type": "i64" },
-        "runtimeEpoch": { "type": "string", "minLength": 1 },
-        "eventStreamNextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "createdSession": { "type": "boolean" },
+        "kind": {
+          "$ref": "#/$defs/TurnStartKind"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "requestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entryId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "eventId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptedAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "eventStreamNextSequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "createdSession": {
+          "type": "boolean"
+        },
         "route": {
           "oneOf": [
-            { "$ref": "#/$defs/TurnStartRoute" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/TurnStartRoute"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "executionProfile": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "x-rust-type": "Option<String>",
           "x-ts-type": "\"conversation\" | \"task\" | null"
         },
         "status": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "x-rust-type": "Option<String>",
           "x-ts-type": "string | null"
         },
         "eventSequence": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0,
           "x-rust-type": "Option<u64>"
         },
         "sessionSummary": {
           "oneOf": [
-            { "$ref": "#/$defs/SessionSummary" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/SessionSummary"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
-        "userMessageItemId": { "type": ["string", "null"] },
+        "userMessageItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "canonicalTurn": {
           "oneOf": [
-            { "$ref": "#/$defs/CanonicalTurn" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/CanonicalTurn"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "canonicalItem": {
           "oneOf": [
-            { "$ref": "#/$defs/CanonicalTurnItem" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/CanonicalTurnItem"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "queue": {
           "oneOf": [
-            { "$ref": "#/$defs/TurnQueueInfo" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/TurnQueueInfo"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
-        "rootTaskId": { "type": ["string", "null"] },
-        "actionTaskId": { "type": ["string", "null"] },
-        "executionChainRef": { "type": ["string", "null"] },
-        "steeredTurnId": { "type": ["string", "null"] },
-        "canonicalSchemaVersion": { "type": ["string", "null"] },
-        "canonicalEventKind": { "type": ["string", "null"] },
-        "canonicalEventId": { "type": ["string", "null"] },
-        "canonicalEventSeq": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
-        "canonicalOccurredAt": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<i64>" }
+        "rootTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actionTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executionChainRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steeredTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonicalSchemaVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonicalEventKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonicalEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonicalEventSeq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "canonicalOccurredAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<i64>"
+        }
       }
     },
     "EventEnvelope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["event_id", "event_type", "category", "occurred_at", "sequence", "payload"],
+      "required": [
+        "event_id",
+        "event_type",
+        "category",
+        "occurred_at",
+        "sequence",
+        "payload"
+      ],
       "properties": {
-        "event_id": { "type": "string", "minLength": 1 },
-        "event_type": { "type": "string", "minLength": 1 },
-        "category": { "$ref": "#/$defs/EventCategory" },
-        "occurred_at": { "type": "integer", "x-rust-type": "i64" },
-        "sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "workspace_id": { "type": ["string", "null"] },
-        "session_id": { "type": ["string", "null"] },
-        "mission_id": { "type": ["string", "null"] },
-        "assignment_id": { "type": ["string", "null"] },
-        "task_id": { "type": ["string", "null"] },
-        "payload": { "type": "object", "x-rust-type": "Value", "x-ts-type": "Record<string, JsonValue>" }
+        "event_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/EventCategory"
+        },
+        "occurred_at": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mission_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assignment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": "object",
+          "x-rust-type": "Value",
+          "x-ts-type": "Record<string, JsonValue>"
+        }
       }
     },
     "EventStreamSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["next_sequence", "recent_events"],
+      "required": [
+        "next_sequence",
+        "recent_events"
+      ],
       "properties": {
-        "next_sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "recent_events": { "type": "array", "items": { "$ref": "#/$defs/EventEnvelope" } }
+        "next_sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "recent_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          }
+        }
       }
     },
     "EventNotificationParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sequence", "event"],
+      "required": [
+        "sequence",
+        "event"
+      ],
       "properties": {
-        "sequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "event": { "$ref": "#/$defs/EventEnvelope" }
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "event": {
+          "$ref": "#/$defs/EventEnvelope"
+        }
       }
     },
     "EventSubscribeResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["subscribed", "nextSequence", "resyncRequired"],
+      "required": [
+        "subscribed",
+        "nextSequence",
+        "resyncRequired"
+      ],
       "properties": {
-        "subscribed": { "type": "boolean" },
-        "nextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "resyncRequired": { "type": "boolean" }
+        "subscribed": {
+          "type": "boolean"
+        },
+        "nextSequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "resyncRequired": {
+          "type": "boolean"
+        }
       }
     },
     "EventSnapshotParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["nextSequence", "recentEvents"],
+      "required": [
+        "nextSequence",
+        "recentEvents"
+      ],
       "properties": {
-        "nextSequence": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
+        "nextSequence": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
         "recentEvents": {
           "type": "array",
-          "items": { "$ref": "#/$defs/EventEnvelope" }
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          }
         }
       }
     },
     "EventResyncReason": {
       "type": "string",
-      "enum": ["afterSequenceExpired", "clientTooSlow"]
+      "enum": [
+        "afterSequenceExpired",
+        "clientTooSlow"
+      ]
     },
     "EventResyncRequiredParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reason", "requestedAfterSequence", "skipped", "snapshot"],
+      "required": [
+        "reason",
+        "requestedAfterSequence",
+        "skipped",
+        "snapshot"
+      ],
       "properties": {
-        "reason": { "$ref": "#/$defs/EventResyncReason" },
-        "requestedAfterSequence": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
-        "skipped": { "type": ["integer", "null"], "minimum": 0, "x-rust-type": "Option<u64>" },
-        "snapshot": { "$ref": "#/$defs/EventStreamSnapshot" }
+        "reason": {
+          "$ref": "#/$defs/EventResyncReason"
+        },
+        "requestedAfterSequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "skipped": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/EventStreamSnapshot"
+        }
       }
     },
     "BrowserToolAccess": {
       "type": "string",
-      "enum": ["read", "write", "mixed"]
+      "enum": [
+        "read",
+        "write",
+        "mixed"
+      ]
     },
     "BrowserToolDescriptor": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "access", "description", "inputSchema"],
+      "required": [
+        "name",
+        "access",
+        "description",
+        "inputSchema"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "access": { "$ref": "#/$defs/BrowserToolAccess" },
-        "description": { "type": "string", "minLength": 1 },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "access": {
+          "$ref": "#/$defs/BrowserToolAccess"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
         "inputSchema": {
           "type": "object",
           "x-rust-type": "Value",
@@ -678,182 +1627,432 @@
     },
     "BrowserHostStatus": {
       "type": "string",
-      "enum": ["stopped", "starting", "ready", "reconnecting", "failed"]
+      "enum": [
+        "stopped",
+        "starting",
+        "ready",
+        "reconnecting",
+        "failed"
+      ]
     },
     "BrowserCapabilitySnapshot": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "revision", "inAppBrowserEnabled", "browserUseEnabled", "devtoolsEnabled",
-        "lanAccessEnabled", "hostStatus", "hostProtocolCompatible"
+        "revision",
+        "inAppBrowserEnabled",
+        "browserUseEnabled",
+        "devtoolsEnabled",
+        "lanAccessEnabled",
+        "hostStatus",
+        "hostProtocolCompatible"
       ],
       "properties": {
-        "revision": { "type": "integer", "minimum": 0, "x-rust-type": "u64" },
-        "inAppBrowserEnabled": { "type": "boolean" },
-        "browserUseEnabled": { "type": "boolean" },
-        "devtoolsEnabled": { "type": "boolean" },
-        "lanAccessEnabled": { "type": "boolean" },
-        "hostStatus": { "$ref": "#/$defs/BrowserHostStatus" },
-        "hostProtocolCompatible": { "type": "boolean" }
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "inAppBrowserEnabled": {
+          "type": "boolean"
+        },
+        "browserUseEnabled": {
+          "type": "boolean"
+        },
+        "devtoolsEnabled": {
+          "type": "boolean"
+        },
+        "lanAccessEnabled": {
+          "type": "boolean"
+        },
+        "hostStatus": {
+          "$ref": "#/$defs/BrowserHostStatus"
+        },
+        "hostProtocolCompatible": {
+          "type": "boolean"
+        }
       }
     },
     "BrowserToolsListResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tools", "capabilities", "runtimeEpoch"],
+      "required": [
+        "tools",
+        "capabilities",
+        "runtimeEpoch"
+      ],
       "properties": {
         "tools": {
           "type": "array",
-          "items": { "$ref": "#/$defs/BrowserToolDescriptor" }
+          "items": {
+            "$ref": "#/$defs/BrowserToolDescriptor"
+          }
         },
-        "capabilities": { "$ref": "#/$defs/BrowserCapabilitySnapshot" },
-        "runtimeEpoch": { "type": "string", "minLength": 1 }
+        "capabilities": {
+          "$ref": "#/$defs/BrowserCapabilitySnapshot"
+        },
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "BrowserToolResultStatus": {
       "type": "string",
-      "enum": ["completed", "blocked", "failed", "cancelled", "indeterminate"]
+      "enum": [
+        "completed",
+        "blocked",
+        "failed",
+        "cancelled",
+        "indeterminate"
+      ]
     },
     "BrowserToolResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tool", "status", "payload", "itemId", "turnId", "runtimeEpoch"],
+      "required": [
+        "tool",
+        "status",
+        "payload",
+        "itemId",
+        "turnId",
+        "runtimeEpoch"
+      ],
       "properties": {
-        "tool": { "type": "string", "minLength": 1 },
-        "status": { "$ref": "#/$defs/BrowserToolResultStatus" },
-        "payload": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-ts-type": "JsonValue" },
-        "itemId": { "type": "string", "minLength": 1 },
-        "turnId": { "type": "string", "minLength": 1 },
-        "runtimeEpoch": { "type": "string", "minLength": 1 }
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/BrowserToolResultStatus"
+        },
+        "payload": {
+          "$ref": "#/$defs/JsonValue",
+          "x-rust-type": "Value",
+          "x-ts-type": "JsonValue"
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeEpoch": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "BrowserToolParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "tool", "arguments"],
+      "required": [
+        "sessionId",
+        "tool",
+        "arguments"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "tool": { "type": "string", "minLength": 1 },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
         "arguments": {
           "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/JsonValue" },
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
           "x-rust-type": "std::collections::HashMap<String, Value>",
           "x-ts-type": "Record<string, JsonValue>"
         },
-        "workspaceId": { "type": ["string", "null"] },
-        "callId": { "type": ["string", "null"] },
-        "browserExecutionId": { "type": ["string", "null"] },
-        "taskId": { "type": ["string", "null"] },
-        "workerId": { "type": ["string", "null"] }
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "callId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "browserExecutionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "ApprovalRequestParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "reason"],
+      "required": [
+        "sessionId",
+        "reason"
+      ],
       "properties": {
-        "sessionId": { "type": "string", "minLength": 1 },
-        "reason": { "type": "string", "minLength": 1 },
-        "risk": { "type": ["string", "null"] }
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "ApprovalDecision": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["approved"],
+      "required": [
+        "approved"
+      ],
       "properties": {
-        "approved": { "type": "boolean" }
+        "approved": {
+          "type": "boolean"
+        }
       }
     },
     "JsonRpcError": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code", "message"],
+      "required": [
+        "code",
+        "message"
+      ],
       "properties": {
-        "code": { "type": "integer", "x-rust-type": "i32" },
-        "message": { "type": "string", "minLength": 1 },
-        "data": { "$ref": "#/$defs/JsonValue" },
-        "retryable": { "type": "boolean" }
+        "code": {
+          "type": "integer",
+          "x-rust-type": "i32"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "data": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
       }
     },
     "JsonRpcRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "id", "method"],
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
-        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
-        "method": { "type": "string", "minLength": 1 },
-        "requestTimeoutMs": { "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "x-rust-type": "Option<u64>" },
-        "params": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-rust-default": true }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion",
+          "x-rust-type": "Option<String>"
+        },
+        "id": {
+          "$ref": "#/$defs/JsonRpcRequestId"
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestTimeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 100,
+          "maximum": 600000,
+          "x-rust-type": "Option<u64>"
+        },
+        "params": {
+          "$ref": "#/$defs/JsonValue",
+          "x-rust-type": "Value",
+          "x-rust-default": true
+        }
       }
     },
     "JsonRpcNotification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "method"],
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
-        "method": { "type": "string", "minLength": 1 },
-        "requestTimeoutMs": { "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "x-rust-type": "Option<u64>" },
-        "params": { "$ref": "#/$defs/JsonValue", "x-rust-type": "Value", "x-rust-default": true }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion",
+          "x-rust-type": "Option<String>"
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestTimeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 100,
+          "maximum": 600000,
+          "x-rust-type": "Option<u64>"
+        },
+        "params": {
+          "$ref": "#/$defs/JsonValue",
+          "x-rust-type": "Value",
+          "x-rust-default": true
+        }
       }
     },
     "JsonRpcResultResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "id", "result"],
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
-        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
-        "result": { "$ref": "#/$defs/JsonValue" }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion",
+          "x-rust-type": "Option<String>"
+        },
+        "id": {
+          "$ref": "#/$defs/JsonRpcRequestId"
+        },
+        "result": {
+          "$ref": "#/$defs/JsonValue"
+        }
       }
     },
     "JsonRpcErrorResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "id", "error"],
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
-        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
-        "error": { "$ref": "#/$defs/JsonRpcError" }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion",
+          "x-rust-type": "Option<String>"
+        },
+        "id": {
+          "$ref": "#/$defs/JsonRpcRequestId"
+        },
+        "error": {
+          "$ref": "#/$defs/JsonRpcError"
+        }
       }
     },
     "JsonRpcResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "id"],
+      "required": [
+        "jsonrpc",
+        "id"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion", "x-rust-type": "Option<String>" },
-        "id": { "$ref": "#/$defs/JsonRpcRequestId" },
-        "result": { "$ref": "#/$defs/JsonValue" },
-        "error": { "$ref": "#/$defs/JsonRpcError" }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion",
+          "x-rust-type": "Option<String>"
+        },
+        "id": {
+          "$ref": "#/$defs/JsonRpcRequestId"
+        },
+        "result": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "error": {
+          "$ref": "#/$defs/JsonRpcError"
+        }
       },
       "oneOf": [
-        { "required": ["result"], "not": { "required": ["error"] } },
-        { "required": ["error"], "not": { "required": ["result"] } }
+        {
+          "required": [
+            "result"
+          ],
+          "not": {
+            "required": [
+              "error"
+            ]
+          }
+        },
+        {
+          "required": [
+            "error"
+          ],
+          "not": {
+            "required": [
+              "result"
+            ]
+          }
+        }
       ]
     },
     "CancelMethod": {
       "type": "string",
-      "enum": ["$/cancelRequest"]
+      "enum": [
+        "$/cancelRequest"
+      ]
     },
     "CancelRequestParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/JsonRpcRequestId" }
+        "id": {
+          "$ref": "#/$defs/JsonRpcRequestId"
+        }
       }
     },
     "CancelNotification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["jsonrpc", "method", "params"],
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
       "properties": {
-        "jsonrpc": { "$ref": "#/$defs/JsonRpcVersion" },
-        "method": { "$ref": "#/$defs/CancelMethod" },
-        "params": { "$ref": "#/$defs/CancelRequestParams" }
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion"
+        },
+        "method": {
+          "$ref": "#/$defs/CancelMethod"
+        },
+        "params": {
+          "$ref": "#/$defs/CancelRequestParams"
+        }
       }
     },
     "JsonRpcServerRequest": {
@@ -884,91 +2083,428 @@
       "$ref": "#/$defs/JsonRpcServerResponse"
     },
     "PluginScopeKind": {
-      "type": "string", "enum": ["workspace", "application"]
+      "type": "string",
+      "enum": [
+        "workspace",
+        "application"
+      ]
     },
     "PluginPermissionKind": {
-      "type": "string", "enum": ["storage", "filesRead", "filesWrite", "network", "tools", "models", "browser"]
+      "type": "string",
+      "enum": [
+        "storage",
+        "filesRead",
+        "filesWrite",
+        "network",
+        "tools",
+        "models",
+        "browser"
+      ]
     },
     "PluginPermission": {
-      "type": "object", "additionalProperties": false,
-      "required": ["kind", "scope", "targets"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "scope",
+        "targets"
+      ],
       "properties": {
-        "kind": { "$ref": "#/$defs/PluginPermissionKind" },
-        "scope": { "$ref": "#/$defs/PluginScopeKind" },
-        "targets": { "type": "array", "items": { "type": "string" }, "maxItems": 64 }
+        "kind": {
+          "$ref": "#/$defs/PluginPermissionKind"
+        },
+        "scope": {
+          "$ref": "#/$defs/PluginScopeKind"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        }
       }
     },
     "PluginToolContribution": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "title", "description", "inputSchema", "readOnly"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "inputSchema",
+        "readOnly"
+      ],
       "properties": {
-        "id": { "type": "string", "maxLength": 64 },
-        "title": { "type": "string", "maxLength": 128 },
-        "description": { "type": "string", "maxLength": 4096 },
-        "inputSchema": { "type": "object" },
-        "readOnly": { "type": "boolean" }
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "inputSchema": {
+          "type": "object"
+        },
+        "readOnly": {
+          "type": "boolean"
+        }
       }
     },
     "PluginViewPlacement": {
-      "type": "string", "enum": ["settings", "home", "main", "rightPane"]
+      "type": "string",
+      "enum": [
+        "settings",
+        "home",
+        "main",
+        "rightPane"
+      ]
     },
     "PluginViewContribution": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "title", "entry", "placements"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "entry",
+        "placements"
+      ],
       "properties": {
-        "id": { "type": "string", "maxLength": 64 },
-        "title": { "type": "string", "maxLength": 128 },
-        "entry": { "type": "string", "maxLength": 256 },
-        "placements": { "type": "array", "items": { "$ref": "#/$defs/PluginViewPlacement" }, "minItems": 1, "maxItems": 4 }
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "entry": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "placements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginViewPlacement"
+          },
+          "minItems": 1,
+          "maxItems": 4
+        }
       }
     },
     "PluginNamedContribution": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "title", "description"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description"
+      ],
       "properties": {
-        "id": { "type": "string", "maxLength": 64 },
-        "title": { "type": "string", "maxLength": 128 },
-        "description": { "type": "string", "maxLength": 4096 }
+        "id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        }
       }
     },
     "PluginContributions": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "x-rust-derive-default": true,
       "properties": {
-        "tools": { "type": "array", "items": { "$ref": "#/$defs/PluginToolContribution" }, "x-rust-default": true },
-        "commands": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
-        "views": { "type": "array", "items": { "$ref": "#/$defs/PluginViewContribution" }, "x-rust-default": true },
-        "workflows": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
-        "engines": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true },
-        "resources": { "type": "array", "items": { "$ref": "#/$defs/PluginNamedContribution" }, "x-rust-default": true }
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginToolContribution"
+          },
+          "x-rust-default": true
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "x-rust-default": true
+        },
+        "views": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginViewContribution"
+          },
+          "x-rust-default": true
+        },
+        "workflows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "x-rust-default": true
+        },
+        "engines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "x-rust-default": true
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginNamedContribution"
+          },
+          "x-rust-default": true
+        }
       }
     },
     "PluginBackendEntry": {
-      "type": "string", "enum": ["plugin.mjs"]
+      "type": "string",
+      "enum": [
+        "plugin.mjs"
+      ]
     },
     "PluginManifest": {
-      "type": "object", "additionalProperties": false,
-      "required": ["sdkVersion", "id", "version", "name", "description", "backend", "applicationInstance", "permissions", "contributions", "settingsSchema", "dataSchemaVersion"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sdkVersion",
+        "id",
+        "version",
+        "name",
+        "description",
+        "backend",
+        "applicationInstance",
+        "permissions",
+        "contributions",
+        "settingsSchema",
+        "dataSchemaVersion"
+      ],
       "properties": {
-        "sdkVersion": { "type": "integer", "minimum": 1, "maximum": 1 },
-        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$", "maxLength": 96 },
-        "version": { "type": "string", "maxLength": 64 },
-        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "description": { "type": "string", "maxLength": 4096 },
-        "backend": { "$ref": "#/$defs/PluginBackendEntry" },
-        "applicationInstance": { "type": "boolean" },
-        "permissions": { "type": "array", "items": { "$ref": "#/$defs/PluginPermission" }, "maxItems": 64 },
-        "contributions": { "$ref": "#/$defs/PluginContributions" },
-        "settingsSchema": { "type": "object" },
-        "dataSchemaVersion": { "type": "integer", "minimum": 1 }
+        "sdkVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$",
+          "maxLength": 96
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "backend": {
+          "$ref": "#/$defs/PluginBackendEntry"
+        },
+        "applicationInstance": {
+          "type": "boolean"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginPermission"
+          },
+          "maxItems": 64
+        },
+        "contributions": {
+          "$ref": "#/$defs/PluginContributions"
+        },
+        "settingsSchema": {
+          "type": "object"
+        },
+        "dataSchemaVersion": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "JsonRpcMessage": {
       "oneOf": [
-        { "$ref": "#/$defs/JsonRpcRequest" },
-        { "$ref": "#/$defs/JsonRpcNotification" },
-        { "$ref": "#/$defs/JsonRpcResponse" }
+        {
+          "$ref": "#/$defs/JsonRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/JsonRpcNotification"
+        },
+        {
+          "$ref": "#/$defs/JsonRpcResponse"
+        }
       ]
+    },
+    "PluginScopeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "PluginAuthorizeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "grants"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "grants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginPermission"
+          }
+        }
+      }
+    },
+    "PluginInstallRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "archiveBase64": {
+          "type": "string"
+        }
+      }
+    },
+    "PluginScopeGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "permissions"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginPermission"
+          }
+        }
+      }
+    },
+    "PluginInstalled": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "digest",
+        "enabledScopes",
+        "activeScopes",
+        "grants"
+      ],
+      "properties": {
+        "manifest": {
+          "$ref": "#/$defs/PluginManifest"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "enabledScopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activeScopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "grants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginScopeGrant"
+          }
+        }
+      }
+    },
+    "PluginList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plugins"
+      ],
+      "properties": {
+        "plugins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginInstalled"
+          }
+        }
+      }
+    },
+    "PluginResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "value"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "x-rust-type": "u64"
+        },
+        "value": {}
+      }
+    },
+    "PluginResourceWriteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedVersion",
+        "value"
+      ],
+      "properties": {
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "x-rust-type": "u64"
+        },
+        "value": {}
+      }
     }
   }
 }

@@ -33,9 +33,11 @@ pub use generated::{
 };
 
 pub use generated::{
-    PluginBackendEntry, PluginContributions, PluginManifest, PluginNamedContribution,
-    PluginPermission, PluginPermissionKind, PluginScopeKind, PluginToolContribution,
-    PluginViewContribution, PluginViewPlacement,
+    PluginAuthorizeRequest, PluginBackendEntry, PluginContributions, PluginInstallRequest,
+    PluginInstalled, PluginList, PluginManifest, PluginNamedContribution, PluginPermission,
+    PluginPermissionKind, PluginResource, PluginResourceWriteRequest, PluginScopeGrant,
+    PluginScopeKind, PluginScopeRequest, PluginToolContribution, PluginViewContribution,
+    PluginViewPlacement,
 };
 
 pub const ERROR_INVALID_REQUEST: i32 = -32600;

@@ -1368,3 +1368,66 @@ pub enum JsonRpcMessage {
     Notification(JsonRpcNotification),
     Variant3(JsonRpcResponse),
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginScopeRequest {
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginAuthorizeRequest {
+    pub scope: String,
+    pub grants: Vec<PluginPermission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginInstallRequest {
+    pub source: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "archiveBase64")]
+    pub archive_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginScopeGrant {
+    pub scope: String,
+    pub permissions: Vec<PluginPermission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginInstalled {
+    pub manifest: PluginManifest,
+    pub digest: String,
+    #[serde(rename = "enabledScopes")]
+    pub enabled_scopes: Vec<String>,
+    #[serde(rename = "activeScopes")]
+    pub active_scopes: Vec<String>,
+    pub grants: Vec<PluginScopeGrant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginList {
+    pub plugins: Vec<PluginInstalled>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginResource {
+    pub version: u64,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginResourceWriteRequest {
+    #[serde(rename = "expectedVersion")]
+    pub expected_version: u64,
+    pub value: Value,
+}

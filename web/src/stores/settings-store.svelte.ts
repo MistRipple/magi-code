@@ -323,7 +323,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let mcpAutoConnectStale = false;
 
   // 当前激活的 Tab
-  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "safeguard" | "project">(
+  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "safeguard" | "project" | "plugins" | `plugin:${string}`>(
     "model",
   );
 

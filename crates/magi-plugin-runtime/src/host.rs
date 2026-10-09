@@ -163,14 +163,35 @@ impl PluginHost {
                         {
                             return Err(protocol_error("Worker 能力请求身份、顺序或数量无效"));
                         }
-                        let result = handler
-                            .call(CapabilityRequest {
-                                identity: invocation.identity.clone(),
-                                operation,
-                                arguments,
-                                cancellation: callback_cancellation.clone(),
-                            })
-                            .await;
+                        let capability = handler.call(CapabilityRequest {
+                            identity: invocation.identity.clone(),
+                            operation,
+                            arguments,
+                            cancellation: callback_cancellation.clone(),
+                        });
+                        tokio::pin!(capability);
+                        let result = tokio::select! {
+                            biased;
+                            result = &mut capability => result,
+                            _ = cancellation.cancelled() => {
+                                // 先通知能力处理器，再给它一个有限的结算窗口。
+                                // 处理器合同要求取消后结束自身的外部请求；窗口耗尽后
+                                // 仍会终止受管 Worker，绝不把调用留成脱离宿主的后台链。
+                                callback_cancellation.cancel();
+                                match tokio::time::timeout(
+                                    Duration::from_millis(100),
+                                    &mut capability,
+                                ).await {
+                                    Ok(result) => result,
+                                    Err(_) => Err(cancelled_error()),
+                                }
+                            }
+                        };
+                        let result = if cancellation.is_cancelled() {
+                            Err(cancelled_error())
+                        } else {
+                            result
+                        };
                         let reply = serde_json::to_vec(&CapabilityReply { sequence, result })
                             .map_err(protocol_error)?;
                         if reply.len() + 1 > invocation.limits.max_frame_bytes {

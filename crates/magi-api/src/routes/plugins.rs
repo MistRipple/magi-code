@@ -7,37 +7,14 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use magi_plugin_system::{MAX_PACKAGE_BYTES, PluginPackage, PluginPermission, PluginSource};
-use serde::{Deserialize, Serialize};
+use magi_plugin_system::{MAX_PACKAGE_BYTES, PluginPackage, PluginSource};
+use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct InstallRequest {
-    #[serde(default)]
-    archive_base64: Option<String>,
-    source: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ScopeRequest {
-    scope: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AuthorizeRequest {
-    scope: String,
-    grants: Vec<PluginPermission>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResourceWriteRequest {
-    expected_version: u64,
-    value: Value,
-}
+type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
+type ScopeRequest = magi_app_server_protocol::PluginScopeRequest;
+type AuthorizeRequest = magi_app_server_protocol::PluginAuthorizeRequest;
+type ResourceWriteRequest = magi_app_server_protocol::PluginResourceWriteRequest;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -45,16 +22,11 @@ struct ScopeQuery {
     scope: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginList {
-    plugins: Vec<magi_plugin_system::InstalledPlugin>,
-}
-
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/plugins", get(list))
         .route("/plugins/manifests", get(manifests))
+        .route("/plugins/{id}/manifest", get(manifest))
         .route("/plugins/{id}/ui/{*path}", get(resource))
         .route(
             "/plugins/{id}/resources/{resource}",
@@ -70,14 +42,14 @@ pub fn routes() -> Router<ApiState> {
         .route("/plugins/{id}/uninstall", post(uninstall))
 }
 
-async fn list(State(state): State<ApiState>) -> Result<Json<PluginList>, ApiError> {
+async fn list(
+    State(state): State<ApiState>,
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let manager = state
         .plugin_manager
         .lock()
         .map_err(|_| ApiError::internal_assembly("读取插件状态失败", "插件锁已损坏"))?;
-    Ok(Json(PluginList {
-        plugins: manager.state().plugins.values().cloned().collect(),
-    }))
+    manager.projection().map(Json).map_err(plugin_error)
 }
 
 async fn manifests(
@@ -89,6 +61,20 @@ async fn manifests(
         .manifests_for_scope(&query.scope)
         .map_err(plugin_error)?;
     Ok(Json(manifests))
+}
+
+async fn manifest(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<magi_app_server_protocol::PluginManifest>, ApiError> {
+    let manager = locked(&state, "读取插件清单")?;
+    Ok(Json(
+        manager
+            .package(&id)
+            .map_err(plugin_error)?
+            .manifest()
+            .clone(),
+    ))
 }
 
 async fn resource(
@@ -141,14 +127,13 @@ async fn read_resource(
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     ensure_declared_resource(&manager, &id, &resource)?;
-    let snapshot =
-        manager
-            .resources()
-            .read(&id, &resource)
-            .unwrap_or(magi_plugin_system::PluginResource {
-                version: 0,
-                value: Value::Null,
-            });
+    let snapshot = manager
+        .resources()
+        .read(&id, &query.scope, &resource)
+        .unwrap_or(magi_plugin_system::PluginResource {
+            version: 0,
+            value: Value::Null,
+        });
     Ok(Json(snapshot))
 }
 
@@ -166,10 +151,13 @@ async fn write_resource(
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     ensure_declared_resource(&manager, &id, &resource)?;
-    let result =
-        manager
-            .resources_mut()
-            .write(&id, &resource, request.expected_version, request.value);
+    let result = manager.resources_mut().write(
+        &id,
+        &query.scope,
+        &resource,
+        request.expected_version,
+        request.value,
+    );
     result.map(Json).map_err(|error| match error {
         magi_plugin_system::ResourceError::Conflict { .. } => ApiError::Conflict(error.to_string()),
         magi_plugin_system::ResourceError::Invalid(message) => ApiError::InvalidInput(message),
@@ -182,7 +170,7 @@ async fn write_resource(
 async fn install(
     State(state): State<ApiState>,
     Json(request): Json<InstallRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let source = parse_source(&request.source)?;
     let bytes = match (request.archive_base64, &source) {
         (Some(encoded), _) => base64::engine::general_purpose::STANDARD
@@ -229,15 +217,13 @@ async fn install(
         .lock()
         .map_err(|_| ApiError::internal_assembly("安装插件失败", "插件锁已损坏"))?;
     manager.install(&package, source).map_err(plugin_error)?;
-    Ok(Json(PluginList {
-        plugins: manager.state().plugins.values().cloned().collect(),
-    }))
+    manager.projection().map(Json).map_err(plugin_error)
 }
 
 async fn upgrade(
     State(state): State<ApiState>,
     Json(request): Json<InstallRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let source = parse_source(&request.source)?;
     let bytes = match request.archive_base64 {
         Some(encoded) => base64::engine::general_purpose::STANDARD
@@ -256,32 +242,32 @@ async fn upgrade(
         .lock()
         .map_err(|_| ApiError::internal_assembly("升级插件失败", "插件锁已损坏"))?;
     manager.upgrade(&package, source).map_err(plugin_error)?;
-    Ok(snapshot(&manager))
+    snapshot(&manager)
 }
 
 async fn authorize(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<AuthorizeRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let mut manager = locked(&state, "授权插件")?;
     manager
         .authorize(&id, &request.scope, request.grants)
         .map_err(plugin_error)?;
-    Ok(snapshot(&manager))
+    snapshot(&manager)
 }
 async fn enable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     mutate_scope(&state, |m| m.enable(&id, &request.scope), "启用插件")
 }
 async fn activate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     mutate_scope(
         &state,
         |m| m.activate(&id, &request.scope).map(|_| ()),
@@ -292,36 +278,36 @@ async fn deactivate(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     mutate_scope(&state, |m| m.deactivate(&id, &request.scope), "停用插件")
 }
 async fn disable(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     mutate_scope(&state, |m| m.disable(&id, &request.scope), "禁用插件")
 }
 async fn uninstall(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<PluginList>, ApiError> {
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
     let mut manager = locked(&state, "卸载插件")?;
     manager.uninstall(&id).map_err(plugin_error)?;
-    Ok(snapshot(&manager))
+    snapshot(&manager)
 }
 
 fn mutate_scope<F>(
     state: &ApiState,
     mut operation: F,
     action: &str,
-) -> Result<Json<PluginList>, ApiError>
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError>
 where
     F: FnMut(&mut magi_plugin_system::PluginManager) -> Result<(), magi_plugin_system::PluginError>,
 {
     let mut manager = locked(state, action)?;
     operation(&mut manager).map_err(plugin_error)?;
-    Ok(snapshot(&manager))
+    snapshot(&manager)
 }
 fn locked<'a>(
     state: &'a ApiState,
@@ -332,10 +318,10 @@ fn locked<'a>(
         .lock()
         .map_err(|_| ApiError::internal_assembly(action, "插件锁已损坏"))
 }
-fn snapshot(manager: &magi_plugin_system::PluginManager) -> Json<PluginList> {
-    Json(PluginList {
-        plugins: manager.state().plugins.values().cloned().collect(),
-    })
+fn snapshot(
+    manager: &magi_plugin_system::PluginManager,
+) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
+    manager.projection().map(Json).map_err(plugin_error)
 }
 fn plugin_error(error: magi_plugin_system::PluginError) -> ApiError {
     match error {

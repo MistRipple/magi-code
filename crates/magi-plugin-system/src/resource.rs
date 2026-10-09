@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-const STATE_VERSION: u16 = 1;
+const STATE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,12 +44,16 @@ impl PluginResourceStore {
         }
         Ok(Self { path, state })
     }
-    pub fn read(&self, plugin_id: &str, resource_id: &str) -> Option<PluginResource> {
-        self.state.values.get(&key(plugin_id, resource_id)).cloned()
+    pub fn read(&self, plugin_id: &str, scope: &str, resource_id: &str) -> Option<PluginResource> {
+        self.state
+            .values
+            .get(&key(plugin_id, scope, resource_id))
+            .cloned()
     }
     pub fn write(
         &mut self,
         plugin_id: &str,
+        scope: &str,
         resource_id: &str,
         expected_version: u64,
         value: Value,
@@ -57,7 +61,7 @@ impl PluginResourceStore {
         if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 4 * 1024 * 1024) {
             return Err(ResourceError::Invalid("资源快照超限".into()));
         }
-        let key = key(plugin_id, resource_id);
+        let key = key(plugin_id, scope, resource_id);
         let current = self
             .state
             .values
@@ -93,6 +97,6 @@ pub enum ResourceError {
     Storage(String),
 }
 
-fn key(plugin_id: &str, resource_id: &str) -> String {
-    format!("{plugin_id}\u{1f}{resource_id}")
+fn key(plugin_id: &str, scope: &str, resource_id: &str) -> String {
+    format!("{plugin_id}\u{1f}{scope}\u{1f}{resource_id}")
 }
