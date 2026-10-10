@@ -245,6 +245,7 @@ impl SessionEngineFactory for PluginSessionEngineFactory {
             attempt_id: None,
         };
         let adapter = PluginSessionEngine::new(
+            Arc::clone(&self.manager),
             self.host.clone(),
             package.source().to_string(),
             identity,

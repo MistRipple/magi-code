@@ -1,6 +1,9 @@
 use magi_plugin_system::{PluginManager, PluginPackage, PluginSource};
 use serde_json::{Value, json};
-use std::io::{Cursor, Write};
+use std::{
+    io::{Cursor, Write},
+    sync::{Arc, Mutex},
+};
 use tempfile::tempdir;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -310,6 +313,45 @@ fn runtime_identity_rejects_stale_package_and_foreign_scope() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn runtime_lease_blocks_deactivation_until_worker_is_settled() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "runtime-lease.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle", "workspace:one").unwrap();
+    manager.activate("acme.lifecycle", "workspace:one").unwrap();
+
+    let manager = Arc::new(Mutex::new(manager));
+    let lease = magi_plugin_system::PluginRuntimeLease::acquire(
+        Arc::clone(&manager),
+        "acme.lifecycle",
+        package.digest(),
+        "workspace:one",
+    )
+    .unwrap();
+    assert!(
+        manager
+            .lock()
+            .unwrap()
+            .deactivate("acme.lifecycle", "workspace:one")
+            .is_err()
+    );
+    drop(lease);
+    manager
+        .lock()
+        .unwrap()
+        .deactivate("acme.lifecycle", "workspace:one")
+        .unwrap();
 }
 
 #[test]

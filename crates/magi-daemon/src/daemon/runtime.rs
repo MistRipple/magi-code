@@ -491,9 +491,24 @@ fn build_plugin_tool_executor(
             limits: RuntimeLimits::default(),
         };
         drop(manager);
+        let lease = match magi_plugin_system::PluginRuntimeLease::acquire(
+            Arc::clone(&plugin_manager),
+            &invocation.identity.plugin_id,
+            &invocation.identity.package_digest,
+            &invocation.identity.instance_id,
+        ) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return (
+                    "{\"status\":\"rejected\",\"error\":\"插件运行租约不可用\"}".into(),
+                    magi_core::ExecutionResultStatus::Rejected,
+                );
+            }
+        };
         let host = plugin_host.clone();
         let capability_handler = Arc::clone(&handler);
         let result = std::thread::spawn(move || {
+            let _lease = lease;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

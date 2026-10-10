@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 const STATE_FILE: &str = "state.json";
@@ -65,6 +66,53 @@ pub struct PluginManager {
     root: PathBuf,
     state: PluginManagerState,
     resources: PluginResourceStore,
+    runtime_leases: BTreeMap<(String, String), usize>,
+}
+
+/// 一次插件 Worker 调用的内存运行租约。
+///
+/// 租约不进入持久化状态，只覆盖当前进程中的在途调用。释放或崩溃时由 Drop
+/// 收口，生命周期操作据此拒绝在途停用，避免把旧 Worker 留在半失效状态。
+pub struct PluginRuntimeLease {
+    manager: Arc<Mutex<PluginManager>>,
+    key: (String, String),
+}
+
+impl PluginRuntimeLease {
+    pub fn acquire(
+        manager: Arc<Mutex<PluginManager>>,
+        id: &str,
+        package_digest: &str,
+        scope: &str,
+    ) -> Result<Self, PluginError> {
+        let mut guard = manager
+            .lock()
+            .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))?;
+        guard.validate_runtime_identity(id, package_digest, scope, scope)?;
+        let key = (id.to_owned(), scope.to_owned());
+        *guard.runtime_leases.entry(key.clone()).or_default() += 1;
+        drop(guard);
+        Ok(Self { manager, key })
+    }
+}
+
+impl Drop for PluginRuntimeLease {
+    fn drop(&mut self) {
+        let Ok(mut manager) = self.manager.lock() else {
+            return;
+        };
+        let remove = match manager.runtime_leases.get_mut(&self.key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            manager.runtime_leases.remove(&self.key);
+        }
+    }
 }
 
 impl PluginManager {
@@ -90,6 +138,7 @@ impl PluginManager {
             root,
             state,
             resources,
+            runtime_leases: BTreeMap::new(),
         })
     }
 
@@ -365,6 +414,13 @@ impl PluginManager {
 
     pub fn deactivate(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         validate_scope_key(scope)?;
+        if self
+            .runtime_leases
+            .get(&(id.to_owned(), scope.to_owned()))
+            .is_some_and(|count| *count > 0)
+        {
+            return Err(conflict("插件仍有在途运行，必须先完成或取消后再停用"));
+        }
         let mut next = self.state.clone();
         let installed = next
             .plugins

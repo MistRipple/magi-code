@@ -7,6 +7,7 @@ use std::sync::Arc;
 /// 将已固定版本的插件后台入口适配为工作流核心。每次决策都启动一次受管 Worker，
 /// 不保留插件全局状态，也不在插件失败时隐式换用默认核心。
 pub struct PluginWorkflowCore {
+    manager: Arc<std::sync::Mutex<crate::PluginManager>>,
     host: PluginHost,
     source: String,
     identity: InvocationIdentity,
@@ -16,6 +17,7 @@ pub struct PluginWorkflowCore {
 
 impl PluginWorkflowCore {
     pub fn new(
+        manager: Arc<std::sync::Mutex<crate::PluginManager>>,
         host: PluginHost,
         source: impl Into<String>,
         identity: InvocationIdentity,
@@ -23,6 +25,7 @@ impl PluginWorkflowCore {
         limits: RuntimeLimits,
     ) -> Self {
         Self {
+            manager,
             host,
             source: source.into(),
             identity,
@@ -50,6 +53,15 @@ impl WorkflowCore for PluginWorkflowCore {
                 })?,
                 limits: self.limits,
             };
+            let _lease = crate::PluginRuntimeLease::acquire(
+                Arc::clone(&self.manager),
+                &invocation.identity.plugin_id,
+                &invocation.identity.package_digest,
+                &invocation.identity.instance_id,
+            )
+            .map_err(|error| WorkflowError {
+                message: error.to_string(),
+            })?;
             let result = self
                 .host
                 .invoke(invocation, self.handler.as_ref(), cancellation)

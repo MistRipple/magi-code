@@ -3,6 +3,7 @@
 //! 引擎只负责消息传递与流式结果；Turn、权限、上下文预算、取消和持久化仍由 daemon
 //! 持有。适配器不能提交工具成功、审批结果或终态事实。
 
+use crate::PluginManager;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub trait SessionEngineAdapter: Send + Sync {
 /// 由唯一 QuickJS Worker 承载的插件会话引擎适配器。
 /// 后台返回 `{events:[...]}`，宿主逐个校验并发布事件；插件不能直接写 Turn。
 pub struct PluginSessionEngine {
+    manager: Arc<std::sync::Mutex<PluginManager>>,
     host: magi_plugin_runtime::PluginHost,
     source: String,
     identity: magi_plugin_runtime::InvocationIdentity,
@@ -58,6 +60,7 @@ pub struct PluginSessionEngine {
 
 impl PluginSessionEngine {
     pub fn new(
+        manager: Arc<std::sync::Mutex<PluginManager>>,
         host: magi_plugin_runtime::PluginHost,
         source: impl Into<String>,
         identity: magi_plugin_runtime::InvocationIdentity,
@@ -66,6 +69,7 @@ impl PluginSessionEngine {
         readiness: EngineReadiness,
     ) -> Self {
         Self {
+            manager,
             host,
             source: source.into(),
             identity,
@@ -105,6 +109,16 @@ impl SessionEngineAdapter for PluginSessionEngine {
                 })?,
                 limits: self.limits,
             };
+            let _lease = crate::PluginRuntimeLease::acquire(
+                Arc::clone(&self.manager),
+                &invocation.identity.plugin_id,
+                &invocation.identity.package_digest,
+                &invocation.identity.instance_id,
+            )
+            .map_err(|error| EngineEvent::Failed {
+                code: "lease_rejected".into(),
+                detail: error.to_string(),
+            })?;
             let cancellation = magi_plugin_runtime::RunCancellation::default();
             let future = self
                 .host

@@ -19,7 +19,8 @@ pub use engine::{
     EngineEvent, EngineReadiness, PluginSessionEngine, SessionEngineAdapter, SessionEngineRequest,
 };
 pub use lifecycle::{
-    ActivePlugin, InstalledPlugin, PluginManager, PluginManagerState, PluginSource,
+    ActivePlugin, InstalledPlugin, PluginManager, PluginManagerState, PluginRuntimeLease,
+    PluginSource,
 };
 pub use magi_app_server_protocol::{
     PluginManifest, PluginPermission, PluginPermissionKind, PluginScopeKind,

@@ -140,6 +140,7 @@ impl WorkflowCoreFactory for PluginWorkflowCoreFactory {
             attempt_id: None,
         };
         Ok(Arc::new(PluginWorkflowCore::new(
+            Arc::clone(&self.manager),
             self.host.clone(),
             package.source().to_string(),
             identity,

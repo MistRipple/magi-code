@@ -75,6 +75,7 @@ impl PluginCommandRunner {
         identity: InvocationIdentity,
         input: Value,
         cancellation: &RunCancellation,
+        lease: crate::PluginRuntimeLease,
     ) -> Result<Value, String> {
         let invocation = Invocation {
             identity,
@@ -86,6 +87,7 @@ impl PluginCommandRunner {
         let handler = Arc::clone(&self.handler);
         let cancellation = cancellation.clone();
         std::thread::spawn(move || {
+            let _lease = lease;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -137,19 +139,27 @@ impl PluginCommandExecutor for PluginCommandRunner {
             return Err("插件命令贡献不存在".into());
         }
         let package_source = package.source().to_string();
+        let package_digest = package.digest().to_string();
+        drop(manager);
+        let lease = crate::PluginRuntimeLease::acquire(
+            Arc::clone(&self.manager),
+            &plugin_id,
+            &package_digest,
+            &scope,
+        )
+        .map_err(|error| error.to_string())?;
         let identity = InvocationIdentity {
             plugin_id,
-            package_digest: package.digest().to_string(),
+            package_digest,
             instance_id: scope,
             invocation_id: format!("{}:{}", invocation.turn_id, invocation.command_id),
             workspace_id: invocation.workspace_id.clone(),
             run_id: Some(invocation.turn_id.clone()),
             attempt_id: Some(invocation.session_id.clone()),
         };
-        drop(manager);
         let input =
             serde_json::to_value(&invocation).map_err(|_| "插件命令输入无效".to_string())?;
-        let result = self.invoke_worker(package_source, identity, input, cancellation)?;
+        let result = self.invoke_worker(package_source, identity, input, cancellation, lease)?;
         let result: PluginCommandResult = serde_json::from_value(result)
             .map_err(|_| "插件命令必须返回 {content:string}".to_string())?;
         if result.content.trim().is_empty() || result.content.len() > 1_048_576 {
