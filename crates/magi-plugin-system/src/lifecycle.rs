@@ -487,6 +487,14 @@ impl PluginManager {
             .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))?;
         let package = guard.package(id)?;
         validate_scope(package.manifest(), scope)?;
+        let installed = guard
+            .state
+            .plugins
+            .get(id)
+            .ok_or_else(|| conflict("插件未安装"))?;
+        if !installed.active_scopes.contains(scope) {
+            return Err(conflict("插件作用域未激活"));
+        }
         let key = (id.to_owned(), scope.to_owned());
         if !guard.draining_scopes.insert(key.clone()) {
             return Err(conflict("插件作用域已经在排空"));
