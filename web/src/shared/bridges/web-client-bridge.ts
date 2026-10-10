@@ -3924,6 +3924,7 @@ interface ExecuteTaskInput {
   resume?: boolean;
   command?: SessionTurnCommand | null;
   workflowId?: string | null;
+  pluginCommandId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
@@ -3965,6 +3966,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
     workflowId: turn.workflowId ?? null,
+    pluginCommandId: turn.pluginCommandId ?? null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -4130,7 +4132,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const workflowId = typeof input.workflowId === 'string' && input.workflowId.trim()
     ? input.workflowId.trim()
     : null;
-  if (!command && !workflowId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
+  const pluginCommandId = typeof input.pluginCommandId === 'string' && input.pluginCommandId.trim()
+    ? input.pluginCommandId.trim()
+    : null;
+  if (!command && !workflowId && !pluginCommandId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4188,6 +4193,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(input.goalMode === true ? { goalMode: true } : {}),
       ...(command ? { sessionCommand: command } : {}),
       ...(workflowId ? { workflowId } : {}),
+      ...(pluginCommandId ? { pluginCommandId } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4216,6 +4222,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       resume: input.resume === true,
       command,
       workflowId,
+      pluginCommandId,
       images,
       contextReferences,
       browserAnnotationRefs,

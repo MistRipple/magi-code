@@ -455,6 +455,7 @@ struct QueuedSessionTurnDto {
     text: Option<String>,
     command: Option<magi_app_server_protocol::SessionTurnCommand>,
     workflow_id: Option<String>,
+    plugin_command_id: Option<String>,
     skill_name: Option<String>,
     goal_mode: bool,
     access_profile: Option<AccessProfile>,
@@ -514,6 +515,7 @@ fn session_turn_queue_response(
                 text,
                 command: queued.request.command.clone(),
                 workflow_id: queued.request.workflow_id.clone(),
+                plugin_command_id: queued.request.plugin_command_id.clone(),
                 skill_name: queued.request.skill_name.clone(),
                 goal_mode: queued.request.goal_mode,
                 access_profile: queued.request.access_profile,
@@ -658,6 +660,10 @@ pub(crate) async fn submit_session_turn_internal(
         .workflow_id
         .as_deref()
         .and_then(|workflow_id| trimmed_non_empty(Some(workflow_id)).map(str::to_string));
+    request.plugin_command_id = request
+        .plugin_command_id
+        .as_deref()
+        .and_then(|command_id| trimmed_non_empty(Some(command_id)).map(str::to_string));
     validate_session_turn_input(&request)?;
     request
         .validate_context_references()
@@ -699,6 +705,7 @@ pub(crate) async fn submit_session_turn_internal(
         )?
     };
     validate_workflow_selection(&state, &request, &scope)?;
+    validate_plugin_command_selection(&state, &request, &scope)?;
     let workspace_id = scope.workspace_id();
     if request.steer_current_turn && (request.goal_mode || request.resume) {
         return Err(ApiError::InvalidInput(
@@ -1320,6 +1327,7 @@ async fn submit_steer_current_turn_after_turn_commit(
 fn session_turn_request_is_plain_text(request: &SessionTurnRequestDto) -> bool {
     request.command.is_none()
         && request.workflow_id.is_none()
+        && request.plugin_command_id.is_none()
         && request.trimmed_text().is_some()
         && request
             .skill_name
@@ -1366,6 +1374,7 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
         && request.browser_annotation_refs.is_empty()
         && request.browser_node_selections.is_empty()
         && request.workflow_id.is_none()
+        && request.plugin_command_id.is_none()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -1417,6 +1426,60 @@ fn validate_workflow_selection(
     }
 }
 
+fn validate_plugin_command_selection(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    scope: &SessionScope,
+) -> Result<(), ApiError> {
+    let Some(command_id) = request.plugin_command_id.as_deref() else {
+        return Ok(());
+    };
+    if !command_id.starts_with("plugin/") || command_id.len() > 192 {
+        return Err(ApiError::InvalidInput("插件命令身份无效".into()));
+    }
+    if request.command.is_some()
+        || request.workflow_id.is_some()
+        || request
+            .skill_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || request.goal_mode
+        || !request.images.is_empty()
+        || !request.context_references.is_empty()
+        || !request.browser_annotation_refs.is_empty()
+        || !request.browser_node_selections.is_empty()
+        || request.steer_current_turn
+        || request.replace_turn_id().is_some()
+    {
+        return Err(ApiError::InvalidInput(
+            "插件命令不能与其他控制输入同时提交".into(),
+        ));
+    }
+    let scope_key = scope
+        .workspace_id()
+        .map(|id| format!("workspace:{id}"))
+        .unwrap_or_else(|| "application".into());
+    let rest = command_id
+        .strip_prefix("plugin/")
+        .and_then(|value| value.rsplit_once('/'))
+        .filter(|(plugin_id, contribution_id)| !plugin_id.is_empty() && !contribution_id.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("插件命令身份无效".into()))?;
+    let manager = state
+        .plugin_manager
+        .lock()
+        .map_err(|_| ApiError::internal_assembly("校验插件命令失败", "插件锁已损坏"))?;
+    let available = manager
+        .command_contributions_for_scope(&scope_key)
+        .map_err(|error| ApiError::internal_assembly("读取插件命令失败", error.to_string()))?
+        .into_iter()
+        .any(|(manifest, command)| manifest.id == rest.0 && command.id == rest.1);
+    if available {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("所选插件命令未在当前作用域激活".into()))
+    }
+}
+
 /// 会话命令只能作为已有会话中的独立轮次提交；文本是命令参数。
 fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
     if request.requested_session_id().is_none() {
@@ -1433,7 +1496,8 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
         || !request.context_references.is_empty()
         || !request.browser_annotation_refs.is_empty()
         || !request.browser_node_selections.is_empty()
-        || request.workflow_id.is_some();
+        || request.workflow_id.is_some()
+        || request.plugin_command_id.is_some();
     if combined_with_other_input {
         return Err(ApiError::InvalidInput(
             "会话命令不能与技能、目标模式、图片或上下文引用同时提交".to_string(),
@@ -1472,6 +1536,9 @@ fn decide_session_turn(
         ));
     }
     if request.command.is_some() {
+        return Ok(session_turn_command_decision());
+    }
+    if request.plugin_command_id.is_some() {
         return Ok(session_turn_command_decision());
     }
     if request.workflow_id.is_some() {
@@ -1845,6 +1912,12 @@ async fn submit_conversation_session_turn(
             serde_json::to_value(command).expect("session command must serialize"),
         );
     }
+    if let Some(plugin_command_id) = request.plugin_command_id.as_ref() {
+        metadata.insert(
+            "magi.pluginCommandId".to_string(),
+            serde_json::Value::String(plugin_command_id.clone()),
+        );
+    }
     metadata.extend([
         (
             "route".to_string(),
@@ -2006,13 +2079,25 @@ async fn submit_conversation_session_turn(
         request_id: Some(request_id),
         user_message_id: Some(user_message_id.clone()),
         placeholder_message_id: request.placeholder_message_id(),
-        command: request.command.as_ref().map(|command| match command {
-            magi_app_server_protocol::SessionTurnCommand::Compact => {
-                SessionTurnCommand::CompactContext {
-                    instructions: request.trimmed_text(),
+        command: request
+            .command
+            .as_ref()
+            .map(|command| match command {
+                magi_app_server_protocol::SessionTurnCommand::Compact => {
+                    SessionTurnCommand::CompactContext {
+                        instructions: request.trimmed_text(),
+                    }
                 }
-            }
-        }),
+            })
+            .or_else(|| {
+                request
+                    .plugin_command_id
+                    .as_ref()
+                    .map(|command_id| SessionTurnCommand::Plugin {
+                        command_id: command_id.clone(),
+                        arguments: request.trimmed_text(),
+                    })
+            }),
     };
     schedule_conversation_execution(state.clone(), execution_request, attempt, trace);
     // 新会话的标题：交给辅助模型根据首条消息精修（未配置辅助模型时静默保留占位标题）。
@@ -6035,6 +6120,7 @@ mod tests {
             replace_turn_id: None,
             command: None,
             workflow_id: None,
+            plugin_command_id: None,
         }
     }
 

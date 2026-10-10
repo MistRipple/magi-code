@@ -2304,6 +2304,13 @@ impl DaemonRuntime {
                 build_plugin_capability_handler(self.plugin_manager.clone()),
                 RuntimeLimits::default(),
             ));
+        let plugin_command_executor: Arc<dyn magi_plugin_system::PluginCommandExecutor> =
+            Arc::new(magi_plugin_system::PluginCommandRunner::new(
+                self.plugin_manager.clone(),
+                self.plugin_host.clone(),
+                build_plugin_capability_handler(self.plugin_manager.clone()),
+                RuntimeLimits::default(),
+            ));
         let mut engine_factories = vec![plugin_engine_factory];
         if let Some(factory) = web_model_factory {
             engine_factories.push(factory);
@@ -2326,7 +2333,8 @@ impl DaemonRuntime {
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
             .with_session_engine_factory(session_engine_factory)
-            .with_workflow_core_factory(workflow_core_factory);
+            .with_workflow_core_factory(workflow_core_factory)
+            .with_plugin_command_executor(plugin_command_executor);
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())

@@ -91,6 +91,11 @@ fn mark_turn_timing(
 pub enum SessionTurnCommand {
     /// `/compact`：立即压缩主线上下文，可附带对摘要重点的补充要求。
     CompactContext { instructions: Option<String> },
+    /// 插件显式命令：后台结果通过同一 conversation Turn 写回，不调用主模型。
+    Plugin {
+        command_id: String,
+        arguments: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -786,6 +791,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub knowledge_context_prompt: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub live_settings_store: Option<Arc<SettingsStore>>,
+    pub plugin_command_executor: Option<Arc<dyn magi_plugin_system::PluginCommandExecutor>>,
 }
 
 #[cfg(test)]
@@ -873,6 +879,7 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt,
         persist_session_state,
         live_settings_store: _live_settings_store,
+        plugin_command_executor,
     } = runtime;
 
     let execution_started = Instant::now();
@@ -887,6 +894,63 @@ fn run_session_turn_execution_inner(
         .orchestrator_thread_for_session(&request.session_id)
         .ok_or_else(SessionTurnExecutionError::runtime_invalid_state)?;
     let orchestrator_thread_id = orchestrator_thread.thread_id;
+
+    if let Some(SessionTurnCommand::Plugin {
+        command_id,
+        arguments,
+    }) = request.command.clone()
+    {
+        let Some(executor) = plugin_command_executor else {
+            return Err(SessionTurnExecutionError::runtime_invalid_state());
+        };
+        let cancellation = magi_plugin_system::RunCancellation::default();
+        let invocation = magi_plugin_system::PluginCommandInvocation {
+            command_id,
+            session_id: request.session_id.to_string(),
+            turn_id: request.turn_id.clone(),
+            workspace_id: request.workspace_id.as_ref().map(ToString::to_string),
+            input: arguments.unwrap_or_else(|| prompt.clone()),
+        };
+        let worker_cancellation = cancellation.clone();
+        let worker = std::thread::spawn(move || executor.invoke(invocation, &worker_cancellation));
+        while !worker.is_finished() {
+            if !request_turn_is_writable(session_store, &request) {
+                cancellation.cancel();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = worker
+            .join()
+            .map_err(|_| SessionTurnExecutionError::runtime_invalid_state())?
+            .map_err(|error| {
+                if !request_turn_is_writable(session_store, &request) {
+                    return SessionTurnExecutionError::runtime_invalid_state();
+                }
+                SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::ModelInvocationFailed,
+                    format!("插件命令执行失败：{error}"),
+                )
+            })?;
+        if !request_turn_is_writable(session_store, &request) {
+            return Ok(SessionTurnExecutionOutput::interrupted());
+        }
+        append_final_item(
+            terminal_policy,
+            event_bus,
+            session_store,
+            &request,
+            FinalItemInput {
+                content: &result.content,
+                item_id: None,
+                timeline_entry_id: None,
+                model_round: Some(0),
+            },
+            &orchestrator_thread_id,
+            persist_session_state,
+        )
+        .map_err(|_| SessionTurnExecutionError::runtime_invalid_state())?;
+        return Ok(SessionTurnExecutionOutput::completed(result.content));
+    }
 
     normalize_interrupted_session_tool_history(
         session_store,
@@ -964,6 +1028,7 @@ fn run_session_turn_execution_inner(
                 instructions: instructions.clone(),
             },
         ),
+        Some(SessionTurnCommand::Plugin { .. }) => unreachable!("插件命令已在模型循环前执行"),
         None => ("pre_turn", ContextCompactionMode::Automatic),
     };
     let manual_compaction = matches!(compaction_mode, ContextCompactionMode::Manual { .. });
@@ -3134,6 +3199,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         })
         .expect("cancelled model invocation should resolve as interrupted turn");
         assert!(output.interrupted);
@@ -3276,6 +3342,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
+            plugin_command_executor: None,
         })
         .expect("识图模型必须完成整个会话轮次");
 
@@ -3361,6 +3428,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: Some(settings.clone()),
+            plugin_command_executor: None,
         })
         .expect("识图后的纯文本轮次必须恢复主模型执行");
 
@@ -3634,6 +3702,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         })
         .expect("steered turn should complete");
 
@@ -3788,6 +3857,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         })
         .expect("ordinary turn should complete independently");
 
@@ -3947,6 +4017,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         });
 
         assert!(matches!(
@@ -4043,6 +4114,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         }) {
             Ok(_) => panic!("empty provider response should fail"),
             Err(error) => error,
@@ -4157,6 +4229,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         })
         .expect("empty stream before output should be retried");
 
@@ -4243,6 +4316,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         }) {
             Ok(_) => panic!("incomplete stream should fail the turn"),
             Err(error) => error,
@@ -4354,6 +4428,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         })
         .expect("流中断应由非流式降级完成");
 
@@ -4457,6 +4532,7 @@ mod tests {
             knowledge_context_prompt: None,
             persist_session_state: None,
             live_settings_store: None,
+            plugin_command_executor: None,
         }) {
             Ok(_) => panic!("image provider empty stream should fail"),
             Err(error) => error,

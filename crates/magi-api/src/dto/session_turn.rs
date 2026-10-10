@@ -202,6 +202,9 @@ pub struct SessionTurnRequestDto {
     /// 用户为本次任务显式选择的工作流核心身份；由 daemon 按当前作用域校验并固定。
     #[serde(default)]
     pub workflow_id: Option<String>,
+    /// 用户为本次独立命令选择的插件命令身份；由 daemon 按当前作用域校验。
+    #[serde(default)]
+    pub plugin_command_id: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
@@ -506,6 +509,8 @@ impl SessionTurnRequestDto {
             "goalMode": normalized.goal_mode,
             "resume": normalized.resume,
             "command": normalized.command,
+            "workflowId": trimmed_non_empty(normalized.workflow_id.as_deref()),
+            "pluginCommandId": trimmed_non_empty(normalized.plugin_command_id.as_deref()),
             "images": normalized.images,
             "contextReferences": context_references,
             "browserAnnotationRefs": normalized.browser_annotation_refs(),
@@ -808,6 +813,7 @@ mod tests {
             replace_turn_id: None,
             command: None,
             workflow_id: None,
+            plugin_command_id: None,
         };
 
         assert_eq!(
@@ -1066,6 +1072,16 @@ mod tests {
                 .request_fingerprint()
                 .expect("changed request should hash"),
             fingerprint
+        );
+
+        request.steer_current_turn = false;
+        request.workflow_id = Some("plugin/acme.tools/flow".into());
+        let workflow_fingerprint = request.request_fingerprint().unwrap();
+        request.plugin_command_id = Some("plugin/acme.tools/open".into());
+        assert_ne!(
+            request.request_fingerprint().unwrap(),
+            workflow_fingerprint,
+            "plugin command identity must participate in idempotency"
         );
     }
 

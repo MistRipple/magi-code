@@ -769,6 +769,7 @@ export interface QueuedMessage {
   createdAt: number;
   command: 'compact' | null;
   workflowId?: string | null;
+  pluginCommandId?: string | null;
   skillName?: string | null;
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;

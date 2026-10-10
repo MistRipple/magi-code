@@ -1201,6 +1201,7 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             })
             .await;
         if response.is_ok() {
@@ -1281,6 +1282,7 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             })
             .await;
         if response.is_ok() {
@@ -1327,6 +1329,7 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             })
             .await;
         if response.is_ok() {
@@ -1371,6 +1374,7 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             })
             .await
     }
@@ -1409,6 +1413,7 @@ impl MagiTurnHarness {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             })
             .await
     }

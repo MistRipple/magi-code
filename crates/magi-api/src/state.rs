@@ -5614,6 +5614,7 @@ mod tests {
                 replace_turn_id: None,
                 command: None,
                 workflow_id: None,
+                plugin_command_id: None,
             },
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),

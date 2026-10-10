@@ -631,6 +631,15 @@
           "maxLength": 192,
           "x-rust-default": true
         },
+        "pluginCommandId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 192,
+          "x-rust-default": true
+        },
         "images": {
           "type": "array",
           "items": {

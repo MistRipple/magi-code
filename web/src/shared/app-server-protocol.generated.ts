@@ -232,6 +232,7 @@ export interface TurnStartParams {
   resume?: boolean;
   command?: SessionTurnCommand | null;
   workflowId?: string | null;
+  pluginCommandId?: string | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;

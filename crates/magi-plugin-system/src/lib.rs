@@ -1,6 +1,7 @@
 //! daemon 插件领域：包、授权、作用域与生命周期。
 //! 执行由 magi-plugin-runtime 承载，外部 DTO 来自唯一 App Server schema。
 
+pub mod command;
 pub mod engine;
 mod lifecycle;
 mod package;
@@ -11,6 +12,9 @@ mod workflow_factory;
 pub mod workflow_runtime;
 use sha2::Digest;
 
+pub use command::{
+    PluginCommandExecutor, PluginCommandInvocation, PluginCommandResult, PluginCommandRunner,
+};
 pub use engine::{
     EngineEvent, EngineReadiness, PluginSessionEngine, SessionEngineAdapter, SessionEngineRequest,
 };

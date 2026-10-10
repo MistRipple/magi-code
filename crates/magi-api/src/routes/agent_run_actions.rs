@@ -503,6 +503,7 @@ async fn restart_task(
         replace_turn_id: None,
         command: None,
         workflow_id: None,
+        plugin_command_id: None,
     };
     let task_tier = root_task
         .policy_snapshot
