@@ -547,7 +547,38 @@ async fn deactivate(
     Path(id): Path<String>,
     Json(request): Json<ScopeRequest>,
 ) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    mutate_scope(&state, |m| m.deactivate(&id, &request.scope), "停用插件")
+    let guard = magi_plugin_system::PluginManager::begin_deactivation(
+        std::sync::Arc::clone(&state.plugin_manager),
+        &id,
+        &request.scope,
+    )
+    .map_err(plugin_error)?;
+    let manager = std::sync::Arc::clone(&state.plugin_manager);
+    let drain_id = id.clone();
+    let drain_scope = request.scope.clone();
+    let drained = tokio::time::timeout(Duration::from_secs(30), async move {
+        loop {
+            let count = manager
+                .lock()
+                .map_err(|_| ApiError::internal_assembly("停用插件失败", "插件锁已损坏"))?
+                .runtime_lease_count(&drain_id, &drain_scope);
+            if count == 0 {
+                return Ok::<(), ApiError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    match drained {
+        Ok(result) => result?,
+        Err(_) => return Err(ApiError::Conflict("插件停用排空超时，仍有在途运行".into())),
+    }
+    let mut manager = locked(&state, "停用插件")?;
+    manager
+        .deactivate(&id, &request.scope)
+        .map_err(plugin_error)?;
+    guard.commit(&mut manager);
+    snapshot(&manager)
 }
 async fn disable(
     State(state): State<ApiState>,

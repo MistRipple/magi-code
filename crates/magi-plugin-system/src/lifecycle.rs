@@ -67,6 +67,7 @@ pub struct PluginManager {
     state: PluginManagerState,
     resources: PluginResourceStore,
     runtime_leases: BTreeMap<(String, String), usize>,
+    draining_scopes: BTreeSet<(String, String)>,
 }
 
 /// 一次插件 Worker 调用的内存运行租约。
@@ -76,6 +77,31 @@ pub struct PluginManager {
 pub struct PluginRuntimeLease {
     manager: Arc<Mutex<PluginManager>>,
     key: (String, String),
+}
+
+/// 关闭准入期间的排空标记。请求取消或超时丢弃它时，标记自动撤销。
+pub struct PluginDrainGuard {
+    manager: Arc<Mutex<PluginManager>>,
+    key: (String, String),
+    committed: bool,
+}
+
+impl PluginDrainGuard {
+    pub fn commit(mut self, manager: &mut PluginManager) {
+        manager.draining_scopes.remove(&self.key);
+        self.committed = true;
+    }
+}
+
+impl Drop for PluginDrainGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Ok(mut manager) = self.manager.lock() {
+            manager.draining_scopes.remove(&self.key);
+        }
+    }
 }
 
 impl PluginRuntimeLease {
@@ -90,6 +116,9 @@ impl PluginRuntimeLease {
             .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))?;
         guard.validate_runtime_identity(id, package_digest, scope, scope)?;
         let key = (id.to_owned(), scope.to_owned());
+        if guard.draining_scopes.contains(&key) {
+            return Err(PluginError::Conflict("插件作用域正在排空".into()));
+        }
         *guard.runtime_leases.entry(key.clone()).or_default() += 1;
         drop(guard);
         Ok(Self { manager, key })
@@ -139,6 +168,7 @@ impl PluginManager {
             state,
             resources,
             runtime_leases: BTreeMap::new(),
+            draining_scopes: BTreeSet::new(),
         })
     }
 
@@ -444,6 +474,35 @@ impl PluginManager {
         self.commit(next)
     }
 
+    pub fn begin_deactivation(
+        manager: Arc<Mutex<Self>>,
+        id: &str,
+        scope: &str,
+    ) -> Result<PluginDrainGuard, PluginError> {
+        let mut guard = manager
+            .lock()
+            .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))?;
+        let package = guard.package(id)?;
+        validate_scope(package.manifest(), scope)?;
+        let key = (id.to_owned(), scope.to_owned());
+        if !guard.draining_scopes.insert(key.clone()) {
+            return Err(conflict("插件作用域已经在排空"));
+        }
+        drop(guard);
+        Ok(PluginDrainGuard {
+            manager,
+            key,
+            committed: false,
+        })
+    }
+
+    pub fn runtime_lease_count(&self, id: &str, scope: &str) -> usize {
+        self.runtime_leases
+            .get(&(id.to_owned(), scope.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn disable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
@@ -452,6 +511,14 @@ impl PluginManager {
             .plugins
             .get_mut(id)
             .ok_or_else(|| conflict("插件未安装"))?;
+        if scope == "application"
+            && installed
+                .active_scopes
+                .iter()
+                .any(|active_scope| active_scope != "application")
+        {
+            return Err(conflict("插件仍有工作区运行，必须先完成或取消后再禁用"));
+        }
         if installed.active_scopes.contains(scope) {
             return Err(conflict("插件仍处于激活状态"));
         }

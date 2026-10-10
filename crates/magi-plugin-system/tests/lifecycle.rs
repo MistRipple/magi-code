@@ -355,6 +355,46 @@ fn runtime_lease_blocks_deactivation_until_worker_is_settled() {
 }
 
 #[test]
+fn deactivation_drain_rejects_new_runtime_leases_and_cleans_up_on_abort() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(false);
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "drain.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle", "workspace:one").unwrap();
+    manager.activate("acme.lifecycle", "workspace:one").unwrap();
+    let manager = Arc::new(Mutex::new(manager));
+
+    let guard =
+        PluginManager::begin_deactivation(Arc::clone(&manager), "acme.lifecycle", "workspace:one")
+            .unwrap();
+    assert!(
+        magi_plugin_system::PluginRuntimeLease::acquire(
+            Arc::clone(&manager),
+            "acme.lifecycle",
+            package.digest(),
+            "workspace:one",
+        )
+        .is_err()
+    );
+    drop(guard);
+    let lease = magi_plugin_system::PluginRuntimeLease::acquire(
+        Arc::clone(&manager),
+        "acme.lifecycle",
+        package.digest(),
+        "workspace:one",
+    )
+    .unwrap();
+    drop(lease);
+}
+
+#[test]
 fn resource_permission_is_required_for_each_declared_resource() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
