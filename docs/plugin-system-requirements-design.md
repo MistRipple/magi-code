@@ -218,7 +218,7 @@ UI 操作和模型工具操作进入同一应用服务方法及权限入口。�
 
 ### 6.2 隔离视图
 
-自定义 UI 建议使用独立来源的受限 iframe，加载插件包内静态资源，允许其自行选择界面框架和图形渲染方式。它不能访问父页面 DOM、daemon 凭据或 Electron preload；网络和敏感操作经受控消息桥处理。
+自定义 UI 使用带 `sandbox="allow-scripts"` 的独立 iframe，加载插件包内静态资源，允许其自行选择界面框架和图形渲染方式。该 sandbox 使文档使用 opaque `null` origin，因此宿主向 iframe 发送消息时使用 `targetOrigin="*"`，同时严格绑定精确 `contentWindow`、实例代次和一次性通道身份；宿主接收消息仍校验 origin（资源 origin 或 `null`）、frame、实例代次、操作类型和载荷大小。插件不能访问父页面 DOM、daemon 凭据或 Electron preload；网络和敏感操作经受控消息桥处理。
 
 宿主校验消息来源、frame、实例代次、操作类型和载荷大小；视图重建后旧通道立即失效。外链导航、下载和弹窗由宿主规则处理。主题、语言、尺寸和可访问性信息作为只读宿主参数提供。
 

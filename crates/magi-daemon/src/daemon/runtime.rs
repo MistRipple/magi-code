@@ -268,6 +268,20 @@ impl CapabilityHandler for PluginCapabilityHandler {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     if !manager
+                        .resource_declared(plugin_id, resource)
+                        .map_err(|_| {
+                            ExecutionError::new(
+                                ExecutionErrorCode::CapabilityRejected,
+                                "插件资源未声明",
+                            )
+                        })?
+                    {
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件资源未声明",
+                        ));
+                    }
+                    if !manager
                         .permission_allowed(
                             plugin_id,
                             &scope,
@@ -293,6 +307,20 @@ impl CapabilityHandler for PluginCapabilityHandler {
                         .get("resourceId")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
+                    if !manager
+                        .resource_declared(plugin_id, resource)
+                        .map_err(|_| {
+                            ExecutionError::new(
+                                ExecutionErrorCode::CapabilityRejected,
+                                "插件资源未声明",
+                            )
+                        })?
+                    {
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件资源未声明",
+                        ));
+                    }
                     if !manager
                         .permission_allowed(
                             plugin_id,

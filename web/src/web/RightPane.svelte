@@ -71,7 +71,7 @@
   import { WEB_MODEL_HOME_TAB_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
   import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
-  import { loadActivePluginManifests, type PluginManifestProjection } from './plugin-api';
+  import { loadActivePluginManifests, PLUGIN_REGISTRY_CHANGED_EVENT, type PluginManifestProjection } from './plugin-api';
   import { openSettings } from '../stores/shell-ui.svelte';
   import {
     WEB_MODEL_ACTION_EVENT,
@@ -284,11 +284,24 @@
       });
     };
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+    const handlePluginRegistryChanged = () => {
+      const scope = rightPaneState.activeWorkspaceId.trim()
+        ? `workspace:${rightPaneState.activeWorkspaceId.trim()}`
+        : 'application';
+      const request = ++pluginManifestRequest;
+      void loadActivePluginManifests(scope).then((manifests) => {
+        if (request === pluginManifestRequest) pluginManifests = manifests;
+      }).catch(() => {
+        if (request === pluginManifestRequest) pluginManifests = [];
+      });
+    };
+    window.addEventListener(PLUGIN_REGISTRY_CHANGED_EVENT, handlePluginRegistryChanged);
     // 失败卡片的主行动（§8）：宿主在这里，卡片只派发动作，不复制宿主状态。
     window.addEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+      window.removeEventListener(PLUGIN_REGISTRY_CHANGED_EVENT, handlePluginRegistryChanged);
       window.removeEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
       domAddPaneMenuOpen = false;
     };

@@ -21,7 +21,7 @@ import { messagesState } from '../stores/messages.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
-import { loadActivePluginManifests, type PluginManifestProjection } from '../web/plugin-api';
+import { loadActivePluginManifests, PLUGIN_REGISTRY_CHANGED_EVENT, type PluginManifestProjection } from '../web/plugin-api';
 import {
   WEB_MODEL_SETTINGS_READY_EVENT,
   WEB_MODEL_SETTINGS_REQUEST_EVENT,
@@ -171,6 +171,22 @@ import {
   }
 
   onMount(() => {
+    const handlePluginRegistryChanged = () => {
+      const scope = pluginScope;
+      const request = ++pluginManifestRequest;
+      void loadActivePluginManifests(scope).then((manifests) => {
+        if (request === pluginManifestRequest) {
+          pluginManifests = manifests;
+          pluginManifestsLoaded = true;
+        }
+      }).catch(() => {
+        if (request === pluginManifestRequest) {
+          pluginManifests = [];
+          pluginManifestsLoaded = true;
+        }
+      });
+    };
+    window.addEventListener(PLUGIN_REGISTRY_CHANGED_EVENT, handlePluginRegistryChanged);
     const handleWebModelSettingsRequest = (event: Event) => {
       applyWebModelSettingsRequest(
         (event as CustomEvent<WebModelSettingsRequest>).detail ?? null,
@@ -178,10 +194,10 @@ import {
     };
     window.addEventListener(WEB_MODEL_SETTINGS_REQUEST_EVENT, handleWebModelSettingsRequest);
     applyWebModelSettingsRequest(consumeWebModelSettingsRequest());
-    return () => window.removeEventListener(
-      WEB_MODEL_SETTINGS_REQUEST_EVENT,
-      handleWebModelSettingsRequest,
-    );
+    return () => {
+      window.removeEventListener(PLUGIN_REGISTRY_CHANGED_EVENT, handlePluginRegistryChanged);
+      window.removeEventListener(WEB_MODEL_SETTINGS_REQUEST_EVENT, handleWebModelSettingsRequest);
+    };
   });
 
   // 每次重新显示：刷新只读数据，并把焦点放到当前分类，键盘用户可以直接继续。

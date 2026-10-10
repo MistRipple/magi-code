@@ -6,6 +6,8 @@ export type PluginManifestProjection = PluginManifest;
 
 export type InstalledPluginProjection = PluginInstalled;
 
+export const PLUGIN_REGISTRY_CHANGED_EVENT = 'magi-plugin-registry-changed';
+
 export interface PluginContributionProjection {
   id: string;
   pluginId: string;
@@ -45,6 +47,7 @@ export async function installPluginArchive(archive: ArrayBuffer, source = 'local
     body: JSON.stringify({ source, archiveBase64: btoa(binary) }),
   });
   if (!response.ok) throw new Error(`安装插件失败: ${response.status}`);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
 export async function installPluginAddress(source: string): Promise<void> {
@@ -54,6 +57,7 @@ export async function installPluginAddress(source: string): Promise<void> {
     body: JSON.stringify({ source }),
   });
   if (!response.ok) throw new Error(`安装插件失败: ${response.status}`);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
 export async function authorizeAndActivatePlugin(pluginId: string, manifest: PluginManifest, scope: string): Promise<void> {
@@ -74,11 +78,31 @@ export async function authorizeAndActivatePlugin(pluginId: string, manifest: Plu
     });
     if (!response.ok) throw new Error(`插件激活失败: ${response.status}`);
   }
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+}
+
+async function changePluginScope(pluginId: string, scope: string, action: 'deactivate' | 'disable'): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scope }),
+  });
+  if (!response.ok) throw new Error(`插件${action === 'deactivate' ? '停用' : '禁用'}失败: ${response.status}`);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+}
+
+export function deactivatePlugin(pluginId: string, scope: string): Promise<void> {
+  return changePluginScope(pluginId, scope, 'deactivate');
+}
+
+export function disablePlugin(pluginId: string, scope: string): Promise<void> {
+  return changePluginScope(pluginId, scope, 'disable');
 }
 
 export async function uninstallPlugin(pluginId: string): Promise<void> {
   const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/uninstall`, { method: 'POST' });
   if (!response.ok) throw new Error(`卸载插件失败: ${response.status}`);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
 export async function loadActivePluginManifests(scope = 'application'): Promise<PluginManifestProjection[]> {

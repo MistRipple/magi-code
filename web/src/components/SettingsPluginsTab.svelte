@@ -3,6 +3,8 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     authorizeAndActivatePlugin,
+    deactivatePlugin,
+    disablePlugin,
     installPluginAddress,
     installPluginArchive,
     listInstalledPlugins,
@@ -63,6 +65,28 @@
     finally { busy = false; }
   }
 
+  async function deactivate(plugin: InstalledPluginProjection): Promise<void> {
+    busy = true;
+    message = '';
+    try {
+      await deactivatePlugin(plugin.manifest.id, scope);
+      await refresh();
+      message = i18n.t('settings.plugins.deactivated');
+    } catch (error) { message = String(error); }
+    finally { busy = false; }
+  }
+
+  async function disable(plugin: InstalledPluginProjection): Promise<void> {
+    busy = true;
+    message = '';
+    try {
+      await disablePlugin(plugin.manifest.id, scope);
+      await refresh();
+      message = i18n.t('settings.plugins.disabled');
+    } catch (error) { message = String(error); }
+    finally { busy = false; }
+  }
+
   async function remove(plugin: InstalledPluginProjection): Promise<void> {
     busy = true;
     message = '';
@@ -110,7 +134,14 @@
           {/if}
         </div>
         <div class="plugin-actions">
-          <button class="btn btn--secondary btn--sm" onclick={() => void activate(plugin)} disabled={busy}>{i18n.t('settings.plugins.activate')}</button>
+          {#if plugin.activeScopes.includes(scope)}
+            <button class="btn btn--secondary btn--sm" onclick={() => void deactivate(plugin)} disabled={busy}>{i18n.t('settings.plugins.deactivate')}</button>
+          {:else if plugin.enabledScopes.includes(scope)}
+            <button class="btn btn--primary btn--sm" onclick={() => void activate(plugin)} disabled={busy}>{i18n.t('settings.plugins.activate')}</button>
+            <button class="btn btn--secondary btn--sm" onclick={() => void disable(plugin)} disabled={busy}>{i18n.t('settings.plugins.disable')}</button>
+          {:else}
+            <button class="btn btn--primary btn--sm" onclick={() => void activate(plugin)} disabled={busy}>{i18n.t('settings.plugins.activate')}</button>
+          {/if}
           <button class="btn btn--secondary btn--sm" onclick={() => void remove(plugin)} disabled={busy || plugin.activeScopes.length > 0 || plugin.enabledScopes.length > 0}>{i18n.t('settings.plugins.uninstall')}</button>
         </div>
       </article>

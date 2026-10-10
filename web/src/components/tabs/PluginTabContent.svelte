@@ -29,7 +29,11 @@
       channel: 'magi-plugin-v1',
       instanceId,
       ...message,
-    }, resourceOrigin);
+    // The sandbox intentionally keeps the plugin document on an opaque
+    // origin (`null`).  The receiving side is still bound to this exact
+    // contentWindow and the per-instance nonce below; using a concrete
+    // origin here would silently drop every host message.
+    }, '*');
   }
 
   const activeResourceSubscriptions = new Map<string, () => void>();
@@ -60,7 +64,8 @@
   }
 
   async function handleMessage(event: MessageEvent): Promise<void> {
-    if (event.origin !== resourceOrigin || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
+    if ((event.origin !== resourceOrigin && event.origin !== 'null')
+      || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     const operation = event.data.operation;

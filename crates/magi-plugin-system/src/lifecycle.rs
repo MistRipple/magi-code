@@ -193,6 +193,18 @@ impl PluginManager {
         Ok(package)
     }
 
+    /// Returns whether the installed manifest owns the resource identity.
+    /// A permission grant alone must never create an implicit resource.
+    pub fn resource_declared(&self, id: &str, resource_id: &str) -> Result<bool, PluginError> {
+        Ok(self
+            .package(id)?
+            .manifest()
+            .contributions
+            .resources
+            .iter()
+            .any(|resource| resource.id == resource_id))
+    }
+
     pub fn install(
         &mut self,
         package: &PluginPackage,

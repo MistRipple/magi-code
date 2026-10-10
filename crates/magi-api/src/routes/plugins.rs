@@ -614,13 +614,9 @@ fn ensure_declared_resource(
     id: &str,
     resource: &str,
 ) -> Result<(), ApiError> {
-    let package = manager.package(id).map_err(plugin_error)?;
-    if package
-        .manifest()
-        .contributions
-        .resources
-        .iter()
-        .any(|item| item.id == resource)
+    if manager
+        .resource_declared(id, resource)
+        .map_err(plugin_error)?
     {
         Ok(())
     } else {
