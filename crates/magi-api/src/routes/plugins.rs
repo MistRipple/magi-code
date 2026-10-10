@@ -17,7 +17,10 @@ use magi_plugin_system::{MAX_PACKAGE_BYTES, PluginPackage, PluginSource};
 use serde::Deserialize;
 use serde_json::Value;
 use std::convert::Infallible;
+use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
+
+const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
 type ScopeRequest = magi_app_server_protocol::PluginScopeRequest;
@@ -437,7 +440,15 @@ async fn install(
             .await
             .map_err(|error| ApiError::InvalidInput(format!("读取本地插件包失败: {error}")))?,
         (None, PluginSource::Center { url }) | (None, PluginSource::Address { url }) => {
-            let response = reqwest::get(url)
+            let client = reqwest::Client::builder()
+                .timeout(PLUGIN_DOWNLOAD_TIMEOUT)
+                .build()
+                .map_err(|error| {
+                    ApiError::internal_assembly("获取插件包失败", error.to_string())
+                })?;
+            let response = client
+                .get(url)
+                .send()
                 .await
                 .map_err(|error| ApiError::InvalidInput(format!("获取插件包失败: {error}")))?;
             if !response.status().is_success() {
@@ -665,11 +676,26 @@ fn parse_source(source: &str) -> Result<PluginSource, ApiError> {
         return Err(ApiError::InvalidInput("插件来源不能为空".into()));
     }
     match kind {
-        "center" => Ok(PluginSource::Center { url: value.into() }),
-        "address" => Ok(PluginSource::Address { url: value.into() }),
+        "center" => Ok(PluginSource::Center {
+            url: validated_remote_url(value)?,
+        }),
+        "address" => Ok(PluginSource::Address {
+            url: validated_remote_url(value)?,
+        }),
         "local" => Ok(PluginSource::Local { name: value.into() }),
         _ => Err(ApiError::InvalidInput("插件来源类型无效".into())),
     }
+}
+
+fn validated_remote_url(value: &str) -> Result<String, ApiError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| ApiError::InvalidInput("插件来源地址无效".into()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ApiError::InvalidInput(
+            "插件来源只支持带主机的 HTTP(S) 地址".into(),
+        ));
+    }
+    Ok(url.to_string())
 }
 
 #[cfg(test)]
@@ -722,6 +748,13 @@ mod tests {
             writer.write_all(&bytes).unwrap();
         }
         PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[test]
+    fn remote_plugin_sources_require_http_url() {
+        assert!(parse_source("address:https://example.test/plugin.zip").is_ok());
+        assert!(parse_source("center:file:///tmp/plugin.zip").is_err());
+        assert!(parse_source("address:not-a-url").is_err());
     }
 
     async fn active_resource_state() -> (ApiState, std::path::PathBuf) {
