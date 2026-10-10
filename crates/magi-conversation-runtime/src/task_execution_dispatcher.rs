@@ -440,11 +440,11 @@ impl WorkflowCoreDecisionRunner {
     }
 }
 
-/// Web 引擎解析上下文：浏览器 client 工厂 + 本次调用的线程 id。
+/// 会话引擎解析上下文：统一会话引擎工厂 + 本次调用的线程 id。
 ///
-/// 只有真正解析到 Web 引擎时才需要；HTTP 引擎路径完全不受影响。
+/// 只有命中非 HTTP 会话引擎时才需要；HTTP 引擎路径完全不受影响。
 #[derive(Clone)]
-pub struct WebModelResolutionContext {
+pub struct SessionEngineResolutionContext {
     pub factory: Arc<dyn magi_plugin_system::SessionEngineFactory>,
     pub thread_id: String,
     /// MCP 工具的范围必须绑定真实工作区，不得把 session id 当路径根。
@@ -468,25 +468,25 @@ pub fn resolve_target_for_role(
     target: RoleTarget<'_>,
     session_id: Option<&SessionId>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
-    resolve_target_for_role_with_web(settings_store, default_client, target, session_id, None)
+    resolve_target_for_role_with_engine(settings_store, default_client, target, session_id, None)
 }
 
-/// 与 [`resolve_target_for_role`] 同一条解析路径，额外允许解析 Web 引擎。
+/// 与 [`resolve_target_for_role`] 同一条解析路径，额外允许解析非 HTTP 会话引擎。
 ///
-/// 未提供 [`WebModelResolutionContext`] 时，命中 Web 引擎**失败关闭**：宁可返回
+/// 未提供 [`SessionEngineResolutionContext`] 时，命中非 HTTP 会话引擎**失败关闭**：宁可返回
 /// 明确错误，也不退回 HTTP 模型（A19、§5.6）。之所以不改变既有函数签名，是为了
-/// 让不涉及 Web 引擎的调用方（辅助模型、标题精修等）保持原样。
-pub fn resolve_target_for_role_with_web(
+/// 让不涉及会话引擎的调用方（辅助模型、标题精修等）保持原样。
+pub fn resolve_target_for_role_with_engine(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
     target: RoleTarget<'_>,
     session_id: Option<&SessionId>,
-    web: Option<&WebModelResolutionContext>,
+    engine: Option<&SessionEngineResolutionContext>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     match target {
         RoleTarget::Orchestrator => {
             if let Some(store) = settings_store
-                && let Some(client) = build_orchestrator_client(store, session_id, web)?
+                && let Some(client) = build_orchestrator_client(store, session_id, engine)?
             {
                 return Ok(Some(client));
             }
@@ -513,20 +513,20 @@ pub fn resolve_target_for_role_with_web(
                 return Ok(None);
             };
             if role_model.config.is_plugin() {
-                let web = web.ok_or_else(|| {
+                let engine = engine.ok_or_else(|| {
                     format!(
                         "角色 {} 绑定了插件会话引擎，但当前运行时未装配会话引擎工厂",
                         role_model.template_id
                     )
                 })?;
-                return web
+                return engine
                     .factory
                     .build_session_engine(magi_plugin_system::SessionEngineInvocationSpec {
                         session_id: session_id
                             .map(|id| id.as_str().to_string())
                             .unwrap_or_default(),
-                        project_id: web.project_id.clone(),
-                        thread_id: web.thread_id.clone(),
+                        project_id: engine.project_id.clone(),
+                        thread_id: engine.thread_id.clone(),
                         engine_id: role_model.engine_id,
                         binding: serde_json::Value::Null,
                     })
@@ -570,13 +570,13 @@ fn build_client_from_section(
 fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
-    web: Option<&WebModelResolutionContext>,
+    engine: Option<&SessionEngineResolutionContext>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     let normalized = resolve_orchestrator_model_config(settings_store, session_id)?;
     if normalized.is_chatgpt_web() || normalized.is_plugin() {
         let engine_id = orchestrator_engine_id(settings_store, session_id)
             .ok_or_else(|| "会话绑定的会话引擎已失效".to_string())?;
-        let client = build_session_engine_client(settings_store, session_id, web, engine_id)?;
+        let client = build_session_engine_client(settings_store, session_id, engine, engine_id)?;
         return Ok(Some(client));
     }
     Ok(normalized
@@ -585,30 +585,36 @@ fn build_orchestrator_client(
 }
 
 /// 构造会话引擎 client。所有非 HTTP 会话引擎都经过这里：会话、线程和引擎身份被闭包进
-/// 唯一工厂；GPT Web 的会话绑定作为 opaque JSON 传入，由对应工厂解释。
+/// 唯一工厂。只有 GPT Web 适配器读取 `webConversation`；普通插件引擎收到空的 opaque
+/// binding，避免把站点专用状态伪装成通用插件配置。
 fn build_session_engine_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
-    web: Option<&WebModelResolutionContext>,
+    engine: Option<&SessionEngineResolutionContext>,
     engine_id: String,
 ) -> Result<Arc<dyn ModelBridgeClient>, String> {
-    let web = web.ok_or_else(|| {
+    let engine = engine.ok_or_else(|| {
         "会话引擎需要已注册工厂，但当前运行时未装配（不允许退回 HTTP 模型）".to_string()
     })?;
     let session_value = session_id
         .map(|id| id.as_str().to_string())
         .unwrap_or_default();
-    let binding = session_id
-        .map(|id| session_web_conversation_binding(settings_store, id))
-        .unwrap_or_else(magi_web_model::WebConversationBinding::temporary);
+    let binding = if magi_web_model::is_chatgpt_web_engine_id(&engine_id) {
+        let web_binding = session_id
+            .map(|id| session_web_conversation_binding(settings_store, id))
+            .unwrap_or_else(magi_web_model::WebConversationBinding::temporary);
+        serde_json::to_value(web_binding).map_err(|_| "Web 引擎绑定无法序列化".to_string())?
+    } else {
+        serde_json::Value::Null
+    };
     let spec = magi_plugin_system::SessionEngineInvocationSpec {
         session_id: session_value,
-        project_id: web.project_id.clone(),
-        thread_id: web.thread_id.clone(),
+        project_id: engine.project_id.clone(),
+        thread_id: engine.thread_id.clone(),
         engine_id,
-        binding: serde_json::to_value(binding).map_err(|_| "Web 引擎绑定无法序列化".to_string())?,
+        binding,
     };
-    web.factory.build_session_engine(spec)
+    engine.factory.build_session_engine(spec)
 }
 
 /// daemon 未注入 [`ContextBudget`] 时，为最小运行时和测试构造提供的默认预算。
@@ -2270,14 +2276,14 @@ impl LlmTaskDispatcher {
         session_id: Option<&SessionId>,
         thread_id: &str,
     ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
-        let web = self.web_resolution_context(thread_id, session_id);
+        let engine = self.session_engine_resolution_context(thread_id, session_id);
         let Some(settings_store) = settings_store else {
-            return resolve_target_for_role_with_web(
+            return resolve_target_for_role_with_engine(
                 settings_store,
                 self.model_bridge_client.clone(),
                 target,
                 session_id,
-                web.as_ref(),
+                engine.as_ref(),
             );
         };
         let target_label = match target {
@@ -2303,12 +2309,12 @@ impl LlmTaskDispatcher {
         {
             return Ok(Some(client));
         }
-        let resolved = resolve_target_for_role_with_web(
+        let resolved = resolve_target_for_role_with_engine(
             Some(settings_store),
             self.model_bridge_client.clone(),
             target,
             session_id,
-            web.as_ref(),
+            engine.as_ref(),
         )?;
         if let Some(client) = resolved.as_ref() {
             self.model_client_cache
@@ -2319,15 +2325,15 @@ impl LlmTaskDispatcher {
         Ok(resolved)
     }
 
-    /// 构造本次解析的 Web 引擎上下文；未装配工厂时返回 `None`（命中 Web 引擎即失败关闭）。
-    fn web_resolution_context(
+    /// 构造本次解析的会话引擎上下文；未装配工厂时返回 `None`（命中非 HTTP 引擎即失败关闭）。
+    fn session_engine_resolution_context(
         &self,
         thread_id: &str,
         session_id: Option<&SessionId>,
-    ) -> Option<WebModelResolutionContext> {
+    ) -> Option<SessionEngineResolutionContext> {
         self.session_engine_factory
             .as_ref()
-            .map(|factory| WebModelResolutionContext {
+            .map(|factory| SessionEngineResolutionContext {
                 factory: Arc::clone(factory),
                 thread_id: thread_id.to_string(),
                 project_id: web_project_id_for_session(&self.session_store, session_id),
@@ -3964,11 +3970,11 @@ mod tests {
     use std::time::Duration;
 
     /// 只记录输入并返回固定 client 的测试工厂（不断言真实浏览器行为）。
-    struct RecordingWebFactory {
+    struct RecordingEngineFactory {
         specs: std::sync::Mutex<Vec<magi_plugin_system::SessionEngineInvocationSpec>>,
     }
 
-    impl RecordingWebFactory {
+    impl RecordingEngineFactory {
         fn new() -> Self {
             Self {
                 specs: std::sync::Mutex::new(Vec::new()),
@@ -3980,9 +3986,9 @@ mod tests {
         }
     }
 
-    impl magi_plugin_system::SessionEngineFactory for RecordingWebFactory {
+    impl magi_plugin_system::SessionEngineFactory for RecordingEngineFactory {
         fn supports(&self, engine_id: &str) -> bool {
-            magi_web_model::is_chatgpt_web_engine_id(engine_id)
+            engine_id.starts_with("plugin/")
         }
 
         fn build_session_engine(
@@ -4032,13 +4038,13 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let factory = Arc::new(RecordingWebFactory::new());
-        let context = WebModelResolutionContext {
+        let factory = Arc::new(RecordingEngineFactory::new());
+        let context = SessionEngineResolutionContext {
             factory: Arc::clone(&factory) as Arc<dyn magi_plugin_system::SessionEngineFactory>,
             thread_id: ORCHESTRATOR_THREAD_ID.to_string(),
             project_id: session_id.to_string(),
         };
-        let resolved = resolve_target_for_role_with_web(
+        let resolved = resolve_target_for_role_with_engine(
             Some(&store),
             None,
             RoleTarget::Orchestrator,
@@ -4059,6 +4065,50 @@ mod tests {
             serde_json::from_value(specs[0].binding.clone()).unwrap();
         assert_eq!(binding.mode, magi_web_model::WebConversationMode::Saved);
         assert_eq!(binding.remote_conversation_id.as_deref(), Some("conv-9"));
+    }
+
+    #[test]
+    fn generic_plugin_engine_does_not_receive_web_conversation_binding() {
+        let session_id = SessionId::new("session-plugin");
+        let store = Arc::new(SettingsStore::new());
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({
+                    "engineId": "plugin/acme.tools/engine",
+                    "model": "plugin/acme.tools/engine",
+                    "reasoningEffort": "high",
+                }),
+            )
+            .expect("写入插件引擎绑定");
+        store
+            .set_session_section(
+                &session_id,
+                crate::model_config::SESSION_WEB_CONVERSATION_SECTION,
+                serde_json::to_value(magi_web_model::WebConversationBinding::saved("web-conv"))
+                    .unwrap(),
+            )
+            .unwrap();
+        let factory = Arc::new(RecordingEngineFactory::new());
+        let context = SessionEngineResolutionContext {
+            factory: Arc::clone(&factory) as Arc<dyn magi_plugin_system::SessionEngineFactory>,
+            thread_id: ORCHESTRATOR_THREAD_ID.to_string(),
+            project_id: "workspace-plugin".to_string(),
+        };
+        let resolved = resolve_target_for_role_with_engine(
+            Some(&store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+            Some(&context),
+        )
+        .expect("插件引擎应当解析成功");
+        assert!(resolved.is_some());
+        let specs = factory.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].engine_id, "plugin/acme.tools/engine");
+        assert_eq!(specs[0].binding, serde_json::Value::Null);
     }
 
     #[test]
@@ -4104,13 +4154,13 @@ mod tests {
                 }]),
             )
             .ok();
-        let factory = Arc::new(RecordingWebFactory::new());
-        let context = WebModelResolutionContext {
+        let factory = Arc::new(RecordingEngineFactory::new());
+        let context = SessionEngineResolutionContext {
             factory: Arc::clone(&factory) as Arc<dyn magi_plugin_system::SessionEngineFactory>,
             thread_id: "task-1".to_string(),
             project_id: "project".to_string(),
         };
-        let result = resolve_target_for_role_with_web(
+        let result = resolve_target_for_role_with_engine(
             Some(&store),
             None,
             RoleTarget::Agent {
@@ -4128,7 +4178,7 @@ mod tests {
     fn web_engine_binding_fails_closed_without_a_factory() {
         let session_id = SessionId::new("session-web");
         let store = web_engine_store(&session_id);
-        let error = match resolve_target_for_role_with_web(
+        let error = match resolve_target_for_role_with_engine(
             Some(&store),
             None,
             RoleTarget::Orchestrator,
@@ -4172,7 +4222,7 @@ mod tests {
                 serde_json::json!({ "engineId": "sonnet-4-5" }),
             )
             .expect("写入会话级覆盖");
-        let resolved = resolve_target_for_role_with_web(
+        let resolved = resolve_target_for_role_with_engine(
             Some(&store),
             None,
             RoleTarget::Orchestrator,
