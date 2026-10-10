@@ -231,6 +231,7 @@ export interface TurnStartParams {
   goalMode?: boolean;
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  workflowId?: string | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;

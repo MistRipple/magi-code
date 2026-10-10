@@ -502,6 +502,7 @@ async fn restart_task(
         expected_turn_id: None,
         replace_turn_id: None,
         command: None,
+        workflow_id: None,
     };
     let task_tier = root_task
         .policy_snapshot

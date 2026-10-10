@@ -6,6 +6,12 @@ export interface ComposerSkillOption {
   description: string;
 }
 
+export interface ComposerWorkflowOption {
+  workflowId: string;
+  name: string;
+  description: string;
+}
+
 /** 会话命令：由 daemon 执行的独立轮次，不调用主模型回复。 */
 export type ComposerSessionCommand = 'compact';
 
@@ -53,6 +59,13 @@ export type ComposerAction =
       name: string;
       description: string;
       skill: ComposerSkillOption;
+    }
+  | {
+      kind: 'workflow';
+      id: string;
+      name: string;
+      description: string;
+      workflow: ComposerWorkflowOption;
     };
 
 function fuzzyMatch(text: string, query: string): boolean {
@@ -67,7 +80,10 @@ function fuzzyMatch(text: string, query: string): boolean {
 export function buildComposerActions(
   skills: ComposerSkillOption[],
   labels: ComposerActionLabels,
-  options: { sessionCommandDisabledReason?: SessionCommandDisabledReason | null } = {},
+  options: {
+    sessionCommandDisabledReason?: SessionCommandDisabledReason | null;
+    workflows?: ComposerWorkflowOption[];
+  } = {},
 ): ComposerAction[] {
   return [
     {
@@ -99,6 +115,13 @@ export function buildComposerActions(
       name: skill.name,
       description: skill.description,
       skill,
+    })),
+    ...(options.workflows ?? []).map<ComposerAction>((workflow) => ({
+      kind: 'workflow',
+      id: workflow.workflowId,
+      name: workflow.name,
+      description: workflow.description,
+      workflow,
     })),
   ];
 }

@@ -124,6 +124,12 @@ pub(super) async fn accept_session_task_submission_at(
         serde_json::Value::String(request_fingerprint),
     );
     user_message_metadata.insert("traceId".to_string(), serde_json::Value::String(trace_id));
+    if let Some(workflow_id) = request.workflow_id.as_deref() {
+        user_message_metadata.insert(
+            "magi.workflowId".to_string(),
+            serde_json::Value::String(workflow_id.to_string()),
+        );
+    }
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_content(trimmed_text.as_deref());
     let mission_title = task_title

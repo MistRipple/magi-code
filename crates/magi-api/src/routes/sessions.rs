@@ -454,6 +454,7 @@ struct QueuedSessionTurnDto {
     content: String,
     text: Option<String>,
     command: Option<magi_app_server_protocol::SessionTurnCommand>,
+    workflow_id: Option<String>,
     skill_name: Option<String>,
     goal_mode: bool,
     access_profile: Option<AccessProfile>,
@@ -512,6 +513,7 @@ fn session_turn_queue_response(
                 content: queued.request.timeline_content(text.as_deref()),
                 text,
                 command: queued.request.command.clone(),
+                workflow_id: queued.request.workflow_id.clone(),
                 skill_name: queued.request.skill_name.clone(),
                 goal_mode: queued.request.goal_mode,
                 access_profile: queued.request.access_profile,
@@ -652,6 +654,10 @@ pub(crate) async fn submit_session_turn_internal(
         .skill_name
         .as_deref()
         .and_then(|skill_name| trimmed_non_empty(Some(skill_name)).map(str::to_string));
+    request.workflow_id = request
+        .workflow_id
+        .as_deref()
+        .and_then(|workflow_id| trimmed_non_empty(Some(workflow_id)).map(str::to_string));
     validate_session_turn_input(&request)?;
     request
         .validate_context_references()
@@ -692,6 +698,7 @@ pub(crate) async fn submit_session_turn_internal(
             requested_workspace_path.as_deref(),
         )?
     };
+    validate_workflow_selection(&state, &request, &scope)?;
     let workspace_id = scope.workspace_id();
     if request.steer_current_turn && (request.goal_mode || request.resume) {
         return Err(ApiError::InvalidInput(
@@ -1312,6 +1319,7 @@ async fn submit_steer_current_turn_after_turn_commit(
 
 fn session_turn_request_is_plain_text(request: &SessionTurnRequestDto) -> bool {
     request.command.is_none()
+        && request.workflow_id.is_none()
         && request.trimmed_text().is_some()
         && request
             .skill_name
@@ -1357,6 +1365,7 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
         && request.context_references.is_empty()
         && request.browser_annotation_refs.is_empty()
         && request.browser_node_selections.is_empty()
+        && request.workflow_id.is_none()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -1371,6 +1380,41 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
         ));
     }
     Ok(())
+}
+
+fn validate_workflow_selection(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    scope: &SessionScope,
+) -> Result<(), ApiError> {
+    let Some(workflow_id) = request.workflow_id.as_deref() else {
+        return Ok(());
+    };
+    if !workflow_id.starts_with("plugin/") || workflow_id.len() > 192 {
+        return Err(ApiError::InvalidInput("工作流核心身份无效".into()));
+    }
+    let scope_key = scope
+        .workspace_id()
+        .map(|id| format!("workspace:{id}"))
+        .unwrap_or_else(|| "application".into());
+    let manager = state
+        .plugin_manager
+        .lock()
+        .map_err(|_| ApiError::internal_assembly("校验工作流核心失败", "插件锁已损坏"))?;
+    let available = manager
+        .workflow_contributions_for_scope(&scope_key)
+        .map_err(|error| ApiError::internal_assembly("读取工作流核心失败", error.to_string()))?
+        .into_iter()
+        .any(|(manifest, workflow)| {
+            format!("plugin/{}/{}", manifest.id, workflow.id) == workflow_id
+        });
+    if available {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "所选插件工作流未在当前作用域激活".into(),
+        ))
+    }
 }
 
 /// 会话命令只能作为已有会话中的独立轮次提交；文本是命令参数。
@@ -1388,7 +1432,8 @@ fn validate_session_turn_command(request: &SessionTurnRequestDto) -> Result<(), 
         || !request.images.is_empty()
         || !request.context_references.is_empty()
         || !request.browser_annotation_refs.is_empty()
-        || !request.browser_node_selections.is_empty();
+        || !request.browser_node_selections.is_empty()
+        || request.workflow_id.is_some();
     if combined_with_other_input {
         return Err(ApiError::InvalidInput(
             "会话命令不能与技能、目标模式、图片或上下文引用同时提交".to_string(),
@@ -1428,6 +1473,9 @@ fn decide_session_turn(
     }
     if request.command.is_some() {
         return Ok(session_turn_command_decision());
+    }
+    if request.workflow_id.is_some() {
+        return Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute));
     }
     // GPT Web 会话的每条消息都是普通对话：原样交给网页，网页自己维护上下文，工具由
     // ChatGPT 侧经 Magi MCP 使用，不能把任务上下文和工具规则塞进网页输入框。
@@ -2552,9 +2600,13 @@ async fn submit_mainline_session_turn(
         .unwrap_or_else(|| "new-session".to_string());
     trace.mark("submit_received", &requested_session_label, None, None);
     let route = decision.route;
-    let user_text = request
-        .trimmed_text()
-        .unwrap_or_else(|| request.timeline_content(None));
+    let user_text = request.trimmed_text().unwrap_or_else(|| {
+        request
+            .workflow_id
+            .as_deref()
+            .map(|workflow_id| format!("执行工作流 {workflow_id}"))
+            .unwrap_or_else(|| request.timeline_content(None))
+    });
     let goal_mode = request.goal_mode;
     let execution_goal = if goal_mode {
         format!("{}\n\n用户原始输入：{}", goal_mode_tool_intent(), user_text)
@@ -5982,6 +6034,7 @@ mod tests {
             expected_turn_id: None,
             replace_turn_id: None,
             command: None,
+            workflow_id: None,
         }
     }
 

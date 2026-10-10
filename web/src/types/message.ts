@@ -768,6 +768,7 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   command: 'compact' | null;
+  workflowId?: string | null;
   skillName?: string | null;
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;

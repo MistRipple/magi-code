@@ -5613,6 +5613,7 @@ mod tests {
                 expected_turn_id: None,
                 replace_turn_id: None,
                 command: None,
+                workflow_id: None,
             },
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),

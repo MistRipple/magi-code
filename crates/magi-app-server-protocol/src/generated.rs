@@ -524,6 +524,10 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<SessionTurnCommand>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workflowId")]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
     pub images: Vec<SessionTurnImage>,
     #[serde(default)]
     #[serde(rename = "contextReferences")]

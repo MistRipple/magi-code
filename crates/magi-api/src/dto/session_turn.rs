@@ -199,6 +199,9 @@ pub struct SessionTurnRequestDto {
     /// 用户显式选择的会话命令（如 `/compact`）；`text` 只包含命令参数，命令身份单独存储。
     #[serde(default)]
     pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
+    /// 用户为本次任务显式选择的工作流核心身份；由 daemon 按当前作用域校验并固定。
+    #[serde(default)]
+    pub workflow_id: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
@@ -804,6 +807,7 @@ mod tests {
             expected_turn_id: None,
             replace_turn_id: None,
             command: None,
+            workflow_id: None,
         };
 
         assert_eq!(

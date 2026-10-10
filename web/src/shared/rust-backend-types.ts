@@ -143,6 +143,7 @@ export interface QueuedSessionTurnDto {
   content: string;
   text?: string | null;
   command: 'compact' | null;
+  workflowId?: string | null;
   skillName?: string | null;
   goalMode: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;

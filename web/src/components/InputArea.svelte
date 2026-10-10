@@ -76,7 +76,9 @@
     type ComposerAction,
     type ComposerSessionCommand,
     type ComposerSkillOption,
+    type ComposerWorkflowOption,
   } from '../lib/composer-actions';
+  import { loadActivePluginWorkflows, type PluginContributionProjection } from '../web/plugin-api';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -129,6 +131,7 @@
     goalMode: boolean;
     sessionCommand: ComposerSessionCommand | null;
     skill: SkillOption | null;
+    workflow: ComposerWorkflowOption | null;
   }
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
@@ -191,6 +194,7 @@
   let selectedGoalMode = $state(false);
   let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
   let selectedSkill = $state<SkillOption | null>(null);
+  let selectedWorkflow = $state<ComposerWorkflowOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
   let selectedBrowserNodeSelections = $state<MessageBrowserNodeSelection[]>([]);
@@ -496,6 +500,27 @@
     return out;
   });
 
+  let availableWorkflows = $state<ComposerWorkflowOption[]>([]);
+  let workflowRequestSeq = 0;
+  $effect(() => {
+    const scope = currentWorkspaceId?.trim() ? `workspace:${currentWorkspaceId.trim()}` : 'application';
+    const request = ++workflowRequestSeq;
+    void loadActivePluginWorkflows(scope).then((entries: PluginContributionProjection[]) => {
+      if (request !== workflowRequestSeq) return;
+      availableWorkflows = entries
+        .filter((entry) => entry.id.startsWith('plugin/'))
+        .map((entry) => ({ workflowId: entry.id, name: entry.title, description: entry.description }));
+      if (selectedWorkflow && !availableWorkflows.some((workflow) => workflow.workflowId === selectedWorkflow?.workflowId)) {
+        selectedWorkflow = null;
+      }
+    }).catch(() => {
+      if (request === workflowRequestSeq) {
+        availableWorkflows = [];
+        selectedWorkflow = null;
+      }
+    });
+  });
+
   // 压缩命令与附件互斥：草稿会话没有可压缩的历史，带附件时 daemon 会拒绝，这里提前说明而不是让它消失。
   const attachmentTotal = $derived(composerAttachmentTotal({
     images: selectedImages.length + pendingImageReadCount,
@@ -524,7 +549,7 @@
         description: i18n.t('input.add.contextDescription'),
       },
     },
-    { sessionCommandDisabledReason: compactDisabledReason },
+    { sessionCommandDisabledReason: compactDisabledReason, workflows: availableWorkflows },
   ));
 
   const filteredSlashCommands = $derived.by<Array<Exclude<ComposerAction, { kind: 'resource' }>>>(() => {
@@ -534,7 +559,9 @@
         ? !selectedGoalMode
         : command.kind === 'command'
           ? command.id !== selectedSessionCommand
-          : command.id !== selectedSkill?.skillId
+        : command.kind === 'skill'
+          ? command.id !== selectedSkill?.skillId
+          : command.id !== selectedWorkflow?.workflowId
     ));
   });
 
@@ -567,6 +594,7 @@
     selectedGoalMode = false;
     selectedSessionCommand = null;
     selectedSkill = null;
+    selectedWorkflow = null;
     addMenuOpen = false;
     contextPickerOpen = false;
     invalidateEnhanceState();
@@ -582,7 +610,8 @@
       || selectedBrowserNodeSelections.length > 0
       || selectedGoalMode
       || selectedSessionCommand !== null
-      || selectedSkill,
+      || selectedSkill
+      || selectedWorkflow,
     );
   }
 
@@ -728,6 +757,7 @@
       goalMode: selectedGoalMode,
       sessionCommand: selectedSessionCommand,
       skill: selectedSkill ? { ...selectedSkill } : null,
+      workflow: selectedWorkflow ? { ...selectedWorkflow } : null,
     };
   }
 
@@ -740,7 +770,8 @@
       && selectedBrowserNodeSelections.length === 0
       && !selectedGoalMode
       && selectedSessionCommand === null
-      && selectedSkill === null;
+      && selectedSkill === null
+      && selectedWorkflow === null;
   }
 
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
@@ -754,6 +785,7 @@
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = draft.sessionCommand;
     selectedSkill = draft.skill ? { ...draft.skill } : null;
+    selectedWorkflow = draft.workflow ? { ...draft.workflow } : null;
     queueMicrotask(focusEditor);
   }
 
@@ -771,6 +803,7 @@
       || selectedGoalMode
       || selectedSessionCommand !== null
       || selectedSkill !== null
+      || selectedWorkflow !== null
       || editingTurn !== null,
     );
   });
@@ -814,6 +847,7 @@
     selectedSkill = draft.skillName
       ? (availableSkills.find((skill) => skill.skillId === draft.skillName) || null)
       : null;
+    selectedWorkflow = null;
     queueMicrotask(focusEditor);
   });
 
@@ -1211,14 +1245,22 @@
       selectedGoalMode = true;
       selectedSessionCommand = null;
       selectedSkill = null;
+      selectedWorkflow = null;
     } else if (command.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = command.id;
       selectedSkill = null;
+      selectedWorkflow = null;
+    } else if (command.kind === 'workflow') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = command.workflow;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = command.skill;
+      selectedWorkflow = null;
     }
     if (inputTextareaEl && slashTriggerStart !== null) {
       invalidateEnhanceState();
@@ -1268,14 +1310,22 @@
       selectedGoalMode = !selectedGoalMode;
       selectedSessionCommand = null;
       selectedSkill = null;
+      selectedWorkflow = null;
     } else if (action.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = selectedSessionCommand === action.id ? null : action.id;
       selectedSkill = null;
+      selectedWorkflow = null;
+    } else if (action.kind === 'workflow') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = selectedWorkflow?.workflowId === action.workflow.workflowId ? null : action.workflow;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = selectedSkill?.skillId === action.skill.skillId ? null : action.skill;
+      selectedWorkflow = null;
     }
     closeAddMenu();
     queueMicrotask(focusEditor);
@@ -1695,7 +1745,7 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (
-        (!normalizedContent && selectedSessionCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
+        (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
@@ -1745,6 +1795,7 @@
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
         command: selectedSessionCommand,
+        workflowId: selectedWorkflow?.workflowId ?? null,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
         followUpMode: !replaceTurnId && !isDraftSession && isSending ? 'queue' : undefined,
@@ -1927,6 +1978,10 @@
       goalMode: target.goalMode === true,
       sessionCommand: target.command === 'compact' ? 'compact' : null,
       skill: restoredSkill,
+      workflow: target.workflowId
+        ? availableWorkflows.find((workflow) => workflow.workflowId === target.workflowId)
+          ?? { workflowId: target.workflowId, name: target.workflowId, description: '' }
+        : null,
     });
   }
 
@@ -2746,7 +2801,7 @@
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill || selectedWorkflow}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -2852,6 +2907,22 @@
             </button>
           </span>
         {/if}
+        {#if selectedWorkflow}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedWorkflow.description}>
+            <Icon name="settings" size={11} />
+            <span class="ia-reference-chip-label">/{selectedWorkflow.name}</span>
+            {#if selectedWorkflow.description}<span class="ia-reference-chip-desc">{selectedWorkflow.description}</span>{/if}
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedWorkflow = null; queueMicrotask(focusEditor); }}
+              title={i18n.t('input.removeWorkflow')}
+              aria-label={i18n.t('input.removeWorkflow')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
       </div>
     {/if}
 
@@ -2895,6 +2966,8 @@
           ? i18n.t('input.placeholderWithCompact')
         : selectedSkill
           ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
+        : selectedWorkflow
+          ? i18n.t('input.placeholderWithWorkflow', { workflowName: selectedWorkflow.name })
         : selectedImages.length > 0
           ? i18n.t('input.placeholderWithImages')
         : selectedContextReferences.length > 0
@@ -2920,7 +2993,9 @@
                   ? i18n.t('input.slash.modeGroup')
                   : command.kind === 'command'
                     ? i18n.t('input.slash.commandGroup')
-                    : i18n.t('input.slash.skillGroup')}
+                    : command.kind === 'workflow'
+                      ? i18n.t('input.slash.workflowGroup')
+                      : i18n.t('input.slash.skillGroup')}
               </div>
             {/if}
             <button
@@ -2935,7 +3010,7 @@
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
               <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
-                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : 'skill'} size={12} />
+                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : command.kind === 'workflow' ? 'settings' : 'skill'} size={12} />
               </span>
               <span class="ia-slash-item-content">
                 <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
@@ -2980,7 +3055,9 @@
                         ? i18n.t('input.slash.modeGroup')
                         : action.kind === 'command'
                           ? i18n.t('input.slash.commandGroup')
-                          : i18n.t('input.slash.skillGroup')}
+                          : action.kind === 'workflow'
+                            ? i18n.t('input.slash.workflowGroup')
+                            : i18n.t('input.slash.skillGroup')}
                   </div>
                 {/if}
                 <button
@@ -2994,6 +3071,8 @@
                       ? selectedSessionCommand === action.id
                     : action.kind === 'skill'
                       ? selectedSkill?.skillId === action.skill.skillId
+                    : action.kind === 'workflow'
+                      ? selectedWorkflow?.workflowId === action.workflow.workflowId
                       : false}
                   onclick={() => applyAddMenuAction(action)}
                   role="menuitem"
@@ -3006,6 +3085,8 @@
                           ? 'infinity'
                           : action.kind === 'command'
                             ? 'refresh'
+                          : action.kind === 'workflow'
+                            ? 'settings'
                           : 'skill'}
                       size={13}
                     />

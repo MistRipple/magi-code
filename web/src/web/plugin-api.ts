@@ -97,6 +97,13 @@ export async function loadActivePluginCommands(scope = 'application'): Promise<P
   return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
 
+export async function loadActivePluginWorkflows(scope = 'application'): Promise<PluginContributionProjection[]> {
+  const response = await pluginRequest(`/api/plugins/workflows?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error(`插件工作流请求失败: ${response.status}`);
+  const payload = await response.json() as unknown;
+  return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
+}
+
 export async function readPluginResource(
   pluginId: string,
   resourceId: string,

@@ -3923,6 +3923,7 @@ interface ExecuteTaskInput {
   /** 用户点击“继续”恢复被中断或可恢复的执行。 */
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  workflowId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
@@ -3963,6 +3964,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
+    workflowId: turn.workflowId ?? null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -4125,7 +4127,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
     : [];
   const command = input.command === 'compact' ? input.command : null;
-  if (!command && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
+  const workflowId = typeof input.workflowId === 'string' && input.workflowId.trim()
+    ? input.workflowId.trim()
+    : null;
+  if (!command && !workflowId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4182,6 +4187,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(skillName ? { skillName } : {}),
       ...(input.goalMode === true ? { goalMode: true } : {}),
       ...(command ? { sessionCommand: command } : {}),
+      ...(workflowId ? { workflowId } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4209,6 +4215,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       goalMode: input.goalMode === true,
       resume: input.resume === true,
       command,
+      workflowId,
       images,
       contextReferences,
       browserAnnotationRefs,
