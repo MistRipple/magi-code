@@ -302,7 +302,7 @@
     pickerWebEngines.find((engine) => engine.id === currentPickerEngineId) ?? null
   ));
   const currentSessionUsesWebEngine = $derived.by(() => (
-    currentPickerEngineId.trim().startsWith('chatgpt-web/')
+    currentPickerEngineId.trim().startsWith('plugin/openai.chatgpt-web/')
   ));
   const canSelectPickerWebEngine = $derived.by(() => (
     isDraftSession || !currentSessionHasCanonicalHistory || currentSessionUsesWebEngine
@@ -2506,7 +2506,7 @@
    *
    * 与选择 provider 模型的区别只有两点：
    * - 写入会话级 `engineId` 绑定；`model` 写引擎自身的族名（与 daemon 从
-   *   `chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
+   *   `plugin/openai.chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
    * - 强度收敛到该引擎 `efforts` 的取值域，不支持时落到引擎的第一个可用档位。
    */
   /**
@@ -2580,12 +2580,12 @@
     const wasDraft = !(currentSessionId?.trim());
     const sessionId = await materializeDraftSession();
     if (wasDraft) {
-      const engineId = currentPickerEngineId || 'chatgpt-web/default';
+      const engineId = currentPickerEngineId || 'plugin/openai.chatgpt-web/default';
       await saveAgentOrchestratorSessionConfig(
         withOrchestratorReasoningEffort(
           messagesState.draftOrchestratorSessionConfig,
           readOrchestratorReasoningEffort(),
-          { engineId, model: engineId.slice('chatgpt-web/'.length) },
+          { engineId, model: engineId.split('/').pop() || engineId },
         ),
         currentWebBinding(sessionId),
       );
@@ -2608,8 +2608,8 @@
       pickerOpen = false;
       return;
     }
-    const family = engineId.startsWith('chatgpt-web/')
-      ? engineId.slice('chatgpt-web/'.length)
+    const family = engineId.startsWith('plugin/openai.chatgpt-web/')
+      ? engineId.split('/').pop() || engineId
       : (engine.displayName || engineId);
     // 强度由网页自己选择，Magi 不改写会话的 reasoningEffort。
     const reasoningEffort = readOrchestratorReasoningEffort();

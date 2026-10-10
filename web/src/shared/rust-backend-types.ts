@@ -1266,7 +1266,7 @@ export interface AgentTemplateIdRequestDto {
 /**
  * 会话内主模型选择器里的 GPT Web 入口（daemon 投影，W18）。
  *
- * 登录后只有一个固定入口 `chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
+ * 登录后只有一个固定入口 `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
  * 不出现。工具能力是可选增强：通道不可用时入口照常可用，`tools.available=false` 并说明缺什么。
  */
 export interface PickerWebEngineDto {

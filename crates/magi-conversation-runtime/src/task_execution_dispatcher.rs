@@ -4012,7 +4012,7 @@ mod tests {
                 session_id,
                 "orchestrator",
                 serde_json::json!({
-                    "engineId": "chatgpt-web/default",
+                    "engineId": "plugin/openai.chatgpt-web/default",
                     "reasoningEffort": "high",
                 }),
             )
@@ -4052,7 +4052,7 @@ mod tests {
         );
         let specs = factory.specs();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].engine_id, "chatgpt-web/default");
+        assert_eq!(specs[0].engine_id, "plugin/openai.chatgpt-web/default");
         assert_eq!(specs[0].session_id, "session-web");
         assert_eq!(specs[0].thread_id, ORCHESTRATOR_THREAD_ID);
         let binding: magi_web_model::WebConversationBinding =
@@ -4097,7 +4097,7 @@ mod tests {
                 "registryAgents",
                 serde_json::json!([{
                     "templateId": "role-web",
-                    "engineId": "chatgpt-web/default",
+                    "engineId": "plugin/openai.chatgpt-web/default",
                     "enabled": true,
                     "bindingRevision": 1,
                     "order": 0,

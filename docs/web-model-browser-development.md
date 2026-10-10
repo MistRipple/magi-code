@@ -117,7 +117,7 @@ MCP 调用和结果不写入 ChatGPT composer，也不作为普通用户消息�
 ```text
 WebConversationBinding {
   mode: temporary | saved,
-  engine_id: chatgpt-web/default,
+  engine_id: plugin/openai.chatgpt-web/default,
   remote_conversation_id?,
   remote_title?,
   last_synced_remote_message_id?,
@@ -320,7 +320,7 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 
 ## 9. 引擎与设置
 
-- **固定入口**：只有一个 Web 引擎条目，`engineId = chatgpt-web/default`，`apiProtocol = chatgpt_web`，不写 `llm`、不写 baseUrl / apiKey，来源标注“来自 Web”。不做模型菜单发现，不保存强度取值域，模型与强度由用户在网页里选。
+- **固定入口**：只有一个 Web 引擎条目，`engineId = plugin/openai.chatgpt-web/default`，`apiProtocol = chatgpt_web`，不写 `llm`、不写 baseUrl / apiKey，来源标注“来自 Web”。不做模型菜单发现，不保存强度取值域，模型与强度由用户在网页里选。
 - 会话内主模型选择器：未登录或登录探测未完成时**不显示** Web 入口；登录成功后空白会话可见并可选这一项；已有本地消息的会话不显示；Web 会话可切到本地模型（W2、W3）。不把网页里的 GPT 模型名称追加为 Magi 的独立模型条目。
 - 选择 Web 引擎后显示模式选择：临时模式直接开始新的多轮临时对话；已保存模式显示 Web 历史选择器和“新建已保存对话”。已保存模式的 Magi 会话标题只接受 Web 返回的标题，标题读取失败时显示明确的未同步状态，不自行猜标题。
 - 全局 `orchestrator` 保存入口拒绝 `chatgpt_web`；Web 引擎只能作为会话级绑定存在。

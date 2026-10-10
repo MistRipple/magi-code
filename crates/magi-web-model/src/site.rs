@@ -79,16 +79,16 @@ pub fn chatgpt_web_temporary_chat_url() -> String {
     format!("{}/?temporary-chat=true", chatgpt_web_origin())
 }
 
-/// Web 引擎 id 的命名空间前缀。
+/// GPT Web 插件贡献的引擎命名空间。
 ///
-/// 引擎身份固定为 `<命名空间>/<family>`（例如 `chatgpt-web/gpt-5`），避免与用户
-/// 自填模型在身份与用量统计上串味。
-pub const WEB_MODEL_ENGINE_ID_NAMESPACE: &str = "chatgpt-web";
+/// 引擎身份使用统一插件合同 `plugin/{pluginId}/{contributionId}`；GPT Web 的
+/// 宿主适配器拥有 `openai.chatgpt-web` 这一受控插件身份。
+pub const WEB_MODEL_ENGINE_ID_NAMESPACE: &str = "plugin/openai.chatgpt-web";
 
 /// GPT Web 引擎的默认 id。发现到具体模型族时会使用同一命名空间下的
-/// `chatgpt-web/<family>`，这样多个已登录 Web 模型可以在 Magi 中并列展示，
+/// `plugin/openai.chatgpt-web/<family>`，这样多个已登录 Web 模型可以在 Magi 中并列展示，
 /// 同时不会与本地/HTTP 引擎混淆。
-pub const WEB_MODEL_ENGINE_ID: &str = "chatgpt-web/default";
+pub const WEB_MODEL_ENGINE_ID: &str = "plugin/openai.chatgpt-web/default";
 
 /// 由站点模型族构造 Web 引擎 id。
 pub fn web_model_engine_id(family: &str) -> String {
@@ -118,9 +118,7 @@ pub fn web_model_engine_id(family: &str) -> String {
 
 /// 判断引擎 id 是否属于 Web 引擎命名空间。
 pub fn is_chatgpt_web_engine_id(engine_id: &str) -> bool {
-    engine_id
-        .strip_prefix(WEB_MODEL_ENGINE_ID_NAMESPACE)
-        .is_some_and(|rest| rest.starts_with('/'))
+    engine_id.starts_with(concat!("plugin/openai.chatgpt-web", "/"))
 }
 
 #[cfg(test)]

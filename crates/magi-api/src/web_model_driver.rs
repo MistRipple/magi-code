@@ -1199,7 +1199,7 @@ impl WebModelHostFactory {
         let binding: magi_web_model::WebConversationBinding = serde_json::from_value(spec.binding)
             .map_err(|_| "GPT Web 会话绑定不符合引擎合同".to_string())?;
         if !magi_web_model::is_chatgpt_web_engine_id(&spec.engine_id) {
-            return Err("GPT Web 引擎 id 必须位于 chatgpt-web 命名空间".to_string());
+            return Err("GPT Web 引擎 id 必须位于 GPT Web 插件命名空间".to_string());
         }
         let identity = WebModelIdentity {
             session_id: spec.session_id.clone(),

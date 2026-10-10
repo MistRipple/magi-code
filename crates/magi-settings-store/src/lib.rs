@@ -819,11 +819,11 @@ mod tests {
             .set_session_section(
                 &session,
                 "orchestrator",
-                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "chatgpt-web/gpt-5"}),
+                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "plugin/openai.chatgpt-web/gpt-5"}),
             )
             .unwrap();
         let stored = store.get_session_section(&session, "orchestrator");
-        assert_eq!(stored["engineId"], json!("chatgpt-web/gpt-5"));
+        assert_eq!(stored["engineId"], json!("plugin/openai.chatgpt-web/gpt-5"));
         assert_eq!(stored["model"], json!("gpt-5"));
         assert_eq!(stored["reasoningEffort"], json!("high"));
     }
@@ -836,12 +836,12 @@ mod tests {
             .set_session_section(
                 &session,
                 "orchestrator",
-                json!({"model": "gpt-5", "engineId": "chatgpt-web/gpt-5", "baseUrl": "https://x"}),
+                json!({"model": "gpt-5", "engineId": "plugin/openai.chatgpt-web/gpt-5", "baseUrl": "https://x"}),
             )
             .unwrap();
         let stored = store.get_session_section(&session, "orchestrator");
         assert_eq!(stored["model"], json!("gpt-5"));
-        assert_eq!(stored["engineId"], json!("chatgpt-web/gpt-5"));
+        assert_eq!(stored["engineId"], json!("plugin/openai.chatgpt-web/gpt-5"));
         assert!(stored.get("baseUrl").is_none());
     }
 
@@ -852,7 +852,7 @@ mod tests {
         store
             .set_section(
                 ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
-                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "chatgpt-web/gpt-5"}),
+                json!({"model": "gpt-5", "reasoningEffort": "high", "engineId": "plugin/openai.chatgpt-web/gpt-5"}),
             )
             .unwrap();
         let stored = store.get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION);

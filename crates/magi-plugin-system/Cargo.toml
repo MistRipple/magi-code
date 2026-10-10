@@ -18,4 +18,5 @@ semver = "1"
 jsonschema = { version = "0.58.6", default-features = false }
 
 [dev-dependencies]
+magi-process = { path = "../magi-process" }
 tempfile = "3"

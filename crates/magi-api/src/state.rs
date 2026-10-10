@@ -2028,7 +2028,7 @@ impl ApiState {
 
     /// 会话内主模型选择器看到的 GPT Web 入口（W18）。
     ///
-    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `chatgpt-web/default`，不复制网页的模型菜单。
+    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单。
     /// 工具能力单独投影：它是可选增强，通道不可用时入口照常可用，只是没有项目工具并说明缺什么。
     pub fn web_model_picker_engines(&self) -> Vec<serde_json::Value> {
         let Some(probe) = self.web_model_probe_snapshot() else {

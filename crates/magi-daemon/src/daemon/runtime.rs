@@ -2298,12 +2298,15 @@ impl DaemonRuntime {
             }
         };
         let plugin_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> =
-            Arc::new(magi_plugin_system::PluginSessionEngineFactory::new(
-                self.plugin_manager.clone(),
-                self.plugin_host.clone(),
-                build_plugin_capability_handler(self.plugin_manager.clone()),
-                RuntimeLimits::default(),
-            ));
+            Arc::new(
+                magi_plugin_system::PluginSessionEngineFactory::new(
+                    self.plugin_manager.clone(),
+                    self.plugin_host.clone(),
+                    build_plugin_capability_handler(self.plugin_manager.clone()),
+                    RuntimeLimits::default(),
+                )
+                .with_reserved_engine_namespace(magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE),
+            );
         let plugin_command_executor: Arc<dyn magi_plugin_system::PluginCommandExecutor> =
             Arc::new(magi_plugin_system::PluginCommandRunner::new(
                 self.plugin_manager.clone(),

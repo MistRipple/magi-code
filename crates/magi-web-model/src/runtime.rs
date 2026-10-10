@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn runtime_is_single_slot() {
         let runtime = WebModelRuntimeRegistry::new();
-        runtime.mark_web_turn("s", "orchestrator", "chatgpt-web/default", "home");
+        runtime.mark_web_turn("s", "orchestrator", "plugin/openai.chatgpt-web/default", "home");
         runtime.record_web_send("s");
         let entries = runtime.snapshot(Some("s"));
         assert_eq!(entries.len(), 1);

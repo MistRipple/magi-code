@@ -78,6 +78,7 @@ pub struct PluginSessionEngineFactory {
     host: magi_plugin_runtime::PluginHost,
     handler: Arc<dyn magi_plugin_runtime::CapabilityHandler>,
     limits: magi_plugin_runtime::RuntimeLimits,
+    reserved_engine_namespaces: Vec<String>,
 }
 
 impl PluginSessionEngineFactory {
@@ -92,7 +93,17 @@ impl PluginSessionEngineFactory {
             host,
             handler,
             limits,
+            reserved_engine_namespaces: Vec::new(),
         }
+    }
+
+    /// 将由宿主适配器负责的插件命名空间从通用包工厂中排除，确保每个引擎身份只有一条路由。
+    pub fn with_reserved_engine_namespace(mut self, namespace: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        if !namespace.trim().is_empty() {
+            self.reserved_engine_namespaces.push(namespace);
+        }
+        self
     }
 
     fn identity(engine_id: &str) -> Result<(String, String), String> {
@@ -110,6 +121,10 @@ impl PluginSessionEngineFactory {
 impl SessionEngineFactory for PluginSessionEngineFactory {
     fn supports(&self, engine_id: &str) -> bool {
         engine_id.starts_with("plugin/")
+            && !self
+                .reserved_engine_namespaces
+                .iter()
+                .any(|namespace| engine_id.starts_with(&format!("{namespace}/")))
     }
 
     fn build_session_engine(
@@ -356,6 +371,69 @@ mod tests {
 
     struct NamespaceFactory(&'static str);
 
+    struct ReservedNamespaceFactory(PluginSessionEngineFactory);
+
+    impl SessionEngineFactory for ReservedNamespaceFactory {
+        fn supports(&self, engine_id: &str) -> bool {
+            self.0.supports(engine_id)
+        }
+
+        fn build_session_engine(
+            &self,
+            spec: SessionEngineInvocationSpec,
+        ) -> Result<Arc<dyn ModelBridgeClient>, String> {
+            self.0.build_session_engine(spec)
+        }
+    }
+
+    #[test]
+    fn reserved_plugin_namespace_keeps_engine_routing_single_owner() {
+        let root = tempfile::tempdir().expect("create plugin manager root");
+        let manager = PluginManager::open(root.path()).expect("open empty plugin manager");
+        let factory = PluginSessionEngineFactory::new(
+            Arc::new(std::sync::Mutex::new(manager)),
+            magi_plugin_runtime::PluginHost::new(
+                std::path::PathBuf::from("/tmp/magi-plugin-worker"),
+                magi_process::ManagedProcessGroup::default(),
+            ),
+            Arc::new(RejectingCapabilityHandler),
+            magi_plugin_runtime::RuntimeLimits::default(),
+        )
+        .with_reserved_engine_namespace("plugin/openai.chatgpt-web");
+        assert!(factory.supports("plugin/example/engine"));
+        assert!(!factory.supports("plugin/openai.chatgpt-web/default"));
+
+        let router = SessionEngineRouter::new(vec![
+            Arc::new(ReservedNamespaceFactory(factory)),
+            Arc::new(NamespaceFactory("plugin/openai.chatgpt-web")),
+        ])
+        .expect("router should register host and plugin factories");
+        assert!(router.supports("plugin/openai.chatgpt-web/default"));
+        assert!(router.supports("plugin/example/engine"));
+    }
+
+    struct RejectingCapabilityHandler;
+
+    impl magi_plugin_runtime::CapabilityHandler for RejectingCapabilityHandler {
+        fn call<'a>(
+            &'a self,
+            _request: magi_plugin_runtime::CapabilityRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Value, magi_plugin_runtime::ExecutionError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::ready(Err(
+                magi_plugin_runtime::ExecutionError::new(
+                    magi_plugin_runtime::ExecutionErrorCode::InvalidRequest,
+                    "测试能力处理器不应被调用",
+                ),
+            )))
+        }
+    }
+
     impl SessionEngineFactory for NamespaceFactory {
         fn supports(&self, engine_id: &str) -> bool {
             engine_id.starts_with(self.0)
@@ -375,12 +453,12 @@ mod tests {
             .expect("router should have one factory");
         assert!(router.supports("plugin/example/engine"));
         assert!(!router.supports("plugin:example:engine"));
-        assert!(!router.supports("chatgpt-web/default"));
+        assert!(!router.supports("builtin/default"));
         let error = match router.build_session_engine(SessionEngineInvocationSpec {
             session_id: String::new(),
             project_id: String::new(),
             thread_id: String::new(),
-            engine_id: "chatgpt-web/default".into(),
+            engine_id: "builtin/default".into(),
             binding: Value::Null,
         }) {
             Ok(_) => panic!("unregistered engine must fail closed"),

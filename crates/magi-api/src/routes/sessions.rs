@@ -6177,7 +6177,7 @@ mod tests {
         // 新会话首条消息携带 GPT Web 引擎配置：固定普通对话，没有任务标题 / 工具意图改写。
         let mut first_message = session_turn_request(text);
         first_message.orchestrator_session_config =
-            Some(serde_json::json!({ "engineId": "chatgpt-web/default" }));
+            Some(serde_json::json!({ "engineId": "plugin/openai.chatgpt-web/default" }));
         let decision = decide_session_turn(&state, &first_message).unwrap();
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert!(decision.task_title.is_none() && decision.execution_goal.is_none());
@@ -6189,7 +6189,7 @@ mod tests {
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                serde_json::json!({ "engineId": "chatgpt-web/default" }),
+                serde_json::json!({ "engineId": "plugin/openai.chatgpt-web/default" }),
             )
             .unwrap();
         let mut existing = session_turn_request(text);

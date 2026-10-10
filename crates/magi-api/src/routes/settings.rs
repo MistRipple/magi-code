@@ -386,7 +386,7 @@ fn ensure_web_session_direction_allowed(
         return Ok(());
     };
 
-    // GPT Web 是固定入口 `chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
+    // GPT Web 是固定入口 `plugin/openai.chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
     let is_web_engine_id = magi_web_model::is_chatgpt_web_engine_id;
     let requested_is_web = is_web_engine_id(requested_engine_id);
     if !requested_is_web {
@@ -2348,7 +2348,7 @@ async fn upsert_engine(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if is_chatgpt_web_engine(&request) {
-        // GPT Web 入口由登录状态自动提供（固定的 `chatgpt-web/default`），不写入引擎注册表：
+        // GPT Web 入口由登录状态自动提供（固定的 `plugin/openai.chatgpt-web/default`），不写入引擎注册表：
         // 注册表里的条目都是 HTTP 引擎，Web 不是第二种“模型”。
         return Err(ApiError::InvalidInput(
             "GPT Web 入口由登录状态自动提供，不能写入模型引擎注册表".to_string(),
@@ -3330,7 +3330,7 @@ mod tests {
             1,
             "登录后只有一个固定入口，不复制网页模型菜单"
         );
-        assert_eq!(engines[0]["id"], json!("chatgpt-web/default"));
+        assert_eq!(engines[0]["id"], json!("plugin/openai.chatgpt-web/default"));
         assert_eq!(engines[0]["apiProtocol"], json!("chatgpt_web"));
         // 通道没配置：入口照常可用，只是没有项目工具并说明缺什么（W8）。
         assert_eq!(engines[0]["tools"]["available"], json!(false));
@@ -5509,7 +5509,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5519,7 +5519,7 @@ mod tests {
         let error = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("已有本地历史的会话不能切入 Web");
         match error {
@@ -5556,7 +5556,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5566,7 +5566,7 @@ mod tests {
         save_initial_orchestrator_session_override_for_new_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("the first request of a newly created session may bind Web")
         .expect("initial Web binding should produce a session override");
@@ -5574,7 +5574,7 @@ mod tests {
             state
                 .settings_store
                 .get_session_section(&session_id, "orchestrator")["engineId"],
-            json!("chatgpt-web/default")
+            json!("plugin/openai.chatgpt-web/default")
         );
     }
 
@@ -5591,7 +5591,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5601,7 +5601,7 @@ mod tests {
         save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("空白会话应允许启动 Web")
         .expect("Web 绑定应产生会话覆盖");
@@ -5624,7 +5624,7 @@ mod tests {
         let reverse = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("切回本地后不能再次转回 Web");
         assert!(
@@ -5655,7 +5655,7 @@ mod tests {
         save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "default", "webMode": "saved" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "default", "webMode": "saved" }),
         )
         .expect("空白会话可以同时选择入口与已保存方式")
         .expect("引擎绑定应产生会话覆盖");

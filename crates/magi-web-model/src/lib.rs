@@ -36,6 +36,7 @@ pub use images::{
 pub use runtime::{WebModelRuntimeEntry, WebModelRuntimeRegistry};
 pub use site::{
     CHATGPT_WEB_HOME_URL, CHATGPT_WEB_ORIGIN, CHATGPT_WEB_TEMPORARY_CHAT_URL, WEB_MODEL_ENGINE_ID,
+    WEB_MODEL_ENGINE_ID_NAMESPACE,
     chatgpt_web_home_url, chatgpt_web_origin, chatgpt_web_temporary_chat_url,
     is_chatgpt_web_engine_id, openai_platform_api_keys_url, openai_platform_tunnels_url,
     web_model_engine_id,

@@ -746,7 +746,10 @@ pub fn orchestrator_web_engine_id(
 
 /// Web 入口没有 HTTP 连接配置：只有协议标签与（占位的）模型名。
 fn chatgpt_web_engine_config(engine_id: &str) -> serde_json::Value {
-    let family = engine_id.strip_prefix("chatgpt-web/").unwrap_or(engine_id);
+    let family = engine_id
+        .strip_prefix(magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE)
+        .and_then(|value| value.strip_prefix('/'))
+        .unwrap_or(engine_id);
     serde_json::json!({ "apiProtocol": "chatgpt_web", "model": family })
 }
 
@@ -934,7 +937,7 @@ mod tests {
             .set_session_section(
                 &session_id,
                 "orchestrator",
-                json!({ "engineId": "chatgpt-web/default", "reasoningEffort": "high" }),
+                json!({ "engineId": "plugin/openai.chatgpt-web/default", "reasoningEffort": "high" }),
             )
             .expect("写入会话级覆盖");
         let config = resolve_orchestrator_model_config(&store, Some(&session_id))
@@ -947,7 +950,7 @@ mod tests {
         assert_eq!(config.provider(), "chatgpt_web");
         assert_eq!(
             orchestrator_web_engine_id(&store, Some(&session_id)).as_deref(),
-            Some("chatgpt-web/default")
+            Some("plugin/openai.chatgpt-web/default")
         );
         // 绑定默认是临时对话；已保存对话只存远端引用。
         assert_eq!(
