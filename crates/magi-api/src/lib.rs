@@ -49,6 +49,7 @@ pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
+pub use routes::{write_plugin_resource_with_event, write_plugin_settings_with_event};
 pub use web_model_channel::{
     WEB_MODEL_TUNNEL_SECTION, WebModelChannelRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
 };

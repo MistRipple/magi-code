@@ -95,7 +95,6 @@ impl PluginManager {
     pub fn state(&self) -> &PluginManagerState {
         &self.state
     }
-
     pub fn resources(&self) -> &PluginResourceStore {
         &self.resources
     }

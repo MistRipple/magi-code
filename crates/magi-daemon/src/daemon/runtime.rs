@@ -210,12 +210,17 @@ fn build_plugin_tool_catalog_provider(
 
 struct PluginCapabilityHandler {
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+    event_bus: Arc<InMemoryEventBus>,
 }
 
 fn build_plugin_capability_handler(
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
+    event_bus: Arc<InMemoryEventBus>,
 ) -> Arc<PluginCapabilityHandler> {
-    Arc::new(PluginCapabilityHandler { plugin_manager })
+    Arc::new(PluginCapabilityHandler {
+        plugin_manager,
+        event_bus,
+    })
 }
 
 impl CapabilityHandler for PluginCapabilityHandler {
@@ -312,9 +317,15 @@ impl CapabilityHandler for PluginCapabilityHandler {
                         .get("value")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
-                    manager
-                        .resources_mut()
-                        .write(plugin_id, &scope, resource, expected, value)
+                    magi_api::write_plugin_resource_with_event(
+                        &mut manager,
+                        &self.event_bus,
+                        plugin_id,
+                        &scope,
+                        resource,
+                        expected,
+                        value,
+                    )
                         .map(|resource| serde_json::json!(resource))
                         .map_err(|_| {
                             ExecutionError::new(
@@ -359,8 +370,14 @@ impl CapabilityHandler for PluginCapabilityHandler {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     Ok(serde_json::json!(
-                        manager
-                            .write_settings(plugin_id, &scope, expected, value)
+                        magi_api::write_plugin_settings_with_event(
+                            &mut manager,
+                            &self.event_bus,
+                            plugin_id,
+                            &scope,
+                            expected,
+                            value,
+                        )
                             .map_err(|_| ExecutionError::new(
                                 ExecutionErrorCode::CapabilityRejected,
                                 "插件设置写入被拒绝"
@@ -379,8 +396,9 @@ impl CapabilityHandler for PluginCapabilityHandler {
 fn build_plugin_tool_executor(
     plugin_manager: Arc<std::sync::Mutex<PluginManager>>,
     plugin_host: PluginHost,
+    event_bus: Arc<InMemoryEventBus>,
 ) -> PluginToolExecutor {
-    let handler = build_plugin_capability_handler(Arc::clone(&plugin_manager));
+    let handler = build_plugin_capability_handler(Arc::clone(&plugin_manager), event_bus);
     Arc::new(move |model_tool_name, arguments, context| {
         let scope = context
             .workspace_id
@@ -1699,8 +1717,11 @@ impl DaemonRuntime {
             build_external_mcp_tool_executor(settings_store.clone(), mcp_connections.clone());
         let plugin_tool_catalog_provider =
             build_plugin_tool_catalog_provider(self.plugin_manager.clone());
-        let plugin_tool_executor =
-            build_plugin_tool_executor(self.plugin_manager.clone(), self.plugin_host.clone());
+        let plugin_tool_executor = build_plugin_tool_executor(
+            self.plugin_manager.clone(),
+            self.plugin_host.clone(),
+            self.event_bus.clone(),
+        );
         let agent_role_catalog_provider = build_agent_role_catalog_provider(
             agent_role_registry.clone(),
             settings_store.clone(),
@@ -2302,7 +2323,10 @@ impl DaemonRuntime {
                 magi_plugin_system::PluginSessionEngineFactory::new(
                     self.plugin_manager.clone(),
                     self.plugin_host.clone(),
-                    build_plugin_capability_handler(self.plugin_manager.clone()),
+                    build_plugin_capability_handler(
+                        self.plugin_manager.clone(),
+                        self.event_bus.clone(),
+                    ),
                     RuntimeLimits::default(),
                 )
                 .with_reserved_engine_namespace(magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE),
@@ -2311,7 +2335,10 @@ impl DaemonRuntime {
             Arc::new(magi_plugin_system::PluginCommandRunner::new(
                 self.plugin_manager.clone(),
                 self.plugin_host.clone(),
-                build_plugin_capability_handler(self.plugin_manager.clone()),
+                build_plugin_capability_handler(
+                    self.plugin_manager.clone(),
+                    self.event_bus.clone(),
+                ),
                 RuntimeLimits::default(),
             ));
         let mut engine_factories = vec![plugin_engine_factory];
@@ -2327,7 +2354,10 @@ impl DaemonRuntime {
                 magi_plugin_system::PluginWorkflowCoreFactory::new(
                     self.plugin_manager.clone(),
                     self.plugin_host.clone(),
-                    build_plugin_capability_handler(self.plugin_manager.clone()),
+                    build_plugin_capability_handler(
+                        self.plugin_manager.clone(),
+                        self.event_bus.clone(),
+                    ),
                     RuntimeLimits::default(),
                 ),
             )])

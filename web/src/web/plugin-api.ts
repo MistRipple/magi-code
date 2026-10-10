@@ -104,6 +104,54 @@ export async function loadActivePluginWorkflows(scope = 'application'): Promise<
   return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
 
+export function subscribePluginResource(
+  pluginId: string,
+  resourceId: string,
+  scope: string,
+  onUpdate: (resource: { version: number; value: unknown }) => void,
+  onError?: (error: unknown) => void,
+): () => void {
+  let closed = false;
+  const connection = getTransport().connectEventStream(
+    agentUrl(
+      `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}/events?scope=${encodeURIComponent(scope)}`,
+    ),
+    {
+      onOpen() {},
+      onMessage(data) {
+        if (closed) return;
+        try {
+          const event = JSON.parse(data) as { reset?: unknown; version?: unknown; value?: unknown };
+          if (event.reset === true) {
+            void readPluginResource(pluginId, resourceId, scope)
+              .then((resource) => {
+                if (closed) return;
+                const snapshot = resource as { version?: unknown; value?: unknown };
+                if (typeof snapshot.version !== 'number') throw new Error('invalid plugin resource snapshot');
+                onUpdate({ version: snapshot.version, value: snapshot.value });
+              })
+              .catch((error) => {
+                if (!closed) onError?.(error);
+              });
+            return;
+          }
+          if (typeof event.version !== 'number') throw new Error('invalid plugin resource event');
+          onUpdate({ version: event.version, value: event.value });
+        } catch (error) {
+          onError?.(error);
+        }
+      },
+      onError() {
+        if (!closed) onError?.(new Error('插件资源订阅失败'));
+      },
+    },
+  );
+  return () => {
+    closed = true;
+    connection.close();
+  };
+}
+
 export async function readPluginResource(
   pluginId: string,
   resourceId: string,

@@ -3,13 +3,21 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
-    response::Response,
+    response::{
+        Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use base64::Engine as _;
+use futures_util::{Stream, StreamExt, future, stream};
+use magi_core::{EventId, WorkspaceId};
+use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_plugin_system::{MAX_PACKAGE_BYTES, PluginPackage, PluginSource};
 use serde::Deserialize;
 use serde_json::Value;
+use std::convert::Infallible;
+use tokio_stream::wrappers::BroadcastStream;
 
 type InstallRequest = magi_app_server_protocol::PluginInstallRequest;
 type ScopeRequest = magi_app_server_protocol::PluginScopeRequest;
@@ -29,6 +37,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/plugins/commands", get(commands))
         .route("/plugins/workflows", get(workflows))
         .route("/plugins/{id}/manifest", get(manifest))
+        .route(
+            "/plugins/{id}/resources/{resource}/events",
+            get(resource_events),
+        )
         .route("/plugins/{id}/ui/{*path}", get(resource))
         .route(
             "/plugins/{id}/resources/{resource}",
@@ -139,6 +151,41 @@ async fn manifest(
     ))
 }
 
+async fn resource_events(
+    State(state): State<ApiState>,
+    Path((id, resource)): Path<(String, String)>,
+    Query(query): Query<ScopeQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let (initial_resource, receiver) = {
+        let manager = locked(&state, "订阅插件资源")?;
+        ensure_active_resource(&manager, &id, &query.scope, &resource)?;
+        let initial_resource = manager
+            .resources()
+            .read(&id, &query.scope, &resource)
+            .unwrap_or(magi_plugin_system::PluginResource {
+                version: 0,
+                value: Value::Null,
+            });
+        // The manager lock serializes this snapshot with every resource writer. The
+        // event-bus cut is then registered before the lock is released, so a writer
+        // can only appear in the initial snapshot or in the live stream.
+        let (_snapshot, receiver) = state.event_bus.snapshot_and_subscribe();
+        (initial_resource, receiver)
+    };
+    let initial = stream::once(future::ready(Ok::<Event, Infallible>(
+        resource_sse_snapshot(&id, &query.scope, &resource, initial_resource),
+    )));
+    let live = BroadcastStream::new(receiver).filter_map(move |event| {
+        future::ready(match event {
+            Ok(envelope) => plugin_resource_event_matches(&envelope, &id, &query.scope, &resource)
+                .then(|| Ok::<Event, Infallible>(resource_sse_event(envelope))),
+            Err(_) => Some(Ok::<Event, Infallible>(resource_sse_reset())),
+        })
+    });
+    Ok(Sse::new(initial.chain(live))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5))))
+}
+
 async fn resource(
     State(state): State<ApiState>,
     Path((id, path)): Path<(String, String)>,
@@ -198,18 +245,7 @@ async fn read_resource(
     {
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
-    ensure_declared_resource(&manager, &id, &resource)?;
-    if !manager
-        .permission_allowed(
-            &id,
-            &query.scope,
-            magi_plugin_system::PluginPermissionKind::Storage,
-            &resource,
-        )
-        .map_err(plugin_error)?
-    {
-        return Err(ApiError::Forbidden("插件未获资源读取权限".into()));
-    }
+    ensure_readable_resource(&manager, &id, &query.scope, &resource)?;
     let snapshot = manager
         .resources()
         .read(&id, &query.scope, &resource)
@@ -227,38 +263,122 @@ async fn write_resource(
     Json(request): Json<ResourceWriteRequest>,
 ) -> Result<Json<magi_plugin_system::PluginResource>, ApiError> {
     let mut manager = locked(&state, "写入插件资源")?;
-    if !manager
-        .is_active_for_scope(&id, &query.scope)
-        .map_err(plugin_error)?
-    {
-        return Err(ApiError::Forbidden("插件未激活".into()));
-    }
-    ensure_declared_resource(&manager, &id, &resource)?;
-    if !manager
-        .permission_allowed(
-            &id,
-            &query.scope,
-            magi_plugin_system::PluginPermissionKind::Storage,
-            &resource,
-        )
-        .map_err(plugin_error)?
-    {
-        return Err(ApiError::Forbidden("插件未获资源写入权限".into()));
-    }
-    let result = manager.resources_mut().write(
+    ensure_active_resource(&manager, &id, &query.scope, &resource)?;
+    let result = write_plugin_resource_with_event(
+        &mut manager,
+        &state.event_bus,
         &id,
         &query.scope,
         &resource,
         request.expected_version,
         request.value,
     );
-    result.map(Json).map_err(|error| match error {
+    let result = result.map_err(|error| match error {
         magi_plugin_system::ResourceError::Conflict { .. } => ApiError::Conflict(error.to_string()),
         magi_plugin_system::ResourceError::Invalid(message) => ApiError::InvalidInput(message),
         magi_plugin_system::ResourceError::Storage(message) => {
             ApiError::internal_assembly("写入插件资源失败", message)
         }
-    })
+    })?;
+    Ok(Json(result))
+}
+
+pub fn write_plugin_resource_with_event(
+    manager: &mut magi_plugin_system::PluginManager,
+    event_bus: &InMemoryEventBus,
+    id: &str,
+    scope: &str,
+    resource_id: &str,
+    expected_version: u64,
+    value: Value,
+) -> Result<magi_plugin_system::PluginResource, magi_plugin_system::ResourceError> {
+    let resource =
+        manager
+            .resources_mut()
+            .write(id, scope, resource_id, expected_version, value)?;
+    publish_plugin_resource_event(event_bus, id, scope, resource_id, &resource);
+    Ok(resource)
+}
+
+pub fn write_plugin_settings_with_event(
+    manager: &mut magi_plugin_system::PluginManager,
+    event_bus: &InMemoryEventBus,
+    id: &str,
+    scope: &str,
+    expected_version: u64,
+    value: Value,
+) -> Result<magi_plugin_system::PluginResource, magi_plugin_system::PluginError> {
+    let resource = manager.write_settings(id, scope, expected_version, value)?;
+    publish_plugin_resource_event(event_bus, id, scope, "__settings", &resource);
+    Ok(resource)
+}
+
+fn publish_plugin_resource_event(
+    event_bus: &InMemoryEventBus,
+    id: &str,
+    scope: &str,
+    resource_id: &str,
+    resource: &magi_plugin_system::PluginResource,
+) {
+    let workspace_id = scope
+        .strip_prefix("workspace:")
+        .filter(|value| !value.is_empty())
+        .map(WorkspaceId::new);
+    let event = EventEnvelope::projection(
+        EventId::new(format!(
+            "plugin-resource-{id}-{scope}-{resource_id}-{}",
+            resource.version
+        )),
+        "plugin.resource.updated",
+        serde_json::json!({
+            "pluginId": id,
+            "scope": scope,
+            "resourceId": resource_id,
+            "version": resource.version,
+            "value": resource.value,
+        }),
+    )
+    .with_context(EventContext {
+        workspace_id,
+        ..EventContext::default()
+    });
+    event_bus.publish(event);
+}
+
+fn ensure_active_resource(
+    manager: &magi_plugin_system::PluginManager,
+    id: &str,
+    scope: &str,
+    resource: &str,
+) -> Result<(), ApiError> {
+    if !manager
+        .is_active_for_scope(id, scope)
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未激活".into()));
+    }
+    ensure_readable_resource(manager, id, scope, resource)
+}
+
+fn ensure_readable_resource(
+    manager: &magi_plugin_system::PluginManager,
+    id: &str,
+    scope: &str,
+    resource: &str,
+) -> Result<(), ApiError> {
+    ensure_declared_resource(manager, id, resource)?;
+    if !manager
+        .permission_allowed(
+            id,
+            scope,
+            magi_plugin_system::PluginPermissionKind::Storage,
+            resource,
+        )
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未获资源读取权限".into()));
+    }
+    Ok(())
 }
 
 async fn read_settings(
@@ -292,10 +412,16 @@ async fn write_settings(
     {
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
-    manager
-        .write_settings(&id, &query.scope, request.expected_version, request.value)
-        .map(Json)
-        .map_err(plugin_error)
+    write_plugin_settings_with_event(
+        &mut manager,
+        &state.event_bus,
+        &id,
+        &query.scope,
+        request.expected_version,
+        request.value,
+    )
+    .map(Json)
+    .map_err(plugin_error)
 }
 
 async fn install(
@@ -490,6 +616,47 @@ fn ensure_declared_resource(
         Err(ApiError::NotFound("插件资源未声明".into()))
     }
 }
+
+fn plugin_resource_event_matches(
+    event: &EventEnvelope,
+    plugin_id: &str,
+    scope: &str,
+    resource_id: &str,
+) -> bool {
+    event.event_type == "plugin.resource.updated"
+        && event.payload.get("pluginId").and_then(Value::as_str) == Some(plugin_id)
+        && event.payload.get("scope").and_then(Value::as_str) == Some(scope)
+        && event.payload.get("resourceId").and_then(Value::as_str) == Some(resource_id)
+}
+
+fn resource_sse_snapshot(
+    plugin_id: &str,
+    scope: &str,
+    resource_id: &str,
+    resource: magi_plugin_system::PluginResource,
+) -> Event {
+    Event::default()
+        .json_data(serde_json::json!({
+            "pluginId": plugin_id,
+            "scope": scope,
+            "resourceId": resource_id,
+            "version": resource.version,
+            "value": resource.value,
+        }))
+        .expect("plugin resource snapshot must remain valid JSON")
+}
+
+fn resource_sse_reset() -> Event {
+    Event::default()
+        .json_data(serde_json::json!({ "reset": true }))
+        .expect("plugin resource reset event must remain valid JSON")
+}
+
+fn resource_sse_event(event: EventEnvelope) -> Event {
+    Event::default()
+        .json_data(&event.payload)
+        .expect("plugin resource event payload must remain valid JSON")
+}
 fn parse_source(source: &str) -> Result<PluginSource, ApiError> {
     let (kind, value) = source.split_once(':').ok_or_else(|| {
         ApiError::InvalidInput("插件来源必须是 center:、address: 或 local:".into())
@@ -502,5 +669,161 @@ fn parse_source(source: &str) -> Result<PluginSource, ApiError> {
         "address" => Ok(PluginSource::Address { url: value.into() }),
         "local" => Ok(PluginSource::Local { name: value.into() }),
         _ => Err(ApiError::InvalidInput("插件来源类型无效".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use futures_util::StreamExt;
+    use magi_governance::GovernanceService;
+    use magi_plugin_system::{
+        PluginManager, PluginPackage, PluginPermission, PluginPermissionKind, PluginScopeKind,
+        PluginSource,
+    };
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::{
+        io::{Cursor, Write},
+        sync::Arc,
+        time::Duration,
+    };
+    use tokio::time::timeout;
+    use tower::util::ServiceExt;
+    use zip::ZipWriter;
+
+    fn package() -> PluginPackage {
+        let manifest = serde_json::json!({
+            "sdkVersion": 1,
+            "id": "acme.resources",
+            "version": "1.0.0",
+            "name": "Resources",
+            "description": "",
+            "backend": "plugin.mjs",
+            "applicationInstance": false,
+            "permissions": [{
+                "kind": "storage",
+                "scope": "workspace",
+                "targets": ["dashboard"]
+            }],
+            "dataSchemaVersion": 1,
+            "settingsSchema": {"type":"object","additionalProperties":false},
+            "contributions": {"resources":[{"id":"dashboard","title":"Dashboard","description":""}]}
+        });
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("plugin.mjs", b"export default () => ({})".to_vec()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        PluginPackage::from_archive(&writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    async fn active_resource_state() -> (ApiState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "magi-plugin-resource-events-{}-{}",
+            std::process::id(),
+            magi_core::UtcMillis::now().0
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manager = PluginManager::open(&root).unwrap();
+        manager
+            .install(
+                &package(),
+                PluginSource::Local {
+                    name: "test.zip".into(),
+                },
+            )
+            .unwrap();
+        manager.enable("acme.resources", "workspace:test").unwrap();
+        manager
+            .authorize(
+                "acme.resources",
+                "workspace:test",
+                vec![PluginPermission {
+                    kind: PluginPermissionKind::Storage,
+                    scope: PluginScopeKind::Workspace,
+                    targets: vec!["dashboard".into()],
+                }],
+            )
+            .unwrap();
+        manager
+            .activate("acme.resources", "workspace:test")
+            .unwrap();
+        let manager = Arc::new(std::sync::Mutex::new(manager));
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let api_state = ApiState::new(
+            "magi-test",
+            event_bus,
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_plugin_manager(manager);
+        (api_state, root)
+    }
+
+    #[tokio::test]
+    async fn resource_writes_publish_snapshot_and_scope_filtered_subscriptions() {
+        let (state, root) = active_resource_state().await;
+        let router = routes().with_state(state.clone());
+        let stream = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(
+                        "/plugins/acme.resources/resources/dashboard/events?scope=workspace%3Atest",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/plugins/acme.resources/resources/dashboard?scope=workspace%3Atest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expectedVersion":0,"value":{"count":1}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+
+        let mut stream = stream;
+        let initial = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&initial).contains("\"version\":0"));
+        let body = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains("\"version\":1"), "{text}");
+        assert!(text.contains("\"count\":1"), "{text}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

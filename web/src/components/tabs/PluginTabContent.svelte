@@ -4,6 +4,7 @@
   import {
     readPluginResource,
     readPluginSettings,
+    subscribePluginResource,
     writePluginResource,
     writePluginSettings,
   } from '../../web/plugin-api';
@@ -21,25 +22,57 @@
   const resourceUrl = $derived(
     agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/ui/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}?scope=${encodeURIComponent(scope)}`),
   );
+  const resourceOrigin = $derived(new URL(resourceUrl, window.location.href).origin);
 
   function send(message: Record<string, unknown>): void {
     iframe?.contentWindow?.postMessage({
       channel: 'magi-plugin-v1',
       instanceId,
       ...message,
-    }, '*');
+    }, resourceOrigin);
+  }
+
+  const activeResourceSubscriptions = new Map<string, () => void>();
+
+  function releaseResourceSubscriptions(): void {
+    for (const unsubscribe of activeResourceSubscriptions.values()) unsubscribe();
+    activeResourceSubscriptions.clear();
+  }
+
+  function handleResourceSubscriptionRequest(requestId: string, resourceId: string): void {
+    if (activeResourceSubscriptions.has(resourceId)) {
+      send({ type: 'response', requestId, ok: true });
+      return;
+    }
+    const unsubscribe = subscribePluginResource(
+      pluginId,
+      resourceId,
+      scope,
+      (resource) => {
+        send({ type: 'event', resourceId, resource });
+      },
+      () => {
+        send({ type: 'event', resourceId, error: 'subscription_failed' });
+      },
+    );
+    activeResourceSubscriptions.set(resourceId, unsubscribe);
+    send({ type: 'response', requestId, ok: true });
   }
 
   async function handleMessage(event: MessageEvent): Promise<void> {
-    if (event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
+    if (event.origin !== resourceOrigin || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId || event.data.type !== 'request') return;
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'settings.read', 'settings.write'].includes(operation)) return;
+    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write'].includes(operation)) return;
     try {
       const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
       if (operation.startsWith('resource.') && (!resourceId || resourceId.length > 256)) {
         throw new Error('插件资源标识无效');
+      }
+      if (operation === 'resource.subscribe') {
+        handleResourceSubscriptionRequest(requestId, resourceId);
+        return;
       }
       const result = operation === 'resource.read'
         ? await readPluginResource(pluginId, resourceId, scope)
@@ -67,7 +100,10 @@
 
   onMount(() => {
     window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      releaseResourceSubscriptions();
+    };
   });
 </script>
 
