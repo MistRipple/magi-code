@@ -221,7 +221,7 @@
     }
     const metadata = message.metadata || {};
     // 会话命令轮次（如 /compact）不是可重新编辑的对话输入。
-    if (metadata.sessionCommand !== undefined) return false;
+    if (metadata.sessionCommand !== undefined || metadata.pluginCommandId !== undefined) return false;
     return metadata.turnStatus === 'cancelled'
       && metadata.interruptionSource === 'user'
       && typeof metadata.turnId === 'string'
