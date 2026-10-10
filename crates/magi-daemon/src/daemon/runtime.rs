@@ -326,13 +326,13 @@ impl CapabilityHandler for PluginCapabilityHandler {
                         expected,
                         value,
                     )
-                        .map(|resource| serde_json::json!(resource))
-                        .map_err(|_| {
-                            ExecutionError::new(
-                                ExecutionErrorCode::CapabilityRejected,
-                                "插件资源写入被拒绝",
-                            )
-                        })
+                    .map(|resource| serde_json::json!(resource))
+                    .map_err(|_| {
+                        ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件资源写入被拒绝",
+                        )
+                    })
                 }
                 "settings.read" | "settings.write" => {
                     if !manager
@@ -378,10 +378,10 @@ impl CapabilityHandler for PluginCapabilityHandler {
                             expected,
                             value,
                         )
-                            .map_err(|_| ExecutionError::new(
-                                ExecutionErrorCode::CapabilityRejected,
-                                "插件设置写入被拒绝"
-                            ))?
+                        .map_err(|_| ExecutionError::new(
+                            ExecutionErrorCode::CapabilityRejected,
+                            "插件设置写入被拒绝"
+                        ))?
                     ))
                 }
                 _ => Err(ExecutionError::new(
@@ -2318,19 +2318,36 @@ impl DaemonRuntime {
                 }
             }
         };
-        let plugin_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> =
-            Arc::new(
-                magi_plugin_system::PluginSessionEngineFactory::new(
+        let native_engine_factory: Option<Arc<magi_plugin_system::NativeSessionEngineFactory>> =
+            if let Some(factory) = web_model_factory.clone() {
+                Some(Arc::new(
+                    magi_plugin_system::NativeSessionEngineFactory::new(vec![(
+                        magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE.to_string(),
+                        factory,
+                    )])
+                    .map_err(|error| {
+                        DaemonError::internal(format!("注册原生插件引擎失败: {error}"))
+                    })?,
+                ))
+            } else {
+                None
+            };
+        let excluded_native_engine_namespaces = native_engine_factory
+            .as_ref()
+            .map(|factory| factory.namespaces().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let plugin_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> = Arc::new(
+            magi_plugin_system::PluginSessionEngineFactory::new(
+                self.plugin_manager.clone(),
+                self.plugin_host.clone(),
+                build_plugin_capability_handler(
                     self.plugin_manager.clone(),
-                    self.plugin_host.clone(),
-                    build_plugin_capability_handler(
-                        self.plugin_manager.clone(),
-                        self.event_bus.clone(),
-                    ),
-                    RuntimeLimits::default(),
-                )
-                .with_reserved_engine_namespace(magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE),
-            );
+                    self.event_bus.clone(),
+                ),
+                RuntimeLimits::default(),
+            )
+            .with_excluded_namespaces(excluded_native_engine_namespaces),
+        );
         let plugin_command_executor: Arc<dyn magi_plugin_system::PluginCommandExecutor> =
             Arc::new(magi_plugin_system::PluginCommandRunner::new(
                 self.plugin_manager.clone(),
@@ -2342,7 +2359,7 @@ impl DaemonRuntime {
                 RuntimeLimits::default(),
             ));
         let mut engine_factories = vec![plugin_engine_factory];
-        if let Some(factory) = web_model_factory {
+        if let Some(factory) = native_engine_factory {
             engine_factories.push(factory);
         }
         let session_engine_factory: Arc<dyn magi_plugin_system::SessionEngineFactory> = Arc::new(

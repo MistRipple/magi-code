@@ -28,8 +28,8 @@ pub use magi_plugin_runtime::RunCancellation;
 pub use package::{MAX_PACKAGE_BYTES, PluginPackage, validate_manifest};
 pub use resource::{PluginResource, PluginResourceStore, ResourceError};
 pub use session_engine::{
-    PluginSessionEngineFactory, SessionEngineFactory, SessionEngineInvocationSpec,
-    SessionEngineModelClient, SessionEngineRouter,
+    NativeSessionEngineFactory, PluginSessionEngineFactory, SessionEngineFactory,
+    SessionEngineInvocationSpec, SessionEngineModelClient, SessionEngineRouter,
 };
 pub use workflow_factory::{
     PluginWorkflowCoreFactory, WorkflowCoreFactory, WorkflowCoreInvocationSpec, WorkflowCoreRouter,

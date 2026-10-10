@@ -32,6 +32,66 @@ pub trait SessionEngineFactory: Send + Sync {
     ) -> Result<Arc<dyn ModelBridgeClient>, String>;
 }
 
+/// 宿主提供的原生插件引擎注册表。
+///
+/// 原生宿主适配器（例如需要 BrowserAuthority 的站点引擎）仍然使用 Magi 的
+/// `SessionEngineFactory` 合同，但由这个注册表按插件引擎命名空间统一路由。
+/// 通用 QuickJS 插件工厂会排除这里注册的命名空间，从而保证一个引擎身份只有
+/// 一条执行路径；注册表不拥有会话、权限或终态事实。
+pub struct NativeSessionEngineFactory {
+    entries: Vec<(String, Arc<dyn SessionEngineFactory>)>,
+}
+
+impl NativeSessionEngineFactory {
+    pub fn new(entries: Vec<(String, Arc<dyn SessionEngineFactory>)>) -> Result<Self, String> {
+        if entries.is_empty() {
+            return Err("未注册原生插件会话引擎".into());
+        }
+        let mut namespaces = std::collections::BTreeSet::new();
+        let mut normalized = Vec::with_capacity(entries.len());
+        for (namespace, factory) in entries {
+            let namespace = namespace.trim().trim_end_matches('/').to_string();
+            if namespace.is_empty() || !namespaces.insert(namespace.clone()) {
+                return Err(format!("原生插件引擎命名空间冲突：{namespace}"));
+            }
+            normalized.push((namespace, factory));
+        }
+        Ok(Self {
+            entries: normalized,
+        })
+    }
+
+    /// 返回该注册表占用的命名空间，供通用插件工厂排除相同身份。
+    pub fn namespaces(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(namespace, _)| namespace.as_str())
+    }
+}
+
+impl SessionEngineFactory for NativeSessionEngineFactory {
+    fn supports(&self, engine_id: &str) -> bool {
+        self.entries.iter().any(|(namespace, factory)| {
+            engine_id.starts_with(&format!("{namespace}/")) && factory.supports(engine_id)
+        })
+    }
+
+    fn build_session_engine(
+        &self,
+        spec: SessionEngineInvocationSpec,
+    ) -> Result<Arc<dyn ModelBridgeClient>, String> {
+        let mut matches = self.entries.iter().filter(|(namespace, factory)| {
+            spec.engine_id.starts_with(&format!("{namespace}/"))
+                && factory.supports(&spec.engine_id)
+        });
+        let Some((_, factory)) = matches.next() else {
+            return Err(format!("未注册原生插件会话引擎：{}", spec.engine_id));
+        };
+        if matches.next().is_some() {
+            return Err(format!("原生插件会话引擎注册冲突：{}", spec.engine_id));
+        }
+        factory.build_session_engine(spec)
+    }
+}
+
 /// 会话引擎的唯一路由器。一个引擎身份只能命中一个已注册工厂，不能通过失败后换用
 /// 另一实现来掩盖配置或激活错误。
 pub struct SessionEngineRouter {
@@ -78,7 +138,7 @@ pub struct PluginSessionEngineFactory {
     host: magi_plugin_runtime::PluginHost,
     handler: Arc<dyn magi_plugin_runtime::CapabilityHandler>,
     limits: magi_plugin_runtime::RuntimeLimits,
-    reserved_engine_namespaces: Vec<String>,
+    excluded_namespaces: Vec<String>,
 }
 
 impl PluginSessionEngineFactory {
@@ -93,16 +153,22 @@ impl PluginSessionEngineFactory {
             host,
             handler,
             limits,
-            reserved_engine_namespaces: Vec::new(),
+            excluded_namespaces: Vec::new(),
         }
     }
 
-    /// 将由宿主适配器负责的插件命名空间从通用包工厂中排除，确保每个引擎身份只有一条路由。
-    pub fn with_reserved_engine_namespace(mut self, namespace: impl Into<String>) -> Self {
-        let namespace = namespace.into();
-        if !namespace.trim().is_empty() {
-            self.reserved_engine_namespaces.push(namespace);
-        }
+    /// 将由原生插件注册表负责的命名空间从通用包工厂中排除，确保每个引擎身份只有一条路由。
+    pub fn with_excluded_namespaces<I, S>(mut self, namespaces: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.excluded_namespaces = namespaces
+            .into_iter()
+            .map(Into::into)
+            .map(|namespace| namespace.trim().trim_end_matches('/').to_string())
+            .filter(|namespace| !namespace.is_empty())
+            .collect();
         self
     }
 
@@ -122,7 +188,7 @@ impl SessionEngineFactory for PluginSessionEngineFactory {
     fn supports(&self, engine_id: &str) -> bool {
         engine_id.starts_with("plugin/")
             && !self
-                .reserved_engine_namespaces
+                .excluded_namespaces
                 .iter()
                 .any(|namespace| engine_id.starts_with(&format!("{namespace}/")))
     }
@@ -371,23 +437,8 @@ mod tests {
 
     struct NamespaceFactory(&'static str);
 
-    struct ReservedNamespaceFactory(PluginSessionEngineFactory);
-
-    impl SessionEngineFactory for ReservedNamespaceFactory {
-        fn supports(&self, engine_id: &str) -> bool {
-            self.0.supports(engine_id)
-        }
-
-        fn build_session_engine(
-            &self,
-            spec: SessionEngineInvocationSpec,
-        ) -> Result<Arc<dyn ModelBridgeClient>, String> {
-            self.0.build_session_engine(spec)
-        }
-    }
-
     #[test]
-    fn reserved_plugin_namespace_keeps_engine_routing_single_owner() {
+    fn native_plugin_namespace_keeps_engine_routing_single_owner() {
         let root = tempfile::tempdir().expect("create plugin manager root");
         let manager = PluginManager::open(root.path()).expect("open empty plugin manager");
         let factory = PluginSessionEngineFactory::new(
@@ -399,15 +450,17 @@ mod tests {
             Arc::new(RejectingCapabilityHandler),
             magi_plugin_runtime::RuntimeLimits::default(),
         )
-        .with_reserved_engine_namespace("plugin/openai.chatgpt-web");
+        .with_excluded_namespaces(["plugin/openai.chatgpt-web"]);
         assert!(factory.supports("plugin/example/engine"));
         assert!(!factory.supports("plugin/openai.chatgpt-web/default"));
 
-        let router = SessionEngineRouter::new(vec![
-            Arc::new(ReservedNamespaceFactory(factory)),
+        let native = NativeSessionEngineFactory::new(vec![(
+            "plugin/openai.chatgpt-web".into(),
             Arc::new(NamespaceFactory("plugin/openai.chatgpt-web")),
-        ])
-        .expect("router should register host and plugin factories");
+        )])
+        .expect("native engine registry");
+        let router = SessionEngineRouter::new(vec![Arc::new(factory), Arc::new(native)])
+            .expect("router should register host and plugin factories");
         assert!(router.supports("plugin/openai.chatgpt-web/default"));
         assert!(router.supports("plugin/example/engine"));
     }
