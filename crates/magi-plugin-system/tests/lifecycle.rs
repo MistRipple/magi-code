@@ -247,22 +247,26 @@ fn resource_permission_is_required_for_each_declared_resource() {
         )
         .unwrap();
     manager.activate("acme.lifecycle", "workspace:one").unwrap();
-    assert!(manager
-        .permission_allowed(
-            "acme.lifecycle",
-            "workspace:one",
-            magi_plugin_system::PluginPermissionKind::Storage,
-            "cache",
-        )
-        .unwrap());
-    assert!(!manager
-        .permission_allowed(
-            "acme.lifecycle",
-            "workspace:one",
-            magi_plugin_system::PluginPermissionKind::Storage,
-            "other",
-        )
-        .unwrap());
+    assert!(
+        manager
+            .permission_allowed(
+                "acme.lifecycle",
+                "workspace:one",
+                magi_plugin_system::PluginPermissionKind::Storage,
+                "cache",
+            )
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .permission_allowed(
+                "acme.lifecycle",
+                "workspace:one",
+                magi_plugin_system::PluginPermissionKind::Storage,
+                "other",
+            )
+            .unwrap()
+    );
 }
 
 #[test]
