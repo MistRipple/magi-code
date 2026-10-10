@@ -413,7 +413,8 @@ impl PluginManager {
     }
 
     pub fn deactivate(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
-        validate_scope_key(scope)?;
+        let package = self.package(id)?;
+        validate_scope(package.manifest(), scope)?;
         if self
             .runtime_leases
             .get(&(id.to_owned(), scope.to_owned()))
@@ -426,12 +427,26 @@ impl PluginManager {
             .plugins
             .get_mut(id)
             .ok_or_else(|| conflict("插件未安装"))?;
-        installed.active_scopes.remove(scope);
+        if scope == "application" {
+            // 应用级实例共享登录态与宿主资源；停止应用实例必须同时关闭其
+            // 所有工作区准入，不能留下仍可调用的孤立工作区实例。
+            if installed
+                .active_scopes
+                .iter()
+                .any(|active_scope| active_scope != "application")
+            {
+                return Err(conflict("插件仍有工作区运行，必须先完成或取消后再停用"));
+            }
+            installed.active_scopes.remove("application");
+        } else {
+            installed.active_scopes.remove(scope);
+        }
         self.commit(next)
     }
 
     pub fn disable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
-        validate_scope_key(scope)?;
+        let package = self.package(id)?;
+        validate_scope(package.manifest(), scope)?;
         let mut next = self.state.clone();
         let installed = next
             .plugins

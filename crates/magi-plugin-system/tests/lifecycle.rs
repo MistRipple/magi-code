@@ -449,6 +449,7 @@ fn workspace_activation_requires_application_scoped_grants_too() {
         )
         .unwrap();
     manager.activate("acme.shared", "workspace:one").unwrap();
+    assert!(manager.deactivate("acme.shared", "application").is_err());
 }
 
 fn package_from_manifest(manifest: Value) -> PluginPackage {
