@@ -62,19 +62,29 @@ export async function installPluginAddress(source: string): Promise<void> {
 
 export async function authorizeAndActivatePlugin(pluginId: string, manifest: PluginManifest, scope: string): Promise<void> {
   const scopeKind = scope === 'application' ? 'application' : 'workspace';
-  const grants = manifest.permissions
-    .filter((permission) => permission.scope === scopeKind)
-    .map((permission) => ({ ...permission, scope: scopeKind }));
-  const body = JSON.stringify({ scope, grants });
-  for (const path of [
-    `/api/plugins/${encodeURIComponent(pluginId)}/authorize`,
-    `/api/plugins/${encodeURIComponent(pluginId)}/enable`,
-    `/api/plugins/${encodeURIComponent(pluginId)}/activate`,
-  ]) {
-    const response = await pluginRequest(path, {
+  const authorizeScope = async (targetScope: string, targetKind: 'application' | 'workspace'): Promise<void> => {
+    const grants = manifest.permissions
+      .filter((permission) => permission.scope === targetKind)
+      .map((permission) => ({ ...permission, scope: targetKind }));
+    const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/authorize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: path.endsWith('/authorize') ? body : JSON.stringify({ scope }),
+      body: JSON.stringify({ scope: targetScope, grants }),
+    });
+    if (!response.ok) throw new Error(`插件授权失败: ${response.status}`);
+  };
+
+  // 工作区实例依赖应用级权限时，先在应用作用域提交同一份清单授权。
+  // daemon 的 activate 合同要求两类授权都已存在；这里是唯一授权顺序入口。
+  if (scopeKind === 'workspace' && manifest.permissions.some((permission) => permission.scope === 'application')) {
+    await authorizeScope('application', 'application');
+  }
+  await authorizeScope(scope, scopeKind);
+  for (const action of ['enable', 'activate'] as const) {
+    const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope }),
     });
     if (!response.ok) throw new Error(`插件激活失败: ${response.status}`);
   }
