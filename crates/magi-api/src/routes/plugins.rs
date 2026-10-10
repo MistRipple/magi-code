@@ -561,7 +561,7 @@ async fn deactivate(
             let count = manager
                 .lock()
                 .map_err(|_| ApiError::internal_assembly("停用插件失败", "插件锁已损坏"))?
-                .runtime_lease_count(&drain_id, &drain_scope);
+                .runtime_lease_count_for_deactivation(&drain_id, &drain_scope);
             if count == 0 {
                 return Ok::<(), ApiError>(());
             }

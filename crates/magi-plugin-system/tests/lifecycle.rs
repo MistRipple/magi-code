@@ -395,6 +395,66 @@ fn deactivation_drain_rejects_new_runtime_leases_and_cleans_up_on_abort() {
 }
 
 #[test]
+fn application_drain_fences_workspace_admission_and_counts_shared_leases() {
+    let root = tempdir().unwrap();
+    let package = package_from_manifest(json!({
+        "sdkVersion":1,"id":"acme.application","version":"1.0.0","name":"Application","description":"",
+        "backend":"plugin.mjs","applicationInstance":true,"permissions":[],
+        "dataSchemaVersion":1,"settingsSchema":{"type":"object","additionalProperties":false},
+        "contributions":{"commands":[{"id":"open","title":"Open","description":""}]}
+    }));
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "application.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.application", "application").unwrap();
+    manager.enable("acme.application", "workspace:one").unwrap();
+    manager.activate("acme.application", "application").unwrap();
+    manager
+        .activate("acme.application", "workspace:one")
+        .unwrap();
+    let manager = Arc::new(Mutex::new(manager));
+    let guard =
+        PluginManager::begin_deactivation(Arc::clone(&manager), "acme.application", "application")
+            .unwrap();
+    assert!(manager
+        .lock()
+        .unwrap()
+        .enable("acme.application", "workspace:two")
+        .is_err());
+    assert!(
+        magi_plugin_system::PluginRuntimeLease::acquire(
+            Arc::clone(&manager),
+            "acme.application",
+            package.digest(),
+            "workspace:one",
+        )
+        .is_err()
+    );
+    drop(guard);
+    let lease = magi_plugin_system::PluginRuntimeLease::acquire(
+        Arc::clone(&manager),
+        "acme.application",
+        package.digest(),
+        "workspace:one",
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .lock()
+            .unwrap()
+            .runtime_lease_count_for_deactivation("acme.application", "application"),
+        1
+    );
+    drop(lease);
+}
+
+#[test]
 fn resource_permission_is_required_for_each_declared_resource() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();

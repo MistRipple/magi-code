@@ -116,7 +116,7 @@ impl PluginRuntimeLease {
             .map_err(|_| PluginError::Conflict("插件管理器不可用".into()))?;
         guard.validate_runtime_identity(id, package_digest, scope, scope)?;
         let key = (id.to_owned(), scope.to_owned());
-        if guard.draining_scopes.contains(&key) {
+        if guard.scope_is_draining(id, scope) {
             return Err(PluginError::Conflict("插件作用域正在排空".into()));
         }
         *guard.runtime_leases.entry(key.clone()).or_default() += 1;
@@ -405,6 +405,7 @@ impl PluginManager {
     pub fn enable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
+        self.ensure_scope_not_draining(id, scope)?;
         let mut next = self.state.clone();
         next.plugins
             .get_mut(id)
@@ -417,6 +418,7 @@ impl PluginManager {
     pub fn activate(&mut self, id: &str, scope: &str) -> Result<ActivePlugin, PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
+        self.ensure_scope_not_draining(id, scope)?;
         let installed = self.state.plugins.get(id).expect("package checked");
         if !installed.enabled_scopes.contains(scope) {
             return Err(conflict("插件作用域未启用"));
@@ -445,11 +447,7 @@ impl PluginManager {
     pub fn deactivate(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
-        if self
-            .runtime_leases
-            .get(&(id.to_owned(), scope.to_owned()))
-            .is_some_and(|count| *count > 0)
-        {
+        if self.runtime_lease_count(id, scope) > 0 {
             return Err(conflict("插件仍有在途运行，必须先完成或取消后再停用"));
         }
         let mut next = self.state.clone();
@@ -471,7 +469,12 @@ impl PluginManager {
         } else {
             installed.active_scopes.remove(scope);
         }
-        self.commit(next)
+        let result = self.commit(next);
+        if result.is_ok() {
+            self.draining_scopes
+                .remove(&(id.to_owned(), scope.to_owned()));
+        }
+        result
     }
 
     pub fn begin_deactivation(
@@ -503,9 +506,44 @@ impl PluginManager {
             .unwrap_or(0)
     }
 
+    /// 应用级停用覆盖共享该实例的所有工作区，排空等待必须统计插件的全部
+    /// 作用域租约，不能只看 `application` 这一条键。
+    pub fn runtime_lease_count_for_deactivation(&self, id: &str, scope: &str) -> usize {
+        if scope == "application" {
+            self.runtime_leases
+                .iter()
+                .filter(|((plugin_id, _), _)| plugin_id == id)
+                .map(|(_, count)| *count)
+                .sum()
+        } else {
+            self.runtime_lease_count(id, scope)
+        }
+    }
+
+    /// 应用级实例拥有所有工作区共享的宿主资源。应用排空时，所有依赖该
+    /// 实例的工作区都必须同时关闭新的激活和运行准入，不能只封住
+    /// `application` 这一条键。
+    fn scope_is_draining(&self, id: &str, scope: &str) -> bool {
+        self.draining_scopes
+            .contains(&(id.to_owned(), scope.to_owned()))
+            || (scope != "application"
+                && self
+                    .draining_scopes
+                    .contains(&(id.to_owned(), "application".to_owned())))
+    }
+
+    fn ensure_scope_not_draining(&self, id: &str, scope: &str) -> Result<(), PluginError> {
+        if self.scope_is_draining(id, scope) {
+            Err(PluginError::Conflict("插件作用域正在排空".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn disable(&mut self, id: &str, scope: &str) -> Result<(), PluginError> {
         let package = self.package(id)?;
         validate_scope(package.manifest(), scope)?;
+        self.ensure_scope_not_draining(id, scope)?;
         let mut next = self.state.clone();
         let installed = next
             .plugins
