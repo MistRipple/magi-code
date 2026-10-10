@@ -417,6 +417,36 @@ impl PluginManager {
             && permissions_granted_for_scope(package.manifest(), installed, scope))
     }
 
+    /// 校验 Worker 调用仍绑定到激活时的包版本和作用域实例。
+    ///
+    /// Worker 运行期间可能跨过禁用、升级或重启边界；仅检查插件当前处于激活
+    /// 状态会把迟到的旧调用错误地交给新包。所有能力桥都必须先通过这一个入口，
+    /// 由当前安装事实核对不可变摘要和实例作用域。
+    pub fn validate_runtime_identity(
+        &self,
+        id: &str,
+        package_digest: &str,
+        instance_scope: &str,
+        scope: &str,
+    ) -> Result<(), PluginError> {
+        validate_scope_key(scope)?;
+        if instance_scope != scope {
+            return Err(PluginError::Conflict("插件实例作用域不匹配".into()));
+        }
+        let installed = self
+            .state
+            .plugins
+            .get(id)
+            .ok_or_else(|| conflict("插件未安装"))?;
+        if package_digest != installed.digest {
+            return Err(PluginError::Conflict("插件执行包已过期".into()));
+        }
+        if !self.is_active_for_scope(id, scope)? {
+            return Err(PluginError::Conflict("插件作用域未激活".into()));
+        }
+        Ok(())
+    }
+
     pub fn manifests_for_scope(&self, scope: &str) -> Result<Vec<PluginManifest>, PluginError> {
         validate_scope_key(scope)?;
         self.state

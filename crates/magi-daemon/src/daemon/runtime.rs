@@ -249,17 +249,19 @@ impl CapabilityHandler for PluginCapabilityHandler {
                 ExecutionError::new(ExecutionErrorCode::CapabilityRejected, "插件管理器不可用")
             })?;
             let plugin_id = &request.identity.plugin_id;
-            if !manager
-                .is_active_for_scope(plugin_id, &scope)
+            manager
+                .validate_runtime_identity(
+                    plugin_id,
+                    &request.identity.package_digest,
+                    &request.identity.instance_id,
+                    &scope,
+                )
                 .map_err(|_| {
-                    ExecutionError::new(ExecutionErrorCode::CapabilityRejected, "插件未激活")
-                })?
-            {
-                return Err(ExecutionError::new(
-                    ExecutionErrorCode::CapabilityRejected,
-                    "插件作用域未激活",
-                ));
-            }
+                    ExecutionError::new(
+                        ExecutionErrorCode::CapabilityRejected,
+                        "插件执行身份已失效",
+                    )
+                })?;
             match request.operation.as_str() {
                 "resource.read" => {
                     let resource = request

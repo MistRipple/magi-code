@@ -254,6 +254,65 @@ fn active_commands_are_projected_to_the_requested_scope() {
 }
 
 #[test]
+fn runtime_identity_rejects_stale_package_and_foreign_scope() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(true);
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "runtime-identity.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle", "workspace:one").unwrap();
+    manager
+        .authorize(
+            "acme.lifecycle",
+            "workspace:one",
+            vec![magi_plugin_system::PluginPermission {
+                kind: magi_plugin_system::PluginPermissionKind::Storage,
+                scope: magi_plugin_system::PluginScopeKind::Workspace,
+                targets: vec!["cache".into()],
+            }],
+        )
+        .unwrap();
+    manager.activate("acme.lifecycle", "workspace:one").unwrap();
+
+    assert!(
+        manager
+            .validate_runtime_identity(
+                "acme.lifecycle",
+                package.digest(),
+                "workspace:one",
+                "workspace:one",
+            )
+            .is_ok()
+    );
+    assert!(
+        manager
+            .validate_runtime_identity(
+                "acme.lifecycle",
+                "stale-digest",
+                "workspace:one",
+                "workspace:one",
+            )
+            .is_err()
+    );
+    assert!(
+        manager
+            .validate_runtime_identity(
+                "acme.lifecycle",
+                package.digest(),
+                "workspace:two",
+                "workspace:one",
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn resource_permission_is_required_for_each_declared_resource() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
