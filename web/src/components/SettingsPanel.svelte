@@ -11,6 +11,7 @@ import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import SettingsPluginsTab from './SettingsPluginsTab.svelte';
 import PluginTabContent from './tabs/PluginTabContent.svelte';
+import PluginSettingsForm from './PluginSettingsForm.svelte';
 import { onMount, tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
@@ -65,16 +66,37 @@ import {
     (manifest.contributions.views ?? [])
       .filter((view) => view.placements.includes('settings'))
       .map((view) => ({
+        kind: 'view' as const,
         tabId: `plugin:${manifest.id}:${view.id}` as `plugin:${string}`,
         id: manifest.id,
+        manifest,
         entry: view.entry,
         label: `${manifest.name} · ${view.title}`,
         title: view.title,
         description: manifest.description,
       }))));
+  const pluginSettingsForms = $derived.by(() => pluginManifests
+    .filter((manifest) => !(manifest.contributions.views ?? []).some((view) => view.placements.includes('settings')))
+    .filter((manifest) => {
+      const schema = manifest.settingsSchema;
+      return Boolean(schema && typeof schema === 'object' && !Array.isArray(schema)
+        && schema.properties && typeof schema.properties === 'object'
+        && Object.keys(schema.properties).length > 0);
+    })
+    .map((manifest) => ({
+      kind: 'form' as const,
+      tabId: `plugin:${manifest.id}:settings` as `plugin:${string}`,
+      id: manifest.id,
+      manifest,
+      entry: '',
+      label: `${manifest.name} · ${i18n.t('settings.plugins.settings.title')}`,
+      title: i18n.t('settings.plugins.settings.title'),
+      description: manifest.description,
+    })));
+  const pluginSettingsTabs = $derived([...pluginSettingsViews, ...pluginSettingsForms]);
   const activeTabDefinition = $derived(
     SETTINGS_TABS.find((tab) => tab.id === store.activeTab)
-      ?? pluginSettingsViews.find((item) => item.tabId === store.activeTab)
+      ?? pluginSettingsTabs.find((item) => item.tabId === store.activeTab)
       ?? SETTINGS_TABS[0],
   );
   const activeTabTitle = $derived(
@@ -101,7 +123,7 @@ import {
   });
   $effect(() => {
     if (pluginManifestsLoaded && store.activeTab.startsWith('plugin:')
-      && !pluginSettingsViews.some((item) => item.tabId === store.activeTab)) {
+      && !pluginSettingsTabs.some((item) => item.tabId === store.activeTab)) {
       store.activeTab = 'model';
     }
   });
@@ -220,7 +242,7 @@ import {
           <span>{i18n.t(tab.titleKey)}</span>
         </button>
       {/each}
-      {#each pluginSettingsViews as tab (tab.tabId)}
+      {#each pluginSettingsTabs as tab (tab.tabId)}
         <button
           type="button"
           class="settings-nav-item"
@@ -292,8 +314,12 @@ import {
       {:else if store.activeTab === 'plugins'}
         <SettingsPluginsTab workspaceId={messagesState.currentWorkspaceId} />
       {:else}
-        {#each pluginSettingsViews.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
-          <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} scope={pluginScope} />
+        {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
+          {#if tab.kind === 'view'}
+            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} scope={pluginScope} />
+          {:else}
+            <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} scope={pluginScope} />
+          {/if}
         {/each}
       {/if}
     </div>

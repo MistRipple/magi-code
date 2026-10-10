@@ -173,6 +173,16 @@ async fn resource(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     Ok(response)
 }
 
@@ -189,6 +199,17 @@ async fn read_resource(
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     ensure_declared_resource(&manager, &id, &resource)?;
+    if !manager
+        .permission_allowed(
+            &id,
+            &query.scope,
+            magi_plugin_system::PluginPermissionKind::Storage,
+            &resource,
+        )
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未获资源读取权限".into()));
+    }
     let snapshot = manager
         .resources()
         .read(&id, &query.scope, &resource)
@@ -213,6 +234,17 @@ async fn write_resource(
         return Err(ApiError::Forbidden("插件未激活".into()));
     }
     ensure_declared_resource(&manager, &id, &resource)?;
+    if !manager
+        .permission_allowed(
+            &id,
+            &query.scope,
+            magi_plugin_system::PluginPermissionKind::Storage,
+            &resource,
+        )
+        .map_err(plugin_error)?
+    {
+        return Err(ApiError::Forbidden("插件未获资源写入权限".into()));
+    }
     let result = manager.resources_mut().write(
         &id,
         &query.scope,

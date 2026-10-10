@@ -222,6 +222,50 @@ fn active_commands_are_projected_to_the_requested_scope() {
 }
 
 #[test]
+fn resource_permission_is_required_for_each_declared_resource() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(true);
+    manager
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "resource-permission.zip".into(),
+            },
+        )
+        .unwrap();
+    manager.enable("acme.lifecycle", "workspace:one").unwrap();
+    manager
+        .authorize(
+            "acme.lifecycle",
+            "workspace:one",
+            vec![magi_plugin_system::PluginPermission {
+                kind: magi_plugin_system::PluginPermissionKind::Storage,
+                scope: magi_plugin_system::PluginScopeKind::Workspace,
+                targets: vec!["cache".into()],
+            }],
+        )
+        .unwrap();
+    manager.activate("acme.lifecycle", "workspace:one").unwrap();
+    assert!(manager
+        .permission_allowed(
+            "acme.lifecycle",
+            "workspace:one",
+            magi_plugin_system::PluginPermissionKind::Storage,
+            "cache",
+        )
+        .unwrap());
+    assert!(!manager
+        .permission_allowed(
+            "acme.lifecycle",
+            "workspace:one",
+            magi_plugin_system::PluginPermissionKind::Storage,
+            "other",
+        )
+        .unwrap());
+}
+
+#[test]
 fn workspace_activation_requires_application_scoped_grants_too() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
