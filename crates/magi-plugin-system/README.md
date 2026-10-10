@@ -14,7 +14,7 @@
 
 ## 生命周期与资源
 
-`PluginManager` 以 `state.json` 和不可变版本 ZIP 作为唯一安装事实；API、Web 或未来 CLI 都只调用它。安装来源可以是中心、地址或本地包，但三者在进入管理器前都经过同一 `PluginPackage::from_archive` 校验。升级要求所有作用域排空并切换到单一新版本，不能并发保留旧实现或静默回退。授权、启用和激活是分开的状态，卸载前必须释放所有作用域。
+`PluginManager` 以 `state.json` 和不可变版本 ZIP 作为唯一安装事实；API、Web 或未来 CLI 都只调用它。安装来源可以是中心、地址或本地包，但三者在进入管理器前都经过同一 `PluginPackage::from_archive` 校验。升级要求所有作用域排空并切换到单一新版本，不能并发保留旧实现或静默回退；状态提交后才清理未引用旧包，重启会继续清理中断的暂存文件。授权、启用和激活是分开的状态，卸载前必须释放所有作用域。
 
 `PluginResourceStore` 是插件资源的单一事实源，写入携带期望版本并返回明确冲突；资源读写还要通过清单声明的 storage 权限。右栏视图只能通过 daemon 资源 URL 读取包内 HTML，响应带受限 CSP，iframe 使用 `sandbox="allow-scripts"` 且不取得父页面 DOM、凭据或 Electron 桥。
 

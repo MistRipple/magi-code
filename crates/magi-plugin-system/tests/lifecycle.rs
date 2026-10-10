@@ -161,6 +161,38 @@ fn upgrade_requires_a_drained_scope_and_keeps_one_installed_version() {
 }
 
 #[test]
+fn reopening_cleans_unreferenced_package_versions_after_lifecycle_commit() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let first = package(false);
+    manager
+        .install(
+            &first,
+            PluginSource::Local {
+                name: "first.zip".into(),
+            },
+        )
+        .unwrap();
+    let old_path = root
+        .path()
+        .join("versions/acme.lifecycle")
+        .join(format!("{}.zip", first.digest()));
+    let mut second_manifest = manifest(false);
+    second_manifest["version"] = json!("1.1.0");
+    let second = package_from_manifest(second_manifest);
+    manager
+        .upgrade(
+            &second,
+            PluginSource::Local {
+                name: "second.zip".into(),
+            },
+        )
+        .unwrap();
+    assert!(!old_path.exists());
+    assert!(PluginManager::open(root.path()).is_ok());
+}
+
+#[test]
 fn active_manifests_are_projected_to_the_requested_scope() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();

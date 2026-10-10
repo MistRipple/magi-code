@@ -83,6 +83,7 @@ impl PluginManager {
         for plugin in state.plugins.values() {
             validate_plugin_path(&root, plugin)?;
         }
+        cleanup_unreferenced_packages(&root, &state)?;
         let resources =
             PluginResourceStore::open(root.join("resources.json")).map_err(PluginError::Storage)?;
         Ok(Self {
@@ -279,15 +280,12 @@ impl PluginManager {
             active_scopes: BTreeSet::new(),
         };
         let mut next = self.state.clone();
-        let old = next
-            .plugins
-            .insert(id.to_owned(), replacement)
-            .expect("current plugin checked");
+        next.plugins.insert(id.to_owned(), replacement);
         if let Err(error) = self.commit(next) {
             let _ = fs::remove_file(&target);
             return Err(error);
         }
-        let _ = fs::remove_file(self.root.join(old.package_path));
+        cleanup_unreferenced_packages(&self.root, &self.state)?;
         Ok(())
     }
 
@@ -594,7 +592,10 @@ impl PluginManager {
         let mut next = self.state.clone();
         next.plugins.remove(id);
         self.commit(next)?;
-        let _ = fs::remove_file(package_path);
+        if package_path.exists() {
+            stage_package_for_removal(&package_path)?;
+        }
+        cleanup_unreferenced_packages(&self.root, &self.state)?;
         Ok(())
     }
 
@@ -620,6 +621,53 @@ fn validate_plugin_path(root: &Path, plugin: &InstalledPlugin) -> Result<(), Plu
     }
     if !root.join(path).is_file() {
         return Err(PluginError::CorruptState("安装包文件缺失".into()));
+    }
+    Ok(())
+}
+
+fn stage_package_for_removal(path: &Path) -> Result<PathBuf, PluginError> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| PluginError::CorruptState("安装包文件名无效".into()))?;
+    let staged = path.with_file_name(format!("{file_name}.removing"));
+    fs::rename(path, &staged).map_err(PluginError::Storage)?;
+    Ok(staged)
+}
+
+fn cleanup_unreferenced_packages(
+    root: &Path,
+    state: &PluginManagerState,
+) -> Result<(), PluginError> {
+    let versions = root.join("versions");
+    let referenced = state
+        .plugins
+        .values()
+        .map(|plugin| plugin.package_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let entries = match fs::read_dir(&versions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            let path = file.path();
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|value| value.to_str());
+            if file.file_type()?.is_file()
+                && relative.is_some_and(|value| !referenced.contains(value))
+            {
+                fs::remove_file(path)?;
+            }
+        }
     }
     Ok(())
 }
