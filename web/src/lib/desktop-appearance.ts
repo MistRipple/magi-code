@@ -5,6 +5,8 @@ export interface DesktopAppearance {
   accentColor: string;
   material: 'clear' | 'translucent' | 'immersive';
   mode: 'light' | 'dark';
+  /** Electron nativeTheme source; system keeps following the OS appearance. */
+  themeSource: 'system' | 'light' | 'dark';
 }
 
 // Electron 原生窗口颜色必须是可序列化的 CSS 颜色。背景色和强调色

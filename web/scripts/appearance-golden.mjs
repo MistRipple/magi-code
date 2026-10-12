@@ -35,13 +35,13 @@ assert.ok(
 );
 assert.doesNotMatch(runtime, /localStorage\.setItem/, '外观运行时不得把 localStorage 作为主题权威');
 assert.match(runtime, /fetchAppearanceSnapshot[\s\S]*?applyAppearanceSnapshot/, '主题恢复必须从 daemon 快照进入唯一应用链路');
-assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: desktopAppearance\.nativeBackgroundColor[\s\S]*?accentColor: scheme\.accent[\s\S]*?material: pack\.material[\s\S]*?mode: nextMode/, '权威主题应用链路必须同步桌面外壳的原生底色、强调色、材质与明暗模式');
+assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: desktopAppearance\.nativeBackgroundColor[\s\S]*?accentColor: scheme\.accent[\s\S]*?material: pack\.material[\s\S]*?mode: nextMode[\s\S]*?themeSource: pack\.schemePolicy === 'adaptive' \? 'system' : nextMode/, '权威主题应用链路必须同步桌面外壳的原生底色、强调色、材质、明暗模式与系统跟随来源');
 assert.match(runtime, /sequence !== applySequence[\s\S]*?emit\(\)/, '异步主题同步返回后必须丢弃过期主题快照');
 assert.match(runtime, /desktopSurfaceIsApp\(\)[\s\S]*?synchronizeDesktopAppearance/, '桌面 App Renderer 必须同步窗口外壳主题');
 assert.match(desktopAppearance, /isDesktopRuntime[\s\S]*?desktop\.setAppearance\(appearance\)/, 'Renderer 必须通过 preload 同步桌面壳外观');
 assert.match(desktopAppearance, /accentColor[\s\S]*?material/, '桌面外观载荷必须包含主题强调色与材质');
 assert.match(desktopPreload, /setAppearance:[\s\S]*?magi-desktop:set-appearance/, 'preload 必须暴露受限外观 IPC');
-assert.match(desktopMain, /nativeTheme\.themeSource = mode[\s\S]*?manager\.setAppearance/, 'Electron Main 必须统一设置原生主题与窗口背景');
+assert.match(desktopMain, /nativeTheme\.themeSource = themeSource[\s\S]*?manager\.setAppearance/, 'Electron Main 必须按主题来源设置原生主题与窗口背景');
 assert.match(desktopWindowManager, /backgroundColor: this\.#appearance\.backgroundColor[\s\S]*?show: false/, '桌面窗口必须先使用当前主题材质并在主题握手前保持隐藏');
 assert.match(desktopWindowManager, /handleRightPaneReady[\s\S]*?record\.window\.show\(\)/, '桌面窗口必须在 App Renderer 完成主题握手后显示');
 assert.match(desktopWindowManager, /this\.#appearance = \{ \.\.\.appearance \}[\s\S]*?for \(const record of this\.#records\.values\(\)/, '主题切换必须同步所有现有桌面窗口并作为新窗口的初始材质');

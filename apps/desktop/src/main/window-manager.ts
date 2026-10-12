@@ -54,6 +54,7 @@ export interface DesktopAppearance {
   accentColor: string;
   material: "clear" | "translucent" | "immersive";
   mode: "light" | "dark";
+  themeSource: "system" | "light" | "dark";
 }
 
 export interface DesktopRendererContext {
@@ -125,6 +126,7 @@ export class WindowManager {
     accentColor: "#2563eb",
     material: "clear",
     mode: "dark",
+    themeSource: "system",
   };
   #activeWindowId = "";
 

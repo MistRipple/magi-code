@@ -304,6 +304,7 @@ interface MagiDesktopBridge {
     accentColor: string;
     material: "clear" | "translucent" | "immersive";
     mode: "light" | "dark";
+    themeSource: "system" | "light" | "dark";
   }): Promise<void>;
   getAppVersion(): Promise<string>;
   getBrowserComponentInfo(): Promise<MagiDesktopBrowserComponentSnapshot>;
