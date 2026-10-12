@@ -642,15 +642,18 @@ function registerIpc(): void {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     const request = rejectUnknownFields(
       object(value),
-      ["mode", "backgroundColor", "accentColor", "material"],
+      ["mode", "themeSource", "backgroundColor", "accentColor", "material"],
       "appearance",
     );
     const mode = request.mode;
+    const themeSource = request.themeSource;
     const backgroundColor = text(request.backgroundColor, "backgroundColor");
     const accentColor = text(request.accentColor, "accentColor");
     const material = request.material;
     if (mode !== "light" && mode !== "dark")
       throw new Error("desktop_appearance_mode_invalid");
+    if (themeSource !== "system" && themeSource !== "light" && themeSource !== "dark")
+      throw new Error("desktop_appearance_theme_source_invalid");
     if (!isDesktopBackgroundColor(backgroundColor)) {
       throw new Error("desktop_appearance_background_invalid");
     }
@@ -664,9 +667,13 @@ function registerIpc(): void {
     ) {
       throw new Error("desktop_appearance_material_invalid");
     }
-    nativeTheme.themeSource = mode;
+    // `mode` is the currently rendered scheme. Keep the native source separate:
+    // forcing it to light/dark here would disable Electron's OS appearance
+    // notifications after the first adaptive-theme application.
+    nativeTheme.themeSource = themeSource;
     manager.setAppearance(windowId, {
       mode,
+      themeSource,
       backgroundColor,
       accentColor,
       material,

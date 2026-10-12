@@ -110,6 +110,7 @@ async function applyTheme(pack: ThemePack): Promise<void> {
         accentColor: scheme.accent,
         material: pack.material,
         mode: nextMode,
+        themeSource: pack.schemePolicy === 'adaptive' ? 'system' : nextMode,
       });
     } catch (error) {
       console.error('[appearance] 同步桌面壳外观失败', error);
