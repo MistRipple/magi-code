@@ -730,7 +730,8 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0 20px 4px;
+    padding: 4px max(32px, calc((100% - 880px) / 2)) 56px;
+    box-sizing: border-box;
     scrollbar-width: none;
     display: flex;
     flex-direction: column;
@@ -743,7 +744,6 @@
     justify-content: space-between;
     gap: 16px;
     padding: 14px 0 12px;
-    border-bottom: 1px solid var(--ind-border-separator);
     margin-bottom: 2px;
   }
   .toolbar-title { font-size: 14px; font-weight: 650; color: var(--ind-foreground); }
@@ -824,7 +824,6 @@
     align-items: flex-start;
     gap: 14px;
     padding-bottom: 18px;
-    border-bottom: 1px solid var(--ind-border-separator);
   }
   .role-editor-eyebrow {
     margin-bottom: 5px;
@@ -902,7 +901,6 @@
     color: var(--ind-foreground-secondary);
   }
   .role-tab.active {
-    background: var(--ind-bg-control-hover);
     color: var(--ind-foreground);
     font-weight: 600;
   }
@@ -986,7 +984,6 @@
     gap: 12px;
     min-width: 0;
     padding: 20px 0 24px;
-    border-top: 1px solid var(--ind-border-separator);
   }
 
   .domain-library-heading {
@@ -1054,7 +1051,6 @@
     align-items: start;
     min-width: 0;
     padding-bottom: 18px;
-    border-bottom: 1px solid var(--ind-border-separator);
   }
 
   .detail-header {
@@ -1160,11 +1156,9 @@
     min-width: 0;
     padding: 0 0 18px;
     margin: 0 0 18px;
-    border-bottom: 1px solid var(--ind-border-separator);
   }
   .detail-masonry .detail-section:nth-last-child(-n + 2) {
     margin-bottom: 0;
-    border-bottom: none;
   }
 
   /* 与 SettingsModelTab.settings-section-title 对齐：14px / 700，常规文字色（非 uppercase microcopy） */

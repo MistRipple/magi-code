@@ -18,6 +18,18 @@
 - 不从 UI 推断任务终态、后台状态或授权成功；消费 daemon 的事件和响应事实。跨层字段变更先读对应 schema、DTO 和调用方。
 - UI 文案沿用现有 i18n 字典和组件模式；不要绕过当前本地化方式硬编码产品文案。
 
+## 设置页一致性
+
+所有设置分类共用 `src/styles/settings.css` 的同一套结构，新增或修改设置页时只用这些共享类，不要在分类内另起一套标题、卡片、行或按钮：
+
+- 页面框架：分类根元素使用 `.apple-scroller-proxy`（或 `.settings-frame`），内容列居中、最宽 880px，不要在分类里再写自己的左右留白。
+- 分区：`.settings-section` + `.settings-section-header`（`.settings-section-title` 14px 加粗，其下 `.settings-section-desc` 12px 灰色；操作放在 `.settings-section-actions`）。分区之间只有一条细分隔线；每个分区最多一个主按钮。
+- 内容：卡片用 `.settings-card`，列表用 `.settings-rows` / `.settings-row`（`.settings-row-copy` 内放 `.settings-row-title` 与 `.settings-row-desc`），标签用 `.settings-chip`，状态点用 `.settings-dot`，提示用 `.settings-notice`，空状态用 `.settings-empty`（一行说明，不用大图标）。
+- 控件：按钮用全局 `.btn`（设置页一律 `.btn--sm`，主操作 `.btn--primary`，其余 `.btn--secondary`，破坏性 `.btn--error`），输入框用 `.form-input`，开关用 `Toggle`。
+- 主从布局（插件页）：整体是一块带边框面板，左侧按状态分组、可独立滚动的列表，右侧在同一页面展示所选项的详情与全部操作，默认选中第一项，不用弹窗；安装/更新这类首要动作用 `.btn--lg`，让「未安装」「有更新」一眼可辨。
+- 分类内的二级标签用 `.settings-subtabs` / `.settings-subtab`（下划线样式），不使用胶囊分段控件。
+- 内容面板不填充背景色、不加阴影、不用渐变，只用 1px `var(--border)` 边框与 10px 圆角；背景色只留给控件（输入框、分段控件、选中项）。
+
 ## 验证
 
 - 类型与 Svelte 检查：`npm --prefix web run check`。

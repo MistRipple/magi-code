@@ -132,8 +132,8 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /\.builtin-summary\s*\{[\s\S]*?width:\s*100%;[\s\S]*?\.command-environment-panel\s*\{[\s\S]*?width:\s*100%;/,
-  'built-in tools and command environment panels must share the same full-width alignment',
+  /\.capability-dependency-strip\s*\{[\s\S]*?border:\s*1px solid var\(--border\);[\s\S]*?\.command-environment-panel\s*\{[\s\S]*?width:\s*100%;[\s\S]*?border:\s*1px solid var\(--border\);/,
+  'built-in tool dependency strip and command environment panel must share the same card material',
 );
 assert.doesNotMatch(
   settingsToolsSource,

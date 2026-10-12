@@ -182,6 +182,7 @@ fn origin_namespace(origin: ChatToolOrigin) -> &'static str {
         ChatToolOrigin::Builtin => "builtin",
         ChatToolOrigin::ExternalMcp => "mcp",
         ChatToolOrigin::Skill => "skill",
+        ChatToolOrigin::Plugin => "plugin",
         ChatToolOrigin::Unspecified => "legacy",
     }
 }

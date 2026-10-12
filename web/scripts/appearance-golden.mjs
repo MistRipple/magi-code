@@ -66,7 +66,7 @@ assert.ok(
   '外观导航必须位于统计之后、项目之前，DOM 与键盘焦点顺序保持一致',
 );
 assert.match(settingsAppearance, /createAppearanceTheme[\s\S]*?updateAppearanceTheme[\s\S]*?deleteAppearanceTheme/, '自定义与导入主题必须具备完整生命周期');
-assert.match(settingsAppearance, /visibleThemes[\s\S]*?record\.pack\.id !== 'builtin\.system'[\s\S]*?system-appearance-row[\s\S]*?<Toggle/, '跟随系统必须作为独立策略控制，不得占用普通主题卡片');
+assert.match(settingsAppearance, /visibleThemes[\s\S]*?record\.pack\.id !== 'builtin\.system'[\s\S]*?settings-row[\s\S]*?<Toggle/, '跟随系统必须作为独立策略控制，不得占用普通主题卡片');
 assert.match(settingsAppearance, /toggleSystemAppearance[\s\S]*?builtin\.system[\s\S]*?builtin\.light[\s\S]*?builtin\.dark/, '关闭跟随系统时必须保持当前明暗外观');
 assert.match(settingsAppearance, /resolveAppearanceAssetUrl[\s\S]*?preview-wallpaper[\s\S]*?background-position[\s\S]*?preview-wallpaper-dim/, '主题卡片必须显示壁纸缩略图并还原焦点、模糊和遮光参数');
 assert.match(settingsAppearance, /previewAppearanceTheme[\s\S]*?restoreActiveAppearance/, '主题编辑必须使用可取消的实时预览事务');

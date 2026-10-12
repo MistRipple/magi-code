@@ -7,6 +7,7 @@
 //! 端口一经选定就持久化：之后每次启动都用同一个端口，被占用时明确报错，不静默换端口，
 //! 这样客户端配置一次即可长期使用。
 
+use crate::external_turns::ExternalTurns;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,6 +68,31 @@ struct PersistedMcp {
     /// 直接对公网开放（监听公网地址）的配置；开着时重启后恢复。
     #[serde(default)]
     direct: DirectAccess,
+    /// 外部会话里调用内容的保存与保留设置。
+    #[serde(default)]
+    external: ExternalRetention,
+}
+
+/// 外部会话（外部 MCP 客户端的调用过程）的隐私与留存设置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExternalRetention {
+    /// 保存调用内容（读到的文件内容、命令输出、写入的内容）。关闭后只保存工具与路径等动作描述。
+    pub save_content: bool,
+    /// 外部会话里的调用保留天数；到期的活动段自动清理。0 表示不自动清理。
+    pub retention_days: u32,
+}
+
+/// 保留天数上限（约十年），防止界面传入荒谬值。
+pub(crate) const MAX_RETENTION_DAYS: u32 = 3650;
+
+impl Default for ExternalRetention {
+    fn default() -> Self {
+        Self {
+            save_content: true,
+            retention_days: 30,
+        }
+    }
 }
 
 /// 直接对公网开放：HTTP 入口改为监听 `bind_host`（如 `0.0.0.0`），不经隧道。
@@ -172,6 +198,7 @@ pub(crate) struct McpServiceStatus {
     pub active_tokens: usize,
     pub network: NetworkStatus,
     pub direct: DirectStatus,
+    pub external: ExternalRetention,
 }
 
 /// 审计日志保留的最大条数。超出后丢弃最旧的。
@@ -341,6 +368,9 @@ fn append_private_line(path: &std::path::Path, entry: &AuditEntry) -> std::io::R
 
 pub(crate) struct McpServiceRuntime {
     audit: McpAuditLog,
+    /// 外部会话活动段 Turn 的开合；事实在会话的 canonical 时间线里。
+    pub(crate) external_turns: ExternalTurns,
+    retention: Mutex<ExternalRetention>,
     tunnel: Arc<dyn TunnelProvider>,
     /// 网络模式是否开启。Quick Tunnel 不持久化（每次由用户显式开启）；命名隧道的开关会持久化并在重启后恢复。
     network_enabled: Arc<AtomicBool>,
@@ -374,6 +404,8 @@ impl McpServiceRuntime {
     pub(crate) fn in_memory() -> Self {
         Self {
             audit: McpAuditLog::in_memory(),
+            external_turns: ExternalTurns::new(),
+            retention: Mutex::new(ExternalRetention::default()),
             tunnel: QuickTunnelProvider::shared(),
             network_enabled: Arc::new(AtomicBool::new(false)),
             named: Mutex::new(None),
@@ -428,6 +460,8 @@ impl McpServiceRuntime {
         let direct = persisted.direct.clone();
         Self {
             audit,
+            external_turns: ExternalTurns::new(),
+            retention: Mutex::new(persisted.external),
             tunnel: QuickTunnelProvider::shared(),
             network_enabled: Arc::new(AtomicBool::new(false)),
             named: Mutex::new(named),
@@ -459,6 +493,29 @@ impl McpServiceRuntime {
         &self.audit
     }
 
+    pub(crate) fn retention(&self) -> ExternalRetention {
+        *self.retention.lock().expect("mcp retention poisoned")
+    }
+
+    pub(crate) fn save_content(&self) -> bool {
+        self.retention().save_content
+    }
+
+    /// 更新外部会话的保存与保留设置并持久化。
+    pub(crate) async fn set_retention(
+        &self,
+        retention: ExternalRetention,
+    ) -> Result<(), McpRuntimeError> {
+        if retention.retention_days > MAX_RETENTION_DAYS {
+            return Err(McpRuntimeError::Token(format!(
+                "保留天数不能超过 {MAX_RETENTION_DAYS}"
+            )));
+        }
+        let control = self.control.lock().await;
+        *self.retention.lock().expect("mcp retention poisoned") = retention;
+        self.persist(control.enabled, control.port)
+    }
+
     fn persist(&self, enabled: bool, port: Option<u16>) -> Result<(), McpRuntimeError> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -479,6 +536,7 @@ impl McpServiceRuntime {
                 .lock()
                 .expect("mcp direct lock poisoned")
                 .clone(),
+            external: self.retention(),
         })
         .map_err(|error| McpRuntimeError::Persist(error.to_string()))?;
         write_private_atomic(path, &body)
@@ -554,6 +612,7 @@ impl McpServiceRuntime {
                 .filter(|record| record.is_active(now))
                 .count(),
             direct: self.direct_status_locked(control),
+            external: self.retention(),
             network: NetworkStatus {
                 enabled,
                 status: if enabled && snapshot.status.is_empty() {
@@ -626,6 +685,20 @@ impl McpServiceRuntime {
         control.enabled = enabled;
         self.persist(control.enabled, control.port)?;
         Ok(self.status_locked(&control).await)
+    }
+
+    /// 释放监听与隧道，但**不改持久化的开关与配置**：插件应用级停用或升级时调用，
+    /// 重新激活后 `start_if_enabled` 按原配置恢复（命名隧道的网络模式也一并恢复）。
+    pub(crate) async fn release(&self) {
+        let mut control = self.control.lock().await;
+        if self.network_enabled.load(Ordering::SeqCst) {
+            control.restore_network = self
+                .named
+                .lock()
+                .expect("mcp named lock poisoned")
+                .is_some();
+        }
+        self.stop_locked(&mut control).await;
     }
 
     /// daemon 启动时调用：上次是开启的就恢复。失败只记日志，不影响 daemon。
@@ -799,6 +872,11 @@ impl McpServiceRuntime {
         &self,
         state: &ApiState,
     ) -> Result<PathBuf, McpRuntimeError> {
+        if !state.web_model_plugin_active() {
+            return Err(McpRuntimeError::Token(
+                "GPT Web 插件未在应用作用域激活".into(),
+            ));
+        }
         let state_root = self
             .state_root()
             .map(std::path::Path::to_path_buf)
@@ -1480,6 +1558,39 @@ mod tests {
         let status = runtime.set_enabled(&state, false).await.unwrap();
         assert!(!status.running && !status.enabled);
         assert!(post(&url, None).await.is_err(), "关闭后端口不应再可达");
+    }
+
+    #[tokio::test]
+    async fn release_stops_listening_but_keeps_the_saved_configuration_for_reactivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = runtime_path_with_port(dir.path().join("mcp-server.json"));
+        let runtime = McpServiceRuntime::load(path);
+        let state = state();
+        let issued = runtime.issue_token(request()).await.unwrap();
+        let status = runtime.set_enabled(&state, true).await.unwrap();
+        let url = status.url.clone().unwrap();
+        assert_eq!(post(&url, Some(&issued.secret)).await.unwrap(), 200);
+
+        runtime.release().await;
+        assert!(post(&url, None).await.is_err(), "释放后端口不应再可达");
+        let status = runtime.status().await;
+        assert!(
+            !status.running && status.enabled,
+            "开关与配置保留，只是未运行"
+        );
+        assert_eq!(runtime.list_tokens().len(), 1, "令牌保留");
+
+        // 重新激活等同于重启后的恢复：按已保存的配置重新监听，原令牌继续有效。
+        runtime.start_if_enabled(&state).await;
+        let status = runtime.status().await;
+        assert!(status.running);
+        assert_eq!(
+            post(&status.url.clone().unwrap(), Some(&issued.secret))
+                .await
+                .unwrap(),
+            200
+        );
+        runtime.set_enabled(&state, false).await.unwrap();
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@
       data-tooltip={i18n.t('header.settings')}
       data-tooltip-align="start"
       aria-label={i18n.t('header.settings')}
-      onclick={openSettings}
+      onclick={() => openSettings()}
     >
       <Icon name="settings" size={14} />
     </button>

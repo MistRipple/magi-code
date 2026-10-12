@@ -18,7 +18,6 @@
     checkForDesktopUpdate,
     desktopUpdaterState,
   } from '../stores/desktop-updater.svelte';
-  import SettingsWebModelSection from './SettingsWebModelSection.svelte';
   import { applyWebModelRuntime, markWebModelStoppedByUser } from '../stores/web-model-runtime.svelte';
   import { confirmAction } from '../stores/confirm-dialog.svelte';
 
@@ -408,20 +407,19 @@
   });
 </script>
 
-<div class="settings-tab-inner browser-settings-tab">
-  <div class="browser-settings-content">
+<div class="settings-frame">
     <section class="settings-section" aria-labelledby="browser-capabilities-title">
-      <div class="section-heading">
+      <div class="settings-section-header">
         <div>
-          <h3 id="browser-capabilities-title">{i18n.t('settings.browser.capabilitiesTitle')}</h3>
-          <p>{i18n.t('settings.browser.capabilitiesDescription')}</p>
+          <div class="settings-section-title" id="browser-capabilities-title">{i18n.t('settings.browser.capabilitiesTitle')}</div>
+          <div class="settings-section-desc">{i18n.t('settings.browser.capabilitiesDescription')}</div>
         </div>
       </div>
-      <div class="capability-list">
-        <div class="capability-row">
-          <div>
-            <strong>{i18n.t('settings.browser.inAppBrowser')}</strong>
-            <span>{i18n.t('settings.browser.inAppBrowserDescription')}</span>
+      <div class="settings-rows">
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t('settings.browser.inAppBrowser')}</span>
+            <span class="settings-row-desc">{i18n.t('settings.browser.inAppBrowserDescription')}</span>
           </div>
           <Toggle
             checked={capabilitySnapshot?.inAppBrowserEnabled ?? false}
@@ -430,10 +428,10 @@
             onchange={(enabled) => void saveCapabilitySetting('inAppBrowserEnabled', enabled)}
           />
         </div>
-        <div class="capability-row">
-          <div>
-            <strong>{i18n.t('settings.browser.browserUse')}</strong>
-            <span>{i18n.t('settings.browser.browserUseDescription')}</span>
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t('settings.browser.browserUse')}</span>
+            <span class="settings-row-desc">{i18n.t('settings.browser.browserUseDescription')}</span>
           </div>
           <Toggle
             checked={capabilitySnapshot?.browserUseEnabled ?? false}
@@ -442,10 +440,10 @@
             onchange={(enabled) => void saveCapabilitySetting('browserUseEnabled', enabled)}
           />
         </div>
-        <div class="capability-row">
-          <div>
-            <strong>{i18n.t('settings.browser.devtools')}</strong>
-            <span>{i18n.t('settings.browser.devtoolsDescription')}</span>
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t('settings.browser.devtools')}</span>
+            <span class="settings-row-desc">{i18n.t('settings.browser.devtoolsDescription')}</span>
           </div>
           <Toggle
             checked={capabilitySnapshot?.devtoolsEnabled ?? false}
@@ -454,10 +452,10 @@
             onchange={(enabled) => void saveCapabilitySetting('devtoolsEnabled', enabled)}
           />
         </div>
-        <div class="capability-row">
-          <div>
-            <strong>{i18n.t('settings.browser.lanAccess')}</strong>
-            <span>{i18n.t('settings.browser.lanAccessDescription')}</span>
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t('settings.browser.lanAccess')}</span>
+            <span class="settings-row-desc">{i18n.t('settings.browser.lanAccessDescription')}</span>
           </div>
           <Toggle
             checked={capabilitySnapshot?.lanAccessEnabled ?? false}
@@ -468,35 +466,33 @@
         </div>
       </div>
       {#if capabilityError}
-        <div class="status-message status-message--error" role="status">
+        <div class="settings-notice settings-notice--error" role="status">
           <Icon name="alert-circle" size={14} />
           <span>{capabilityError}</span>
         </div>
       {/if}
     </section>
 
-    <SettingsWebModelSection {isDesktop} />
-
     <section class="settings-section browser-resource-section" aria-labelledby="browser-resources-title">
-      <div class="section-heading">
-        <div class="section-icon" aria-hidden="true"><Icon name="database" size={17} /></div>
+      <div class="settings-section-header">
         <div>
-          <h3 id="browser-resources-title">{i18n.t('settings.browser.resourcesTitle')}</h3>
-          <p>{i18n.t('settings.browser.resourcesDescription')}</p>
+          <div class="settings-section-title" id="browser-resources-title">{i18n.t('settings.browser.resourcesTitle')}</div>
+          <div class="settings-section-desc">{i18n.t('settings.browser.resourcesDescription')}</div>
         </div>
       </div>
 
-      <div class="resource-summary" aria-live="polite">
-        <div class="resource-summary-copy">
-          <strong>
+      <div class="settings-rows" aria-live="polite">
+      <div class="settings-row">
+        <div class="settings-row-copy">
+          <span class="settings-row-title">
             {browserResources
               ? i18n.t('settings.browser.resourcesUsage', {
                   used: browserResources.liveTabs,
                   max: browserResources.maxTabs,
                 })
               : i18n.t('settings.browser.resourcesReading')}
-          </strong>
-          <span>
+          </span>
+          <span class="settings-row-desc">
             {browserResources
               ? i18n.t('settings.browser.resourcesReclaimable', { count: browserResources.reclaimableTabs })
               : i18n.t('settings.browser.resourcesReadingDescription')}
@@ -504,13 +500,14 @@
         </div>
         <button
           type="button"
-          class="resource-manage-button"
+          class="btn btn--secondary btn--sm"
           onclick={openResourceManager}
           disabled={resourceLoading && !browserResources}
         >
           <Icon name={resourceManagerOpen ? 'chevron-up' : 'chevron-down'} size={12} />
           {i18n.t(resourceManagerOpen ? 'settings.browser.resourcesCollapse' : 'settings.browser.resourcesManage')}
         </button>
+      </div>
       </div>
 
       {#if resourceManagerOpen}
@@ -522,13 +519,13 @@
             <div>
               <button
                 type="button"
-                class="resource-text-button"
+                class="plugin-link-btn"
                 onclick={selectAllReclaimableResources}
                 disabled={resourceLoading || resourceReclaiming || !browserResources?.reclaimableTabs}
               >{i18n.t('settings.browser.resourcesSelectAll')}</button>
               <button
                 type="button"
-                class="resource-text-button"
+                class="plugin-link-btn"
                 onclick={() => { selectedResourceTabIds = []; }}
                 disabled={resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
               >{i18n.t('settings.browser.resourcesClearSelection')}</button>
@@ -563,7 +560,7 @@
           {/if}
 
           {#if resourceError}
-            <div class="status-message status-message--error" role="alert">
+            <div class="settings-notice settings-notice--error" role="alert">
               <Icon name="alert-circle" size={14} /><span>{resourceError}</span>
             </div>
           {/if}
@@ -572,7 +569,7 @@
             <span>{i18n.t('settings.browser.resourcesWarning')}</span>
             <button
               type="button"
-              class="danger resource-reclaim-button"
+              class="btn btn--error btn--sm"
               onclick={() => void reclaimSelectedResources()}
               disabled={!isDesktop || resourceLoading || resourceReclaiming || selectedResourceTabIds.length === 0}
               aria-busy={resourceReclaiming}
@@ -589,16 +586,15 @@
 
     {#if isDesktop}
       <section class="settings-section desktop-components" aria-labelledby="browser-components-title">
-        <div class="section-heading">
-          <div class="section-icon" aria-hidden="true"><Icon name="globe" size={18} /></div>
+        <div class="settings-section-header">
           <div>
-            <h3 id="browser-components-title">{i18n.t('settings.browser.componentsTitle')}</h3>
-            <p>{i18n.t('settings.browser.componentsDescription')}</p>
+            <div class="settings-section-title" id="browser-components-title">{i18n.t('settings.browser.componentsTitle')}</div>
+            <div class="settings-section-desc">{i18n.t('settings.browser.componentsDescription')}</div>
           </div>
           <button
             type="button"
-            class="icon-action"
-            class:icon-action--loading={activeAction === 'refresh-components' || desktopLoading}
+            class="btn-icon btn-icon--sm"
+            class:refreshing={activeAction === 'refresh-components' || desktopLoading}
             onclick={() => void runDesktopAction('refresh-components')}
             disabled={componentActionDisabled('refresh-components')}
             aria-busy={desktopLoading || activeAction === 'refresh-components'}
@@ -607,34 +603,34 @@
           ><Icon name="refresh" size={14} /></button>
         </div>
 
-        <div class="component-list" aria-live="polite">
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.desktopHost')}</strong><span>{hostComponentStatus()}</span></div>
+        <div class="settings-rows" aria-live="polite">
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.desktopHost')}</span><span class="settings-row-desc">{hostComponentStatus()}</span></div>
             <code>{versionText(desktopInfo?.product_version)}</code>
           </div>
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.electron')}</strong><span>{browserEngineStatus(desktopInfo?.electron_version)}</span></div>
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.electron')}</span><span class="settings-row-desc">{browserEngineStatus(desktopInfo?.electron_version)}</span></div>
             <code>{versionText(desktopInfo?.electron_version)}</code>
           </div>
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.chromium')}</strong><span>{browserEngineStatus(desktopInfo?.chromium_version)}</span></div>
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.chromium')}</span><span class="settings-row-desc">{browserEngineStatus(desktopInfo?.chromium_version)}</span></div>
             <code>{versionText(desktopInfo?.chromium_version)}</code>
           </div>
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.daemon')}</strong><span>{componentStatus(desktopInfo?.daemon.status)}</span></div>
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.daemon')}</span><span class="settings-row-desc">{componentStatus(desktopInfo?.daemon.status)}</span></div>
             <code>{versionText(desktopInfo?.daemon.version)}</code>
           </div>
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.automationWorker')}</strong><span>{componentStatus(desktopInfo?.worker.status)}</span></div>
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.automationWorker')}</span><span class="settings-row-desc">{componentStatus(desktopInfo?.worker.status)}</span></div>
             <code>{versionText(desktopInfo?.worker.version)}</code>
           </div>
-          <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.protocol')}</strong><span>{protocolComponentStatus()}</span></div>
+          <div class="settings-row">
+          <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('settings.browser.component.protocol')}</span><span class="settings-row-desc">{protocolComponentStatus()}</span></div>
             <code>{desktopInfo ? protocolVersion() : i18n.t('settings.browser.versionUnavailable')}</code>
           </div>
         </div>
         {#if desktopInfo?.error}
-          <div class="status-message status-message--error" role="status" aria-live="assertive">
+          <div class="settings-notice settings-notice--error" role="status" aria-live="assertive">
             <Icon name="alert-circle" size={14} />
             <span>{desktopInfo.error.target}: <code>{desktopInfo.error.message}</code></span>
           </div>
@@ -642,47 +638,49 @@
       </section>
 
       <section class="settings-section desktop-actions" aria-labelledby="browser-actions-title">
-        <div class="section-heading">
+        <div class="settings-section-header">
           <div>
-            <h3 id="browser-actions-title">{i18n.t('settings.browser.actionsTitle')}</h3>
-            <p>{i18n.t('settings.browser.actionsDescription')}</p>
+            <div class="settings-section-title" id="browser-actions-title">{i18n.t('settings.browser.actionsTitle')}</div>
+            <div class="settings-section-desc">{i18n.t('settings.browser.actionsDescription')}</div>
           </div>
         </div>
 
-        <div class="action-list">
-          <div class="action-row">
-            <div>
-              <strong>{i18n.t('settings.browser.restartAutomation')}</strong>
-              <span>{i18n.t('settings.browser.restartAutomationDescription')}</span>
+        <div class="settings-rows">
+          <div class="settings-row">
+          <div class="settings-row-copy">
+              <span class="settings-row-title">{i18n.t('settings.browser.restartAutomation')}</span>
+              <span class="settings-row-desc">{i18n.t('settings.browser.restartAutomationDescription')}</span>
             </div>
             <button
               type="button"
+              class="btn btn--secondary btn--sm"
               onclick={() => void runDesktopAction('restart-automation')}
               disabled={componentActionDisabled('restart-automation')}
               aria-busy={activeAction === 'restart-automation'}
             >{actionLabel('restart-automation')}</button>
           </div>
-          <div class="action-row">
-            <div>
-              <strong>{i18n.t('settings.browser.clearData')}</strong>
-              <span>{i18n.t('settings.browser.clearDataDescription')}</span>
+          <div class="settings-row">
+          <div class="settings-row-copy">
+              <span class="settings-row-title">{i18n.t('settings.browser.clearData')}</span>
+              <span class="settings-row-desc">{i18n.t('settings.browser.clearDataDescription')}</span>
             </div>
             <button
               type="button"
-              class="danger"
+              class="btn btn--error btn--sm"
               onclick={() => void runDesktopAction('clear-data')}
               disabled={componentActionDisabled('clear-data')}
               aria-busy={activeAction === 'clear-data'}
             >{actionLabel('clear-data')}</button>
           </div>
-          <div class="action-row">
-            <div>
-              <strong>{i18n.t('settings.browser.checkDesktopUpdates')}</strong>
-              <span>{i18n.t('settings.browser.checkDesktopUpdatesDescription')}</span>
-              <small>{updateStatusText()}</small>
+          <div class="settings-row">
+          <div class="settings-row-copy">
+              <span class="settings-row-title">{i18n.t('settings.browser.checkDesktopUpdates')}</span>
+              <span class="settings-row-desc">{i18n.t('settings.browser.checkDesktopUpdatesDescription')}</span>
+              <span class="settings-row-desc">{updateStatusText()}</span>
             </div>
             <button
               type="button"
+              class="btn btn--secondary btn--sm"
               onclick={() => void runDesktopAction('check-updates')}
               disabled={componentActionDisabled('check-updates')}
               aria-busy={activeAction === 'check-updates'}
@@ -691,12 +689,12 @@
         </div>
 
         {#if desktopError}
-          <div class="status-message status-message--error" role="status" aria-live="assertive">
+          <div class="settings-notice settings-notice--error" role="status" aria-live="assertive">
             <Icon name="alert-circle" size={14} />
             <span>{i18n.t('settings.browser.actionFailed')}: <code>{desktopError}</code></span>
           </div>
         {:else if actionNotice}
-          <div class="status-message status-message--success" role="status" aria-live="polite">
+          <div class="settings-notice settings-notice--success" role="status" aria-live="polite">
             <Icon name="check-circle" size={14} />
             <span>{actionNotice}</span>
           </div>
@@ -704,203 +702,18 @@
       </section>
     {:else}
       <section class="settings-section desktop-unavailable" aria-labelledby="browser-desktop-unavailable-title">
-        <div class="section-icon" aria-hidden="true"><Icon name="globe" size={18} /></div>
         <div>
-          <h3 id="browser-desktop-unavailable-title">{i18n.t('settings.browser.webUnavailableTitle')}</h3>
-          <p>{i18n.t('settings.browser.webUnavailableDescription')}</p>
+          <div class="settings-section-title" id="browser-desktop-unavailable-title">{i18n.t('settings.browser.webUnavailableTitle')}</div>
+          <div class="settings-section-desc">{i18n.t('settings.browser.webUnavailableDescription')}</div>
         </div>
       </section>
     {/if}
 
   </div>
-</div>
 
 <style>
-  .browser-settings-tab {
-    padding: 28px clamp(24px, 5vw, 64px) 42px;
-    box-sizing: border-box;
-  }
-
-  .browser-settings-content {
-    width: min(100%, 720px);
-    margin: 0 auto;
-  }
-
-  .settings-section {
-    padding: 0 2px 26px;
-  }
-
-  /* 分区之间的间距由容器统一给：其中有来自子组件的分区（网页模型），
-     组件内的相邻选择器跨不过组件边界，会让紧随其后的分区丢掉上边距。 */
-  .browser-settings-content > :global(.settings-section + .settings-section) {
-    padding-top: 26px;
-    border-top: 1px solid var(--ind-border-separator);
-  }
-
-  .section-heading,
-  .capability-row,
-  .component-row,
-  .action-row,
-  .desktop-unavailable {
-    display: flex;
-    align-items: center;
-  }
-
-  .section-heading {
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-
-  .section-heading > div:not(.section-icon),
-  .capability-row > div,
-  .component-row > div,
-  .action-row > div,
-  .desktop-unavailable > div:last-child {
-    min-width: 0;
-    flex: 1;
-  }
-
-  h3 {
-    margin: 0;
-    color: var(--ind-foreground);
-    font-size: 14px;
-    font-weight: 650;
-    letter-spacing: 0;
-  }
-
-  p {
-    margin: 5px 0 0;
-    color: var(--ind-foreground-secondary);
-    font-size: 12px;
-    line-height: 1.55;
-  }
-
-  .capability-list,
-  .component-list,
-  .action-list {
-    border-top: 1px solid var(--ind-border-separator);
-  }
-
-  .capability-row,
-  .component-row,
-  .action-row {
-    gap: 20px;
-    border-bottom: 1px solid var(--ind-border-separator);
-  }
-
-  .capability-row { min-height: 58px; }
-  .component-row { min-height: 48px; }
-  .action-row { min-height: 66px; }
-
-  .capability-row strong,
-  .capability-row span,
-  .component-row strong,
-  .component-row span,
-  .action-row strong,
-  .action-row span,
-  .action-row small {
-    display: block;
-  }
-
-  .capability-row strong,
-  .component-row strong,
-  .action-row strong {
-    color: var(--ind-foreground);
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .capability-row span,
-  .component-row span,
-  .action-row span,
-  .action-row small {
-    margin-top: 4px;
-    color: var(--ind-foreground-secondary);
-    font-size: 11px;
-    line-height: 1.45;
-  }
-
-  .action-row small {
-    color: var(--ind-foreground-muted);
-  }
-
-  .component-row code {
-    max-width: 50%;
-    overflow-wrap: anywhere;
-    color: var(--ind-foreground);
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 12px;
-    text-align: right;
-  }
-
-  .section-icon {
-    width: 34px;
-    height: 34px;
-    display: grid;
-    flex: 0 0 auto;
-    place-items: center;
-    border: 1px solid var(--ind-border-control);
-    border-radius: 8px;
-    color: var(--ind-tab-accent);
-    background: var(--ind-bg-control);
-  }
-
-  .resource-summary {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 12px 0;
-    border-top: 1px solid var(--ind-border-separator);
-    border-bottom: 1px solid var(--ind-border-separator);
-  }
-
-  .resource-summary-copy {
-    min-width: 0;
-    flex: 1;
-  }
-
-  .resource-summary-copy strong,
-  .resource-summary-copy span {
-    display: block;
-  }
-
-  .resource-summary-copy strong {
-    color: var(--ind-foreground);
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .resource-summary-copy span {
-    margin-top: 4px;
-    color: var(--ind-foreground-secondary);
-    font-size: 11px;
-    line-height: 1.45;
-  }
-
-  .resource-manage-button,
-  .resource-text-button,
-  .resource-reclaim-button {
-    cursor: pointer;
-  }
-
-  .resource-manage-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    flex: 0 0 auto;
-    min-height: 29px;
-    padding: 0 10px;
-    border: 1px solid var(--ind-border-control);
-    border-radius: 6px;
-    color: var(--ind-foreground);
-    background: var(--ind-bg-control);
-    font-size: 12px;
-  }
-
-  .resource-manager {
-    padding-top: 12px;
-  }
-
+  /* 视觉来自 settings.css 的共享类与全局 .btn；这里只保留“页面回收管理器”特有的布局。 */
+  .resource-manager { padding-top: 12px; }
   .resource-manager-toolbar,
   .resource-manager-footer {
     display: flex;
@@ -908,61 +721,35 @@
     justify-content: space-between;
     gap: 12px;
   }
-
-  .resource-manager-toolbar {
-    color: var(--ind-foreground-muted);
-    font-size: 11px;
-  }
-
-  .resource-manager-toolbar > div {
-    display: inline-flex;
-    gap: 10px;
-  }
-
-  .resource-text-button {
+  .resource-manager-toolbar { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .resource-manager-toolbar > div { display: inline-flex; gap: 10px; }
+  .plugin-link-btn {
     padding: 0;
     border: 0;
-    color: var(--ind-tab-accent);
+    color: var(--primary);
     background: transparent;
-    font-size: 11px;
+    font-size: var(--text-xs);
+    cursor: pointer;
   }
-
-  .resource-text-button:disabled {
-    cursor: default;
-    opacity: 0.42;
-  }
-
+  .plugin-link-btn:disabled { cursor: default; opacity: 0.42; }
   .resource-list {
     max-height: 280px;
     margin-top: 8px;
     overflow: auto;
-    border-top: 1px solid var(--ind-border-separator);
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-top: 1px solid var(--border-subtle);
+    border-bottom: 1px solid var(--border-subtle);
   }
-
   .resource-row {
     display: flex;
     align-items: center;
     gap: 10px;
     min-height: 52px;
     padding: 7px 2px;
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-bottom: 1px solid var(--border-subtle);
   }
-
   .resource-row:last-child { border-bottom: 0; }
-
-  .resource-row input {
-    flex: 0 0 auto;
-    width: 14px;
-    height: 14px;
-    accent-color: var(--ind-tab-accent);
-  }
-
-  .resource-row-copy {
-    min-width: 0;
-    flex: 1;
-  }
-
+  .resource-row input { flex: 0 0 auto; width: 14px; height: 14px; accent-color: var(--primary); }
+  .resource-row-copy { min-width: 0; flex: 1; }
   .resource-row-copy strong,
   .resource-row-copy span,
   .resource-row-copy small {
@@ -971,152 +758,31 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
-  .resource-row-copy strong {
-    color: var(--ind-foreground);
-    font-size: 11px;
-    font-weight: 600;
-  }
-
-  .resource-row-copy .resource-page {
-    margin-top: 2px;
-    color: var(--ind-foreground-secondary);
-    font-size: 11px;
-  }
-
+  .resource-row-copy strong { color: var(--foreground); font-size: var(--text-xs); font-weight: 600; }
+  .resource-row-copy .resource-page { margin-top: 2px; color: var(--foreground-muted); font-size: var(--text-xs); }
   .resource-row-copy small {
     margin-top: 2px;
-    color: var(--ind-foreground-muted);
+    color: var(--foreground-muted);
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
     font-size: 10px;
   }
-
-  .resource-row-status {
-    flex: 0 0 auto;
-    max-width: 104px;
-    color: var(--ind-foreground-muted);
-    font-size: 10px;
-    text-align: right;
-  }
-
-  .resource-row-status--ready {
-    color: var(--ind-tab-accent);
-  }
-
-  .resource-manager-footer {
-    align-items: flex-start;
-    padding-top: 10px;
-  }
-
-  .resource-manager-footer > span {
-    max-width: 64%;
-    color: var(--ind-foreground-muted);
-    font-size: 10px;
-    line-height: 1.45;
-  }
-
-  .resource-reclaim-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    flex: 0 0 auto;
-    min-height: 29px;
-    padding: 0 10px;
-    border: 1px solid color-mix(in srgb, var(--danger, #c53f4f) 42%, var(--ind-border-control));
-    border-radius: 6px;
-    color: var(--danger, #c53f4f);
-    background: transparent;
-    font-size: 11px;
-  }
-
-  .resource-reclaim-button:disabled {
-    cursor: default;
-    opacity: 0.42;
-  }
-
+  .resource-row-status { flex: 0 0 auto; max-width: 104px; color: var(--foreground-muted); font-size: 10px; text-align: right; }
+  .resource-row-status--ready { color: var(--primary); }
+  .resource-manager-footer { align-items: flex-start; padding-top: 10px; }
+  .resource-manager-footer > span { max-width: 64%; color: var(--foreground-muted); font-size: 10px; line-height: 1.45; }
   .resource-empty {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 7px;
     min-height: 74px;
-    color: var(--ind-foreground-muted);
-    font-size: 11px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
   }
-
-  .resource-empty :global(svg) {
-    animation: browser-components-refresh-spin 0.9s linear infinite;
-  }
-
-  .icon-action,
-  .action-row button {
-    border: 1px solid var(--ind-border-control);
-    border-radius: 6px;
-    color: var(--ind-foreground);
-    background: var(--ind-bg-control);
-    cursor: pointer;
-  }
-
-  .icon-action {
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    display: inline-grid;
-    place-items: center;
-  }
-
-  .action-row button {
-    min-width: 82px;
-    min-height: 29px;
-    padding: 0 10px;
-    font-size: 12px;
-  }
-
-  .action-row button.danger:not(:disabled) {
-    color: var(--danger, #c53f4f);
-  }
-
-  button:disabled {
-    cursor: default;
-    opacity: 0.42;
-  }
-
-  .icon-action--loading :global(svg) {
-    animation: browser-components-refresh-spin 0.9s linear infinite;
-  }
-
-  @keyframes browser-components-refresh-spin {
-    to { transform: rotate(360deg); }
-  }
-
-  .status-message {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 14px;
-    font-size: 12px;
-  }
-
-  .status-message code {
-    overflow-wrap: anywhere;
-    font-size: 11px;
-  }
-
-  .status-message--error { color: var(--danger, #c53f4f); }
-  .status-message--success { color: var(--success, #2f9e63); }
-
-  .desktop-unavailable {
-    gap: 12px;
-  }
-
+  .resource-empty :global(svg),
+  .refreshing :global(svg) { animation: browser-components-refresh-spin 0.9s linear infinite; }
+  @keyframes browser-components-refresh-spin { to { transform: rotate(360deg); } }
   @media (max-width: 560px) {
-    .browser-settings-tab { padding-inline: 18px; }
-    .section-heading { align-items: flex-start; }
-    .component-row code { max-width: 42%; }
-    .action-row { align-items: flex-start; padding: 12px 0; }
-    .resource-summary { align-items: flex-start; }
-    .resource-summary { flex-direction: column; }
-    .resource-manage-button { align-self: flex-start; }
     .resource-manager-footer { flex-direction: column; }
     .resource-manager-footer > span { max-width: none; }
   }

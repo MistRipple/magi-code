@@ -8,7 +8,7 @@
  *   node scripts/verify-mcp-server.mjs --base http://127.0.0.1:38199 \
  *     --mcp-bin target/debug/magi-mcp [--keep]
  *
- * 覆盖：注册工作区 → 启用服务 → 创建令牌 → HTTP 与 stdio 两条链路的
+ * 覆盖：注册工作区 → 安装并激活 MCP 服务插件 → 启用服务 → 创建令牌 → HTTP 与 stdio 两条链路的
  * initialize / tools/list / 只读调用 / 越界拒绝 / 写入审批（允许、拒绝、超时）/ 变更列表 / 吊销。
  */
 import { spawn } from 'node:child_process';
@@ -89,6 +89,16 @@ try {
   const registered = await api('POST', '/api/workspaces/register', { path: workspaceDir });
   const workspaceId = registered.json?.workspaceId ?? registered.json?.workspace?.workspaceId;
   check('注册工作区', registered.status === 200 && !!workspaceId, registered.text);
+
+  // MCP 服务是第一方插件壳：安装并在应用作用域激活后管理面才可用。
+  const pluginId = 'magi.mcp-server';
+  const installed = await api('POST', `/api/plugins/bundled/${pluginId}/install`, {});
+  const manifest = installed.json?.plugins?.find((entry) => entry.manifest.id === pluginId)?.manifest;
+  check('安装 MCP 服务插件', installed.status === 200 && !!manifest, installed.text);
+  await api('POST', `/api/plugins/${pluginId}/enable`, { scope: 'application' });
+  await api('POST', `/api/plugins/${pluginId}/authorize`, { scope: 'application', grants: manifest?.permissions ?? [] });
+  const activated = await api('POST', `/api/plugins/${pluginId}/activate`, { scope: 'application' });
+  check('激活 MCP 服务插件', activated.status === 200, activated.text);
 
   const enabled = await api('POST', '/api/mcp-server/enabled', { enabled: true });
   check('启用 MCP 服务并得到固定端口', enabled.json?.running === true && !!enabled.json?.port, enabled.text);

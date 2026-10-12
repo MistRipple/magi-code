@@ -13,6 +13,8 @@
   } from '../lib/conversation-runtime-records';
   import MessageList from './MessageList.svelte';
   import ConversationApprovalTray from './ConversationApprovalTray.svelte';
+  import ExternalSessionBar from './ExternalSessionBar.svelte';
+  import { isExternalSessionId } from '../stores/external-sessions.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
   import ActiveAgentCenter from './ActiveAgentCenter.svelte';
@@ -111,8 +113,12 @@
     <ConversationApprovalTray approvals={unanchoredApprovals} />
   </div>
 
-  <!-- 输入区域 -->
-  <InputArea />
+  <!-- 输入区域：外部会话只读，这里换成来源提示和待确认 -->
+  {#if isExternalSessionId(messagesState.currentSessionId)}
+    <ExternalSessionBar />
+  {:else}
+    <InputArea />
+  {/if}
 </div>
 
 <style>

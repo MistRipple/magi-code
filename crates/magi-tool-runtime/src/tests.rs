@@ -10163,3 +10163,66 @@ fn file_read_ranges_preserve_line_numbers_utf8_and_full_content_version() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
+    use crate::{PluginToolCatalogEntry, PluginToolCatalogProvider, PluginToolExecutor};
+    let entry = |name: &str, read_only: bool| PluginToolCatalogEntry {
+        plugin_id: "acme.tools".into(),
+        contribution_id: name.into(),
+        model_tool_name: format!("plugin__acme.tools__{name}"),
+        title: name.into(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type": "object"}),
+        read_only,
+    };
+    let provider: PluginToolCatalogProvider =
+        Arc::new(move |_| vec![entry("read", true), entry("write", false)]);
+    let executor: PluginToolExecutor = Arc::new(|_, _, _| {
+        (
+            "{\"ran\":true}".to_string(),
+            ExecutionResultStatus::Succeeded,
+        )
+    });
+    let registry = make_registry().with_plugin_tools(provider, executor);
+    let context = test_workspace_context();
+    let call = |name: &str, profile| {
+        registry
+            .execute_plugin_tool(
+                &format!("plugin__acme.tools__{name}"),
+                "{}",
+                &context,
+                profile,
+            )
+            .expect("plugin tool is in the catalog")
+    };
+
+    let (_, status) = call("read", magi_core::AccessProfile::ReadOnly);
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+
+    let (payload, status) = call("write", magi_core::AccessProfile::Restricted);
+    assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["approval_resume_safe"], true,
+        "审批续跑合同要求回执声明可安全重放，否则授权后会被判为契约失败"
+    );
+
+    let (_, status) = call("write", magi_core::AccessProfile::ReadOnly);
+    assert_eq!(status, ExecutionResultStatus::Rejected);
+    let (payload, status) = call("write", magi_core::AccessProfile::FullAccess);
+    assert_eq!(status, ExecutionResultStatus::Succeeded);
+    assert_eq!(payload, "{\"ran\":true}");
+
+    assert!(
+        registry
+            .execute_plugin_tool(
+                "plugin__other__tool",
+                "{}",
+                &context,
+                magi_core::AccessProfile::FullAccess
+            )
+            .is_none(),
+        "不在目录内的名称不属于插件工具"
+    );
+}

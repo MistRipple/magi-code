@@ -196,6 +196,15 @@ export interface BrowserNodeSelectionBounds {
   height: number;
 }
 
+export interface PluginSelection {
+  pluginId: string;
+  resourceId: string;
+  version: number;
+  label: string;
+  summary: string;
+  selection?: JsonValue | null;
+}
+
 export interface BrowserNodeSelection {
   tabId: string;
   surfaceId: string;
@@ -231,6 +240,8 @@ export interface TurnStartParams {
   goalMode?: boolean;
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  workflowId?: string | null;
+  pluginCommandId?: string | null;
   images?: Array<SessionTurnImage>;
   contextReferences?: Array<SessionContextReference>;
   browserAnnotationRefs?: Array<string>;
@@ -243,6 +254,7 @@ export interface TurnStartParams {
   steerCurrentTurn?: boolean;
   expectedTurnId?: string | null;
   replaceTurnId?: string | null;
+  pluginSelections?: Array<PluginSelection>;
 }
 
 export interface SessionSummary {
@@ -545,4 +557,197 @@ export type ServerNotification = JsonRpcServerNotification;
 
 export type ServerResponse = JsonRpcServerResponse;
 
+export type PluginScopeKind = "workspace" | "application";
+
+export type PluginPermissionKind = "storage" | "filesRead" | "filesWrite" | "network" | "tools" | "models" | "browser";
+
+export interface PluginPermission {
+  kind: PluginPermissionKind;
+  scope: PluginScopeKind;
+  targets: Array<string>;
+}
+
+export interface PluginToolContribution {
+  id: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+}
+
+export type PluginViewPlacement = "settings" | "home" | "main" | "rightPane" | "homeCard";
+
+export interface PluginViewContribution {
+  id: string;
+  title: string;
+  entry: string;
+  placements: Array<PluginViewPlacement>;
+}
+
+export type PluginSurfacePersistence = "persistent" | "ephemeral";
+
+export type PluginSurfaceCloseAction = "hide" | "destroy";
+
+export interface PluginBrowserSurfaceContribution {
+  id: string;
+  title: string;
+  description: string;
+  scope: PluginScopeKind;
+  persistence: PluginSurfacePersistence;
+  keepMounted: boolean;
+  closeAction: PluginSurfaceCloseAction;
+  backgroundInference: boolean;
+}
+
+export interface PluginNamedContribution {
+  id: string;
+  title: string;
+  description: string;
+}
+
+export interface PluginContributions {
+  tools?: Array<PluginToolContribution>;
+  commands?: Array<PluginNamedContribution>;
+  views?: Array<PluginViewContribution>;
+  workflows?: Array<PluginNamedContribution>;
+  engines?: Array<PluginNamedContribution>;
+  resources?: Array<PluginNamedContribution>;
+  browserSurfaces?: Array<PluginBrowserSurfaceContribution>;
+}
+
+export type PluginBackendEntry = "plugin.mjs";
+
+export interface PluginDataMigration {
+  fromVersions: Array<number>;
+}
+
+export interface PluginManifest {
+  sdkVersion: number;
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  backend: PluginBackendEntry;
+  permissions: Array<PluginPermission>;
+  contributions: PluginContributions;
+  settingsSchema: Record<string, unknown>;
+  dataSchemaVersion: number;
+  dataMigration?: PluginDataMigration;
+}
+
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
+
+export interface PluginScopeRequest {
+  scope: string;
+}
+
+export interface PluginAuthorizeRequest {
+  scope: string;
+  grants: Array<PluginPermission>;
+}
+
+export interface PluginInstallRequest {
+  source: string;
+  archiveBase64?: string;
+  expectedDigest?: string;
+}
+
+export type PluginCandidateOperation = "install" | "upgrade" | "unchanged";
+
+export interface PluginCandidatePreview {
+  manifest: PluginManifest;
+  digest: string;
+  operation: PluginCandidateOperation;
+  installedVersion?: string;
+  installedDigest?: string;
+  addedPermissions: Array<PluginPermission>;
+  removedPermissions: Array<PluginPermission>;
+  dataSchemaFrom?: number;
+  dataSchemaBlocked: boolean;
+  dataConversion: boolean;
+}
+
+export interface PluginScopeGrant {
+  scope: string;
+  permissions: Array<PluginPermission>;
+}
+
+export type PluginSourceKind = "center" | "address" | "local" | "builtin";
+
+export interface PluginSourceProjection {
+  kind: PluginSourceKind;
+  location: string;
+}
+
+export type PluginDrainPhase = "draining" | "cancelling";
+
+export interface PluginDrainingScope {
+  scope: string;
+  phase: PluginDrainPhase;
+  startedAtMs: number;
+  deadlineMs: number;
+}
+
+export interface PluginLifecycleLimits {
+  drainTimeoutMs: number;
+  cancelSettleTimeoutMs: number;
+}
+
+export interface PluginInstalled {
+  manifest: PluginManifest;
+  digest: string;
+  enabledScopes: Array<string>;
+  activeScopes: Array<string>;
+  grants: Array<PluginScopeGrant>;
+  source: PluginSourceProjection;
+  draining: Array<PluginDrainingScope>;
+}
+
+export interface PluginList {
+  plugins: Array<PluginInstalled>;
+  lifecycle: PluginLifecycleLimits;
+}
+
+export interface PluginCenterKey {
+  keyId: string;
+  publicKey: string;
+}
+
+export interface PluginCenterConfig {
+  url: string;
+  trustedKeys: Array<PluginCenterKey>;
+}
+
+export type PluginCenterEntryState = "available" | "updatable" | "installed";
+
+export interface PluginCenterEntry {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  size: number;
+  state: PluginCenterEntryState;
+  installedVersion?: string | null;
+}
+
+export interface PluginCenterProjection {
+  config: PluginCenterConfig;
+  entries: Array<PluginCenterEntry>;
+  verified: boolean;
+  error?: string | null;
+}
+
+export interface PluginCenterInstallRequest {
+  id: string;
+  version?: string | null;
+}
+
+export interface PluginResource {
+  version: number;
+  value: unknown;
+}
+
+export interface PluginResourceWriteRequest {
+  expectedVersion: number;
+  value: unknown;
+}

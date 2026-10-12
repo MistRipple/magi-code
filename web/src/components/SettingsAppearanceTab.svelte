@@ -319,65 +319,69 @@
   }
 </script>
 
-<div class="appearance-tab settings-tab-inner">
-  <div class="system-appearance-row locale-row">
-    <span class="system-appearance-icon" aria-hidden="true"><Icon name="globe" size={16} /></span>
-    <div class="system-appearance-copy">
-      <strong>{i18n.t('settings.locale.label')}</strong>
-      <span>{i18n.t('settings.locale.description')}</span>
+<div class="appearance-tab settings-frame">
+  <div class="settings-section">
+    <div class="settings-section-header">
+      <div>
+        <div class="settings-section-title">{i18n.t('settings.locale.label')}</div>
+        <div class="settings-section-desc">{i18n.t('settings.locale.description')}</div>
+      </div>
+      <div class="settings-section-actions">
+        <select
+          class="form-input locale-select"
+          aria-label={i18n.t('settings.locale.label')}
+          value={i18n.locale}
+          onchange={(event) => {
+            const code = event.currentTarget.value;
+            // 失败时界面语言没变，把下拉恢复成实际语言。
+            if (isSupportedLocale(code)) {
+              void switchLocale(code).then((ok) => { if (!ok) event.currentTarget.value = i18n.locale; });
+            }
+          }}
+        >
+          {#each LOCALES as locale (locale.code)}
+            <option value={locale.code} lang={locale.code}>{locale.nativeName}</option>
+          {/each}
+        </select>
+      </div>
     </div>
-    <select
-      class="form-input locale-select"
-      aria-label={i18n.t('settings.locale.label')}
-      value={i18n.locale}
-      onchange={(event) => {
-        const code = event.currentTarget.value;
-        // 失败时界面语言没变，把下拉恢复成实际语言。
-        if (isSupportedLocale(code)) {
-          void switchLocale(code).then((ok) => { if (!ok) event.currentTarget.value = i18n.locale; });
-        }
-      }}
-    >
-      {#each LOCALES as locale (locale.code)}
-        <option value={locale.code} lang={locale.code}>{locale.nativeName}</option>
-      {/each}
-    </select>
   </div>
 
-  <div class="appearance-toolbar">
-    <div>
-      <div class="toolbar-title">{i18n.t('appearance.libraryTitle')}</div>
-      <div class="toolbar-subtitle">{i18n.t('appearance.libraryDescription')}</div>
+  <div class="settings-section">
+    <div class="settings-section-header">
+      <div>
+        <div class="settings-section-title">{i18n.t('appearance.libraryTitle')}</div>
+        <div class="settings-section-desc">{i18n.t('appearance.libraryDescription')}</div>
+      </div>
+      <div class="settings-section-actions">
+        <input
+          bind:this={importInput}
+          class="sr-only"
+          type="file"
+          accept=".zip,.magi-theme.zip,application/zip"
+          onchange={handleImportChange}
+        />
+        <button class="btn btn--secondary btn--sm" type="button" onclick={() => importInput?.click()} disabled={Boolean(busyAction)}>
+          <Icon name="download" size={14} />
+          {i18n.t('appearance.import')}
+        </button>
+        <button class="btn btn--primary btn--sm" type="button" onclick={() => beginCreate()} disabled={!runtime.activeTheme || Boolean(busyAction)}>
+          <Icon name="plus" size={14} />
+          {i18n.t('appearance.create')}
+        </button>
+      </div>
     </div>
-    <div class="toolbar-actions">
-      <input
-        bind:this={importInput}
-        class="sr-only"
-        type="file"
-        accept=".zip,.magi-theme.zip,application/zip"
-        onchange={handleImportChange}
-      />
-      <button class="btn btn--secondary btn--sm" type="button" onclick={() => importInput?.click()} disabled={Boolean(busyAction)}>
-        <Icon name="download" size={14} />
-        {i18n.t('appearance.import')}
-      </button>
-      <button class="btn btn--primary btn--sm" type="button" onclick={() => beginCreate()} disabled={!runtime.activeTheme || Boolean(busyAction)}>
-        <Icon name="plus" size={14} />
-        {i18n.t('appearance.create')}
-      </button>
-    </div>
-  </div>
 
   {#if errorMessage && !editorOpen}
     <div class="inline-alert inline-alert--error" role="alert">{errorMessage}</div>
   {/if}
 
   {#if runtime.library}
-    <div class="system-appearance-row">
-      <span class="system-appearance-icon" aria-hidden="true"><Icon name="monitor" size={16} /></span>
-      <div class="system-appearance-copy">
-        <strong>{i18n.t('appearance.followSystem')}</strong>
-        <span>
+    <div class="settings-rows">
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('appearance.followSystem')}</span>
+        <span class="settings-row-desc">
           {i18n.t('appearance.followSystemDescription')}
           · {i18n.t('appearance.currentMode', { mode: i18n.t(`appearance.mode.${runtime.mode}`) })}
         </span>
@@ -388,6 +392,7 @@
         ariaLabel={i18n.t('appearance.followSystem')}
         onchange={(enabled) => void toggleSystemAppearance(enabled)}
       />
+    </div>
     </div>
   {/if}
 
@@ -455,6 +460,8 @@
     {/each}
   </div>
   {/if}
+
+  </div>
 
   {#if editorOpen && draft}
     <div class="editor-overlay" role="presentation">
@@ -563,20 +570,12 @@
 </div>
 
 <style>
-  .appearance-tab { position: relative; gap: 18px; padding: 2px 4px 20px; color: var(--foreground); }
-  .appearance-toolbar, .theme-card-body, .editor-header, .editor-footer, .wallpaper-heading, .toolbar-actions, .theme-actions, .wallpaper-actions { display: flex; align-items: center; }
-  .appearance-toolbar { justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-  .toolbar-title { font-size: var(--text-lg); font-weight: var(--font-semibold); }
-  .toolbar-subtitle { margin-top: 4px; color: var(--foreground-muted); font-size: var(--text-sm); }
-  .toolbar-actions, .theme-actions, .wallpaper-actions { gap: 8px; }
+  .appearance-tab { position: relative; color: var(--foreground); }
+  .theme-card-body, .editor-header, .editor-footer, .wallpaper-heading, .theme-actions, .wallpaper-actions { display: flex; align-items: center; }
+  .theme-actions, .wallpaper-actions { gap: 8px; }
   .locale-select { width: auto; min-width: 140px; }
-  .system-appearance-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 12px 2px; border-block: 1px solid var(--border-subtle); }
-  .system-appearance-icon { width: 32px; height: 32px; display: grid; place-items: center; border-radius: var(--radius-md); background: var(--primary-muted); color: var(--primary); }
-  .system-appearance-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-  .system-appearance-copy strong { font-size: var(--text-sm); }
-  .system-appearance-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); }
-  .theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; padding-bottom: 10px; }
-  .theme-card { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-1); }
+  .theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 16px; }
+  .theme-card { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); }
   .theme-card.active { border-color: color-mix(in srgb, var(--primary) 72%, var(--border)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent); }
   .theme-preview { position: relative; display: block; width: 100%; height: 104px; overflow: hidden; border: 0; border-bottom: 1px solid var(--border-subtle); cursor: pointer; }
   .preview-wallpaper { position: absolute; inset: -24px; background-repeat: no-repeat; background-size: cover; }

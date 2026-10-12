@@ -51,6 +51,14 @@ const WEB_MODEL_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WEB_MODEL_PROBE_PAGE_LOAD_RETRIES: usize = 40;
 const WEB_MODEL_PROBE_PAGE_LOAD_DELAY: Duration = Duration::from_millis(500);
 
+fn require_web_model_plugin(state: &ApiState) -> Result<(), ApiError> {
+    if state.web_model_plugin_active() {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("GPT Web 插件未安装或未激活".into()))
+    }
+}
+
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/browser/capabilities", get(capabilities))
@@ -1320,6 +1328,9 @@ struct CreateAppBrowserSessionResponse {
 async fn get_app_session(
     State(state): State<ApiState>,
 ) -> Result<Json<CurrentBrowserSessionResponse>, ApiError> {
+    if !state.web_model_plugin_active() {
+        return Ok(Json(CurrentBrowserSessionResponse { session: None }));
+    }
     let session = state
         .browser_authority
         .lock()
@@ -1344,6 +1355,7 @@ async fn create_app_session(
     headers: HeaderMap,
     Json(request): Json<CreateAppBrowserSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateAppBrowserSessionResponse>), ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let existing = state
         .browser_authority
@@ -1467,6 +1479,7 @@ async fn get_web_model_tunnel(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     Ok(Json(state.web_model.status()))
 }
@@ -1500,6 +1513,7 @@ async fn configure_web_model_tunnel(
     headers: HeaderMap,
     Json(request): Json<ConfigureWebModelTunnelRequest>,
 ) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     let config = if request.clear {
         None
@@ -1567,6 +1581,7 @@ async fn set_web_model_tool_policy(
     headers: HeaderMap,
     Json(request): Json<SetWebModelToolPolicyRequest>,
 ) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     let tool_profile = match request.tool_profile.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -1596,6 +1611,7 @@ async fn reveal_web_model_api_key(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     let api_key = state.web_model.reveal_api_key().ok_or_else(|| {
         ApiError::not_found("尚未保存运行时 API 密钥", "web-model-tunnel-api-key")
@@ -1618,6 +1634,7 @@ async fn navigate_web_model_page(
     headers: HeaderMap,
     Json(request): Json<NavigateWebModelPageRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     state
         .open_web_model_page(request.target)
@@ -1631,6 +1648,7 @@ async fn reload_web_model_page(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     state
         .reload_web_model_page()
@@ -1651,7 +1669,11 @@ async fn reset_web_models(
     // 清除登录态 / 页面数据也必须释放 daemon 内存中的单槽位，并取消在飞推理。
     state.forget_web_model_probe();
     state.stop_web_model().await;
-    state.web_model.stop_tunnel(&state).await;
+    state.web_model.stop_tunnel(&state).await.map_err(|error| {
+        ApiError::Conflict(format!(
+            "GPT Web 工具通道未能确认停止，已保留待清理状态，可重试：{error}"
+        ))
+    })?;
     Ok(Json(serde_json::json!({ "status": "login_required" })))
 }
 
@@ -1837,6 +1859,7 @@ async fn get_web_model_runtime(
     headers: HeaderMap,
     Query(query): Query<WebModelRuntimeQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, query.client_platform)?;
     let session_filter = query
         .session_id
@@ -1951,12 +1974,27 @@ async fn probe_web_model(
     headers: HeaderMap,
     Json(request): Json<ProbeWebModelRequest>,
 ) -> Result<Json<ProbeWebModelResponse>, ApiError> {
+    require_web_model_plugin(&state)?;
     let response = run_web_model_probe(&state, &headers, request.client_platform).await?;
     // 平台页面的探测不代表 ChatGPT 的可用性，不覆盖引擎可见性的结论。
     if response.status != "failed" && response.status != "platform_page" {
         state.record_web_model_probe(response.to_probe_snapshot());
     }
     Ok(Json(response))
+}
+
+async fn ensure_host_surface(
+    client: &magi_browser_authority::BrowserHostClient,
+    tab_id: &BrowserTabId,
+) -> Result<BrowserHostCommandResult, ApiError> {
+    require_host_success(
+        client
+            .request(BrowserHostCommand::EnsureSurface {
+                tab_id: tab_id.clone(),
+            })
+            .await,
+        "物化 GPT Web 宿主失败",
+    )
 }
 
 /// `POST /browser/web-models/ensure-home`：只物化应用级 GPT Web 宿主。
@@ -1971,6 +2009,7 @@ async fn ensure_web_model_home_surface(
     headers: HeaderMap,
     Json(request): Json<EnsureWebModelHomeRequest>,
 ) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     let client = require_browser_host(&state)?;
     let session = ensure_app_browser_session(&state)?;
@@ -1992,14 +2031,20 @@ async fn ensure_web_model_home_surface(
             .map_err(crate::web_model_ops::web_model_api_error)?;
     }
 
-    let result = require_host_success(
-        client
-            .request(BrowserHostCommand::EnsureSurface {
-                tab_id: tab_id.clone(),
-            })
-            .await,
-        "物化 GPT Web 宿主失败",
-    )?;
+    let result = match ensure_host_surface(&client, &tab_id).await {
+        // 首次使用：主页逻辑 Tab 刚建立，Desktop 里还没有任何物理 Surface，
+        // 与“挂起后恢复”是同一种缺失，必须走同一条恢复路径打开登录态主页，
+        // 否则 Renderer 会在一个永远不会出现的 Surface 上无限重试。
+        // 只在 Surface 根本不存在时恢复：已存在的页面（可能正在某个对话里）不会被导航。
+        Err(ApiError::Conflict(message)) if message.contains("browser_surface_not_found") => {
+            state
+                .restore_web_home_page()
+                .await
+                .map_err(crate::web_model_ops::web_model_api_error)?;
+            ensure_host_surface(&client, &tab_id).await?
+        }
+        other => other?,
+    };
     let BrowserHostCommandResult::SurfaceBinding(binding) = result else {
         return Err(ApiError::InternalAssemblyError(
             "物化 GPT Web 宿主结果缺少 Surface binding".to_string(),
@@ -4065,6 +4110,49 @@ mod tests {
         headers
     }
 
+    fn activate_gpt_web_plugin(state: &ApiState) {
+        let package =
+            crate::bundled_plugins::bundled_plugin_package(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .unwrap();
+        let permissions = package.manifest().permissions.clone();
+        let mut manager = state.plugin_manager.lock().unwrap();
+        manager
+            .install(
+                &package,
+                magi_plugin_system::PluginSource::Builtin {
+                    name: magi_web_model::WEB_MODEL_PLUGIN_ID.into(),
+                },
+            )
+            .unwrap();
+        manager
+            .authorize(
+                magi_web_model::WEB_MODEL_PLUGIN_ID,
+                "application",
+                permissions,
+            )
+            .unwrap();
+        manager
+            .enable(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+            .unwrap();
+        manager
+            .activate(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_browser_session_is_not_created_before_gpt_web_plugin_activation() {
+        let state = capability_test_state("browser-app-session-gated-test");
+        let headers = desktop_request_headers(&state);
+        let error = create_app_session(
+            State(state),
+            headers,
+            Json(CreateAppBrowserSessionRequest::default()),
+        )
+        .await
+        .expect_err("inactive GPT Web must reject app session creation");
+        assert!(matches!(error, ApiError::Forbidden(message) if message.contains("GPT Web 插件")));
+    }
+
     fn annotation_fixture() -> (ApiState, SessionId, SessionId, BrowserAnnotationId) {
         let state = ApiState::new(
             "browser-annotation-context-test",
@@ -5105,6 +5193,7 @@ mod tests {
     #[tokio::test]
     async fn app_browser_session_is_singleton_with_a_stable_id_and_home_tab() {
         let state = capability_test_state("browser-app-session-test");
+        activate_gpt_web_plugin(&state);
         state
             .mutate_browser_authority(|authority| {
                 authority.register_profile(BrowserProfile {
@@ -5158,6 +5247,7 @@ mod tests {
     #[tokio::test]
     async fn app_browser_session_sessions_are_not_visible_to_session_browser_routes() {
         let state = capability_test_state("browser-app-session-scope-test");
+        activate_gpt_web_plugin(&state);
         state
             .mutate_browser_authority(|authority| {
                 authority.register_profile(BrowserProfile {

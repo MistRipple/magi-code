@@ -8,6 +8,10 @@
   import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
   import ExternalApprovalTray from '../components/ExternalApprovalTray.svelte';
+  import ExternalSessionsSection from '../components/ExternalSessionsSection.svelte';
+  import { OPEN_EXTERNAL_SESSION_EVENT, isExternalSessionId, refreshExternalSessions } from '../stores/external-sessions.svelte';
+  import { externalApprovals } from '../stores/external-approvals.svelte';
+  import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
   import SidebarFooter from '../components/SidebarFooter.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
@@ -30,6 +34,7 @@
     getState,
     getUnreadNotificationCount,
     messagesState,
+    setCurrentTopTab,
     replaceWorkspaceSessionProjection,
     replacePersonalSessionProjection,
     updateWorkspaceSessionProjectionSessions,
@@ -398,6 +403,34 @@ import {
     });
   });
 
+  // 外部客户端会话（Magi MCP）：首次、以及插件注册表变化（激活、停用、窗口重新获得焦点）后读取；调用过程由事件驱动。
+  $effect(() => {
+    void pluginRegistryRevision();
+    void refreshExternalSessions();
+  });
+  /** 切换到外部会话，并回到「对话」标签：停在变更、知识或插件页时点外部会话也要看到它。 */
+  function openExternalSessionIn(workspace: AgentWorkspaceSummary, sessionId: string): void {
+    setCurrentTopTab('thread');
+    switchSession(workspace, sessionId);
+  }
+
+  // 设置页等地方请求打开某个外部会话：展开它所在的工作区并切换过去。
+  $effect(() => {
+    const open = (event: Event) => {
+      const session = (event as CustomEvent<{ session?: { sessionId: string; workspaceId: string | null } }>).detail?.session;
+      const workspace = workspaces.find((candidate) => candidate.workspaceId === session?.workspaceId);
+      if (!session || !workspace) return;
+      expandedWorkspaceIds = { ...expandedWorkspaceIds, [workspace.workspaceId]: true };
+      openExternalSessionIn(workspace, session.sessionId);
+    };
+    window.addEventListener(OPEN_EXTERNAL_SESSION_EVENT, open);
+    return () => window.removeEventListener(OPEN_EXTERNAL_SESSION_EVENT, open);
+  });
+  /** 该工作区下等待在 Magi 里确认的外部调用数；工作区折叠时用来提示。 */
+  function externalAwaitingCount(workspaceId: string): number {
+    return externalApprovals.approvals.filter((approval) => approval.workspaceId === workspaceId).length;
+  }
+
   $effect(() => {
     const sessions = messagesState.personalSessionProjection.sessions;
     if (sessions.length !== recentSessions.length || sessions.some((session, index) => recentSessions[index]?.id !== session.id || recentSessions[index]?.updatedAt !== session.updatedAt)) {
@@ -560,7 +593,7 @@ import {
         browser,
       };
     }
-    if (activeTab.kind === 'webSession') {
+    if (activeTab.kind === 'webSession' || activeTab.kind === 'plugin') {
       // 防御分支：应用级视图不应出现在 perSession 容器里。
       return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
     }
@@ -1183,6 +1216,8 @@ import {
   }
 
   function isInternalSession(session: Session): boolean {
+    // 外部会话（外部 MCP 客户端）有自己的入口，不作为普通会话行出现；打开它时 bootstrap 会把它带进当前会话。
+    if (isExternalSessionId(session.id)) return true;
     const name = (session.name || '').trim();
     const preview = (session.preview || '').trim();
     return INTERNAL_SESSION_NAME_PATTERNS.some((pattern) => pattern.test(name))
@@ -3316,6 +3351,9 @@ import {
                     </span>
                     <Icon name="folder" size={12} class="workspace-folder-icon" />
                     <span class="workspace-name">{workspace.name}</span>
+                    {#if externalAwaitingCount(workspace.workspaceId) > 0}
+                      <span class="workspace-attention" data-testid="workspace-external-attention" title={i18n.t('externalSession.awaitingShort', { count: externalAwaitingCount(workspace.workspaceId) })} aria-hidden="true"></span>
+                    {/if}
                   </button>
                   <button
                     type="button"
@@ -3467,6 +3505,11 @@ import {
                       </div>
                     {/if}
                     <UnavailableSessionList sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []} />
+                    <ExternalSessionsSection
+                      workspaceId={workspace.workspaceId}
+                      currentSessionId={currentSessionId ?? ''}
+                      onOpen={(session) => openExternalSessionIn(workspace, session.sessionId)}
+                    />
                   </div>
                 {/if}
               </div>
@@ -4481,6 +4524,14 @@ import {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .workspace-attention {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--warning);
   }
 
   .workspace-children {

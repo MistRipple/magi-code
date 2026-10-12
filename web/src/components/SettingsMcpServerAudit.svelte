@@ -9,6 +9,8 @@
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
+  import { closeSettings } from '../stores/shell-ui.svelte';
+  import { externalSessions, openExternalSession, refreshExternalSessions } from '../stores/external-sessions.svelte';
   import {
     clearMcpServerAudit,
     listMcpServerAudit,
@@ -56,6 +58,18 @@
     }
   }
 
+  /** 选中的客户端有外部会话时，可以直接去看它的调用过程。 */
+  const hasSession = $derived(
+    filterTokenId !== '' && externalSessions.sessions.some((session) => session.tokenId === filterTokenId),
+  );
+
+  function viewSession(): void {
+    const session = externalSessions.sessions.find((item) => item.tokenId === filterTokenId);
+    if (!session) return;
+    closeSettings();
+    openExternalSession(session);
+  }
+
   function go(delta: number): void {
     offset = Math.max(0, Math.min((pageCount - 1) * PAGE_SIZE, offset + delta * PAGE_SIZE));
     void load();
@@ -74,6 +88,7 @@
     busy = true;
     try {
       const result = await clearMcpServerAudit(filterTokenId || undefined);
+      void refreshExternalSessions();
       addToast('success', i18n.t('mcpServer.audit.cleared', { count: String(result.removed) }));
       offset = 0;
       await load();
@@ -112,6 +127,8 @@
     <span class="meta" data-mcp-audit-total="1">{i18n.t('mcpServer.audit.total', { count: String(total) })}</span>
   </div>
 
+  <p class="meta">{i18n.t('mcpServer.audit.hint')}</p>
+
   <div class="audit-tools">
     <label class="field audit-filter">
       <span>{i18n.t('mcpServer.audit.filter')}</span>
@@ -123,6 +140,9 @@
       </select>
     </label>
     <div class="action-row">
+      {#if hasSession}
+        <button type="button" data-mcp-audit-view-session="1" onclick={viewSession}>{i18n.t('mcpServer.audit.viewSession')}</button>
+      {/if}
       <button type="button" disabled={busy} onclick={() => void load()}>{i18n.t('mcpServer.audit.refresh')}</button>
       <button type="button" class="danger" data-mcp-audit-clear="1" disabled={busy || total === 0} onclick={() => void clearRecords()}>
         {filterTokenId ? i18n.t('mcpServer.audit.clearClient') : i18n.t('mcpServer.audit.clearAll')}

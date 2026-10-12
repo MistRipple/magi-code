@@ -25,6 +25,7 @@
     type AgentSettingsBootstrapSnapshot,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
+  import type { PluginSelection } from '../shared/app-server-protocol.generated';
   import type { PickerWebEngineDto } from '../shared/rust-backend-types';
   import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
@@ -75,8 +76,11 @@
     resolveSlashTrigger,
     type ComposerAction,
     type ComposerSessionCommand,
+    type ComposerPluginCommandOption,
     type ComposerSkillOption,
+    type ComposerWorkflowOption,
   } from '../lib/composer-actions';
+  import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
     MAX_COMPOSER_IMAGE_BYTES,
@@ -120,15 +124,22 @@
     | 'screenshotArtifactId'
   >;
 
+  function pluginSelectionKey(selection: PluginSelection): string {
+    return `${selection.pluginId}/${selection.resourceId}@${selection.version}:${JSON.stringify(selection.selection ?? null)}`;
+  }
+
   interface ComposerSubmissionDraft {
     text: string;
     images: SelectedImage[];
     contextReferences: ComposerContextReference[];
     browserAnnotations: SelectedBrowserAnnotation[];
     browserNodeSelections: MessageBrowserNodeSelection[];
+    pluginSelections: PluginSelection[];
     goalMode: boolean;
     sessionCommand: ComposerSessionCommand | null;
     skill: SkillOption | null;
+    workflow: ComposerWorkflowOption | null;
+    pluginCommand: ComposerPluginCommandOption | null;
   }
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
@@ -191,9 +202,12 @@
   let selectedGoalMode = $state(false);
   let selectedSessionCommand = $state<ComposerSessionCommand | null>(null);
   let selectedSkill = $state<SkillOption | null>(null);
+  let selectedWorkflow = $state<ComposerWorkflowOption | null>(null);
+  let selectedPluginCommand = $state<ComposerPluginCommandOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
   let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
   let selectedBrowserNodeSelections = $state<MessageBrowserNodeSelection[]>([]);
+  let selectedPluginSelections = $state<PluginSelection[]>([]);
   let editingBrowserAnnotation = $state<SelectedBrowserAnnotation | null>(null);
   let editingBrowserAnnotationComment = $state('');
   let browserAnnotationSaving = $state(false);
@@ -291,7 +305,7 @@
     pickerWebEngines.find((engine) => engine.id === currentPickerEngineId) ?? null
   ));
   const currentSessionUsesWebEngine = $derived.by(() => (
-    currentPickerEngineId.trim().startsWith('chatgpt-web/')
+    currentPickerEngineId.trim().startsWith('plugin/openai.chatgpt-web/')
   ));
   const canSelectPickerWebEngine = $derived.by(() => (
     isDraftSession || !currentSessionHasCanonicalHistory || currentSessionUsesWebEngine
@@ -469,7 +483,8 @@
     return selectedImages.length > 0
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
-      || selectedBrowserNodeSelections.length > 0;
+      || selectedBrowserNodeSelections.length > 0
+      || selectedPluginSelections.length > 0;
   });
 
   // bootstrap 是全局缓存，新会话/设置变更都会同步更新这里，所以输入框可以直接派生。
@@ -496,12 +511,38 @@
     return out;
   });
 
+  // 命令与工作流入口只来自 daemon 的激活投影，并随插件注册表变化一起刷新。
+  const pluginScope = APPLICATION_PLUGIN_SCOPE;
+  $effect(() => {
+    trackPluginProjection(pluginScope);
+  });
+  const availableWorkflows = $derived<ComposerWorkflowOption[]>(
+    pluginProjection(pluginScope).workflows
+      .filter((entry) => entry.id.startsWith('plugin/'))
+      .map((entry) => ({ workflowId: entry.id, name: entry.title, description: entry.description })),
+  );
+  const availablePluginCommands = $derived<ComposerPluginCommandOption[]>(
+    pluginProjection(pluginScope).commands
+      .filter((entry) => entry.id.startsWith('plugin/'))
+      .map((entry) => ({ pluginCommandId: entry.id, name: entry.title, description: entry.description })),
+  );
+  // 已选入口失效（插件停用或工作区切换）时撤销选择，避免提交已不可用的身份。
+  $effect(() => {
+    if (!pluginProjection(pluginScope).loaded) return;
+    if (selectedWorkflow && !availableWorkflows.some((workflow) => workflow.workflowId === selectedWorkflow?.workflowId)) {
+      selectedWorkflow = null;
+    }
+    if (selectedPluginCommand && !availablePluginCommands.some((command) => command.pluginCommandId === selectedPluginCommand?.pluginCommandId)) {
+      selectedPluginCommand = null;
+    }
+  });
+
   // 压缩命令与附件互斥：草稿会话没有可压缩的历史，带附件时 daemon 会拒绝，这里提前说明而不是让它消失。
   const attachmentTotal = $derived(composerAttachmentTotal({
     images: selectedImages.length + pendingImageReadCount,
     contextReferences: selectedContextReferences.length,
     browserAnnotations: selectedBrowserAnnotations.length,
-    browserNodeSelections: selectedBrowserNodeSelections.length,
+    browserNodeSelections: selectedBrowserNodeSelections.length + selectedPluginSelections.length,
   }));
   const compactDisabledReason = $derived(sessionCommandDisabledReason({
     sessionCommandsAvailable: !isDraftSession,
@@ -524,7 +565,11 @@
         description: i18n.t('input.add.contextDescription'),
       },
     },
-    { sessionCommandDisabledReason: compactDisabledReason },
+    {
+      sessionCommandDisabledReason: compactDisabledReason,
+      workflows: availableWorkflows,
+      pluginCommands: availablePluginCommands,
+    },
   ));
 
   const filteredSlashCommands = $derived.by<Array<Exclude<ComposerAction, { kind: 'resource' }>>>(() => {
@@ -534,7 +579,11 @@
         ? !selectedGoalMode
         : command.kind === 'command'
           ? command.id !== selectedSessionCommand
-          : command.id !== selectedSkill?.skillId
+        : command.kind === 'skill'
+          ? command.id !== selectedSkill?.skillId
+          : command.kind === 'workflow'
+            ? command.id !== selectedWorkflow?.workflowId
+            : command.id !== selectedPluginCommand?.pluginCommandId
     ));
   });
 
@@ -564,9 +613,12 @@
     selectedContextReferences = [];
     selectedBrowserAnnotations = [];
     selectedBrowserNodeSelections = [];
+    selectedPluginSelections = [];
     selectedGoalMode = false;
     selectedSessionCommand = null;
     selectedSkill = null;
+    selectedWorkflow = null;
+    selectedPluginCommand = null;
     addMenuOpen = false;
     contextPickerOpen = false;
     invalidateEnhanceState();
@@ -580,9 +632,12 @@
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
+      || selectedPluginSelections.length > 0
       || selectedGoalMode
       || selectedSessionCommand !== null
-      || selectedSkill,
+      || selectedSkill
+      || selectedWorkflow
+      || selectedPluginCommand,
     );
   }
 
@@ -725,9 +780,12 @@
       contextReferences: selectedContextReferences.map((reference) => ({ ...reference })),
       browserAnnotations: selectedBrowserAnnotations.map((annotation) => ({ ...annotation })),
       browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
+      pluginSelections: selectedPluginSelections.map((selection) => ({ ...selection })),
       goalMode: selectedGoalMode,
       sessionCommand: selectedSessionCommand,
       skill: selectedSkill ? { ...selectedSkill } : null,
+      workflow: selectedWorkflow ? { ...selectedWorkflow } : null,
+      pluginCommand: selectedPluginCommand ? { ...selectedPluginCommand } : null,
     };
   }
 
@@ -738,9 +796,12 @@
       && selectedContextReferences.length === 0
       && selectedBrowserAnnotations.length === 0
       && selectedBrowserNodeSelections.length === 0
+      && selectedPluginSelections.length === 0
       && !selectedGoalMode
       && selectedSessionCommand === null
-      && selectedSkill === null;
+      && selectedSkill === null
+      && selectedWorkflow === null
+      && selectedPluginCommand === null;
   }
 
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
@@ -751,9 +812,12 @@
     selectedContextReferences = draft.contextReferences.map((reference) => ({ ...reference }));
     selectedBrowserAnnotations = draft.browserAnnotations.map((annotation) => ({ ...annotation }));
     selectedBrowserNodeSelections = draft.browserNodeSelections.map(cloneBrowserNodeSelection);
+    selectedPluginSelections = draft.pluginSelections.map((selection) => ({ ...selection }));
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = draft.sessionCommand;
     selectedSkill = draft.skill ? { ...draft.skill } : null;
+    selectedWorkflow = draft.workflow ? { ...draft.workflow } : null;
+    selectedPluginCommand = draft.pluginCommand ? { ...draft.pluginCommand } : null;
     queueMicrotask(focusEditor);
   }
 
@@ -768,9 +832,12 @@
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
       || selectedBrowserNodeSelections.length > 0
+      || selectedPluginSelections.length > 0
       || selectedGoalMode
       || selectedSessionCommand !== null
       || selectedSkill !== null
+      || selectedWorkflow !== null
+      || selectedPluginCommand !== null
       || editingTurn !== null,
     );
   });
@@ -809,11 +876,14 @@
       attributes: { ...selection.attributes },
       bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
     }));
+    selectedPluginSelections = [];
     selectedGoalMode = draft.goalMode;
     selectedSessionCommand = null;
     selectedSkill = draft.skillName
       ? (availableSkills.find((skill) => skill.skillId === draft.skillName) || null)
       : null;
+    selectedWorkflow = null;
+    selectedPluginCommand = null;
     queueMicrotask(focusEditor);
   });
 
@@ -940,14 +1010,16 @@
 
   // 压缩命令不能带附件：用户主动添加附件时让命令让位并说明，附件不丢。
   function dropSessionCommandForAttachment(): void {
-    if (selectedSessionCommand === null) return;
+    if (selectedSessionCommand === null && selectedPluginCommand === null) return;
     selectedSessionCommand = null;
+    if (selectedPluginCommand !== null) selectedPluginCommand = null;
     addToast('info', i18n.t('input.compact.removedForAttachment'), undefined, { forceVisible: true });
   }
 
   function activeModeLabel(): string | null {
     if (selectedGoalMode) return i18n.t('input.goalMode.name');
     if (selectedSessionCommand) return i18n.t('input.compact.name');
+    if (selectedPluginCommand) return selectedPluginCommand.name;
     if (selectedSkill) return selectedSkill.name;
     return null;
   }
@@ -1211,14 +1283,32 @@
       selectedGoalMode = true;
       selectedSessionCommand = null;
       selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
     } else if (command.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = command.id;
       selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
+    } else if (command.kind === 'workflow') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = command.workflow;
+      selectedPluginCommand = null;
+    } else if (command.kind === 'plugin-command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = command.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = command.skill;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
     }
     if (inputTextareaEl && slashTriggerStart !== null) {
       invalidateEnhanceState();
@@ -1268,14 +1358,34 @@
       selectedGoalMode = !selectedGoalMode;
       selectedSessionCommand = null;
       selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
     } else if (action.kind === 'command') {
       selectedGoalMode = false;
       selectedSessionCommand = selectedSessionCommand === action.id ? null : action.id;
       selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
+    } else if (action.kind === 'workflow') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = selectedWorkflow?.workflowId === action.workflow.workflowId ? null : action.workflow;
+      selectedPluginCommand = null;
+    } else if (action.kind === 'plugin-command') {
+      selectedGoalMode = false;
+      selectedSessionCommand = null;
+      selectedSkill = null;
+      selectedWorkflow = null;
+      selectedPluginCommand = selectedPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
+        ? null
+        : action.pluginCommand;
     } else {
       selectedGoalMode = false;
       selectedSessionCommand = null;
       selectedSkill = selectedSkill?.skillId === action.skill.skillId ? null : action.skill;
+      selectedWorkflow = null;
+      selectedPluginCommand = null;
     }
     closeAddMenu();
     queueMicrotask(focusEditor);
@@ -1514,6 +1624,34 @@
       selectedBrowserNodeSelections = [...selectedBrowserNodeSelections, cloneBrowserNodeSelection(selection)];
       queueMicrotask(focusEditor);
     }
+    function handlePluginSelectionAdded(event: Event) {
+      const detail = (event as CustomEvent<PluginSelection>).detail;
+      if (
+        !detail
+        || typeof detail.pluginId !== 'string' || !detail.pluginId.trim()
+        || typeof detail.resourceId !== 'string' || !detail.resourceId.trim()
+        || typeof detail.version !== 'number'
+        || typeof detail.label !== 'string' || !detail.label.trim()
+      ) return;
+      const key = pluginSelectionKey(detail);
+      if (selectedPluginSelections.some((item) => pluginSelectionKey(item) === key)) return;
+      if (selectedPluginSelections.length >= 8) {
+        addToast('warning', i18n.t('input.pluginSelection.limit'));
+        return;
+      }
+      dropSessionCommandForAttachment();
+      selectedPluginSelections = [...selectedPluginSelections, { ...detail }];
+      // 输入区只在“对话”标签里可见：从主内容区插件页面选中时，明确告知引用已加入。
+      if (messagesState.currentTopTab !== 'thread') {
+        addToast('info', i18n.t('input.pluginSelection.added', { label: detail.label }), undefined, { forceVisible: true });
+      }
+      queueMicrotask(focusEditor);
+    }
+    function handlePluginSelectionInvalidated(event: Event) {
+      const pluginId = (event as CustomEvent<{ pluginId?: unknown }>).detail?.pluginId;
+      if (typeof pluginId !== 'string') return;
+      selectedPluginSelections = selectedPluginSelections.filter((selection) => selection.pluginId !== pluginId);
+    }
     function handleBrowserNodeSelectionInvalidated(event: Event) {
       const detail = (event as CustomEvent<{
         browserSessionId?: unknown;
@@ -1603,6 +1741,8 @@
     window.addEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
     window.addEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
     window.addEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
+    window.addEventListener('magi:pluginSelectionAdded', handlePluginSelectionAdded as EventListener);
+    window.addEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
     window.addEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
@@ -1618,6 +1758,8 @@
       window.removeEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
       window.removeEventListener('magi:browserNodeSelected', handleBrowserNodeSelected as EventListener);
       window.removeEventListener('magi:browserNodeSelectionInvalidated', handleBrowserNodeSelectionInvalidated as EventListener);
+      window.removeEventListener('magi:pluginSelectionAdded', handlePluginSelectionAdded as EventListener);
+      window.removeEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
       window.removeEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
@@ -1695,7 +1837,7 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (
-        (!normalizedContent && selectedSessionCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0)
+        (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
@@ -1713,6 +1855,8 @@
               ? i18n.t('browser.annotation.context')
             : selectedBrowserNodeSelections.length > 0
               ? i18n.t('browser.nodeSelection.context')
+            : selectedPluginSelections.length > 0
+              ? i18n.t('input.pluginSelection.context')
             : null;
       const submissionLength = submissionText?.length ?? 0;
 
@@ -1745,6 +1889,8 @@
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
         command: selectedSessionCommand,
+        workflowId: selectedWorkflow?.workflowId ?? null,
+        pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
         followUpMode: !replaceTurnId && !isDraftSession && isSending ? 'queue' : undefined,
@@ -1756,6 +1902,7 @@
         contextReferences: toSessionContextReferencePayload(selectedContextReferences),
         browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
         browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
+        pluginSelections: selectedPluginSelections.map((selection) => ({ ...selection })),
       });
       if (!replaceTurnId) {
         clearComposerState();
@@ -1924,9 +2071,18 @@
       contextReferences: references,
       browserAnnotations: [],
       browserNodeSelections: (target.browserNodeSelections ?? []).map(cloneBrowserNodeSelection),
+      pluginSelections: (target.pluginSelections ?? []).map((selection) => ({ ...selection })),
       goalMode: target.goalMode === true,
       sessionCommand: target.command === 'compact' ? 'compact' : null,
       skill: restoredSkill,
+      workflow: target.workflowId
+        ? availableWorkflows.find((workflow) => workflow.workflowId === target.workflowId)
+          ?? { workflowId: target.workflowId, name: target.workflowId, description: '' }
+        : null,
+      pluginCommand: target.pluginCommandId
+        ? availablePluginCommands.find((command) => command.pluginCommandId === target.pluginCommandId)
+          ?? { pluginCommandId: target.pluginCommandId, name: target.pluginCommandId, description: '' }
+        : null,
     });
   }
 
@@ -2259,6 +2415,7 @@
       const payload = await fetchAgentModelList(
         (getOrchestratorConfigSnapshot() ?? {}) as Record<string, unknown>,
         'orch',
+        currentWorkspaceId,
       );
       pickerWebEngines = Array.isArray(payload.webEngines) ? payload.webEngines : [];
     } catch (error) {
@@ -2285,6 +2442,7 @@
         const payload = await fetchAgentModelList(
           orchestratorConfig as Record<string, unknown>,
           'orch',
+          currentWorkspaceId,
         );
         pickerModels = Array.isArray(payload.models) ? payload.models : [];
         // Web 引擎只来自 daemon 的可用性投影：未登录、未确认说明或
@@ -2381,7 +2539,7 @@
    *
    * 与选择 provider 模型的区别只有两点：
    * - 写入会话级 `engineId` 绑定；`model` 写引擎自身的族名（与 daemon 从
-   *   `chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
+   *   `plugin/openai.chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
    * - 强度收敛到该引擎 `efforts` 的取值域，不支持时落到引擎的第一个可用档位。
    */
   /**
@@ -2455,12 +2613,12 @@
     const wasDraft = !(currentSessionId?.trim());
     const sessionId = await materializeDraftSession();
     if (wasDraft) {
-      const engineId = currentPickerEngineId || 'chatgpt-web/default';
+      const engineId = currentPickerEngineId || 'plugin/openai.chatgpt-web/default';
       await saveAgentOrchestratorSessionConfig(
         withOrchestratorReasoningEffort(
           messagesState.draftOrchestratorSessionConfig,
           readOrchestratorReasoningEffort(),
-          { engineId, model: engineId.slice('chatgpt-web/'.length) },
+          { engineId, model: engineId.split('/').pop() || engineId },
         ),
         currentWebBinding(sessionId),
       );
@@ -2483,8 +2641,8 @@
       pickerOpen = false;
       return;
     }
-    const family = engineId.startsWith('chatgpt-web/')
-      ? engineId.slice('chatgpt-web/'.length)
+    const family = engineId.startsWith('plugin/openai.chatgpt-web/')
+      ? engineId.split('/').pop() || engineId
       : (engine.displayName || engineId);
     // 强度由网页自己选择，Magi 不改写会话的 reasoningEffort。
     const reasoningEffort = readOrchestratorReasoningEffort();
@@ -2746,7 +2904,7 @@
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedBrowserNodeSelections.length > 0 || selectedPluginSelections.length > 0 || selectedGoalMode || selectedSessionCommand || selectedSkill || selectedWorkflow || selectedPluginCommand}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -2802,6 +2960,21 @@
             </button>
           </span>
         {/each}
+        {#each selectedPluginSelections as selection, selectionIndex (pluginSelectionKey(selection))}
+          <span class="ia-reference-chip" data-testid="plugin-selection-chip" title={selection.summary || selection.label}>
+            <Icon name="settings" size={11} />
+            <span class="ia-reference-chip-label">{selection.label}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedPluginSelections = selectedPluginSelections.filter((_, index) => index !== selectionIndex); }}
+              title={i18n.t('input.pluginSelection.remove')}
+              aria-label={i18n.t('input.pluginSelection.remove')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/each}
         {#if selectedGoalMode}
           <span class="ia-reference-chip ia-reference-chip-goal" title={i18n.t('input.goalMode.description')}>
             <Icon name="infinity" size={11} />
@@ -2852,6 +3025,38 @@
             </button>
           </span>
         {/if}
+        {#if selectedWorkflow}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedWorkflow.description}>
+            <Icon name="settings" size={11} />
+            <span class="ia-reference-chip-label">/{selectedWorkflow.name}</span>
+            {#if selectedWorkflow.description}<span class="ia-reference-chip-desc">{selectedWorkflow.description}</span>{/if}
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedWorkflow = null; queueMicrotask(focusEditor); }}
+              title={i18n.t('input.removeWorkflow')}
+              aria-label={i18n.t('input.removeWorkflow')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
+        {#if selectedPluginCommand}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={selectedPluginCommand.description}>
+            <Icon name="tool" size={11} />
+            <span class="ia-reference-chip-label">/{selectedPluginCommand.name}</span>
+            {#if selectedPluginCommand.description}<span class="ia-reference-chip-desc">{selectedPluginCommand.description}</span>{/if}
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedPluginCommand = null; queueMicrotask(focusEditor); }}
+              title={i18n.t('input.removePluginCommand')}
+              aria-label={i18n.t('input.removePluginCommand')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
       </div>
     {/if}
 
@@ -2895,6 +3100,10 @@
           ? i18n.t('input.placeholderWithCompact')
         : selectedSkill
           ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
+        : selectedWorkflow
+          ? i18n.t('input.placeholderWithWorkflow', { workflowName: selectedWorkflow.name })
+        : selectedPluginCommand
+          ? i18n.t('input.placeholderWithPluginCommand', { commandName: selectedPluginCommand.name })
         : selectedImages.length > 0
           ? i18n.t('input.placeholderWithImages')
         : selectedContextReferences.length > 0
@@ -2920,7 +3129,11 @@
                   ? i18n.t('input.slash.modeGroup')
                   : command.kind === 'command'
                     ? i18n.t('input.slash.commandGroup')
-                    : i18n.t('input.slash.skillGroup')}
+                  : command.kind === 'workflow'
+                      ? i18n.t('input.slash.workflowGroup')
+                      : command.kind === 'plugin-command'
+                        ? i18n.t('input.slash.pluginCommandGroup')
+                        : i18n.t('input.slash.skillGroup')}
               </div>
             {/if}
             <button
@@ -2935,7 +3148,7 @@
               onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
               <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
-                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : 'skill'} size={12} />
+                <Icon name={command.kind === 'goal' ? 'infinity' : command.kind === 'command' ? 'refresh' : command.kind === 'workflow' ? 'settings' : command.kind === 'plugin-command' ? 'tool' : 'skill'} size={12} />
               </span>
               <span class="ia-slash-item-content">
                 <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.kind === 'command' ? command.id : command.name}</span>
@@ -2980,7 +3193,11 @@
                         ? i18n.t('input.slash.modeGroup')
                         : action.kind === 'command'
                           ? i18n.t('input.slash.commandGroup')
-                          : i18n.t('input.slash.skillGroup')}
+                        : action.kind === 'workflow'
+                            ? i18n.t('input.slash.workflowGroup')
+                            : action.kind === 'plugin-command'
+                              ? i18n.t('input.slash.pluginCommandGroup')
+                              : i18n.t('input.slash.skillGroup')}
                   </div>
                 {/if}
                 <button
@@ -2994,7 +3211,11 @@
                       ? selectedSessionCommand === action.id
                     : action.kind === 'skill'
                       ? selectedSkill?.skillId === action.skill.skillId
-                      : false}
+                    : action.kind === 'workflow'
+                      ? selectedWorkflow?.workflowId === action.workflow.workflowId
+                      : action.kind === 'plugin-command'
+                        ? selectedPluginCommand?.pluginCommandId === action.pluginCommand.pluginCommandId
+                        : false}
                   onclick={() => applyAddMenuAction(action)}
                   role="menuitem"
                 >
@@ -3006,6 +3227,10 @@
                           ? 'infinity'
                           : action.kind === 'command'
                             ? 'refresh'
+                          : action.kind === 'workflow'
+                            ? 'settings'
+                            : action.kind === 'plugin-command'
+                              ? 'tool'
                           : 'skill'}
                       size={13}
                     />

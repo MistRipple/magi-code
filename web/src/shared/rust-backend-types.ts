@@ -2,6 +2,7 @@
 // Source of truth for all DTO types returned by the Rust daemon HTTP API.
 // Formerly maintained in support/frontend-contract/src/contracts.ts.
 
+import type { PluginSelection } from './app-server-protocol.generated';
 import type { ModelApiProtocol } from './types/agent-types';
 
 export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'System';
@@ -76,6 +77,7 @@ export interface SessionTurnRequestDto {
   }>;
   browserAnnotationRefs?: string[];
   browserNodeSelections?: SessionBrowserNodeSelectionDto[];
+  pluginSelections?: PluginSelection[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;
@@ -143,6 +145,8 @@ export interface QueuedSessionTurnDto {
   content: string;
   text?: string | null;
   command: 'compact' | null;
+  workflowId?: string | null;
+  pluginCommandId?: string | null;
   skillName?: string | null;
   goalMode: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
@@ -155,6 +159,7 @@ export interface QueuedSessionTurnDto {
   }>;
   browserAnnotationRefs: string[];
   browserNodeSelections: SessionBrowserNodeSelectionDto[];
+  pluginSelections: PluginSelection[];
   canGuide: boolean;
   retryCount: number;
 }
@@ -1264,7 +1269,7 @@ export interface AgentTemplateIdRequestDto {
 /**
  * 会话内主模型选择器里的 GPT Web 入口（daemon 投影，W18）。
  *
- * 登录后只有一个固定入口 `chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
+ * 登录后只有一个固定入口 `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单；未登录或探测失败时
  * 不出现。工具能力是可选增强：通道不可用时入口照常可用，`tools.available=false` 并说明缺什么。
  */
 export interface PickerWebEngineDto {
@@ -1290,6 +1295,7 @@ export interface FetchModelsResponseDto {
 export interface FetchModelsRequestDto {
   config: Record<string, unknown>;
   target: string;
+  workspaceId?: string;
 }
 
 export interface ExecutionStatsTotalsDto {

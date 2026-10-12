@@ -2,7 +2,7 @@ import { getDefaultAgentBaseUrl } from '../shared/agent-shared-config';
 import { getTransport } from '../shared/transport';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
-import type { SessionTurnCommand } from '../shared/app-server-protocol.generated';
+import type { PluginSelection, SessionTurnCommand } from '../shared/app-server-protocol.generated';
 import type {
   SettingsBootstrapPayload,
   SettingsBuiltinTool,
@@ -2511,6 +2511,8 @@ export async function submitSessionTurn(
     goalMode?: boolean;
     resume?: boolean;
     command?: SessionTurnCommand | null;
+    workflowId?: string | null;
+    pluginCommandId?: string | null;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
       kind: 'file' | 'directory';
@@ -2520,6 +2522,7 @@ export async function submitSessionTurn(
     }>;
     browserAnnotationRefs?: string[];
     browserNodeSelections?: MessageBrowserNodeSelection[];
+    pluginSelections?: PluginSelection[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
@@ -2547,6 +2550,8 @@ export async function submitSessionTurn(
         goalMode: payload.goalMode === true,
         resume: payload.resume === true,
         command: payload.command ?? null,
+        workflowId: payload.workflowId ?? null,
+        pluginCommandId: payload.pluginCommandId ?? null,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
@@ -2572,6 +2577,7 @@ export async function submitSessionTurn(
           attributes: { ...selection.attributes },
           bounds: selection.bounds ? { ...selection.bounds } : selection.bounds,
         })),
+        pluginSelections: (payload.pluginSelections ?? []).map((selection) => ({ ...selection })),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),
     });
@@ -3494,8 +3500,16 @@ export async function removeAgentRegistryBinding(templateId: string): Promise<Ag
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
-export async function fetchAgentModelList(config: Record<string, unknown>, target: string): Promise<FetchModelsResponseDto> {
-  return await postGlobalJson<FetchModelsResponseDto>('/api/settings/models/fetch', { config, target }, 'fetch model list');
+export async function fetchAgentModelList(
+  config: Record<string, unknown>,
+  target: string,
+  workspaceId?: string | null,
+): Promise<FetchModelsResponseDto> {
+  return await postGlobalJson<FetchModelsResponseDto>(
+    '/api/settings/models/fetch',
+    { config, target, ...(workspaceId?.trim() ? { workspaceId: workspaceId.trim() } : {}) },
+    'fetch model list',
+  );
 }
 
 export async function clearAgentProjectKnowledge(
@@ -4044,6 +4058,8 @@ export interface McpServerDirectStatus {
 }
 
 export interface McpServerStatus {
+  /** 外部会话的隐私与留存设置。 */
+  external: McpExternalRetention;
   enabled: boolean;
   running: boolean;
   port: number | null;
@@ -4106,6 +4122,8 @@ export interface McpServerApproval {
   tokenPrefix: string;
   workspaceId: string;
   toolName: string;
+  /** 对应调用的 id；SafetyGate 的补充确认带 `-safety` 后缀。 */
+  toolCallId: string;
   summary: string;
   requestedAtMs: number;
   expiresAtMs: number;
@@ -4306,6 +4324,34 @@ export function listMcpServerAudit(
     `/api/mcp-server/audit${suffix ? `?${suffix}` : ''}`,
     'load mcp server audit',
   );
+}
+
+/** 外部 MCP 客户端（一个令牌）的外部会话概要；会话本身是普通会话，调用过程在它的时间线里。 */
+export interface McpExternalSession {
+  tokenId: string;
+  sessionId: string;
+  clientName: string;
+  workspaceId: string | null;
+  lastActivityAtMs: number;
+  /** 在途调用数（含等待人工确认的）。 */
+  running: number;
+}
+
+export function listMcpExternalSessions(): Promise<{ sessions: McpExternalSession[] }> {
+  return mcpServerJson('/api/mcp-server/sessions', 'load mcp external sessions');
+}
+
+/** 外部会话的隐私与留存：是否保存调用内容，以及保留多少天（0 表示不自动清理）。 */
+export interface McpExternalRetention {
+  saveContent: boolean;
+  retentionDays: number;
+}
+
+export function setMcpExternalRetention(retention: McpExternalRetention): Promise<McpServerStatus> {
+  return mcpServerJson('/api/mcp-server/external', 'set mcp external retention', {
+    method: 'PUT',
+    body: retention,
+  });
 }
 
 /** 清理调用记录：带 tokenId 只清理该客户端的，否则清空全部。 */

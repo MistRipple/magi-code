@@ -22,8 +22,10 @@ use crate::{errors::ApiError, state::ApiState};
 const DEFAULT_TOKEN_TTL_DAYS: u32 = 90;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
-pub fn routes() -> Router<ApiState> {
-    Router::new()
+/// 管理面按插件门控：MCP 服务插件未安装或未激活时，开关、令牌、隧道、配置与审计都拒绝。
+/// 待确认列表不在此列——GPT Web 的槽位调用也经它审批，由 GPT Web 或 MCP 任一插件放行。
+pub fn routes(state: ApiState) -> Router<ApiState> {
+    let management = Router::new()
         .route("/mcp-server/status", get(get_status))
         .route("/mcp-server/enabled", post(set_enabled))
         .route("/mcp-server/network", post(set_network))
@@ -42,9 +44,45 @@ pub fn routes() -> Router<ApiState> {
         .route("/mcp-server/tokens/{token_id}/secret", get(view_secret))
         .route("/mcp-server/tokens/{token_id}/rotate", post(rotate_token))
         .route("/mcp-server/config-snippets", get(config_snippets))
+        .route("/mcp-server/audit", get(list_audit).delete(clear_audit))
+        .route("/mcp-server/sessions", get(list_sessions))
+        .route("/mcp-server/external", put(set_external_retention))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_mcp_plugin,
+        ));
+    let approvals = Router::new()
         .route("/mcp-server/approvals", get(list_approvals))
         .route("/mcp-server/approvals/resolve", post(resolve_approval))
-        .route("/mcp-server/audit", get(list_audit).delete(clear_audit))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            require_approval_plugin,
+        ));
+    management.merge(approvals)
+}
+
+async fn require_mcp_plugin(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    if !state.mcp_server_plugin_active() {
+        return Err(ApiError::Forbidden("MCP 服务插件未安装或未激活".into()));
+    }
+    Ok(next.run(request).await)
+}
+
+async fn require_approval_plugin(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    if !state.mcp_server_plugin_active() && !state.web_model_plugin_active() {
+        return Err(ApiError::Forbidden(
+            "MCP 服务与 GPT Web 插件均未激活，没有待确认的外部调用".into(),
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 fn require_local(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -768,6 +806,8 @@ struct ExternalApprovalDto {
     token_prefix: String,
     workspace_id: String,
     tool_name: String,
+    /// 对应调用的 id（`mcp-…`；SafetyGate 的补充确认带 `-safety` 后缀），界面据此把确认放回调用卡片上。
+    tool_call_id: String,
     /// 操作摘要（工具与路径），不含文件正文。
     summary: String,
     requested_at_ms: u64,
@@ -797,6 +837,7 @@ fn pending_external_approvals(state: &ApiState) -> Vec<ExternalApprovalDto> {
                 token_prefix: owner.token_prefix.clone(),
                 workspace_id: owner.workspace_id.clone(),
                 tool_name: pending.tool_name,
+                tool_call_id: pending.tool_call_id,
                 summary: pending.reason,
                 requested_at_ms: pending.requested_at.0,
                 expires_at_ms: pending.requested_at.0.saturating_add(
@@ -935,7 +976,105 @@ async fn clear_audit(
         .audit()
         .clear(query.token_id.as_deref())
         .map_err(|error| ApiError::internal_assembly("调用记录", error))?;
+    // 外部会话里的调用过程是同一批调用的详细内容，清理记录时一并清除（外部客户端再次调用会建立新会话）。
+    state
+        .mcp_service
+        .external_turns
+        .clear_sessions(&state, query.token_id.as_deref())
+        .await;
     Ok(Json(ClearAuditResponse { removed }))
+}
+
+/// 外部客户端（一个令牌）的外部会话。会话本身是普通会话，调用过程在它的 canonical 时间线里；
+/// 这里只给侧栏提供入口所需的概要。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalSessionDto {
+    token_id: String,
+    session_id: String,
+    client_name: String,
+    workspace_id: Option<String>,
+    last_activity_at_ms: u64,
+    /// 在途调用数（含等待人工确认的）。
+    running: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionsResponse {
+    sessions: Vec<ExternalSessionDto>,
+}
+
+/// 有活动的外部会话，最近活动的在前。
+async fn list_sessions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionsResponse>, ApiError> {
+    require_local(&headers)?;
+    let tokens = state.mcp_service.list_tokens();
+    let mut sessions = state
+        .session_store
+        .sessions()
+        .into_iter()
+        .filter(|session| session.kind == magi_session_store::SessionKind::ExternalTool)
+        .filter_map(|session| {
+            let token_id = session
+                .session_id
+                .as_str()
+                .strip_prefix(crate::mcp_service::EXTERNAL_SESSION_ID_PREFIX)?
+                .to_string();
+            let client_name = tokens
+                .iter()
+                .find(|record| record.token_id == token_id)
+                .map(|record| record.client_name.clone())
+                .unwrap_or_else(|| {
+                    session
+                        .title
+                        .strip_suffix(" · 外部工具")
+                        .unwrap_or(&session.title)
+                        .to_string()
+                });
+            Some(ExternalSessionDto {
+                token_id,
+                running: state
+                    .mcp_service
+                    .external_turns
+                    .in_flight(&session.session_id),
+                session_id: session.session_id.to_string(),
+                client_name,
+                workspace_id: session.workspace_id,
+                last_activity_at_ms: session.updated_at.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at_ms));
+    Ok(Json(SessionsResponse { sessions }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetExternalRetentionRequest {
+    save_content: bool,
+    retention_days: u32,
+}
+
+/// 外部会话的隐私与留存：是否保存调用内容，以及保留多少天（0 表示不自动清理）。
+async fn set_external_retention(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SetExternalRetentionRequest>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    require_local(&headers)?;
+    state
+        .mcp_service
+        .set_retention(crate::mcp_runtime::ExternalRetention {
+            save_content: request.save_content,
+            retention_days: request.retention_days,
+        })
+        .await
+        .map_err(runtime_error)?;
+    state.mcp_service.external_turns.purge_expired(&state).await;
+    Ok(Json(status_response(&state).await))
 }
 
 #[cfg(test)]
@@ -966,6 +1105,10 @@ mod tests {
                 AbsolutePath::new(dir.path().display().to_string()),
             )
             .unwrap();
+        crate::bundled_plugins::activate_bundled_for_test(
+            &state,
+            crate::bundled_plugins::MCP_SERVER_PLUGIN_ID,
+        );
         (state, dir)
     }
 
@@ -992,6 +1135,66 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn management_routes_are_refused_until_the_plugin_is_active_but_approvals_follow_either_plugin()
+     {
+        let (active, _dir) = state_with_workspace();
+        // 一个没有激活任何插件的状态：管理面与待确认列表都拒绝。
+        let inactive = ApiState::new(
+            "magi-test",
+            std::sync::Arc::new(InMemoryEventBus::new(16)),
+            std::sync::Arc::new(SessionStore::default()),
+            std::sync::Arc::new(WorkspaceStore::default()),
+            std::sync::Arc::new(GovernanceService::default()),
+        );
+        for (method, path) in [
+            ("GET", "/mcp-server/status"),
+            ("POST", "/mcp-server/enabled"),
+            ("POST", "/mcp-server/tokens"),
+            ("GET", "/mcp-server/config-snippets"),
+            ("GET", "/mcp-server/audit"),
+            ("GET", "/mcp-server/approvals"),
+        ] {
+            let (status, _) = call(&inactive, method, path, serde_json::json!({}), false).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+
+        // 只激活 GPT Web：槽位调用仍需要在待确认托盘里审批，管理面依旧关闭。
+        crate::bundled_plugins::activate_bundled_for_test(
+            &inactive,
+            magi_web_model::WEB_MODEL_PLUGIN_ID,
+        );
+        let (status, _) = call(
+            &inactive,
+            "GET",
+            "/mcp-server/approvals",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &inactive,
+            "GET",
+            "/mcp-server/status",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // 激活 MCP 插件后管理面可用。
+        let (status, _) = call(
+            &active,
+            "GET",
+            "/mcp-server/status",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1757,6 +1960,82 @@ mod tests {
         .await;
         assert_eq!(only["entries"].as_array().unwrap().len(), 1);
         assert_eq!(only["entries"][0]["atMs"], 3);
+    }
+
+    #[tokio::test]
+    async fn external_sessions_list_and_clear_with_the_records_and_retention_is_validated() {
+        let (state, _dir) = state_with_workspace();
+        for token in ["t1", "t2"] {
+            crate::mcp_service::ensure_external_session(&state, token, "cursor", "ws-1").unwrap();
+        }
+        let (_, sessions) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        let sessions = sessions["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["clientName"], "cursor");
+        assert!(
+            sessions[0]["sessionId"]
+                .as_str()
+                .unwrap()
+                .starts_with("external-tool-")
+        );
+        assert_eq!(sessions[0]["running"], 0);
+
+        // 外部会话不进入用户的会话列表，清理记录时一并清除。
+        call(
+            &state,
+            "DELETE",
+            "/mcp-server/audit?tokenId=t1",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        let (_, sessions) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        let remaining = sessions["sessions"].as_array().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["tokenId"], "t2");
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/mcp-server/external",
+            serde_json::json!({"saveContent": false, "retentionDays": 7}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, status) = call(
+            &state,
+            "GET",
+            "/mcp-server/status",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(status["external"]["saveContent"], false);
+        assert_eq!(status["external"]["retentionDays"], 7);
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/mcp-server/external",
+            serde_json::json!({"saveContent": true, "retentionDays": 999999}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

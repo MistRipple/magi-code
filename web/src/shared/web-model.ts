@@ -4,6 +4,12 @@
  * 这里只放渲染层需要的最小事实，不复制 daemon 或站点适配层的任何状态。
  */
 
+/** GPT Web 第一方插件的身份；daemon 的 `WEB_MODEL_PLUGIN_ID` 与之一致。 */
+export const WEB_MODEL_PLUGIN_ID = 'openai.chatgpt-web';
+
+/** GPT Web 插件清单中声明的原生 Browser surface 贡献 ID，同时是其 browser 权限目标。 */
+export const WEB_MODEL_SURFACE_ID = 'gpt-web';
+
 /** 应用级 GPT Web 会话的固定持久分区。 */
 export const WEB_MODEL_PARTITION = 'persist:magi-web-model';
 

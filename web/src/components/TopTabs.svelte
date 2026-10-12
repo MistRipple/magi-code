@@ -3,12 +3,19 @@
   import { messagesState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
 
-  interface Props {
-    activeTopTab: 'thread' | 'edits' | 'knowledge';
-    onTabChange: (tab: 'thread' | 'edits' | 'knowledge') => void;
+  interface PluginPageTab {
+    id: string;
+    label: string;
   }
 
-  let { activeTopTab, onTabChange }: Props = $props();
+  interface Props {
+    activeTopTab: string;
+    onTabChange: (tab: string) => void;
+    /** 已激活插件声明在主内容区的页面入口；是否打开由用户选择，入口本身不打开任何页面。 */
+    pluginTabs?: PluginPageTab[];
+  }
+
+  let { activeTopTab, onTabChange, pluginTabs = [] }: Props = $props();
 
   const editsBadge = $derived(ensureArray(messagesState.edits).length);
 </script>
@@ -26,6 +33,11 @@
   <button class="tab-item" class:active={activeTopTab === 'knowledge'} onclick={() => onTabChange('knowledge')}>
     {i18n.t('topTabs.knowledge')}
   </button>
+  {#each pluginTabs as tab (tab.id)}
+    <button class="tab-item" data-testid="top-tab-plugin" data-tab-id={tab.id} class:active={activeTopTab === tab.id} onclick={() => onTabChange(tab.id)} title={tab.label}>
+      {tab.label}
+    </button>
+  {/each}
 </div>
 
 <style>

@@ -6,12 +6,13 @@ import {
   type BrowserSessionSnapshot,
   type BrowserTabSnapshot,
 } from './agent-api';
+import { APPLICATION_PLUGIN_SCOPE, loadedPluginProjection } from '../stores/plugin-registry.svelte';
 import { applyWebModelProbeStatus, applyWebModelRuntime } from '../stores/web-model-runtime.svelte';
 import {
   synchronizeWebModelAppSession,
   type WebModelHost,
 } from '../stores/right-pane.svelte';
-import { WEB_MODEL_HOME_TAB_ID } from '../shared/web-model';
+import { WEB_MODEL_HOME_TAB_ID, WEB_MODEL_PLUGIN_ID } from '../shared/web-model';
 import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
 import { navigateSession } from '../shared/session-navigation.svelte';
 import type { WebModelRuntimeEntry } from './agent-api';
@@ -93,6 +94,13 @@ async function probeWebModelAfterRestore(): Promise<void> {
  * 宿主丢了会中断推理，运行态丢了只是少一行提示。
  */
 export async function refreshWebModelRuntime(): Promise<void> {
+  // GPT Web 是可选插件：投影已加载且插件未激活时，运行态本就不存在，
+  // 不向 daemon 发请求，也不把这种预期状态当作错误记录。
+  const application = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
+  if (application.loaded && !application.manifests.some((manifest) => manifest.id === WEB_MODEL_PLUGIN_ID)) {
+    applyWebModelRuntime(null);
+    return;
+  }
   try {
     applyWebModelRuntime(await getWebModelRuntime());
   } catch (error) {

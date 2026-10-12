@@ -3015,7 +3015,7 @@ async fn conversation_turn_replays_after_daemon_restart_without_task_or_duplicat
         "scope": "personal",
         "text": "这是一段普通对话，重启后应回放同一 Turn 且不创建任务",
         "images": [],
-        "orchestratorSessionConfig": { "engineId": "chatgpt-web/default" },
+        "orchestratorSessionConfig": { "engineId": "plugin/openai.chatgpt-web/default" },
         "requestId": request_id,
         "userMessageId": user_message_id,
     });
@@ -3310,7 +3310,7 @@ async fn daemon_http_server_restart_replays_conversation_turn_without_task_or_du
         "scope": "personal",
         "text": "普通对话在 HTTP daemon 实例重启后回放同一 Turn",
         "images": [],
-        "orchestratorSessionConfig": { "engineId": "chatgpt-web/default" },
+        "orchestratorSessionConfig": { "engineId": "plugin/openai.chatgpt-web/default" },
         "requestId": "request-http-daemon-conversation-restart",
         "userMessageId": "user-http-daemon-conversation-restart",
     });

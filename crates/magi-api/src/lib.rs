@@ -6,9 +6,11 @@ mod browser_image;
 pub mod browser_network_policy;
 mod browser_tool_runtime;
 pub mod builtin_skills;
+mod bundled_plugins;
 mod change_projection;
 mod dto;
 mod errors;
+mod external_turns;
 pub mod git_tool_runtime;
 mod host_paths;
 mod isolation;
@@ -49,8 +51,10 @@ pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::{DaemonIdentity, DirectHttpModelProbeConfig};
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
+pub use routes::{write_plugin_resource_with_event, write_plugin_settings_with_event};
 pub use web_model_channel::{
     WEB_MODEL_TUNNEL_SECTION, WebModelChannelRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
+    restore_configured_channel,
 };
 pub use web_model_driver::{HostWebModelPageDriver, WebModelHostFactory};
 pub fn schedule_restored_session_task_dispatches(state: ApiState) {

@@ -12,9 +12,8 @@ use magi_core::{BrowserSessionId, BrowserTabId, UtcMillis};
 use magi_web_model::{
     BrowserWebModelBridgeClient, ConnectorConfigOutcome, ConnectorStatus, DriverFuture, LoginState,
     SavedConversationEntry, SavedConversationSnapshot, SubmitOutcome, TurnState, WebMessage,
-    WebModelClientConfig, WebModelClientFactory, WebModelError, WebModelErrorCode,
-    WebModelIdentity, WebModelInvocationSpec, WebModelPageDriver, WebModelRuntimeRegistry,
-    WebSlotOwner, WebSlotTable, WriteOutcome, new_web_slot_table,
+    WebModelClientConfig, WebModelError, WebModelErrorCode, WebModelIdentity, WebModelPageDriver,
+    WebModelRuntimeRegistry, WebSlotOwner, WebSlotTable, WriteOutcome, new_web_slot_table,
 };
 
 const COMPOSER_SELECTOR_TOKEN: &str = "@composer";
@@ -1149,6 +1148,7 @@ pub struct WebModelHostFactory {
     driver: Arc<dyn WebModelPageDriver>,
     slots: Arc<WebSlotTable>,
     runtime: Arc<WebModelRuntimeRegistry>,
+    plugin_manager: Arc<std::sync::Mutex<magi_plugin_system::PluginManager>>,
     saved_sink: Option<Arc<dyn magi_web_model::SavedConversationSink>>,
     image_sink: Option<Arc<dyn magi_web_model::WebImageSink>>,
 }
@@ -1157,11 +1157,13 @@ impl WebModelHostFactory {
     pub fn new(
         host_client: Arc<RwLock<Option<BrowserHostClient>>>,
         authority: Arc<Mutex<BrowserAuthority>>,
+        plugin_manager: Arc<std::sync::Mutex<magi_plugin_system::PluginManager>>,
     ) -> Result<Self, String> {
         Ok(Self {
             driver: Arc::new(HostWebModelPageDriver::new(host_client, authority)),
             slots: new_web_slot_table(),
             runtime: Arc::new(WebModelRuntimeRegistry::new()),
+            plugin_manager,
             saved_sink: None,
             image_sink: None,
         })
@@ -1192,13 +1194,45 @@ impl WebModelHostFactory {
     }
 }
 
-impl WebModelClientFactory for WebModelHostFactory {
+impl WebModelHostFactory {
     fn build_web_model_client(
         &self,
-        spec: WebModelInvocationSpec,
+        spec: magi_plugin_system::SessionEngineInvocationSpec,
     ) -> Result<Arc<dyn magi_bridge_client::ModelBridgeClient>, String> {
+        let binding: magi_web_model::WebConversationBinding = serde_json::from_value(spec.binding)
+            .map_err(|_| "GPT Web 会话绑定不符合引擎合同".to_string())?;
         if !magi_web_model::is_chatgpt_web_engine_id(&spec.engine_id) {
-            return Err("GPT Web 引擎 id 必须位于 chatgpt-web 命名空间".to_string());
+            return Err("GPT Web 引擎 id 必须位于 GPT Web 插件命名空间".to_string());
+        }
+        let scope = magi_plugin_system::APPLICATION_SCOPE;
+        let plugin_manager = self
+            .plugin_manager
+            .lock()
+            .map_err(|_| "插件管理器不可用".to_string())?;
+        if !plugin_manager
+            .is_active_for_scope(magi_web_model::WEB_MODEL_PLUGIN_ID, scope)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("GPT Web 插件未在当前作用域激活".to_string());
+        }
+        for (kind, target, denied) in [
+            (
+                magi_app_server_protocol::PluginPermissionKind::Models,
+                "default",
+                "GPT Web 插件未获模型权限",
+            ),
+            (
+                magi_app_server_protocol::PluginPermissionKind::Browser,
+                "gpt-web",
+                "GPT Web 插件未获浏览器权限",
+            ),
+        ] {
+            if !plugin_manager
+                .permission_allowed(magi_web_model::WEB_MODEL_PLUGIN_ID, scope, kind, target)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(denied.to_string());
+            }
         }
         let identity = WebModelIdentity {
             session_id: spec.session_id.clone(),
@@ -1212,11 +1246,10 @@ impl WebModelClientFactory for WebModelHostFactory {
             WebSlotOwner::new(spec.session_id, spec.project_id),
             identity,
             WebModelClientConfig {
-                mode: spec.binding.mode,
-                remote_conversation_id: spec.binding.remote_conversation_id,
-                context_established: spec.binding.mode
-                    == magi_web_model::WebConversationMode::Temporary
-                    && spec.binding.sync_state == magi_web_model::WebConversationSyncState::Active,
+                mode: binding.mode,
+                remote_conversation_id: binding.remote_conversation_id,
+                context_established: binding.mode == magi_web_model::WebConversationMode::Temporary
+                    && binding.sync_state == magi_web_model::WebConversationSyncState::Active,
                 ..Default::default()
             },
         )
@@ -1230,6 +1263,19 @@ impl WebModelClientFactory for WebModelHostFactory {
             None => client,
         };
         Ok(Arc::new(client))
+    }
+}
+
+impl magi_plugin_system::SessionEngineFactory for WebModelHostFactory {
+    fn supports(&self, engine_id: &str) -> bool {
+        magi_web_model::is_chatgpt_web_engine_id(engine_id)
+    }
+
+    fn build_session_engine(
+        &self,
+        spec: magi_plugin_system::SessionEngineInvocationSpec,
+    ) -> Result<Arc<dyn magi_bridge_client::ModelBridgeClient>, String> {
+        self.build_web_model_client(spec)
     }
 }
 

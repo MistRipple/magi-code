@@ -763,7 +763,6 @@
     padding: var(--space-4);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    background: var(--surface-1, transparent);
   }
   .cfg-card-title {
     margin: 0;
@@ -1124,17 +1123,12 @@
 
   /* 操作栏吸底：长表单（识图规则）滚动时「测试 / 保存」始终可达。 */
   .model-form-actions {
-    position: sticky;
-    bottom: 0;
-    z-index: 2;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: var(--space-3);
     margin-top: var(--space-2);
     padding: var(--space-3) 0;
-    border-top: 1px solid var(--border-subtle, var(--border));
-    background: var(--background, var(--surface-1));
   }
 
   .model-form-actions--buttons-only {

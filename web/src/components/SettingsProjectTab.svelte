@@ -169,12 +169,13 @@
 
 <svelte:window onpointerdown={handleWindowPointerDown} />
 
-<div class="settings-tab-inner project-tab">
+<div class="settings-frame project-tab">
   <!-- 身份区：产品名、简介与版本 -->
-  <section class="about-hero" aria-label={i18n.t('settings.project.title')}>
-    <div class="about-hero-text">
-      <h3 class="about-name">Magi</h3>
-      <p class="about-intro">{i18n.t('settings.project.intro')}</p>
+  <section class="settings-section" aria-label={i18n.t('settings.project.title')}>
+    <div class="settings-section-header">
+    <div>
+      <div class="settings-section-title">Magi</div>
+      <div class="settings-section-desc">{i18n.t('settings.project.intro')}</div>
     </div>
 
     {#if displayVersion}
@@ -246,74 +247,34 @@
         {/if}
       </div>
     {/if}
+    </div>
   </section>
 
   <!-- 开源与反馈：三个入口做成并排的卡片 -->
-  <section class="about-section" aria-labelledby="project-repository-title">
-    <div class="about-section-heading">
-      <h4 id="project-repository-title">{i18n.t('settings.project.repositoryLabel')}</h4>
-      <p>{i18n.t('settings.project.repositoryDesc')}</p>
-    </div>
+  <section class="settings-section" aria-labelledby="project-repository-title">
+    <div class="settings-section-title" id="project-repository-title">{i18n.t('settings.project.repositoryLabel')}</div>
+    <div class="settings-section-desc">{i18n.t('settings.project.repositoryDesc')}</div>
 
-    <ul class="about-links" aria-label={i18n.t('settings.project.moreLinks')}>
+    <div class="settings-rows" aria-label={i18n.t('settings.project.moreLinks')}>
       {#each PROJECT_LINKS as link (link.id)}
-        <li>
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t(link.labelKey)}</span>
+            <code class="settings-row-desc settings-mono">{REPOSITORY_HOST_PATH}{link.path}</code>
+          </div>
           <button
-            class="about-link"
+            class="btn btn--secondary btn--sm"
             type="button"
             data-testid={`project-open-${link.id}`}
             onclick={() => openRepository(link.path)}
-          >
-            <span class="about-link-name">{i18n.t(link.labelKey)}</span>
-            <code class="about-link-url">{REPOSITORY_HOST_PATH}{link.path}</code>
-            <span class="about-link-open">{i18n.t('settings.project.open')}</span>
-          </button>
-        </li>
+          >{i18n.t('settings.project.open')}</button>
+        </div>
       {/each}
-    </ul>
+    </div>
   </section>
 </div>
 
 <style>
-  .project-tab {
-    gap: var(--space-6, 24px);
-  }
-
-  /* ---------- 身份区 ---------- */
-  .about-hero {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-5);
-    padding: var(--space-6, 24px);
-    border: 1px solid var(--ind-border-card);
-    border-radius: var(--ind-radius-card);
-    background:
-      radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--ind-tab-accent) 12%, transparent), transparent 62%),
-      var(--ind-bg-card);
-  }
-
-  .about-hero-text {
-    min-width: 0;
-  }
-
-  .about-name {
-    margin: 0;
-    color: var(--foreground);
-    font-size: 30px;
-    font-weight: 750;
-    letter-spacing: -0.04em;
-    line-height: 1.1;
-  }
-
-  .about-intro {
-    max-width: 52ch;
-    margin: var(--space-3) 0 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-sm);
-    line-height: 1.7;
-    text-wrap: pretty;
-  }
 
   /* ---------- 版本 ---------- */
   .about-version {
@@ -466,99 +427,7 @@
   }
 
   /* ---------- 开源与反馈 ---------- */
-  .about-section-heading h4 {
-    margin: 0;
-    color: var(--foreground);
-    font-size: var(--text-base);
-    font-weight: var(--font-bold);
-  }
-
-  .about-section-heading p {
-    margin: var(--space-1) 0 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-  }
-
-  /* 窄内容区一列纵向排列，足够宽时并排三列；不出现 2+1 的悬挂。 */
-  .about-links {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-3);
-    margin: var(--space-4) 0 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  .about-link {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      'name open'
-      'url open';
-    align-items: center;
-    column-gap: var(--space-3);
-    row-gap: 2px;
-    width: 100%;
-    height: 100%;
-    padding: var(--space-4);
-    border: 1px solid var(--ind-border-card);
-    border-radius: var(--ind-radius-card);
-    background: var(--ind-bg-card);
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-    transition: border-color var(--transition-fast), background var(--transition-fast);
-  }
-
-  .about-link:hover {
-    border-color: color-mix(in srgb, var(--ind-tab-accent) 50%, var(--border));
-    background: color-mix(in srgb, var(--ind-tab-accent) 6%, var(--ind-bg-card));
-  }
-
-  .about-link:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-  }
-
-  .about-link-name {
-    grid-area: name;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-  }
-
-  .about-link-url {
-    grid-area: url;
-    max-width: 100%;
-    overflow: hidden;
-    color: var(--foreground-muted);
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: var(--text-xs);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .about-link-open {
-    grid-area: open;
-    color: var(--ind-tab-accent);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-  }
-
-  @media (min-width: 1200px) {
-    .about-links {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-  }
-
   @media (max-width: 640px) {
-    .about-hero {
-      flex-direction: column;
-      padding: var(--space-5);
-    }
-
     .about-popover {
       right: auto;
       left: 0;

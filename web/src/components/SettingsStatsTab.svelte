@@ -784,7 +784,8 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0 4px 4px;
+    padding: 4px max(32px, calc((100% - 880px) / 2)) 56px;
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -827,10 +828,8 @@
     display: grid;
     grid-template-columns: minmax(220px, 1.35fr) minmax(140px, 0.8fr) minmax(250px, 1.15fr);
     gap: 0;
-    background: var(--ind-bg-card);
     border: 1px solid var(--ind-border-card);
-    border-radius: 8px;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.025);
+    border-radius: 10px;
     overflow: hidden;
   }
   .insight-cell {
@@ -910,10 +909,8 @@
 
   /* ---------- Left: Agents List ---------- */
   .stats-left {
-    background: var(--ind-bg-card);
     border: 1px solid var(--ind-border-card);
-    border-radius: var(--ind-radius-card);
-    box-shadow: var(--ind-shadow-sm);
+    border-radius: 10px;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -1067,10 +1064,8 @@
 
   /* ---------- Right: Slice Detail ---------- */
   .stats-right {
-    background: var(--ind-bg-card);
     border: 1px solid var(--ind-border-card);
-    border-radius: var(--ind-radius-card);
-    box-shadow: var(--ind-shadow-sm);
+    border-radius: 10px;
     padding: 16px 18px;
     display: flex;
     flex-direction: column;

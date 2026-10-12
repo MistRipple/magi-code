@@ -386,7 +386,7 @@ fn ensure_web_session_direction_allowed(
         return Ok(());
     };
 
-    // GPT Web 是固定入口 `chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
+    // GPT Web 是固定入口 `plugin/openai.chatgpt-web/default`：只按引擎 id 命名空间判定，不查引擎注册表。
     let is_web_engine_id = magi_web_model::is_chatgpt_web_engine_id;
     let requested_is_web = is_web_engine_id(requested_engine_id);
     if !requested_is_web {
@@ -495,6 +495,8 @@ fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile 
 struct FetchModelsRequest {
     config: Value,
     target: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 fn parse_fetch_models_config(
@@ -942,12 +944,57 @@ fn align_engine_llm_with_worker_configs(
     }
 }
 
+/// 返回当前真正可用的引擎投影：插件全局生效，激活的插件引擎对所有工作区一致。
 pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
     let raw_engines = state.settings_store.get_section("engines");
     let mut normalized = normalize_engine_entries(&raw_engines);
     let worker_configs =
         normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
     align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
+    if let Ok(manager) = state.plugin_manager.lock()
+        && let Ok(contributions) =
+            manager.engine_contributions_for_scope(magi_plugin_system::APPLICATION_SCOPE)
+    {
+        for (manifest, engine) in contributions {
+            let id = magi_plugin_system::ContributionRef::new(&manifest.id, &engine.id).identity();
+            if normalized
+                .iter()
+                .any(|entry| entry.get("id") == Some(&Value::String(id.clone())))
+            {
+                continue;
+            }
+            normalized.push(serde_json::json!({
+                "id": id,
+                "displayName": engine.title,
+                "description": engine.description,
+                "source": "plugin",
+                "pluginId": manifest.id,
+                "pluginContributionId": engine.id,
+                "llm": {
+                    "apiProtocol": "plugin",
+                    "model": id,
+                },
+            }));
+        }
+    }
+    normalized
+}
+
+/// 返回模型设置真正拥有的引擎。插件引擎只是插件清单的运行时投影，不能被
+/// 普通模型设置的写入路径带回 `engines` 持久化段，避免卸载后留下影子配置。
+fn load_user_registry_engines(state: &ApiState) -> Vec<Value> {
+    let raw_engines = state.settings_store.get_section("engines");
+    let mut normalized = normalize_engine_entries(&raw_engines);
+    let worker_configs =
+        normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
+    align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
+    normalized.retain(|entry| {
+        entry.get("source").and_then(Value::as_str) != Some("plugin")
+            && entry
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !id.starts_with("plugin/"))
+    });
     normalized
 }
 
@@ -2292,7 +2339,7 @@ async fn upsert_engine(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if is_chatgpt_web_engine(&request) {
-        // GPT Web 入口由登录状态自动提供（固定的 `chatgpt-web/default`），不写入引擎注册表：
+        // GPT Web 入口由登录状态自动提供（固定的 `plugin/openai.chatgpt-web/default`），不写入引擎注册表：
         // 注册表里的条目都是 HTTP 引擎，Web 不是第二种“模型”。
         return Err(ApiError::InvalidInput(
             "GPT Web 入口由登录状态自动提供，不能写入模型引擎注册表".to_string(),
@@ -2309,7 +2356,12 @@ async fn upsert_engine(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?
         .to_string();
-    let mut engines = load_registry_engines(&state);
+    if engine_id.starts_with("plugin/") {
+        return Err(ApiError::InvalidInput(
+            "插件会话引擎由插件清单管理，不能通过模型设置改写".to_string(),
+        ));
+    }
+    let mut engines = load_user_registry_engines(&state);
     if let Some(position) = engines.iter().position(|entry| {
         entry
             .get("id")
@@ -2324,7 +2376,7 @@ async fn upsert_engine(
         .settings_store
         .set_section("engines", Value::Array(engines.clone()))
         .map_err(settings_persistence_error)?;
-    Ok(Json(json!({ "engines": engines })))
+    Ok(Json(json!({ "engines": load_registry_engines(&state) })))
 }
 
 async fn remove_engine(
@@ -2335,7 +2387,12 @@ async fn remove_engine(
         .get("engineId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let mut engines = load_registry_engines(&state);
+    if engine_id.starts_with("plugin/") {
+        return Err(ApiError::InvalidInput(
+            "插件会话引擎由插件清单管理，不能通过模型设置移除".to_string(),
+        ));
+    }
+    let mut engines = load_user_registry_engines(&state);
     engines.retain(|entry| {
         entry
             .get("id")
@@ -2346,7 +2403,7 @@ async fn remove_engine(
         .settings_store
         .set_section("engines", Value::Array(engines.clone()))
         .map_err(settings_persistence_error)?;
-    Ok(Json(json!({ "engines": engines })))
+    Ok(Json(json!({ "engines": load_registry_engines(&state) })))
 }
 
 async fn list_agents(
@@ -2444,7 +2501,11 @@ async fn fetch_models(
     State(state): State<ApiState>,
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let FetchModelsRequest { config, target } = request;
+    let FetchModelsRequest {
+        config,
+        target,
+        workspace_id,
+    } = request;
     // Web 引擎没有 provider 的 baseUrl/apiKey，也没有 HTTP 模型列表接口。
     // 当调用方只配置了 GPT Web（这是产品允许的首选用法）时，不能因为既有
     // provider 列表查询缺少配置而把 Web 引擎一起隐藏。先读取 daemon 的 Web
@@ -2456,6 +2517,7 @@ async fn fetch_models(
     let provider_result = parse_fetch_models_config(FetchModelsRequest {
         config,
         target: target.clone(),
+        workspace_id: workspace_id.clone(),
     });
     let (models, session_defaults) = match provider_result {
         Ok((config, _)) => match fetch_model_ids_for_config(&config).await {
@@ -2643,6 +2705,33 @@ mod tests {
 
     fn test_state() -> ApiState {
         test_state_with_external_catalog_snapshot(None)
+    }
+
+    fn install_active_gpt_web_plugin(state: &ApiState) {
+        let package =
+            crate::bundled_plugins::bundled_plugin_package(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .unwrap();
+        let manifest = package.manifest().clone();
+        let mut manager = state.plugin_manager.lock().unwrap();
+        manager
+            .install(
+                &package,
+                magi_plugin_system::PluginSource::Builtin {
+                    name: "openai.chatgpt-web".into(),
+                },
+            )
+            .unwrap();
+        manager
+            .authorize(
+                "openai.chatgpt-web",
+                "application",
+                manifest.permissions.clone(),
+            )
+            .unwrap();
+        manager.enable("openai.chatgpt-web", "application").unwrap();
+        manager
+            .activate("openai.chatgpt-web", "application")
+            .unwrap();
     }
 
     fn role_test_state(role_dir: &std::path::Path) -> ApiState {
@@ -3198,6 +3287,7 @@ mod tests {
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orch".to_string(),
+                workspace_id: None,
             }),
         )
         .await
@@ -3225,6 +3315,7 @@ mod tests {
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orch".to_string(),
+                workspace_id: None,
             }),
         )
         .await
@@ -3245,12 +3336,15 @@ mod tests {
             account_hint: "plus".to_string(),
             probed_at: 1,
         });
+        assert!(state.web_model_picker_engines().is_empty());
+        install_active_gpt_web_plugin(&state);
 
         let response = fetch_models(
             State(state.clone()),
             Json(FetchModelsRequest {
                 config: json!({}),
                 target: "orch".to_string(),
+                workspace_id: None,
             }),
         )
         .await
@@ -3264,7 +3358,7 @@ mod tests {
             1,
             "登录后只有一个固定入口，不复制网页模型菜单"
         );
-        assert_eq!(engines[0]["id"], json!("chatgpt-web/default"));
+        assert_eq!(engines[0]["id"], json!("plugin/openai.chatgpt-web/default"));
         assert_eq!(engines[0]["apiProtocol"], json!("chatgpt_web"));
         // 通道没配置：入口照常可用，只是没有项目工具并说明缺什么（W8）。
         assert_eq!(engines[0]["tools"]["available"], json!(false));
@@ -3376,6 +3470,7 @@ mod tests {
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orchestrator".to_string(),
+                workspace_id: None,
             }),
         )
         .await;
@@ -5443,7 +5538,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5453,7 +5548,7 @@ mod tests {
         let error = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("已有本地历史的会话不能切入 Web");
         match error {
@@ -5490,7 +5585,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5500,7 +5595,7 @@ mod tests {
         save_initial_orchestrator_session_override_for_new_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("the first request of a newly created session may bind Web")
         .expect("initial Web binding should produce a session override");
@@ -5508,7 +5603,7 @@ mod tests {
             state
                 .settings_store
                 .get_session_section(&session_id, "orchestrator")["engineId"],
-            json!("chatgpt-web/default")
+            json!("plugin/openai.chatgpt-web/default")
         );
     }
 
@@ -5525,7 +5620,7 @@ mod tests {
             .set_section(
                 "engines",
                 json!([{
-                    "id": "chatgpt-web/default",
+                    "id": "plugin/openai.chatgpt-web/default",
                     "displayName": "GPT-5 (Web)",
                     "apiProtocol": "chatgpt_web"
                 }]),
@@ -5535,7 +5630,7 @@ mod tests {
         save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect("空白会话应允许启动 Web")
         .expect("Web 绑定应产生会话覆盖");
@@ -5558,7 +5653,7 @@ mod tests {
         let reverse = save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "gpt-5" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "gpt-5" }),
         )
         .expect_err("切回本地后不能再次转回 Web");
         assert!(
@@ -5571,6 +5666,7 @@ mod tests {
     fn web_conversation_mode_is_set_before_the_first_message_and_never_leaks_into_the_orchestrator_section()
      {
         let state = test_state();
+        install_active_gpt_web_plugin(&state);
         let session_id = SessionId::new("session-web-mode");
         state
             .session_store
@@ -5589,7 +5685,7 @@ mod tests {
         save_orchestrator_session_override_for_session(
             &state,
             &session_id,
-            &json!({ "engineId": "chatgpt-web/default", "model": "default", "webMode": "saved" }),
+            &json!({ "engineId": "plugin/openai.chatgpt-web/default", "model": "default", "webMode": "saved" }),
         )
         .expect("空白会话可以同时选择入口与已保存方式")
         .expect("引擎绑定应产生会话覆盖");
@@ -5828,6 +5924,7 @@ mod tests {
                 "apiProtocol": "anthropic_messages"
             }),
             target: "orch".to_string(),
+            workspace_id: None,
         })
         .expect("anthropic-style base url should also be listable");
 
@@ -5849,6 +5946,7 @@ mod tests {
                 "apiProtocol": "openai_chat"
             }),
             target: "orch".to_string(),
+            workspace_id: None,
         })
         .expect("openai-compatible provider can list models");
 
@@ -5874,6 +5972,7 @@ mod tests {
                 "apiProtocol": "openai_chat"
             }),
             target: "orch".to_string(),
+            workspace_id: None,
         })
         .expect_err("full path mode has no canonical models endpoint");
 
@@ -5895,6 +5994,7 @@ mod tests {
                 "urlMode": "standard"
             }),
             target: "orch".to_string(),
+            workspace_id: None,
         })
         .expect_err("fetch models config should reject fields outside the schema");
 

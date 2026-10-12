@@ -2,6 +2,7 @@
   import { onMount, type Component } from 'svelte';
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
+  import PluginTabContent from './components/tabs/PluginTabContent.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
   import IsolationExitDialog from './components/IsolationExitDialog.svelte';
   import IsolationMergeDialog from './components/IsolationMergeDialog.svelte';
@@ -31,13 +32,32 @@
   import { synchronizeBrowserAuthority } from './web/browser-authority-coordinator';
   import { syncSessionIsolations } from './stores/session-isolation-store.svelte';
   import { syncWorkspaceWaits } from './stores/workspace-wait-store.svelte';
+  import { APPLICATION_PLUGIN_SCOPE, pluginMainPageId, pluginProjection, trackPluginProjection } from './stores/plugin-registry.svelte';
 
-  type TopTabType = 'thread' | 'edits' | 'knowledge';
+  // 插件在主内容区声明的完整页面。入口只来自 daemon 的激活投影；插件停用后入口消失，
+  // 正在查看该页面时当前 Tab 自动回到对话。
+  const pluginScope = APPLICATION_PLUGIN_SCOPE;
+  $effect(() => {
+    trackPluginProjection(pluginScope);
+  });
+  const mainPluginPages = $derived(
+    pluginProjection(pluginScope).manifests.flatMap((manifest) => (
+      (manifest.contributions.views ?? [])
+        .filter((view) => view.placements.includes('main'))
+        .map((view) => ({
+          id: pluginMainPageId(manifest.id, view.id),
+          pluginId: manifest.id,
+          entry: view.entry,
+          label: `${manifest.name} · ${view.title}`,
+        }))
+    )),
+  );
 
   // 安全获取顶部 Tab（映射非顶部 Tab 到默认值）
-  const currentTopTab = $derived<TopTabType>(
+  const currentTopTab = $derived<string>(
     ['thread', 'edits', 'knowledge'].includes(messagesState.currentTopTab as string)
-      ? (messagesState.currentTopTab as TopTabType)
+      || mainPluginPages.some((page) => page.id === messagesState.currentTopTab)
+      ? (messagesState.currentTopTab as string)
       : 'thread'
   );
   const isWebMode = isWebAgentMode();
@@ -109,7 +129,7 @@
   const isBootstrapping = $derived(!messagesState.bootstrapped);
   let bootstrapConnectionFailed = $state(false);
 
-  function handleTabChange(tab: TopTabType) {
+  function handleTabChange(tab: string) {
     setCurrentTopTab(tab);
   }
 
@@ -357,7 +377,11 @@
 <div class="app-container">
   <!-- 顶部标题栏 + 导航栏 -->
   <Header>
-    <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
+    <TopTabs
+      activeTopTab={currentTopTab}
+      onTabChange={handleTabChange}
+      pluginTabs={mainPluginPages.map((page) => ({ id: page.id, label: page.label }))}
+    />
   </Header>
 
   <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
@@ -399,6 +423,11 @@
         {/if}
       {/if}
     </div>
+    {#each mainPluginPages.filter((page) => page.id === currentTopTab) as page (page.id)}
+      <div class="top-tab-pane active">
+        <PluginTabContent pluginId={page.pluginId} entry={page.entry} label={page.label} scope={pluginScope} />
+      </div>
+    {/each}
   </div>
 
   <IsolationMergeDialog />

@@ -199,6 +199,12 @@ pub struct SessionTurnRequestDto {
     /// 用户显式选择的会话命令（如 `/compact`）；`text` 只包含命令参数，命令身份单独存储。
     #[serde(default)]
     pub command: Option<magi_app_server_protocol::SessionTurnCommand>,
+    /// 用户为本次任务显式选择的工作流核心身份；由 daemon 按当前作用域校验并固定。
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    /// 用户为本次独立命令选择的插件命令身份；由 daemon 按当前作用域校验。
+    #[serde(default)]
+    pub plugin_command_id: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
@@ -210,6 +216,9 @@ pub struct SessionTurnRequestDto {
     /// 已由真实 Browser Surface 产生并随本轮提交的 DOM 节点观察结果。
     #[serde(default)]
     pub browser_node_selections: Vec<BrowserNodeSelectionDto>,
+    /// 用户在插件视图中选中的对象引用；插件、资源和版本由 daemon 按作用域校验。
+    #[serde(default)]
+    pub plugin_selections: Vec<magi_app_server_protocol::generated::PluginSelection>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
     #[serde(default)]
@@ -381,6 +390,58 @@ impl SessionTurnRequestDto {
             .collect()
     }
 
+    /// 校验插件选中对象的结构，并让调用方用权威状态（作用域激活、资源声明与授权）逐项核对。
+    /// 返回的值已裁剪长度，可直接进入任务负载与 canonical metadata。
+    pub fn validate_plugin_selections_with<F>(
+        &self,
+        mut validate_binding: F,
+    ) -> Result<Vec<Value>, String>
+    where
+        F: FnMut(&magi_app_server_protocol::generated::PluginSelection) -> Result<(), String>,
+    {
+        const MAX_PLUGIN_SELECTIONS: usize = 8;
+        const MAX_SELECTION_BYTES: usize = 4096;
+        if self.plugin_selections.len() > MAX_PLUGIN_SELECTIONS {
+            return Err(format!("单轮最多添加 {MAX_PLUGIN_SELECTIONS} 个插件选择"));
+        }
+        let mut values: Vec<Value> = Vec::new();
+        for (index, selection) in self.plugin_selections.iter().enumerate() {
+            if selection.plugin_id.trim().is_empty()
+                || selection.resource_id.trim().is_empty()
+                || selection.label.trim().is_empty()
+            {
+                return Err(format!("插件选择[{index}] 缺少插件、资源或名称"));
+            }
+            let payload = selection.selection.clone().unwrap_or(Value::Null);
+            if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > MAX_SELECTION_BYTES)
+            {
+                return Err(format!(
+                    "插件选择[{index}] 的选中对象超过 {MAX_SELECTION_BYTES} 字节"
+                ));
+            }
+            validate_binding(selection)
+                .map_err(|error| format!("插件选择[{index}] 无效: {error}"))?;
+            let value = serde_json::json!({
+                "pluginId": selection.plugin_id.trim(),
+                "resourceId": selection.resource_id.trim(),
+                "version": selection.version,
+                "label": selection.label.trim(),
+                "summary": selection.summary.trim(),
+                "selection": payload,
+            });
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        Ok(values)
+    }
+
+    /// 已通过结构校验的选择值（不重复核对权威状态），用于幂等指纹与队列回显。
+    pub fn plugin_selections(&self) -> Vec<Value> {
+        self.validate_plugin_selections_with(|_| Ok(()))
+            .unwrap_or_default()
+    }
+
     pub fn browser_node_selections(&self) -> Vec<Value> {
         self.browser_node_selections
             .iter()
@@ -451,6 +512,9 @@ impl SessionTurnRequestDto {
                 self.browser_annotation_refs.len()
             ));
         }
+        if trimmed_text.is_none() && !self.plugin_selections.is_empty() {
+            message_lines.push(format!("[插件选择 {} 项]", self.plugin_selections.len()));
+        }
         if trimmed_text.is_none() && !self.browser_node_selections.is_empty() {
             message_lines.push(format!(
                 "[浏览器节点选择 {} 项]",
@@ -478,6 +542,7 @@ impl SessionTurnRequestDto {
         let mut normalized = self.clone();
         normalized.validate_context_references()?;
         normalized.validate_browser_node_selections()?;
+        normalized.validate_plugin_selections_with(|_| Ok(()))?;
         let context_references = normalized
             .context_references()
             .into_iter()
@@ -503,10 +568,13 @@ impl SessionTurnRequestDto {
             "goalMode": normalized.goal_mode,
             "resume": normalized.resume,
             "command": normalized.command,
+            "workflowId": trimmed_non_empty(normalized.workflow_id.as_deref()),
+            "pluginCommandId": trimmed_non_empty(normalized.plugin_command_id.as_deref()),
             "images": normalized.images,
             "contextReferences": context_references,
             "browserAnnotationRefs": normalized.browser_annotation_refs(),
             "browserNodeSelections": normalized.browser_node_selections(),
+            "pluginSelections": normalized.plugin_selections(),
             "accessProfile": normalized.requested_access_profile(),
             "orchestratorSessionConfig": normalized.orchestrator_session_config,
             "requestId": normalized.request_id(),
@@ -795,6 +863,7 @@ mod tests {
             context_references: Vec::new(),
             browser_annotation_refs: Vec::new(),
             browser_node_selections: Vec::new(),
+            plugin_selections: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,
@@ -804,6 +873,8 @@ mod tests {
             expected_turn_id: None,
             replace_turn_id: None,
             command: None,
+            workflow_id: None,
+            plugin_command_id: None,
         };
 
         assert_eq!(
@@ -1029,6 +1100,72 @@ mod tests {
         assert_eq!(references[0].path, root.canonicalize().unwrap());
     }
 
+    fn request_with_plugin_selections(selections: Value) -> SessionTurnRequestDto {
+        serde_json::from_value(serde_json::json!({
+            "scope": "personal",
+            "text": "看看选中的任务",
+            "pluginSelections": selections,
+        }))
+        .expect("request should deserialize")
+    }
+
+    #[test]
+    fn plugin_selections_are_trimmed_deduplicated_and_checked_against_authority() {
+        let selection = serde_json::json!({
+            "pluginId": " acme.board ", "resourceId": "board", "version": 3,
+            "label": " 任务 12 ", "summary": "  待办  ", "selection": {"id": 12}
+        });
+        let request = request_with_plugin_selections(serde_json::json!([selection, selection]));
+        let mut checked = 0;
+        let values = request
+            .validate_plugin_selections_with(|_| {
+                checked += 1;
+                Ok(())
+            })
+            .expect("valid selections");
+        assert_eq!(checked, 2, "每一项都必须经过权威状态核对");
+        assert_eq!(values.len(), 1, "完全相同的选择只保留一份");
+        assert_eq!(values[0]["pluginId"], "acme.board");
+        assert_eq!(values[0]["summary"], "待办");
+
+        let rejected = request.validate_plugin_selections_with(|_| Err("插件未激活".into()));
+        assert!(rejected.unwrap_err().contains("插件未激活"));
+    }
+
+    #[test]
+    fn plugin_selections_reject_oversized_payloads_and_too_many_items() {
+        let big = "x".repeat(5000);
+        let request = request_with_plugin_selections(serde_json::json!([{
+            "pluginId": "acme.board", "resourceId": "board", "version": 1,
+            "label": "a", "summary": "", "selection": {"blob": big}
+        }]));
+        assert!(request.validate_plugin_selections_with(|_| Ok(())).is_err());
+
+        let many: Vec<Value> = (0..9)
+            .map(|index| {
+                serde_json::json!({
+                    "pluginId": "acme.board", "resourceId": "board", "version": index,
+                    "label": "a", "summary": ""
+                })
+            })
+            .collect();
+        let request = request_with_plugin_selections(Value::Array(many));
+        assert!(request.validate_plugin_selections_with(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn plugin_selections_change_the_request_fingerprint_and_stand_in_for_empty_text() {
+        let mut request = request_with_plugin_selections(serde_json::json!([]));
+        let without = request.request_fingerprint().unwrap();
+        request = request_with_plugin_selections(serde_json::json!([{
+            "pluginId": "acme.board", "resourceId": "board", "version": 1,
+            "label": "任务", "summary": ""
+        }]));
+        assert_ne!(request.request_fingerprint().unwrap(), without);
+        request.text = None;
+        assert_eq!(request.timeline_content(None), "[插件选择 1 项]");
+    }
+
     #[test]
     fn request_fingerprint_covers_control_fields_and_normalizes_transport_whitespace() {
         let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
@@ -1062,6 +1199,16 @@ mod tests {
                 .request_fingerprint()
                 .expect("changed request should hash"),
             fingerprint
+        );
+
+        request.steer_current_turn = false;
+        request.workflow_id = Some("plugin/acme.tools/flow".into());
+        let workflow_fingerprint = request.request_fingerprint().unwrap();
+        request.plugin_command_id = Some("plugin/acme.tools/open".into());
+        assert_ne!(
+            request.request_fingerprint().unwrap(),
+            workflow_fingerprint,
+            "plugin command identity must participate in idempotency"
         );
     }
 

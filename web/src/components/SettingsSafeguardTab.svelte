@@ -65,18 +65,18 @@
 
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
-  <div class="safeguard-tabs" role="tablist" aria-label={i18n.t('settings.zone.safeguard')}>
-    <button type="button" role="tab" class="safeguard-tab" class:active={view === 'rules'} aria-selected={view === 'rules'} data-testid="safeguard-tab-rules" onclick={() => { view = 'rules'; }}>
+  <div class="settings-subtabs" role="tablist" aria-label={i18n.t('settings.zone.safeguard')}>
+    <button type="button" role="tab" class="settings-subtab" class:active={view === 'rules'} aria-selected={view === 'rules'} data-testid="safeguard-tab-rules" onclick={() => { view = 'rules'; }}>
       {i18n.t('settings.safeguard.tab.rules')}
     </button>
-    <button type="button" role="tab" class="safeguard-tab" class:active={view === 'audit'} aria-selected={view === 'audit'} data-testid="safeguard-tab-audit" onclick={() => { view = 'audit'; }}>
+    <button type="button" role="tab" class="settings-subtab" class:active={view === 'audit'} aria-selected={view === 'audit'} data-testid="safeguard-tab-audit" onclick={() => { view = 'audit'; }}>
       {i18n.t('settings.safeguard.tab.audit')}
       {#if safeguardAuditCount > 0}<span class="safeguard-tab-count">{safeguardAuditCount}</span>{/if}
     </button>
   </div>
 
   {#if view === 'rules'}
-    <div class="settings-section" style="border-bottom: none;">
+    <div class="settings-section">
       <div class="settings-section-header">
         <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
         {#if safeguardStatusText}
@@ -160,7 +160,7 @@
       </div>
     </div>
   {:else}
-    <div class="settings-section" style="border-bottom: none;">
+    <div class="settings-section">
       <SafeguardAuditPanel persistenceHealthy={safeguardAuditPersistenceHealthy} onCountChange={setSafeguardAuditCount} />
     </div>
   {/if}
@@ -179,23 +179,6 @@
 
   .rules-save-status.error { color: var(--danger); }
 
-  .safeguard-tabs { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border-subtle, var(--border)); margin: 0 var(--space-4); }
-  .safeguard-tab {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 12px 10px;
-    border: none;
-    background: transparent;
-    color: var(--foreground-muted);
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-  .safeguard-tab:hover { color: var(--foreground); }
-  .safeguard-tab.active { color: var(--foreground); font-weight: var(--font-semibold); }
-  .safeguard-tab.active::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--primary); }
-  .safeguard-tab:focus-visible { outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent); outline-offset: -3px; border-radius: 4px; }
   .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: 11px; font-weight: normal; font-variant-numeric: tabular-nums; }
 
   .safeguard-policy-note {

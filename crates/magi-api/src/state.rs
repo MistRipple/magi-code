@@ -12,8 +12,7 @@ use crate::mcp_config::{
     normalize_mcp_server_snapshot_entry,
 };
 use crate::routes::settings::{
-    load_registry_engines, registered_role_template_ids, resolve_registry_agents,
-    role_templates_for_registry,
+    registered_role_template_ids, resolve_registry_agents, role_templates_for_registry,
 };
 use crate::scope_binding::strip_scope_binding_fields;
 use crate::skill_loader;
@@ -574,6 +573,12 @@ impl RunnerManager {
                         waiting_streak = waiting_streak.saturating_add(1);
                         let backoff_ms = 200u64.saturating_mul(waiting_streak as u64).min(2_000);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    RunCycleOutcome::UserInputRequired => {
+                        let mut status = bg_handle.status.lock().expect("status lock should hold");
+                        *status = "waiting_user".to_string();
+                        bg_active.store(false, Ordering::Relaxed);
+                        break;
                     }
                     RunCycleOutcome::Unrunnable(task_ids) => {
                         let runner_status =
@@ -1381,6 +1386,10 @@ pub struct ApiState {
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
+    /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
+    pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
+    /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
+    pub plugin_data_migrator: Option<Arc<dyn magi_plugin_system::PluginDataMigrator>>,
     /// GPT Web 工具通道（OpenAI Tunnel 托管 + 槽位端点装配）。通道状态与槽位只驻进程内存。
     pub web_model: Arc<crate::web_model_channel::WebModelChannelRuntime>,
     /// 统一 Magi MCP 服务。GPT Web、OpenAI Tunnel 与其他 MCP 客户端都只能
@@ -1996,6 +2005,29 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
 }
 
 impl ApiState {
+    /// GPT Web 的原生宿主只能在第一方插件的应用实例激活后使用。
+    /// 这是 daemon 侧的准入事实，UI 隐藏入口不能替代它。
+    pub(crate) fn web_model_plugin_active(&self) -> bool {
+        self.plugin_active(magi_web_model::WEB_MODEL_PLUGIN_ID)
+    }
+
+    /// Magi MCP 服务（对外开放工具）只能在第一方插件的应用实例激活后使用。
+    pub(crate) fn mcp_server_plugin_active(&self) -> bool {
+        self.plugin_active(crate::bundled_plugins::MCP_SERVER_PLUGIN_ID)
+    }
+
+    fn plugin_active(&self, plugin_id: &str) -> bool {
+        self.plugin_manager
+            .lock()
+            .ok()
+            .and_then(|manager| {
+                manager
+                    .is_active_for_scope(plugin_id, magi_plugin_system::APPLICATION_SCOPE)
+                    .ok()
+            })
+            .unwrap_or(false)
+    }
+
     /// 记录一次只读探测结论（唯一投影来源，§5.11）。
     pub(crate) fn record_web_model_probe(&self, snapshot: WebModelProbeSnapshot) {
         *self
@@ -2021,9 +2053,25 @@ impl ApiState {
 
     /// 会话内主模型选择器看到的 GPT Web 入口（W18）。
     ///
-    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `chatgpt-web/default`，不复制网页的模型菜单。
+    /// 未登录或探测未完成时为空；登录后只有**一个固定入口** `plugin/openai.chatgpt-web/default`，不复制网页的模型菜单。
     /// 工具能力单独投影：它是可选增强，通道不可用时入口照常可用，只是没有项目工具并说明缺什么。
     pub fn web_model_picker_engines(&self) -> Vec<serde_json::Value> {
+        let plugin_ready = self
+            .plugin_manager
+            .lock()
+            .ok()
+            .and_then(|manager| {
+                manager
+                    .is_active_for_scope(
+                        magi_web_model::WEB_MODEL_PLUGIN_ID,
+                        magi_plugin_system::APPLICATION_SCOPE,
+                    )
+                    .ok()
+            })
+            .unwrap_or(false);
+        if !plugin_ready {
+            return Vec::new();
+        }
         let Some(probe) = self.web_model_probe_snapshot() else {
             return Vec::new();
         };
@@ -2166,6 +2214,15 @@ impl ApiState {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
+            plugin_manager: Arc::new(Mutex::new(
+                magi_plugin_system::PluginManager::open(std::env::temp_dir().join(format!(
+                    "magi-api-plugin-state-{}-{}",
+                    std::process::id(),
+                    UtcMillis::now().0
+                )))
+                .expect("in-memory ApiState plugin manager should initialize"),
+            )),
+            plugin_data_migrator: None,
             web_model: Arc::new(crate::web_model_channel::WebModelChannelRuntime::new()),
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
             web_model_probe: Arc::new(RwLock::new(None)),
@@ -2480,6 +2537,22 @@ impl ApiState {
 
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
+        self
+    }
+
+    pub fn with_plugin_manager(
+        mut self,
+        manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
+    ) -> Self {
+        self.plugin_manager = manager;
+        self
+    }
+
+    pub fn with_plugin_data_migrator(
+        mut self,
+        migrator: Arc<dyn magi_plugin_system::PluginDataMigrator>,
+    ) -> Self {
+        self.plugin_data_migrator = Some(migrator);
         self
     }
 
@@ -3114,6 +3187,8 @@ impl ApiState {
             .sessions()
             .into_iter()
             .filter(|session| session.workspace_id.as_deref() == workspace_id)
+            // 外部工具会话（外部 MCP 客户端）有自己的侧栏入口，不进用户的会话列表。
+            .filter(|session| session.kind.is_user())
             .filter(session_has_user_content)
             .collect()
     }
@@ -3326,7 +3401,7 @@ impl ApiState {
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": role_templates_for_registry(self.agent_role_registry.as_ref()),
-            "registryEngines": load_registry_engines(self),
+            "registryEngines": crate::routes::settings::load_registry_engines(self),
             "registryAgents": resolve_registry_agents(self),
             "bootstrapScope": if hydrate_mcp_servers { "full" } else { "core" },
             "mcpServersHydrated": hydrate_mcp_servers,
@@ -3591,10 +3666,14 @@ impl ApiState {
         self.web_model.shutdown(self).await;
     }
 
+    /// 只有 MCP 服务插件已激活才按已保存的配置恢复监听；daemon 启动与插件激活共用此入口。
     pub fn start_mcp_service_if_enabled(&self) {
         let state = self.clone();
         tokio::spawn(async move {
-            state.mcp_service.start_if_enabled(&state).await;
+            if state.mcp_server_plugin_active() {
+                state.mcp_service.start_if_enabled(&state).await;
+                state.mcp_service.external_turns.start_maintenance(&state);
+            }
         });
     }
 
@@ -5582,6 +5661,7 @@ mod tests {
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
                 browser_node_selections: Vec::new(),
+                plugin_selections: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some(format!("request-{queue_id}")),
@@ -5591,6 +5671,8 @@ mod tests {
                 expected_turn_id: None,
                 replace_turn_id: None,
                 command: None,
+                workflow_id: None,
+                plugin_command_id: None,
             },
             request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),

@@ -2,6 +2,7 @@
   import type { ContentBlock } from '../../types/message';
   import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
+  import ToolOriginBadge from '../ToolOriginBadge.svelte';
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
   import { i18n } from '../../stores/i18n.svelte';
@@ -130,6 +131,7 @@
 
       <span class="tool-title">
         <span class="tool-name">{changeLabel}</span>
+        <ToolOriginBadge origin={change.origin} />
         {#if change.changeType === 'rename' && change.oldPath}
           <span
             class="rename-path"

@@ -175,6 +175,7 @@ impl AppServerNotificationMethod {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppServerRequestParams {
     Initialize(InitializeParams),
@@ -438,6 +439,21 @@ pub struct BrowserNodeSelectionBounds {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSelection {
+    #[serde(rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(rename = "resourceId")]
+    pub resource_id: String,
+    pub version: u64,
+    pub label: String,
+    pub summary: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserNodeSelection {
     #[serde(rename = "tabId")]
     pub tab_id: String,
@@ -524,6 +540,14 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<SessionTurnCommand>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workflowId")]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "pluginCommandId")]
+    pub plugin_command_id: Option<String>,
+    #[serde(default)]
     pub images: Vec<SessionTurnImage>,
     #[serde(default)]
     #[serde(rename = "contextReferences")]
@@ -565,6 +589,9 @@ pub struct TurnStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "replaceTurnId")]
     pub replace_turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "pluginSelections")]
+    pub plugin_selections: Vec<PluginSelection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1240,9 +1267,400 @@ pub type ServerNotification = JsonRpcServerNotification;
 pub type ServerResponse = JsonRpcServerResponse;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginScopeKind {
+    #[serde(rename = "workspace")]
+    Workspace,
+    #[serde(rename = "application")]
+    Application,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginPermissionKind {
+    #[serde(rename = "storage")]
+    Storage,
+    #[serde(rename = "filesRead")]
+    FilesRead,
+    #[serde(rename = "filesWrite")]
+    FilesWrite,
+    #[serde(rename = "network")]
+    Network,
+    #[serde(rename = "tools")]
+    Tools,
+    #[serde(rename = "models")]
+    Models,
+    #[serde(rename = "browser")]
+    Browser,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginPermission {
+    pub kind: PluginPermissionKind,
+    pub scope: PluginScopeKind,
+    pub targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginToolContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+    #[serde(rename = "readOnly")]
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginViewPlacement {
+    #[serde(rename = "settings")]
+    Settings,
+    #[serde(rename = "home")]
+    Home,
+    #[serde(rename = "main")]
+    Main,
+    #[serde(rename = "rightPane")]
+    RightPane,
+    #[serde(rename = "homeCard")]
+    HomeCard,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginViewContribution {
+    pub id: String,
+    pub title: String,
+    pub entry: String,
+    pub placements: Vec<PluginViewPlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginSurfacePersistence {
+    #[serde(rename = "persistent")]
+    Persistent,
+    #[serde(rename = "ephemeral")]
+    Ephemeral,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginSurfaceCloseAction {
+    #[serde(rename = "hide")]
+    Hide,
+    #[serde(rename = "destroy")]
+    Destroy,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginBrowserSurfaceContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub scope: PluginScopeKind,
+    pub persistence: PluginSurfacePersistence,
+    #[serde(rename = "keepMounted")]
+    pub keep_mounted: bool,
+    #[serde(rename = "closeAction")]
+    pub close_action: PluginSurfaceCloseAction,
+    #[serde(rename = "backgroundInference")]
+    pub background_inference: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginNamedContribution {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginContributions {
+    #[serde(default)]
+    pub tools: Vec<PluginToolContribution>,
+    #[serde(default)]
+    pub commands: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub views: Vec<PluginViewContribution>,
+    #[serde(default)]
+    pub workflows: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub engines: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    pub resources: Vec<PluginNamedContribution>,
+    #[serde(default)]
+    #[serde(rename = "browserSurfaces")]
+    pub browser_surfaces: Vec<PluginBrowserSurfaceContribution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginBackendEntry {
+    #[serde(rename = "plugin.mjs")]
+    PluginMjs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginDataMigration {
+    #[serde(rename = "fromVersions")]
+    pub from_versions: Vec<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginManifest {
+    #[serde(rename = "sdkVersion")]
+    pub sdk_version: u16,
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub description: String,
+    pub backend: PluginBackendEntry,
+    pub permissions: Vec<PluginPermission>,
+    pub contributions: PluginContributions,
+    #[serde(rename = "settingsSchema")]
+    pub settings_schema: Value,
+    #[serde(rename = "dataSchemaVersion")]
+    pub data_schema_version: i64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dataMigration")]
+    pub data_migration: Option<PluginDataMigration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     Request(JsonRpcRequest),
     Notification(JsonRpcNotification),
     Variant3(JsonRpcResponse),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginScopeRequest {
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginAuthorizeRequest {
+    pub scope: String,
+    pub grants: Vec<PluginPermission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginInstallRequest {
+    pub source: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "archiveBase64")]
+    pub archive_base64: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedDigest")]
+    pub expected_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginCandidateOperation {
+    #[serde(rename = "install")]
+    Install,
+    #[serde(rename = "upgrade")]
+    Upgrade,
+    #[serde(rename = "unchanged")]
+    Unchanged,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCandidatePreview {
+    pub manifest: PluginManifest,
+    pub digest: String,
+    pub operation: PluginCandidateOperation,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedVersion")]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedDigest")]
+    pub installed_digest: Option<String>,
+    #[serde(rename = "addedPermissions")]
+    pub added_permissions: Vec<PluginPermission>,
+    #[serde(rename = "removedPermissions")]
+    pub removed_permissions: Vec<PluginPermission>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dataSchemaFrom")]
+    pub data_schema_from: Option<i64>,
+    #[serde(rename = "dataSchemaBlocked")]
+    pub data_schema_blocked: bool,
+    #[serde(rename = "dataConversion")]
+    pub data_conversion: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginScopeGrant {
+    pub scope: String,
+    pub permissions: Vec<PluginPermission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginSourceKind {
+    #[serde(rename = "center")]
+    Center,
+    #[serde(rename = "address")]
+    Address,
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "builtin")]
+    Builtin,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSourceProjection {
+    pub kind: PluginSourceKind,
+    pub location: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginDrainPhase {
+    #[serde(rename = "draining")]
+    Draining,
+    #[serde(rename = "cancelling")]
+    Cancelling,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginDrainingScope {
+    pub scope: String,
+    pub phase: PluginDrainPhase,
+    #[serde(rename = "startedAtMs")]
+    pub started_at_ms: u64,
+    #[serde(rename = "deadlineMs")]
+    pub deadline_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginLifecycleLimits {
+    #[serde(rename = "drainTimeoutMs")]
+    pub drain_timeout_ms: u64,
+    #[serde(rename = "cancelSettleTimeoutMs")]
+    pub cancel_settle_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginInstalled {
+    pub manifest: PluginManifest,
+    pub digest: String,
+    #[serde(rename = "enabledScopes")]
+    pub enabled_scopes: Vec<String>,
+    #[serde(rename = "activeScopes")]
+    pub active_scopes: Vec<String>,
+    pub grants: Vec<PluginScopeGrant>,
+    pub source: PluginSourceProjection,
+    pub draining: Vec<PluginDrainingScope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginList {
+    pub plugins: Vec<PluginInstalled>,
+    pub lifecycle: PluginLifecycleLimits,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCenterKey {
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCenterConfig {
+    pub url: String,
+    #[serde(rename = "trustedKeys")]
+    pub trusted_keys: Vec<PluginCenterKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginCenterEntryState {
+    #[serde(rename = "available")]
+    Available,
+    #[serde(rename = "updatable")]
+    Updatable,
+    #[serde(rename = "installed")]
+    Installed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCenterEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub size: u64,
+    pub state: PluginCenterEntryState,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "installedVersion")]
+    pub installed_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCenterProjection {
+    pub config: PluginCenterConfig,
+    pub entries: Vec<PluginCenterEntry>,
+    pub verified: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCenterInstallRequest {
+    pub id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginResource {
+    pub version: u64,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginResourceWriteRequest {
+    #[serde(rename = "expectedVersion")]
+    pub expected_version: u64,
+    pub value: Value,
 }

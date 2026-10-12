@@ -214,6 +214,17 @@ impl magi_web_model::WebImageSink for ApiImageSink {
 }
 
 impl ApiState {
+    fn require_web_model_plugin(&self) -> Result<(), WebModelError> {
+        if self.web_model_plugin_active() {
+            Ok(())
+        } else {
+            Err(WebModelError::new(
+                WebModelErrorCode::WebDesktopUnavailable,
+                "GPT Web 插件未安装或未激活",
+            ))
+        }
+    }
+
     pub fn web_image_sink(&self) -> Arc<dyn magi_web_model::WebImageSink> {
         Arc::new(ApiImageSink {
             state: self.clone(),
@@ -299,6 +310,8 @@ impl ApiState {
         override_fields: &serde_json::Map<String, serde_json::Value>,
         is_new_session_first_request: bool,
     ) -> Result<(), ApiError> {
+        self.require_web_model_plugin()
+            .map_err(web_model_api_error)?;
         let session_engine = self
             .settings_store
             .get_session_section(session_id, "orchestrator")
@@ -360,6 +373,7 @@ impl ApiState {
     /// 物化应用级主页（普通首页，非临时对话）：重启 / 停止后右栏重新显示 GPT Web 时使用。
     /// 槽位被会话占用时页面本来就在，不重复导航。
     pub(crate) async fn restore_web_home_page(&self) -> Result<(), WebModelError> {
+        self.require_web_model_plugin()?;
         if self
             .web_model
             .bindings()
@@ -415,6 +429,7 @@ impl ApiState {
         &self,
         target: WebModelPageTarget,
     ) -> Result<(), WebModelError> {
+        self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
         let driver = self.web_driver()?;
         match target {
@@ -440,6 +455,7 @@ impl ApiState {
     /// 不要求槽位空闲：刷新不换页面、不改变 Web 对话，页面卡住或加载失败时恰恰是占用中最需要它。
     /// 遇到页面交接（`browser_surface_*`）先重新对齐绑定再重试，和回到主页同一策略。
     pub async fn reload_web_model_page(&self) -> Result<(), WebModelError> {
+        self.require_web_model_plugin()?;
         let driver = self.web_driver()?;
         let mut last = None;
         for attempt in 0..HOME_RECOVERY_ATTEMPTS {
@@ -460,6 +476,7 @@ impl ApiState {
     pub async fn web_connector_status(
         &self,
     ) -> Result<magi_web_model::ConnectorStatus, WebModelError> {
+        self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
         // 页面可能停在 OpenAI 平台页或设置页：连接器检查从 ChatGPT 主页开始。
         let driver = self.web_driver()?;
@@ -474,6 +491,7 @@ impl ApiState {
     pub async fn configure_web_connector(
         &self,
     ) -> Result<magi_web_model::ConnectorConfigOutcome, WebModelError> {
+        self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
         let status = self.web_model.status();
         if status.tunnel_id.trim().is_empty() {
@@ -493,6 +511,7 @@ impl ApiState {
     pub async fn list_web_saved_conversations(
         &self,
     ) -> Result<Vec<SavedConversationEntry>, WebModelError> {
+        self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
         // 侧栏历史只在普通（非临时）主页上可读；槽位空闲时先回到主页再读。
         let driver = self.web_driver()?;
@@ -549,6 +568,7 @@ impl ApiState {
         session_id: &SessionId,
         conversation_id: &str,
     ) -> Result<WebConversationBinding, WebModelError> {
+        self.require_web_model_plugin()?;
         let slots = self.web_model.bindings().ok_or_else(|| {
             WebModelError::new(
                 WebModelErrorCode::WebDesktopUnavailable,
@@ -619,6 +639,7 @@ impl ApiState {
         if binding.mode != WebConversationMode::Saved {
             return Ok(0);
         }
+        self.require_web_model_plugin()?;
         let Some(conversation_id) = binding.remote_conversation_id.clone() else {
             // 新建已保存对话：还没有远端 id，第一条消息被接受后才会拿到。
             return Ok(0);

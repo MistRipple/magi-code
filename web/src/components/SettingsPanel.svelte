@@ -9,6 +9,11 @@ import SettingsToolsTab from './SettingsToolsTab.svelte';
 import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
+import SettingsPluginsTab from './SettingsPluginsTab.svelte';
+import SettingsWebModelSection from './SettingsWebModelSection.svelte';
+import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
+import PluginTabContent from './tabs/PluginTabContent.svelte';
+import PluginSettingsForm from './PluginSettingsForm.svelte';
 import { onMount, tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
@@ -17,6 +22,7 @@ import { i18n } from '../stores/i18n.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
+import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
 import {
   WEB_MODEL_SETTINGS_READY_EVENT,
   WEB_MODEL_SETTINGS_REQUEST_EVENT,
@@ -25,6 +31,7 @@ import {
 } from '../web/web-model-actions';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
+  import { shellUi } from '../stores/shell-ui.svelte';
   
   interface Props {
     /** 当前是否显示。设置与工作台是同级视图：不显示时保活，只是不参与布局。 */
@@ -49,9 +56,75 @@ import {
     void untrack(() => store.reloadRoleTemplates());
   });
 
-  const activeTabDefinition = $derived(
-    SETTINGS_TABS.find((tab) => tab.id === store.activeTab) ?? SETTINGS_TABS[0],
+  const pluginManifests = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests);
+  const pluginManifestsLoaded = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).loaded);
+  const pluginSettingsViews = $derived.by(() => pluginManifests.flatMap((manifest) =>
+    (manifest.contributions.views ?? [])
+      .filter((view) => view.placements.includes('settings'))
+      .map((view) => ({
+        kind: 'view' as const,
+        tabId: `plugin:${manifest.id}:${view.id}` as `plugin:${string}`,
+        id: manifest.id,
+        manifest,
+        entry: view.entry,
+        label: `${manifest.name} · ${view.title}`,
+        title: view.title,
+        description: manifest.description,
+      }))));
+  const pluginSettingsForms = $derived.by(() => pluginManifests
+    .filter((manifest) => !(manifest.contributions.views ?? []).some((view) => view.placements.includes('settings')))
+    .filter((manifest) => {
+      const schema = manifest.settingsSchema;
+      return Boolean(schema && typeof schema === 'object' && !Array.isArray(schema)
+        && schema.properties && typeof schema.properties === 'object'
+        && Object.keys(schema.properties).length > 0);
+    })
+    .map((manifest) => ({
+      kind: 'form' as const,
+      tabId: `plugin:${manifest.id}:settings` as `plugin:${string}`,
+      id: manifest.id,
+      manifest,
+      entry: '',
+      label: `${manifest.name} · ${i18n.t('settings.plugins.settings.title')}`,
+      title: i18n.t('settings.plugins.settings.title'),
+      description: manifest.description,
+    })));
+  const pluginSettingsTabs = $derived([...pluginSettingsViews, ...pluginSettingsForms]);
+  // 第一方插件的专属设置分类：对应插件在应用作用域激活后才出现，停用即消失。
+  const visibleSettingsTabs = $derived(
+    SETTINGS_TABS.filter((tab) => !tab.requiresPlugin
+      || pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests.some((manifest) => manifest.id === tab.requiresPlugin)),
   );
+  $effect(() => {
+    trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
+  });
+  const isDesktopRuntime = typeof window !== 'undefined' && window.magiDesktop?.runtime === 'electron';
+  const activeTabDefinition = $derived(
+    visibleSettingsTabs.find((tab) => tab.id === store.activeTab)
+      ?? pluginSettingsTabs.find((item) => item.tabId === store.activeTab)
+      ?? SETTINGS_TABS[0],
+  );
+  const activeTabTitle = $derived(
+    'titleKey' in activeTabDefinition ? i18n.t(activeTabDefinition.titleKey) : activeTabDefinition.title,
+  );
+  const activeTabDescription = $derived(
+    'descKey' in activeTabDefinition ? i18n.t(activeTabDefinition.descKey) : activeTabDefinition.description,
+  );
+
+  $effect(() => {
+    // 当前分类对应的插件已停用：回到默认分类，而不是停在一个已消失的页面。
+    if (pluginProjection(APPLICATION_PLUGIN_SCOPE).loaded
+      && SETTINGS_TABS.some((tab) => tab.requiresPlugin && tab.id === store.activeTab)
+      && !visibleSettingsTabs.some((tab) => tab.id === store.activeTab)) {
+      store.activeTab = 'model';
+    }
+  });
+  $effect(() => {
+    if (pluginManifestsLoaded && store.activeTab.startsWith('plugin:')
+      && !pluginSettingsTabs.some((item) => item.tabId === store.activeTab)) {
+      store.activeTab = 'model';
+    }
+  });
 
   // 返回要先等待保存队列与清理完成（见 store.closeSettings）；期间禁用，避免重复触发。
   let leaving = $state(false);
@@ -86,7 +159,7 @@ import {
   /** 失败卡片动作可在设置页尚未挂载时到达，使用 actions 模块的 pending 请求接住。 */
   function applyWebModelSettingsRequest(request: WebModelSettingsRequest | null): void {
     if (!request) return;
-    store.activeTab = 'browser';
+    store.activeTab = 'webModel';
     void tick().then(() => {
       window.dispatchEvent(new CustomEvent<WebModelSettingsRequest>(
         WEB_MODEL_SETTINGS_READY_EVENT,
@@ -107,6 +180,16 @@ import {
       WEB_MODEL_SETTINGS_REQUEST_EVENT,
       handleWebModelSettingsRequest,
     );
+  });
+
+  // 其他视图（如右栏添加菜单）请求设置页落到指定分类。
+  $effect(() => {
+    const requested = shellUi.settingsRequestedTab;
+    if (!requested) return;
+    untrack(() => {
+      store.activeTab = requested as typeof store.activeTab;
+      shellUi.settingsRequestedTab = null;
+    });
   });
 
   // 每次重新显示：刷新只读数据，并把焦点放到当前分类，键盘用户可以直接继续。
@@ -154,7 +237,7 @@ import {
     </button>
     <div class="settings-nav-caption" aria-hidden="true">{i18n.t('settings.title')}</div>
     <nav class="settings-nav-list" aria-label={i18n.t('settings.title')}>
-      {#each SETTINGS_TABS as tab (tab.id)}
+      {#each visibleSettingsTabs as tab (tab.id)}
         <button
           type="button"
           class="settings-nav-item"
@@ -165,6 +248,19 @@ import {
         >
           <Icon name={tab.icon} size={15} />
           <span>{i18n.t(tab.titleKey)}</span>
+        </button>
+      {/each}
+      {#each pluginSettingsTabs as tab (tab.tabId)}
+        <button
+          type="button"
+          class="settings-nav-item"
+          class:active={store.activeTab === tab.tabId}
+          aria-current={store.activeTab === tab.tabId ? 'page' : undefined}
+          data-testid={`settings-nav-${tab.tabId}`}
+          onclick={() => store.activeTab = tab.tabId}
+        >
+          <Icon name="settings" size={15} />
+          <span>{tab.label}</span>
         </button>
       {/each}
     </nav>
@@ -181,8 +277,8 @@ import {
     <header class="main-header">
       <div class="header-breadcrumbs">
         <div class="header-title-group">
-          <h2>{i18n.t(activeTabDefinition.titleKey)}</h2>
-          <span class="header-description">{i18n.t(activeTabDefinition.descKey)}</span>
+          <h2>{activeTabTitle}</h2>
+          <span class="header-description">{activeTabDescription}</span>
         </div>
       </div>
     </header>
@@ -199,8 +295,8 @@ import {
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
-          {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay} openWebModelSettings={() => { store.activeTab = 'browser'; }}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} pluginEngines={store.pluginEngines} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
+          {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay} openWebModelSettings={() => { store.activeTab = 'webModel'; }}
         />
       {:else if store.activeTab === 'agents'}
         <!-- 角色管理 Tab -->
@@ -223,6 +319,22 @@ import {
         />
       {:else if store.activeTab === 'browser'}
         <SettingsBrowserTab />
+      {:else if store.activeTab === 'plugins'}
+        <SettingsPluginsTab />
+      {:else if store.activeTab === 'webModel'}
+        <SettingsWebModelSection isDesktop={isDesktopRuntime} />
+      {:else if store.activeTab === 'mcpServer'}
+        <div class="apple-manager"><div class="apple-scroller-proxy"><div class="settings-section">
+          <SettingsMcpServerSection />
+        </div></div></div>
+      {:else}
+        {#each pluginSettingsTabs.filter((item) => item.tabId === store.activeTab) as tab (tab.tabId)}
+          {#if tab.kind === 'view'}
+            <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} scope={APPLICATION_PLUGIN_SCOPE} />
+          {:else}
+            <PluginSettingsForm pluginId={tab.id} manifest={tab.manifest} scope={APPLICATION_PLUGIN_SCOPE} />
+          {/if}
+        {/each}
       {/if}
     </div>
   </main>

@@ -595,7 +595,16 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
 #[cfg(unix)]
 fn terminate_unix_process_tree(root_pid: u32) -> io::Result<()> {
     let tracked_processes = unix_process_tree(root_pid);
-    send_unix_process_group_signal(root_pid, libc::SIGTERM)?;
+    if let Err(error) = send_unix_process_group_signal(root_pid, libc::SIGTERM) {
+        // 收口期间子进程可自然退出并被 Tokio 回收。macOS 对已不存在的进程组
+        // 也可能返回 EPERM；以追踪进程的实际退出状态决定结算，不按 errno 猜测。
+        // 仍有存活进程时保留真实信号错误，不能把未完成清理报告为成功。
+        return if wait_for_unix_processes_to_exit(&tracked_processes, Duration::ZERO) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
     if wait_for_unix_processes_to_exit(&tracked_processes, Duration::from_secs(2)) {
         return Ok(());
     }
@@ -1300,6 +1309,21 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "async managed process termination should be prompt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_termination_settles_a_child_that_already_exited() {
+        let mut command = std_command("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = spawn_managed(&mut command).expect("managed child should start");
+        assert!(child.wait().expect("child should exit").success());
+        assert!(
+            child
+                .terminate()
+                .expect("already exited child should settle")
+                .success()
         );
     }
 

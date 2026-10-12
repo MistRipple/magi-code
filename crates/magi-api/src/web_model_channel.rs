@@ -374,7 +374,7 @@ impl WebModelChannelRuntime {
             .expect("web model state root lock poisoned") = Some(state_root.clone());
         let launch = {
             let _lifecycle = self.lifecycle.lock().await;
-            self.stop_tunnel_inner(state).await;
+            self.stop_tunnel_inner(state).await?;
             let Some(config) = config else {
                 // 显式清除：连密钥文件一起删除。
                 let _ = std::fs::remove_file(api_key_path(&state_root));
@@ -465,7 +465,9 @@ impl WebModelChannelRuntime {
         match state.mcp_service.start_slot_gateway(state).await {
             Ok(endpoint) => self.lock().slot_endpoint = Some(endpoint),
             Err(error) => {
-                self.stop_tunnel_inner(state).await;
+                if let Err(stop_error) = self.stop_tunnel_inner(state).await {
+                    tracing::warn!(%stop_error, "槽位端点启动失败后停止 Tunnel 也失败，保留待清理状态");
+                }
                 self.set_phase(Some(("mcp_unavailable", error.to_string())));
                 return;
             }
@@ -490,12 +492,22 @@ impl WebModelChannelRuntime {
         self.refresh_channel_status();
     }
 
-    pub async fn stop_tunnel(&self, state: &ApiState) {
+    /// 停止并释放通道。失败时保留 Tunnel 跟踪与槽位端点（待清理），返回原因；
+    /// 调用方不得据此宣告资源已释放，可在修复后重试。
+    pub async fn stop_tunnel(&self, state: &ApiState) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock().await;
-        self.stop_tunnel_inner(state).await;
+        self.stop_tunnel_inner(state).await
     }
 
-    async fn stop_tunnel_inner(&self, state: &ApiState) {
+    /// 上一次停止是否失败、仍有待清理的托管运行时。
+    pub fn cleanup_pending(&self) -> bool {
+        self.lock()
+            .tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.status().code() == "stop_failed")
+    }
+
+    async fn stop_tunnel_inner(&self, state: &ApiState) -> Result<(), String> {
         self.launch_generation.fetch_add(1, Ordering::SeqCst);
         self.lock().phase = None;
         self.monitor_generation.fetch_add(1, Ordering::SeqCst);
@@ -510,18 +522,26 @@ impl WebModelChannelRuntime {
             // 监视器不拥有 tunnel 进程，先停止观察再发停止命令是安全的。
             handle.abort();
         }
-        let tunnel = self.lock().tunnel.take();
+        let tunnel = self.lock().tunnel.clone();
         if let Some(tunnel) = tunnel {
-            tunnel.stop().await;
+            if let Err(error) = tunnel.stop().await {
+                // 保留跟踪：运行时可能仍在，槽位端点也必须继续由本通道持有直到真正释放。
+                self.refresh_channel_status();
+                return Err(error);
+            }
+            self.lock().tunnel = None;
         }
         state.mcp_service.stop_slot_gateway().await;
         self.lock().slot_endpoint = None;
         self.refresh_channel_status();
+        Ok(())
     }
 
-    /// 应用退出：停通道、停槽位端点。
+    /// 应用退出：停通道、停槽位端点。退出时无法重试，失败只记录。
     pub async fn shutdown(&self, state: &ApiState) {
-        self.stop_tunnel(state).await;
+        if let Err(error) = self.stop_tunnel(state).await {
+            tracing::warn!(%error, "应用退出时 OpenAI Tunnel 未能确认停止");
+        }
     }
 
     pub fn refresh_channel_status(&self) {
@@ -570,6 +590,52 @@ impl WebModelChannelRuntime {
     }
 }
 
+/// 按已保存的凭据引用恢复工具通道。
+///
+/// 通道属于 GPT Web 插件的应用级资源：插件未安装或应用级未激活时**不启动**——持久配置只是
+/// “用户配置过”的事实，不能让已禁用的插件资源在重启后复活。daemon 启动与插件应用级激活
+/// 共用这一个入口。这里只启动用户已明确配置过的通道，不替用户创建 Tunnel，也不读取凭据内容。
+pub async fn restore_configured_channel(state: &ApiState) -> Option<WebModelTunnelStatus> {
+    state.runtime_persistence()?;
+    let raw = state.settings_store.get_section(WEB_MODEL_TUNNEL_SECTION);
+    if raw.is_null() {
+        return None;
+    }
+    if !state.web_model_plugin_active() {
+        tracing::info!("GPT Web 插件未激活，不恢复工具通道");
+        return None;
+    }
+    let config = match serde_json::from_value::<WebModelTunnelConfig>(raw) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "GPT Web 工具通道配置无法解析，该 Web 会话没有项目工具");
+            return None;
+        }
+    };
+    match state
+        .web_model
+        .clone()
+        .configure(state, Some(config), None)
+        .await
+    {
+        Ok(status) => {
+            if status.ready {
+                tracing::info!("已恢复 GPT Web 工具通道");
+            } else {
+                tracing::warn!(
+                    code = %status.code,
+                    "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具"
+                );
+            }
+            Some(status)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具");
+            None
+        }
+    }
+}
+
 impl Default for WebModelChannelRuntime {
     fn default() -> Self {
         Self::new()
@@ -591,6 +657,38 @@ mod tests {
         assert!(!config.is_configured());
         config.tunnel_id = "tunnel_123".to_string();
         assert!(config.is_configured());
+    }
+
+    #[tokio::test]
+    async fn saved_tunnel_configuration_does_not_revive_the_channel_while_the_plugin_is_inactive() {
+        use magi_event_bus::InMemoryEventBus;
+        use magi_governance::GovernanceService;
+        use magi_session_store::SessionStore;
+        use magi_workspace::WorkspaceStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(Arc::new(crate::state::RuntimeStatePersistence::new(
+            root.path().to_path_buf(),
+            root.path().join("workspaces.json"),
+            root.path().join("knowledge.json"),
+        )));
+        state
+            .settings_store
+            .set_section(
+                WEB_MODEL_TUNNEL_SECTION,
+                serde_json::json!({"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"}),
+            )
+            .unwrap();
+        // 插件没有安装/激活：即使用户曾经配置过通道，也不得在重启或恢复时启动它。
+        assert!(restore_configured_channel(&state).await.is_none());
+        assert!(state.web_model.configured().is_none());
     }
 
     #[tokio::test]

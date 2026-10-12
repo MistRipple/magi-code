@@ -504,17 +504,41 @@ pub enum TaskRuntimePayload {
         #[serde(default)]
         accesses: Vec<AgentContextAccessRecord>,
     },
-    /// 用户在浏览器中创建的页面标记。
+    /// 用户随本轮提交的结构化上下文锚点：浏览器页面标记、DOM 节点选择和插件视图选中对象。
     ///
-    /// 该负载只保存经过 BrowserAuthority 校验的结构化引用，实际截图仍由
-    /// 浏览器 artifact 存储负责。任务执行器可以把它注入模型上下文，但不
-    /// 允许把前端提交的未校验坐标直接当作事实使用。
-    BrowserAnnotations {
+    /// 该负载只保存经过 BrowserAuthority / 插件管理器校验的结构化引用，实际截图仍由
+    /// 浏览器 artifact 存储负责。任务执行器可以把它们注入模型上下文，但不
+    /// 允许把前端提交的未校验坐标或选中内容直接当作事实使用。
+    #[serde(alias = "browser_annotations")]
+    ContextAnchors {
         #[serde(default)]
         references: Vec<serde_json::Value>,
         #[serde(default)]
         node_selections: Vec<serde_json::Value>,
+        #[serde(default)]
+        plugin_selections: Vec<serde_json::Value>,
     },
+    /// 固定的可替换工作流核心及其检查点。工作流实现不能把检查点藏在
+    /// Worker 内存中，恢复必须使用任务持久化的这份事实。
+    Workflow {
+        workflow_id: String,
+        checkpoint_version: u32,
+        #[serde(default = "default_workflow_stage")]
+        stage: String,
+        #[serde(default)]
+        checkpoint: serde_json::Value,
+        /// 已提交但尚未结算的动作身份。存在时恢复入口必须先处理该动作记录，
+        /// 不能把插件下一次决策误当成新的动作。
+        #[serde(default)]
+        pending_action: Option<serde_json::Value>,
+        /// 最近一次已结算的动作结果，供进程重启后的下一次决策读取。
+        #[serde(default)]
+        last_result: Option<serde_json::Value>,
+    },
+}
+
+fn default_workflow_stage() -> String {
+    "start".to_string()
 }
 
 /// 任务完成合同。
@@ -874,30 +898,49 @@ impl Task {
     pub fn agent_context_package(&self) -> Option<&AgentContextPackage> {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { package, .. } => Some(package.as_ref()),
-            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => None,
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::ContextAnchors { .. }
+            | TaskRuntimePayload::Workflow { .. } => None,
         }
     }
 
     pub fn agent_context_accesses(&self) -> &[AgentContextAccessRecord] {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { accesses, .. } => accesses,
-            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => &[],
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::ContextAnchors { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 
     pub fn browser_annotation_references(&self) -> &[serde_json::Value] {
         match &self.runtime_payload {
-            TaskRuntimePayload::BrowserAnnotations { references, .. } => references,
-            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
+            TaskRuntimePayload::ContextAnchors { references, .. } => references,
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::AgentContext { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 
     pub fn browser_node_selections(&self) -> &[serde_json::Value] {
         match &self.runtime_payload {
-            TaskRuntimePayload::BrowserAnnotations {
+            TaskRuntimePayload::ContextAnchors {
                 node_selections, ..
             } => node_selections,
-            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::AgentContext { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
+        }
+    }
+
+    pub fn plugin_selections(&self) -> &[serde_json::Value] {
+        match &self.runtime_payload {
+            TaskRuntimePayload::ContextAnchors {
+                plugin_selections, ..
+            } => plugin_selections,
+            TaskRuntimePayload::None
+            | TaskRuntimePayload::AgentContext { .. }
+            | TaskRuntimePayload::Workflow { .. } => &[],
         }
     }
 

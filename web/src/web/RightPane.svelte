@@ -7,6 +7,7 @@
   import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
   import TerminalTabContent from '../components/tabs/TerminalTabContent.svelte';
   import WebModelTabContent from '../components/tabs/WebModelTabContent.svelte';
+  import PluginTabContent from '../components/tabs/PluginTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
   import {
@@ -38,10 +39,12 @@
     type BrowserTabPayload,
     type TerminalTabPayload,
     type WebModelTabPayload,
+    type PluginTabPayload,
     type WebModelHost,
     openBrowserTab,
     synchronizeBrowserSessionSnapshot,
     openTerminalTab,
+    openPluginTab,
     openWebModelTab,
     hideWebModelTabView,
     orderPaneTabsForDisplay,
@@ -65,9 +68,14 @@
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
-  import { WEB_MODEL_HOME_TAB_ID, isWebModelBrowserSession } from '../shared/web-model';
+  import { WEB_MODEL_HOME_TAB_ID, WEB_MODEL_PLUGIN_ID, WEB_MODEL_SURFACE_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
   import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
+  import {
+    APPLICATION_PLUGIN_SCOPE,
+    pluginProjection,
+    trackPluginProjection,
+  } from '../stores/plugin-registry.svelte';
   import { openSettings } from '../stores/shell-ui.svelte';
   import {
     WEB_MODEL_ACTION_EVENT,
@@ -204,6 +212,16 @@
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let domAddPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
+  const pluginManifests = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests);
+  // 原生 Browser surface 由已激活插件的清单声明；挂载、权限和释放仍由 BrowserAuthority 与 Main 执行，
+  // 这里只决定入口是否出现。宿主当前实现的语义（应用级唯一实例、保持挂载、关闭只隐藏）
+  // 已在 daemon 激活时校验，声明不被满足的插件不会出现在投影里。
+  const webModelPluginActive = $derived(
+    pluginManifests.some((manifest) => (
+      manifest.id === WEB_MODEL_PLUGIN_ID
+      && (manifest.contributions.browserSurfaces ?? []).some((surface) => surface.id === WEB_MODEL_SURFACE_ID)
+    )),
+  );
   const addPaneMenuOpen = $derived(domAddPaneMenuOpen);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
@@ -219,9 +237,12 @@
    * 应用级 GPT Web 视图与内置浏览器共享同一 Desktop-only 能力判定
    * （`canCreateBrowserPane`）；非 Desktop 上禁用并给出原因，不静默消失。
    */
-  const canCreateWebModelPane = $derived(canCreateBrowserPane);
-  const webModelDisabledReason = $derived(
+  const canCreateWebModelPane = $derived(canCreateBrowserPane && webModelPluginActive);
+  const browserDisabledReason = $derived(
     i18n.t(desktopSurface ? 'browser.error.internalUnavailable' : 'browser.error.desktopRequired'),
+  );
+  const webModelDisabledReason = $derived(
+    webModelPluginActive ? browserDisabledReason : i18n.t('rightPane.addPanelWebModelPluginDisabled'),
   );
 
   function applyBrowserCapabilities(snapshot: BrowserCapabilitiesSnapshot): void {
@@ -239,6 +260,28 @@
       if (!menu.matches(':popover-open')) menu.showPopover?.();
     } else if (menu.matches(':popover-open')) {
       menu.hidePopover?.();
+    }
+  });
+
+  $effect(() => {
+    trackPluginProjection(APPLICATION_PLUGIN_SCOPE);
+  });
+
+  // 插件被停用、撤权或升级后，已打开的插件视图随注册表一起关闭，
+  // 不能留下指向已失效包的页面（入口出现与面板打开分别管理，关闭同样由投影决定）。
+  $effect(() => {
+    const projection = pluginProjection(APPLICATION_PLUGIN_SCOPE);
+    if (!projection.loaded) return;
+    for (const tab of openTabs) {
+      if (tab.kind !== 'plugin') continue;
+      const payload = tab.payload as PluginTabPayload;
+      const contributed = projection.manifests.some((manifest) => (
+        manifest.id === payload.pluginId
+        && (manifest.contributions.views ?? []).some((view) => (
+          view.id === payload.contributionId && view.placements.includes('rightPane')
+        ))
+      ));
+      if (!contributed) closeTab(paneScopeKey, tab.id);
     }
   });
 
@@ -563,35 +606,89 @@
    */
   const webModelRunningBadgeCount = $derived(webModelActiveTurnCount());
 
-  type RightPaneCreationKind = 'browser' | 'terminal' | 'webSession';
+  type RightPaneCreationKind = 'browser' | 'terminal' | 'webSession' | 'plugin' | 'managePlugins';
+  interface AddPaneItem {
+    /** 菜单项唯一键：多个插件视图共用 kind，不能用 kind 做 each 的 key。 */
+    key: string;
+    kind: RightPaneCreationKind;
+    label: string;
+    /** 次要说明（插件视图显示所属插件名）。 */
+    detail?: string;
+    icon: 'terminal' | 'globe' | 'plug';
+    enabled: boolean;
+    disabledReason: string;
+    /** 分组首项前画分隔线。 */
+    separatorBefore?: boolean;
+    pluginId?: string;
+    contributionId?: string;
+  }
   /**
-   * 「新增」菜单**始终渲染三项**，用 `enabled` + `disabledReason` 表达不可用
+   * 「新增」菜单**始终渲染内置项**，用 `enabled` + `disabledReason` 表达不可用
    * （设计基线 §5.2）：现有实现让 browser 项在不可用时整项不渲染，等于在
    * Web / 手机 Web 上功能完全消失且没有解释。
+   *
+   * 其后是已激活插件贡献的入口（GPT Web、右栏视图；只列 daemon 投影里存在的贡献，
+   * 未安装或未激活的插件不出现），最后固定一项「管理插件」进入设置页插件分类，
+   * 让未安装/未激活的插件有可发现的入口。
    */
-  const addablePaneKinds = $derived([
+  const pluginViews = $derived.by(() => pluginManifests.flatMap((manifest) => manifest.contributions?.views?.filter((view) => view.placements.includes('rightPane')).map((view) => ({ manifest, view })) ?? []));
+  const webModelSurfaceTitle = $derived(
+    pluginManifests
+      .find((manifest) => manifest.id === WEB_MODEL_PLUGIN_ID)
+      ?.contributions.browserSurfaces?.find((surface) => surface.id === WEB_MODEL_SURFACE_ID)?.title,
+  );
+  const pluginViewNeedsSession = $derived(!rightPaneState.activeSessionId.trim());
+  const addablePaneKinds = $derived<AddPaneItem[]>([
     {
-      kind: 'terminal' as const,
+      key: 'terminal',
+      kind: 'terminal',
       label: i18n.t('rightPane.addPanelTerminal'),
-      icon: 'terminal' as const,
+      icon: 'terminal',
       enabled: canCreateTerminalPane,
       disabledReason: i18n.t('rightPane.addPanelTerminalDisabled'),
     },
     {
-      kind: 'browser' as const,
+      key: 'browser',
+      kind: 'browser',
       label: i18n.t('rightPane.addPanelBrowser'),
-      icon: 'globe' as const,
+      icon: 'globe',
       enabled: canCreateBrowserPane,
-      disabledReason: webModelDisabledReason,
+      disabledReason: browserDisabledReason,
     },
+    // 插件相关项只在对应插件已安装并激活时才出现，未安装时不显示（不做置灰占位）；
+    // 想安装的用户通过末尾的「管理插件」进入。
+    ...(webModelPluginActive
+      ? [{
+        key: 'webSession',
+        kind: 'webSession' as const,
+        label: webModelRunningBadgeCount > 0
+          ? i18n.t('rightPane.addPanelWebModelRunning', { count: webModelRunningBadgeCount })
+          : webModelSurfaceTitle ?? i18n.t('rightPane.addPanelWebModel'),
+        icon: 'globe' as const,
+        enabled: canCreateWebModelPane,
+        disabledReason: browserDisabledReason,
+      }]
+      : []),
+    ...(pluginViewNeedsSession ? [] : pluginViews.map(({ manifest, view }, index): AddPaneItem => ({
+      key: `plugin:${manifest.id}:${view.id}`,
+      kind: 'plugin',
+      label: view.title,
+      detail: manifest.name,
+      icon: 'plug',
+      enabled: true,
+      disabledReason: '',
+      separatorBefore: index === 0,
+      pluginId: manifest.id,
+      contributionId: view.id,
+    }))),
     {
-      kind: 'webSession' as const,
-      label: webModelRunningBadgeCount > 0
-        ? i18n.t('rightPane.addPanelWebModelRunning', { count: webModelRunningBadgeCount })
-        : i18n.t('rightPane.addPanelWebModel'),
-      icon: 'globe' as const,
-      enabled: canCreateWebModelPane,
-      disabledReason: i18n.t('rightPane.addPanelWebModelDisabled'),
+      key: 'managePlugins',
+      kind: 'managePlugins',
+      label: i18n.t('rightPane.addPanelManagePlugins'),
+      icon: 'plug',
+      enabled: true,
+      disabledReason: '',
+      separatorBefore: true,
     },
   ]);
   const canOpenAddPaneMenu = $derived(addablePaneKinds.length > 0);
@@ -605,7 +702,7 @@
     domAddPaneMenuOpen = event.newState === 'open';
   }
 
-  async function chooseAddPane(kind: RightPaneCreationKind): Promise<void> {
+  async function chooseAddPane(kind: RightPaneCreationKind, pluginId?: string, contributionId?: string): Promise<void> {
     domAddPaneMenuOpen = false;
     if (kind === 'browser') {
       await createBrowserPane();
@@ -613,6 +710,15 @@
     }
     if (kind === 'webSession') {
       await createWebModelPane();
+      return;
+    }
+    if (kind === 'managePlugins') {
+      openSettings('plugins');
+      return;
+    }
+    if (kind === 'plugin') {
+      const item = pluginViews.find(({ manifest, view }) => manifest.id === pluginId && view.id === contributionId);
+      if (item) openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name} · ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
       return;
     }
     createTerminalPane();
@@ -633,6 +739,7 @@
       ? state?.openTabs.find((tab) => tab.id === activeTabId) ?? null
       : null;
   });
+
 
   // ============ Code tab：内容拉取 ============
   /** filepath → 异步加载的源码内容（仅用于补全 store 中没有 content 时） */
@@ -1400,17 +1507,24 @@
     aria-hidden={!addPaneMenuOpen}
   >
       <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
-        {#each addablePaneKinds as item (item.kind)}
+        {#each addablePaneKinds as item (item.key)}
           <button
             type="button"
             class="right-pane-add-menu-item"
+            class:right-pane-add-menu-item--separated={item.separatorBefore}
             role="menuitem"
             disabled={!item.enabled}
             title={item.enabled ? item.label : item.disabledReason}
-            onclick={() => chooseAddPane(item.kind)}
+            data-kind={item.kind}
+            data-plugin-id={item.pluginId}
+            data-contribution-id={item.contributionId}
+            onclick={() => chooseAddPane(item.kind, item.pluginId, item.contributionId)}
           >
             <Icon name={item.icon} size={14} />
             <span>{item.label}</span>
+            {#if item.detail}
+              <span class="right-pane-add-menu-reason">{item.detail}</span>
+            {/if}
             {#if !item.enabled}
               <span class="right-pane-add-menu-reason">{item.disabledReason}</span>
             {/if}
@@ -1463,6 +1577,7 @@
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
     class:right-pane-body--web-model={activeTab?.kind === 'webSession'}
+    class:right-pane-body--plugin={activeTab?.kind === 'plugin'}
   >
     {#each browserHosts as host (host.tabId)}
       {@const retainedInBackground = !host.visible && retainedTabIds.has(host.tabId)}
@@ -1532,6 +1647,14 @@
       <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
     {:else if activeTab.kind === 'webSession'}
       <!-- WebModelTabContent 已在上方的内容槽中始终挂载；这里同样不能进入文件预览分支。 -->
+    {:else if activeTab.kind === 'plugin'}
+      {@const pluginPayload = activeTab.payload as PluginTabPayload}
+      <PluginTabContent
+        pluginId={pluginPayload.pluginId}
+        entry={pluginPayload.entry}
+        label={activeTab.label}
+        scope={pluginPayload.workspaceId ? `workspace:${pluginPayload.workspaceId}` : 'application'}
+      />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
@@ -1806,6 +1929,11 @@
     overflow-wrap: anywhere;
   }
 
+  .right-pane-add-menu-item--separated {
+    border-top: 1px solid var(--border-subtle);
+    margin-top: 4px;
+    padding-top: 8px;
+  }
   .right-pane-add-menu-item:disabled {
     opacity: 0.45;
     cursor: default;
@@ -2059,6 +2187,14 @@
     overflow: hidden;
     padding: 0;
   }
+
+  .right-pane-body--plugin {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0;
+  }
+
 
   .right-pane-source {
     min-height: 0;

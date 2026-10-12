@@ -400,8 +400,13 @@ fn event_session_workspace_id(state: &ApiState, event: &EventEnvelope) -> Option
     session.workspace_id.map(WorkspaceId::new)
 }
 
+/// 与用户当前所在的工作区或个人空间无关、所有事件流都收到的事件。
+/// 外部会话活动属于用户级：不管此刻打开的是哪个工作区，侧栏里的外部客户端都要更新。
 fn event_is_user_global(event: &EventEnvelope) -> bool {
-    matches!(event.event_type.as_str(), "model.context_window.updated")
+    matches!(
+        event.event_type.as_str(),
+        "model.context_window.updated" | "mcp.activity"
+    )
 }
 
 fn event_payload_workspace_matches(
@@ -618,6 +623,28 @@ mod tests {
             &event,
             Some(&SessionId::new("session-a"))
         ));
+    }
+
+    #[test]
+    fn external_session_activity_reaches_every_event_stream_scope() {
+        let state = test_state();
+        let event = EventEnvelope::domain(
+            EventId::new("event-mcp-activity"),
+            "mcp.activity",
+            json!({ "entry": { "callId": "c1" } }),
+        )
+        .with_context(EventContext {
+            workspace_id: Some(workspace_id("workspace-b")),
+            ..EventContext::default()
+        });
+
+        for scope in [
+            EventStreamScope::Personal,
+            EventStreamScope::Workspace(workspace_id("workspace-a")),
+            EventStreamScope::Workspace(workspace_id("workspace-b")),
+        ] {
+            assert!(event_matches_event_stream_scope(&state, &event, &scope));
+        }
     }
 
     #[test]

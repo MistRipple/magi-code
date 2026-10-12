@@ -8,6 +8,8 @@ members = [
   "crates/magi-web-model",
   "crates/magi-mcp-server",
   "crates/magi-process",
+  "crates/magi-plugin-runtime",
+  "crates/magi-plugin-system",
   "crates/magi-daemon",
   "crates/magi-api",
   "crates/magi-session-store",

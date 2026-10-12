@@ -31,9 +31,22 @@ use crate::state::ApiState;
 /// 等待 Magi 界面人工确认的默认时限。超时后调用以工具错误收口，不会稍后补执行。
 pub(crate) const EXTERNAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// 每次调用唯一的 id：同一毫秒内的并发调用也不会撞号；审批、活动与槽位写回共用它。
+fn next_call_id(token_id: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "mcp-{token_id}-{}-{}",
+        UtcMillis::now().0,
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// 外部工具会话 id 的前缀；前端据此识别外部会话。
+pub(crate) const EXTERNAL_SESSION_ID_PREFIX: &str = "external-tool-";
+
 /// 外部令牌对应的外部工具会话 id。
 pub(crate) fn external_session_id(token_id: &str) -> SessionId {
-    SessionId::new(format!("external-tool-{token_id}"))
+    SessionId::new(format!("{EXTERNAL_SESSION_ID_PREFIX}{token_id}"))
 }
 
 /// 由宿主直接实现（不是内置工具）的变更账本工具。
@@ -125,6 +138,12 @@ impl AuditSink for EventBusAudit {
                 detail: detail.clone(),
                 at_ms: event.at_ms,
             });
+        // 在进入工具前就被拒绝的外部调用也要在外部会话里看得到（GPT Web 槽位的调用归它自己的会话）。
+        if let AuditOutcome::Denied { reason } = &event.outcome
+            && event.token_id != crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID
+        {
+            record_denied_external_call(&self.state, &event, reason);
+        }
         let workspace_id = WorkspaceId::new(event.workspace_id.clone());
         let _ = self.state.event_bus.publish(
             EventEnvelope::domain(
@@ -289,6 +308,7 @@ impl ApiToolBackend {
     async fn run_changes_tool(
         &self,
         invocation: &ToolInvocation,
+        call_id: &str,
         session_id: &SessionId,
         workspace_id: &WorkspaceId,
         root: &Path,
@@ -348,6 +368,7 @@ impl ApiToolBackend {
                     let tokens = self.tokens.clone();
                     let timeout = self.approval_timeout;
                     let invocation = invocation.clone();
+                    let call_id = call_id.to_string();
                     let session_id = session_id.clone();
                     let workspace_id = workspace_id.clone();
                     let root = root.to_path_buf();
@@ -357,6 +378,7 @@ impl ApiToolBackend {
                             &tokens,
                             timeout,
                             &invocation,
+                            &call_id,
                             &session_id,
                             &workspace_id,
                             &root,
@@ -393,23 +415,12 @@ impl ApiToolBackend {
     /// 槽位令牌取槽位拥有者的会话，并确认该 turn 仍在进行。
     fn resolve_session(&self, invocation: &ToolInvocation) -> Result<SessionId, String> {
         match &invocation.attribution {
-            AttributionTarget::ExternalSession { token_id } => {
-                let session_id = external_session_id(token_id);
-                if self.state.session_store.session(&session_id).is_none() {
-                    let title = format!("{} · 外部工具", invocation.principal.client_name);
-                    if let Err(error) = self.state.session_store.create_external_tool_session(
-                        session_id.clone(),
-                        title,
-                        invocation.principal.workspace_id.clone(),
-                    ) {
-                        // 并发创建时另一方已建好，属于正常竞态。
-                        if self.state.session_store.session(&session_id).is_none() {
-                            return Err(format!("创建外部工具会话失败: {error}"));
-                        }
-                    }
-                }
-                Ok(session_id)
-            }
+            AttributionTarget::ExternalSession { token_id } => ensure_external_session(
+                &self.state,
+                token_id,
+                &invocation.principal.client_name,
+                &invocation.principal.workspace_id,
+            ),
             AttributionTarget::WebSlotTurn {
                 session_id,
                 turn_id,
@@ -425,6 +436,89 @@ impl ApiToolBackend {
             }
         }
     }
+}
+
+/// 外部令牌的外部会话；不存在时创建（并发创建时另一方已建好属于正常竞态）。
+pub(crate) fn ensure_external_session(
+    state: &ApiState,
+    token_id: &str,
+    client_name: &str,
+    workspace_id: &str,
+) -> Result<SessionId, String> {
+    let session_id = external_session_id(token_id);
+    if state.session_store.session(&session_id).is_none() {
+        let title = format!("{client_name} · 外部工具");
+        if let Err(error) = state.session_store.create_external_tool_session(
+            session_id.clone(),
+            title,
+            workspace_id.to_string(),
+        ) && state.session_store.session(&session_id).is_none()
+        {
+            return Err(format!("创建外部工具会话失败: {error}"));
+        }
+    }
+    Ok(session_id)
+}
+
+/// 进入工具之前就被拒绝的外部调用（权限档、路径范围、参数上限）：作为一条已拒绝的工具项
+/// 写进外部会话，结果文本是拒绝原因。写入失败只记日志，不影响拒绝本身。
+fn record_denied_external_call(state: &ApiState, event: &AuditEvent, reason: &str) {
+    let session_id = match ensure_external_session(
+        state,
+        &event.token_id,
+        &event.client_name,
+        &event.workspace_id,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "无法为被拒绝的外部调用建立外部会话");
+            return;
+        }
+    };
+    let workspace_id = Some(WorkspaceId::new(event.workspace_id.clone()));
+    let turns = &state.mcp_service.external_turns;
+    let turn_id = match turns.begin_call(
+        state,
+        &session_id,
+        &WorkspaceId::new(event.workspace_id.clone()),
+        &event.client_name,
+    ) {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            tracing::warn!(%error, "被拒绝的外部调用无法写入外部会话");
+            return;
+        }
+    };
+    let writer = magi_conversation_runtime::session_writeback::ExternalToolItemWriter {
+        session_store: &state.session_store,
+        event_bus: &state.event_bus,
+        session_id: &session_id,
+        workspace_id: &workspace_id,
+        turn_id: Some(&turn_id),
+        origin: None,
+    };
+    let arguments = serde_json::json!({ "paths": event.paths }).to_string();
+    // 与其他策略拒绝同一种结构，工具卡片按拒绝展示，而不是“执行异常”。
+    let rejection = serde_json::json!({
+        "tool": &event.tool,
+        "status": "rejected",
+        "error_code": "external_tool_policy_rejected",
+        "error": reason,
+    })
+    .to_string();
+    let internal_name = magi_mcp_server::catalog::mapping_for_public_name(&event.tool)
+        .map(|mapping| mapping.internal_name.to_string())
+        .unwrap_or_else(|| event.tool.clone());
+    if let Err(error) = writer.finished(
+        &next_call_id(&event.token_id),
+        &internal_name,
+        &arguments,
+        &rejection,
+        ExecutionResultStatus::Rejected,
+    ) {
+        tracing::warn!(%error, "被拒绝的外部调用写入失败");
+    }
+    turns.end_call(state, &session_id);
 }
 
 /// 槽位表里当前进行中的 Web turn 是否就是这一个。槽位表是唯一事实源。
@@ -624,57 +718,129 @@ impl ToolBackend for ApiToolBackend {
 
     fn invoke<'a>(&'a self, invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
         Box::pin(async move {
-            // 槽位调用：作为普通工具项内联写进 Web 会话当前 turn 的 canonical（§8.4）。
-            let slot_session = match &invocation.attribution {
-                AttributionTarget::WebSlotTurn { session_id, .. } => {
-                    Some(SessionId::new(session_id.clone()))
-                }
-                AttributionTarget::ExternalSession { .. } => None,
-            };
-            let call_id = format!(
-                "mcp-{}-{}",
-                invocation.principal.token_id,
-                UtcMillis::now().0
-            );
-            let arguments_json = invocation.arguments.to_string();
-            let tool_name = invocation.public_name.clone();
+            let call_id = next_call_id(&invocation.principal.token_id);
             let workspace_id = Some(WorkspaceId::new(invocation.principal.workspace_id.clone()));
-            let writer = slot_session.as_ref().map(|session_id| {
-                (
-                    session_id.clone(),
-                    magi_conversation_runtime::session_writeback::ExternalToolItemWriter {
-                        session_store: &self.state.session_store,
-                        event_bus: &self.state.event_bus,
-                        session_id,
-                        workspace_id: &workspace_id,
-                    },
-                )
+            let turns = &self.state.mcp_service.external_turns;
+            // 调用都作为普通工具项写进 canonical（§8.4）：GPT Web 槽位写进拥有者会话当前的 Turn，
+            // 外部令牌写进它自己外部会话的活动段 Turn。
+            let target = match &invocation.attribution {
+                AttributionTarget::WebSlotTurn { session_id, .. } => Some((
+                    SessionId::new(session_id.clone()),
+                    None,
+                    Some(magi_conversation_runtime::session_writeback::TOOL_ORIGIN_CHATGPT_WEB),
+                )),
+                AttributionTarget::ExternalSession { .. } => {
+                    let session_id = match self.resolve_session(&invocation) {
+                        Ok(id) => id,
+                        Err(error) => return error_outcome(error),
+                    };
+                    match turns.begin_call(
+                        &self.state,
+                        &session_id,
+                        &WorkspaceId::new(invocation.principal.workspace_id.clone()),
+                        &invocation.principal.client_name,
+                    ) {
+                        Ok(turn_id) => Some((session_id, Some(turn_id), None)),
+                        Err(error) => {
+                            // 记录失败不应让外部客户端的调用整体不可用：照常执行，只是这次没有展示。
+                            tracing::warn!(%error, "外部调用无法写入外部会话时间线");
+                            None
+                        }
+                    }
+                }
+            };
+            let external_session_id = matches!(
+                invocation.attribution,
+                AttributionTarget::ExternalSession { .. }
+            )
+            .then(|| target.as_ref().map(|(session_id, _, _)| session_id.clone()))
+            .flatten();
+            let save_content = self.state.mcp_service.save_content();
+            let recorded_arguments = if save_content {
+                invocation.arguments.to_string()
+            } else {
+                redact_arguments(&invocation.arguments)
+            };
+            let tool_name = invocation.internal_name.clone();
+            let writer = target.as_ref().map(|(session_id, turn_id, origin)| {
+                magi_conversation_runtime::session_writeback::ExternalToolItemWriter {
+                    session_store: &self.state.session_store,
+                    event_bus: &self.state.event_bus,
+                    session_id,
+                    workspace_id: &workspace_id,
+                    turn_id: turn_id.as_deref(),
+                    origin: *origin,
+                }
             });
-            if let Some((_, writer)) = &writer
-                && let Err(error) = writer.started(&call_id, &tool_name, &arguments_json)
+            if let Some(writer) = &writer
+                && let Err(error) = writer.started(&call_id, &tool_name, &recorded_arguments)
             {
-                return error_outcome(format!("无法记录到当前 Web 对话：{error}"));
+                if external_session_id.is_none() {
+                    return error_outcome(format!("无法记录到当前 Web 对话：{error}"));
+                }
+                tracing::warn!(%error, "外部调用开始项写入失败");
             }
-            let outcome = self.invoke_resolved(invocation).await;
-            if let Some((_, writer)) = &writer {
+            let outcome = self.invoke_resolved(invocation, &call_id).await;
+            if let Some(writer) = &writer {
                 let status = if outcome.is_error {
                     ExecutionResultStatus::Failed
                 } else {
                     ExecutionResultStatus::Succeeded
                 };
-                if let Err(error) =
-                    writer.finished(&call_id, &tool_name, &arguments_json, &outcome.text, status)
-                {
-                    tracing::warn!(%error, "槽位工具结果写入 canonical 失败");
+                let recorded_result = if save_content {
+                    outcome.text.clone()
+                } else {
+                    CONTENT_NOT_SAVED.to_string()
+                };
+                if let Err(error) = writer.finished(
+                    &call_id,
+                    &tool_name,
+                    &recorded_arguments,
+                    &recorded_result,
+                    status,
+                ) {
+                    tracing::warn!(%error, "工具结果写入 canonical 失败");
                 }
+            }
+            if let Some(session_id) = &external_session_id {
+                turns.end_call(&self.state, session_id);
             }
             outcome
         })
     }
 }
 
+/// 关闭“保存调用内容”后，结果文本在外部会话里的占位。
+const CONTENT_NOT_SAVED: &str = "（内容未保存：已在设置里关闭「保存调用内容」）";
+
+/// 超过这个长度的字符串参数（文件内容、补丁、命令输出等）在不保存内容时被省略。
+const REDACT_STRING_BYTES: usize = 200;
+
+/// 不保存调用内容时的参数：保留路径、查询、命令这类描述动作的短字段，省略大段内容。
+fn redact_arguments(arguments: &Value) -> String {
+    fn redact(value: &Value) -> Value {
+        match value {
+            Value::String(text) if text.len() > REDACT_STRING_BYTES => {
+                Value::String("（内容已省略）".to_string())
+            }
+            Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), redact(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    redact(arguments).to_string()
+}
+
 impl ApiToolBackend {
-    async fn invoke_resolved(&self, invocation: ToolInvocation) -> InvocationOutcome {
+    async fn invoke_resolved(
+        &self,
+        invocation: ToolInvocation,
+        call_id: &str,
+    ) -> InvocationOutcome {
         {
             let Some(registry) = self.state.tool_registry().cloned() else {
                 return error_outcome("工具运行时未就绪");
@@ -690,7 +856,7 @@ impl ApiToolBackend {
             let class = Some(invocation.class);
             if invocation.internal_name.starts_with("changes_") {
                 return self
-                    .run_changes_tool(&invocation, &session_id, &workspace_id, &root)
+                    .run_changes_tool(&invocation, call_id, &session_id, &workspace_id, &root)
                     .await;
             }
             // git 工具需要会话的 Git context；由变更面板同一入口建立（幂等）。
@@ -715,6 +881,7 @@ impl ApiToolBackend {
             let state = self.state.clone();
             let tokens = self.tokens.clone();
             let approval_timeout = self.approval_timeout;
+            let call_id = call_id.to_string();
             let joined = tokio::task::spawn_blocking(move || {
                 run_blocking(
                     &state,
@@ -722,6 +889,7 @@ impl ApiToolBackend {
                     approval_timeout,
                     &registry,
                     &invocation,
+                    &call_id,
                     &session_id,
                     &workspace_id,
                     &root,
@@ -774,11 +942,13 @@ const WEB_APPROVAL_DENIED_BY_SETTING: &str =
     "GPT Web 的授权方式设置为「拒绝」：需要授权的操作一律不执行。";
 
 /// 发起人工确认并阻塞等待；`Err` 携带终态结果文本。
+#[allow(clippy::too_many_arguments)]
 fn approve_blocking(
     state: &ApiState,
     tokens: &Arc<TokenStore>,
     timeout: Duration,
     invocation: &ToolInvocation,
+    call_id: &str,
     session_id: &SessionId,
     workspace_id: &WorkspaceId,
     root: &Path,
@@ -790,13 +960,8 @@ fn approve_blocking(
         }
         crate::web_model_channel::WebApprovalMode::Ask => {}
     }
-    let call_id = format!(
-        "mcp-{}-{}",
-        invocation.principal.token_id,
-        UtcMillis::now().0
-    );
     let is_alive = liveness(state, tokens, invocation);
-    await_external_tool_approval(
+    let approval = await_external_tool_approval(
         &state.event_bus,
         state.conversation_registry.tool_approvals(),
         &ExternalApprovalRequest {
@@ -805,15 +970,15 @@ fn approve_blocking(
             token_id: &invocation.principal.token_id,
             client_name: &invocation.principal.client_name,
             token_prefix: &invocation.principal.token_prefix,
-            tool_call_id: &call_id,
+            tool_call_id: call_id,
             tool_name: &invocation.internal_name,
             arguments_json: &invocation.arguments.to_string(),
             summary: &approval_summary(invocation, root),
             timeout,
         },
         &is_alive,
-    )
-    .map_err(|(payload, _)| payload)
+    );
+    approval.map_err(|(payload, _)| payload)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -823,22 +988,18 @@ fn run_blocking(
     approval_timeout: Duration,
     registry: &magi_tool_runtime::ToolRegistry,
     invocation: &ToolInvocation,
+    call_id: &str,
     session_id: &SessionId,
     workspace_id: &WorkspaceId,
     root: &Path,
     snapshot: Option<&dyn magi_snapshot::ToolHook>,
 ) -> InvocationOutcome {
     let arguments_json = invocation.arguments.to_string();
-    let call_id = format!(
-        "mcp-{}-{}",
-        invocation.principal.token_id,
-        UtcMillis::now().0
-    );
     let safety_gate =
         magi_conversation_runtime::safety_gate_from_settings(Some(&state.settings_store));
     let is_alive = liveness(state, tokens, invocation);
     let summary = approval_summary(invocation, root);
-    let approve = |call_id: &str| {
+    let approve = |approval_id: &str| {
         await_external_tool_approval(
             &state.event_bus,
             state.conversation_registry.tool_approvals(),
@@ -848,7 +1009,7 @@ fn run_blocking(
                 token_id: &invocation.principal.token_id,
                 client_name: &invocation.principal.client_name,
                 token_prefix: &invocation.principal.token_prefix,
-                tool_call_id: call_id,
+                tool_call_id: approval_id,
                 tool_name: &invocation.internal_name,
                 arguments_json: &arguments_json,
                 summary: &summary,
@@ -868,7 +1029,7 @@ fn run_blocking(
                 return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
             }
             crate::web_model_channel::WebApprovalMode::Ask => {
-                if let Err((payload, _)) = approve(&call_id) {
+                if let Err((payload, _)) = approve(call_id) {
                     return error_outcome(payload);
                 }
             }
@@ -877,7 +1038,7 @@ fn run_blocking(
     }
     let access_profile = access_profile_for(invocation.principal.profile);
     let external_call = ExternalToolCall {
-        call_id: &call_id,
+        call_id,
         tool_name: &invocation.internal_name,
         arguments_json: &arguments_json,
         session_id,
@@ -969,6 +1130,9 @@ pub(crate) fn web_slot_tool_digest(state: &ApiState) -> Option<String> {
 }
 
 fn web_slot_catalog(state: &ApiState) -> Option<Vec<magi_mcp_server::ToolDescriptor>> {
+    if !state.web_model_plugin_active() {
+        return None;
+    }
     let harness = state.web_model.clone();
     let auth = crate::web_slot_mcp::slot_principal_provider(
         slots_provider(state),
@@ -1141,6 +1305,34 @@ mod tests {
         registry.register_default_builtins();
         std::mem::forget(state_dir);
         let state = base.with_tool_registry(registry);
+        let package =
+            crate::bundled_plugins::bundled_plugin_package(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .unwrap();
+        let permissions = package.manifest().permissions.clone();
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    magi_plugin_system::PluginSource::Builtin {
+                        name: magi_web_model::WEB_MODEL_PLUGIN_ID.into(),
+                    },
+                )
+                .unwrap();
+            manager
+                .authorize(
+                    magi_web_model::WEB_MODEL_PLUGIN_ID,
+                    "application",
+                    permissions,
+                )
+                .unwrap();
+            manager
+                .enable(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+            manager
+                .activate(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         state
@@ -1282,6 +1474,99 @@ mod tests {
             .await;
             assert!(is_error(&denied), "{path}: {denied}");
         }
+    }
+
+    /// 外部会话在 canonical 里的工具项：(工具名, 参数文本, 结果文本, 状态)。
+    fn external_tool_items(f: &Fixture) -> Vec<(String, String, String, String)> {
+        f.state
+            .session_store
+            .canonical_turns_for_session(&external_session_id(&f.token_id))
+            .into_iter()
+            .flat_map(|turn| turn.items)
+            .filter_map(|item| {
+                let tool = item.tool?;
+                Some((
+                    tool.name,
+                    tool.arguments
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    tool.result
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    format!("{:?}", item.status),
+                ))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn external_calls_land_in_the_external_session_timeline_with_results_and_denials() {
+        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        std::fs::write(f.root.join("hello.txt"), "hi there").unwrap();
+        let ok = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.read", serde_json::json!({"path": "hello.txt"})),
+        )
+        .await;
+        assert!(!is_error(&ok), "{ok}");
+        let denied = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.read", serde_json::json!({"path": "../escape.txt"})),
+        )
+        .await;
+        assert!(is_error(&denied), "{denied}");
+
+        let session_id = external_session_id(&f.token_id);
+        let turns = f
+            .state
+            .session_store
+            .canonical_turns_for_session(&session_id);
+        assert_eq!(turns.len(), 1, "连续的外部调用在同一个活动段 Turn 里");
+        let items = external_tool_items(&f);
+        let read = items
+            .iter()
+            .find(|item| item.2.contains("hi there"))
+            .expect("成功的读取带着读到的内容");
+        assert!(read.1.contains("hello.txt"));
+        let refused = items
+            .iter()
+            .find(|item| item.1.contains("paths"))
+            .expect("被拒绝的越界读取也是一条工具项");
+        assert!(!refused.2.is_empty(), "结果文本是拒绝原因");
+        assert_eq!(f.state.mcp_service.external_turns.in_flight(&session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn turning_off_content_saving_keeps_actions_but_not_results() {
+        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        f.state
+            .mcp_service
+            .set_retention(crate::mcp_runtime::ExternalRetention {
+                save_content: false,
+                retention_days: 30,
+            })
+            .await
+            .unwrap();
+        std::fs::write(f.root.join("secret.txt"), "top secret body").unwrap();
+        let ok = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.read", serde_json::json!({"path": "secret.txt"})),
+        )
+        .await;
+        assert!(!is_error(&ok), "{ok}");
+        let items = external_tool_items(&f);
+        assert!(
+            items.iter().any(|item| item.1.contains("secret.txt")),
+            "动作与路径保留"
+        );
+        assert!(
+            items.iter().all(|item| !item.2.contains("top secret body")),
+            "关闭保存内容后读到的内容不落库: {items:?}"
+        );
+        assert!(items.iter().any(|item| item.2.contains("内容未保存")));
     }
 
     #[tokio::test]

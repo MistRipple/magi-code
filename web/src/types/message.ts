@@ -6,6 +6,7 @@ import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
 import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
 import type { LocaleCode } from '../i18n/locales';
 import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
+import type { PluginSelection } from '../shared/app-server-protocol.generated';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---
 
@@ -311,8 +312,12 @@ export interface ToolPolicyPayload {
 }
 
 // 工具调用
+/** 工具调用的来源：Magi 自己的 agent 发起的调用没有来源标记；GPT Web 网页里的模型经 MCP 回调的工具标为 chatgpt_web。 */
+export type ToolOrigin = 'chatgpt_web';
+
 export interface ToolCall {
   id: string;
+  origin?: ToolOrigin;
   name: string;
   arguments: Record<string, unknown>;
   status: ToolCallStatus;
@@ -403,6 +408,7 @@ export interface ContentBlock {
     headSummary?: string;
     tailSummary?: string;
     toolCallId?: string;
+    origin?: ToolOrigin;
   };
   plan?: {
     goal: string;
@@ -768,6 +774,8 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   command: 'compact' | null;
+  workflowId?: string | null;
+  pluginCommandId?: string | null;
   skillName?: string | null;
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
@@ -775,6 +783,7 @@ export interface QueuedMessage {
   contextReferences?: QueuedMessageContextReference[];
   browserAnnotationRefs?: string[];
   browserNodeSelections?: QueuedMessageBrowserNodeSelection[];
+  pluginSelections?: PluginSelection[];
   canGuide: boolean;
 }
 

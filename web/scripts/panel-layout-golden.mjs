@@ -507,8 +507,8 @@ assert.match(
 );
 assert.match(
   settingsPanelSource,
-  /\{#each SETTINGS_TABS as tab/,
-  '设置导航必须由唯一的分类清单生成',
+  /visibleSettingsTabs = \$derived\(\s*SETTINGS_TABS\.filter[\s\S]*?\{#each visibleSettingsTabs as tab/,
+  '设置导航必须由唯一的分类清单生成（插件专属分类只做可见性过滤）',
 );
 const projectTabSource = await readFile(
   new URL('../src/components/SettingsProjectTab.svelte', import.meta.url),
@@ -666,13 +666,13 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /@container tools-tab \(max-width:\s*760px\)[\s\S]*?\.builtin-summary-toggle\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) auto;/,
-  '窄屏内置工具摘要必须切换为分层网格布局',
+  /settings-section-header[\s\S]*?settings\.tools\.builtinTools[\s\S]*?capability-dependency-strip/,
+  '内置工具使用统一的分区标题，依赖状态在标题下方独占一行并按自然宽度换行',
 );
-assert.match(
+assert.doesNotMatch(
   settingsToolsSource,
-  /@container tools-tab \(max-width:\s*760px\)[\s\S]*?\.capability-dependency-strip\s*\{[\s\S]*?grid-column:\s*1 \/ -1;[\s\S]*?width:\s*100%;/,
-  '窄屏依赖状态必须占据完整第二行并按自然宽度换行',
+  /builtin-summary/,
+  '工具页不再保留自成一套的内置工具摘要卡片',
 );
 assert.doesNotMatch(
   inputAreaSource,

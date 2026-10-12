@@ -10,6 +10,8 @@ mod knowledge;
 mod mcp_server;
 mod mcp_skills_repos;
 mod messages;
+mod plugins;
+pub use plugins::{write_plugin_resource_with_event, write_plugin_settings_with_event};
 mod session_isolation;
 mod session_scope;
 pub(crate) mod sessions;
@@ -299,7 +301,8 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(appearance::routes())
         .merge(browser::routes())
         .merge(mcp_skills_repos::routes())
-        .merge(mcp_server::routes())
+        .merge(mcp_server::routes(state.clone()))
+        .merge(plugins::routes())
         .merge(changes_files_tunnel::routes())
         .merge(file_site::routes())
         .merge(agent_run_actions::routes())
