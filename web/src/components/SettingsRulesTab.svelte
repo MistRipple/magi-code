@@ -41,7 +41,7 @@
 />
 
 <!-- 用户自定义规则 -->
-<div class="settings-section" style="border-bottom: none;">
+<div class="settings-section">
   <div class="settings-section-header">
     <div class="settings-section-title">{i18n.t('settings.profile.userRules')}</div>
     {#if userRulesStatusText}

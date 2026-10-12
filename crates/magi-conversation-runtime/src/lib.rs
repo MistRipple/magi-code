@@ -18,6 +18,7 @@ mod driver;
 pub mod execution_admission;
 pub mod execution_chain_recovery;
 pub mod external_approval;
+pub mod external_session_turn;
 pub mod external_tool;
 mod goal_tool_failure;
 pub mod human_wait;

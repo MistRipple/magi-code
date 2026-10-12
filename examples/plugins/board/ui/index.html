@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; color: CanvasText; background: Canvas; }
+    li { display: flex; gap: 8px; align-items: center; padding: 4px 0; }
+    button, input { font: inherit; }
+    #status { color: GrayText; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1 id="title">看板</h1>
+  <form id="add"><input id="text" placeholder="新条目" maxlength="200" required> <button>添加</button></form>
+  <ul id="items"></ul>
+  <p id="status"></p>
+  <script>
+    // 视图运行在 sandbox="allow-scripts" 的隔离 iframe 中，不能直接联网或访问宿主页面；
+    // 所有数据经宿主的消息桥读取、订阅和提交。
+    const CHANNEL = 'magi-plugin-v1';
+    let instanceId = null;
+    let version = 0;
+    let items = [];
+    let nextRequest = 0;
+    const pending = new Map();
+
+    function request(operation, fields) {
+      return new Promise((resolve, reject) => {
+        const requestId = `r${++nextRequest}`;
+        pending.set(requestId, { resolve, reject });
+        parent.postMessage({ channel: CHANNEL, instanceId, type: 'request', requestId, operation, ...fields }, '*');
+      });
+    }
+
+    function render() {
+      const list = document.getElementById('items');
+      list.replaceChildren(...items.map((item, index) => {
+        const row = document.createElement('li');
+        const label = document.createElement('span');
+        label.textContent = item.text;
+        // 把某一条交给输入框作为结构化上下文：只传资源、版本、名称和摘要。
+        const pick = document.createElement('button');
+        pick.textContent = '引用';
+        pick.onclick = () => request('context.select', {
+          resourceId: 'board', version, label: `看板条目 ${index + 1}`, summary: item.text,
+          selection: { index },
+        }).catch(show);
+        row.append(label, pick);
+        return row;
+      }));
+    }
+
+    function show(error) {
+      document.getElementById('status').textContent = error instanceof Error ? error.message : String(error);
+    }
+
+    function apply(resource) {
+      version = resource.version;
+      items = Array.isArray(resource.value?.items) ? resource.value.items : [];
+      render();
+    }
+
+    window.addEventListener('message', async (event) => {
+      const message = event.data;
+      if (!message || message.channel !== CHANNEL) return;
+      if (message.type === 'init') {
+        instanceId = message.instanceId;
+        try {
+          const settings = await request('settings.read', {});
+          if (settings.value?.title) document.getElementById('title').textContent = settings.value.title;
+          apply(await request('resource.read', { resourceId: 'board' }));
+          await request('resource.subscribe', { resourceId: 'board' });
+        } catch (error) { show(error); }
+      } else if (message.type === 'response') {
+        const waiter = pending.get(message.requestId);
+        pending.delete(message.requestId);
+        if (waiter) message.ok ? waiter.resolve(message.result) : waiter.reject(new Error(message.error));
+      } else if (message.type === 'event') {
+        if (message.error) show(message.error); else apply(message.resource);
+      }
+    });
+
+    document.getElementById('add').addEventListener('submit', async (submit) => {
+      submit.preventDefault();
+      const input = document.getElementById('text');
+      try {
+        await request('resource.write', {
+          resourceId: 'board', expectedVersion: version,
+          value: { items: [...items, { text: input.value }] },
+        });
+        input.value = '';
+      } catch (error) { show(error); }
+    });
+  </script>
+</body>
+</html>

@@ -12,10 +12,13 @@ export type ShellPopover = 'notifications' | 'lan' | 'language';
 export const shellUi = $state<{
   settingsOpen: boolean;
   settingsMounted: boolean;
+  /** 其他视图请求设置页落到的分类；设置页消费后清空。 */
+  settingsRequestedTab: string | null;
   popover: ShellPopover | null;
 }>({
   settingsOpen: false,
   settingsMounted: false,
+  settingsRequestedTab: null,
   popover: null,
 });
 
@@ -24,8 +27,10 @@ export function mountSettings(): void {
   shellUi.settingsMounted = true;
 }
 
-export function openSettings(): void {
+/** 打开设置；传入分类 id 时设置页会切到该分类（如从右栏添加菜单进入「插件」）。 */
+export function openSettings(tab?: string): void {
   shellUi.popover = null;
+  shellUi.settingsRequestedTab = tab ?? null;
   shellUi.settingsMounted = true;
   shellUi.settingsOpen = true;
 }

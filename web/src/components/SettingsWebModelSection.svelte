@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * 「设置 → 浏览器 → GPT Web」分区。
+   * 「设置 → GPT Web」独立分类。
    *
    * 只有四件事：登录与可用性、停止（释放槽位）、工具通道（OpenAI Tunnel）、清除数据。
    * 分区只展示 daemon 的事实，不自行推断可用性；GPT Web 的模型、窗口与强度都在网页里，
@@ -443,47 +443,51 @@
   );
 </script>
 
-<section class="settings-section web-model-section" aria-labelledby="web-model-title">
-  <div class="section-heading">
-    <div class="section-icon" aria-hidden="true"><Icon name="globe" size={17} /></div>
-    <div>
-      <h3 id="web-model-title">{i18n.t('settings.browser.webModel.title')}</h3>
-      <p>{i18n.t('settings.browser.webModel.desc')}</p>
+<div class="apple-manager">
+<div class="apple-scroller-proxy">
+<div class="settings-section web-model-section">
+  <div class="settings-section-header">
+    <div class="settings-section-title" id="web-model-title">{i18n.t('settings.browser.webModel.title')}</div>
+    <div class="settings-section-actions">
+      <button
+        type="button"
+        class="btn btn--sm btn--secondary"
+        data-web-model-connect="1"
+        disabled={!isDesktop || probing}
+        onclick={() => void checkAvailability()}
+      >
+        {probing
+          ? i18n.t('settings.browser.webModel.connecting')
+          : i18n.t('settings.browser.webModel.connect')}
+      </button>
     </div>
-    <button
-      type="button"
-      class="ctl ctl--primary"
-      disabled={!isDesktop || probing}
-      onclick={() => void checkAvailability()}
-    >
-      {probing
-        ? i18n.t('settings.browser.webModel.connecting')
-        : i18n.t('settings.browser.webModel.connect')}
-    </button>
   </div>
+  <div class="settings-section-desc">{i18n.t('settings.browser.webModel.desc')}</div>
 
   {#if !isDesktop}
-    <div class="status-message">{i18n.t('settings.browser.webModel.needDesktop')}</div>
+    <div class="settings-notice settings-notice--warn">{i18n.t('settings.browser.webModel.needDesktop')}</div>
   {/if}
 
-  <div class="row-list">
-    <div class="row" data-web-model-status="1">
-      <div class="row-copy">
-        <strong>{probe ? statusLabel(probe.status) : i18n.t('webModel.status.notStarted')}</strong>
+  <div class="settings-rows">
+    <div class="settings-row" data-web-model-status="1">
+      <div class="settings-row-copy">
+        <span class="settings-row-title wm-status-title">
+          <span class="settings-dot" class:settings-dot--ok={probe?.status === 'ok'} class:settings-dot--warn={Boolean(probe) && probe?.status !== 'ok'} aria-hidden="true"></span>
+          {probe ? statusLabel(probe.status) : i18n.t('webModel.status.notStarted')}
+        </span>
         {#if probe?.reason}
-          <span>{i18n.t('webModel.reason.detail', { reason: probe.reason })}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.reason.detail', { reason: probe.reason })}</span>
         {/if}
         {#if probe?.status === 'ok'}
           {#if accountPlanLabel}
-            <span>{i18n.t('settings.browser.webModel.accountHint', { hint: accountPlanLabel })}</span>
+            <span class="settings-row-desc">{i18n.t('settings.browser.webModel.accountHint', { hint: accountPlanLabel })}</span>
           {/if}
-          <span>{i18n.t('webModel.status.fixedEntry')}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.status.fixedEntry')}</span>
         {/if}
       </div>
       <button
         type="button"
-        class="ctl"
-        class:ctl--primary={needsOpenHome || !probe}
+        class={`btn btn--sm ${needsOpenHome || !probe ? 'btn--primary' : 'btn--secondary'}`}
         disabled={!isDesktop || probing}
         data-web-model-open="1"
         onclick={() => void openWebModelHome()}
@@ -492,26 +496,26 @@
       </button>
     </div>
 
-    <div class="row" data-web-model-slot="1">
-      <div class="row-copy">
-        <strong>{i18n.t('webModel.slot.title')}</strong>
+    <div class="settings-row" data-web-model-slot="1">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('webModel.slot.title')}</span>
         {#if slotOwner}
-          <span>
+          <span class="settings-row-desc">
             {slotOwner.active ? i18n.t('webModel.slot.ownedActive') : i18n.t('webModel.slot.owned')}
             · {slotOwner.sessionTitle?.trim() || i18n.t('webModel.slot.untitled')}
           </span>
         {:else}
-          <span>{i18n.t('webModel.slot.idle')}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.slot.idle')}</span>
         {/if}
         {#if runtimeProjection.quota}
-          <span>{i18n.t('webModel.quota.notice')}</span>
-          <span>{i18n.t('webModel.quota.sentCount', { count: runtimeProjection.quota.sentMessages })}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.quota.notice')}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.quota.sentCount', { count: runtimeProjection.quota.sentMessages })}</span>
         {/if}
-        <small>{i18n.t('webModel.slot.stopHint')}</small>
+        <span class="settings-row-desc wm-fine">{i18n.t('webModel.slot.stopHint')}</span>
       </div>
       <button
         type="button"
-        class="ctl"
+        class="btn btn--sm btn--secondary"
         data-web-model-stop="1"
         disabled={!isDesktop || stopping || !slotOwner}
         onclick={() => void stopWeb()}
@@ -520,10 +524,10 @@
   </div>
 
   <details class="tools-group" data-web-model-tunnel="1">
-    <summary class="row row--summary">
-      <div class="row-copy">
-        <strong>{i18n.t('webModel.group.tools')}</strong>
-        <span>{tunnel?.channel === 'openai_tunnel' ? 'OpenAI Tunnel' : i18n.t('webModel.tunnel.channelNone')}</span>
+    <summary class="settings-row wm-summary">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('webModel.group.tools')}</span>
+        <span class="settings-row-desc">{tunnel?.channel === 'openai_tunnel' ? 'OpenAI Tunnel' : i18n.t('webModel.tunnel.channelNone')}</span>
       </div>
       <span class="group-summary-end">
         <span class="state" class:state--ok={tunnel?.ready}>
@@ -533,79 +537,79 @@
       </span>
     </summary>
 
-    <div class="row-list row-list--nested">
-      <div class="row row--stacked">
-        <div class="row-copy">
-          <span>{i18n.t('webModel.tunnel.setupGuide')}</span>
+    <div class="settings-rows wm-nested">
+      <div class="settings-row settings-row--stacked">
+        <div class="settings-row-copy">
+          <span class="settings-row-desc">{i18n.t('webModel.tunnel.setupGuide')}</span>
         </div>
-        <div class="row-actions">
-          <button type="button" class="ctl" onclick={() => openPlatformPage('tunnels')}>
+        <div class="settings-row-actions">
+          <button type="button" class="btn btn--sm btn--secondary" onclick={() => openPlatformPage('tunnels')}>
             {i18n.t('webModel.tunnel.openPlatformTunnels')}
           </button>
-          <button type="button" class="ctl" onclick={() => openPlatformPage('api_keys')}>
+          <button type="button" class="btn btn--sm btn--secondary" onclick={() => openPlatformPage('api_keys')}>
             {i18n.t('webModel.tunnel.openPlatformKeys')}
           </button>
         </div>
       </div>
 
       {#if tunnel}
-        <div class="row">
-          <div class="row-copy">
-            <strong>{i18n.t('webModel.tunnel.statusLabel')}</strong>
-            <span>{tunnelStatusText(tunnel)}</span>
+        <div class="settings-row">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">{i18n.t('webModel.tunnel.statusLabel')}</span>
+            <span class="settings-row-desc">{tunnelStatusText(tunnel)}</span>
           </div>
         </div>
       {/if}
 
-      <div class="row">
-        <div class="row-copy"><strong>Tunnel id</strong></div>
-        <div class="row-control">
-          <input class="ctl-input" bind:value={tunnelId} data-web-model-tunnel-id="1" placeholder="tunnel_..." />
+      <div class="settings-row">
+        <div class="settings-row-copy"><span class="settings-row-title">Tunnel id</span></div>
+        <div class="wm-control">
+          <input class="form-input" bind:value={tunnelId} data-web-model-tunnel-id="1" placeholder="tunnel_..." />
         </div>
       </div>
 
-      <div class="row">
-        <div class="row-copy">
-          <strong>{i18n.t('webModel.tunnel.apiKey')}</strong>
+      <div class="settings-row">
+        <div class="settings-row-copy">
+          <span class="settings-row-title">{i18n.t('webModel.tunnel.apiKey')}</span>
         </div>
-        <div class="row-control row-control--inline">
+        <div class="wm-control wm-control--inline">
           {#if tunnel?.hasApiKey && !keyEditing}
             <input
-              class="ctl-input"
+              class="form-input"
               type="text"
               readonly
               autocomplete="off"
               value={keyRevealed ? revealedKey : (tunnel.apiKeyPreview ?? '')}
               data-web-model-tunnel-credential="1"
             />
-            <button type="button" class="ctl" onclick={() => void toggleKeyReveal()}>
+            <button type="button" class="btn btn--sm btn--secondary" onclick={() => void toggleKeyReveal()}>
               {keyRevealed ? i18n.t('webModel.tunnel.keyHide') : i18n.t('webModel.tunnel.keyShow')}
             </button>
-            <button type="button" class="ctl" onclick={startEditingKey}>{i18n.t('webModel.tunnel.keyReplace')}</button>
+            <button type="button" class="btn btn--sm btn--secondary" onclick={startEditingKey}>{i18n.t('webModel.tunnel.keyReplace')}</button>
           {:else}
             <input
-              class="ctl-input"
+              class="form-input"
               type={keyInputVisible ? 'text' : 'password'}
               autocomplete="off"
               bind:value={apiKey}
               data-web-model-tunnel-credential="1"
               placeholder="sk-..."
             />
-            <button type="button" class="ctl" onclick={() => (keyInputVisible = !keyInputVisible)}>
+            <button type="button" class="btn btn--sm btn--secondary" onclick={() => (keyInputVisible = !keyInputVisible)}>
               {keyInputVisible ? i18n.t('webModel.tunnel.keyHide') : i18n.t('webModel.tunnel.keyShow')}
             </button>
             {#if tunnel?.hasApiKey}
-              <button type="button" class="ctl" onclick={cancelEditingKey}>{i18n.t('webModel.tunnel.keyCancel')}</button>
+              <button type="button" class="btn btn--sm btn--secondary" onclick={cancelEditingKey}>{i18n.t('webModel.tunnel.keyCancel')}</button>
             {/if}
           {/if}
         </div>
       </div>
 
-      <div class="row">
-        <div class="row-copy"><strong>{i18n.t('webModel.tunnel.toolProfile')}</strong></div>
-        <div class="row-control">
+      <div class="settings-row">
+        <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.tunnel.toolProfile')}</span></div>
+        <div class="wm-control">
           <select
-            class="ctl-input"
+            class="form-input"
             bind:value={toolProfile}
             data-web-model-tool-profile="1"
             onchange={() => void applyToolPolicy({ toolProfile })}
@@ -617,14 +621,14 @@
         </div>
       </div>
 
-      <div class="row">
-        <div class="row-copy">
-          <strong>{i18n.t('webModel.tunnel.approvalMode')}</strong>
-          <span>{i18n.t(`webModel.tunnel.approval.${approvalMode}Hint`)}</span>
+      <div class="settings-row">
+        <div class="settings-row-copy">
+          <span class="settings-row-title">{i18n.t('webModel.tunnel.approvalMode')}</span>
+          <span class="settings-row-desc">{i18n.t(`webModel.tunnel.approval.${approvalMode}Hint`)}</span>
         </div>
-        <div class="row-control">
+        <div class="wm-control">
           <select
-            class="ctl-input"
+            class="form-input"
             bind:value={approvalMode}
             data-web-model-approval-mode="1"
             onchange={() => void applyToolPolicy({ approvalMode })}
@@ -636,32 +640,32 @@
         </div>
       </div>
 
-      <div class="row row--actions">
-        <div class="row-actions">
-          <button type="button" class="ctl ctl--primary" disabled={!isDesktop || tunnelBusy} onclick={() => void saveTunnel()}>
+      <div class="settings-row">
+        <div class="settings-row-actions">
+          <button type="button" class="btn btn--sm btn--primary" disabled={!isDesktop || tunnelBusy} onclick={() => void saveTunnel()}>
             {i18n.t('webModel.action.configureTunnel')}
           </button>
-          <button type="button" class="ctl" disabled={!isDesktop || tunnelBusy} onclick={() => void clearTunnel()}>
+          <button type="button" class="btn btn--sm btn--secondary" disabled={!isDesktop || tunnelBusy} onclick={() => void clearTunnel()}>
             {i18n.t('webModel.action.clearTunnel')}
           </button>
         </div>
       </div>
 
-      <div class="row row--actions" data-web-model-connector="1">
-        <div class="row-copy">
-          <strong>{i18n.t('webModel.connector.title')}</strong>
+      <div class="settings-row" data-web-model-connector="1">
+        <div class="settings-row-copy">
+          <span class="settings-row-title">{i18n.t('webModel.connector.title')}</span>
           {#if connectorMessage}
-            <span>{connectorMessage}</span>
+            <span class="settings-row-desc">{connectorMessage}</span>
           {/if}
         </div>
-        <div class="row-actions">
-          <button type="button" class="ctl" disabled={!isDesktop || connectorBusy} onclick={() => void checkConnector()}>
+        <div class="settings-row-actions">
+          <button type="button" class="btn btn--sm btn--secondary" disabled={!isDesktop || connectorBusy} onclick={() => void checkConnector()}>
             {i18n.t('webModel.connector.check')}
           </button>
-          <button type="button" class="ctl" data-web-model-refresh-tools="1" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void refreshConnectorTools()}>
+          <button type="button" class="btn btn--sm btn--secondary" data-web-model-refresh-tools="1" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void refreshConnectorTools()}>
             {i18n.t('webModel.connector.refresh')}
           </button>
-          <button type="button" class="ctl" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void configureConnector()}>
+          <button type="button" class="btn btn--sm btn--secondary" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void configureConnector()}>
             {i18n.t('webModel.connector.configure')}
           </button>
         </div>
@@ -669,15 +673,15 @@
     </div>
   </details>
 
-  <div class="row-list">
-    <div class="row">
-      <div class="row-copy">
-        <strong>{i18n.t('webModel.action.clearData')}</strong>
-        <span>{i18n.t('settings.browser.clearDataWebNotice')}</span>
+  <div class="settings-rows">
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <span class="settings-row-title">{i18n.t('webModel.action.clearData')}</span>
+        <span class="settings-row-desc">{i18n.t('settings.browser.clearDataWebNotice')}</span>
       </div>
       <button
         type="button"
-        class="ctl"
+        class="btn btn--sm btn--secondary"
         data-web-model-clear-data="1"
         disabled={!isDesktop || clearing}
         onclick={() => void clearWebData()}
@@ -686,292 +690,49 @@
   </div>
 
   {#if notice}
-    <div class="status-message status-message--success">{notice}</div>
+    <div class="settings-notice settings-notice--success">{notice}</div>
   {/if}
   {#if errorMessage}
-    <div class="status-message status-message--error">{errorMessage}</div>
+    <div class="settings-notice settings-notice--error">{errorMessage}</div>
     {#if errorIsSlotBusy && slotOwner}
-      <div class="row-actions row-actions--start">
-        <button type="button" class="ctl" onclick={() => goToSlotOwnerSession(slotOwner)}>
+      <div class="settings-row-actions wm-actions-start">
+        <button type="button" class="btn btn--sm btn--secondary" onclick={() => goToSlotOwnerSession(slotOwner)}>
           {i18n.t('webModel.slot.goToOwner')}
         </button>
-        <button type="button" class="ctl" disabled={stopping} onclick={() => void stopWeb()}>
+        <button type="button" class="btn btn--sm btn--secondary" disabled={stopping} onclick={() => void stopWeb()}>
           {i18n.t('webModel.action.stop')}
         </button>
       </div>
     {/if}
   {/if}
-</section>
+</div>
+</div>
+</div>
 
 <style>
-  /* 与「设置 → 浏览器」其他分区同一套结构和令牌：分区标题 + 以分隔线划分的行（左侧标题与说明，
-     右侧控件）。字号、字重、间距、边框、圆角都取自同一组 --ind-* 变量，不另起一套。 */
-  .settings-section {
-    padding: 0 2px 26px;
-  }
-
-  .section-heading {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-
-  .section-heading > div:not(.section-icon) {
-    min-width: 0;
-    flex: 1;
-  }
-
-  .section-icon {
-    width: 34px;
-    height: 34px;
-    display: grid;
-    flex: 0 0 auto;
-    place-items: center;
-    border: 1px solid var(--ind-border-control);
-    border-radius: 8px;
-    color: var(--ind-tab-accent);
-    background: var(--ind-bg-control);
-  }
-
-  h3 {
-    margin: 0;
-    color: var(--ind-foreground);
-    font-size: 14px;
-    font-weight: 650;
-    letter-spacing: 0;
-  }
-
-  .section-heading p {
-    margin: 5px 0 0;
-    color: var(--ind-foreground-secondary);
-    font-size: 12px;
-    line-height: 1.55;
-  }
-
-  .row-list {
-    border-top: 1px solid var(--ind-border-separator);
-  }
-
-  .row-list + .tools-group,
-  .tools-group + .row-list {
-    margin-top: 14px;
-  }
-
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    min-height: 58px;
-    padding: 10px 0;
-    border-bottom: 1px solid var(--ind-border-separator);
-    box-sizing: border-box;
-  }
-
-  .row-copy {
-    min-width: 0;
-    flex: 1;
-  }
-
-  .row-copy strong,
-  .row-copy span,
-  .row-copy small {
-    display: block;
-  }
-
-  .row-copy strong {
-    color: var(--ind-foreground);
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .row-copy span,
-  .row-copy small {
-    margin-top: 4px;
-    color: var(--ind-foreground-secondary);
-    font-size: 11px;
-    line-height: 1.45;
-    overflow-wrap: anywhere;
-  }
-
-  .row-copy small {
-    color: var(--ind-foreground-muted);
-  }
-
-  .row-control {
-    flex: 0 1 340px;
-    min-width: 0;
-  }
-
-  .row-control--inline {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .row-actions {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .row-actions--start {
-    margin-top: 10px;
-  }
-
-  .row--stacked {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
-  }
-
-  .row--actions {
-    min-height: 52px;
-  }
-
-  .row--actions > .row-actions:only-child {
-    margin-left: auto;
-  }
+  /* 视觉来自 settings.css 的共享类与全局 .btn / .form-input，这里只放本页特有的布局。 */
+  .wm-control { flex: 0 1 340px; min-width: 0; }
+  .wm-control--inline { display: flex; align-items: center; gap: 6px; }
+  .wm-control--inline .form-input { flex: 1; }
+  .wm-status-title { display: inline-flex; align-items: center; gap: 8px; }
+  .wm-fine { color: var(--foreground-muted); opacity: 0.85; }
+  .wm-actions-start { margin-top: 10px; }
+  .wm-nested { border-top: 0; }
 
   /* 折叠分组：标题行本身就是一行，右侧是状态文字和展开箭头。 */
-  .tools-group {
-    border-top: 1px solid var(--ind-border-separator);
-  }
-
-  .tools-group > summary {
-    cursor: pointer;
-    list-style: none;
-  }
-
-  .tools-group > summary::-webkit-details-marker {
-    display: none;
-  }
-
-  .tools-group > summary:hover strong,
-  .tools-group > summary:hover .group-chevron {
-    color: var(--primary);
-  }
-
-  .tools-group > summary:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: -2px;
-    border-radius: 6px;
-  }
-
-  .row--summary {
-    min-height: 52px;
-  }
-
-  .group-summary-end {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    flex: none;
-  }
-
-  .group-summary-end .state {
-    color: var(--ind-foreground-secondary);
-    font-size: 11px;
-  }
-
-  .group-summary-end .state--ok {
-    color: var(--success, #2f9e63);
-  }
-
-  .group-chevron {
-    display: inline-flex;
-    color: var(--ind-foreground-muted);
-    transition: transform 0.15s ease;
-  }
-
-  .tools-group[open] > summary .group-chevron {
-    transform: rotate(180deg);
-  }
-
-  .row-list--nested {
-    border-top: 0;
-    margin-top: 0;
-  }
-
-  /* 控件：与同页其他按钮 / 输入同一套边框、底色、圆角和字号。 */
-  .ctl {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 auto;
-    gap: 6px;
-    min-height: 29px;
-    padding: 0 10px;
-    border: 1px solid var(--ind-border-control);
-    border-radius: 6px;
-    color: var(--ind-foreground);
-    background: var(--ind-bg-control);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .ctl:hover:not(:disabled) {
-    border-color: var(--primary);
-  }
-
-  .ctl--primary {
-    border-color: var(--primary);
-    background: var(--primary);
-    color: var(--primary-foreground, #fff);
-  }
-
-  .ctl--primary:hover:not(:disabled) {
-    background: var(--primary-hover, var(--primary));
-  }
-
-  .ctl:disabled {
-    cursor: default;
-    opacity: 0.45;
-  }
-
-  .ctl-input {
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    min-height: 29px;
-    padding: 0 10px;
-    border: 1px solid var(--ind-border-control);
-    border-radius: 6px;
-    color: var(--ind-foreground);
-    background: var(--ind-bg-control);
-    font-size: 12px;
-  }
-
-  .row-control--inline .ctl-input {
-    flex: 1;
-  }
-
-  .ctl-input:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: -1px;
-  }
-
-  .status-message {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 14px;
-    font-size: 12px;
-    color: var(--ind-foreground-secondary);
-  }
-
-  .status-message--error { color: var(--danger, #c53f4f); }
-  .status-message--success { color: var(--success, #2f9e63); }
+  .tools-group { border-top: 1px solid var(--border-subtle); margin-top: var(--space-3); }
+  .tools-group > summary { cursor: pointer; list-style: none; }
+  .tools-group > summary::-webkit-details-marker { display: none; }
+  .tools-group > summary:hover .settings-row-title,
+  .tools-group > summary:hover .group-chevron { color: var(--primary); }
+  .tools-group > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; border-radius: 6px; }
+  .group-summary-end { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+  .group-summary-end .state { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .group-summary-end .state--ok { color: var(--success); }
+  .group-chevron { display: inline-flex; color: var(--foreground-muted); transition: transform 0.15s ease; }
+  .tools-group[open] > summary .group-chevron { transform: rotate(180deg); }
 
   @media (max-width: 640px) {
-    .row {
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
-    .row-control {
-      flex: 1 1 100%;
-    }
+    .wm-control { flex: 1 1 100%; }
   }
 </style>

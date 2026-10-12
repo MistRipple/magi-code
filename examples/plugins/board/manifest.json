@@ -1,0 +1,54 @@
+{
+  "sdkVersion": 1,
+  "id": "example.board",
+  "version": "1.0.0",
+  "name": "看板示例",
+  "description": "展示工具、命令、资源同步、设置与隔离视图如何在同一个插件里协作的最小示例。",
+  "backend": "plugin.mjs",
+  "permissions": [
+    { "kind": "storage", "scope": "workspace", "targets": ["board", "__settings"] },
+    { "kind": "tools", "scope": "workspace", "targets": ["board-summary", "board-add"] }
+  ],
+  "dataSchemaVersion": 1,
+  "settingsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "title": { "type": "string", "title": "看板标题", "default": "我的看板" },
+      "maxItems": { "type": "integer", "title": "最多条目数", "default": 50 }
+    }
+  },
+  "contributions": {
+    "resources": [{ "id": "board", "title": "看板", "description": "条目列表，视图与工具共享这一份数据" }],
+    "tools": [
+      {
+        "id": "board-summary",
+        "title": "读取看板",
+        "description": "返回看板当前的条目与版本。",
+        "inputSchema": { "type": "object", "additionalProperties": false },
+        "readOnly": true
+      },
+      {
+        "id": "board-add",
+        "title": "添加条目",
+        "description": "向看板追加一个条目；写入经过与界面相同的版本检查。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text"],
+          "properties": { "text": { "type": "string", "minLength": 1, "maxLength": 200 } }
+        },
+        "readOnly": false
+      }
+    ],
+    "commands": [{ "id": "clear", "title": "清空看板", "description": "删除看板中的全部条目。" }],
+    "views": [
+      {
+        "id": "dashboard",
+        "title": "看板",
+        "entry": "ui/index.html",
+        "placements": ["rightPane", "main", "home", "homeCard"]
+      }
+    ]
+  }
+}

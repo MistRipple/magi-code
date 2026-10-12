@@ -117,7 +117,7 @@ MCP 调用和结果不写入 ChatGPT composer，也不作为普通用户消息�
 ```text
 WebConversationBinding {
   mode: temporary | saved,
-  engine_id: chatgpt-web/default,
+  engine_id: plugin/openai.chatgpt-web/default,
   remote_conversation_id?,
   remote_title?,
   last_synced_remote_message_id?,
@@ -167,7 +167,7 @@ WebConversationBinding {
 
 ### 4.5 关闭与停止
 - 点右栏 Tab 的关闭按钮：只隐藏视图，页面、对话、槽位、进行中的推理都保留；Tab 条与菜单显示“后台推理中”；Tab 标题栏只有只读地址、连接状态和“检查连接”，不放破坏性动作。
-- 设置 → 浏览器 → GPT Web 的“停止并释放”，或被占用提示条上的“释放并使用”：取消进行中的推理，销毁页面，释放槽位；该会话变为失效。登录态仍保留。
+- 设置 → GPT Web 的“停止并释放”，或被占用提示条上的“释放并使用”：取消进行中的推理，销毁页面，释放槽位；该会话变为失效。登录态仍保留。
 - “清除 Web 数据”是显式的另一个操作：同上，并清理持久分区。它只清理本地登录态和页面数据，不替用户删除 ChatGPT 已保存对话；所有已保存绑定标记为待重新登录 / 待重新绑定，Magi 已有的 canonical 镜像保留。
 - 同一进程内再次点击“新增 → GPT Web”或 Tab 条入口只是重新显示原宿主，不是重新登录，也不是新建临时对话；只有“停止并释放 / 释放并使用 / 清除数据”才会销毁页面。
 
@@ -320,13 +320,13 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 
 ## 9. 引擎与设置
 
-- **固定入口**：只有一个 Web 引擎条目，`engineId = chatgpt-web/default`，`apiProtocol = chatgpt_web`，不写 `llm`、不写 baseUrl / apiKey，来源标注“来自 Web”。不做模型菜单发现，不保存强度取值域，模型与强度由用户在网页里选。
+- **固定入口**：只有一个 Web 引擎条目，`engineId = plugin/openai.chatgpt-web/default`，`apiProtocol = chatgpt_web`，不写 `llm`、不写 baseUrl / apiKey，来源标注“来自 Web”。不做模型菜单发现，不保存强度取值域，模型与强度由用户在网页里选。
 - 会话内主模型选择器：未登录或登录探测未完成时**不显示** Web 入口；登录成功后空白会话可见并可选这一项；已有本地消息的会话不显示；Web 会话可切到本地模型（W2、W3）。不把网页里的 GPT 模型名称追加为 Magi 的独立模型条目。
 - 选择 Web 引擎后显示模式选择：临时模式直接开始新的多轮临时对话；已保存模式显示 Web 历史选择器和“新建已保存对话”。已保存模式的 Magi 会话标题只接受 Web 返回的标题，标题读取失败时显示明确的未同步状态，不自行猜标题。
 - 全局 `orchestrator` 保存入口拒绝 `chatgpt_web`；Web 引擎只能作为会话级绑定存在。
 - 引擎状态（可用 / 需要登录 / 站点被拦 / 需要桌面 / 额度用尽）由 daemon 投影，UI 只展示，前端不自造结论。未登录时不显示 Web 引擎。
 - 退出登录或清除 Web 数据后，Magi 既有 Web canonical 记录仍可读；临时绑定不可恢复，已保存绑定必须在同一账号重新登录并重新校验 `conversation_id` 后才能继续。
-- 设置 → 浏览器 → GPT Web：登录状态、打开主页、**停止并释放**、清除 Web 数据、T3 通道状态与配置、当前槽位拥有者、临时 / 已保存模式、后台推理中的指示。不再有“连接 / 刷新 Web 模型”与上限标定。
+- 设置 → GPT Web：登录状态、打开主页、**停止并释放**、清除 Web 数据、T3 通道状态与配置、当前槽位拥有者、临时 / 已保存模式、后台推理中的指示。不再有“连接 / 刷新 Web 模型”与上限标定。
 - 额度只按**实际发送条数**计数展示，不折算 token，不进 token 聚合。
 
 ---

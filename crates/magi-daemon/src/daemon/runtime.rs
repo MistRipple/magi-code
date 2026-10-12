@@ -4,6 +4,7 @@ use super::{
     events::publish_ledger_status_event,
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
     persistence::{RuntimeSidecarPersistence, StateRepository},
+    plugin_bridge::PluginServices,
 };
 use magi_api::{
     ApiError, ApiState, DaemonIdentity, DirectHttpModelProbeConfig, RunnerManager,
@@ -988,6 +989,8 @@ pub(crate) struct DaemonRuntime {
     runtime_maintenance: RuntimeMaintenance,
     managed_process_group: ManagedProcessGroup,
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
+    /// 插件安装、授权和生命周期的唯一 daemon 所有者；UI 只通过 API 投影访问。
+    plugins: PluginServices,
 }
 
 impl DaemonRuntime {
@@ -1063,6 +1066,12 @@ impl DaemonRuntime {
         );
         runtime_maintenance.publish_runtime_status_event("system-runtime-maintenance-ready");
 
+        let managed_process_group = ManagedProcessGroup::new();
+        let plugins = PluginServices::open(
+            &config.state_root,
+            event_bus.clone(),
+            managed_process_group.clone(),
+        )?;
         Ok(Self {
             state_root: config.state_root.clone(),
             state_repository,
@@ -1075,8 +1084,9 @@ impl DaemonRuntime {
             governance: Arc::new(GovernanceService::default()),
             worker_runtime,
             runtime_maintenance,
-            managed_process_group: ManagedProcessGroup::new(),
+            managed_process_group,
             browser_host_controller_lifecycle: BrowserHostControllerLifecycle::new(),
+            plugins,
         })
     }
 
@@ -1535,6 +1545,10 @@ impl DaemonRuntime {
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
+            .with_plugin_tools(
+                self.plugins.tool_catalog_provider(),
+                self.plugins.tool_executor(),
+            )
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_image_generation_runtime(
                 image_generation_executor,
@@ -1853,6 +1867,8 @@ impl DaemonRuntime {
         .with_task_execution_registry(task_execution_registry)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
+        .with_plugin_manager(self.plugins.manager())
+        .with_plugin_data_migrator(self.plugins.data_migrator())
         .with_runtime_persistence(runtime_persistence)
         .with_canonical_event_next_sequence_provider({
             let repository = self.state_repository.clone();
@@ -1944,11 +1960,12 @@ impl DaemonRuntime {
         );
         // GPT Web 引擎的 client 工厂：宿主实现把驱动映射到 Desktop 宿主命令。
         // 应用级浏览器会话按需创建，因此这里只装配共享引用，不固定会话 id。
-        let web_model_factory: Option<Arc<dyn magi_web_model::WebModelClientFactory>> = {
+        let web_model_factory: Option<Arc<dyn magi_plugin_system::SessionEngineFactory>> = {
             let browser_dependencies = state.browser_tool_runtime_dependencies();
             match magi_api::WebModelHostFactory::new(
                 Arc::clone(&browser_dependencies.host_client),
                 Arc::clone(&browser_dependencies.authority),
+                self.plugins.manager(),
             ) {
                 Ok(factory) => {
                     state.web_model.set_bindings(Arc::clone(factory.bindings()));
@@ -1969,10 +1986,21 @@ impl DaemonRuntime {
                 }
             }
         };
+        let session_engine_factory =
+            self.plugins
+                .session_engine_factory(web_model_factory.map(|factory| {
+                    (
+                        magi_web_model::WEB_MODEL_ENGINE_ID_NAMESPACE.to_string(),
+                        factory,
+                    )
+                }))?;
+        let workflow_core_factory = self.plugins.workflow_core_factory()?;
+        let plugin_command_executor = self.plugins.command_executor();
         let mut llm_task_dispatcher = llm_task_dispatcher;
-        if let Some(factory) = web_model_factory {
-            llm_task_dispatcher = llm_task_dispatcher.with_web_model_client_factory(factory);
-        }
+        llm_task_dispatcher = llm_task_dispatcher
+            .with_session_engine_factory(session_engine_factory)
+            .with_workflow_core_factory(workflow_core_factory)
+            .with_plugin_command_executor(plugin_command_executor);
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())

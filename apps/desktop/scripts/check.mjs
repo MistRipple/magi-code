@@ -14,12 +14,16 @@ const requiredConfig = [
   "releaseType: release",
   "browser-automation-worker",
   "magi-daemon-app",
+  "magi-plugin-worker",
   ...bridgeBinaryNames,
   "browser-capability-manifest.json",
   "magi-desktop.cdx.json",
 ];
 for (const requirement of requiredConfig) {
   if (!config.includes(requirement)) throw new Error(`Electron Builder 配置缺少: ${requirement}`);
+}
+for (const resource of ["magi-plugin-worker", "magi-plugin-worker.exe", "Contents/Resources/daemon/magi-plugin-worker"]) {
+  if (!config.includes(resource)) throw new Error(`Electron Builder 配置缺少插件 Worker: ${resource}`);
 }
 for (const binaryName of bridgeBinaryNames) {
   for (const fileName of [binaryName, `${binaryName}.exe`]) {

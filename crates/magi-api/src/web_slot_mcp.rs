@@ -293,6 +293,34 @@ mod tests {
         let table = Arc::new(WebSlotTable::new());
         state.web_model.set_bindings(table.clone());
         state.install_web_slot_hooks();
+        let package =
+            crate::bundled_plugins::bundled_plugin_package(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .unwrap();
+        let permissions = package.manifest().permissions.clone();
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .install(
+                    &package,
+                    magi_plugin_system::PluginSource::Builtin {
+                        name: magi_web_model::WEB_MODEL_PLUGIN_ID.into(),
+                    },
+                )
+                .unwrap();
+            manager
+                .authorize(
+                    magi_web_model::WEB_MODEL_PLUGIN_ID,
+                    "application",
+                    permissions,
+                )
+                .unwrap();
+            manager
+                .enable(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+            manager
+                .activate(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+        }
         let endpoint = state.mcp_service.start_slot_gateway(&state).await.unwrap();
         Fixture {
             state,
@@ -419,7 +447,7 @@ mod tests {
         let kinds = turn
             .items
             .iter()
-            .filter(|item| item.tool_name.as_deref() == Some("magi.fs.read"))
+            .filter(|item| item.tool_name.as_deref() == Some("file_read"))
             .map(|item| (item.kind.clone(), item.tool_status.clone()))
             .collect::<Vec<_>>();
         assert!(

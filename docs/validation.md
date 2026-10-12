@@ -33,8 +33,11 @@
 | `npm run test:electron-browser-network-policy` | 开发依赖 Electron 的网络边界验收；验证 iframe、fetch、重定向和 localhost 预览来源 |
 | `npm run test:browser-core-live -- --session-id <id>` | 已运行 daemon 的真实会话/Tab；`--app-renderer` 使用已启动 Desktop 的可信 Renderer，`--lifecycle-regression` 覆盖生命周期。环境变量和可写操作开关见 scripts/verify-browser-core-live.mjs |
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、终态、取消、恢复和时序。应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部 |
+| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与脚本提供的本地 Provider；用示例插件走完安装、授权激活（插件页为左右分栏：左侧按「有更新/已安装/可安装」分组的可滚动列表，右侧在同一页面展示所选插件的详情与全部操作，默认选中第一项、不弹窗；含分页、搜索、过滤与「打开设置」快捷入口）、设置表单、主页入口与主内容区页面、隔离视图资源订阅、视图选中引用、模型发起的插件工具调用、命令、右栏视图与添加菜单（插件视图项、管理插件直达）、停用清理、MCP 服务插件壳（未激活拒绝、激活监听、停用释放、重新激活恢复）、外部会话（外部 agent 经 MCP 的读取、越界拒绝、待确认写入：外部会话是对应工作区下的真正会话，在主对话区只读打开，调用在 canonical 时间线里按工具卡片展示，待确认出现在会话自己的授权托盘并批准，窗口不在前台时发系统通知、停在其他标签时点外部会话回到「对话」，关闭「保存调用内容」后读到的内容不落库）、主页卡片、升级候选包预览与确认面板及升级排空、数据格式升级（新版入口在 Worker 内转换已有数据）、插件中心（发布工具签名目录 → daemon 验签 → 安装）。应用路径与端口通过 MAGI_ELECTRON_PLUGINS_* 设置 |
+| `cargo test -p magi-plugin-system --test catalog_tool` | 用 `scripts/plugin-center.mjs` 发布工具签名目录，再由 daemon 的 `PluginCatalog::verify` 校验；需要 Node.js，缺失时跳过 |
+| `npm run test:electron-gpt-web` | 已打包 Electron；把本机已登录的 `persist:magi-web-model` 分区复制到一次性状态根，验证第一方 GPT Web 插件安装激活、首次使用物化主页、探测、临时对话收发和停用释放，会向真实 ChatGPT 账号发送一条消息。`MAGI_GPT_WEB_FRESH=1` 只验证全新环境到“需要登录”；未找到登录分区时跳过。通过 MAGI_GPT_WEB_* 设置 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
-| `node scripts/verify-mcp-server.mjs --base <daemon-url> --mcp-bin <magi-mcp-path>` | 在独立状态根运行的 daemon 与已构建 magi-mcp；通过真实 HTTP/stdio 检查令牌、工具、审批与吊销；会注册工作区并修改测试实例设置 |
+| `node scripts/verify-mcp-server.mjs --base <daemon-url> --mcp-bin <magi-mcp-path>` | 在独立状态根运行的 daemon 与已构建 magi-mcp；通过真实 HTTP/stdio 检查令牌、工具、审批与吊销；会注册工作区、安装并激活 MCP 服务插件并修改测试实例设置 |
 
 核心集成按改动触发，不接入日常 npm test。Browser actions 负责页面交互和快照，network policy 负责 Chromium 网络边界；DOM 入口负责消息、工具、审批、取消和重启恢复；Browser live 检查当前 Tab 的物理生命周期，权限矩阵验证真实工具授权，MCP 入口验证 HTTP/stdio 对外协议。
 

@@ -37,6 +37,11 @@ export interface StallDetectionConfig {
 export interface ModelEngine {
   id: string;
   displayName: string;
+  /** daemon 注册的插件引擎只读投影，不能进入本地模型配置写入路径。 */
+  source?: 'plugin' | 'user';
+  pluginId?: string;
+  pluginContributionId?: string;
+  description?: string;
   /**
    * 连接配置（baseUrl / apiKey / model）。
    */

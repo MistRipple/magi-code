@@ -200,41 +200,13 @@ pub(super) fn start_controller(state: &ApiState, lifecycle: &BrowserHostControll
     // 通道配置只保存 Tunnel id 与权限档（API 密钥在 state root 下的私有文件里），运行态
     // 不落盘。daemon 重启后必须从 settings 重新装配 harness / tunnel；否则首个
     // Web turn 会在通道仍是默认 `none` 时静默降到 T2，用户必须再次打开设置页
-    // 才能恢复 T3。这条恢复只启动用户已经明确配置过的通道，不替用户创建
-    // Tunnel，也不读取或记录凭据内容。
+    // 才能恢复 T3。恢复只针对 GPT Web 插件已激活的情形（见 `restore_configured_channel`），
+    // 且只启动用户已经明确配置过的通道。
     if state.runtime_persistence().is_some() {
-        let raw = state
-            .settings_store
-            .get_section(magi_api::WEB_MODEL_TUNNEL_SECTION);
-        if !raw.is_null() {
-            match serde_json::from_value::<magi_api::WebModelTunnelConfig>(raw) {
-                Ok(config) => {
-                    let state = state.clone();
-                    handle.spawn(async move {
-                        match state
-                            .web_model
-                            .clone()
-                            .configure(&state, Some(config), None)
-                            .await
-                        {
-                            Ok(status) if !status.ready => tracing::warn!(
-                                code = %status.code,
-                                "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具"
-                            ),
-                            Ok(_) => tracing::info!("已恢复 GPT Web 工具通道"),
-                            Err(error) => tracing::warn!(
-                                %error,
-                                "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具"
-                            ),
-                        }
-                    });
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "GPT Web 工具通道配置无法解析，该 Web 会话没有项目工具"
-                ),
-            }
-        }
+        let state = state.clone();
+        handle.spawn(async move {
+            magi_api::restore_configured_channel(&state).await;
+        });
     }
 
     let state = state.clone();

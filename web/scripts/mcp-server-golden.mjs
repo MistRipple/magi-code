@@ -8,6 +8,9 @@ const read = (relative) => fs.readFileSync(path.join(repositoryRoot, relative), 
 const section = read('web/src/components/SettingsMcpServerSection.svelte');
 const audit = read('web/src/components/SettingsMcpServerAudit.svelte');
 const tray = read('web/src/components/ExternalApprovalTray.svelte');
+const approvalStore = read('web/src/stores/external-approvals.svelte.ts');
+const approvalActions = read('web/src/components/ExternalApprovalActions.svelte');
+const settingsPanel = read('web/src/components/SettingsPanel.svelte');
 const toolsTab = read('web/src/components/SettingsToolsTab.svelte');
 const shell = read('web/src/web/WebWorkbenchShell.svelte');
 const bridge = read('web/src/shared/bridges/web-client-bridge.ts');
@@ -132,19 +135,34 @@ assert.match(
   /event\.payload\?\.external === true\) \{[\s\S]*?MCP_APPROVALS_CHANGED_EVENT[\s\S]*?return;[\s\S]*?\}\s*refreshCurrentSessionToolApprovals\(eventType\)/,
 );
 assert.match(shell, /<ExternalApprovalTray \/>/);
-assert.match(toolsTab, /<SettingsMcpServerSection \/>/);
+// MCP 服务是独立的设置分类（插件激活后才出现），不再嵌在工具页里。
+assert.match(settingsPanel, /<SettingsMcpServerSection \/>/);
+assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
 
 // ── 托盘：没有待确认项时不产生周期请求；无管理权限时自行停用 ─────────────────
-assert.match(tray, /if \(approvals\.length > 0\) void refresh\(\)/);
-assert.match(tray, /disabled = true;/);
-assert.match(tray, /'allow_once'/);
-assert.doesNotMatch(tray, /allow_for_turn/);
+// 托盘与外部会话里的调用卡片共用同一个存储和同一组操作按钮：批准与拒绝只有一个入口。
+assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0\) void refreshExternalApprovals\(\)/);
+assert.match(approvalStore, /disabled = true;/);
+assert.match(approvalActions, /'allow_once'/);
+assert.doesNotMatch(approvalActions + approvalStore, /allow_for_turn/);
+// 窗口不在前台时新的待确认发系统通知；启动时已存在的不重复提醒。
+assert.match(approvalStore, /new Notification\(/);
+assert.match(approvalStore, /document\.hasFocus\(\)/);
+assert.match(approvalStore, /if \(!loadedOnce\)/);
+assert.match(tray, /<ExternalApprovalActions \{approval\} \/>/);
+// 外部会话是真正的会话：在主对话区打开，输入区换成只读提示，待确认走会话自己的授权托盘（同一个组件）。
+const threadPanel = read('web/src/components/ThreadPanel.svelte');
+assert.match(threadPanel, /isExternalSessionId\(messagesState\.currentSessionId\)[\s\S]*?<ExternalSessionBar \/>[\s\S]*?<InputArea \/>/);
+assert.match(read('web/src/components/ExternalSessionBar.svelte'), /externalSession\.readOnlyNote/);
+assert.doesNotMatch(read('web/src/components/ExternalSessionBar.svelte'), /textarea|<InputArea/);
+// 设置页只留调用审计，待确认不再在设置里重复出现。
+assert.doesNotMatch(section, /resolveMcpServerApproval|data-mcp-server-approvals/);
 
 // ── i18n：用到的键中英文都存在，且两边键集合一致 ─────────────────────────────
 const usedKeys = new Set();
 for (const action of ['token.view_secret', 'token.update', 'token.rotate']) usedKeys.add(`mcpServer.audit.action.${action}`);
 for (const id of ['connect', 'clients', 'remote', 'activity']) usedKeys.add(`mcpServer.tab.${id}`);
-for (const source of [section, tray, audit]) {
+for (const source of [section, tray, audit, approvalActions, approvalStore, read('web/src/components/ExternalSessionBar.svelte'), read('web/src/components/ExternalSessionsSection.svelte')]) {
   for (const match of source.matchAll(/i18n\.t\(\s*['`](mcpServer\.[^'`$]+)['`]/g)) usedKeys.add(match[1]);
 }
 for (const profile of ['read_only', 'edit', 'edit_trusted', 'exec']) {

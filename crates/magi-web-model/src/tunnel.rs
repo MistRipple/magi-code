@@ -371,6 +371,11 @@ pub enum TunnelClientStatus {
     Failed {
         reason: String,
     },
+    /// `runtimes stop` 未能确认托管运行时已释放：保留跟踪与待清理状态，
+    /// 拒绝把资源报告为已释放（生命周期操作不得据此宣告完成）。
+    StopFailed {
+        reason: String,
+    },
 }
 
 impl TunnelClientStatus {
@@ -391,6 +396,7 @@ impl TunnelClientStatus {
             Self::NotReady { .. } => "runtime_not_ready",
             Self::MissingCredential { .. } => "credential_missing",
             Self::Failed { .. } => "start_failed",
+            Self::StopFailed { .. } => "stop_failed",
         }
     }
 
@@ -411,6 +417,9 @@ impl TunnelClientStatus {
                 format!("缺少 Tunnels Read + Use 的 API 密钥文件：{path}")
             }
             Self::Failed { reason } => format!("tunnel-client 启动失败：{reason}"),
+            Self::StopFailed { reason } => {
+                format!("OpenAI Tunnel 停止失败，已保留待清理状态：{reason}")
+            }
         }
     }
 }
@@ -517,37 +526,7 @@ impl TunnelManager {
     /// projection, so relying on an async timeout here would still allow a
     /// wedged vendor CLI to block that route forever.
     fn run_status_probe(&self) -> std::io::Result<std::process::Output> {
-        let mut command = std_command(&self.config.client_binary);
-        command
-            .args(["runtimes", "cleanup"])
-            // tunnel-client 0.0.15 的 `cleanup` / `stop` 不再接受 profile 选择器，清单是整个
-            // 本机 state root 的。身份边界因此只剩 Magi 独占的 runtime 别名：解析时只认
-            // 与别名**完全相等**的条目，缺失或重名一律按未就绪处理（见 `parse_runtime_status`）。
-            .arg("--json")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CONTROL_PLANE_API_KEY")
-            .env_remove("OPENAI_ADMIN_KEY")
-            .env_remove("CONTROL_PLANE_ADMIN_KEY")
-            .env_remove("MAGI_OPENAI_COMPAT_API_KEY")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn()?;
-        let deadline = std::time::Instant::now() + TUNNEL_STATUS_TIMEOUT;
-        loop {
-            if child.try_wait()?.is_some() {
-                return child.wait_with_output();
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "tunnel runtime status probe timed out",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        run_inventory_probe(&self.config.client_binary)
     }
 
     /// 按需启动。任何前置件不满足都 fail closed，并保留「具体缺哪一项」。
@@ -776,34 +755,127 @@ impl TunnelManager {
     }
 
     /// 停止通道（应用退出、用户清除配置）。
-    pub async fn stop(&self) {
+    /// 停止托管运行时，并**核实**它确实已经释放。
+    ///
+    /// `runtimes stop` 的退出码不是唯一依据：命令失败但本机清单里已经没有该别名，视为已释放；
+    /// 命令成功但清单仍显示运行，则未释放。无法核实（清单探测失败）时只有 stop 命令成功才算数。
+    /// 失败时保留 `managed` 与跟踪，状态进入 `StopFailed`，由调用方重试，不能被当成已完成。
+    pub async fn stop(&self) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock().await;
         let should_stop = {
             let state = self.state.lock().expect("tunnel state lock");
             state.managed
         };
-        if should_stop {
-            let mut command = tokio_command(&self.config.client_binary);
-            command.args(["runtimes", "stop", &self.config.alias, "--json"]);
-            command.stdin(Stdio::null());
-            command.stdout(Stdio::null());
-            command.stderr(Stdio::null());
-            command.kill_on_drop(true);
-            for key in [
-                "OPENAI_API_KEY",
-                "CONTROL_PLANE_API_KEY",
-                "OPENAI_ADMIN_KEY",
-                "CONTROL_PLANE_ADMIN_KEY",
-                "MAGI_OPENAI_COMPAT_API_KEY",
-            ] {
-                command.env_remove(key);
-            }
-            let _ = tokio::time::timeout(TUNNEL_STOP_TIMEOUT, command.output()).await;
+        if !should_stop {
+            let mut state = self.state.lock().expect("tunnel state lock");
+            state.status = TunnelClientStatus::Stopped;
+            state.startup_deadline = None;
+            return Ok(());
         }
+        let mut command = tokio_command(&self.config.client_binary);
+        command.args(["runtimes", "stop", &self.config.alias, "--json"]);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        command.kill_on_drop(true);
+        for key in [
+            "OPENAI_API_KEY",
+            "CONTROL_PLANE_API_KEY",
+            "OPENAI_ADMIN_KEY",
+            "CONTROL_PLANE_ADMIN_KEY",
+            "MAGI_OPENAI_COMPAT_API_KEY",
+        ] {
+            command.env_remove(key);
+        }
+        let command_result = match tokio::time::timeout(TUNNEL_STOP_TIMEOUT, command.output()).await
+        {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(output)) => Err(format!("runtimes stop 退出码 {:?}", output.status.code())),
+            Ok(Err(error)) => Err(format!("无法执行 runtimes stop：{error}")),
+            Err(_) => Err("runtimes stop 超时".to_string()),
+        };
+        let released = match self.inventory_live().await {
+            // 清单确认运行时仍在：无论命令返回什么都没有释放。
+            Some(true) => false,
+            // 清单确认别名已不存在。
+            Some(false) => true,
+            // 无法核实：只信任成功的 stop 命令。
+            None => command_result.is_ok(),
+        };
         let mut state = self.state.lock().expect("tunnel state lock");
-        state.status = TunnelClientStatus::Stopped;
-        state.managed = false;
+        if released {
+            state.status = TunnelClientStatus::Stopped;
+            state.managed = false;
+            state.startup_deadline = None;
+            return Ok(());
+        }
+        let reason = command_result
+            .err()
+            .unwrap_or_else(|| "清单显示运行时仍在运行".to_string());
+        state.status = TunnelClientStatus::StopFailed {
+            reason: reason.clone(),
+        };
         state.startup_deadline = None;
+        Err(reason)
+    }
+
+    /// 本机清单里本管理器别名是否仍在运行：`Some(true)` 在运行，`Some(false)` 已不存在，
+    /// `None` 无法判断（探测失败，或厂商返回了未知运行状态——不把未知当作在运行）。
+    async fn inventory_live(&self) -> Option<bool> {
+        let binary = self.config.client_binary.clone();
+        let alias = self.config.alias.clone();
+        let output = tokio::task::spawn_blocking(move || run_inventory_probe(&binary))
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        match parse_runtime_status(&String::from_utf8_lossy(&output.stdout), &alias) {
+            TunnelClientStatus::Running { .. } => Some(true),
+            TunnelClientStatus::NotReady { reason }
+                if matches!(reason.as_str(), "starting" | "healthy") =>
+            {
+                Some(true)
+            }
+            TunnelClientStatus::NotReady { .. } => None,
+            _ => Some(false),
+        }
+    }
+}
+
+/// 读取本机运行时清单（`runtimes cleanup --json`，不带 `--apply`）。带硬性期限。
+fn run_inventory_probe(client_binary: &Path) -> std::io::Result<std::process::Output> {
+    let mut command = std_command(client_binary);
+    command
+        .args(["runtimes", "cleanup"])
+        // tunnel-client 0.0.15 的 `cleanup` / `stop` 不再接受 profile 选择器，清单是整个
+        // 本机 state root 的。身份边界因此只剩 Magi 独占的 runtime 别名：解析时只认
+        // 与别名**完全相等**的条目，缺失或重名一律按未就绪处理（见 `parse_runtime_status`）。
+        .arg("--json")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .env_remove("OPENAI_ADMIN_KEY")
+        .env_remove("CONTROL_PLANE_ADMIN_KEY")
+        .env_remove("MAGI_OPENAI_COMPAT_API_KEY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + TUNNEL_STATUS_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tunnel runtime status probe timed out",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1119,7 +1191,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_started_process_is_reported_running_and_stops_cleanly() {
+    async fn a_started_process_is_reported_running_and_an_unverifiable_stop_is_not_released() {
         let dir = temp_dir("run");
         let mut config = config(&dir);
         config.client_binary = PathBuf::from("/bin/sh");
@@ -1132,8 +1204,9 @@ mod tests {
         let manager = TunnelManager::new(config);
         let status = manager.start().await;
         assert!(status.is_running(), "{status:?}");
-        manager.stop().await;
-        assert_eq!(manager.status(), TunnelClientStatus::Stopped);
+        // /bin/sh 不是 tunnel-client：stop 命令失败且清单无法核实，必须按未释放处理。
+        assert!(manager.stop().await.is_err());
+        assert_eq!(manager.status().code(), "stop_failed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1165,15 +1238,22 @@ mod tests {
         let dir = temp_dir("status-command");
         let mut config = config(&dir);
         let script = r#"#!/bin/sh
-        if [ "$1" = "runtimes" ] && [ "$2" = "cleanup" ] && [ "$3" = "--json" ]; then
-  printf '{"entries":[{"alias":"magi-web-model","runtime_state":"ready","live_runtime":{"system":{"pid":99}}}]}'
+ALIVE="$0.alive"
+if [ "$1" = "runtimes" ] && [ "$2" = "cleanup" ] && [ "$3" = "--json" ]; then
+  if [ -f "$ALIVE" ]; then
+    printf '{"entries":[{"alias":"magi-web-model","runtime_state":"ready","live_runtime":{"system":{"pid":99}}}]}'
+  else
+    printf '{"entries":[]}'
+  fi
   exit 0
 fi
 if [ "$1" = "runtimes" ] && [ "$2" = "connect" ]; then
+  touch "$ALIVE"
   printf '{"running":true,"healthy":true,"ready":true,"pid":98}'
   exit 0
 fi
 if [ "$1" = "runtimes" ] && [ "$2" = "stop" ] && [ "$3" = "magi-web-model" ] && [ "$4" = "--json" ]; then
+  rm -f "$ALIVE"
   exit 0
 fi
 exit 17
@@ -1198,8 +1278,92 @@ exit 17
             TunnelClientStatus::Running { pid: 99 },
             "readiness must come from the local cleanup inventory"
         );
-        manager.stop().await;
+        manager
+            .stop()
+            .await
+            .expect("stop should release the runtime");
         assert_eq!(manager.status(), TunnelClientStatus::Stopped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 可控的假 tunnel-client：`connect` 登记运行时，`cleanup` 报告清单，`stop` 的行为由标记文件决定。
+    #[cfg(unix)]
+    fn stateful_client(tag: &str) -> (PathBuf, TunnelManager) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir(tag);
+        let mut config = config(&dir);
+        let script = r#"#!/bin/sh
+ALIVE="$0.alive"
+HERE="$(dirname "$0")"
+if [ "$1" = "runtimes" ] && [ "$2" = "cleanup" ]; then
+  if [ -f "$ALIVE" ]; then
+    printf '{"entries":[{"alias":"magi-web-model","runtime_state":"ready","live_runtime":{"system":{"pid":99}}}]}'
+  else
+    printf '{"entries":[]}'
+  fi
+  exit 0
+fi
+if [ "$1" = "runtimes" ] && [ "$2" = "connect" ]; then
+  touch "$ALIVE"
+  printf '{"running":true,"healthy":true,"ready":true,"pid":98}'
+  exit 0
+fi
+if [ "$1" = "runtimes" ] && [ "$2" = "stop" ]; then
+  if [ -f "$HERE/stop-works" ]; then rm -f "$ALIVE"; exit 0; fi
+  if [ -f "$HERE/stop-fails-but-exits" ]; then rm -f "$ALIVE"; exit 1; fi
+  if [ -f "$HERE/stop-lies" ]; then exit 0; fi
+  exit 1
+fi
+exit 17
+"#;
+        std::fs::write(&config.client_binary, script).expect("write fake tunnel client");
+        let mut permissions = std::fs::metadata(&config.client_binary)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&config.client_binary, permissions).expect("chmod");
+        config.expected_client_sha256 = Some(sha256_of(&config.client_binary));
+        std::fs::write(&config.credential_file, b"not-read-by-magi").expect("credential");
+        (dir, TunnelManager::new(config))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_stop_keeps_the_runtime_tracked_and_is_not_reported_as_released() {
+        let (dir, manager) = stateful_client("stop-failed");
+        assert!(manager.start().await.is_running());
+        // 命令失败且清单仍显示运行：未释放，保留待清理状态。
+        let error = manager.stop().await.unwrap_err();
+        assert!(error.contains("runtimes stop"), "{error}");
+        assert_eq!(manager.status().code(), "stop_failed");
+        assert!(!manager.status().is_running());
+        // 修复后可沿同一跟踪重试，真正释放后才回到 Stopped。
+        std::fs::write(dir.join("stop-works"), b"").unwrap();
+        manager.stop().await.expect("retry releases the runtime");
+        assert_eq!(manager.status(), TunnelClientStatus::Stopped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_trusts_the_inventory_over_the_exit_code() {
+        // stop 命令报告失败，但清单里运行时已经不存在：资源确实释放了。
+        let (dir, manager) = stateful_client("stop-exit-but-gone");
+        assert!(manager.start().await.is_running());
+        std::fs::write(dir.join("stop-fails-but-exits"), b"").unwrap();
+        manager
+            .stop()
+            .await
+            .expect("inventory shows the runtime is gone");
+        assert_eq!(manager.status(), TunnelClientStatus::Stopped);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // stop 命令报告成功，但清单仍显示运行：没有释放。
+        let (dir, manager) = stateful_client("stop-lies");
+        assert!(manager.start().await.is_running());
+        std::fs::write(dir.join("stop-lies"), b"").unwrap();
+        assert!(manager.stop().await.is_err());
+        assert_eq!(manager.status().code(), "stop_failed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

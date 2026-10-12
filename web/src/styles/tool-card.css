@@ -54,6 +54,14 @@
   cursor: default;
 }
 
+/* 代码块标题栏是紧凑变体：正文往往只有一两行，沿用卡片的 36px 标题会让标题比内容还高。
+   其余卡片（工具、思考、计划）保持统一高度。 */
+.code-header {
+  min-height: 28px;
+  padding: 2px var(--space-3);
+  gap: var(--space-2);
+}
+
 /* ---------- 2. header 标题字体规范 ---------- */
 .tool-name,
 .lang-name,

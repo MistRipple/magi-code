@@ -2,7 +2,6 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
-  import SettingsMcpServerSection from './SettingsMcpServerSection.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { getAgentSkillDetail } from '../web/agent-api';
   import { formatSkillFileSize, splitSkillInstruction } from '../lib/skill-instruction';
@@ -688,66 +687,61 @@
 </script>
 
 <div class="apple-manager tools-manager">
-  <div class="apple-scroller-proxy tools-scroller">
+  <div class="apple-scroller-proxy">
       <div class="tools-stack">
         <!-- 内置工具 -->
         <div class="settings-section tools-section builtin-section">
-          <div class="builtin-summary">
-            <button
-              type="button"
-              class="builtin-summary-toggle"
-              onclick={toggleBuiltinExpanded}
-              aria-expanded={builtinExpanded}
-            >
-              <div class="builtin-summary-main">
-                <div class="header-title-group">
-                  <div class="settings-section-title">{i18n.t('settings.tools.builtinTools')}</div>
-                  <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
-                </div>
-                {#if capabilityDependencies.length > 0}
-                  <div
-                    class="capability-dependency-strip"
-                    aria-label={i18n.t('settings.tools.capabilityDependencySummary')}
-                  >
-                    {#each capabilityDependencies as dependency (dependency.name)}
-                      <span
-                        class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyDisplayClass(dependency)}`}
-                        title={getCapabilityDependencyTitle(dependency)}
-                      >
-                        <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
-                        <span>{getCapabilityDependencyLabel(dependency.name)}</span>
-                        <span class="capability-dependency-status">
-                          {getCapabilityDependencyDisplayStatus(dependency)}
-                        </span>
-                      </span>
-                    {/each}
-                  </div>
-                {/if}
+          <div class="settings-section-header">
+            <div>
+              <div class="settings-section-title">
+                {i18n.t('settings.tools.builtinTools')}
+                <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
               </div>
-              <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
-                <Icon name="chevronDown" size={14} />
-              </span>
-            </button>
-            <div class="builtin-summary-actions">
+              <div class="settings-section-desc">{i18n.t('settings.tools.builtinDesc')}</div>
+            </div>
+            <div class="settings-section-actions">
               <button
                 type="button"
                 class="btn-icon btn-icon--sm"
                 class:refreshing={builtinToolsLoading}
                 title={i18n.t('settings.tools.refreshBuiltinTools')}
+                aria-label={i18n.t('settings.tools.refreshBuiltinTools')}
                 onclick={() => refreshBuiltinToolCatalog()}
                 disabled={builtinToolsLoading}
               >
-                <Icon name="refresh" size={12} />
+                <Icon name="refresh" size={13} />
+              </button>
+              <button
+                type="button"
+                class="btn btn--secondary btn--sm"
+                onclick={toggleBuiltinExpanded}
+                aria-expanded={builtinExpanded}
+              >
+                <span>{builtinExpanded ? i18n.t('settings.tools.collapse') : i18n.t('settings.tools.expand')}</span>
+                <span class="builtin-expand-icon" class:expanded={builtinExpanded}><Icon name="chevronDown" size={12} /></span>
               </button>
             </div>
           </div>
+          {#if capabilityDependencies.length > 0}
+            <div class="capability-dependency-strip" aria-label={i18n.t('settings.tools.capabilityDependencySummary')}>
+              {#each capabilityDependencies as dependency (dependency.name)}
+                <span
+                  class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyDisplayClass(dependency)}`}
+                  title={getCapabilityDependencyTitle(dependency)}
+                >
+                  <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
+                  <span>{getCapabilityDependencyLabel(dependency.name)}</span>
+                  <span class="capability-dependency-status">
+                    {getCapabilityDependencyDisplayStatus(dependency)}
+                  </span>
+                </span>
+              {/each}
+            </div>
+          {/if}
           {#if builtinExpanded}
             <div class="tools-fixed-panel tools-fixed-panel--builtin builtin-tool-panel">
               {#if builtinTools.length === 0}
-                <div class="empty-state">
-                  <Icon name="tools" size={48} />
-                  <p>{i18n.t('settings.tools.noBuiltinTools')}</p>
-                </div>
+                <div class="settings-empty"><span>{i18n.t('settings.tools.noBuiltinTools')}</span></div>
               {:else}
                 <div class="builtin-category-list">
                   {#each builtinToolGroups as group (group.category)}
@@ -807,10 +801,10 @@
 
         <!-- 命令环境 -->
         <div class="settings-section tools-section command-environment-section">
-          <div class="command-environment-panel">
-            <div class="command-environment-header">
-              <div class="header-title-group">
-                <div class="settings-section-title">{i18n.t('settings.tools.commandEnvironment')}</div>
+          <div class="settings-section-header">
+            <div>
+              <div class="settings-section-title">
+                {i18n.t('settings.tools.commandEnvironment')}
                 {#if commandEnvironment}
                   <span class="builtin-count-tag">
                     {i18n.t('settings.tools.commandEnvironmentCount', {
@@ -820,6 +814,9 @@
                   </span>
                 {/if}
               </div>
+              <div class="settings-section-desc">{i18n.t('settings.tools.commandEnvironmentDesc')}</div>
+            </div>
+            <div class="settings-section-actions">
               <button
                 type="button"
                 class="btn-icon btn-icon--sm"
@@ -829,9 +826,11 @@
                 onclick={() => refreshCommandEnvironment()}
                 disabled={commandEnvironmentLoading}
               >
-                <Icon name="refresh" size={12} />
+                <Icon name="refresh" size={13} />
               </button>
             </div>
+          </div>
+          <div class="command-environment-panel">
             {#if commandEnvironment}
               <div class="command-environment-list">
                 {#each commandEnvironment.commands as command (command.name)}
@@ -856,8 +855,8 @@
 
         <!-- MCP 工具 -->
         <div class="settings-section tools-section">
-          <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
-            <div class="header-title-group">
+          <div class="settings-section-header">
+            <div>
               <div class="settings-section-title">{i18n.t('settings.tools.mcpTools')}</div>
               <div class="settings-section-desc">{i18n.t('settings.tools.mcpDesc')}</div>
             </div>
@@ -870,16 +869,14 @@
           </div>
           <div class="tools-fixed-panel tools-fixed-panel--mcp">
             {#if mcpServersLoading && !mcpServersHydrated}
-              <div class="empty-state">
-                <Icon name="loader" size={48} />
-                <p>{i18n.t('settings.tools.loading')}</p>
-                <p class="empty-state-hint">{i18n.t('settings.tools.mcpLoadingHint')}</p>
+              <div class="settings-empty">
+                <Icon name="loader" size={16} />
+                <div><div class="settings-empty-title">{i18n.t('settings.tools.loading')}</div>{i18n.t('settings.tools.mcpLoadingHint')}</div>
               </div>
             {:else if mcpServers.length === 0}
-              <div class="empty-state">
-                <Icon name="tools" size={48} />
-                <p>{i18n.t('settings.tools.noMcpServer')}</p>
-                <p class="empty-state-hint">{i18n.t('settings.tools.noMcpServerHint')}</p>
+              <div class="settings-empty">
+                <Icon name="plug" size={16} />
+                <div><div class="settings-empty-title">{i18n.t('settings.tools.noMcpServer')}</div>{i18n.t('settings.tools.noMcpServerHint')}</div>
               </div>
             {:else}
               <div class="mcp-server-list">
@@ -1001,8 +998,8 @@
 
         <!-- Skill 工具 -->
         <div class="settings-section tools-section">
-          <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
-            <div class="header-title-group">
+          <div class="settings-section-header">
+            <div>
               <div class="settings-section-title">{i18n.t('settings.tools.skillsTools')}</div>
               <div class="settings-section-desc">{i18n.t('settings.tools.skillsDesc')}</div>
             </div>
@@ -1012,27 +1009,26 @@
                 <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
               </button>
               {#if skillUpdateAvailableCount > 0}
-                <button class="btn btn--primary btn--sm" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
+                <button class="btn btn--secondary btn--sm" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
                   <Icon name="download" size={14} />
                   <span>{i18n.t('settings.tools.updateAllSkills', { count: skillUpdateAvailableCount })}</span>
                 </button>
               {/if}
+              <button class="btn btn--secondary btn--sm" onclick={() => openRepoDialog()}>
+                <Icon name="grid" size={14} />
+                <span>{i18n.t('settings.tools.manageRepos')}</span>
+              </button>
               <button class="btn btn--primary btn--sm" onclick={() => openSkillLibraryDialog()}>
                 <Icon name="plus" size={14} />
                 <span>{i18n.t('settings.tools.installSkill')}</span>
-              </button>
-              <button class="btn btn--primary btn--sm" onclick={() => openRepoDialog()}>
-                <Icon name="grid" size={14} />
-                <span>{i18n.t('settings.tools.manageRepos')}</span>
               </button>
             </div>
           </div>
           <div class="tools-fixed-panel tools-fixed-panel--skills">
             {#if skills.length === 0}
-              <div class="empty-state">
-                <Icon name="tools" size={48} />
-                <p>{i18n.t('settings.tools.noSkills')}</p>
-                <p class="empty-state-hint">{i18n.t('settings.tools.noSkillsHint')}</p>
+              <div class="settings-empty">
+                <Icon name="tools" size={16} />
+                <div><div class="settings-empty-title">{i18n.t('settings.tools.noSkills')}</div>{i18n.t('settings.tools.noSkillsHint')}</div>
               </div>
             {:else}
               <div class="skill-list">
@@ -1164,7 +1160,6 @@
             {/if}
           </div>
         </div>
-        <SettingsMcpServerSection />
       </div>
     </div>
 </div>
@@ -1193,23 +1188,7 @@
     container-name: tools-tab;
   }
 
-  .tools-scroller {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    padding: 0;
-    overflow-y: auto;
-  }
 
-  .tools-stack {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    padding: 0 4px 12px 4px;
-    box-sizing: border-box;
-  }
 
   .tools-section {
     display: flex;
@@ -1247,87 +1226,23 @@
     background-clip: content-box;
   }
 
-  .tools-fixed-panel > .empty-state {
-    flex: 1 1 auto;
-    min-height: 0;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
   .tools-fixed-panel .apple-grid {
     min-height: 0;
   }
 
-  .builtin-section {
-    padding-bottom: 12px;
-  }
 
-  .command-environment-section {
-    padding-top: 12px;
-    padding-bottom: 12px;
-  }
 
-  .builtin-summary {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    padding: 0;
-    background: rgba(var(--foreground-rgb), 0.025);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    transition: background 0.15s ease, border-color 0.15s ease;
-  }
 
-  .builtin-summary:hover {
-    background: rgba(var(--foreground-rgb), 0.05);
-    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.35);
-  }
 
-  .builtin-summary-toggle {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex: 1 1 auto;
-    min-width: 0;
-    padding: 8px 0 8px 12px;
-    background: transparent;
-    border: 0;
-    color: inherit;
-    cursor: pointer;
-    font: inherit;
-    text-align: left;
-  }
 
-  .builtin-summary-toggle:focus-visible {
-    outline: 1px solid color-mix(in srgb, var(--primary) 62%, transparent);
-    outline-offset: -2px;
-    border-radius: 8px;
-  }
 
-  .builtin-summary-main {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    min-width: 0;
-    flex: 1;
-  }
 
-  .header-title-group {
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: 4px 10px;
-    min-width: 0;
-  }
 
-  .header-title-group .settings-section-title,
-  .header-title-group .settings-section-desc {
-    margin-bottom: 0;
-  }
 
   .builtin-count-tag {
+    margin-left: 8px;
+    vertical-align: 1px;
+    font-weight: 400;
     font-size: 11px;
     color: var(--foreground-muted);
     padding: 2px 8px;
@@ -1341,6 +1256,9 @@
     gap: 6px;
     min-width: 0;
     flex-wrap: wrap;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
   }
 
   .capability-dependency-chip {
@@ -1380,13 +1298,6 @@
     opacity: 0.78;
   }
 
-  .builtin-summary-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-    padding: 0 8px 0 4px;
-  }
 
   .builtin-expand-icon {
     display: inline-flex;
@@ -1404,18 +1315,11 @@
   .command-environment-panel {
     width: 100%;
     box-sizing: border-box;
-    padding: 10px 12px;
+    padding: 12px;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(var(--foreground-rgb), 0.025);
   }
 
-  .command-environment-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
 
   .command-environment-list {
     display: flex;
@@ -1459,46 +1363,6 @@
     font-size: 10px;
   }
 
-  @container tools-tab (max-width: 760px) {
-    .builtin-summary {
-      align-items: stretch;
-    }
-
-    .builtin-summary-toggle {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      row-gap: 8px;
-      padding-top: 10px;
-      padding-bottom: 10px;
-    }
-
-    .builtin-summary-main {
-      display: contents;
-    }
-
-    .builtin-summary-main > .header-title-group {
-      grid-column: 1;
-      grid-row: 1;
-    }
-
-    .builtin-expand-icon {
-      grid-column: 2;
-      grid-row: 1;
-      margin-left: 8px;
-    }
-
-    .capability-dependency-strip {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      width: 100%;
-    }
-
-    .builtin-summary-actions {
-      align-self: flex-start;
-      padding-top: 8px;
-    }
-  }
 
   .builtin-category-list {
     display: flex;
@@ -1511,7 +1375,6 @@
     scrollbar-width: thin;
     border: 1px solid var(--border);
     border-radius: 8px;
-    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
   }
 
   .builtin-category-group {
@@ -1750,7 +1613,6 @@
     width: 100%;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(var(--foreground-rgb), 0.025);
   }
 
   .mcp-server-item {
@@ -2121,7 +1983,6 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
-    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
   }
   .skill-row {
     display: grid;

@@ -10,12 +10,14 @@
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import TurnNavigationRail from './TurnNavigationRail.svelte';
   import Icon from './Icon.svelte';
+  import PluginTabContent from './tabs/PluginTabContent.svelte';
   import { tick, onDestroy } from 'svelte';
   import {
     clearMessageJump,
     beginTurnEditing,
     commitOlderSessionHistoryPage,
     messagesState,
+    setCurrentTopTab,
     setSessionHistoryState,
     updatePanelScrollState,
     hasActiveLocalTimelineTurn,
@@ -29,6 +31,7 @@
   import { getAgentSessionMessages } from '../web/agent-api';
   import { normalizeCanonicalTurnStrict } from '../shared/protocol/canonical-turn';
   import { setCanonicalTimelineError } from '../stores/turn-store.svelte';
+  import { APPLICATION_PLUGIN_SCOPE, pluginMainPageId, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import { postBridgeMessage } from '../shared/bridges/bridge-runtime';
   import {
     MessageScrollCoordinator,
@@ -221,7 +224,7 @@
     }
     const metadata = message.metadata || {};
     // 会话命令轮次（如 /compact）不是可重新编辑的对话输入。
-    if (metadata.sessionCommand !== undefined) return false;
+    if (metadata.sessionCommand !== undefined || metadata.pluginCommandId !== undefined) return false;
     return metadata.turnStatus === 'cancelled'
       && metadata.interruptionSource === 'user'
       && typeof metadata.turnId === 'string'
@@ -566,6 +569,40 @@
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
+  // 主页入口只来自 daemon 的激活投影；它只是进入主内容区页面的触发器，不会自动打开任何页面。
+  const homePluginScope = APPLICATION_PLUGIN_SCOPE;
+  $effect(() => {
+    trackPluginProjection(homePluginScope);
+  });
+  const homeEntries = $derived(
+    displayContext === 'thread' && !emptyState
+      ? pluginProjection(homePluginScope).manifests.flatMap((manifest) => (
+        (manifest.contributions.views ?? [])
+          .filter((view) => view.placements.includes('home') && view.placements.includes('main'))
+          .map((view) => ({
+            id: pluginMainPageId(manifest.id, view.id),
+            label: `${manifest.name} · ${view.title}`,
+          }))
+      ))
+      : [],
+  );
+  // 主页卡片是插件显式声明的嵌入视图（homeCard）；与入口一样只来自 daemon 的激活投影。
+  const homeCards = $derived(
+    displayContext === 'thread' && !emptyState
+      ? pluginProjection(homePluginScope).manifests.flatMap((manifest) => (
+        (manifest.contributions.views ?? [])
+          .filter((view) => view.placements.includes('homeCard'))
+          .map((view) => ({
+            key: `${manifest.id}:${view.id}`,
+            pluginId: manifest.id,
+            entry: view.entry,
+            title: view.title,
+            pluginName: manifest.name,
+            pageId: view.placements.includes('main') ? pluginMainPageId(manifest.id, view.id) : null,
+          }))
+      ))
+      : [],
+  );
   const showSuggestions = $derived(displayContext === 'thread' && !emptyState && !messagesState.isProcessing);
   const suggestionScope = $derived.by(() => {
     const workspaceId = typeof messagesState.currentWorkspaceId === 'string'
@@ -1705,6 +1742,33 @@
         </div>
         <p class="empty-text">{emptyTitle}</p>
         <p class="empty-hint">{emptyHint}</p>
+        {#if homeEntries.length > 0}
+          <div class="plugin-home-entries" role="group" aria-label={i18n.t('messageList.pluginEntries')}>
+            {#each homeEntries as entry (entry.id)}
+              <button type="button" class="plugin-home-entry" data-testid="plugin-home-entry" data-entry-id={entry.id} onclick={() => setCurrentTopTab(entry.id)} title={entry.label}>
+                <Icon name="settings" size={14} />
+                <span>{entry.label}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#if homeCards.length > 0}
+          <div class="plugin-home-cards" role="group" aria-label={i18n.t('messageList.pluginCards')}>
+            {#each homeCards as card (card.key)}
+              <section class="plugin-home-card" data-testid="plugin-home-card" data-card-id={card.key}>
+                <header class="plugin-home-card-header">
+                  <span class="plugin-home-card-title">{card.pluginName} · {card.title}</span>
+                  {#if card.pageId}
+                    <button type="button" class="plugin-home-card-open" onclick={() => setCurrentTopTab(card.pageId!)}>{i18n.t('messageList.pluginCardOpen')}</button>
+                  {/if}
+                </header>
+                <div class="plugin-home-card-body">
+                  <PluginTabContent pluginId={card.pluginId} entry={card.entry} label={card.title} scope={homePluginScope} frameTestId="plugin-card-view" />
+                </div>
+              </section>
+            {/each}
+          </div>
+        {/if}
         {#if showSuggestions}
           <div class="empty-suggestions">
             <div class="suggestions-header">
@@ -1895,6 +1959,83 @@
   .empty-hint {
     font-size: var(--text-sm);
     opacity: 0.7;
+  }
+
+  .plugin-home-entries {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
+  }
+
+  .plugin-home-entry {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .plugin-home-cards {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-3);
+    width: min(100%, 768px);
+    margin-top: var(--space-4);
+    text-align: left;
+  }
+
+  .plugin-home-card {
+    flex: 1 1 320px;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg, 12px);
+    overflow: hidden;
+    background: var(--surface-1);
+  }
+
+  .plugin-home-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 6px var(--space-3);
+    border-bottom: 1px solid var(--border);
+    font-size: var(--text-xs);
+  }
+
+  .plugin-home-card-title {
+    color: var(--foreground);
+    font-weight: 600;
+  }
+
+  .plugin-home-card-open {
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .plugin-home-card-open:hover {
+    color: var(--foreground);
+  }
+
+  .plugin-home-card-body {
+    height: 180px;
+    display: flex;
+  }
+
+  .plugin-home-entry:hover {
+    background: var(--surface-hover, rgba(255,255,255,0.05));
   }
 
   .empty-suggestions {

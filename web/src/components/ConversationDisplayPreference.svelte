@@ -76,7 +76,6 @@
 <style>
   .conversation-display-preference {
     padding-bottom: var(--space-5);
-    border-bottom: 1px solid var(--border-subtle, var(--border));
   }
 
   .conversation-display-status {
@@ -108,7 +107,6 @@
     white-space: normal;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--surface-1, transparent);
     color: var(--foreground);
     text-align: left;
     cursor: pointer;

@@ -23,7 +23,7 @@ import {
 } from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
-import type { SessionTurnCommand } from '../app-server-protocol.generated';
+import type { PluginSelection, SessionTurnCommand } from '../app-server-protocol.generated';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
@@ -190,7 +190,7 @@ import {
   clearWorkspaceWaiting,
   markWorkspaceWaiting,
 } from '../../stores/workspace-wait-store.svelte';
-import { MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
+import { MCP_ACTIVITY_EVENT, MCP_APPROVALS_CHANGED_EVENT } from '../../lib/mcp-server-events';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -1901,6 +1901,12 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   advanceEventStreamCursorFromEvent(event);
 
+  // 外部会话有变化（不属于当前工作区的事件流过滤）：转成窗口事件，侧栏据此刷新外部客户端入口。
+  if (eventType === 'mcp.activity') {
+    window.dispatchEvent(new Event(MCP_ACTIVITY_EVENT));
+    return;
+  }
+
   // 事件流可能携带当前主对话之外的会话事件。它们不能进入消息时间轴，
   // 但必须继续驱动对应的工作区目录投影，否则后台会话的状态灯会停留在旧状态。
   if (!eventMatchesCurrentWorkspace(event)) {
@@ -2045,6 +2051,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     // 外部 MCP 客户端的确认不属于当前会话，走跨会话托盘，不能刷新当前会话的授权投影。
     if (event.payload?.external === true) {
       window.dispatchEvent(new CustomEvent(MCP_APPROVALS_CHANGED_EVENT));
+      // 正在这个外部会话里：同一份待确认也要出现在会话自己的授权托盘（和内部对话同一个组件）。
+      if (rustEventSessionId(event) && rustEventSessionId(event) === currentSessionId.trim()) {
+        refreshCurrentSessionToolApprovals(eventType);
+      }
       return;
     }
     refreshCurrentSessionToolApprovals(eventType);
@@ -3923,6 +3933,8 @@ interface ExecuteTaskInput {
   /** 用户点击“继续”恢复被中断或可恢复的执行。 */
   resume?: boolean;
   command?: SessionTurnCommand | null;
+  workflowId?: string | null;
+  pluginCommandId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
@@ -3939,6 +3951,7 @@ interface ExecuteTaskInput {
   }>;
   browserAnnotationRefs?: string[];
   browserNodeSelections?: MessageBrowserNodeSelection[];
+  pluginSelections?: PluginSelection[];
 }
 
 function bridgeRuntimeIsBusy(): boolean {
@@ -3963,6 +3976,8 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
     command: turn.command === 'compact' ? 'compact' : null,
+    workflowId: turn.workflowId ?? null,
+    pluginCommandId: turn.pluginCommandId ?? null,
     skillName: turn.skillName ?? null,
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
@@ -3970,6 +3985,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     contextReferences: turn.contextReferences,
     browserAnnotationRefs: turn.browserAnnotationRefs,
     browserNodeSelections: turn.browserNodeSelections,
+    pluginSelections: turn.pluginSelections ?? [],
     canGuide: turn.canGuide,
   };
 }
@@ -4124,8 +4140,23 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }))
       .filter((selection) => selection.browserSessionId && selection.tabId && selection.surfaceId)
     : [];
+  const pluginSelections = Array.isArray(input.pluginSelections)
+    ? input.pluginSelections.filter((selection) => (
+      Boolean(selection)
+      && typeof selection.pluginId === 'string' && selection.pluginId.trim().length > 0
+      && typeof selection.resourceId === 'string' && selection.resourceId.trim().length > 0
+      && typeof selection.version === 'number'
+      && typeof selection.label === 'string' && selection.label.trim().length > 0
+    )).map((selection) => ({ ...selection }))
+    : [];
   const command = input.command === 'compact' ? input.command : null;
-  if (!command && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0) {
+  const workflowId = typeof input.workflowId === 'string' && input.workflowId.trim()
+    ? input.workflowId.trim()
+    : null;
+  const pluginCommandId = typeof input.pluginCommandId === 'string' && input.pluginCommandId.trim()
+    ? input.pluginCommandId.trim()
+    : null;
+  if (!command && !workflowId && !pluginCommandId && !normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0 && browserNodeSelections.length === 0 && pluginSelections.length === 0) {
     return false;
   }
   const requestId = trimBridgeString(input.requestId) || generateMessageId();
@@ -4182,6 +4213,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       ...(skillName ? { skillName } : {}),
       ...(input.goalMode === true ? { goalMode: true } : {}),
       ...(command ? { sessionCommand: command } : {}),
+      ...(workflowId ? { workflowId } : {}),
+      ...(pluginCommandId ? { pluginCommandId } : {}),
     },
   };
   beginLocalTurnSubmission({
@@ -4209,10 +4242,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       goalMode: input.goalMode === true,
       resume: input.resume === true,
       command,
+      workflowId,
+      pluginCommandId,
       images,
       contextReferences,
       browserAnnotationRefs,
       browserNodeSelections,
+      pluginSelections,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
@@ -5444,6 +5480,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
+            || (Array.isArray(message.pluginSelections) && message.pluginSelections.length > 0)
             || message.command === 'compact'
           ) {
             void executeTask({
@@ -5483,6 +5520,9 @@ export function createWebClientBridge(): ClientBridge {
                 : [],
               browserNodeSelections: Array.isArray(message.browserNodeSelections)
                 ? message.browserNodeSelections as MessageBrowserNodeSelection[]
+                : [],
+              pluginSelections: Array.isArray(message.pluginSelections)
+                ? message.pluginSelections as PluginSelection[]
                 : [],
             });
           }

@@ -2555,6 +2555,14 @@ fn execute_task_tool_call(
             browser_capability_snapshot: browser_capability_snapshot.clone(),
             browser_execution_id: Some(format!("task:{}", task.task_id)),
         };
+        if let Some(result) = registry.execute_plugin_tool(
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            &context,
+            effective_access_profile,
+        ) {
+            return result;
+        }
         let output = match on_progress {
             Some(on_progress) => {
                 registry.execute_with_policy_and_progress(input, context, &tool_policy, on_progress)

@@ -324,7 +324,7 @@
     background: transparent;
     border: 1px solid transparent;
     border-radius: 4px;
-    padding: 4px 8px;
+    padding: 2px 6px;
     color: var(--foreground-muted);
     font-size: var(--font-size-xs);
     cursor: pointer;

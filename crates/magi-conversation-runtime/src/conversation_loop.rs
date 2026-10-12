@@ -1413,6 +1413,7 @@ fn run_conversation_loop_inner(
                     allowed_tools,
                     denied_tools,
                     include_external: deferred_mcp_tools_loaded,
+                    workspace_id: workspace_id.as_ref(),
                 });
         }
         if task.is_goal_mode() {

@@ -193,6 +193,43 @@ fn task_runtime_payload_none_serialization_roundtrip() {
 }
 
 #[test]
+fn task_runtime_payload_workflow_serialization_roundtrip() {
+    let payload = TaskRuntimePayload::Workflow {
+        workflow_id: "plugin/example/workflow".into(),
+        checkpoint_version: 1,
+        stage: "start".into(),
+        checkpoint: serde_json::json!({"stage":"start"}),
+        pending_action: None,
+        last_result: None,
+    };
+    let encoded = serde_json::to_string(&payload).expect("工作流负载应可序列化");
+    let decoded: TaskRuntimePayload = serde_json::from_str(&encoded).expect("工作流负载应可恢复");
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn context_anchors_payload_reads_the_pre_rename_persisted_tag() {
+    // 重命名前持久化的任务以 `browser_annotations` 为标签，且没有插件选择字段。
+    let legacy = "{\"kind\":\"browser_annotations\",\"references\":[{\"annotationId\":\"a\"}]}";
+    let parsed: TaskRuntimePayload = serde_json::from_str(legacy).expect("旧任务负载应可恢复");
+    let TaskRuntimePayload::ContextAnchors {
+        references,
+        node_selections,
+        plugin_selections,
+    } = &parsed
+    else {
+        panic!("旧标签应解析为上下文锚点");
+    };
+    assert_eq!(references.len(), 1);
+    assert!(node_selections.is_empty() && plugin_selections.is_empty());
+    assert!(
+        serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("context_anchors")
+    );
+}
+
+#[test]
 fn progress_summary_default() {
     let summary = ProgressSummary::default();
     assert_eq!(summary.total_tasks, 0);

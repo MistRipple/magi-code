@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { ToolCallStatus } from '../types/message';
+  import type { ToolCallStatus, ToolOrigin } from '../types/message';
+  import ToolOriginBadge from './ToolOriginBadge.svelte';
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
@@ -64,6 +65,7 @@
   interface Props {
     name: string;
     id?: string;
+    origin?: ToolOrigin;
     input?: unknown;
     output?: unknown;
     error?: string;
@@ -78,6 +80,7 @@
   let {
     name,
     id,
+    origin,
     input,
     output,
     error,
@@ -954,6 +957,7 @@
 
   <span class="tool-title">
     <span class="tool-name">{toolDisplayName}</span>
+    <ToolOriginBadge {origin} />
     {#if status === 'error' && errorDiagnosis}
       <span class="error-tag error-{errorDiagnosis.category}" title={errorDiagnosis.ownerLabel}>
         {errorDiagnosis.categoryLabel}

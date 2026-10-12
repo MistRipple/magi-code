@@ -32,6 +32,14 @@ pub use generated::{
     APP_SERVER_METHODS, JSONRPC_VERSION, PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_NAME,
 };
 
+pub use generated::{
+    PluginAuthorizeRequest, PluginBackendEntry, PluginContributions, PluginInstallRequest,
+    PluginInstalled, PluginList, PluginManifest, PluginNamedContribution, PluginPermission,
+    PluginPermissionKind, PluginResource, PluginResourceWriteRequest, PluginScopeGrant,
+    PluginScopeKind, PluginScopeRequest, PluginToolContribution, PluginViewContribution,
+    PluginViewPlacement,
+};
+
 pub const ERROR_INVALID_REQUEST: i32 = -32600;
 pub const ERROR_METHOD_NOT_FOUND: i32 = -32601;
 pub const ERROR_INVALID_PARAMS: i32 = -32602;

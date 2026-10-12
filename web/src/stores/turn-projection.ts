@@ -11,6 +11,7 @@ import type {
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
   ToolCallStatus,
+  ToolOrigin,
 } from '../types/message';
 import type {
   CanonicalToolCall,
@@ -259,7 +260,13 @@ function readTruncatedResultOmittedChars(item: CanonicalTurnItem): number | unde
   return typeof record.omittedChars === 'number' ? record.omittedChars : 0;
 }
 
+/** 工具项的来源标记由 daemon 写在 item metadata 里（GPT Web 网页里的模型回调）。 */
+function readToolOrigin(item: CanonicalTurnItem): ToolOrigin | undefined {
+  return item.metadata?.toolOrigin === 'chatgpt_web' ? 'chatgpt_web' : undefined;
+}
+
 function buildToolBlock(item: CanonicalTurnItem, tool: CanonicalToolCall): ContentBlock {
+  const origin = readToolOrigin(item);
   const status = item.status;
   const omittedChars = readTruncatedResultOmittedChars(item);
   const toolStatus = statusToToolStatus(status);
@@ -271,6 +278,7 @@ function buildToolBlock(item: CanonicalTurnItem, tool: CanonicalToolCall): Conte
     content: '',
     toolCall: {
       id: tool.callId,
+      ...(origin ? { origin } : {}),
       name: tool.name,
       arguments: coerceToolArgumentsRecord(tool.arguments),
       status: toolStatus,
@@ -329,6 +337,7 @@ function buildMessageBlocks(
       arguments: item.tool.arguments,
       result: item.tool.result,
       status: statusToToolStatus(item.status),
+      origin: readToolOrigin(item),
     });
     if (fileChangeBlocks.length > 0) {
       return fileChangeBlocks;

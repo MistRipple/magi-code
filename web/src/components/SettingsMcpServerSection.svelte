@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * 「设置 → 能力 → Magi MCP 服务」分区。
+   * 「设置 → MCP 服务」分类（MCP 服务插件激活后出现）。
    *
    * 只展示 daemon 的事实：服务是否运行、令牌列表、待确认调用与审计记录都来自
    * `/api/mcp-server/*`。令牌原文由 daemon 在本机保存，需要时通过“查看配置”重新取回；
@@ -17,34 +17,29 @@
     getMcpServerConfigSnippets,
     getMcpServerStatus,
     getMcpServerTokenSecret,
-    listMcpServerApprovals,
-    resolveMcpServerApproval,
     revokeAllMcpServerTokens,
     revokeMcpServerToken,
     saveMcpServerNamedTunnel,
     rotateMcpServerToken,
+    setMcpExternalRetention,
     setMcpServerDirect,
     setMcpServerEnabled,
     setMcpServerNetwork,
     updateMcpServerToken,
     verifyMcpServerNamedTunnel,
-    type McpServerApproval,
     type McpServerConfigSnippets,
     type McpServerNamedTunnelCheck,
     type McpServerProfile,
     type McpServerStatus,
     type McpServerToken,
   } from '../web/agent-api';
-  import { MCP_APPROVALS_CHANGED_EVENT } from '../lib/mcp-server-events';
   import SettingsMcpServerAudit from './SettingsMcpServerAudit.svelte';
 
   const PROFILES: readonly McpServerProfile[] = ['read_only', 'edit', 'edit_trusted', 'exec'];
   const HIGH_RISK_PROFILES: readonly McpServerProfile[] = ['edit_trusted', 'exec'];
-  const APPROVAL_POLL_MS = 3000;
 
   let status = $state<McpServerStatus | null>(null);
   let snippets = $state<McpServerConfigSnippets | null>(null);
-  let approvals = $state<McpServerApproval[]>([]);
   /** 调用记录组件的刷新信号（审批处理后递增）。 */
   let auditVersion = $state(0);
 
@@ -56,7 +51,6 @@
   let showInactive = $state(false);
   let loadError = $state('');
   let busy = $state(false);
-  let now = $state(Date.now());
 
   let clientName = $state('');
   let workspaceId = $state('');
@@ -149,11 +143,11 @@
   );
   /** 能直接填进配置的令牌：有效且保存了原文。 */
   const connectTokens = $derived((status?.tokens ?? []).filter((token) => token.active));
+  const STATUS_POLL_MS = 3000;
   const TABS: readonly McpTab[] = ['connect', 'clients', 'remote', 'activity'];
   const activeTokenCount = $derived((status?.tokens ?? []).filter((token) => token.active).length);
   function tabBadge(id: McpTab): string {
     if (id === 'clients') return activeTokenCount > 0 ? String(activeTokenCount) : '';
-    if (id === 'activity') return approvals.length > 0 ? String(approvals.length) : '';
     if (id === 'remote') return status?.network.enabled || status?.direct.enabled ? '●' : '';
     return '';
   }
@@ -180,18 +174,9 @@
     try {
       status = await getMcpServerStatus();
       loadError = '';
-      approvals = await listMcpServerApprovals();
       auditVersion += 1;
     } catch (error) {
       loadError = i18n.t('mcpServer.error.load', { message: messageOf(error) });
-    }
-  }
-
-  async function refreshApprovals(): Promise<void> {
-    try {
-      approvals = await listMcpServerApprovals();
-    } catch {
-      /* 下一次轮询再试；错误由完整刷新展示 */
     }
   }
 
@@ -204,6 +189,15 @@
     } finally {
       busy = false;
     }
+  }
+
+  const RETENTION_CHOICES = [7, 30, 90, 0] as const;
+
+  function saveExternal(patch: { saveContent?: boolean; retentionDays?: number }): Promise<void> {
+    const current = status?.external ?? { saveContent: true, retentionDays: 30 };
+    return act(async () => {
+      status = await setMcpExternalRetention({ ...current, ...patch });
+    });
   }
 
   function toggleEnabled(enabled: boolean): Promise<void> {
@@ -423,13 +417,6 @@
     });
   }
 
-  function resolveApproval(approval: McpServerApproval, decision: 'allow_once' | 'deny'): Promise<void> {
-    return act(async () => {
-      approvals = await resolveMcpServerApproval(approval.approvalId, decision);
-      auditVersion += 1;
-    });
-  }
-
   async function copy(key: string, text: string): Promise<void> {
     try {
       await navigator.clipboard.writeText(text);
@@ -466,10 +453,6 @@
     if (token.revokedAtMs !== null) return i18n.t('mcpServer.token.revoked');
     if (!token.active) return i18n.t('mcpServer.token.expired');
     return '';
-  }
-
-  function secondsLeft(approval: McpServerApproval): number {
-    return Math.max(0, Math.ceil((approval.expiresAtMs - now) / 1000));
   }
 
   $effect(() => {
@@ -520,41 +503,30 @@
   onMount(() => {
     void refresh();
     const timer = window.setInterval(() => {
-      now = Date.now();
-      void refreshApprovals();
       // 隧道建立需要几秒：网络模式开启但还没就绪时，跟随刷新状态以拿到公网地址。
       if (status?.network.enabled && status.network.status !== 'running') void refresh();
-    }, APPROVAL_POLL_MS);
-    const clock = window.setInterval(() => { now = Date.now(); }, 1000);
-    const onChanged = () => { void refreshApprovals(); };
-    window.addEventListener(MCP_APPROVALS_CHANGED_EVENT, onChanged);
-    return () => {
-      window.clearInterval(timer);
-      window.clearInterval(clock);
-      window.removeEventListener(MCP_APPROVALS_CHANGED_EVENT, onChanged);
-    };
+    }, STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
   });
 </script>
 
 <section class="mcp-server-section" data-mcp-server="1">
-  <div class="section-heading">
-    <div>
-      <h3>{i18n.t('mcpServer.title')}</h3>
-      <p>{i18n.t('mcpServer.desc')}</p>
-    </div>
+  <div>
+    <div class="settings-section-title">{i18n.t('mcpServer.title')}</div>
+    <div class="settings-section-desc">{i18n.t('mcpServer.desc')}</div>
   </div>
 
   {#if loadError}
     <p class="status-message error" role="alert">{loadError}</p>
   {/if}
 
-  <div class="tabs" role="tablist" data-mcp-tabs="1">
+  <div class="settings-subtabs" role="tablist" data-mcp-tabs="1">
     {#each TABS as id (id)}
       <button
         type="button"
         role="tab"
-        class="tab"
-        class:tab--active={tab === id}
+        class="settings-subtab"
+        class:active={tab === id}
         aria-selected={tab === id}
         data-mcp-tab={id}
         onclick={() => { tab = id; }}
@@ -797,38 +769,6 @@
         </button>
       </div>
     </form>
-  </div>
-
-  {/if}
-
-  {#if tab === 'activity'}
-  <div class="card" data-mcp-server-approvals="1">
-    <h4>{i18n.t('mcpServer.approvals.section')}</h4>
-    {#if approvals.length === 0}
-      <p class="meta">{i18n.t('mcpServer.approvals.empty')}</p>
-    {:else}
-      <ul class="rows">
-        {#each approvals as approval (approval.approvalId)}
-          <li data-mcp-approval={approval.approvalId}>
-            <div class="row-main">
-              <span class="row-title">{approval.summary}</span>
-              <span class="meta">
-                {i18n.t('mcpServer.approvals.from', { client: approval.clientName, prefix: approval.tokenPrefix })}
-                · {i18n.t('mcpServer.approvals.expiresIn', { seconds: secondsLeft(approval) })}
-              </span>
-            </div>
-            <div class="action-row">
-              <button type="button" class="primary-action" disabled={busy} onclick={() => void resolveApproval(approval, 'allow_once')}>
-                {i18n.t('mcpServer.approvals.allow')}
-              </button>
-              <button type="button" disabled={busy} onclick={() => void resolveApproval(approval, 'deny')}>
-                {i18n.t('mcpServer.approvals.deny')}
-              </button>
-            </div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
   </div>
 
   {/if}
@@ -1101,6 +1041,34 @@
   {/if}
 
   {#if tab === 'activity'}
+    <div class="card" data-mcp-server-external="1">
+      <h4>{i18n.t('mcpServer.external.section')}</h4>
+      <p class="meta">{i18n.t('mcpServer.external.desc')}</p>
+      <label class="switch-line">
+        <input
+          type="checkbox"
+          data-mcp-external-save-content="1"
+          checked={status?.external.saveContent ?? true}
+          disabled={busy || status === null}
+          onchange={(event) => void saveExternal({ saveContent: (event.currentTarget as HTMLInputElement).checked })}
+        />
+        <span>{i18n.t('mcpServer.external.saveContent')}</span>
+      </label>
+      <p class="meta">{i18n.t('mcpServer.external.saveContentHint')}</p>
+      <label class="field">
+        <span>{i18n.t('mcpServer.external.retention')}</span>
+        <select
+          data-mcp-external-retention="1"
+          value={String(status?.external.retentionDays ?? 30)}
+          disabled={busy || status === null}
+          onchange={(event) => void saveExternal({ retentionDays: Number((event.currentTarget as HTMLSelectElement).value) })}
+        >
+          {#each RETENTION_CHOICES as days (days)}
+            <option value={String(days)}>{days === 0 ? i18n.t('mcpServer.external.retentionForever') : i18n.t('mcpServer.external.retentionDays', { days: String(days) })}</option>
+          {/each}
+        </select>
+      </label>
+    </div>
     <SettingsMcpServerAudit tokens={status?.tokens ?? []} version={auditVersion} />
   {/if}
 </section>
@@ -1110,38 +1078,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 16px 0;
-    border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
-  }
-
-  .tabs {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    padding: 3px;
-    border-radius: 10px;
-    background: var(--surface-muted, rgba(127, 127, 127, 0.1));
-    align-self: flex-start;
-  }
-
-  .tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 14px;
-    border: none;
-    border-radius: 8px;
-    font-size: 12px;
-    background: transparent;
-    color: inherit;
-    opacity: 0.72;
-    cursor: pointer;
-  }
-
-  .tab--active {
-    background: var(--surface, rgba(255, 255, 255, 0.14));
-    font-weight: 600;
-    opacity: 1;
+    padding: 0;
   }
 
   .tab-badge {
@@ -1160,26 +1097,12 @@
     color: #fff;
   }
 
-  .section-heading h3 {
-    margin: 0 0 4px;
-    font-size: 14px;
-    font-weight: 600;
-  }
-
-  .section-heading p {
-    margin: 0;
-    max-width: 560px;
-    font-size: 12px;
-    line-height: 1.5;
-    opacity: 0.72;
-  }
-
   .card {
     display: flex;
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
+    border: 1px solid var(--border);
     border-radius: 10px;
   }
 
@@ -1203,22 +1126,55 @@
     cursor: pointer;
   }
 
+  /* 复选框渲染成与全局 Toggle 一致的开关 */
+  .switch-line input[type='checkbox'] {
+    appearance: none;
+    position: relative;
+    flex: 0 0 auto;
+    width: 32px;
+    height: 18px;
+    margin: 0;
+    border-radius: 999px;
+    background: var(--foreground-muted);
+    opacity: 0.55;
+    cursor: pointer;
+    transition: background var(--transition-fast), opacity var(--transition-fast);
+  }
+  .switch-line input[type='checkbox']::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform var(--transition-fast);
+  }
+  .switch-line input[type='checkbox']:checked { background: var(--success); opacity: 1; }
+  .switch-line input[type='checkbox']:checked::after { transform: translateX(14px); }
+  .switch-line input[type='checkbox']:disabled { cursor: default; opacity: 0.35; }
+  .switch-line input[type='checkbox']:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
   .switch-line.risk {
     color: var(--danger, #c53f4f);
   }
 
   .badge {
-    padding: 1px 6px;
+    padding: 0 8px;
+    min-height: 18px;
+    background: transparent;
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
     border-radius: 999px;
-    font-size: 10px;
-    background: var(--accent-soft, rgba(80, 140, 255, 0.16));
-    color: var(--accent-strong, #3b6fd4);
+    font-size: var(--text-xs);
+    color: var(--success);
   }
 
   .badge--off {
-    background: var(--surface-muted, rgba(127, 127, 127, 0.14));
-    color: inherit;
-    opacity: 0.8;
+    border-color: var(--border);
+    color: var(--foreground-muted);
   }
 
   .rows {
@@ -1346,13 +1302,16 @@
 
   .field input,
   .field select {
-    padding: 4px 8px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 6px;
-    font-size: 12px;
-    background: transparent;
-    color: inherit;
+    min-height: 28px;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    background: var(--vscode-input-background);
+    color: var(--foreground);
   }
+  .field input:focus,
+  .field select:focus { outline: none; border-color: var(--primary); }
 
   .snippet {
     display: flex;
@@ -1382,24 +1341,31 @@
     gap: 8px;
   }
 
-  button {
-    padding: 5px 12px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 8px;
-    font-size: 12px;
-    background: transparent;
-    color: inherit;
+  /* 与全局 .btn--secondary / .btn--primary / .btn--sm 同一形态 */
+  button:not(.settings-subtab) {
+    height: var(--btn-height-sm);
+    padding: 0 var(--space-3);
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    background: var(--secondary);
+    color: var(--foreground);
     cursor: pointer;
+    transition: background var(--transition-fast);
   }
+
+  button:not(.settings-subtab):hover:not(:disabled) { background: var(--secondary-hover); }
 
   button.primary-action {
-    background: var(--accent-soft, rgba(80, 140, 255, 0.16));
-    border-color: transparent;
-    color: var(--accent-strong, #3b6fd4);
+    background: var(--primary);
+    color: var(--primary-foreground);
   }
 
+  button.primary-action:hover:not(:disabled) { background: var(--primary-hover, var(--primary)); }
+
   button.danger {
-    color: var(--danger, #c53f4f);
+    color: var(--error);
   }
 
   button:disabled {

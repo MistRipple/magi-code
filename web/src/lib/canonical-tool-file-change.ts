@@ -1,4 +1,4 @@
-import type { ToolCallStatus } from '../types/message';
+import type { ToolCallStatus, ToolOrigin } from '../types/message';
 import type { ContentBlock } from '../types/message';
 import {
   coerceToolArgumentsRecord,
@@ -13,6 +13,7 @@ interface FileChangeProjectionInput {
   arguments: unknown;
   result?: unknown;
   status: ToolCallStatus;
+  origin?: ToolOrigin;
 }
 
 interface TextPatch {
@@ -132,6 +133,7 @@ function fileChangeBlock(
     fileChange: {
       sessionId: input.sessionId,
       toolCallId: input.blockIdBase,
+      ...(input.origin ? { origin: input.origin } : {}),
       contentKind: 'text',
       ...change,
     },

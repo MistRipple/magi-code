@@ -108,6 +108,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBlockedTurnRemainsRecoverable(canonicalProtocol);
   assertReducerIndexesStayConsistent(reducer);
   assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, canonicalProtocol);
+  assertWebModelToolOriginProjectsToToolCard(reducer, projection);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertTruncatedToolResultCarriesHistoryRef(reducer, projection);
   assertCompactedAndFullItemsOfSameVersionAreCompatible(reducer);
@@ -324,6 +325,19 @@ function assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, c
   const toolCall = projection.buildCanonicalTimelineProjection(state).artifacts[0]
     ?.message.blocks?.find((block) => block.type === 'tool_call')?.toolCall;
   assert.equal(toolCall?.status, 'unconfirmed', 'indeterminate item must project as an unconfirmed tool card');
+}
+
+function assertWebModelToolOriginProjectsToToolCard(reducer, projection) {
+  const c = baseCase('tool-origin', 'session-golden-tool-origin', 'turn-golden-tool-origin', 11_707);
+  const own = tool(c, 1, 'tool-own', 'call-own', 'ls', 'completed', { status: 'ok' });
+  const viaChatgpt = { ...tool(c, 2, 'tool-chatgpt', 'call-chatgpt', 'ls', 'completed', { status: 'ok' }), metadata: { toolOrigin: 'chatgpt_web' } };
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [own, viaChatgpt])]);
+  const calls = projection.buildCanonicalTimelineProjection(state).artifacts
+    .flatMap((artifact) => artifact.message.blocks ?? [])
+    .filter((block) => block.type === 'tool_call')
+    .map((block) => block.toolCall);
+  assert.equal(calls.find((call) => call.id === 'call-own')?.origin, undefined, 'Magi 自己的 agent 发起的调用没有来源标记');
+  assert.equal(calls.find((call) => call.id === 'call-chatgpt')?.origin, 'chatgpt_web', 'GPT Web 回调的工具带来源标记');
 }
 
 function assertSingleThinkingProjectsAsGroup(reducer, projection) {

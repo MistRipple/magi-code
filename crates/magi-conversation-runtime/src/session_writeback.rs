@@ -1595,24 +1595,47 @@ fn to_turn_item_summary(
     }
 }
 
-/// 外部（MCP）工具调用在会话当前 Turn 里的内联展示。
+/// 工具项的来源标记（item metadata 的键）：不是 Magi 自己 agent 发起的工具调用，界面据此在工具卡片上标明来源。
+pub const TOOL_ORIGIN_METADATA_KEY: &str = "toolOrigin";
+/// GPT Web 网页里的模型经 MCP 回调 Magi 工具。
+pub const TOOL_ORIGIN_CHATGPT_WEB: &str = "chatgpt_web";
+
+/// 外部（MCP）工具调用在会话 Turn 里的内联展示。
 ///
-/// GPT Web 的工具由网页模型经 MCP 调用，不经过 Magi 自己的工具循环；它们仍是 Magi 的执行事实，
-/// 必须作为普通工具项写进 canonical 并发布 turn item 事件（W9、§8.4）。写入的 Turn 是会话
-/// **当前进行中的 Turn**：没有进行中的 Turn 时返回错误，调用方应拒绝该调用。
+/// 两种来源共用同一个写入边界：GPT Web 的工具由网页模型经 MCP 调用，写进槽位拥有者会话
+/// **当前进行中的 Turn**（`turn_id` 为空，没有进行中的 Turn 时返回错误，调用方应拒绝该调用）；
+/// 外部 MCP 客户端的调用写进它自己外部会话的活动段 Turn（`turn_id` 指定，见 `external_session_turn`）。
+/// 它们都不经过 Magi 自己的工具循环，仍是 Magi 的执行事实，必须作为普通工具项写进 canonical
+/// 并发布 turn item 事件（W9、§8.4）。
 pub struct ExternalToolItemWriter<'a> {
     pub session_store: &'a SessionStore,
     pub event_bus: &'a InMemoryEventBus,
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
+    /// 写入的 Turn；为空取会话当前进行中的 Turn。
+    pub turn_id: Option<&'a str>,
+    /// 工具项的来源标记（`toolOrigin`）；外部会话里全部是外部调用，不需要逐项标记。
+    pub origin: Option<&'a str>,
 }
 
 impl ExternalToolItemWriter<'_> {
     fn current_turn_id(&self) -> Result<String, String> {
+        if let Some(turn_id) = self.turn_id {
+            return Ok(turn_id.to_string());
+        }
         self.session_store
             .runtime_sidecar(self.session_id)
             .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
             .ok_or_else(|| format!("会话 {} 当前没有进行中的 Turn", self.session_id))
+    }
+
+    fn mark_origin(&self, item: &mut ActiveExecutionTurnItem) {
+        if let Some(origin) = self.origin {
+            item.metadata.insert(
+                TOOL_ORIGIN_METADATA_KEY.to_string(),
+                serde_json::Value::String(origin.to_string()),
+            );
+        }
     }
 
     fn source_thread(&self) -> ThreadId {
@@ -1657,6 +1680,7 @@ impl ExternalToolItemWriter<'_> {
             self.source_thread(),
         );
         item.source = "tool".to_string();
+        self.mark_origin(&mut item);
         item.tool_call_id = Some(call_id.to_string());
         item.tool_name = Some(tool_name.to_string());
         item.tool_status = Some("running".to_string());
@@ -1682,6 +1706,7 @@ impl ExternalToolItemWriter<'_> {
             self.source_thread(),
         );
         item.source = "tool".to_string();
+        self.mark_origin(&mut item);
         item.tool_call_id = Some(call_id.to_string());
         item.tool_name = Some(tool_name.to_string());
         item.tool_status = Some(status.wire_label().to_string());
@@ -1900,6 +1925,65 @@ mod tests {
             .expect("reset frame should publish");
         assert!(!first_frame);
         assert!(published.reset);
+    }
+
+    #[test]
+    fn external_tool_items_are_marked_as_coming_from_chatgpt_web() {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-web-slot-origin");
+        session_store
+            .create_session(session_id.clone(), "web slot origin")
+            .expect("session should be creatable");
+        seed_test_conversation_turn(
+            &session_store,
+            &session_id,
+            ActiveExecutionTurn {
+                turn_id: "turn-web-slot-origin".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis::now(),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: None,
+                items: Vec::new(),
+            },
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let workspace_id = None;
+        let writer = ExternalToolItemWriter {
+            session_store: &session_store,
+            event_bus: &event_bus,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            turn_id: None,
+            origin: Some(TOOL_ORIGIN_CHATGPT_WEB),
+        };
+        writer
+            .started("mcp-web-slot-1", "magi.fs.read", "{}")
+            .expect("started should be written");
+        writer
+            .finished(
+                "mcp-web-slot-1",
+                "magi.fs.read",
+                "{}",
+                "ok",
+                ExecutionResultStatus::Succeeded,
+            )
+            .expect("finished should be written");
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn");
+        let item = turn
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("mcp-web-slot-1"))
+            .expect("tool item");
+        assert_eq!(
+            item.metadata.get(TOOL_ORIGIN_METADATA_KEY),
+            Some(&serde_json::Value::String(
+                TOOL_ORIGIN_CHATGPT_WEB.to_string()
+            ))
+        );
     }
 
     #[test]

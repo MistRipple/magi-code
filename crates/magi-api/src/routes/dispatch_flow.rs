@@ -124,6 +124,12 @@ pub(super) async fn accept_session_task_submission_at(
         serde_json::Value::String(request_fingerprint),
     );
     user_message_metadata.insert("traceId".to_string(), serde_json::Value::String(trace_id));
+    if let Some(workflow_id) = request.workflow_id.as_deref() {
+        user_message_metadata.insert(
+            "magi.workflowId".to_string(),
+            serde_json::Value::String(workflow_id.to_string()),
+        );
+    }
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_content(trimmed_text.as_deref());
     let mission_title = task_title
@@ -198,6 +204,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         context_references: Vec::new(),
         browser_annotation_refs: Vec::new(),
         browser_node_selections: Vec::new(),
+        plugin_selections: Vec::new(),
         created_session: false,
         mission_title: "目标自动推进".to_string(),
         task_title: "执行: 目标自动推进".to_string(),
@@ -209,6 +216,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         goal_mode: true,
         use_tools: true,
         target_role: None,
+        workflow_id: None,
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
@@ -373,6 +381,38 @@ async fn execute_dispatch_submission(
         }
         Err(error) => return Err(ApiError::InvalidInput(error)),
     };
+    let plugin_selection_scope = magi_plugin_system::APPLICATION_SCOPE;
+    let plugin_selection_result = request.validate_plugin_selections_with(|selection| {
+        let manager = state
+            .plugin_manager
+            .lock()
+            .map_err(|_| "插件管理器不可用".to_string())?;
+        // 读取资源会同时核对：作用域已激活、资源由清单声明、存储权限已授予。
+        let current = manager
+            .read_resource(
+                &selection.plugin_id,
+                plugin_selection_scope,
+                &selection.resource_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if selection.version > current.version {
+            return Err("选中对象的资源版本高于当前版本".to_string());
+        }
+        Ok(())
+    });
+    let plugin_selections = match plugin_selection_result {
+        Ok(selections) => selections,
+        Err(error) if created_session => {
+            return Err(rollback_created_session_on_dispatch_error(
+                state,
+                &session_id,
+                previous_current_session_id.clone(),
+                ApiError::InvalidInput(error),
+            )
+            .await);
+        }
+        Err(error) => return Err(ApiError::InvalidInput(error)),
+    };
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -388,6 +428,7 @@ async fn execute_dispatch_submission(
         context_references: request.context_references(),
         browser_annotation_refs,
         browser_node_selections,
+        plugin_selections,
         created_session,
         mission_title,
         task_title: action_task_title,
@@ -399,6 +440,10 @@ async fn execute_dispatch_submission(
         goal_mode: request.goal_mode,
         use_tools,
         target_role,
+        workflow_id: user_message_metadata
+            .get("magi.workflowId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         request_id: request.request_id(),
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
@@ -1378,6 +1423,7 @@ mod tests {
                 context_references: Vec::new(),
                 browser_annotation_refs: Vec::new(),
                 browser_node_selections: Vec::new(),
+                plugin_selections: Vec::new(),
                 created_session: false,
                 mission_title: "派发失败诊断".to_string(),
                 task_title: "派发失败诊断".to_string(),
@@ -1389,6 +1435,7 @@ mod tests {
                 goal_mode: false,
                 use_tools: true,
                 target_role: None,
+                workflow_id: None,
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
