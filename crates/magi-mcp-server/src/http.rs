@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ToolSchema, ToolSchemaProvider};
     use crate::path_guard::PathRequest;
-    use crate::profile::Profile;
+    use crate::profile::ApprovalMode;
     use crate::rate_limit::MAX_AUTH_FAILURES as MAX_AUTH_FAILURES_FOR_TEST;
     use crate::server::{
         BoxFuture, InvocationOutcome, ToolBackend, ToolInvocation, WorkspaceResolver,
@@ -379,7 +379,7 @@ mod tests {
                 IssueTokenRequest {
                     client_name: "test".to_string(),
                     workspace_id: "ws".to_string(),
-                    profile: Profile::Edit,
+                    approval_mode: ApprovalMode::Ask,
                     attribution: AttributionMode::External,
                     ttl_ms: None,
                     network: false,
@@ -530,7 +530,7 @@ mod tests {
                     IssueTokenRequest {
                         client_name: "test".to_string(),
                         workspace_id: "ws".to_string(),
-                        profile: Profile::Edit,
+                        approval_mode: ApprovalMode::Ask,
                         attribution: AttributionMode::External,
                         ttl_ms: None,
                         network,
@@ -737,7 +737,7 @@ mod tests {
                 IssueTokenRequest {
                     client_name: "remote".to_string(),
                     workspace_id: "ws".to_string(),
-                    profile: Profile::Edit,
+                    approval_mode: ApprovalMode::Ask,
                     attribution: AttributionMode::External,
                     ttl_ms: None,
                     network: true,

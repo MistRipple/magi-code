@@ -4,7 +4,7 @@
   import AgentCursorOverlay, { type AgentCursorSignal } from './AgentCursorOverlay.svelte';
   import { agentCursorPoint, normalizeAgentCursorAction } from '../../lib/agent-cursor';
   import { i18n } from '../../stores/i18n.svelte';
-  import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
+  import { normalizeExternalWebUrl, openExternalUrl } from '../../lib/external-link';
   import {
     browserScreenshotUrl,
     browserClientPlatform,
@@ -1259,7 +1259,7 @@
         await window.magiDesktop.openExternal(externalUrl);
         return;
       }
-      await openExternalWebUrl(externalUrl);
+      await openExternalUrl(externalUrl);
     });
   }
 

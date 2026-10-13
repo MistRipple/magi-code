@@ -401,7 +401,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ToolSchema, ToolSchemaProvider};
     use crate::path_guard::PathRequest;
-    use crate::profile::Profile;
+    use crate::profile::{ApprovalMode, Profile};
     use crate::server::{
         BoxFuture, InvocationOutcome, ToolBackend, ToolInvocation, WorkspaceResolver,
     };
@@ -477,7 +477,7 @@ mod tests {
                 IssueTokenRequest {
                     client_name: "test".to_string(),
                     workspace_id: "ws".to_string(),
-                    profile: Profile::Edit,
+                    approval_mode: ApprovalMode::Ask,
                     attribution: AttributionMode::External,
                     ttl_ms: None,
                     network: false,
@@ -628,6 +628,7 @@ mod tests {
                     client_name: "GPT Web".to_string(),
                     workspace_id: "ws".to_string(),
                     profile: Profile::Edit,
+                    approval_mode: ApprovalMode::Ask,
                     attribution: AttributionMode::External,
                 })
             })

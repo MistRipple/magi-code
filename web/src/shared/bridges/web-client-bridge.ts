@@ -96,7 +96,7 @@ import {
   dispatchFilePreviewEvent,
   normalizeFileReferenceTarget,
 } from '../../lib/file-reference';
-import { openExternalWebUrl } from '../../lib/external-link';
+import { openExternalUrl } from '../../lib/external-link';
 import type {
   AgentKnowledgeItemPatch,
   AgentKnowledgeItemPayload,
@@ -5603,7 +5603,7 @@ export function createWebClientBridge(): ClientBridge {
               });
               return;
             }
-            void openExternalWebUrl(message.url).catch((error) => {
+            void openExternalUrl(message.url).catch((error: unknown) => {
               logBridgeOperationFailure(i18n.t('bridge.action.openExternalLink'), '[web-client-bridge] 打开外部网页失败:', error);
             });
           }

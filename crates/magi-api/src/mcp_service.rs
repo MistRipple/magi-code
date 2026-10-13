@@ -19,9 +19,9 @@ use magi_core::{AccessProfile, EventId, ExecutionResultStatus, SessionId, UtcMil
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_mcp_server::server::BoxFuture;
 use magi_mcp_server::{
-    AttributionTarget, AuditEvent, AuditOutcome, AuditSink, DynamicTool, InvocationOutcome,
-    PathAccess, PathRequest, Profile, TokenStore, ToolBackend, ToolClass, ToolInvocation,
-    ToolSchema, ToolSchemaProvider, WorkspaceResolver,
+    ApprovalMode, AttributionTarget, AuditEvent, AuditOutcome, AuditSink, DynamicTool,
+    InvocationOutcome, PathAccess, PathRequest, Profile, TokenStore, ToolBackend, ToolClass,
+    ToolInvocation, ToolSchema, ToolSchemaProvider, WorkspaceResolver,
 };
 use magi_tool_runtime::{BuiltinToolName, tool_path_access_requests};
 use serde_json::Value;
@@ -172,8 +172,7 @@ impl AuditSink for EventBusAudit {
     }
 }
 
-/// 内置工具在网关里的权限类别：只读自动放行；写入需确认；删除、推送与未知副作用永远逐次确认；
-/// 命令执行只对 Exec 档开放。
+/// 内置工具在网关里的风险类别：供 GPT Web 槽位按工具档决策；MCP 令牌不按类别过滤，由授权方式统一处理。
 fn builtin_tool_class(tool: BuiltinToolName) -> ToolClass {
     match tool {
         BuiltinToolName::ShellExec
@@ -319,6 +318,13 @@ impl ApiToolBackend {
         };
         match invocation.internal_name.as_str() {
             CHANGES_LIST => {
+                if invocation.requires_approval
+                    && let Err(message) = self
+                        .request_approval(invocation, call_id, session_id, workspace_id, root)
+                        .await
+                {
+                    return error_outcome(message);
+                }
                 let listing = tokio::task::spawn_blocking(move || {
                     snapshot
                         .reconcile()
@@ -363,33 +369,12 @@ impl ApiToolBackend {
                     Ok(Some(message)) => return error_outcome(message),
                     Err(message) => return error_outcome(message),
                 }
-                if invocation.requires_approval {
-                    let state = self.state.clone();
-                    let tokens = self.tokens.clone();
-                    let timeout = self.approval_timeout;
-                    let invocation = invocation.clone();
-                    let call_id = call_id.to_string();
-                    let session_id = session_id.clone();
-                    let workspace_id = workspace_id.clone();
-                    let root = root.to_path_buf();
-                    let approved = tokio::task::spawn_blocking(move || {
-                        approve_blocking(
-                            &state,
-                            &tokens,
-                            timeout,
-                            &invocation,
-                            &call_id,
-                            &session_id,
-                            &workspace_id,
-                            &root,
-                        )
-                    })
-                    .await;
-                    match approved {
-                        Ok(Ok(())) => {}
-                        Ok(Err(payload)) => return error_outcome(payload),
-                        Err(_) => return error_outcome("审批等待意外中断"),
-                    }
+                if invocation.requires_approval
+                    && let Err(message) = self
+                        .request_approval(invocation, call_id, session_id, workspace_id, root)
+                        .await
+                {
+                    return error_outcome(message);
                 }
                 // 审批等待期间文件可能又被改过，落盘前再确认一次。
                 match check_revert_conflicts(snapshot.clone(), paths.clone()).await {
@@ -435,6 +420,38 @@ impl ApiToolBackend {
                 Ok(session_id)
             }
         }
+    }
+
+    async fn request_approval(
+        &self,
+        invocation: &ToolInvocation,
+        call_id: &str,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        root: &Path,
+    ) -> Result<(), String> {
+        let state = self.state.clone();
+        let tokens = self.tokens.clone();
+        let timeout = self.approval_timeout;
+        let invocation = invocation.clone();
+        let call_id = call_id.to_string();
+        let session_id = session_id.clone();
+        let workspace_id = workspace_id.clone();
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            approve_blocking(
+                &state,
+                &tokens,
+                timeout,
+                &invocation,
+                &call_id,
+                &session_id,
+                &workspace_id,
+                &root,
+            )
+        })
+        .await
+        .map_err(|_| "审批等待意外中断".to_string())?
     }
 }
 
@@ -907,7 +924,7 @@ impl ApiToolBackend {
     }
 }
 
-/// GPT Web 槽位发起的调用按设置里的授权方式处理；其他来源（外部令牌）一律每次询问。
+/// GPT Web 槽位按设置里的工具档和授权方式处理；外部令牌按令牌的授权方式处理。
 fn slot_approval_mode(
     state: &ApiState,
     invocation: &ToolInvocation,
@@ -918,12 +935,14 @@ fn slot_approval_mode(
     ) {
         effective_approval_mode(state.web_model.approval_mode(), invocation.class)
     } else {
-        crate::web_model_channel::WebApprovalMode::Ask
+        match invocation.principal.approval_mode {
+            ApprovalMode::Ask => crate::web_model_channel::WebApprovalMode::Ask,
+            ApprovalMode::Always => crate::web_model_channel::WebApprovalMode::Always,
+        }
     }
 }
 
-/// 「始终授权」只覆盖创建 / 修改类（`Write`）。删除、推送、合并等破坏性操作和命令执行
-/// （`Destructive` / `Exec`）按权限档的约定永远逐次确认，不能被一个全局开关静默放行。
+/// GPT Web 的「始终授权」保留高风险操作的逐次确认边界；MCP 令牌的开放权限由上游直接处理。
 fn effective_approval_mode(
     mode: crate::web_model_channel::WebApprovalMode,
     class: magi_mcp_server::ToolClass,
@@ -1019,19 +1038,20 @@ fn run_blocking(
         )
     };
 
-    let mut granted = false;
+    let approval_mode = slot_approval_mode(state, invocation);
+    // MCP 的开放权限代表用户已授予完整工具调用；传入 granted 让既有执行链跳过重复审批，
+    // 但路径越界等硬性策略仍由执行层拒绝。
+    let mut granted = approval_mode == crate::web_model_channel::WebApprovalMode::Always;
     if invocation.requires_approval {
-        match slot_approval_mode(state, invocation) {
-            // 「始终授权」只免掉按权限档需要的那次人工确认；工作区路径范围、审计和下面
-            // SafetyGate 对敏感操作的确认都照常生效。
+        match approval_mode {
             crate::web_model_channel::WebApprovalMode::Always => {}
-            crate::web_model_channel::WebApprovalMode::Deny => {
-                return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
-            }
             crate::web_model_channel::WebApprovalMode::Ask => {
                 if let Err((payload, _)) = approve(call_id) {
                     return error_outcome(payload);
                 }
+            }
+            crate::web_model_channel::WebApprovalMode::Deny => {
+                return error_outcome(WEB_APPROVAL_DENIED_BY_SETTING);
             }
         }
         granted = true;
@@ -1079,8 +1099,8 @@ fn run_blocking(
     }
 }
 
-/// MCP 权限档到 Magi 访问档的映射：只读档收紧为 ReadOnly；其余一律 Restricted，
-/// 绝不映射到 FullAccess（shell 仍受 Magi 的命令风险判定与 SafetyGate 约束）。
+/// 执行层访问档映射：只读 GPT Web 槽位收紧为 ReadOnly；其余使用 Restricted。
+/// MCP 的 `always` 会在既有执行链中请求授权后的 FullAccess，但仍受路径和硬性策略限制。
 fn access_profile_for(profile: Profile) -> AccessProfile {
     match profile {
         Profile::ReadOnly => AccessProfile::ReadOnly,
@@ -1220,7 +1240,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_mcp_server::http::{HttpConfig, HttpState, router};
-    use magi_mcp_server::{AttributionMode, IssueTokenRequest};
+    use magi_mcp_server::{ApprovalMode, AttributionMode, IssueTokenRequest};
     use magi_session_store::{SessionKind, SessionStore};
     use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
@@ -1236,7 +1256,11 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn fixture(profile: Profile, approval_timeout: Duration) -> Fixture {
+    fn fixture(approval_timeout: Duration) -> Fixture {
+        fixture_with_approval(ApprovalMode::Ask, approval_timeout)
+    }
+
+    fn fixture_with_approval(approval_mode: ApprovalMode, approval_timeout: Duration) -> Fixture {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
         let base = ApiState::new(
@@ -1348,7 +1372,7 @@ mod tests {
                 IssueTokenRequest {
                     client_name: "cursor".to_string(),
                     workspace_id: "ws-mcp".to_string(),
-                    profile,
+                    approval_mode,
                     attribution: AttributionMode::External,
                     ttl_ms: None,
                     network: false,
@@ -1437,8 +1461,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_profile_lists_write_tools_but_not_shell() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+    async fn tokens_list_the_full_tool_catalog_including_shell() {
+        let f = fixture(Duration::from_secs(5));
         let response = rpc(&f, "tools/list", serde_json::json!({})).await;
         let names = response["result"]["tools"]
             .as_array()
@@ -1448,12 +1472,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"magi.fs.read".to_string()));
         assert!(names.contains(&"magi.fs.write".to_string()));
-        assert!(!names.contains(&"magi.shell.exec".to_string()));
+        assert!(
+            names.contains(&"magi.shell.exec".to_string()),
+            "令牌不按工具档过滤，命令执行也在目录里（是否询问由授权方式决定）"
+        );
     }
 
     #[tokio::test]
-    async fn read_runs_without_approval_and_paths_outside_the_workspace_are_denied() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+    async fn open_mode_reads_without_prompt_and_paths_outside_the_workspace_are_denied() {
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
         std::fs::write(f.root.join("hello.txt"), "hi there").unwrap();
 
         let ok = rpc(
@@ -1501,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_calls_land_in_the_external_session_timeline_with_results_and_denials() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
         std::fs::write(f.root.join("hello.txt"), "hi there").unwrap();
         let ok = rpc(
             &f,
@@ -1540,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn turning_off_content_saving_keeps_actions_but_not_results() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
         f.state
             .mcp_service
             .set_retention(crate::mcp_runtime::ExternalRetention {
@@ -1571,7 +1598,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_write_lands_in_the_external_session_ledger() {
-        let f = fixture(Profile::Edit, Duration::from_secs(10));
+        let f = fixture(Duration::from_secs(10));
         let approver = resolve_pending(
             &f.state,
             &f.token_id,
@@ -1618,8 +1645,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_mode_prompts_for_each_write_in_one_activity() {
+        let f = fixture(Duration::from_millis(400));
+        let approver = resolve_pending(
+            &f.state,
+            &f.token_id,
+            magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
+        );
+        let first = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path": "activity-first.txt", "content": "first"}),
+            ),
+        )
+        .await;
+        approver.join().unwrap();
+        assert!(!is_error(&first), "{first}");
+
+        let second = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.fs.write",
+                serde_json::json!({"path": "activity-second.txt", "content": "second"}),
+            ),
+        )
+        .await;
+        assert!(
+            is_error(&second),
+            "同一活动段内的第二次写入仍需授权: {second}"
+        );
+        assert!(second.to_string().contains("tool_approval_timeout"));
+        assert!(!f.root.join("activity-second.txt").exists());
+        assert_eq!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn denied_or_timed_out_write_leaves_the_file_untouched() {
-        let f = fixture(Profile::Edit, Duration::from_millis(400));
+        let f = fixture(Duration::from_millis(400));
         let approver = resolve_pending(
             &f.state,
             &f.token_id,
@@ -1653,24 +1725,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_profile_never_sees_or_runs_write_tools() {
-        let f = fixture(Profile::ReadOnly, Duration::from_secs(5));
-        let response = rpc(
-            &f,
-            "tools/call",
-            call(
-                "magi.fs.write",
-                serde_json::json!({"path": "a.txt", "content": "x"}),
-            ),
-        )
-        .await;
-        assert!(is_error(&response));
-        assert!(!f.root.join("a.txt").exists());
-    }
-
-    #[tokio::test]
     async fn changes_list_shows_own_writes_and_revert_restores_after_approval() {
-        let f = fixture(Profile::Edit, Duration::from_secs(10));
+        let f = fixture(Duration::from_secs(10));
         std::fs::write(f.root.join("keep.txt"), "original").unwrap();
 
         // 先让 snapshot 建立基线：一次经批准的覆盖写入。
@@ -1691,12 +1747,18 @@ mod tests {
         approver.join().unwrap();
         assert!(!is_error(&written), "{written}");
 
+        let list_approver = resolve_pending(
+            &f.state,
+            &f.token_id,
+            magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
+        );
         let listed = rpc(
             &f,
             "tools/call",
             call("magi.changes.list", serde_json::json!({})),
         )
         .await;
+        list_approver.join().unwrap();
         assert!(!is_error(&listed), "{listed}");
         assert!(listed.to_string().contains("keep.txt"), "{listed}");
 
@@ -1725,7 +1787,7 @@ mod tests {
 
     #[tokio::test]
     async fn revert_is_refused_when_someone_else_changed_the_file_after_this_client() {
-        let f = fixture(Profile::Edit, Duration::from_secs(10));
+        let f = fixture(Duration::from_secs(10));
         std::fs::write(f.root.join("shared.txt"), "original").unwrap();
 
         let approver = resolve_pending(
@@ -1771,7 +1833,7 @@ mod tests {
 
     #[tokio::test]
     async fn revert_outside_the_workspace_and_approve_are_not_available() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture(Duration::from_secs(5));
         let escaped = rpc(
             &f,
             "tools/call",
@@ -1792,8 +1854,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_status_is_read_only_and_runs_without_approval() {
-        let f = fixture(Profile::ReadOnly, Duration::from_secs(5));
+    async fn open_mode_git_status_runs_without_approval() {
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(5));
         let git = |args: &[&str]| {
             let output = magi_process::std_command("git")
                 .arg("-C")
@@ -1841,7 +1903,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_pointing_outside_the_workspace_cannot_be_read_or_written_through() {
-        let f = fixture(Profile::Edit, Duration::from_secs(2));
+        let f = fixture(Duration::from_secs(2));
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "TOP-SECRET").unwrap();
         std::os::unix::fs::symlink(outside.path(), f.root.join("link")).unwrap();
@@ -1872,7 +1934,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_paths_git_dir_and_internal_or_cased_names_cannot_bypass_the_guards() {
-        let f = fixture(Profile::Edit, Duration::from_secs(2));
+        let f = fixture(Duration::from_secs(2));
         let patch = "*** Begin Patch\n*** Add File: ../escaped.txt\n+x\n*** End Patch\n";
         let escaped = rpc(
             &f,
@@ -1918,7 +1980,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_and_events_never_contain_file_content_or_the_token_secret() {
-        let f = fixture(Profile::EditTrusted, Duration::from_secs(2));
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(2));
         let response = rpc(
             &f,
             "tools/call",
@@ -1938,28 +2000,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_profile_writes_without_approval_but_remove_still_asks() {
-        let f = fixture(Profile::EditTrusted, Duration::from_millis(300));
-        std::fs::write(f.root.join("gone.txt"), "x").unwrap();
+    async fn open_mode_still_rejects_hard_blocked_commands_without_prompting() {
+        // 开放权限只免掉人工确认；用户配置的 HardBlock 规则、路径与访问档限制仍然拒绝。
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_secs(2));
+        f.state
+            .settings_store
+            .set_section(
+                "safeguardConfig",
+                serde_json::json!({"rules": [{
+                    "pattern": "magi-hard-block-probe",
+                    "enabled": true,
+                    "category": "custom",
+                    "action": "hard_block"
+                }]}),
+            )
+            .unwrap();
+        let blocked = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.shell.exec",
+                serde_json::json!({"command": "touch hard-block-ran.txt && echo magi-hard-block-probe"}),
+            ),
+        )
+        .await;
+        assert!(
+            is_error(&blocked),
+            "开放模式也必须拒绝 HardBlock: {blocked}"
+        );
+        assert!(
+            blocked.to_string().contains("tool_safety_rejected"),
+            "拒绝原因必须是安全防护硬拦截: {blocked}"
+        );
+        assert!(
+            !f.root.join("hard-block-ran.txt").exists(),
+            "被硬拦截的命令不得产生任何副作用"
+        );
+        assert!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .is_empty(),
+            "硬拦截是直接拒绝，不是转成待确认"
+        );
+
+        // 同一令牌的其它命令不受影响：只拦命中规则的那一条。
+        let ok = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.shell.exec",
+                serde_json::json!({"command": "printf still-open"}),
+            ),
+        )
+        .await;
+        assert!(!is_error(&ok), "{ok}");
+        assert!(ok.to_string().contains("still-open"));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_always_allows_all_calls_without_a_prompt() {
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_millis(300));
         let written = rpc(
             &f,
             "tools/call",
             call(
                 "magi.fs.write",
-                serde_json::json!({"path": "d.txt", "content": "ok"}),
+                serde_json::json!({"path": "auto.txt", "content": "ok"}),
             ),
         )
         .await;
         assert!(!is_error(&written), "{written}");
-        // 删除永远逐次确认：无人处理 → 超时 → 文件仍在。
+        assert!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .is_empty(),
+            "自动允许普通写入不应创建待确认项"
+        );
+
+        let created = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.mkdir", serde_json::json!({"path": "auto-dir"})),
+        )
+        .await;
+        assert!(!is_error(&created), "普通目录写入也不应再次询问: {created}");
+        assert!(f.root.join("auto-dir").is_dir());
+        assert!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .is_empty()
+        );
+
+        std::fs::write(f.root.join("remove-without-prompt.txt"), "remove me").unwrap();
         let removed = rpc(
             &f,
             "tools/call",
-            call("magi.fs.remove", serde_json::json!({"path": "gone.txt"})),
+            call(
+                "magi.fs.remove",
+                serde_json::json!({"path": "remove-without-prompt.txt"}),
+            ),
         )
         .await;
-        assert!(is_error(&removed), "{removed}");
-        assert!(f.root.join("gone.txt").exists());
+        assert!(!is_error(&removed), "开放权限应自动执行删除: {removed}");
+        assert!(!f.root.join("remove-without-prompt.txt").exists());
+
+        let command = rpc(
+            &f,
+            "tools/call",
+            call(
+                "magi.shell.exec",
+                serde_json::json!({"command": "printf open-mode"}),
+            ),
+        )
+        .await;
+        assert!(!is_error(&command), "开放权限应自动执行命令: {command}");
+        assert!(command.to_string().contains("open-mode"));
+        let read = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.read", serde_json::json!({"path": "auto.txt"})),
+        )
+        .await;
+        assert!(!is_error(&read), "开放权限应自动读取: {read}");
+        assert!(read.to_string().contains("ok"));
+        assert!(
+            f.state
+                .conversation_registry
+                .tool_approvals()
+                .pending_for_session(&external_session_id(&f.token_id))
+                .is_empty(),
+            "开放权限调用不应留下待确认项"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_mode_still_prompts_for_destructive_calls() {
+        let f = fixture_with_approval(ApprovalMode::Ask, Duration::from_millis(250));
+        std::fs::write(f.root.join("keep.txt"), "keep").unwrap();
+        let removed = rpc(
+            &f,
+            "tools/call",
+            call("magi.fs.remove", serde_json::json!({"path": "keep.txt"})),
+        )
+        .await;
+        assert!(is_error(&removed), "删除仍需逐次授权: {removed}");
+        assert!(f.root.join("keep.txt").exists(), "未授权时不得删除文件");
     }
 
     // ── 网关动态目录：项目允许的内置工具 / 下游 MCP / Skill handler ──────────────
@@ -1975,7 +2166,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_lists_extra_builtins_and_downstream_mcp_but_never_context_bound_tools() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture(Duration::from_secs(5));
         let names = tool_names(&f).await;
         assert!(
             names.contains(&"mcp.mcp__docs__search".to_string()),
@@ -1998,46 +2189,66 @@ mod tests {
         );
         // 静态目录里的内置工具不重复出现。
         assert!(!names.contains(&"magi.file_read".to_string()));
+        // 令牌统一开放完整目录：命令执行与下游写入类工具都在，授权方式只决定是否询问。
+        assert!(names.contains(&"magi.shell.exec".to_string()));
         assert!(
-            !names.contains(&"magi.shell.exec".to_string()),
-            "命令执行只对 Exec 档开放"
-        );
-        let read_only = fixture(Profile::ReadOnly, Duration::from_secs(5));
-        let read_only_names = tool_names(&read_only).await;
-        assert!(read_only_names.contains(&"mcp.mcp__docs__search".to_string()));
-        assert!(!read_only_names.contains(&"mcp.mcp__docs__publish".to_string()));
-        let exec = fixture(Profile::Exec, Duration::from_secs(5));
-        let exec_names = tool_names(&exec).await;
-        assert!(exec_names.contains(&"magi.shell.exec".to_string()));
-        assert!(
-            !exec_names.contains(&"magi.shell_exec".to_string()),
+            !names.contains(&"magi.shell_exec".to_string()),
             "内部名不得作为公开名重复出现"
         );
     }
 
     #[tokio::test]
     async fn connector_tool_digest_is_stable_for_the_same_catalog() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture(Duration::from_secs(5));
         let first = web_slot_tool_digest(&f.state).expect("catalog digest");
         assert_eq!(Some(first.clone()), web_slot_tool_digest(&f.state));
         assert_eq!(first.len(), 64);
     }
 
     #[tokio::test]
-    async fn web_slot_tool_count_matches_the_tools_list_catalog() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
-        let listed_count = tool_names(&f).await.len();
-
+    async fn web_slot_tool_count_matches_the_slots_own_tools_list() {
+        // 连接器状态的工具数来自 GPT Web 槽位自己的目录（按槽位工具档过滤），
+        // 而不是令牌的完整目录；两者都必须与各自真实的 tools/list 一致。
+        let f = fixture(Duration::from_secs(5));
+        let slot_principal = magi_mcp_server::ClientPrincipal {
+            token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
+            token_prefix: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
+            client_name: "GPT Web".to_string(),
+            workspace_id: String::new(),
+            profile: crate::web_slot_mcp::slot_profile_from_setting(None),
+            approval_mode: ApprovalMode::Ask,
+            attribution: magi_mcp_server::AttributionMode::FollowWebSlot,
+        };
+        let response = build_slot_mcp_server(f.state.clone())
+            .handle(
+                &slot_principal,
+                magi_mcp_server::JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(1)),
+                    method: "tools/list".to_string(),
+                    params: Some(serde_json::json!({})),
+                },
+                1,
+            )
+            .await
+            .expect("slot tools/list responds");
+        let slot_count = response["result"]["tools"].as_array().unwrap().len();
         assert_eq!(
             web_slot_tool_count(&f.state),
-            u64::try_from(listed_count).ok(),
-            "connector status count must come from the same tools/list catalog"
+            u64::try_from(slot_count).ok(),
+            "connector status count must come from the slot's own tools/list catalog"
         );
+        let token_names = tool_names(&f).await;
+        assert!(
+            token_names.len() > slot_count,
+            "令牌的完整目录比槽位目录多出命令执行等工具"
+        );
+        assert!(token_names.contains(&"magi.shell.exec".to_string()));
     }
 
     #[tokio::test]
-    async fn read_only_downstream_tool_runs_without_approval_and_write_tool_always_asks() {
-        let f = fixture(Profile::EditTrusted, Duration::from_millis(400));
+    async fn open_mode_runs_downstream_read_and_write_tools_without_approval() {
+        let f = fixture_with_approval(ApprovalMode::Always, Duration::from_millis(400));
         let search = rpc(
             &f,
             "tools/call",
@@ -2047,37 +2258,19 @@ mod tests {
         assert!(!is_error(&search), "{search}");
         assert_eq!(f.mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // 即使是“免确认编辑”档，副作用未知的下游工具也要逐次确认：无人处理则超时且不执行。
         let publish = rpc(
             &f,
             "tools/call",
             call("mcp.mcp__docs__publish", serde_json::json!({})),
         )
         .await;
-        assert!(is_error(&publish), "{publish}");
-        assert_eq!(f.mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        let f = fixture(Profile::Edit, Duration::from_secs(10));
-        let approver = resolve_pending(
-            &f.state,
-            &f.token_id,
-            magi_conversation_runtime::ToolApprovalDecision::AllowOnce,
-        );
-        let approved = rpc(
-            &f,
-            "tools/call",
-            call("mcp.mcp__docs__publish", serde_json::json!({})),
-        )
-        .await;
-        approver.join().unwrap();
-        assert!(!is_error(&approved), "{approved}");
-        assert!(approved.to_string().contains("publish"));
-        assert_eq!(f.mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!is_error(&publish), "{publish}");
+        assert_eq!(f.mcp_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn extra_builtin_runs_through_the_same_policy_and_unknown_dynamic_names_are_refused() {
-        let f = fixture(Profile::Edit, Duration::from_secs(5));
+        let f = fixture(Duration::from_secs(5));
         for name in [
             "mcp.nope",
             "skill.nope",

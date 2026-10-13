@@ -1009,11 +1009,18 @@
   }
 
   // 压缩命令不能带附件：用户主动添加附件时让命令让位并说明，附件不丢。
-  function dropSessionCommandForAttachment(): void {
+  function dropSessionCommandForAttachment(reason: 'attachment' | 'plugin-selection' = 'attachment'): void {
     if (selectedSessionCommand === null && selectedPluginCommand === null) return;
     selectedSessionCommand = null;
     if (selectedPluginCommand !== null) selectedPluginCommand = null;
-    addToast('info', i18n.t('input.compact.removedForAttachment'), undefined, { forceVisible: true });
+    addToast(
+      'info',
+      reason === 'attachment'
+        ? i18n.t('input.compact.removedForAttachment')
+        : i18n.t('input.pluginCommand.removedForSelection'),
+      undefined,
+      { forceVisible: true },
+    );
   }
 
   function activeModeLabel(): string | null {
@@ -1639,7 +1646,7 @@
         addToast('warning', i18n.t('input.pluginSelection.limit'));
         return;
       }
-      dropSessionCommandForAttachment();
+      dropSessionCommandForAttachment('plugin-selection');
       selectedPluginSelections = [...selectedPluginSelections, { ...detail }];
       // 输入区只在“对话”标签里可见：从主内容区插件页面选中时，明确告知引用已加入。
       if (messagesState.currentTopTab !== 'thread') {

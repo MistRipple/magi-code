@@ -297,6 +297,19 @@ impl ToolApprovalRegistry {
         }
     }
 
+    /// Remove external approval state for a session without touching ordinary approvals.
+    pub fn remove_external_session(&self, session_id: &SessionId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.turn_tool_grants.retain(|grant| {
+                grant.session_id != *session_id || !grant.task_id.as_str().starts_with("external:")
+            });
+            state.denied_session_tool_calls.retain(|fingerprint| {
+                fingerprint.session_id != *session_id
+                    || !fingerprint.task_id.as_str().starts_with("external:")
+            });
+        }
+    }
+
     pub fn pending_for_session(&self, session_id: &SessionId) -> Vec<PendingToolApproval> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();

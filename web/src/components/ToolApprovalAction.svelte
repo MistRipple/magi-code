@@ -17,6 +17,9 @@
   let resolving = $state<ToolApprovalDecision | null>(null);
   let resolved = $state(false);
   let actionError = $state('');
+  const isExternalApproval = $derived(
+    approval.taskId.startsWith('external:') && approval.taskId !== 'external:web-slot',
+  );
   const approvalIsActive = $derived(
     !toolApprovalState.hydrated
       || toolApprovalState.sessionId !== approval.sessionId
@@ -58,16 +61,22 @@
       disabled={Boolean(resolving) || resolved || !approvalIsActive}
       onclick={() => void resolve('allow_once')}
     >
-      {resolving === 'allow_once' ? i18n.t('toolCall.approval.processing') : i18n.t('toolCall.approval.allowOnce')}
+      {resolving === 'allow_once'
+        ? i18n.t('toolCall.approval.processing')
+        : i18n.t(isExternalApproval ? 'mcpServer.approvals.allow' : 'toolCall.approval.allowOnce')}
     </button>
-    <button
-      type="button"
-      class="approval-button"
-      disabled={Boolean(resolving) || resolved || !approvalIsActive}
-      onclick={() => void resolve('allow_for_turn')}
-    >
-      {resolving === 'allow_for_turn' ? i18n.t('toolCall.approval.processing') : i18n.t(approval.agent ? 'toolCall.approval.allowForTurnAgent' : 'toolCall.approval.allowForTurn')}
-    </button>
+    {#if !isExternalApproval}
+      <button
+        type="button"
+        class="approval-button"
+        disabled={Boolean(resolving) || resolved || !approvalIsActive}
+        onclick={() => void resolve('allow_for_turn')}
+      >
+        {resolving === 'allow_for_turn'
+          ? i18n.t('toolCall.approval.processing')
+          : i18n.t(approval.agent ? 'toolCall.approval.allowForTurnAgent' : 'toolCall.approval.allowForTurn')}
+      </button>
+    {/if}
     <button
       type="button"
       class="approval-button"

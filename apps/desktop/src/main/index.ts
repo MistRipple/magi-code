@@ -605,7 +605,9 @@ function registerIpc(): void {
     trustedAppSender(event.sender.id);
     if (typeof value !== "string") throw new Error("external_url_invalid");
     const url = new URL(value);
-    if (!["http:", "https:"].includes(url.protocol))
+    // 网页交给系统浏览器，`mailto:` 交给系统邮件客户端。两者都是「外部
+    // 处理器」，但都不属于内置 BrowserSurface 能承载的文档协议。
+    if (!["http:", "https:", "mailto:"].includes(url.protocol))
       throw new Error("external_url_invalid");
     await shell.openExternal(url.href);
   });

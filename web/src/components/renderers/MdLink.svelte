@@ -14,7 +14,7 @@
   import { vscode } from '../../lib/vscode-bridge';
   import { desktopContextMenu, type DesktopContextMenuDescriptor } from '../../lib/desktop-context-menu-contract';
   import { requestOpenUrlInBrowser } from '../../lib/browser-navigation';
-  import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
+  import { normalizeExternalWebUrl, openExternalUrl } from '../../lib/external-link';
   import { i18n } from '../../stores/i18n.svelte';
   import { addToast } from '../../stores/messages.svelte';
   import Icon from '../Icon.svelte';
@@ -49,6 +49,9 @@
     if (webTarget && requestOpenUrlInBrowser(webTarget)) {
       return;
     }
+    // 非网页链接（`mailto:` 等）没有内置浏览器归宿，交给宿主的外部处理器；
+    // IDE 宿主模式由 bridge 转发给宿主，Web/Desktop 由 bridge 落到
+    // `openExternalUrl`（Desktop 进而交给系统邮件客户端）。
     vscode.postMessage({ type: 'openLink', url: href });
   }
 
@@ -61,7 +64,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (!webTarget) return;
-    void openExternalWebUrl(webTarget).catch(() => {
+    void openExternalUrl(webTarget).catch(() => {
       addToast('error', i18n.t('browser.error.openExternal'), undefined, { forceVisible: true });
     });
   }

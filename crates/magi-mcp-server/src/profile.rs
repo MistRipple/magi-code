@@ -1,11 +1,11 @@
-//! 权限档与审批决策。
+//! GPT Web 槽位的工具档与 MCP 授权方式。
 //!
-//! 决策只依赖两个输入：令牌的权限档、工具的风险类别。它是**纯函数**，网络客户端与
-//! 本机客户端走同一张表，不允许出现第二套判定。
+//! 工具档决策只依赖两个输入：槽位的工具档、工具的风险类别，是**纯函数**。MCP 令牌不使用
+//! 工具档：它们固定开放完整工具目录，只由 [`ApprovalMode`] 决定逐次询问还是自动执行。
 
 use serde::{Deserialize, Serialize};
 
-/// 令牌的权限档。默认 `ReadOnly`；网络客户端不得默认高于 `Edit`。
+/// GPT Web 槽位按设置选择的工具档。MCP 令牌不携带工具档，对外一律完整工具目录。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Profile {
@@ -18,6 +18,19 @@ pub enum Profile {
     EditTrusted,
     /// 在 `Edit` 之上额外开放 shell；写入与执行都逐次确认。
     Exec,
+}
+
+/// 需要人工确认的调用如何处理。
+///
+/// `Always` 自动放行完整工具目录里的调用；Magi 自身的路径限制、安全策略和硬性拒绝仍生效。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// 默认每次 MCP 工具调用都在 Magi 中询问。
+    #[default]
+    Ask,
+    /// 自动允许所有 MCP 工具调用。
+    Always,
 }
 
 /// 工具的风险类别。

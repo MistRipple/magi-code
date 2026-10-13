@@ -11,12 +11,17 @@ const [handler, bridge, projectTab, desktopMain, desktopPreload, desktopTypes, p
   readFile(new URL('../package.json', import.meta.url), 'utf8'),
 ]);
 
-assert.match(handler, /EXTERNAL_WEB_PROTOCOLS = new Set\(\['http:', 'https:'\]\)/, 'external links must reject non-web protocols');
+assert.match(handler, /EXTERNAL_WEB_PROTOCOLS = new Set\(\['http:', 'https:'\]\)/, '内置浏览器候选必须是纯网页协议');
+assert.match(
+  handler,
+  /EXTERNAL_HANDLER_PROTOCOLS = new Set\(\['http:', 'https:', 'mailto:'\]\)/,
+  '系统处理器协议必须包含 mailto，邮件链接不能成为死链',
+);
 assert.match(handler, /window\.magiDesktop[\s\S]*?window\.magiDesktop\.openExternal\(url\)/, 'desktop links must use the Electron system browser bridge');
 assert.match(handler, /window\.open\(url, '_blank', 'noopener,noreferrer'\)/, 'web links must continue to use a protected browser window');
-assert.match(bridge, /case 'openLink':[\s\S]*?openExternalWebUrl\(message\.url\)/, 'all bridge links must use the shared external-link handler');
+assert.match(bridge, /case 'openLink':[\s\S]*?openExternalUrl\(message\.url\)/, 'all bridge links must use the shared external-link handler');
 assert.match(projectTab, /type: 'openLink'/, 'project links must flow through the shared bridge');
-assert.match(desktopMain, /\["http:", "https:"\]\.includes\(url\.protocol\)[\s\S]*?shell\.openExternal/, 'Electron Main must validate web protocols before opening externally');
+assert.match(desktopMain, /\["http:", "https:", "mailto:"\]\.includes\(url\.protocol\)[\s\S]*?shell\.openExternal/, 'Electron Main must validate handler protocols before opening externally');
 assert.match(desktopPreload, /openExternal:[\s\S]*?magi-desktop:open-external/, 'preload must expose only the scoped external-link IPC');
 assert.match(desktopTypes, /openExternal\(url: string\): Promise<void>/, 'Renderer bridge typing must expose the external-link contract');
 assert.doesNotMatch(handler + desktopPreload + desktopMain, /@tauri-apps|tauri_plugin_opener/, 'external links must not retain a Tauri fallback');

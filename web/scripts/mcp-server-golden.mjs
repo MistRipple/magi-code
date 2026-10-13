@@ -52,22 +52,24 @@ assert.match(section, /token\.hasSecret/);
 assert.match(section, /data-mcp-token-no-secret/);
 assert.match(section, /rotateMcpServerToken\(token\.tokenId\)/);
 assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.token\.rotateConfirm'/);
-// 编辑：高风险档要确认；升到高风险档时网络一并关闭；工作区不可改
-assert.match(section, /confirmHighRisk: editNeedsConfirm \? editConfirmHighRisk : undefined/);
-assert.match(section, /const network = editHighRisk \? false : editNetwork/);
+// 所有客户端使用完整工具目录，只选择逐次询问或开放权限。
+assert.doesNotMatch(section, /McpServerProfile|data-mcp-profile|data-mcp-edit-profile|confirmHighRisk|editConfirmHighRisk/);
+assert.doesNotMatch(agentApi, /McpServerProfile|confirmHighRisk/);
 assert.doesNotMatch(section, /updateMcpServerToken\([^)]*workspaceId/);
 assert.match(section, /viewingSecret = null/, '收起后原文必须丢弃');
 
-// ── 高风险权限档必须显式确认 ─────────────────────────────────────────────────
-assert.match(section, /HIGH_RISK_PROFILES[\s\S]*'edit_trusted'[\s\S]*'exec'/);
-assert.match(section, /\(!needsConfirm \|\| confirmHighRisk\)/);
-assert.match(section, /confirmHighRisk: needsConfirm \? confirmHighRisk : undefined/);
+// ── MCP 权限只有每次询问与开放权限两种 ───────────────────────────────────────
+assert.match(section, /data-mcp-approval-mode/);
+assert.match(section, /data-mcp-edit-approval-mode/);
+assert.match(section, /const APPROVAL_MODES:[^\n]*= \['ask', 'always'\]/);
+assert.doesNotMatch(section, /profile !== 'read_only'/);
+assert.match(section, /let approvalMode = \$state<McpServerApprovalMode>\('ask'\)/);
 
-// ── 网络模式：需要确认风险；高风险权限档不能带网络；地址会变要提示 ─────────────
+// ── 网络模式：需要确认风险；工具目录保持完整；地址会变要提示 ──────────────────
 assert.match(section, /confirmMessage\(i18n\.t\('mcpServer\.network\.confirm'\)/);
 assert.match(section, /setMcpServerNetwork\(enabled, enabled\)/);
-assert.match(section, /allowNetwork: allowNetwork && !needsConfirm \? true : undefined/);
-assert.match(section, /if \(needsConfirm\) allowNetwork = false/);
+assert.match(section, /allowNetwork: allowNetwork \? true : undefined/);
+assert.match(section, /data-mcp-allow-network="1"/);
 assert.match(section, /!status\.network\.enabled && !hasNetworkToken/);
 assert.match(section, /mcpServer\.network\.addressChanges/);
 assert.match(agentApi, /body: \{ enabled, confirmRisk \}/);
@@ -135,6 +137,8 @@ assert.match(
   /event\.payload\?\.external === true\) \{[\s\S]*?MCP_APPROVALS_CHANGED_EVENT[\s\S]*?return;[\s\S]*?\}\s*refreshCurrentSessionToolApprovals\(eventType\)/,
 );
 assert.match(shell, /<ExternalApprovalTray \/>/);
+assert.match(shell, /mergeExternalSessionsIntoSidebar/);
+assert.doesNotMatch(shell, /<ExternalSessionsSection/);
 // MCP 服务是独立的设置分类（插件激活后才出现），不再嵌在工具页里。
 assert.match(settingsPanel, /<SettingsMcpServerSection \/>/);
 assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
@@ -144,7 +148,8 @@ assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
 assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0\) void refreshExternalApprovals\(\)/);
 assert.match(approvalStore, /disabled = true;/);
 assert.match(approvalActions, /'allow_once'/);
-assert.doesNotMatch(approvalActions + approvalStore, /allow_for_turn/);
+assert.doesNotMatch(approvalActions, /allow_for_turn/);
+assert.match(read('web/src/components/ToolApprovalAction.svelte'), /\{#if !isExternalApproval\}[\s\S]*?allow_for_turn/);
 // 窗口不在前台时新的待确认发系统通知；启动时已存在的不重复提醒。
 assert.match(approvalStore, /new Notification\(/);
 assert.match(approvalStore, /document\.hasFocus\(\)/);
@@ -162,12 +167,12 @@ assert.doesNotMatch(section, /resolveMcpServerApproval|data-mcp-server-approvals
 const usedKeys = new Set();
 for (const action of ['token.view_secret', 'token.update', 'token.rotate']) usedKeys.add(`mcpServer.audit.action.${action}`);
 for (const id of ['connect', 'clients', 'remote', 'activity']) usedKeys.add(`mcpServer.tab.${id}`);
-for (const source of [section, tray, audit, approvalActions, approvalStore, read('web/src/components/ExternalSessionBar.svelte'), read('web/src/components/ExternalSessionsSection.svelte')]) {
+for (const source of [section, tray, audit, approvalActions, approvalStore, read('web/src/components/ExternalSessionBar.svelte')]) {
   for (const match of source.matchAll(/i18n\.t\(\s*['`](mcpServer\.[^'`$]+)['`]/g)) usedKeys.add(match[1]);
 }
-for (const profile of ['read_only', 'edit', 'edit_trusted', 'exec']) {
-  usedKeys.add(`mcpServer.token.profile.${profile}`);
-  usedKeys.add(`mcpServer.token.profileShort.${profile}`);
+for (const mode of ['ask', 'always']) {
+  usedKeys.add(`mcpServer.token.approvalMode.${mode}`);
+  usedKeys.add(`mcpServer.token.approvalModeShort.${mode}`);
 }
 for (const state of ['stopped', 'installing', 'starting', 'running', 'error']) {
   usedKeys.add(`mcpServer.network.status.${state}`);

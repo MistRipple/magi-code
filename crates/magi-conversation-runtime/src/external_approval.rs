@@ -3,10 +3,7 @@
 //! 复用 `ToolApprovalRegistry` 与 `tool.approval.requested` 事件，但存活判据不是“会话当前 turn
 //! 仍在运行”，而是调用方提供的 `is_alive`（令牌仍有效且连接未断）。
 //!
-//! 每次调用使用独立的合成 `turn_id`（`external:<token_id>:<call_id>`），因此：
-//! - 拒绝记忆只作用于这一次调用，用户之后改变主意可以重新发起；
-//! - `AllowForTurn` 只对这一次调用生效，等同 `AllowOnce`；
-//! - 调用结束后立即清理该 turn 的全部授权状态。
+//! 每次调用使用独立的合成 `turn_id`（`external:<token_id>:<call_id>`），因此每次询问只作用于该调用。
 
 use std::time::{Duration, Instant};
 
@@ -51,6 +48,8 @@ pub fn cancel_external_approvals(
     token_id: &str,
 ) {
     registry.remove_task(session_id, &external_approval_task_id(token_id));
+    // 槽位审批也复用这个取消入口；不能清掉该会话里的普通审批。
+    registry.remove_external_session(session_id);
 }
 
 fn failure(

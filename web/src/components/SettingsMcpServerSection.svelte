@@ -29,14 +29,14 @@
     verifyMcpServerNamedTunnel,
     type McpServerConfigSnippets,
     type McpServerNamedTunnelCheck,
-    type McpServerProfile,
+    type McpServerApprovalMode,
     type McpServerStatus,
     type McpServerToken,
   } from '../web/agent-api';
   import SettingsMcpServerAudit from './SettingsMcpServerAudit.svelte';
 
-  const PROFILES: readonly McpServerProfile[] = ['read_only', 'edit', 'edit_trusted', 'exec'];
-  const HIGH_RISK_PROFILES: readonly McpServerProfile[] = ['edit_trusted', 'exec'];
+  // 新建 MCP 令牌始终开放完整工具目录；权限只决定是否在调用前询问。
+  const APPROVAL_MODES: readonly McpServerApprovalMode[] = ['ask', 'always'];
 
   let status = $state<McpServerStatus | null>(null);
   let snippets = $state<McpServerConfigSnippets | null>(null);
@@ -54,9 +54,8 @@
 
   let clientName = $state('');
   let workspaceId = $state('');
-  let profile = $state<McpServerProfile>('edit');
+  let approvalMode = $state<McpServerApprovalMode>('ask');
   let ttlDays = $state(90);
-  let confirmHighRisk = $state(false);
   let allowNetwork = $state(false);
   /** 刚创建的令牌原文。只驻内存，用户点“我已保存”后丢弃。 */
   let freshSecret = $state('');
@@ -89,13 +88,11 @@
   /** 正在编辑的令牌。工作区创建后不可改。 */
   let editingTokenId = $state('');
   let editName = $state('');
-  let editProfile = $state<McpServerProfile>('edit');
+  let editApprovalMode = $state<McpServerApprovalMode>('ask');
   let editNetwork = $state(false);
   let editTtl = $state('');
-  let editConfirmHighRisk = $state(false);
 
   const workspaces = $derived(composerWorkspaceState.workspaces);
-  const needsConfirm = $derived(HIGH_RISK_PROFILES.includes(profile));
   const hasNetworkToken = $derived(
     (status?.tokens ?? []).some((token) => token.network && token.active),
   );
@@ -103,15 +100,10 @@
   const editingToken = $derived(
     (status?.tokens ?? []).find((token) => token.tokenId === editingTokenId) ?? null,
   );
-  const editNeedsConfirm = $derived(
-    HIGH_RISK_PROFILES.includes(editProfile) && editProfile !== editingToken?.profile,
-  );
-  const editHighRisk = $derived(HIGH_RISK_PROFILES.includes(editProfile));
   const canSaveEdit = $derived(
     !busy
       && editName.trim() !== ''
-      && (editTtl.trim() === '' || /^\d+$/.test(editTtl.trim()))
-      && (!editNeedsConfirm || editConfirmHighRisk),
+      && (editTtl.trim() === '' || /^\d+$/.test(editTtl.trim())),
   );
   const remoteTokens = $derived(
     (status?.tokens ?? []).filter((token) => token.active && token.network),
@@ -162,8 +154,7 @@
   const canCreate = $derived(
     !busy
       && clientName.trim() !== ''
-      && workspaceId !== ''
-      && (!needsConfirm || confirmHighRisk),
+      && workspaceId !== '',
   );
 
   function messageOf(error: unknown): string {
@@ -212,15 +203,14 @@
       const created = await createMcpServerToken({
         clientName: clientName.trim(),
         workspaceId,
-        profile,
+        approvalMode,
         ttlDays,
-        confirmHighRisk: needsConfirm ? confirmHighRisk : undefined,
-        allowNetwork: allowNetwork && !needsConfirm ? true : undefined,
+        allowNetwork: allowNetwork ? true : undefined,
       });
       freshSecret = created.secret;
       showCreate = false;
       clientName = '';
-      confirmHighRisk = false;
+      approvalMode = 'ask';
       allowNetwork = false;
       await refresh();
     });
@@ -363,10 +353,10 @@
   function startEdit(token: McpServerToken): void {
     editingTokenId = token.tokenId;
     editName = token.clientName;
-    editProfile = token.profile;
+    // Legacy `deny` tokens enter the current two-choice model as `ask` when saved.
+    editApprovalMode = token.approvalMode === 'always' ? 'always' : 'ask';
     editNetwork = token.network;
     editTtl = '';
-    editConfirmHighRisk = false;
   }
 
   function cancelEdit(): void {
@@ -378,14 +368,11 @@
     if (!token) return Promise.resolve();
     return act(async () => {
       const ttl = editTtl.trim();
-      // 高风险权限档不能同时开放公网：升到高风险档时一并关掉。
-      const network = editHighRisk ? false : editNetwork;
       status = await updateMcpServerToken(token.tokenId, {
         clientName: editName.trim() !== token.clientName ? editName.trim() : undefined,
-        profile: editProfile !== token.profile ? editProfile : undefined,
-        allowNetwork: network !== token.network ? network : undefined,
+        approvalMode: editApprovalMode !== token.approvalMode ? editApprovalMode : undefined,
+        allowNetwork: editNetwork !== token.network ? editNetwork : undefined,
         ttlDays: ttl === '' ? undefined : Number(ttl),
-        confirmHighRisk: editNeedsConfirm ? editConfirmHighRisk : undefined,
       });
       editingTokenId = '';
       await refresh();
@@ -454,10 +441,6 @@
     if (!token.active) return i18n.t('mcpServer.token.expired');
     return '';
   }
-
-  $effect(() => {
-    if (needsConfirm) allowNetwork = false;
-  });
 
   // 默认选一个能直接填进配置的客户端（没有原文的令牌无法填入）。
   $effect(() => {
@@ -800,7 +783,7 @@
               <span class="row-title">
                 {token.clientName}
                 <code>{token.prefix}…</code>
-                <span class="badge">{i18n.t(`mcpServer.token.profileShort.${token.profile}`)}</span>
+                <span class="badge" data-mcp-token-approval-mode={token.approvalMode}>{i18n.t(`mcpServer.token.approvalModeShort.${token.approvalMode}`)}</span>
                 {#if token.network}<span class="badge" data-mcp-token-network="1">{i18n.t('mcpServer.token.networkBadge')}</span>{/if}
                 {#if tokenStateLabel(token)}<span class="badge badge--off">{tokenStateLabel(token)}</span>{/if}
               </span>
@@ -867,10 +850,10 @@
                 </label>
                 <p class="meta">{i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
                 <label class="field">
-                  <span>{i18n.t('mcpServer.token.profile')}</span>
-                  <select bind:value={editProfile} data-mcp-edit-profile="1">
-                    {#each PROFILES as option (option)}
-                      <option value={option}>{i18n.t(`mcpServer.token.profile.${option}`)}</option>
+                  <span>{i18n.t('mcpServer.token.approvalMode')}</span>
+                  <select bind:value={editApprovalMode} data-mcp-edit-approval-mode="1">
+                    {#each APPROVAL_MODES as option (option)}
+                      <option value={option}>{i18n.t(`mcpServer.token.approvalMode.${option}`)}</option>
                     {/each}
                   </select>
                 </label>
@@ -878,20 +861,10 @@
                   <span>{i18n.t('mcpServer.token.editTtl')}</span>
                   <input bind:value={editTtl} inputmode="numeric" placeholder={i18n.t('mcpServer.token.editTtlKeep')} data-mcp-edit-ttl="1" />
                 </label>
-                {#if !editHighRisk}
-                  <label class="switch-line">
-                    <input type="checkbox" bind:checked={editNetwork} />
-                    <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
-                  </label>
-                {:else if token.network}
-                  <p class="meta">{i18n.t('mcpServer.token.editNetworkDropped')}</p>
-                {/if}
-                {#if editNeedsConfirm}
-                  <label class="switch-line risk">
-                    <input type="checkbox" bind:checked={editConfirmHighRisk} />
-                    <span>{i18n.t('mcpServer.token.confirmHighRisk')}</span>
-                  </label>
-                {/if}
+                <label class="switch-line">
+                  <input type="checkbox" bind:checked={editNetwork} />
+                  <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
+                </label>
                 <p class="meta">{i18n.t('mcpServer.token.editEffect')}</p>
                 <div class="action-row">
                   <button type="submit" class="primary-action" disabled={!canSaveEdit}>{i18n.t('mcpServer.token.save')}</button>
@@ -949,10 +922,10 @@
         </select>
       </label>
       <label class="field">
-        <span>{i18n.t('mcpServer.token.profile')}</span>
-        <select bind:value={profile} data-mcp-profile="1">
-          {#each PROFILES as option (option)}
-            <option value={option}>{i18n.t(`mcpServer.token.profile.${option}`)}</option>
+        <span>{i18n.t('mcpServer.token.approvalMode')}</span>
+        <select bind:value={approvalMode} data-mcp-approval-mode="1">
+          {#each APPROVAL_MODES as option (option)}
+            <option value={option}>{i18n.t(`mcpServer.token.approvalMode.${option}`)}</option>
           {/each}
         </select>
       </label>
@@ -960,18 +933,10 @@
         <span>{i18n.t('mcpServer.token.ttl')}</span>
         <input type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
       </label>
-      {#if needsConfirm}
-        <label class="switch-line risk" data-mcp-confirm-risk="1">
-          <input type="checkbox" bind:checked={confirmHighRisk} />
-          <span>{i18n.t('mcpServer.token.confirmHighRisk')}</span>
-        </label>
-      {/if}
-      {#if !needsConfirm}
-        <label class="switch-line" data-mcp-allow-network="1">
-          <input type="checkbox" bind:checked={allowNetwork} />
-          <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
-        </label>
-      {/if}
+      <label class="switch-line" data-mcp-allow-network="1">
+        <input type="checkbox" bind:checked={allowNetwork} />
+        <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
+      </label>
       <div class="action-row">
         <button type="submit" class="primary-action" data-mcp-create="1" disabled={!canCreate}>
           {i18n.t('mcpServer.token.create')}
@@ -1155,10 +1120,6 @@
   .switch-line input[type='checkbox']:checked::after { transform: translateX(14px); }
   .switch-line input[type='checkbox']:disabled { cursor: default; opacity: 0.35; }
   .switch-line input[type='checkbox']:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-
-  .switch-line.risk {
-    color: var(--danger, #c53f4f);
-  }
 
   .badge {
     padding: 0 8px;

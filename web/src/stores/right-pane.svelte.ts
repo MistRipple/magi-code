@@ -624,6 +624,9 @@ function upsertTab(
       existing.lastActivatedAt = timestamp;
       session.activeTabId = id;
       session.collapsed = false;
+      // 激活任意会话级 Tab 即离开应用级视图（与 `setActiveRightPaneTab` 同一语义）；
+      // 否则 GPT Web 视图处于激活态时，新开的 Tab 只进 Tab 条，内容槽仍显示 GPT Web。
+      rightPaneState.activeAppTabId = null;
       rememberDesktopPanelIntent(scopeKey, existing);
     }
     return existing;
@@ -641,6 +644,7 @@ function upsertTab(
   if (activate) {
     session.activeTabId = id;
     session.collapsed = false;
+    rightPaneState.activeAppTabId = null;
     rememberDesktopPanelIntent(scopeKey, tab);
   }
   return tab;

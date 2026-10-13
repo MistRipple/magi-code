@@ -32,6 +32,18 @@ await withGoldenViteServer(async (server) => {
   assert.equal(navigation.requestOpenHtmlFileInBrowser('/tmp/readme.md'), false);
   assert.equal(events.length, 1);
 
+  // 链接点击：只有 http(s) 才派发「在内置浏览器打开」，其余协议（mailto、
+  // javascript 等）不在这里处理，由调用方交给外部处理器。
+  const before = events.length;
+  assert.equal(navigation.requestOpenUrlInBrowser('https://example.com/a?b=1'), true);
+  assert.equal(events.length, before + 1);
+  assert.equal(events[events.length - 1].type, navigation.OPEN_URL_IN_BROWSER_EVENT);
+  assert.deepEqual(events[events.length - 1].detail, { url: 'https://example.com/a?b=1' });
+  assert.equal(navigation.requestOpenUrlInBrowser('mailto:dev@example.com'), false);
+  assert.equal(navigation.requestOpenUrlInBrowser('javascript:alert(1)'), false);
+  assert.equal(navigation.requestOpenUrlInBrowser('   '), false);
+  assert.equal(events.length, before + 1);
+
   delete globalThis.window;
   console.log('browser navigation golden replay passed');
 });

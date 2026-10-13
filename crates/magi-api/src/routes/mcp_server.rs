@@ -11,7 +11,7 @@ use axum::{
 };
 use magi_conversation_runtime::ToolApprovalDecision;
 use magi_core::WorkspaceId;
-use magi_mcp_server::{AttributionMode, IssueTokenRequest, Profile, TokenPatch, TokenRecord};
+use magi_mcp_server::{ApprovalMode, AttributionMode, IssueTokenRequest, TokenPatch, TokenRecord};
 use serde::{Deserialize, Serialize};
 
 use super::is_public_tunnel_request;
@@ -110,7 +110,7 @@ struct TokenDto {
     prefix: String,
     client_name: String,
     workspace_id: String,
-    profile: Profile,
+    approval_mode: ApprovalMode,
     attribution: AttributionMode,
     /// 是否允许经公网隧道使用。
     network: bool,
@@ -130,7 +130,7 @@ impl TokenDto {
             prefix: record.prefix.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
-            profile: record.profile,
+            approval_mode: record.approval_mode,
             attribution: record.attribution,
             network: record.network,
             created_at_ms: record.created_at_ms,
@@ -369,37 +369,15 @@ async fn verify_named_tunnel(
 struct CreateTokenRequest {
     client_name: String,
     workspace_id: String,
-    profile: Profile,
+    /// 需要人工确认的调用如何处理；默认每次询问。
+    #[serde(default)]
+    approval_mode: ApprovalMode,
     /// 有效期天数。缺省 90；`0` 表示不过期。
     #[serde(default)]
     ttl_days: Option<u32>,
-    /// 免确认写入（`edit_trusted`）与命令执行（`exec`）必须显式确认风险。
-    #[serde(default)]
-    confirm_high_risk: bool,
-    /// 允许这个令牌经公网隧道使用（网络模式）。默认只能在本机使用；
-    /// 网络令牌的权限档不得高于 `edit`。
+    /// 允许这个令牌经公网隧道使用（网络模式）。默认只能在本机使用。
     #[serde(default)]
     allow_network: bool,
-}
-
-/// 创建与编辑共用的权限校验：高风险权限档要显式确认，网络令牌不得高于 `edit`。
-fn validate_scope(
-    profile: Profile,
-    network: bool,
-    confirm_high_risk: bool,
-) -> Result<(), ApiError> {
-    let high_risk = matches!(profile, Profile::EditTrusted | Profile::Exec);
-    if high_risk && !confirm_high_risk {
-        return Err(ApiError::InvalidInput(
-            "免确认写入与命令执行权限需要显式确认风险".to_string(),
-        ));
-    }
-    if network && high_risk {
-        return Err(ApiError::InvalidInput(
-            "允许网络访问的令牌权限档不能高于“编辑”（写入前需要确认）".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// 有效期天数换算为毫秒；`0` 表示不过期。
@@ -430,18 +408,13 @@ async fn create_token(
     {
         return Err(ApiError::InvalidInput("工作区不存在".to_string()));
     }
-    validate_scope(
-        request.profile,
-        request.allow_network,
-        request.confirm_high_risk,
-    )?;
     let ttl_ms = ttl_days_to_ms(request.ttl_days.unwrap_or(DEFAULT_TOKEN_TTL_DAYS));
     let issued = state
         .mcp_service
         .issue_token(IssueTokenRequest {
             client_name: request.client_name,
             workspace_id: request.workspace_id,
-            profile: request.profile,
+            approval_mode: request.approval_mode,
             // 令牌只归到自己的外部工具会话；follow_web_slot 由 GPT Web 槽位内部签发。
             attribution: AttributionMode::External,
             ttl_ms,
@@ -460,19 +433,17 @@ async fn create_token(
 struct UpdateTokenRequest {
     #[serde(default)]
     client_name: Option<String>,
+    /// 需要人工确认的调用如何处理；缺省不改。
     #[serde(default)]
-    profile: Option<Profile>,
+    approval_mode: Option<ApprovalMode>,
     /// 从现在起重新计算的有效期天数；`0` 表示不过期。缺省不改。
     #[serde(default)]
     ttl_days: Option<u32>,
     #[serde(default)]
     allow_network: Option<bool>,
-    /// 把权限档改成免确认写入或命令执行时必须显式确认风险。
-    #[serde(default)]
-    confirm_high_risk: bool,
 }
 
-/// 编辑令牌的名称、权限档、有效期与网络开关。工作区和归属方式不可改，原文不变，下一次调用起生效。
+/// 编辑令牌的名称、授权方式、有效期与网络开关。工作区和归属方式不可改，原文不变，下一次调用起生效。
 async fn update_token(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -491,11 +462,6 @@ async fn update_token(
             "GPT Web 内部令牌由系统管理，不能编辑".to_string(),
         ));
     }
-    let profile = request.profile.unwrap_or(current.profile);
-    let network = request.allow_network.unwrap_or(current.network);
-    // 只在权限档真的被改成高风险档时才要求确认；没改权限档的编辑不重复确认。
-    let confirmed = request.confirm_high_risk || profile == current.profile;
-    validate_scope(profile, network, confirmed)?;
     let updated = state
         .mcp_service
         .update_token(
@@ -503,7 +469,7 @@ async fn update_token(
             &token_id,
             TokenPatch {
                 client_name: request.client_name,
-                profile: request.profile,
+                approval_mode: request.approval_mode,
                 expires_at_ms: request
                     .ttl_days
                     .map(|days| ttl_days_to_ms(days).map(|ms| now_ms().saturating_add(ms))),
@@ -530,10 +496,10 @@ fn describe_update(before: &TokenRecord, after: &TokenRecord) -> String {
             before.client_name, after.client_name
         ));
     }
-    if before.profile != after.profile {
+    if before.approval_mode != after.approval_mode {
         changes.push(format!(
-            "profile: {:?} → {:?}",
-            before.profile, after.profile
+            "approvalMode: {:?} → {:?}",
+            before.approval_mode, after.approval_mode
         ));
     }
     if before.network != after.network {
@@ -871,7 +837,14 @@ async fn list_approvals(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResolveApprovalRequest {
     approval_id: String,
-    decision: ToolApprovalDecision,
+    decision: ExternalApprovalDecision,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalApprovalDecision {
+    AllowOnce,
+    Deny,
 }
 
 async fn resolve_approval(
@@ -880,12 +853,6 @@ async fn resolve_approval(
     Json(request): Json<ResolveApprovalRequest>,
 ) -> Result<Json<ApprovalsResponse>, ApiError> {
     require_local(&headers)?;
-    // 外部审批只支持“允许一次 / 拒绝”。
-    if request.decision == ToolApprovalDecision::AllowForTurn {
-        return Err(ApiError::InvalidInput(
-            "外部调用的授权只支持允许一次或拒绝".to_string(),
-        ));
-    }
     let owner = crate::mcp_service::approval_owners(&state)
         .into_iter()
         .find(|owner| {
@@ -906,7 +873,14 @@ async fn resolve_approval(
     state
         .conversation_registry
         .tool_approvals()
-        .resolve(&owner, &request.approval_id, request.decision)
+        .resolve(
+            &owner,
+            &request.approval_id,
+            match request.decision {
+                ExternalApprovalDecision::AllowOnce => ToolApprovalDecision::AllowOnce,
+                ExternalApprovalDecision::Deny => ToolApprovalDecision::Deny,
+            },
+        )
         .map_err(ApiError::Conflict)?;
     Ok(Json(ApprovalsResponse {
         approvals: pending_external_approvals(&state),
@@ -1204,7 +1178,7 @@ mod tests {
             &state,
             "POST",
             "/mcp-server/tokens",
-            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1"}),
             false,
         )
         .await;
@@ -1254,37 +1228,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_risk_profiles_and_unknown_workspaces_are_rejected() {
+    async fn tokens_have_no_tool_scope_and_removed_fields_are_rejected() {
         let (state, _dir) = state_with_workspace();
-        for profile in ["edit_trusted", "exec"] {
-            let (status, body) = call(
+        let (status, created) = call(
+            &state,
+            "POST",
+            "/mcp-server/tokens",
+            serde_json::json!({"clientName": "x", "workspaceId": "ws-1"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["token"]["approvalMode"], "ask", "默认每次询问");
+        assert!(
+            !created["token"]
+                .as_object()
+                .unwrap()
+                .contains_key("profile"),
+            "令牌不再有工具范围字段"
+        );
+        // 已删除的字段不再被静默忽略：创建与编辑都明确拒绝。
+        for removed in [
+            serde_json::json!({"profile": "edit"}),
+            serde_json::json!({"confirmHighRisk": true}),
+        ] {
+            let mut body = serde_json::json!({"clientName": "x", "workspaceId": "ws-1"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(removed.as_object().unwrap().clone());
+            let (status, _) = call(&state, "POST", "/mcp-server/tokens", body, false).await;
+            assert!(status.is_client_error(), "创建应拒绝已删除字段: {removed}");
+            let token_id = created["token"]["tokenId"].as_str().unwrap();
+            let (status, _) = call(
                 &state,
-                "POST",
-                "/mcp-server/tokens",
-                serde_json::json!({"clientName": "x", "workspaceId": "ws-1", "profile": profile}),
+                "PATCH",
+                &format!("/mcp-server/tokens/{token_id}"),
+                removed.clone(),
                 false,
             )
             .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{profile}: {body}");
+            assert!(status.is_client_error(), "编辑应拒绝已删除字段: {removed}");
         }
         let (status, _) = call(
             &state,
             "POST",
             "/mcp-server/tokens",
-            serde_json::json!({"clientName": "x", "workspaceId": "ws-1", "profile": "edit_trusted", "confirmHighRisk": true}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/mcp-server/tokens",
-            serde_json::json!({"clientName": "x", "workspaceId": "missing", "profile": "edit"}),
+            serde_json::json!({"clientName": "x", "workspaceId": "missing"}),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn approval_mode_is_persisted_without_a_second_confirmation_step() {
+        let (state, _dir) = state_with_workspace();
+        let (status, created) = call(
+            &state,
+            "POST",
+            "/mcp-server/tokens",
+            serde_json::json!({
+                "clientName": "cursor",
+                "workspaceId": "ws-1",
+                "approvalMode": "always"
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["token"]["approvalMode"], "always");
+        let token_id = created["token"]["tokenId"].as_str().unwrap();
+
+        let (status, updated) = call(
+            &state,
+            "PATCH",
+            &format!("/mcp-server/tokens/{token_id}"),
+            serde_json::json!({"approvalMode": "ask"}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["tokens"][0]["approvalMode"], "ask");
     }
 
     async fn create(state: &ApiState, body: serde_json::Value) -> (String, String) {
@@ -1301,7 +1325,7 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         let (token_id, secret) = create(
             &state,
-            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "exec", "confirmHighRisk": true}),
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1"}),
         )
         .await;
         let path = format!("/mcp-server/tokens/{token_id}/secret");
@@ -1346,7 +1370,7 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         let (token_id, secret) = create(
             &state,
-            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1"}),
         )
         .await;
         let path = format!("/mcp-server/tokens/{token_id}");
@@ -1378,27 +1402,17 @@ mod tests {
             Some(secret.as_str())
         );
 
-        // 升到高风险权限档需要确认。
-        let (status, _) = call(
-            &state,
-            "PATCH",
-            &path,
-            serde_json::json!({"profile": "exec"}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // 令牌没有工具范围，只编辑 MCP 授权方式。
         let (status, body) = call(
             &state,
             "PATCH",
             &path,
-            serde_json::json!({"profile": "exec", "confirmHighRisk": true}),
+            serde_json::json!({"approvalMode": "always"}),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["tokens"][0]["profile"], "exec");
-        // 高风险权限档不能同时开放网络；反过来开放网络的令牌也不能升到高风险档。
+        assert_eq!(body["tokens"][0]["approvalMode"], "always");
         let (status, _) = call(
             &state,
             "PATCH",
@@ -1407,25 +1421,7 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, _) = call(
-            &state,
-            "PATCH",
-            &path,
-            serde_json::json!({"profile": "edit", "allowNetwork": true}),
-            false,
-        )
-        .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(
-            &state,
-            "PATCH",
-            &path,
-            serde_json::json!({"profile": "exec", "confirmHighRisk": true}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // 工作区不可改（字段被拒绝），未知令牌 404。
         let (status, _) = call(
@@ -1453,7 +1449,7 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         let (token_id, old_secret) = create(
             &state,
-            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1"}),
         )
         .await;
         let (status, rotated) = call(
@@ -1475,7 +1471,7 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         let (token_id, secret) = create(
             &state,
-            serde_json::json!({"clientName": "Cursor Work", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "Cursor Work", "workspaceId": "ws-1"}),
         )
         .await;
         let (status, generic) = call(
@@ -1602,12 +1598,12 @@ mod tests {
         let (state, _dir) = state_with_workspace();
         let (a, _) = create(
             &state,
-            serde_json::json!({"clientName": "a", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "a", "workspaceId": "ws-1"}),
         )
         .await;
         let (b, _) = create(
             &state,
-            serde_json::json!({"clientName": "b", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "b", "workspaceId": "ws-1"}),
         )
         .await;
         for (token, count) in [(&a, 5), (&b, 3)] {
@@ -1739,7 +1735,7 @@ mod tests {
 
         create(
             &state,
-            serde_json::json!({"clientName": "remote", "workspaceId": "ws-1", "profile": "edit", "allowNetwork": true}),
+            serde_json::json!({"clientName": "remote", "workspaceId": "ws-1", "allowNetwork": true}),
         )
         .await;
         for bad in [
@@ -1817,7 +1813,7 @@ mod tests {
                 &state,
                 method,
                 path,
-                serde_json::json!({"enabled": true, "clientName": "x", "workspaceId": "ws-1", "profile": "edit"}),
+                serde_json::json!({"enabled": true, "clientName": "x", "workspaceId": "ws-1"}),
                 true,
             )
             .await;
@@ -1830,13 +1826,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_approvals_are_listed_across_sessions_and_resolvable_once() {
+    async fn external_approvals_are_listed_across_sessions_and_resolved_once() {
         let (state, _dir) = state_with_workspace();
         let (_, created) = call(
             &state,
             "POST",
             "/mcp-server/tokens",
-            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "cursor", "workspaceId": "ws-1"}),
             false,
         )
         .await;
@@ -1881,16 +1877,6 @@ mod tests {
         assert_eq!(listed["approvals"][0]["clientName"], "cursor");
         assert_eq!(listed["approvals"][0]["summary"], "magi.fs.write: a.txt");
 
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/mcp-server/approvals/resolve",
-            serde_json::json!({"approvalId": "approval-1", "decision": "allow_for_turn"}),
-            false,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "外部审批不支持“本轮允许”");
-
         let (status, after) = call(
             &state,
             "POST",
@@ -1899,12 +1885,22 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(status, StatusCode::OK, "外部审批应支持单次授权: {after}");
         assert!(after["approvals"].as_array().unwrap().is_empty());
         assert_eq!(
             waiter.decision_rx.recv().unwrap(),
             magi_conversation_runtime::ToolApprovalDecision::AllowOnce
         );
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/mcp-server/approvals/resolve",
+            serde_json::json!({"approvalId": "approval-1", "decision": "allow_for_turn"}),
+            false,
+        )
+        .await;
+        assert!(status.is_client_error(), "外部 MCP 只接受单次批准或拒绝");
 
         let (status, _) = call(
             &state,
@@ -2039,20 +2035,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_tokens_are_capped_at_edit_and_network_mode_needs_risk_confirmation() {
+    async fn network_tokens_keep_full_tool_access_and_network_mode_needs_risk_confirmation() {
         let (state, _dir) = state_with_workspace();
-        for profile in ["edit_trusted", "exec"] {
-            let (status, body) = call(
-                &state,
-                "POST",
-                "/mcp-server/tokens",
-                serde_json::json!({"clientName": "x", "workspaceId": "ws-1", "profile": profile,
-                    "confirmHighRisk": true, "allowNetwork": true}),
-                false,
-            )
-            .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{profile}: {body}");
-        }
         // 没有允许网络访问的令牌时不能开启；开启还需要显式确认风险。
         let (status, _) = call(
             &state,
@@ -2077,17 +2061,23 @@ mod tests {
             &state,
             "POST",
             "/mcp-server/tokens",
-            serde_json::json!({"clientName": "remote", "workspaceId": "ws-1", "profile": "edit", "allowNetwork": true}),
+            serde_json::json!({"clientName": "remote", "workspaceId": "ws-1", "allowNetwork": true}),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{created}");
         assert_eq!(created["token"]["network"], true);
+        assert!(
+            !created["token"]
+                .as_object()
+                .unwrap()
+                .contains_key("profile")
+        );
         let (_, local) = call(
             &state,
             "POST",
             "/mcp-server/tokens",
-            serde_json::json!({"clientName": "local", "workspaceId": "ws-1", "profile": "edit"}),
+            serde_json::json!({"clientName": "local", "workspaceId": "ws-1"}),
             false,
         )
         .await;

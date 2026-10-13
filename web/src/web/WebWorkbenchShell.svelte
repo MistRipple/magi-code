@@ -8,8 +8,12 @@
   import UnavailableSessionList from '../components/UnavailableSessionList.svelte';
   import NotificationCenter from '../components/NotificationCenter.svelte';
   import ExternalApprovalTray from '../components/ExternalApprovalTray.svelte';
-  import ExternalSessionsSection from '../components/ExternalSessionsSection.svelte';
-  import { OPEN_EXTERNAL_SESSION_EVENT, isExternalSessionId, refreshExternalSessions } from '../stores/external-sessions.svelte';
+  import {
+    OPEN_EXTERNAL_SESSION_EVENT,
+    externalSessions,
+    isExternalSessionId,
+    refreshExternalSessions,
+  } from '../stores/external-sessions.svelte';
   import { externalApprovals } from '../stores/external-approvals.svelte';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
   import SidebarFooter from '../components/SidebarFooter.svelte';
@@ -55,6 +59,7 @@
     retainUiClock,
   } from '../stores/ui-clock.svelte';
   import { formatRelativeTime } from '../lib/relative-time';
+  import { mergeExternalSessionsIntoSidebar } from '../lib/session-sidebar';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
@@ -67,6 +72,7 @@
     togglePopover,
   } from '../stores/shell-ui.svelte';
   import type { EditContentKind, Session } from '../types/message';
+  import type { McpExternalSession } from './agent-api';
   import { resolveFilePreviewScope } from '../lib/file-preview-scope';
   import { isHtmlFile } from '../lib/file-preview-utils';
   import {
@@ -76,8 +82,15 @@
   } from '../appearance/runtime';
   import {
     OPEN_HTML_FILE_IN_BROWSER_EVENT,
+    OPEN_URL_IN_BROWSER_EVENT,
     type OpenHtmlFileInBrowserRequest,
+    type OpenUrlInBrowserRequest,
   } from '../lib/browser-navigation';
+  import { normalizeExternalWebUrl, openExternalUrl } from '../lib/external-link';
+  import {
+    openUrlInRightPaneBrowser,
+    openWorkspaceHtmlInRightPaneBrowser,
+  } from './right-pane-browser';
   import {
     RUNTIME_CONNECTION_EVENT,
     resolveAgentPath,
@@ -286,16 +299,7 @@ import {
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
-    htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
-    onHtmlBrowserOpenHandled?: (requestId: number) => void;
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
-  };
-  type HtmlBrowserOpenRequest = {
-    requestId: number;
-    filepath: string;
-    workspaceId: string;
-    workspacePath: string;
-    sessionId: string;
   };
   type WebFolderPickerProps = {
     title?: string;
@@ -311,8 +315,6 @@ import {
   let fileTreeShowHidden = $state(false);
   let RightPaneComponent = $state<Component<RightPaneProps> | null>(null);
   let WebFolderPickerComponent = $state<Component<WebFolderPickerProps> | null>(null);
-  let htmlBrowserOpenRequest = $state<HtmlBrowserOpenRequest | null>(null);
-  let htmlBrowserOpenRequestId = 0;
   let projectFileTreeLoad: Promise<void> | null = null;
   let rightPaneLoad: Promise<void> | null = null;
   let webFolderPickerLoad: Promise<void> | null = null;
@@ -833,6 +835,12 @@ import {
       : '';
   }
 
+  function workspaceHasSession(workspaceId: string, sessionId: string): boolean {
+    return (sessionsByWorkspace[workspaceId] ?? []).some((session) => session.id === sessionId)
+      || (isExternalSessionId(sessionId)
+        && externalSessions.sessions.some((session) => session.sessionId === sessionId && session.workspaceId === workspaceId));
+  }
+
   function workspacePathForId(workspaceId: string): string {
     const workspace = workspaces.find((candidate) => candidate.workspaceId === workspaceId);
     return workspace ? workspaceNavigationPath(workspace) : '';
@@ -1082,8 +1090,11 @@ import {
       [authoritativeWorkspaceId]: true,
     };
     currentSessionId = bootstrapSessionId || null;
-    const currentSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
-    if (currentSessions.length === 0 || (bootstrapSessionId && !currentSessions.some((session) => session.id === bootstrapSessionId))) {
+    const hasLoadedSessionList = Object.prototype.hasOwnProperty.call(
+      sessionsByWorkspace,
+      authoritativeWorkspaceId,
+    );
+    if (!hasLoadedSessionList || (bootstrapSessionId && !workspaceHasSession(authoritativeWorkspaceId, bootstrapSessionId))) {
       void refreshWorkspaceSessions(
         authoritativeWorkspaceId,
         workspace.rootPath,
@@ -1152,8 +1163,7 @@ import {
     }
 
     // 非空：必须存在于当前工作区列表里，避免把别工作区的会话错激活到本地视图
-    const belongsToSelectedWorkspace = (sessionsByWorkspace[selectedWorkspaceId] ?? [])
-      .some((session) => session.id === bootstrapSessionId);
+    const belongsToSelectedWorkspace = workspaceHasSession(selectedWorkspaceId, bootstrapSessionId);
     if (!belongsToSelectedWorkspace) {
       // 新会话首条消息会先建立本地 session 身份，再等待服务端 accepted。
       // 这时任何更早发出的目录请求都不再具备清理当前指针的因果资格；先使其
@@ -1166,6 +1176,23 @@ import {
 
   function getWorkspaceSessionList(workspaceId: string): Session[] {
     return (sessionsByWorkspace[workspaceId] ?? []).filter((session) => !isInternalSession(session));
+  }
+
+  /** 工作区会话目录和外部 MCP 会话来自两个 daemon 读模型，展示前按最近活动时间合并。 */
+  function getWorkspaceSidebarSessionList(workspaceId: string): Session[] {
+    return mergeExternalSessionsIntoSidebar(
+      getWorkspaceSessionList(workspaceId),
+      externalSessions.sessions,
+      workspaceId,
+    );
+  }
+
+  function externalSessionForSidebarRow(sessionId: string): McpExternalSession | undefined {
+    return externalSessions.sessions.find((session) => session.sessionId === sessionId);
+  }
+
+  function externalAwaitingCountForSession(session: McpExternalSession): number {
+    return externalApprovals.approvals.filter((approval) => approval.tokenId === session.tokenId).length;
   }
 
   function getPersonalSessionList(): Session[] {
@@ -1216,7 +1243,7 @@ import {
   }
 
   function isInternalSession(session: Session): boolean {
-    // 外部会话（外部 MCP 客户端）有自己的入口，不作为普通会话行出现；打开它时 bootstrap 会把它带进当前会话。
+    // 外部会话由 MCP 概要和下面的统一排序入口渲染，避免目录投影将来包含它时重复显示。
     if (isExternalSessionId(session.id)) return true;
     const name = (session.name || '').trim();
     const preview = (session.preview || '').trim();
@@ -1774,18 +1801,16 @@ import {
       return false;
     }
     if (desktopAppSurface && isHtmlFile(metadata.displayPath || normalizedFilePath)) {
-      // HTML 文件在桌面端代表可运行的网页入口。请求放在 Shell 状态中，
-      // 由右栏组件消费，避免右栏懒加载或主 Renderer 切换布局时丢事件。
-      htmlBrowserOpenRequest = {
-        requestId: ++htmlBrowserOpenRequestId,
+      // HTML 文件在桌面端代表可运行的网页入口。创建动作直接由 Shell 发起，
+      // 不经过「请求对象 → 等右栏消费」，右栏懒加载或未挂载时也不会丢事件。
+      requestRightPaneVisibility(true);
+      void openWorkspaceHtmlInRightPaneBrowser({
         filepath: normalizedFilePath,
         workspaceId,
         workspacePath,
         sessionId,
-      };
-      requestRightPaneVisibility(true);
+      });
     } else {
-      htmlBrowserOpenRequest = null;
       openCodeTab(sessionId, normalizedFilePath, {
         displayPath: metadata.displayPath,
         label: metadata.label,
@@ -2192,7 +2217,7 @@ import {
           const nextWorkspace = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId);
           if (nextWorkspace) {
             await loadWorkspaceSessionsForSidebar(nextWorkspace);
-            const nextSession = getWorkspaceSessionList(selectedWorkspaceId)[0];
+            const nextSession = getWorkspaceSidebarSessionList(selectedWorkspaceId)[0];
             navigateSession(nextSession
               ? {
                   kind: 'session',
@@ -2237,7 +2262,7 @@ import {
         }
       }
 
-      const nextSession = getWorkspaceSessionList(workspaceId)[0];
+      const nextSession = getWorkspaceSidebarSessionList(workspaceId)[0];
       navigateSession(nextSession
           ? {
             kind: 'session',
@@ -2281,7 +2306,7 @@ import {
       ...expandedWorkspaceIds,
       [workspace.workspaceId]: !isExpanded,
     };
-    if (!isExpanded && getWorkspaceSessionList(workspace.workspaceId).length === 0) {
+    if (!isExpanded && getWorkspaceSidebarSessionList(workspace.workspaceId).length === 0) {
       void loadWorkspaceSessionsForSidebar(workspace);
     }
   }
@@ -2325,7 +2350,8 @@ import {
       return;
     }
     const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
-    const nextSessionName = nextSession?.name || i18n.t('header.unnamedSession');
+    const nextExternalSession = externalSessionForSidebarRow(sessionId);
+    const nextSessionName = nextSession?.name || nextExternalSession?.clientName || i18n.t('header.unnamedSession');
     addToast('info', i18n.t('web.sessionSwitching', { name: nextSessionName }), undefined, {
       source: 'session-management',
       duration: 1800,
@@ -3049,14 +3075,47 @@ import {
       if (!filepath || !isHtmlFile(filepath)) return;
       const binding = currentWorkspaceBinding();
       if (binding.scope !== 'workspace' || !binding.workspaceId || !binding.workspacePath || !binding.sessionId) return;
-      htmlBrowserOpenRequest = {
-        requestId: ++htmlBrowserOpenRequestId,
+      requestRightPaneVisibility(true);
+      void openWorkspaceHtmlInRightPaneBrowser({
         filepath,
         workspaceId: binding.workspaceId,
         workspacePath: binding.workspacePath,
         sessionId: binding.sessionId,
-      };
-      requestRightPaneVisibility(true);
+      });
+    };
+    /**
+     * 链接点击（消息 Markdown、代码块等）在右栏展开一个顶级浏览器 Tab。
+     *
+     * 消费者必须在始终挂载的 Shell 上：右栏是懒加载 + 条件挂载的组件，
+     * 把监听放在右栏会让「折叠右栏 / 从未打开过右栏」时的点击被静默丢弃。
+     */
+    const handleOpenUrlInBrowser = (event: Event) => {
+      const url = (event as CustomEvent<OpenUrlInBrowserRequest>).detail?.url?.trim() || '';
+      if (!url) return;
+      const externalUrl = normalizeExternalWebUrl(url);
+      if (!externalUrl) return;
+      // 以 Shell 的权威绑定为准（含 workspacePath），草稿 / 个人会话也不会
+      // 误用右栏里残留的旧作用域。
+      const binding = currentWorkspaceBinding();
+      void openUrlInRightPaneBrowser(externalUrl, {
+        workspaceId: binding.workspaceId,
+        workspacePath: binding.workspacePath,
+        sessionId: binding.sessionId,
+      }).then((outcome) => {
+        if (outcome === 'opened') {
+          // 右栏此刻可能还没挂载或处于折叠：展开由 Shell 负责，创建由
+          // right-pane-browser 负责，两边都不依赖右栏组件已经存在。
+          requestRightPaneVisibility(true);
+          return;
+        }
+        // 非 Desktop 没有物理 BrowserSurface：退回系统浏览器，保证点击
+        // 始终有结果。内置浏览器被关闭或创建失败时已经给出过提示与主行动，
+        // 不叠加系统浏览器弹窗。
+        if (outcome !== 'fallback-external') return;
+        void openExternalUrl(externalUrl).catch(() => {
+          addToast('error', i18n.t('browser.error.openExternal'), undefined, { forceVisible: true });
+        });
+      });
     };
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
@@ -3097,6 +3156,7 @@ import {
     window.addEventListener('scroll', handleSidebarTooltipViewportChange, true);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
+    window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, synchronizeBrowserProjectionFromAuthorityEvent);
     window.addEventListener('keydown', handlePanelEscape);
@@ -3133,6 +3193,7 @@ import {
       window.removeEventListener('scroll', handleSidebarTooltipViewportChange, true);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(OPEN_HTML_FILE_IN_BROWSER_EVENT, handleOpenHtmlFileInBrowser as EventListener);
+      window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
       window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, synchronizeBrowserProjectionFromAuthorityEvent);
       window.removeEventListener('keydown', handlePanelEscape);
@@ -3386,11 +3447,42 @@ import {
                   <div class="workspace-children">
                     {#if loadingWorkspaceIds[workspace.workspaceId]}
                       <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
-                    {:else if getWorkspaceSessionList(workspace.workspaceId).length === 0}
+                    {:else if getWorkspaceSidebarSessionList(workspace.workspaceId).length === 0}
                       <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noWorkspaceSessions')}</div>
                     {:else}
                       <div class="session-list session-list--nested">
-                        {#each getWorkspaceSessionList(workspace.workspaceId) as session (session.id)}
+                        {#each getWorkspaceSidebarSessionList(workspace.workspaceId) as session (session.id)}
+                          {#if isExternalSessionId(session.id)}
+                            {@const externalSession = externalSessionForSidebarRow(session.id)}
+                            {#if externalSession}
+                              {@const awaiting = externalAwaitingCountForSession(externalSession)}
+                              <div class="session-row" class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}>
+                                <button
+                                  type="button"
+                                  class="session-item external-session-item"
+                                  class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
+                                  data-testid="external-session-item"
+                                  data-token-id={externalSession.tokenId}
+                                  data-session-id={externalSession.sessionId}
+                                  data-session-updated-at={externalSession.lastActivityAtMs}
+                                  title={externalSession.clientName}
+                                  onclick={() => openExternalSessionIn(workspace, externalSession.sessionId)}
+                                >
+                                  <span class="external-dot" class:running={externalSession.running > 0 && awaiting === 0} class:awaiting={awaiting > 0} aria-hidden="true">
+                                    <Icon name="plug" size={12} />
+                                  </span>
+                                  <span class="session-name">{externalSession.clientName}</span>
+                                  <span class="session-meta external-session-meta">
+                                    {#if awaiting > 0}
+                                      {i18n.t('externalSession.awaitingShort', { count: awaiting })}
+                                    {:else}
+                                      {i18n.t('externalSession.badge')} · {formatRelativeTime(externalSession.lastActivityAtMs, relativeTimeNow, i18n.locale)}
+                                    {/if}
+                                  </span>
+                                </button>
+                              </div>
+                            {/if}
+                          {:else}
                           {@const sessionRunning = isSessionRunning(workspace.workspaceId, session)}
                           {@const sessionIndicator = resolveSessionActivityIndicator({
                             isRunning: sessionRunning,
@@ -3453,6 +3545,7 @@ import {
                                 class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
                                 class:pending={session.id === pendingSessionSwitchId && workspace.workspaceId === pendingSessionSwitchWorkspaceId}
                                 data-session-id={session.id}
+                                data-session-updated-at={session.updatedAt || session.createdAt}
                                 title={session.name || i18n.t('header.unnamedSession')}
                                 onclick={() => switchSession(workspace, session.id)}
                               >
@@ -3501,15 +3594,11 @@ import {
                               </div>
                             {/if}
                           </div>
+                          {/if}
                         {/each}
                       </div>
                     {/if}
                     <UnavailableSessionList sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []} />
-                    <ExternalSessionsSection
-                      workspaceId={workspace.workspaceId}
-                      currentSessionId={currentSessionId ?? ''}
-                      onOpen={(session) => openExternalSessionIn(workspace, session.sessionId)}
-                    />
                   </div>
                 {/if}
               </div>
@@ -3731,12 +3820,6 @@ import {
         <RightPaneComponent
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
-          htmlBrowserOpenRequest={htmlBrowserOpenRequest}
-          onHtmlBrowserOpenHandled={(requestId) => {
-            if (htmlBrowserOpenRequest?.requestId === requestId) {
-              htmlBrowserOpenRequest = null;
-            }
-          }}
         />
       {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || rightPaneBackgroundMounted)}
         {#if desktopRightPaneVisible}
@@ -3759,12 +3842,6 @@ import {
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             desktopSurface={true}
             agentRetainedSurfaces={agentRetainedSurfaces}
-            htmlBrowserOpenRequest={htmlBrowserOpenRequest}
-            onHtmlBrowserOpenHandled={(requestId) => {
-              if (htmlBrowserOpenRequest?.requestId === requestId) {
-                htmlBrowserOpenRequest = null;
-              }
-            }}
           />
         </div>
       {/if}
@@ -4566,6 +4643,37 @@ import {
     background: color-mix(in srgb, var(--surface-selected) 78%, transparent);
   }
 
+  .external-session-item {
+    gap: var(--space-2);
+  }
+
+  .external-dot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    color: var(--foreground-muted);
+  }
+
+  .external-dot.running {
+    color: var(--primary);
+    animation: external-pulse 1.4s ease-in-out infinite;
+  }
+
+  .external-dot.awaiting {
+    color: var(--warning);
+  }
+
+  .external-session-meta {
+    font-variant-numeric: tabular-nums;
+  }
+
+  @keyframes external-pulse {
+    50% { opacity: 0.35; }
+  }
+
   .session-row:hover .session-actions,
   .session-row:focus-within .session-actions {
     opacity: 1;
@@ -4684,6 +4792,11 @@ import {
       opacity: 1;
       box-shadow: 0 0 10px color-mix(in srgb, var(--info) 78%, transparent);
     }
+  }
+
+  /* 外部会话指示点的动效偏好；放在运行指示灯规则之后，运行指示灯不受系统动画偏好影响。 */
+  @media (prefers-reduced-motion: reduce) {
+    .external-dot.running { animation: none; }
   }
 
   .session-name {

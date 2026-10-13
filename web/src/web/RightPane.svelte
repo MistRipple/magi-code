@@ -9,14 +9,8 @@
   import WebModelTabContent from '../components/tabs/WebModelTabContent.svelte';
   import PluginTabContent from '../components/tabs/PluginTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { highlightCode } from '../lib/code-highlighter';
-  import {
-    OPEN_URL_IN_BROWSER_EVENT,
-    type OpenUrlInBrowserRequest,
-  } from '../lib/browser-navigation';
-  import { normalizeExternalWebUrl, openExternalWebUrl } from '../lib/external-link';
   import { addToast } from '../stores/messages.svelte';
-  import { navigateSession, waitForSessionNavigation } from '../shared/session-navigation.svelte';
+  import { highlightCode } from '../lib/code-highlighter';
   import {
     isHtmlFile,
     isKnownBinaryFile,
@@ -41,7 +35,6 @@
     type WebModelTabPayload,
     type PluginTabPayload,
     type WebModelHost,
-    openBrowserTab,
     synchronizeBrowserSessionSnapshot,
     openTerminalTab,
     openPluginTab,
@@ -51,23 +44,23 @@
     activateWebModelTab,
   } from '../stores/right-pane.svelte';
   import {
-    AgentApiError,
+    agentUrl,
+    buildFilePreviewQuery,
     closeBrowserTab,
     closeTerminalSession,
-    createBrowserSession,
-    createBrowserTab,
     createAppBrowserSession,
     stopWebModel,
     getBrowserCapabilities,
-    materializeSession,
     getAgentChangeDiff,
     getAgentFilePreview,
-    agentUrl,
-    buildFilePreviewQuery,
     isPublicTunnelAccess,
     type BrowserCapabilitiesSnapshot,
   } from './agent-api';
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
+  import {
+    openUrlInRightPaneBrowser,
+    openWorkspaceHtmlInRightPaneBrowser,
+  } from './right-pane-browser';
   import { WEB_MODEL_HOME_TAB_ID, WEB_MODEL_PLUGIN_ID, WEB_MODEL_SURFACE_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
   import { refreshWebModelRuntime, runWebModelProbe } from './web-model-session-projection';
@@ -83,20 +76,10 @@
     type WebModelActionDetail,
   } from './web-model-actions';
 
-  type HtmlBrowserOpenRequest = {
-    requestId: number;
-    filepath: string;
-    workspaceId: string;
-    workspacePath: string;
-    sessionId: string;
-  };
-
   interface Props {
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
-    htmlBrowserOpenRequest?: HtmlBrowserOpenRequest | null;
-    onHtmlBrowserOpenHandled?: (requestId: number) => void;
     /** Main 声明的代理正在使用的页面；不可见时在离屏内容槽中保持挂载。 */
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   }
@@ -105,8 +88,6 @@
     workspaceRoot,
     overlay = false,
     desktopSurface = false,
-    htmlBrowserOpenRequest = null,
-    onHtmlBrowserOpenHandled,
     agentRetainedSurfaces = [],
   }: Props = $props();
 
@@ -208,6 +189,7 @@
   function closePane(): void {
     setRightPaneCollapsed(paneScopeKey, true);
   }
+  /** 「新增 → 浏览器」在途：只驱动按钮的 loading 表现。 */
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let domAddPaneMenuOpen = $state(false);
@@ -293,27 +275,11 @@
       applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
     };
     window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-    const handleOpenUrlInBrowser = (event: Event) => {
-      const request = (event as CustomEvent<OpenUrlInBrowserRequest>).detail;
-      if (!request?.url) return;
-      if (desktopSurface) {
-        void createBrowserPane(request.url);
-        return;
-      }
-      // Web 和手机 Web 没有物理 BrowserSurface。链接仍需保持可用，
-      // 直接交给系统浏览器，避免点击后只得到一条无法继续操作的提示。
-      const externalUrl = normalizeExternalWebUrl(request.url);
-      if (!externalUrl) return;
-      void openExternalWebUrl(externalUrl).catch(() => {
-        addToast('error', i18n.t('browser.error.openExternal'), undefined, { forceVisible: true });
-      });
-    };
-    window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
-    // 失败卡片的主行动（§8）：宿主在这里，卡片只派发动作，不复制宿主状态。
+    // 链接点击的创建入口在 Shell（右栏可能尚未挂载），这里只保留失败卡片的
+    // 主行动（§8）：宿主在这里，卡片只派发动作，不复制宿主状态。
     window.addEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-      window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
       window.removeEventListener(WEB_MODEL_ACTION_EVENT, handleWebModelFailureAction);
       domAddPaneMenuOpen = false;
     };
@@ -358,126 +324,6 @@
       });
     } catch (error) {
       console.warn('[RightPane] 关闭终端面板资源失败:', error);
-    }
-  }
-
-  async function ensureBrowserSession(
-    workspaceId: string,
-    workspacePath: string,
-    sessionHint = '',
-  ): Promise<string> {
-    let sessionId = sessionHint.trim();
-    if (!sessionId && rightPaneState.activeWorkspaceId.trim() === workspaceId.trim()) {
-      sessionId = rightPaneState.activeSessionId.trim();
-    }
-    if (sessionId) return sessionId;
-
-    const materialized = await materializeSession(
-      workspaceId || null,
-      workspaceId ? workspacePath : undefined,
-    );
-    sessionId = materialized.sessionId;
-    const navigation = navigateSession(workspaceId
-      ? {
-          kind: 'session',
-          scope: 'workspace',
-          workspaceId,
-          workspacePath,
-          sessionId,
-        }
-      : { kind: 'session', scope: 'personal', sessionId });
-    if (!navigation) {
-      throw new Error('当前已有会话导航操作正在进行');
-    }
-    // 会话事实完成主 Renderer 导航后，才创建浏览器资源，避免浏览器事件
-    // 抢在 Composer 完成绑定前切换右栏作用域。
-    await waitForSessionNavigation(navigation);
-    return sessionId;
-  }
-
-  function registerBrowserPane(
-    browserSessionId: string,
-    tabId: string,
-    workspaceId: string,
-    sessionId: string,
-    workspacePath?: string,
-    lifecycle?: BrowserTabPayload['lifecycle'],
-    url = 'about:blank',
-    navigationRevision = 0,
-  ): void {
-    openBrowserTab(browserSessionId, tabId, {
-      workspaceId,
-      workspacePath,
-      sessionId,
-      label: i18n.t('browser.tab.new'),
-      lifecycle,
-      url,
-      navigationRevision,
-    });
-  }
-
-  function browserOpenFailureFeedback(error: unknown): {
-    type: 'warning' | 'error';
-    message: string;
-  } {
-    if (error instanceof AgentApiError) {
-      if (error.errorCode === 'BROWSER_GLOBAL_TAB_LIMIT_REACHED') {
-        return {
-          type: 'warning',
-          message: i18n.t('browser.error.globalTabLimitReached'),
-        };
-      }
-      if (error.errorCode === 'BROWSER_SESSION_TAB_LIMIT_REACHED') {
-        return {
-          type: 'warning',
-          message: i18n.t('browser.error.sessionTabLimitReached'),
-        };
-      }
-    }
-    return {
-      type: 'error',
-      message: i18n.t('browser.error.openInternal'),
-    };
-  }
-
-  async function createBrowserPane(initialUrl = 'about:blank'): Promise<void> {
-    if (creatingBrowserPane) return;
-    if (!canCreateBrowserPane) {
-      const message = desktopSurface
-        ? i18n.t('browser.error.internalUnavailable')
-        : i18n.t('browser.error.desktopRequired');
-      addToast('warning', message, undefined, { forceVisible: true });
-      return;
-    }
-    const targetUrl = initialUrl === 'about:blank'
-      ? initialUrl
-      : normalizeExternalWebUrl(initialUrl);
-    if (!targetUrl) return;
-    const workspaceId = rightPaneState.activeWorkspaceId.trim();
-    creatingBrowserPane = true;
-    try {
-      const sessionId = await ensureBrowserSession(workspaceId, workspaceRoot);
-      const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
-      const tab = await createBrowserTab(
-        browserSession.browserSessionId,
-        targetUrl,
-      );
-      registerBrowserPane(
-        browserSession.browserSessionId,
-        tab.tabId,
-        workspaceId,
-        sessionId,
-        workspaceRoot,
-        tab.lifecycle,
-        tab.url,
-        tab.navigationRevision,
-      );
-    } catch (error) {
-      console.warn('[RightPane] 新建浏览器面板失败:', error);
-      const feedback = browserOpenFailureFeedback(error);
-      addToast(feedback.type, feedback.message, undefined, { forceVisible: true });
-    } finally {
-      creatingBrowserPane = false;
     }
   }
 
@@ -705,7 +551,18 @@
   async function chooseAddPane(kind: RightPaneCreationKind, pluginId?: string, contributionId?: string): Promise<void> {
     domAddPaneMenuOpen = false;
     if (kind === 'browser') {
-      await createBrowserPane();
+      // 与消息里的链接共用同一个创建入口；空白页不参与同 URL 复用。
+      if (creatingBrowserPane) return;
+      creatingBrowserPane = true;
+      try {
+        await openUrlInRightPaneBrowser('about:blank', {
+          workspaceId: rightPaneState.activeWorkspaceId.trim(),
+          workspacePath: workspaceRoot.trim(),
+          sessionId: rightPaneState.activeSessionId.trim(),
+        });
+      } finally {
+        creatingBrowserPane = false;
+      }
       return;
     }
     if (kind === 'webSession') {
@@ -1128,72 +985,29 @@
     documentModes = { ...documentModes, [activeContentCacheKey]: mode };
   }
 
+  /**
+   * 副标题栏的「在浏览器打开」：把当前 HTML 文件交给统一入口创建预览页。
+   *
+   * 创建、复用与失败提示都在 `right-pane-browser`，这里只取当前 Tab 的
+   * 文件与作用域，并保留按钮的进行中状态。
+   */
   let openingHtmlInBrowser = $state(false);
-  async function openHtmlInMagiBrowser(request?: HtmlBrowserOpenRequest): Promise<void> {
-    if (!canCreateBrowserPane) {
-      const message = desktopSurface
-        ? i18n.t('browser.error.internalUnavailable')
-        : i18n.t('browser.error.desktopRequired');
-      addToast('warning', message, undefined, { forceVisible: true });
-      return;
-    }
-    const filePath = request?.filepath.trim() || activeFilePath.trim();
-    const workspaceId = request?.workspaceId.trim() || activeCodePayload?.workspaceId?.trim() || '';
-    const workspacePath = request?.workspacePath.trim()
-      || activeCodePayload?.workspacePath?.trim()
-      || workspaceRoot.trim();
-    const sessionHint = request?.sessionId.trim() || activeCodePayload?.sessionId?.trim() || '';
-    if (!isHtmlFile(filePath) || !workspaceId || !workspacePath || !sessionHint || openingHtmlInBrowser || creatingBrowserPane) return;
+  async function openHtmlInMagiBrowser(): Promise<void> {
+    const filePath = activeFilePath.trim();
+    if (!isHtmlFile(filePath) || openingHtmlInBrowser) return;
     openingHtmlInBrowser = true;
     try {
-      const sitePreviewQuery = buildFilePreviewQuery(filePath, {
-        includeSession: false,
-        workspaceId,
-        workspacePath,
+      await openWorkspaceHtmlInRightPaneBrowser({
+        filepath: filePath,
+        workspaceId: activeCodePayload?.workspaceId?.trim() || rightPaneState.activeWorkspaceId.trim(),
+        workspacePath: activeCodePayload?.workspacePath?.trim() || workspaceRoot.trim(),
+        sessionId: activeCodePayload?.sessionId?.trim() || rightPaneState.activeSessionId.trim(),
       });
-      const sessionId = await ensureBrowserSession(workspaceId, workspacePath, sessionHint);
-      const browserSession = await createBrowserSession(workspaceId, sessionId, workspacePath);
-      const tab = await createBrowserTab(
-        browserSession.browserSessionId,
-        agentUrl('/api/files/site-open', sitePreviewQuery),
-      );
-      registerBrowserPane(
-        browserSession.browserSessionId,
-        tab.tabId,
-        workspaceId,
-        sessionId,
-        workspacePath,
-        tab.lifecycle,
-        tab.url,
-        tab.navigationRevision,
-      );
-    } catch (error) {
-      console.warn('[RightPane] 打开 HTML 内置浏览器失败:', error);
-      const feedback = browserOpenFailureFeedback(error);
-      addToast(feedback.type, feedback.message, undefined, { forceVisible: true });
     } finally {
       openingHtmlInBrowser = false;
     }
   }
 
-  let handledHtmlBrowserOpenRequestId = 0;
-  $effect(() => {
-    const request = htmlBrowserOpenRequest;
-    void browserCapabilities;
-    void creatingBrowserPane;
-    void openingHtmlInBrowser;
-    if (!request || request.requestId === handledHtmlBrowserOpenRequestId) return;
-    // 能力快照尚未返回时不能把一次性请求判定为失败；等快照完成后再消费。
-    if (
-      !browserCapabilities
-      || creatingBrowserPane
-      || openingHtmlInBrowser
-    ) return;
-    handledHtmlBrowserOpenRequestId = request.requestId;
-    void openHtmlInMagiBrowser(request).finally(() => {
-      onHtmlBrowserOpenHandled?.(request.requestId);
-    });
-  });
   const rawPreviewContent = $derived(previewContent ?? '');
   const truncatedContent = $derived(
     rawPreviewContent.length > 500_000 ? rawPreviewContent.slice(0, 100_000) : rawPreviewContent,

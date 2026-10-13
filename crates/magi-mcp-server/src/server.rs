@@ -3,7 +3,7 @@
 //! 服务是**薄的协议与策略层**：不复制工具实现，也不持有审批与账本。一次 `tools/call`
 //! 的顺序固定为：
 //!
-//! 工具是否在该权限档的目录里 → 归属解析 → 工作区路径校验 → 审批处置 → 后端执行 → 审计。
+//! MCP 客户端使用完整工具目录（GPT Web 槽位按设置过滤）→ 归属解析 → 工作区路径校验 → 审批处置 → 后端执行 → 审计。
 //!
 //! 任何一步失败都以 MCP 工具错误返回，后续步骤不执行；网络与本机客户端走同一条管线。
 
@@ -19,6 +19,7 @@ use crate::catalog::{
     mapping_for_public_name, tools_list_result,
 };
 use crate::path_guard::{PathGuard, PathRequest};
+use crate::profile::ApprovalMode;
 use crate::profile::{Disposition, Profile, ToolClass};
 use crate::protocol::{
     JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JsonRpcRequest,
@@ -41,6 +42,7 @@ pub struct ClientPrincipal {
     pub client_name: String,
     pub workspace_id: String,
     pub profile: Profile,
+    pub approval_mode: ApprovalMode,
     pub attribution: AttributionMode,
 }
 
@@ -51,7 +53,9 @@ impl From<&TokenRecord> for ClientPrincipal {
             token_prefix: record.prefix.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
-            profile: record.profile,
+            // 令牌统一开放完整工具目录；工具档只属于 GPT Web 槽位的 principal。
+            profile: Profile::Exec,
+            approval_mode: record.approval_mode,
             attribution: record.attribution,
         }
     }
@@ -399,7 +403,10 @@ impl McpServer {
             }
         };
 
-        let requires_approval = requires_approval(principal.profile, &mapping);
+        let requires_approval = match principal.attribution {
+            AttributionMode::External => principal.approval_mode == ApprovalMode::Ask,
+            AttributionMode::FollowWebSlot => requires_approval(principal.profile, &mapping),
+        };
         let invocation = ToolInvocation {
             principal: principal.clone(),
             public_name: mapping.public_name.clone(),
@@ -542,6 +549,7 @@ mod tests {
             client_name: "Cursor".to_string(),
             workspace_id: "ws".to_string(),
             profile,
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::External,
         }
     }
@@ -669,32 +677,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_tools_run_without_approval_and_writes_require_it() {
+    async fn ask_mode_requires_approval_for_every_external_tool_call() {
         let h = harness();
-        let read = h
-            .server
-            .handle(
-                &principal(Profile::Edit),
-                call("magi.fs.read", json!({"path": "a.txt"})),
-                5,
-            )
-            .await
-            .unwrap();
-        assert!(!is_error(&read));
-        let write = h
-            .server
-            .handle(
-                &principal(Profile::Edit),
-                call("magi.fs.write", json!({"path": "b.txt", "content": "x"})),
-                6,
-            )
-            .await
-            .unwrap();
-        assert!(!is_error(&write));
+        let p = principal(Profile::Exec);
+        for (index, request) in [
+            call("magi.fs.read", json!({"path": "a.txt"})),
+            call("magi.fs.write", json!({"path": "b.txt", "content": "x"})),
+            call("magi.fs.remove", json!({"path": "a.txt"})),
+            call("magi.shell.exec", json!({"command": "printf hi"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = h.server.handle(&p, request, index as u64).await.unwrap();
+            assert!(!is_error(&response));
+        }
 
         let calls = h.backend.calls.lock().unwrap();
-        assert!(!calls[0].requires_approval);
-        assert!(calls[1].requires_approval);
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|call| call.requires_approval));
         assert_eq!(calls[1].internal_name, "file_write");
         assert_eq!(
             calls[1].attribution,
@@ -705,15 +706,15 @@ mod tests {
         drop(calls);
 
         let events = h.audit.0.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].tool, "magi.fs.write");
-        assert!(events[1].requires_approval);
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| event.requires_approval));
     }
 
     #[tokio::test]
-    async fn trusted_profile_skips_approval_for_writes_but_never_for_remove() {
+    async fn always_approval_mode_skips_prompts_for_the_full_tool_surface() {
         let h = harness();
-        let p = principal(Profile::EditTrusted);
+        let mut p = principal(Profile::Exec);
+        p.approval_mode = ApprovalMode::Always;
         h.server
             .handle(
                 &p,
@@ -726,9 +727,20 @@ mod tests {
             .handle(&p, call("magi.fs.remove", json!({"path": "a.txt"})), 2)
             .await
             .unwrap();
+        h.server
+            .handle(
+                &p,
+                call("magi.shell.exec", json!({"command": "printf open"})),
+                3,
+            )
+            .await
+            .unwrap();
+        h.server
+            .handle(&p, call("magi.fs.read", json!({"path": "a.txt"})), 4)
+            .await
+            .unwrap();
         let calls = h.backend.calls.lock().unwrap();
-        assert!(!calls[0].requires_approval);
-        assert!(calls[1].requires_approval, "破坏性工具不受预授权豁免");
+        assert!(calls.iter().all(|call| !call.requires_approval));
     }
 
     #[tokio::test]

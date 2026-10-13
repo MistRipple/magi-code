@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use magi_mcp_server::local_socket::{PrincipalProvider, SocketAuth};
 use magi_mcp_server::{
-    AttributionMode, AttributionRefusal, AttributionResolver, AttributionTarget, ClientPrincipal,
-    Profile,
+    ApprovalMode, AttributionMode, AttributionRefusal, AttributionResolver, AttributionTarget,
+    ClientPrincipal, Profile,
 };
 use magi_web_model::{WebSlotOwner, WebSlotTable};
 
@@ -95,6 +95,7 @@ pub(crate) fn slot_principal_provider(
             client_name: WEB_SLOT_CLIENT_NAME.to_string(),
             workspace_id,
             profile: profile(),
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::FollowWebSlot,
         })
     });
@@ -113,6 +114,7 @@ mod tests {
             client_name: WEB_SLOT_CLIENT_NAME.to_string(),
             workspace_id: workspace.to_string(),
             profile: Profile::Edit,
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::FollowWebSlot,
         }
     }

@@ -38,12 +38,16 @@ assert.match(
   /\(authoritySnapshot\) => \{[\s\S]*?if \(!sameDesktopPanelTarget\(currentDesktopPanelTarget\(\), request\)\) return;[\s\S]*?revealTabId: browser\.tabId/u,
   '旧 Authority 回调不得用 revealTabId 覆盖更新的 Tab 意图',
 );
-assert.match(shell, /type HtmlBrowserOpenRequest = \{[\s\S]*workspaceId: string;[\s\S]*workspacePath: string;[\s\S]*sessionId: string;/u);
-assert.match(rightPane, /openHtmlInMagiBrowser\(request\)/u);
+assert.match(shell, /openWorkspaceHtmlInRightPaneBrowser\(\{/u);
+assert.match(
+  shell,
+  /window\.addEventListener\(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener\)/u,
+  '链接点击的消费者必须在 Shell 上，右栏未挂载时也不能丢事件',
+);
 assert.match(shell, /decideDesktopPanelActivation\(/u);
 const chooseAddPane = rightPane.match(/async function chooseAddPane\([\s\S]*?\n  \}/u)?.[0] ?? '';
 assert.match(chooseAddPane, /kind === 'browser'/u);
-assert.match(chooseAddPane, /createBrowserPane\(\)/u);
+assert.match(chooseAddPane, /openUrlInRightPaneBrowser\('about:blank', \{[\s\S]*?workspacePath: workspaceRoot/u);
 assert.match(chooseAddPane, /createTerminalPane\(\)/u);
 assert.match(rightPane, /class="right-pane-browser-tab-host"/u);
 assert.match(rightPane, /class="right-pane-body"/u);

@@ -20,7 +20,7 @@ pub use catalog::{
     V1_TOOLS, build_catalog, mapping_for_public_name,
 };
 pub use path_guard::{PathAccess, PathGuard, PathRequest, PathViolation};
-pub use profile::{Disposition, Profile, ToolClass};
+pub use profile::{ApprovalMode, Disposition, Profile, ToolClass};
 pub use protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION};
 pub use server::{
     AttributionRefusal, AttributionResolver, AttributionTarget, AuditEvent, AuditOutcome,

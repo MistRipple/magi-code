@@ -1,15 +1,14 @@
 //! 客户端令牌：生成、哈希存储、校验与吊销。
 //!
-//! 令牌是「这个客户端在这个工作区里能做什么」的凭据：绑定一个工作区、一个权限档与
-//! 一个归属模式。原文只在创建时返回一次；这里只保存哈希、前缀与元数据。原文不进日志、
-//! 不进诊断、不进 canonical。
+//! 令牌绑定一个工作区、授权方式与归属模式；工具目录对所有令牌统一完整开放。原文只在创建时返回一次；这里只保存哈希、
+//! 前缀与元数据。原文不进日志、不进诊断、不进 canonical。
 
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::profile::Profile;
+use crate::profile::ApprovalMode;
 
 /// 令牌原文的固定前缀，便于用户和扫描工具识别。
 pub const TOKEN_PREFIX: &str = "magi_mcp_";
@@ -39,7 +38,9 @@ pub struct TokenRecord {
     pub hash: String,
     pub client_name: String,
     pub workspace_id: String,
-    pub profile: Profile,
+    /// 需要人工确认的调用如何处理；历史令牌没有该字段，按每次询问处理。
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
     #[serde(default)]
     pub attribution: AttributionMode,
     pub created_at_ms: u64,
@@ -65,7 +66,8 @@ impl TokenRecord {
 pub struct IssueTokenRequest {
     pub client_name: String,
     pub workspace_id: String,
-    pub profile: Profile,
+    /// 需要人工确认的调用如何处理。
+    pub approval_mode: ApprovalMode,
     pub attribution: AttributionMode,
     /// 有效期（毫秒）。`None` 表示不过期。
     pub ttl_ms: Option<u64>,
@@ -114,7 +116,8 @@ pub enum TokenError {
 #[derive(Clone, Debug, Default)]
 pub struct TokenPatch {
     pub client_name: Option<String>,
-    pub profile: Option<Profile>,
+    /// 需要人工确认的调用如何处理；`None` 表示不改。
+    pub approval_mode: Option<ApprovalMode>,
     /// `Some(None)` 表示改为不过期；`Some(Some(t))` 表示在 `t`（毫秒时间戳）过期。
     pub expires_at_ms: Option<Option<u64>>,
     pub network: Option<bool>,
@@ -194,7 +197,7 @@ impl TokenStore {
             hash: hash_secret(&secret),
             client_name: request.client_name.trim().to_string(),
             workspace_id: request.workspace_id.trim().to_string(),
-            profile: request.profile,
+            approval_mode: request.approval_mode,
             attribution: request.attribution,
             created_at_ms: now_ms,
             expires_at_ms: request.ttl_ms.map(|ttl| now_ms.saturating_add(ttl)),
@@ -234,8 +237,8 @@ impl TokenStore {
         if let Some(name) = name {
             record.client_name = name;
         }
-        if let Some(profile) = patch.profile {
-            record.profile = profile;
+        if let Some(approval_mode) = patch.approval_mode {
+            record.approval_mode = approval_mode;
         }
         if let Some(expires) = patch.expires_at_ms {
             record.expires_at_ms = expires;
@@ -332,11 +335,11 @@ impl TokenStore {
 mod tests {
     use super::*;
 
-    fn request(profile: Profile) -> IssueTokenRequest {
+    fn request() -> IssueTokenRequest {
         IssueTokenRequest {
             client_name: "Cursor · 笔记本".to_string(),
             workspace_id: "workspace-a".to_string(),
-            profile,
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::External,
             ttl_ms: None,
             network: false,
@@ -346,7 +349,7 @@ mod tests {
     #[test]
     fn issued_secret_authenticates_and_is_never_stored() {
         let store = TokenStore::new();
-        let issued = store.issue(request(Profile::ReadOnly), 1_000).unwrap();
+        let issued = store.issue(request(), 1_000).unwrap();
         assert!(issued.secret.starts_with(TOKEN_PREFIX));
         assert_eq!(issued.secret.len(), TOKEN_PREFIX.len() + 64);
 
@@ -369,10 +372,10 @@ mod tests {
     #[test]
     fn wrong_unknown_expired_and_revoked_tokens_fail_identically() {
         let store = TokenStore::new();
-        let mut short = request(Profile::Edit);
+        let mut short = request();
         short.ttl_ms = Some(500);
         let expiring = store.issue(short, 1_000).unwrap();
-        let revoked = store.issue(request(Profile::Edit), 1_000).unwrap();
+        let revoked = store.issue(request(), 1_000).unwrap();
         assert!(store.revoke(&revoked.record.token_id, 1_100));
 
         assert_eq!(
@@ -398,8 +401,8 @@ mod tests {
     #[test]
     fn revoke_all_and_workspace_removal_invalidate_tokens() {
         let store = TokenStore::new();
-        let a = store.issue(request(Profile::ReadOnly), 1).unwrap();
-        let mut other = request(Profile::ReadOnly);
+        let a = store.issue(request(), 1).unwrap();
+        let mut other = request();
         other.workspace_id = "workspace-b".to_string();
         let b = store.issue(other, 1).unwrap();
 
@@ -414,19 +417,28 @@ mod tests {
     #[test]
     fn records_round_trip_without_secret_and_reject_blank_inputs() {
         let store = TokenStore::new();
-        let issued = store.issue(request(Profile::EditTrusted), 10).unwrap();
-        let restored = TokenStore::from_records(
-            serde_json::from_str(&serde_json::to_string(&store.records()).unwrap()).unwrap(),
-        );
+        let issued = store.issue(request(), 10).unwrap();
+        // 历史文件里的令牌带已删除的 `profile` 键、没有 `approvalMode`：必须能读回，且按每次询问处理。
+        let mut legacy = serde_json::to_value(store.records()).unwrap();
+        legacy[0]["profile"] = serde_json::json!("read_only");
+        legacy[0].as_object_mut().unwrap().remove("approvalMode");
+        let restored = TokenStore::from_records(serde_json::from_value(legacy).unwrap());
         assert!(restored.authenticate(&issued.secret, 11).is_ok());
+        assert_eq!(restored.records()[0].approval_mode, ApprovalMode::Ask);
+        assert!(
+            !serde_json::to_string(&restored.records())
+                .unwrap()
+                .contains("profile"),
+            "重新保存后不再写出已删除的字段"
+        );
 
-        let mut blank = request(Profile::ReadOnly);
+        let mut blank = request();
         blank.client_name = "  ".to_string();
         assert!(matches!(
             store.issue(blank, 1),
             Err(TokenError::EmptyClientName)
         ));
-        let mut blank = request(Profile::ReadOnly);
+        let mut blank = request();
         blank.workspace_id = String::new();
         assert!(matches!(
             store.issue(blank, 1),
@@ -444,7 +456,7 @@ mod tests {
     #[test]
     fn update_changes_scope_without_changing_the_secret_and_rejects_revoked_tokens() {
         let store = TokenStore::new();
-        let issued = store.issue(request(Profile::ReadOnly), 1_000).unwrap();
+        let issued = store.issue(request(), 1_000).unwrap();
         let id = issued.record.token_id.clone();
 
         let (before, after) = store
@@ -452,21 +464,21 @@ mod tests {
                 &id,
                 TokenPatch {
                     client_name: Some("  Claude Desktop ".to_string()),
-                    profile: Some(Profile::Edit),
+                    approval_mode: Some(ApprovalMode::Always),
                     expires_at_ms: Some(Some(9_000)),
                     network: Some(true),
                 },
                 2_000,
             )
             .unwrap();
-        assert_eq!(before.profile, Profile::ReadOnly);
+        assert_eq!(before.approval_mode, ApprovalMode::Ask);
         assert_eq!(after.client_name, "Claude Desktop");
-        assert_eq!(after.profile, Profile::Edit);
+        assert_eq!(after.approval_mode, ApprovalMode::Always);
         assert_eq!(after.expires_at_ms, Some(9_000));
         assert!(after.network);
-        // 原文不变：仍用创建时的原文认证，且读到的是新的权限档。
+        // 原文不变：仍用创建时的原文认证，且读到的是新的授权方式。
         let authenticated = store.authenticate(&issued.secret, 3_000).unwrap();
-        assert_eq!(authenticated.profile, Profile::Edit);
+        assert_eq!(authenticated.approval_mode, ApprovalMode::Always);
 
         // 改为不过期；空名称被拒绝。
         let (_, never) = store
@@ -506,10 +518,10 @@ mod tests {
     #[test]
     fn rotate_replaces_the_secret_and_keeps_everything_else() {
         let store = TokenStore::new();
-        let issued = store.issue(request(Profile::Edit), 1_000).unwrap();
+        let issued = store.issue(request(), 1_000).unwrap();
         let (record, new_secret) = store.rotate(&issued.record.token_id).unwrap();
         assert_ne!(new_secret, issued.secret);
-        assert_eq!(record.profile, Profile::Edit);
+        assert_eq!(record.approval_mode, ApprovalMode::Ask);
         assert_eq!(record.workspace_id, "workspace-a");
         assert!(
             store.authenticate(&issued.secret, 2_000).is_err(),

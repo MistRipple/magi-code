@@ -4011,14 +4011,14 @@ export async function revertAgentExecutionGroupChanges(
 
 // ── Magi MCP 服务（对外暴露 Magi 工具的标准 MCP 入口）─────────────────────────
 
-export type McpServerProfile = 'read_only' | 'edit' | 'edit_trusted' | 'exec';
+export type McpServerApprovalMode = 'ask' | 'always';
 
 export interface McpServerToken {
   tokenId: string;
   prefix: string;
   clientName: string;
   workspaceId: string;
-  profile: McpServerProfile;
+  approvalMode: McpServerApprovalMode;
   attribution: 'external' | 'follow_web_slot';
   /** 是否允许经公网隧道使用。 */
   network: boolean;
@@ -4075,12 +4075,10 @@ export interface McpServerStatus {
 export interface McpServerCreateTokenRequest {
   clientName: string;
   workspaceId: string;
-  profile: McpServerProfile;
+  approvalMode?: McpServerApprovalMode;
   /** 有效期天数；缺省 90，0 表示不过期。 */
   ttlDays?: number;
-  /** 免确认写入与命令执行必须显式确认风险。 */
-  confirmHighRisk?: boolean;
-  /** 允许经公网隧道使用（权限档不得高于 edit）。 */
+  /** 允许经公网隧道使用。 */
   allowNetwork?: boolean;
 }
 
@@ -4092,12 +4090,10 @@ export interface McpServerCreateTokenResponse {
 
 export interface McpServerUpdateTokenRequest {
   clientName?: string;
-  profile?: McpServerProfile;
+  approvalMode?: McpServerApprovalMode;
   /** 从现在起重新计算的有效期天数；0 表示不过期。缺省不改。 */
   ttlDays?: number;
   allowNetwork?: boolean;
-  /** 把权限档改成免确认写入或命令执行时必须显式确认风险。 */
-  confirmHighRisk?: boolean;
 }
 
 export interface McpServerConfigSnippets {

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -114,6 +114,7 @@ const post = (_page, path, body) => tools.post(path, body);
 const click = (_page, selector) => tools.click(selector);
 const exists = (_page, selector) => tools.exists(selector);
 const text = (_page, selector) => tools.text(selector);
+const documentBodyIncludes = (value) => page.evaluate(`document.body.innerText.includes(${JSON.stringify(value)})`);
 
 /** 设置页在显示时会重置/聚焦当前分类；重试点击直到目标分类真正成为当前页。 */
 async function openSettingsTab(page, tabId) {
@@ -279,6 +280,41 @@ try {
 
   check("主内容区页面选中时提示引用已加入输入区", await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("加入输入区"), "加入提示", 5_000));
   await click(page, ".tab-bar--top .tab-item"); // 回到“对话”标签，输入区才可见
+
+  // 命令与结构化引用互斥：用户先选命令再从插件视图选引用时，命令必须让位并说明，不能提交非法组合。
+  await page.evaluate(`(() => {
+    const chip = document.querySelector('[data-testid="plugin-selection-chip"]');
+    // 主内容区切回“对话”时输入区可能尚未重新挂载；此时没有旧 chip 也不影响
+    // 后续“命令 → 引用”的互斥行为验证。
+    chip?.querySelector('button')?.click();
+  })()`);
+  await click(page, '[aria-label="添加上下文与能力"]');
+  await waitFor(() => exists(page, '.ia-add-item[role="menuitem"]'), "输入区添加菜单展开");
+  await page.evaluate(`(() => {
+    const item = [...document.querySelectorAll('.ia-add-item')].find((el) => el.textContent.includes('清空看板'));
+    if (!item) throw new Error('添加菜单缺少清空看板命令');
+    item.click();
+  })()`);
+  await waitFor(() => documentBodyIncludes('清空看板'), "插件命令选中后显示在输入区");
+  await click(page, '[data-testid="top-tab-plugin"]');
+  await waitFor(() => exists(page, '[data-testid="plugin-view"]'), "回到插件视图");
+  await waitFor(async () => {
+    try {
+      return await inFrame("Boolean(document.querySelector('#items li:nth-child(1) button'))");
+    } catch {
+      return false;
+    }
+  }, "插件视图条目重新挂载", 10_000);
+  await inFrame(`document.querySelector('#items li:nth-child(1) button').click()`);
+  await click(page, ".tab-bar--top .tab-item"); // 回到“对话”标签，输入区才可见
+  check(
+    "选择插件引用会取消已选插件命令并保留引用",
+    await page.evaluate(`(() => ({
+      selection: Boolean(document.querySelector('[data-testid="plugin-selection-chip"]')),
+      command: Boolean([...document.querySelectorAll('.ia-reference-chip')].some((el) => el.textContent.includes('清空看板'))),
+    }))()`).then((state) => state.selection && !state.command),
+  );
+
   // 7. 带引用提交一轮，并让模型调用真实插件工具
   await page.evaluate(`(() => {
     const el = document.querySelector('[data-testid="input-textarea"]');
@@ -388,6 +424,7 @@ try {
   await openSettingsTab(page, "plugins");
   await click(page, '[data-testid="plugin-sources-open"]');
   await waitFor(() => exists(page, '[data-testid="plugin-address-input"]'), "安装来源弹窗中的地址输入框");
+  check("地址输入框明确只接受远程地址", (await page.evaluate(`document.querySelector('[data-testid="plugin-address-input"]')?.getAttribute('placeholder')`)) === "远程插件包地址（HTTP(S)），本地 ZIP 请使用下方选择文件");
   await page.evaluate(`(() => { const input = document.querySelector('[data-testid="plugin-address-input"]'); input.value = ${JSON.stringify(`local:${archive2}`)}; input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
   await click(page, '[data-testid="plugin-address-install"]');
   await waitFor(() => exists(page, '[data-testid="plugin-candidate"][data-operation="upgrade"]'), "升级确认面板出现");
@@ -565,6 +602,26 @@ try {
   check("停用后管理面被拒绝", (await api(page, "/api/mcp-server/status")).status === 403);
   await post(page, `/api/plugins/${MCP_ID}/authorize`, { scope: "application", grants: mcpManifest.permissions });
   await post(page, `/api/plugins/${MCP_ID}/activate`, { scope: "application" });
+  // MCP 客户端设置：工具目录固定完整开放，只选择逐次询问或开放全部权限。
+  await page.call("Page.reload", { ignoreCache: true });
+  await waitFor(() => exists(page, '[data-testid="input-textarea"]'), "MCP 激活后工作台重新加载");
+  await openSettingsTab(page, "mcpServer");
+  await click(page, '[data-mcp-tab="clients"]');
+  await waitFor(() => exists(page, '[data-mcp-create-open="1"]'), "MCP 客户端设置出现");
+  await click(page, '[data-mcp-create-open="1"]');
+  await waitFor(() => exists(page, '[data-mcp-approval-mode="1"]'), "MCP 客户端授权方式选择器出现");
+  check("新令牌默认完整工具目录并逐次询问", await page.evaluate(`(() => ({
+    hasProfile: Boolean(document.querySelector('[data-mcp-profile="1"]')),
+    approval: document.querySelector('[data-mcp-approval-mode="1"]')?.value,
+    hasDeny: [...(document.querySelector('[data-mcp-approval-mode="1"]')?.options ?? [])].some((option) => option.value === 'deny'),
+  }))()`).then((state) => !state.hasProfile && state.approval === 'ask' && !state.hasDeny));
+  await page.evaluate(`(() => {
+    const select = document.querySelector('[data-mcp-approval-mode="1"]');
+    select.value = 'always';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  check("开放权限无需第二个风险确认，网络开关仍独立可选", !(await exists(page, '[data-mcp-confirm-risk="1"]')) && await exists(page, '[data-mcp-allow-network="1"]'));
+  await page.evaluate(`(() => [...document.querySelectorAll('form.create-form')].at(-1)?.querySelector('button[type="button"]')?.click())()`);
   const restoredUrl = await waitFor(async () => {
     const status = JSON.parse((await api(page, "/api/mcp-server/status")).body);
     return status.running ? status.url : null;
@@ -573,13 +630,43 @@ try {
   // 10e. 外部会话：外部 agent 通过 MCP 调用本地工具的过程，是对应工作区下的一个真正的（只读）会话，
   // 调用写进它的 canonical 时间线，在主对话区里和内部对话同一套展示
   await writeFile(join(workspaceRoot, "external-read.txt"), "hello from an external agent");
-  const issued = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "e2e-agent", workspaceId, profile: "edit", ttlDays: 1 })).body);
+  const autoIssued = JSON.parse((await post(page, "/api/mcp-server/tokens", {
+    clientName: "e2e-auto-agent",
+    workspaceId,
+    approvalMode: "always",
+    ttlDays: 1,
+  })).body);
+  const autoCall = (name, args_) => fetch(restoredUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${autoIssued.secret}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args_ } }),
+  }).then((response) => response.json());
+  const autoWrite = await autoCall("magi.fs.write", { path: "auto-mode.txt", content: "auto-approved\n" });
+  const pendingAfterAutoWrite = JSON.parse((await api(page, "/api/mcp-server/approvals")).body).approvals ?? [];
+  check("始终授权令牌的普通写入无需 Magi 弹窗", autoWrite.result?.isError !== true && pendingAfterAutoWrite.length === 0, JSON.stringify(autoWrite).slice(0, 200));
+  await writeFile(join(workspaceRoot, "auto-delete.txt"), "remove without prompt");
+  const autoRemove = await autoCall("magi.fs.remove", { path: "auto-delete.txt" });
+  const removedFileStillExists = await access(join(workspaceRoot, "auto-delete.txt")).then(() => true).catch(() => false);
+  check("开放权限也自动执行删除类 MCP 工具", autoRemove.result?.isError !== true && !removedFileStillExists, JSON.stringify(autoRemove).slice(0, 200));
+  const autoExec = await autoCall("magi.shell.exec", { command: "printf open-mode" });
+  check("开放权限也自动执行命令工具", autoExec.result?.isError !== true && JSON.stringify(autoExec).includes("open-mode"), JSON.stringify(autoExec).slice(0, 200));
+  const issued = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "e2e-agent", workspaceId, ttlDays: 1 })).body);
   const mcpCall = (name, args_) => fetch(restoredUrl, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}` },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args_ } }),
   }).then((response) => response.json());
-  const externalRead = await mcpCall("magi.fs.read", { path: "external-read.txt" });
+  const externalReadPending = mcpCall("magi.fs.read", { path: "external-read.txt" });
+  const readApproval = await waitFor(async () => {
+    const approvals = JSON.parse((await api(page, "/api/mcp-server/approvals")).body).approvals ?? [];
+    return approvals.find((approval) => approval.tokenId === issued.token.tokenId) ?? null;
+  }, "每次询问模式下读取操作也请求确认");
+  const readApprovalResult = await post(page, "/api/mcp-server/approvals/resolve", {
+    approvalId: readApproval.approvalId,
+    decision: "allow_once",
+  });
+  check("可单次允许 MCP 读取操作", readApprovalResult.status === 200, readApprovalResult.body.slice(0, 200));
+  const externalRead = await externalReadPending;
   check("外部 agent 经 MCP 读取本地文件成功", externalRead.result?.isError !== true && JSON.stringify(externalRead).includes("hello from an external agent"), JSON.stringify(externalRead).slice(0, 200));
   const externalDenied = await mcpCall("magi.fs.read", { path: "../escape.txt" });
   check("越出工作区的调用被拒绝", externalDenied.result?.isError === true);
@@ -590,7 +677,13 @@ try {
   const sessionItem = '[data-testid="external-session-item"]';
   await page.evaluate(`(() => { const header = document.querySelector('[data-workspace-id="${workspaceId}"]'); if (header && header.getAttribute('aria-expanded') !== 'true') header.click(); })()`);
   await waitFor(() => exists(page, sessionItem), "工作区下出现外部客户端会话", 30_000);
-  check("外部会话不进入用户的会话列表（没有普通会话行）", !(await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`)));
+  check("外部会话进入工作区的统一会话列表", await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`));
+  check("外部会话按最近活动时间排在普通会话中", await page.evaluate(`(() => {
+    const item = document.querySelector('[data-testid="external-session-item"]');
+    const list = item?.closest('.session-list');
+    const times = list ? [...list.querySelectorAll('.session-item')].map((entry) => Number(entry.dataset.sessionUpdatedAt ?? 0)) : [];
+    return Boolean(item && list && !item.closest('.external-list') && times.every((time, index) => index === 0 || times[index - 1] >= time));
+  })()`));
   check("侧栏的外部会话以客户端名称标识并标注「外部」", await page.evaluate(`(() => { const item = document.querySelector('[data-testid="external-session-item"]'); return Boolean(item?.closest('.workspace-children')) && item.innerText.includes('e2e-agent') && item.innerText.includes('外部'); })()`));
   if (await exists(page, '[data-testid="settings-back"]')) await click(page, '[data-testid="settings-back"]').catch(() => {});
   // 停在「变更」标签时点外部会话，也要回到「对话」标签看到它。
@@ -600,14 +693,14 @@ try {
   await waitFor(() => exists(page, '[data-testid="external-session-bar"]'), "打开外部会话后输入区换成只读提示", 30_000);
   check("点外部会话后顶部标签回到「对话」", await page.evaluate(`document.querySelector('.tab-bar--top .tab-item')?.classList.contains('active') === true`));
   check("外部会话在主对话区打开，没有对话输入框", !(await exists(page, '[data-testid="input-textarea"]')));
-  check("打开外部会话后它也不作为普通会话行出现", !(await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`)));
+  check("打开外部会话后仍保留在统一会话列表", await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`));
   await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("external-read.txt"), "时间线里出现外部调用的工具卡片", 30_000).catch(async (error) => {
     const dom = await page.evaluate(`JSON.stringify({ thread: document.querySelector('.thread-panel')?.innerText?.slice(0, 300), html: document.querySelector('.main-content')?.innerHTML?.replace(/<style[\\s\\S]*?<\\/style>/g, '').slice(0, 1200), bar: Boolean(document.querySelector('[data-testid="external-session-bar"]')), settings: Boolean(document.querySelector('[data-testid="settings-page"]')?.getClientRects().length), vis: document.visibilityState })`);
     const api_ = (await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body;
     throw new Error(`${error.message}；${dom}；API=${api_.slice(0, 900)}`);
   });
   check("外部调用在时间线里按工具卡片展示（读取的文件名）", true);
-  // 写入需要在 Magi 中确认：确认出现在会话自己的授权托盘里（和内部对话同一个组件），批准后写入成功。
+  // 写入需要在 Magi 中确认：确认出现在会话自己的授权托盘里（和内部对话同一个组件），允许一次后写入成功。
   // 窗口不在前台时，新的待确认发系统通知（验收里用桩捕获 Notification 调用）。
   await page.evaluate(`window.__notes = []; document.hasFocus = () => false; window.Notification = class { static permission = 'granted'; constructor(title, options) { window.__notes.push({ title, body: options?.body ?? '' }); } close() {} };`);
   const writing = mcpCall("magi.fs.write", { path: "ext-write.txt", content: "written by external\n" });
@@ -616,16 +709,33 @@ try {
   check("等待确认的写入出现在外部会话自己的授权托盘里", true);
   const notes = await waitFor(async () => { const list = JSON.parse(await page.evaluate(`JSON.stringify(window.__notes)`)); return list.length > 0 ? list : null; }, "窗口不在前台时发出系统通知", 20_000);
   check("待确认在窗口不在前台时发系统通知（带客户端名称与操作摘要）", notes[0].body.includes("e2e-agent") && notes[0].body.includes("ext-write.txt"), JSON.stringify(notes).slice(0, 200));
-  await page.evaluate(`(() => { const button = [...document.querySelectorAll('[data-approval-id] button')].find((el) => el.innerText.includes('仅允许本次')); if (!button) throw new Error('缺少允许按钮'); button.click(); })()`);
+  await page.evaluate(`(() => { const button = [...document.querySelectorAll('[data-approval-id] button')].find((el) => el.innerText.includes('允许一次') || el.innerText.includes('Allow once')); if (!button) throw new Error('缺少单次授权按钮'); button.click(); })()`);
   const written = await writing;
   check("在会话里批准后外部写入成功", written.result?.isError !== true, JSON.stringify(written).slice(0, 200));
   await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("ext-write.txt"), "写入展示为带文件名的卡片", 30_000);
   check("外部写入在会话里展示为带文件名的卡片", true);
+  const writingAgain = mcpCall("magi.fs.write", { path: "ext-write-again.txt", content: "written by external after another prompt\n" });
+  const secondApprovalAppeared = await waitFor(() => exists(page, '[data-approval-id]'), "下一次写入再次出现单次确认", 30_000).then(() => true).catch(() => false);
+  if (secondApprovalAppeared) {
+    await page.evaluate(`(() => { const button = [...document.querySelectorAll('[data-approval-id] button')].find((el) => el.innerText.includes('允许一次') || el.innerText.includes('Allow once')); if (!button) throw new Error('缺少第二次单次授权按钮'); button.click(); })()`);
+  }
+  const writtenAgain = await writingAgain;
+  check("每次询问模式对下一次写入再次确认", secondApprovalAppeared && writtenAgain.result?.isError !== true, JSON.stringify(writtenAgain).slice(0, 200));
   // 不保存调用内容：读到的内容不落库，动作与路径保留。
   const retention = await fetch(`http://127.0.0.1:${daemonPort}/api/mcp-server/external`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ saveContent: false, retentionDays: 30 }) });
   check("可关闭保存调用内容", retention.status === 200);
   await writeFile(join(workspaceRoot, "private.txt"), "very private body");
-  const privateRead = await mcpCall("magi.fs.read", { path: "private.txt" });
+  const privateReadPending = mcpCall("magi.fs.read", { path: "private.txt" });
+  const privateReadApproval = await waitFor(async () => {
+    const approvals = JSON.parse((await api(page, "/api/mcp-server/approvals")).body).approvals ?? [];
+    return approvals.find((approval) => approval.tokenId === issued.token.tokenId) ?? null;
+  }, "每次询问模式下的隐私读取也请求确认");
+  check("每次询问模式下的隐私读取也请求确认", true);
+  await post(page, "/api/mcp-server/approvals/resolve", {
+    approvalId: privateReadApproval.approvalId,
+    decision: "allow_once",
+  });
+  const privateRead = await privateReadPending;
   check("关闭保存后外部调用本身仍然成功", privateRead.result?.isError !== true);
   const turnsText = JSON.stringify(JSON.parse((await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body));
   check("关闭保存后读到的内容不落库、动作与路径保留", !turnsText.includes("very private body") && turnsText.includes("private.txt"), turnsText.slice(0, 200));

@@ -138,11 +138,17 @@ await withGoldenViteServer(async (server) => {
   assert.match(terminalSource, /class="terminal-pane"/u);
   assert.match(
     shellSource,
-    /if \(desktopAppSurface && isHtmlFile\([\s\S]*?htmlBrowserOpenRequest = \{[\s\S]*?\} else \{[\s\S]*?openCodeTab\(/u,
+    /if \(desktopAppSurface && isHtmlFile\([\s\S]*?openWorkspaceHtmlInRightPaneBrowser\(\{[\s\S]*?\} else \{[\s\S]*?openCodeTab\(/u,
     '文件树的 Desktop HTML 与文件视图必须互斥路由',
   );
-  assert.match(shellSource, /type HtmlBrowserOpenRequest = \{[\s\S]*workspaceId: string;[\s\S]*workspacePath: string;[\s\S]*sessionId: string;/u);
-  assert.match(rightPaneSource, /openHtmlInMagiBrowser\(request\)[\s\S]*onHtmlBrowserOpenHandled/u);
+  assert.match(
+    shellSource,
+    /window\.addEventListener\(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener\)/u,
+    '链接点击的消费者必须在始终挂载的 Shell 上（右栏是懒加载 + 条件挂载）',
+  );
+  assert.match(shellSource, /openUrlInRightPaneBrowser\(externalUrl, \{[\s\S]*?workspacePath: binding\.workspacePath/u, 'Shell 必须以权威绑定（含 workspacePath）调用');
+  assert.match(rightPaneSource, /openWorkspaceHtmlInRightPaneBrowser\(\{/u);
+  assert.doesNotMatch(rightPaneSource, /OPEN_URL_IN_BROWSER_EVENT/u);
   assert.doesNotMatch(rightPaneSource, /currentFilePath !== request\.filepath|\|\| !htmlFile/u);
   for (const [name, source] of Object.entries({ editsSource, fileChangeSource, knowledgeSource })) {
     assert.match(
@@ -322,6 +328,47 @@ await withGoldenViteServer(async (server) => {
   rightPane.synchronizeWebModelAppSession(null, null);
   assert.equal(rightPane.rightPaneState.appTabs.length, 0);
   assert.equal(rightPane.rightPaneState.activeAppTabId, null);
+
+  // GPT Web 视图激活时，用户点击打开的任意会话级 Tab（浏览器、文件、终端）都要离开应用级
+  // 视图，否则 Tab 只进 Tab 条而内容槽仍停在 GPT Web。视图本身保持挂载。
+  rightPane.activateRightPaneSession('workspace-leave', 'session-leave');
+  rightPane.synchronizeWebModelAppSession('browser-session-app-1-0', homeHost, [homeHost]);
+  for (const open of [
+    () => rightPane.openBrowserTab('browser-session-leave', 'browser-tab-leave', {
+      workspaceId: 'workspace-leave',
+      sessionId: 'session-leave',
+      url: 'https://example.com/',
+    }),
+    () => rightPane.openCodeTab('session-leave', '/tmp/leave.txt', { workspaceId: 'workspace-leave' }),
+    () => rightPane.openTerminalTab({ workspaceId: 'workspace-leave', sessionId: 'session-leave' }),
+  ]) {
+    rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
+    assert.equal(rightPane.rightPaneState.activeAppTabId, 'webSession:app');
+    open();
+    assert.equal(rightPane.rightPaneState.activeAppTabId, null);
+    assert.equal(rightPane.rightPaneState.appTabs.length, 1, '离开应用级视图不销毁宿主');
+  }
+  // Authority 同步（activate=false）不是用户意图，不能抢走应用级视图。
+  rightPane.openWebModelTab('browser-session-app-1-0', homeHost);
+  rightPane.synchronizeBrowserTabs('workspace-leave', '/tmp', 'session-leave', {
+    browserSessionId: 'browser-session-sync',
+    revision: 1,
+    agentOccupied: false,
+    activeTabId: 'browser-tab-sync',
+    tabs: [{
+      tabId: 'browser-tab-sync',
+      lifecycle: 'ready',
+      url: 'https://example.org/',
+      title: 'Sync',
+      navigationRevision: 1,
+    }],
+  });
+  assert.equal(
+    rightPane.rightPaneState.activeAppTabId,
+    'webSession:app',
+    'Authority 同步不得夺走应用级视图',
+  );
+  rightPane.synchronizeWebModelAppSession(null, null);
 
   console.log('right pane golden replay passed');
 });

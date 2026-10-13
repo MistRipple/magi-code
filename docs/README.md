@@ -66,7 +66,7 @@ npm run desktop:dev
 - [对话性能验证](./conversation-performance-validation.md)：按性能问题选择测量阶段、证据和比较口径。
 - [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
-- [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与权限档、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
+- [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与授权方式、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。

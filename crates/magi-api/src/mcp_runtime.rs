@@ -19,9 +19,7 @@ use magi_mcp_server::http::{HttpConfig, HttpState, router};
 use magi_mcp_server::local_socket::{
     LocalSocketServer, local_endpoint_for, serve_local_socket, serve_local_socket_with_auth,
 };
-use magi_mcp_server::{
-    IssueTokenRequest, IssuedToken, Profile, TokenPatch, TokenRecord, TokenStore,
-};
+use magi_mcp_server::{IssueTokenRequest, IssuedToken, TokenPatch, TokenRecord, TokenStore};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -1290,7 +1288,7 @@ impl McpServiceRuntime {
                 token_id,
                 TokenPatch {
                     client_name: Some(before.client_name.clone()),
-                    profile: Some(before.profile),
+                    approval_mode: Some(before.approval_mode),
                     expires_at_ms: Some(before.expires_at_ms),
                     network: Some(before.network),
                 },
@@ -1386,21 +1384,17 @@ impl McpServiceRuntime {
     }
 }
 
-/// 这次编辑有没有收紧该令牌的权限（降权、关闭公网、缩短有效期）。收紧时挂起的审批按旧权限发起，
-/// 不能继续等；单纯放宽（例如从只读升到编辑）不需要作废。
+/// 这次编辑有没有收紧该令牌的权限（关闭公网、缩短有效期）。收紧时挂起的审批按旧权限发起，
+/// 不能继续等；单纯放宽或改名不需要作废。授权方式不参与：开放模式从不产生审批，
+/// 询问模式下已挂起的审批仍可由用户处理。
 fn narrows_access(before: &TokenRecord, after: &TokenRecord) -> bool {
-    let profile_narrowed = before.profile != after.profile
-        && !matches!(
-            (before.profile, after.profile),
-            (Profile::ReadOnly, _) | (Profile::Edit, Profile::EditTrusted | Profile::Exec)
-        );
     let network_narrowed = before.network && !after.network;
     let expiry_narrowed = match (before.expires_at_ms, after.expires_at_ms) {
         (None, Some(_)) => true,
         (Some(old), Some(new)) => new < old,
         _ => false,
     };
-    profile_narrowed || network_narrowed || expiry_narrowed
+    network_narrowed || expiry_narrowed
 }
 
 fn cancel_pending(state: &ApiState, token_id: &str) {
@@ -1456,7 +1450,7 @@ mod tests {
     use super::*;
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_mcp_server::{AttributionMode, Profile};
+    use magi_mcp_server::{ApprovalMode, AttributionMode};
     use magi_session_store::SessionStore;
     use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
@@ -1514,7 +1508,7 @@ mod tests {
         IssueTokenRequest {
             client_name: "cursor".to_string(),
             workspace_id: "ws".to_string(),
-            profile: Profile::ReadOnly,
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::External,
             ttl_ms: None,
             network: false,
@@ -1729,11 +1723,11 @@ mod tests {
 
     const TUNNEL_HOST: &str = "quick-demo.trycloudflare.com";
 
-    fn network_request(profile: Profile) -> IssueTokenRequest {
+    fn network_request() -> IssueTokenRequest {
         IssueTokenRequest {
             client_name: "remote".to_string(),
             workspace_id: "ws".to_string(),
-            profile,
+            approval_mode: ApprovalMode::Ask,
             attribution: AttributionMode::External,
             ttl_ms: None,
             network: true,
@@ -1769,10 +1763,7 @@ mod tests {
         ));
         assert!(fake.started_ports.lock().unwrap().is_empty());
 
-        let remote = runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        let remote = runtime.issue_token(network_request()).await.unwrap();
         let status = runtime.set_network(&state, true).await.unwrap();
         assert!(
             status.network.enabled && status.running,
@@ -1817,10 +1808,7 @@ mod tests {
         let fake = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let runtime = McpServiceRuntime::in_memory().with_tunnel_provider(fake.clone());
         let state = state();
-        let remote = runtime
-            .issue_token(network_request(Profile::ReadOnly))
-            .await
-            .unwrap();
+        let remote = runtime.issue_token(network_request()).await.unwrap();
         let status = runtime.set_network(&state, true).await.unwrap();
         let local_url = status.url.unwrap();
         for _ in 0..100 {
@@ -1861,10 +1849,7 @@ mod tests {
         let fake = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let runtime = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake.clone());
         let state = state();
-        let remote = runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        let remote = runtime.issue_token(network_request()).await.unwrap();
 
         let status = runtime.set_network(&state, true).await.unwrap();
         let local_url = status.url.unwrap();
@@ -1964,7 +1949,7 @@ mod tests {
             store
                 .issue(
                     IssueTokenRequest {
-                        profile: Profile::Edit,
+                        approval_mode: ApprovalMode::Ask,
                         network: true,
                         ttl_ms: Some(10_000),
                         ..request()
@@ -1976,11 +1961,8 @@ mod tests {
         };
         let before = base();
         let mut widened = before.clone();
-        widened.profile = Profile::Exec;
-        assert!(!narrows_access(&before, &widened), "升权限不取消挂起审批");
-        let mut narrowed = before.clone();
-        narrowed.profile = Profile::ReadOnly;
-        assert!(narrows_access(&before, &narrowed));
+        widened.approval_mode = ApprovalMode::Always;
+        assert!(!narrows_access(&before, &widened), "放宽授权不取消挂起审批");
         let mut offline = before.clone();
         offline.network = false;
         assert!(narrows_access(&before, &offline));
@@ -2004,10 +1986,7 @@ mod tests {
         let state = state();
         let fake = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let runtime = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake.clone());
-        runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        runtime.issue_token(network_request()).await.unwrap();
 
         let status = runtime
             .set_named_tunnel("https://MCP.example.com/", &named_token())
@@ -2104,10 +2083,7 @@ mod tests {
         let state = state();
         let fake = crate::mcp_tunnel::fake::FakeTunnel::new(&format!("https://{TUNNEL_HOST}"));
         let runtime = McpServiceRuntime::load(path.clone()).with_tunnel_provider(fake.clone());
-        runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        runtime.issue_token(network_request()).await.unwrap();
 
         // Quick：开了也不持久化。
         let status = runtime.set_network(&state, true).await.unwrap();
@@ -2236,10 +2212,7 @@ mod tests {
         ));
         assert!(!runtime.status().await.running);
 
-        let remote = runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        let remote = runtime.issue_token(network_request()).await.unwrap();
         assert!(
             runtime
                 .set_direct_access(&state, direct_request(&[]))
@@ -2300,10 +2273,7 @@ mod tests {
         let (path, port) = runtime_path_with_port(dir.path().join("mcp-server.json"));
         let state = state();
         let first = McpServiceRuntime::load(path.clone());
-        let remote = first
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        let remote = first.issue_token(network_request()).await.unwrap();
         first
             .set_direct_access(
                 &state,
@@ -2354,10 +2324,7 @@ mod tests {
         let (path, _) = runtime_path_with_port(dir.path().join("mcp-server.json"));
         let runtime = McpServiceRuntime::load(path);
         let state = state();
-        runtime
-            .issue_token(network_request(Profile::Edit))
-            .await
-            .unwrap();
+        runtime.issue_token(network_request()).await.unwrap();
         runtime.set_enabled(&state, true).await.unwrap();
 
         let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))

@@ -52,6 +52,22 @@ Electron BrowserWindow
 
 浏览器只能出现在当前 `browser` Tab 的内容槽中，不能覆盖右栏 Tab 栏、工具栏、弹出菜单或其他内容类型。右栏宽度和拖动只由现有 DOM/CSS 布局负责，浏览器实现不得读取或计算窗口坐标。Renderer 只允许把当前内容槽的瞬时宽高作为 fixed 设备画布的 Chromium 显示比例输入；该宽高不是窗口坐标，不得用于设置原生 bounds 或持久化布局。
 
+### 2.2 链接与文件的打开入口
+
+「在右栏打开一个网页」只有一份实现：`web/src/web/right-pane-browser.ts`。它负责能力闸门、会话作用域解析（必要时先物化会话并等主 Renderer 完成导航）、同 URL 复用、创建 Browser Session 与 Tab，以及失败反馈。所有调用方都走它，不得再写第二条创建路径：
+
+| 触发 | 调用方 |
+| --- | --- |
+| 消息 / 代码块里的 HTTP(S) 链接 | `WebWorkbenchShell` 监听 `OPEN_URL_IN_BROWSER_EVENT` |
+| 工作区 HTML 文件作为可运行网页 | `WebWorkbenchShell`（文件树与 `magi:previewFile` 分流） |
+| 右栏「新增 → 浏览器」 | `RightPane` 的 `chooseAddPane` |
+
+消费者必须在**始终挂载**的 `WebWorkbenchShell` 上：右栏是懒加载且按可见性条件挂载的组件，把链接监听的归属放在右栏会让「右栏折叠 / 从未打开过右栏」时的点击被静默丢弃。右栏组件只负责展示与移除，不再承担「点击链接」的消费。
+
+同一 URL 在同一 Magi 会话内复用已有 `browser` Tab；`about:blank` 表示「再开一个浏览器」，允许多个并存。非 Desktop 没有物理 BrowserSurface：HTTP(S) 链接退回系统浏览器，工作区 HTML 预览明确拒绝并给出原因。
+
+`mailto:` 不属于内置浏览器能承载的文档协议，但仍是可用的外部处理器目标：`normalizeExternalWebUrl` 保持只认 `http/https`（内置浏览器候选），`normalizeExternalHandlerUrl` 额外接受 `mailto:`（系统处理器），两个概念不混用。Electron Main 的 `magi-desktop:open-external` 白名单为 `http/https/mailto`。
+
 ## 3. 浏览器显示架构
 
 ### 3.1 唯一显示路径
@@ -358,6 +374,9 @@ App Server 的 `initialize/initialized` 只在可信 Desktop 传输且客户端�
 9. 重启 daemon、Worker 和 Desktop，确认逻辑 URL、标记、消息引用和多会话归属恢复，迟到事件不会污染其他 Tab。
 10. 检查控制台和日志，不得有 `setBounds` 浏览器调用、Overlay IPC、黑屏、focus 串位、Surface stale 误报或无限连接等待。
 11. 应用级 Web 模型会话（§4.3）：登录 GPT Web 后折叠右栏、关闭该视图、切换项目 / 会话，确认右栏现有标签与活动面板不被夺走、单一 guest 不被销毁、后台推理继续；重启 Magi 后登录态仍在（`persist:magi-web-model`），临时对话失效、已保存对话按 `conversation_id` 重绑，且不会恢复第二个 WebView。
+12. 链接入口（§2.2）：在**右栏从未挂载**的状态下点击消息里的 HTTP(S) 链接，确认右栏自动展开并出现新的顶级 `browser` Tab、目标页真实加载、同 URL 重复点击复用同一 Tab、不同 URL 新建 Tab、Tab 归属当前 Magi 会话（而非 `browser-session-app-*`）。
+
+`npm run test:electron-right-pane-links` 覆盖第 12 条：用打包 Electron 与本地 OpenAI-compatible Provider 让回复带上两个链接，从全新状态根（右栏未挂载）开始逐步断言上述行为。
 
 网络边界（§5.5）有独立的真实 Chromium 验收：`npm run test:electron-browser-network-policy` 用开发依赖里的 Electron 启动不显示窗口的最小宿主，验证 iframe、fetch 和重定向无法绕过 session 层拦截，并确认 `*.localhost` 预览来源能解析到本机。
 
