@@ -1,3 +1,4 @@
+import type { BrowserWebQuestion } from "@magi/desktop-browser-contracts";
 import { createHash } from "node:crypto";
 
 /**
@@ -16,7 +17,7 @@ import { createHash } from "node:crypto";
  */
 
 /** 站点适配层结构版本。selector 集变化即推进，用于诊断与漂移判定。 */
-export const WEB_MODEL_SITE_REVISION = "chatgpt-web-7";
+export const WEB_MODEL_SITE_REVISION = "chatgpt-web-9";
 
 /** ChatGPT 页面的 DOM 事实（selector、命名）。集中在这里，不得散落。 */
 export const WEB_MODEL_SELECTORS = {
@@ -61,7 +62,16 @@ export const WEB_MODEL_SELECTORS = {
   /** 风险 / 验证页标志。 */
   blockPage: ["#challenge-form", "iframe[src*='challenges.cloudflare.com']", "[data-testid='blocked-page']"],
   /** 附件 chip：出现即说明输入被转成了附件。 */
-  attachmentChip: ["[data-testid='attachment-chip']", "[data-testid*='attachment'][role='listitem']"],
+  attachmentChip: ["[data-composer-attachments] [role='button'].composer-attachment-surface"],
+  /**
+   * 输入框附件区里每个附件上的「移除」按钮（aria-label 形如 "Remove <文件名>"，随界面语言变化，
+   * 所以不按文案匹配，只认附件区里带 aria-label 的按钮）：一个按钮 = 一个已附加（或上传中）的附件。
+   */
+  attachmentRemove: ["[data-composer-attachments] button[aria-label]"],
+  /** 附件仍在上传的标志（附件缩略图上的圆形进度）：出现即不能提交。 */
+  attachmentUploading: ["[data-composer-attachments] [role='progressbar']"],
+  /** 文件选择输入：附加图片通过它进入，不模拟粘贴。 */
+  fileInput: ["input[type='file']"],
   /** 提交按钮。找不到时退回 composer 上的 Enter 键（ChatGPT 的默认提交手势）。 */
   submitButton: [
     "button[data-testid='send-button']",
@@ -594,30 +604,90 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     return { revision, nodes };
   };
 
+  // ── 附件：图片经文件输入进入输入框 ────────────────────────────────────────
+  const composerRoot = () => {
+    const composer = firstComposer();
+    return (composer && (composer.closest('form') || composer.parentElement)) || document;
+  };
+  // 移除按钮默认 opacity:0，只有 hover 才显现；它仍然是可激活的附件控件。
+  const attachmentRemoveButtons = () => allMatches(SELECTORS.attachmentRemove, composerRoot()).filter((node) => !node.hidden && !node.disabled);
+  const attachmentUploading = () => allMatches(SELECTORS.attachmentUploading, composerRoot()).some(visible);
+  const ownedAttachmentNames = new Set();
+  const attachmentState = () => ({
+    count: Math.max(attachmentRemoveButtons().length, allMatches(SELECTORS.attachmentChip, composerRoot()).length),
+    uploading: attachmentUploading(),
+  });
+  const beginAttachmentUpload = (names) => {
+    if (attachmentState().count !== 0) throw new Error('web_attach_draft_conflict:网页已有未发送附件');
+    ownedAttachmentNames.clear();
+    for (const name of names) ownedAttachmentNames.add(name);
+    return true;
+  };
+  const ownedAttachment = (node) => {
+    const chip = node.closest?.('[role="button"].composer-attachment-surface');
+    return Boolean(chip && ownedAttachmentNames.has(chip.getAttribute('aria-label')));
+  };
+  const foreignAttachments = () => allMatches(SELECTORS.attachmentChip, composerRoot())
+    .some((chip) => !ownedAttachmentNames.has(chip.getAttribute('aria-label')));
+  // 给「接收图片的文件输入」打上临时标记，worker 再按这个标记用 CDP 设置文件。
+  // 优先输入框所在区域内、接受图片、不是相机拍摄的那个；找不到返回 null。
+  const fileInputTarget = () => {
+    document.querySelectorAll('[data-magi-upload-target]').forEach((node) => node.removeAttribute('data-magi-upload-target'));
+    const inputs = allMatches(SELECTORS.fileInput, document).filter((node) => node.type === 'file' && !node.disabled);
+    const root = composerRoot();
+    const acceptsImages = (node) => {
+      const accept = (node.getAttribute('accept') || '').toLowerCase();
+      return !accept || accept.includes('image') || accept.includes('*/*');
+    };
+    // 站点同时放着「拍照」（单选、capture）、「附加照片」（多选、只收图片）和「附加文件」（多选、不限类型）。
+    // 多图要用多选；明确声明收图片的优先于不限类型的。
+    const usable = inputs.filter((node) => !node.hasAttribute('capture') && acceptsImages(node));
+    const explicitImage = (node) => (node.getAttribute('accept') || '').toLowerCase().includes('image');
+    const imageOnly = (node) => explicitImage(node) && !(node.getAttribute('accept') || '').toLowerCase().includes('video');
+    const rank = (node) => (node.multiple ? 0 : 4) + (imageOnly(node) ? 0 : explicitImage(node) ? 1 : 2);
+    const target = usable
+      .filter((node) => root.contains(node))
+      .sort((left, right) => rank(left) - rank(right))[0]
+      || usable.sort((left, right) => rank(left) - rank(right))[0]
+      || null;
+    if (!target) return null;
+    target.setAttribute('data-magi-upload-target', '1');
+    return "input[data-magi-upload-target='1']";
+  };
+  // 回滚：点掉输入框里所有附件。只用于本次附图失败 / 提交前失败，绝不动已发送的消息。
+  const clearAttachments = async () => {
+    if (ownedAttachmentNames.size === 0) return { remaining: attachmentState().count };
+    for (let guard = 0; guard < 24; guard += 1) {
+      const button = attachmentRemoveButtons().find(ownedAttachment);
+      if (!button) break;
+      button.click();
+      await sleep(120);
+    }
+    const remaining = attachmentState().count;
+    if (remaining === 0) ownedAttachmentNames.clear();
+    return { remaining };
+  };
+
   const submit = async () => {
     const composer = firstComposer();
     if (!composer) return { submitted: false, composer_empty: true, reason: 'composer_missing' };
-    if (!composerText(composer).trim()) return { submitted: false, composer_empty: true, reason: 'composer_empty' };
-    const submitRoot = composer.closest('form') || document;
-    const button = firstVisible(SELECTORS.submitButton, submitRoot);
-    if (button) {
-      // 写入后页面框架要过一小会儿才会放开发送按钮（刚打开页面时尤其明显）；
-      // 短暂等待，仍禁用才算不可用。
-      const unavailable = () => button.disabled || button.getAttribute('aria-disabled') === 'true';
-      for (let waited = 0; unavailable() && waited < 1500; waited += 100) await sleep(100);
-      if (unavailable()) {
-        throw new Error('web_submit_unavailable:submit button is disabled');
-      }
-      button.click();
-    } else {
-      composer.focus();
-      composer.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
-      }));
-    }
+    if (!composerText(composer).trim() && attachmentState().count === 0) return { submitted: false, composer_empty: true, reason: 'composer_empty' };
+    if (foreignAttachments()) throw new Error('web_attach_draft_conflict:未发送网页用户原有草稿附件');
+    const button = firstVisible(SELECTORS.submitButton, composer.closest('form') || document);
+    if (!button) throw new Error('web_submit_target_missing:找不到页面发送按钮，未猜测或伪造 Enter 提交');
+    const unavailable = () => button.disabled || button.getAttribute('aria-disabled') === 'true';
+    for (let waited = 0; unavailable() && waited < 1500; waited += 100) await sleep(100);
+    if (unavailable()) throw new Error('web_submit_unavailable:submit button is disabled');
+    // 与站点菜单共用完整指针序列；后台离屏 guest 不依赖 Chromium compositor 接收鼠标。
+    press(button);
     await sleep(80);
     const after = firstComposer();
-    return { submitted: true, composer_empty: !after || composerText(after).trim().length === 0, reason: null };
+    if (attachmentState().count === 0) ownedAttachmentNames.clear();
+    return {
+      submitted: true,
+      composer_empty: !after || (composerText(after).trim().length === 0 && attachmentState().count === 0),
+      reason: null,
+    };
   };
 
   // ChatGPT 在第一次打开 ?temporary-chat=true 时会先显示一个确认层。
@@ -968,6 +1038,127 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     return images.length === 0 || images.some((image) => !image.complete || !(image.naturalWidth > 0));
   };
 
+  // DIL 原生交互卡片：只读当前最后一条助手消息中的真实控件，不从正文猜选项。
+  const questionCard = (assistant) => {
+    if (!assistant) return null;
+    const roots = queryAll(assistant, '[data-dil-message-id]').filter(exposed);
+    const root = roots[roots.length - 1];
+    if (!root) return null;
+    const actions = queryAll(root, 'button[data-d-component="button"]').filter(visible);
+    const skip = actions.find((button) => /^(skip|跳过)$/i.test(textOf(button)));
+    const submit = actions.find((button) => /^(next|continue|submit|confirm|下一步|继续|提交|确认)/i.test(textOf(button)));
+    if (!submit) return null;
+    const groups = queryAll(root, '[data-d-component="radio-group"], [data-d-component="checkbox-group"]').filter(exposed);
+    const grid = queryAll(root, '[data-d-component="grid"]').find((node) => queryAll(node, 'button[data-d-component="pressable"]').length >= 2);
+    const containers = groups.length ? groups : grid ? [grid] : [];
+    if (!containers.length) return null;
+    const items = containers.map((container) => {
+      let nodes = queryAll(container, '[role="radio"], [role="checkbox"], button[data-d-component="pressable"]').filter(exposed);
+      const promptNodes = queryAll(root, '[data-d-component="text"]')
+        .filter((node) => !node.closest('[data-d-component="radio"], [data-d-component="pressable"], [data-d-component="checkbox"]')
+          && !node.parentElement?.closest('[data-d-component="text"]')
+          && (node.compareDocumentPosition(container) & Node.DOCUMENT_POSITION_FOLLOWING));
+      const textInput = queryAll(container.parentElement, 'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]), textarea')
+        .find((node) => visible(node) && !node.disabled && !node.readOnly && (node.tagName === 'TEXTAREA' || ['text', 'search', ''].includes(node.type)));
+      const customNode = textInput && nodes.find((node) => node.closest('[data-d-component="radio"], [data-d-component="checkbox"], label')?.contains(textInput));
+      if (customNode) nodes = nodes.filter((node) => node !== customNode);
+      // 单选自定义输入必须有可通过原生事件选择的专属选项，不能用 DOM 改 checked 绕过页面状态。
+      const allowsText = Boolean(textInput && (customNode || nodes.some((node) => node.getAttribute('role') === 'checkbox')));
+      const options = nodes.map((node) => {
+        if (node.getAttribute('data-d-component') === 'pressable') {
+          const texts = queryAll(node, 'p[data-d-component="text"]');
+          return { label: textOf(texts[0]) || textOf(node), description: texts.slice(1).map(textOf).join(' ') };
+        }
+        return { label: textOf(node.closest('label')) || node.getAttribute('aria-label') || node.getAttribute('value') || '', description: '' };
+      });
+      return { nodes, textInput, customNode, question: {
+        question: promptNodes.map(textOf).join('\n'),
+        options,
+        multi_select: nodes.some((node) => node.getAttribute('role') === 'checkbox'),
+        allows_text: allowsText,
+      } };
+    });
+    if (items.some((item) => !item.question.question || item.question.options.length < 2
+      || item.question.options.some((option) => !option.label)
+      || new Set(item.question.options.map((option) => option.label)).size !== item.question.options.length)) return null;
+    const questions = items.map((item) => item.question);
+    // ID 不含选中态。选中不会换题；文本/选项/提交动作发生变化才是下一阶段。
+    const signature = JSON.stringify({ questions, submit: textOf(submit), can_skip: Boolean(skip) });
+    let hash = 2166136261;
+    for (let i = 0; i < signature.length; i += 1) hash = Math.imul(hash ^ signature.charCodeAt(i), 16777619) >>> 0;
+    const id = root.getAttribute('data-dil-message-id') + ':' + hash.toString(16);
+    return { root, items, submit, skip, snapshot: { id, questions, can_skip: Boolean(skip) } };
+  };
+
+  const currentQuestionCard = () => {
+    const assistants = allMatches(SELECTORS.assistantMessage).sort((left, right) => (
+      left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+    ));
+    const last = assistants[assistants.length - 1];
+    if (!last || allMatches(SELECTORS.userMessage).some((user) => last.compareDocumentPosition(user) & Node.DOCUMENT_POSITION_FOLLOWING)) return null;
+    return questionCard(last);
+  };
+  const requireQuestionCard = (id) => {
+    const card = currentQuestionCard();
+    if (!card || card.snapshot.id !== id) throw new Error('web_question_stale:网页上的问题已经变化，未回写旧答案');
+    return card;
+  };
+  const questionOptionChecked = (node) => {
+    const checked = node.getAttribute('aria-checked') || node.getAttribute('aria-pressed') || node.getAttribute('aria-selected');
+    if (checked !== null) return checked === 'true';
+    // 已采集的 DIL 网格只为选中项在 between 行内追加 info 色勾选徽标；普通装饰图标不算。
+    return Boolean(node.querySelector('[data-d-justify="between"] svg[data-d-component="icon"][style*="var(--color-text-info)"]'));
+  };
+  const questionActions = (id, answer) => {
+    const card = requireQuestionCard(id);
+    if (answer.kind === 'skipped') {
+      if (!card.skip) throw new Error('web_question_answer_invalid:当前卡片不支持跳过');
+      return [{ kind: 'skip' }];
+    }
+    if (answer.kind !== 'answered' || answer.answers.length !== card.items.length) throw new Error('web_question_answer_invalid:回答数量不匹配');
+    const actions = [];
+    answer.answers.forEach((selection, itemIndex) => {
+      const item = card.items[itemIndex];
+      const indices = selection.selected;
+      if (item.nodes.some((node) => node.disabled || node.getAttribute('aria-disabled') === 'true')) throw new Error('web_question_target_unavailable:有选项不可用');
+      if (!Array.isArray(indices) || new Set(indices).size !== indices.length
+        || indices.some((index) => !Number.isInteger(index) || index < 0 || index >= item.nodes.length)
+        || (!indices.length && !selection.text)
+        || (!item.question.multi_select && indices.length + (selection.text ? 1 : 0) !== 1)
+        || (selection.text && !item.question.allows_text)) throw new Error('web_question_answer_invalid:回答与页面控件不匹配');
+      item.nodes.forEach((node, index) => {
+        const checked = questionOptionChecked(node);
+        const wanted = indices.includes(index);
+        if (wanted !== checked && (wanted || item.question.multi_select)) actions.push({ kind: 'option', item: itemIndex, index });
+      });
+      if (selection.text && item.customNode && !questionOptionChecked(item.customNode)) actions.push({ kind: 'custom', item: itemIndex });
+      if (selection.text) actions.push({ kind: 'text', item: itemIndex, text: selection.text });
+    });
+    actions.push({ kind: 'submit' });
+    return actions;
+  };
+  const verifyQuestionAnswer = (id, answer) => {
+    const card = requireQuestionCard(id);
+    if (answer.kind === 'skipped') return Boolean(card.skip);
+    return card.items.every((item, itemIndex) => {
+      const selection = answer.answers[itemIndex];
+      const actual = item.nodes.map((node, index) => ({ node, index })).filter(({ node }) =>
+        questionOptionChecked(node)).map(({ index }) => index);
+      return actual.length === selection.selected.length && actual.every((index) => selection.selected.includes(index))
+        && (!selection.text || (item.textInput?.value === selection.text && (!item.customNode || questionOptionChecked(item.customNode))));
+    });
+  };
+  const activateQuestionAction = (id, action) => {
+    const card = requireQuestionCard(id);
+    const node = action.kind === 'submit' ? card.submit : action.kind === 'skip' ? card.skip
+      : action.kind === 'text' ? card.items[action.item]?.textInput : action.kind === 'custom' ? card.items[action.item]?.customNode : card.items[action.item]?.nodes[action.index];
+    if (!node || node.disabled || node.getAttribute('aria-disabled') === 'true') throw new Error('web_question_target_unavailable:页面控件不可用');
+    if (!exposed(node)) throw new Error('web_question_target_unavailable:页面控件已隐藏');
+    if (action.kind === 'text') setFieldValue(node, action.text);
+    else press(node);
+    return true;
+  };
+
   const turnState = () => {
     const blocked = allMatches(SELECTORS.blockPage).some(exposed);
     const conversation = firstVisible(SELECTORS.conversation);
@@ -1022,6 +1213,7 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
           : textWithLineBreaks(lastMessage)
         : null,
       account_hint: accountHint(),
+      question: lastMessageRole === 'assistant' ? questionCard(lastAssistant)?.snapshot || null : null,
     };
   };
 
@@ -1251,6 +1443,13 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     writeText: writeTextWithTemporaryChat,
     observe,
     submit,
+    attachmentState,
+    beginAttachmentUpload,
+    fileInputTarget,
+    questionActions,
+    activateQuestionAction,
+    verifyQuestionAnswer,
+    clearAttachments,
     turnState,
     markdownOf,
     readImage,
@@ -1278,6 +1477,7 @@ export interface WebModelRawTurnState {
   last_message_role: "user" | "assistant" | null;
   last_message_text: string | null;
   account_hint: string | null;
+  question?: BrowserWebQuestion | null;
 }
 
 /**
@@ -1299,6 +1499,7 @@ export interface WebModelTurnState {
   thinkingText: string;
   lastMessageRole: "user" | "assistant" | null;
   lastMessageText: string | null;
+  question: BrowserWebQuestion | null;
 }
 
 /** 纯函数归一化：只吃页面原始快照，不碰 DOM。 */
@@ -1324,6 +1525,7 @@ export function normalizeWebModelTurnState(
     thinkingText: snapshot.thinking_text,
     lastMessageRole: snapshot.last_message_role,
     lastMessageText: snapshot.last_message_text,
+    question: snapshot.question ?? null,
   };
 }
 

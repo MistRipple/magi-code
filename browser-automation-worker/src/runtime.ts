@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { basename, isAbsolute } from "node:path";
 import type {
   BrowserCommandOutcome,
   BrowserActionTarget,
   BrowserCommandResult,
   BrowserHostCommand,
+  BrowserWebQuestionAnswer,
+  BrowserWebQuestion,
   BrowserSnapshot,
   BrowserSnapshotTarget,
   BrowserSurfaceBinding,
@@ -62,6 +64,9 @@ interface NativeDialogOpenedResult {
 }
 
 const DIALOG_WAIT_TIMEOUT_MS = 2_000;
+/** 图片附加到 GPT Web 输入框并上传完成的上限。 */
+const WEB_ATTACH_TIMEOUT_MS = 60_000;
+const sleep = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 interface HeapSnapshotData {
   meta: Record<string, unknown>;
@@ -500,6 +505,26 @@ export class BrowserAutomationRuntime {
         }
         return { result: { type: "json", payload: { value: submitted } } };
       }
+      case "web_attach_files": {
+        await this.ensureWebModelAdapter(binding);
+        const paths = command.payload.file_paths;
+        const authorizedPaths = await this.validateUploadPaths(paths);
+        const attached = await this.attachWebModelFiles(binding, authorizedPaths);
+        return { result: { type: "json", payload: { value: attached } } };
+      }
+      case "web_clear_attachments": {
+        await this.ensureWebModelAdapter(binding);
+        const cleared = await this.evaluate<{ remaining: number }>(
+          binding,
+          "globalThis.__magiWebModel.clearAttachments()",
+        );
+        return { result: { type: "json", payload: { value: cleared } } };
+      }
+      case "web_answer_question": {
+        await this.ensureWebModelAdapter(binding);
+        await this.answerWebQuestion(binding, command.payload.question_id, command.payload.answer);
+        return { result: { type: "json", payload: { value: { answered: true } } } };
+      }
       case "web_turn_state": {
         await this.ensureWebModelAdapter(binding);
         const raw = await this.evaluate<WebModelRawTurnState>(
@@ -527,6 +552,7 @@ export class BrowserAutomationRuntime {
                 assistant_message_count: state.assistantMessageCount,
                 assistant_text: state.assistantText,
                 thinking_text: state.thinkingText,
+                question: state.question,
                 last_message_role: state.lastMessageRole,
                 last_message_text: state.lastMessageText,
               },
@@ -1472,6 +1498,82 @@ export class BrowserAutomationRuntime {
     });
   }
 
+  private async answerWebQuestion(
+    binding: BrowserSurfaceBinding,
+    questionId: string,
+    answer: BrowserWebQuestionAnswer,
+  ): Promise<void> {
+    // 一次校验整组回答，任何越界/不支持的输入都必须在首次点击之前拒绝。
+    const actions = await this.evaluate<Array<{ kind: string; item?: number; index?: number; text?: string }>>(
+      binding, `globalThis.__magiWebModel.questionActions(${JSON.stringify(questionId)}, ${JSON.stringify(answer)})`,
+    );
+    for (const action of actions) {
+      if (action.kind === "submit") {
+        const confirmed = await this.evaluate<boolean>(binding,
+          `globalThis.__magiWebModel.verifyQuestionAnswer(${JSON.stringify(questionId)}, ${JSON.stringify(answer)})`);
+        if (!confirmed) throw protocolFailure("web_question_answer_unconfirmed", "页面没有确认选项或输入，未提交", true);
+      }
+      try {
+        const activated = await this.evaluate<boolean>(binding,
+          `globalThis.__magiWebModel.activateQuestionAction(${JSON.stringify(questionId)}, ${JSON.stringify(action)})`);
+        if (activated !== true) throw protocolFailure("web_question_answer_unconfirmed", "页面操作未确认", true);
+      } catch (cause) { throw sideEffectFailure(cause); }
+      await sleep(100);
+    }
+    // 站点激活后回读结果；相同卡片还留在页面时 client 等它换阶段，不再次回写。
+  }
+
+  /**
+   * 把文件附加到 GPT Web 输入框：经文件输入设置文件，再等「附件数增加 N 且没有上传中标志」。
+   * 超时或找不到文件输入时撤掉本次已附加的文件再报错，保证失败不留下半截附件。
+   */
+  private async attachWebModelFiles(
+    binding: BrowserSurfaceBinding,
+    paths: string[],
+  ): Promise<{ attached: number; total: number }> {
+    const before = await this.evaluate<{ count: number; uploading: boolean }>(
+      binding,
+      "globalThis.__magiWebModel.attachmentState()",
+    );
+    if (before.count !== 0) throw protocolFailure("web_attach_draft_conflict", "网页已有未发送附件，未覆盖用户草稿");
+    const selector = await this.evaluate<string | null>(binding, "globalThis.__magiWebModel.fileInputTarget()");
+    if (!selector) {
+      throw protocolFailure("web_attach_input_missing", "ChatGPT 页面里找不到接收图片的文件输入");
+    }
+    const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: -1, pierce: true });
+    const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
+    if (!node.nodeId) {
+      throw protocolFailure("web_attach_input_missing", "接收图片的文件输入已不在页面中");
+    }
+    await this.evaluate(binding, `globalThis.__magiWebModel.beginAttachmentUpload(${JSON.stringify(paths.map((path) => basename(path)))})`);
+    // 设置文件一旦开始就可能留下附件；后续任何异常均进入清理路径。
+    try {
+      await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: paths });
+      const expected = paths.length;
+      const deadline = Date.now() + WEB_ATTACH_TIMEOUT_MS;
+      let state = before;
+      while (Date.now() < deadline) {
+        await sleep(250);
+        state = await this.evaluate<{ count: number; uploading: boolean }>(
+          binding,
+          "globalThis.__magiWebModel.attachmentState()",
+        );
+        if (state.count >= expected && !state.uploading) {
+          return { attached: paths.length, total: state.count };
+        }
+      }
+      throw protocolFailure(
+        "web_attach_timeout",
+        `图片未能在 ${WEB_ATTACH_TIMEOUT_MS / 1000} 秒内上传完成（已识别 ${state.count}/${expected}）`,
+      );
+    } catch (cause) {
+      // 当前命令取消后 CDP 会拒绝继续执行。仍须标记可能已附图，daemon 用新命令清理。
+      const cleared = await this.evaluate<{ remaining: number }>(binding, "globalThis.__magiWebModel.clearAttachments()").catch(() => null);
+      if (!cleared || cleared.remaining !== 0) throw sideEffectFailure(cause);
+      throw cause;
+    }
+  }
+
   private async uploadFile(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const snapshot = snapshotTarget(args);
     const target = await this.target(binding, snapshot);
@@ -2365,6 +2467,16 @@ function isWebSubmitResult(value: unknown): value is {
     && (value.reason === null || typeof value.reason === "string");
 }
 
+function isWebQuestion(value: unknown): value is BrowserWebQuestion {
+  return isRecord(value) && typeof value.id === "string" && value.id.length > 0
+    && typeof value.can_skip === "boolean" && Array.isArray(value.questions) && value.questions.length > 0
+    && value.questions.every((item) => isRecord(item) && typeof item.question === "string" && item.question.length > 0
+      && typeof item.multi_select === "boolean" && typeof item.allows_text === "boolean"
+      && Array.isArray(item.options) && item.options.length >= 2
+      && item.options.every((option) => isRecord(option) && typeof option.label === "string"
+        && option.label.length > 0 && typeof option.description === "string"));
+}
+
 function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
   return isRecord(value)
     && typeof value.origin === "string"
@@ -2385,7 +2497,8 @@ function isRawWebModelTurnState(value: unknown): value is WebModelRawTurnState {
       || value.last_message_role === "user"
       || value.last_message_role === "assistant")
     && (value.last_message_text === null || typeof value.last_message_text === "string")
-    && (value.account_hint === null || typeof value.account_hint === "string");
+    && (value.account_hint === null || typeof value.account_hint === "string")
+    && (value.question === undefined || value.question === null || isWebQuestion(value.question));
 }
 
 function protocolFailure(code: string, message: string, sideEffectStarted = false): Error {

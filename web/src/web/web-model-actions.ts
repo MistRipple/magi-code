@@ -84,6 +84,7 @@ export function webModelFailureAction(code: string): WebModelFailureAction | nul
   switch (code.trim()) {
     case 'web_send_rejected':
     case 'web_write_not_confirmed':
+    case 'web_attach_failed':
     case 'web_turn_timeout':
       return { kind: 'retry', labelKey: 'webModel.action.retry' };
     case 'web_session_busy':

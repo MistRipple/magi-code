@@ -60,6 +60,9 @@
 
 <style>
   .markdown-content {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     color: var(--foreground);
   }
 
@@ -106,6 +109,9 @@
   .markdown-content :global(pre) {
     margin: var(--spacing-sm) 0;
     padding: var(--spacing-md);
+    box-sizing: border-box;
+    max-width: 100%;
+    overflow-wrap: normal;
     overflow-x: auto;
   }
 
@@ -115,6 +121,9 @@
   }
 
   .markdown-content :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
     width: 100%;
     border-collapse: collapse;
     margin: var(--spacing-sm) 0;
@@ -178,6 +187,12 @@
     background: var(--code-bg, rgba(0,0,0,0.2));
     padding: 1px 4px;
     border-radius: var(--radius-sm, 3px);
+  }
+
+  .markdown-content :global(.katex-display) {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
   .markdown-content :global(img) {

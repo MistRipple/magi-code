@@ -114,6 +114,7 @@ pub struct TurnState {
     pub assistant_message_count: u64,
     pub assistant_text: String,
     pub thinking_text: String,
+    pub question: Option<crate::WebQuestion>,
     pub last_message_role: Option<String>,
     pub last_message_text: Option<String>,
 }
@@ -137,6 +138,29 @@ pub trait WebModelPageDriver: Send + Sync {
                 "页面驱动未提供读取图片的能力",
             ))
         })
+    }
+
+    /// 把本轮用户消息里的图片附加到输入框，并等待上传完成。
+    ///
+    /// 失败必须保证没有留下半截附件（实现方先撤销再报错）。默认实现表示驱动不具备该能力。
+    fn attach_images<'a>(
+        &'a self,
+        page_id: &'a str,
+        images: &'a [magi_bridge_client::llm_types::ImageSource],
+    ) -> DriverFuture<'a, ()> {
+        let _ = (page_id, images);
+        Box::pin(async {
+            Err(WebModelError::new(
+                WebModelErrorCode::WebAttachFailed,
+                "页面驱动未提供附加图片的能力",
+            ))
+        })
+    }
+
+    /// 撤销 Magi 上传且尚未发送的附件；存在未授权接管的网页草稿时应拒绝。
+    fn clear_attachments<'a>(&'a self, page_id: &'a str) -> DriverFuture<'a, ()> {
+        let _ = page_id;
+        Box::pin(async { Ok(()) })
     }
 
     /// 重新加载唯一 WebView 当前所在的页面（页面卡住 / 加载失败时的手动刷新）。
@@ -189,6 +213,20 @@ pub trait WebModelPageDriver: Send + Sync {
 
     /// 只能把本轮 prompt 原样写入 composer；不支持追加、历史回放或分片。
     fn write_text<'a>(&'a self, page_id: &'a str, text: &'a str) -> DriverFuture<'a, WriteOutcome>;
+
+    fn answer_question<'a>(
+        &'a self,
+        _page_id: &'a str,
+        _question_id: &'a str,
+        _answer: &'a crate::WebQuestionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(async {
+            Err(WebModelError::new(
+                WebModelErrorCode::WebSelectorsDrift,
+                "页面驱动未提供选择卡片回写能力",
+            ))
+        })
+    }
 
     fn submit<'a>(&'a self, page_id: &'a str) -> DriverFuture<'a, SubmitOutcome>;
 

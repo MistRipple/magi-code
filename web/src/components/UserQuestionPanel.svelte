@@ -112,7 +112,7 @@
       if (number <= active.options.length) {
         event.preventDefault();
         pickOption(active.options[number - 1].label);
-      } else if (number === active.options.length + 1) {
+      } else if (number === active.options.length + 1 && active.allowOther !== false) {
         event.preventDefault();
         pickOther();
       }
@@ -189,6 +189,7 @@
       </button>
     {/each}
 
+    {#if active.allowOther !== false}
     <div class="uq-option uq-other" class:checked={draft.otherActive}>
       <button
         type="button"
@@ -216,6 +217,7 @@
         />
       {/if}
     </div>
+    {/if}
   </div>
 
   {#if errorMessage}
@@ -225,9 +227,11 @@
   <footer class="uq-foot">
     <span class="uq-keyhint dock-meta">{i18n.t('userQuestion.keyHint')}</span>
     <span class="uq-spacer"></span>
+    {#if pending.canSkip !== false}
     <button type="button" class="uq-button dock-btn" disabled={submitting} onclick={() => void skip()}>
       {i18n.t('userQuestion.skip')}
     </button>
+    {/if}
     {#if !isLast}
       <button
         type="button"
@@ -256,6 +260,8 @@
     z-index: 1;
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    max-width: 100%;
     /* 窗口较矮、又有其他面板叠在上面时，不能把消息区挤没：限高并在卡片内部滚动。 */
     max-height: min(46vh, 420px);
     overflow-y: auto;
@@ -290,16 +296,20 @@
     font-size: var(--text-xs);
     font-weight: 600;
     line-height: 1.5;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 
   .uq-steps {
     display: inline-flex;
+    flex-wrap: wrap;
+    max-width: 100%;
     gap: 2px;
     padding: 2px;
     border-radius: 999px;
     background: color-mix(in srgb, var(--foreground) 6%, transparent);
     min-width: 0;
-    overflow-x: auto;
   }
 
   .uq-step {
@@ -313,7 +323,10 @@
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: 1.5;
-    white-space: nowrap;
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
     cursor: pointer;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
@@ -346,11 +359,15 @@
 
   .uq-ask {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     align-items: baseline;
     gap: var(--space-2);
   }
 
   .uq-question {
+    min-width: 0;
+    max-width: 100%;
     margin: 0;
     color: var(--foreground);
     font-size: var(--text-sm);
@@ -376,8 +393,9 @@
   }
 
   .uq-option {
+    box-sizing: border-box;
+    min-width: 0;
     display: flex;
-    align-items: flex-start;
     align-items: center;
     gap: var(--space-2);
     width: 100%;
@@ -470,6 +488,8 @@
   }
 
   .uq-label {
+    min-width: 0;
+    max-width: 100%;
     font-size: var(--text-sm);
     line-height: 1.5;
     overflow-wrap: anywhere;
@@ -480,6 +500,8 @@
   }
 
   .uq-desc {
+    min-width: 0;
+    max-width: 100%;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: 1.5;
@@ -501,6 +523,9 @@
   }
 
   .uq-other-input {
+    box-sizing: border-box;
+    min-width: 0;
+    max-width: 100%;
     align-self: flex-end;
     width: calc(100% - 14px - var(--space-2));
     padding: var(--space-1) 0;
@@ -518,12 +543,15 @@
   }
 
   .uq-error {
+    overflow-wrap: anywhere;
     color: var(--error);
     font-size: var(--text-xs);
   }
 
   .uq-foot {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     align-items: center;
     gap: var(--space-2);
   }

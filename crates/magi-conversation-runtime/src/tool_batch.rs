@@ -2670,11 +2670,12 @@ fn await_user_question_answer(
     let request = crate::PendingUserQuestion {
         question_id: question_id.clone(),
         session_id: session_id.clone(),
-        task_id: task.task_id.clone(),
+        task_id: Some(task.task_id.clone()),
         turn_id: turn_id.clone(),
         tool_call_id: tool_call.id.clone(),
         questions: questions.clone(),
         requested_at: UtcMillis::now(),
+        can_skip: true,
     };
     let waiter = registry.request(request.clone());
 

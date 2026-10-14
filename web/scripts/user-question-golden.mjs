@@ -73,5 +73,13 @@ await withGoldenViteServer(async (server) => {
   const visibility = await server.ssrLoadModule('/src/shared/tool-visibility.ts');
   assert.equal(visibility.isRuntimeInternalTool('ask_user_question'), false, '提问必须出现在对话流里');
 
+  const panel = await readFile(new URL('../src/components/UserQuestionPanel.svelte', import.meta.url), 'utf8');
+  assert.match(panel, /\.uq-steps\s*\{[^}]*flex-wrap: wrap/s, '问题步骤需换行而不是制造横向滚动');
+  assert.match(panel, /\.uq-label\s*\{[^}]*max-width: 100%;[^}]*overflow-wrap: anywhere/s, '长选项需在面板内断行');
+  assert.match(panel, /\.uq-foot\s*\{[^}]*flex-wrap: wrap/s, '窄面板下操作栏允许换行');
+  const markdown = await readFile(new URL('../src/components/MarkdownContent.svelte', import.meta.url), 'utf8');
+  assert.match(markdown, /\.markdown-content\s*\{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere/s);
+  assert.match(markdown, /:global\(table\)\s*\{[^}]*max-width: 100%;[^}]*overflow-x: auto/s, '宽表格只在自身横向滚动');
+
   console.log('user question golden passed');
 });

@@ -180,6 +180,81 @@ test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结
   assert.equal(observed.nodes[0]?.found, false);
 });
 
+test("附件：按真实页面结构挑选多选图片输入、数出附件并识别上传中", () => {
+  type FakeNode = Record<string, unknown>;
+  const visibleNode = (attributes: Record<string, string>, extra: FakeNode = {}): FakeNode => ({
+    hidden: false,
+    getAttribute: (name: string) => attributes[name] ?? null,
+    hasAttribute: (name: string) => name in attributes,
+    getBoundingClientRect: () => ({ width: 20, height: 20 }),
+    ...extra,
+  });
+  const fileInput = (id: string, attributes: Record<string, string>, multiple: boolean): FakeNode => {
+    const marks = new Map<string, string>();
+    return visibleNode(attributes, {
+      id,
+      type: "file",
+      disabled: false,
+      multiple,
+      setAttribute: (name: string, value: string) => marks.set(name, value),
+      removeAttribute: (name: string) => marks.delete(name),
+      marks,
+    });
+  };
+  // 真实页面的四个输入：拍照（单选 capture）、照片或视频、仅照片、任意文件。
+  const camera = fileInput("camera", { accept: "image/*", capture: "environment" }, false);
+  const photosVideos = fileInput("photos-videos", { accept: "image/*,video/*" }, true);
+  const photos = fileInput("photos", { accept: "image/*" }, true);
+  const anyFile = fileInput("any", {}, true);
+  let removeButtons: FakeNode[] = [];
+  let chips: FakeNode[] = [];
+  let progress: FakeNode[] = [];
+  const document = {
+    documentElement: { getAttribute: () => null },
+    contains: () => true,
+    querySelector: () => null,
+    querySelectorAll: (selector: string) => {
+      if (selector === "input[type='file']") return [camera, photosVideos, photos, anyFile];
+      if (selector === "[data-composer-attachments] button[aria-label]") return removeButtons;
+      if (selector === "[data-composer-attachments] [role='button'].composer-attachment-surface") return chips;
+      if (selector === "[data-composer-attachments] [role='progressbar']") return progress;
+      return [];
+    },
+    getElementById: () => null,
+  };
+  const context: Record<string, unknown> = {
+    document,
+    setTimeout: (callback: () => void) => setTimeout(callback, 0),
+    clearTimeout,
+    location: { origin: "https://chatgpt.com", pathname: "/", search: "" },
+    getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    globalThis: undefined,
+  };
+  context.globalThis = context;
+  runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
+  const adapter = context.__magiWebModel as {
+    attachmentState: () => { count: number; uploading: boolean };
+    fileInputTarget: () => string | null;
+  };
+
+  assert.deepEqual(JSON.parse(JSON.stringify(adapter.attachmentState())), { count: 0, uploading: false });
+  const selector = adapter.fileInputTarget();
+  assert.equal(selector, "input[data-magi-upload-target='1']");
+  // 选中的是「只收图片」的多选输入，不是拍照，也不是任意文件。
+  assert.equal((photos.marks as Map<string, string>).get("data-magi-upload-target"), "1");
+  assert.equal((photosVideos.marks as Map<string, string>).size, 0);
+  assert.equal((camera.marks as Map<string, string>).size, 0);
+  assert.equal((anyFile.marks as Map<string, string>).size, 0);
+
+  // 上传中：每个附件一个移除按钮（文案随界面语言变，不能按文案数），缩略图上有圆形进度。
+  removeButtons = [visibleNode({ "aria-label": "Remove a.png" }), visibleNode({ "aria-label": "移除 b.png" })];
+  chips = [visibleNode({}), visibleNode({})];
+  progress = [visibleNode({ role: "progressbar" })];
+  assert.deepEqual(JSON.parse(JSON.stringify(adapter.attachmentState())), { count: 2, uploading: true });
+  progress = [];
+  assert.deepEqual(JSON.parse(JSON.stringify(adapter.attachmentState())), { count: 2, uploading: false });
+});
+
 test("账号等级只读资料行里文本恰好等于套餐名的叶子节点，忽略用户名和折叠栏的骨架入口", async () => {
   const leaf = (text: string) => ({ childElementCount: 0, textContent: text });
   // 折叠侧栏里的资料入口只有头像骨架；带用户名的那一行才有等级。用户名里带 free 字样不能被当成等级。

@@ -17,6 +17,9 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "scroll":
     case "web_write_text":
     case "web_submit":
+    case "web_attach_files":
+    case "web_clear_attachments":
+    case "web_answer_question":
     case "web_cancel_generation":
     case "web_configure_connector":
       return true;

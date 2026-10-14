@@ -115,7 +115,7 @@ pub struct ToolApprovalRegistry {
     state: Arc<Mutex<ToolApprovalState>>,
 }
 
-pub(crate) fn session_turn_is_active(
+pub fn session_turn_is_active(
     session_store: &SessionStore,
     session_id: &SessionId,
     turn_id: &str,

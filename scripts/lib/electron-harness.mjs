@@ -44,6 +44,7 @@ export async function connectTarget(cdpPort, matches, label, errors = []) {
   if (!target?.webSocketDebuggerUrl) throw new Error(`未找到 ${label}`);
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   const pending = new Map();
+  const listeners = new Map();
   let nextId = 1;
   socket.on("message", (raw) => {
     const message = JSON.parse(raw.toString());
@@ -51,6 +52,9 @@ export async function connectTarget(cdpPort, matches, label, errors = []) {
       errors.push(message.params.exceptionDetails?.exception?.description || message.params.exceptionDetails?.text || "exception");
     } else if (message.method === "Runtime.consoleAPICalled" && message.params.type === "error") {
       errors.push(message.params.args.map((arg) => arg.value ?? arg.description ?? "").join(" "));
+    }
+    if (message.method) {
+      for (const listener of listeners.get(message.method) ?? []) listener(message.params);
     }
     const entry = pending.get(message.id);
     if (!entry) return;
@@ -74,7 +78,13 @@ export async function connectTarget(cdpPort, matches, label, errors = []) {
     }
     return result?.result?.value;
   };
-  return { call, evaluate, close: () => socket.close() };
+  const on = (method, listener) => {
+    const handlers = listeners.get(method) ?? new Set();
+    handlers.add(listener);
+    listeners.set(method, handlers);
+    return () => handlers.delete(listener);
+  };
+  return { call, evaluate, on, close: () => socket.close() };
 }
 
 export function connectAppPage(cdpPort, daemonPort, errors) {
@@ -100,9 +110,9 @@ export function pageTools(page) {
 }
 
 /** 启动打包应用；返回进程、日志缓冲和关闭函数。 */
-export function launchApp({ executable, cwd, cdpPort, env, disableGpu = true }) {
+export function launchApp({ executable, cwd, cdpPort, env, disableGpu = true, inspectPort = null }) {
   const log = [];
-  const child = spawn(executable, [`--remote-debugging-port=${cdpPort}`, ...(disableGpu ? ["--disable-gpu"] : [])], {
+  const child = spawn(executable, [`--remote-debugging-port=${cdpPort}`, ...(inspectPort ? [`--inspect=127.0.0.1:${inspectPort}`] : []), ...(disableGpu ? ["--disable-gpu"] : [])], {
     cwd,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],

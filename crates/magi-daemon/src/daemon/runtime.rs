@@ -1966,6 +1966,7 @@ impl DaemonRuntime {
                 Arc::clone(&browser_dependencies.host_client),
                 Arc::clone(&browser_dependencies.authority),
                 self.plugins.manager(),
+                self.state_root.join("web-uploads"),
             ) {
                 Ok(factory) => {
                     state.web_model.set_bindings(Arc::clone(factory.bindings()));
@@ -1976,7 +1977,8 @@ impl DaemonRuntime {
                     Some(Arc::new(
                         factory
                             .with_saved_sink(state.web_saved_sink())
-                            .with_image_sink(state.web_image_sink()),
+                            .with_image_sink(state.web_image_sink())
+                            .with_question_sink(state.web_question_sink()),
                     ))
                 }
                 Err(error) => {

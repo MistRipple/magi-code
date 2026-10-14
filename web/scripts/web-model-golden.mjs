@@ -16,6 +16,7 @@ await withGoldenViteServer(async (server) => {
     web_desktop_unavailable: 'openSettings',
     web_send_rejected: 'retry',
     web_write_not_confirmed: 'retry',
+    web_attach_failed: 'retry',
     web_turn_timeout: 'retry',
     web_quota_exhausted: 'switchModel',
     web_tunnel_unavailable: 'openTunnelSettings',

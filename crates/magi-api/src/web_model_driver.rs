@@ -1,8 +1,10 @@
 //! GPT Web 的宿主驱动与单槽位 client 工厂。
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use magi_bridge_client::llm_types::ImageSource;
 use magi_browser_authority::{
     BrowserAuthority, BrowserHostClient, BrowserHostClientError, BrowserHostCommand,
     BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
@@ -35,16 +37,22 @@ const CONNECTOR_PAGE_DELAY: Duration = Duration::from_millis(700);
 pub struct HostWebModelPageDriver {
     host_client: Arc<RwLock<Option<BrowserHostClient>>>,
     authority: Arc<Mutex<BrowserAuthority>>,
+    /// 本轮图片落盘的暂存目录：页面文件输入只认磁盘路径，图片在 Magi 里只有 base64。
+    upload_dir: PathBuf,
 }
 
 impl HostWebModelPageDriver {
     pub fn new(
         host_client: Arc<RwLock<Option<BrowserHostClient>>>,
         authority: Arc<Mutex<BrowserAuthority>>,
+        upload_dir: PathBuf,
     ) -> Self {
+        // 进程崩溃可能留下上次未清理的暂存图片；目录只服务当前进程，启动时清空。
+        sweep_upload_dir(&upload_dir);
         Self {
             host_client,
             authority,
+            upload_dir,
         }
     }
 
@@ -706,6 +714,101 @@ impl WebModelPageDriver for HostWebModelPageDriver {
         })
     }
 
+    fn attach_images<'a>(
+        &'a self,
+        _page_id: &'a str,
+        images: &'a [ImageSource],
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            let tab_id = self.home_tab()?;
+            let staged = StagedUploads::stage(&self.upload_dir, images)?;
+            // 暂存文件在命令返回（成败皆然）后立即删除：页面已把内容读入上传请求。
+            let reply = self
+                .client()?
+                .request(BrowserHostCommand::WebAttachFiles {
+                    tab_id,
+                    file_paths: staged.paths(),
+                })
+                .await;
+            let error = match reply {
+                Ok(reply) => match reply.response.outcome {
+                    BrowserHostCommandOutcome::Succeeded(result) => {
+                        if let BrowserHostCommandResult::Json { value } = *result
+                            && value.get("attached").and_then(serde_json::Value::as_u64)
+                                == Some(images.len() as u64)
+                        {
+                            return Ok(());
+                        }
+                        WebModelError::new(WebModelErrorCode::WebAttachFailed, "附图结果未确认")
+                    }
+                    // Worker 明确失败前已完成回滚，或根本没设置文件。
+                    BrowserHostCommandOutcome::Failed(error) => {
+                        return Err(WebModelError::new(
+                            WebModelErrorCode::WebAttachFailed,
+                            error.message,
+                        ));
+                    }
+                    BrowserHostCommandOutcome::Indeterminate(error) => {
+                        WebModelError::new(WebModelErrorCode::WebAttachFailed, error.message)
+                    }
+                    BrowserHostCommandOutcome::Cancelled => WebModelError::cancelled(),
+                },
+                Err(error) => host_error(error),
+            };
+            // 当前 Worker 请求已取消，必须用新请求清理。页面适配器只允许撤销 Magi 自己的附件。
+            if let Err(cleanup) = self.clear_attachments(_page_id).await {
+                return Err(WebModelError::new(
+                    WebModelErrorCode::WebSelectorsDrift,
+                    format!(
+                        "图片上传结果未确认且撤销失败：{}；{}",
+                        error.message, cleanup.message
+                    ),
+                ));
+            }
+            Err(error)
+        })
+    }
+
+    fn clear_attachments<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            let value = self
+                .json_command(
+                    BrowserHostCommand::WebClearAttachments {
+                        tab_id: self.home_tab()?,
+                    },
+                    WebModelErrorCode::WebAttachFailed,
+                )
+                .await?;
+            if value.get("remaining").and_then(serde_json::Value::as_u64) != Some(0) {
+                return Err(WebModelError::new(
+                    WebModelErrorCode::WebAttachFailed,
+                    "网页附件清理未确认，未继续提交",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn answer_question<'a>(
+        &'a self,
+        _page_id: &'a str,
+        question_id: &'a str,
+        answer: &'a magi_web_model::WebQuestionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            self.json_command(
+                BrowserHostCommand::WebAnswerQuestion {
+                    tab_id: self.home_tab()?,
+                    question_id: question_id.to_string(),
+                    answer: answer.clone(),
+                },
+                WebModelErrorCode::WebSelectorsDrift,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
     fn submit<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, SubmitOutcome> {
         Box::pin(async move {
             let reply = self
@@ -1151,6 +1254,7 @@ pub struct WebModelHostFactory {
     plugin_manager: Arc<std::sync::Mutex<magi_plugin_system::PluginManager>>,
     saved_sink: Option<Arc<dyn magi_web_model::SavedConversationSink>>,
     image_sink: Option<Arc<dyn magi_web_model::WebImageSink>>,
+    question_sink: Option<Arc<dyn magi_web_model::WebQuestionSink>>,
 }
 
 impl WebModelHostFactory {
@@ -1158,14 +1262,20 @@ impl WebModelHostFactory {
         host_client: Arc<RwLock<Option<BrowserHostClient>>>,
         authority: Arc<Mutex<BrowserAuthority>>,
         plugin_manager: Arc<std::sync::Mutex<magi_plugin_system::PluginManager>>,
+        upload_dir: PathBuf,
     ) -> Result<Self, String> {
         Ok(Self {
-            driver: Arc::new(HostWebModelPageDriver::new(host_client, authority)),
+            driver: Arc::new(HostWebModelPageDriver::new(
+                host_client,
+                authority,
+                upload_dir,
+            )),
             slots: new_web_slot_table(),
             runtime: Arc::new(WebModelRuntimeRegistry::new()),
             plugin_manager,
             saved_sink: None,
             image_sink: None,
+            question_sink: None,
         })
     }
     /// 已保存对话进度的唯一写入方（daemon 装配）。
@@ -1176,6 +1286,10 @@ impl WebModelHostFactory {
     /// 回复里的图片落地（保存到会话所属项目）。
     pub fn with_image_sink(mut self, sink: Arc<dyn magi_web_model::WebImageSink>) -> Self {
         self.image_sink = Some(sink);
+        self
+    }
+    pub fn with_question_sink(mut self, sink: Arc<dyn magi_web_model::WebQuestionSink>) -> Self {
+        self.question_sink = Some(sink);
         self
     }
     pub fn slots(&self) -> &Arc<WebSlotTable> {
@@ -1262,6 +1376,10 @@ impl WebModelHostFactory {
             Some(sink) => client.with_image_sink(Arc::clone(sink)),
             None => client,
         };
+        let client = match &self.question_sink {
+            Some(sink) => client.with_question_sink(Arc::clone(sink)),
+            None => client,
+        };
         Ok(Arc::new(client))
     }
 }
@@ -1276,6 +1394,105 @@ impl magi_plugin_system::SessionEngineFactory for WebModelHostFactory {
         spec: magi_plugin_system::SessionEngineInvocationSpec,
     ) -> Result<Arc<dyn magi_bridge_client::ModelBridgeClient>, String> {
         self.build_web_model_client(spec)
+    }
+}
+
+static UPLOAD_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 一次发送的暂存图片文件；drop 时无条件删除。
+struct StagedUploads {
+    paths: Vec<PathBuf>,
+}
+
+impl StagedUploads {
+    fn stage(dir: &Path, images: &[ImageSource]) -> Result<Self, WebModelError> {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let attach_failed =
+            |message: String| WebModelError::new(WebModelErrorCode::WebAttachFailed, message);
+        std::fs::create_dir_all(dir)
+            .map_err(|error| attach_failed(format!("无法创建图片暂存目录：{error}")))?;
+        let mut staged = Self { paths: Vec::new() };
+        for (index, image) in images.iter().enumerate() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image.data.trim())
+                .map_err(|_| attach_failed(format!("第 {} 张图片不是有效的 base64", index + 1)))?;
+            let digest = hex_prefix(&sha2::Sha256::digest(&bytes));
+            // 文件名带进程内唯一序号：并发发送同一张图时互不覆盖，也互不误删。
+            let sequence = UPLOAD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = dir.join(format!(
+                "{digest}-{sequence}.{}",
+                image_extension(&image.media_type)
+            ));
+            write_private_file(&path, &bytes)
+                .map_err(|error| attach_failed(format!("无法写入图片暂存文件：{error}")))?;
+            staged.paths.push(path);
+        }
+        Ok(staged)
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+impl Drop for StagedUploads {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn hex_prefix(digest: &[u8]) -> String {
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn image_extension(media_type: &str) -> &'static str {
+    match media_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "img",
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn sweep_upload_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -1344,6 +1561,14 @@ fn state_from_json(value: &serde_json::Value) -> Result<TurnState, WebModelError
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        question: value
+            .get("question")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| invalid(&format!("网页问题结构无效：{error}")))
+            })
+            .transpose()?,
         last_message_role: value
             .get("last_message_role")
             .and_then(serde_json::Value::as_str)
@@ -1357,7 +1582,56 @@ fn state_from_json(value: &serde_json::Value) -> Result<TurnState, WebModelError
 
 #[cfg(test)]
 mod tests {
-    use super::is_surface_handoff;
+    use super::{StagedUploads, is_surface_handoff, sweep_upload_dir};
+    use magi_bridge_client::llm_types::ImageSource;
+    use magi_web_model::WebModelErrorCode;
+
+    fn png(data: &str) -> ImageSource {
+        ImageSource {
+            kind: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn staged_uploads_are_private_files_removed_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = StagedUploads::stage(dir.path(), &[png("AQID"), png("AQID")]).expect("stage");
+        let paths = staged.paths();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1], "同一张图连发两次也不能共用文件");
+        for path in &paths {
+            assert_eq!(std::fs::read(path).expect("staged file"), vec![1, 2, 3]);
+            assert!(path.ends_with(".png"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path).expect("meta").permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
+        drop(staged);
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
+
+    #[test]
+    fn invalid_base64_fails_as_attach_failure_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = StagedUploads::stage(dir.path(), &[png("AQID"), png("not base64 !!")])
+            .err()
+            .expect("must fail");
+        assert_eq!(error.code, WebModelErrorCode::WebAttachFailed);
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
+
+    #[test]
+    fn startup_sweep_removes_leftovers_from_a_crashed_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("leftover.png"), b"x").expect("write");
+        sweep_upload_dir(dir.path());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
 
     #[test]
     fn only_surface_handoff_errors_count_as_a_possibly_submitted_message() {

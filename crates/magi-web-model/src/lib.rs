@@ -11,6 +11,7 @@ mod driver;
 mod errors;
 mod factory;
 mod images;
+mod questions;
 mod runtime;
 mod site;
 pub mod tunnel;
@@ -32,6 +33,10 @@ pub use errors::{EngineState, WebModelError, WebModelErrorCode};
 pub use factory::new_web_slot_table;
 pub use images::{
     PageImageRef, WebImage, WebImageSink, page_image_refs, rewrite_page_images, strip_page_images,
+};
+pub use questions::{
+    WebQuestion, WebQuestionAnswer, WebQuestionItem, WebQuestionOption, WebQuestionSelection,
+    WebQuestionSink,
 };
 pub use runtime::{WebModelRuntimeEntry, WebModelRuntimeRegistry};
 pub use site::{

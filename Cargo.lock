@@ -1931,6 +1931,7 @@ name = "magi-web-model"
 version = "3.0.55"
 dependencies = [
  "magi-bridge-client",
+ "magi-browser-authority",
  "magi-process",
  "serde",
  "serde_json",

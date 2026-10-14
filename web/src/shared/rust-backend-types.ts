@@ -272,17 +272,20 @@ export interface UserQuestionDto {
   question: string;
   header: string;
   multiSelect: boolean;
+  /** 页面卡片只展示它实际支持的输入；模型提问默认允许。 */
+  allowOther?: boolean;
   options: Array<{ label: string; description?: string }>;
 }
 
 export interface PendingUserQuestionDto {
   questionId: string;
   sessionId: string;
-  taskId: string;
+  taskId: string | null;
   turnId: string;
   toolCallId: string;
   questions: UserQuestionDto[];
   requestedAt: number;
+  canSkip?: boolean;
 }
 
 export interface UserQuestionAnswerDto {

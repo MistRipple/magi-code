@@ -175,13 +175,22 @@ interface WebScriptResponses {
   savedMessages?: Record<string, unknown>;
   connectorStatus?: Record<string, unknown>;
   configureConnector?: Record<string, unknown>;
+  /** 每次 attachmentState() 依次返回；用完后重复最后一项。 */
+  attachmentStates?: Array<{ count: number; uploading: boolean }>;
+  fileInputTarget?: string | null;
+  questionStale?: boolean;
+  questionConfirmed?: boolean;
+  attachmentReadFails?: boolean;
 }
 
 function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
   let adapterInstalled = false;
   let observeCalls = 0;
+  let attachmentReads = 0;
   return new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+    if (method === "DOM.querySelector") return { nodeId: 7 };
     if (method === "Page.createIsolatedWorld") {
       adapterInstalled = false;
       return { executionContextId: 1 };
@@ -236,6 +245,29 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
     }
     if (expression.includes("globalThis.__magiWebModel.configureConnector(")) {
       return { result: { value: responses.configureConnector ?? null } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.questionActions(")) {
+      if (responses.questionStale) return { exceptionDetails: { text: "web_question_stale:changed" } };
+      return { result: { value: [{ kind: "option", item: 0, index: 0 }, { kind: "submit" }] } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.activateQuestionAction(")) return { result: { value: true } };
+    if (expression.includes("globalThis.__magiWebModel.verifyQuestionAnswer(")) return { result: { value: responses.questionConfirmed !== false } };
+    if (expression.includes("globalThis.__magiBrowserAutomation.preparePointer(")) return { result: { value: { x: 50, y: 50, bounds: { x: 40, y: 40, width: 20, height: 20 }, name: "option", role: "radio" } } };
+    if (expression.includes("globalThis.__magiBrowserAutomation.verifyPointer(")) return { result: { value: true } };
+    if (expression.includes("globalThis.__magiBrowserAutomation.finishPointer(")) return { result: { value: { observed: true } } };
+    if (expression.includes("globalThis.__magiWebModel.beginAttachmentUpload(")) return { result: { value: true } };
+    if (expression.includes("globalThis.__magiWebModel.attachmentState()")) {
+      if (responses.attachmentReadFails && attachmentReads > 0) return { exceptionDetails: { text: "web_attach_read_failed:fixture" } };
+      const states = responses.attachmentStates ?? [{ count: 0, uploading: false }];
+      const state = states[Math.min(attachmentReads, states.length - 1)];
+      attachmentReads += 1;
+      return { result: { value: state } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.fileInputTarget()")) {
+      return { result: { value: responses.fileInputTarget === undefined ? "input[type=file]" : responses.fileInputTarget } };
+    }
+    if (expression.includes("globalThis.__magiWebModel.clearAttachments()")) {
+      return { result: { value: { remaining: 0 } } };
     }
     return { result: { value: null } };
   });
@@ -2385,6 +2417,77 @@ test("web_write_text 使用 snake_case payload、遵守 timeout_ms，并返回�
   assert.doesNotMatch(expression ?? "", /timeoutMs/iu);
 });
 
+test("web_attach_files 把图片交给页面文件输入，等附件数增加且上传结束才成功", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "magi-attach-"));
+  try {
+    const first = join(dir, "a.png");
+    const second = join(dir, "b.png");
+    await writeFile(first, PNG_BYTES);
+    await writeFile(second, PNG_BYTES);
+    // 提交前先读到 0 个附件；第一次轮询仍在上传，第二次才完成（2 个，上传结束）。
+    const port = webScriptedPort({
+      attachmentStates: [
+        { count: 0, uploading: false },
+        { count: 2, uploading: true },
+        { count: 2, uploading: false },
+      ],
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute("web-attach", binding, webCommand("web_attach_files", {
+      tab_id: binding.tab_id,
+      file_paths: [first, second],
+    }));
+    assert.equal(result.outcome.status, "succeeded");
+    const value = result.outcome.status === "succeeded" && result.outcome.payload.type === "json"
+      ? result.outcome.payload.payload.value as Record<string, any>
+      : null;
+    assert.deepEqual(value, { attached: 2, total: 2 });
+    const set = port.requests.find((request) => request.method === "DOM.setFileInputFiles");
+    assert.equal(set?.params.nodeId, 7);
+    assert.equal((set?.params.files as string[]).length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("web_attach_files 在页面里找不到文件输入、或路径不是真实文件时显式失败且不设置文件", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "magi-attach-"));
+  try {
+    const file = join(dir, "a.png");
+    await writeFile(file, PNG_BYTES);
+    const missingInput = webScriptedPort({ fileInputTarget: null });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(missingInput), "worker-test");
+    const noInput = await runtime.execute("web-attach-1", binding, webCommand("web_attach_files", {
+      tab_id: binding.tab_id,
+      file_paths: [file],
+    }));
+    assert.equal(noInput.outcome.status, "failed");
+    if (noInput.outcome.status === "failed") assert.equal(noInput.outcome.payload.code, "web_attach_input_missing");
+    const badPath = await runtime.execute("web-attach-2", binding, webCommand("web_attach_files", {
+      tab_id: binding.tab_id,
+      file_paths: [join(dir, "missing.png")],
+    }));
+    assert.equal(badPath.outcome.status, "failed");
+    if (badPath.outcome.status === "failed") assert.equal(badPath.outcome.payload.code, "browser_upload_file_invalid");
+    assert.equal(missingInput.requests.some((request) => request.method === "DOM.setFileInputFiles"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("web_clear_attachments 返回页面剩余附件数", async () => {
+  const port = webScriptedPort({});
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("web-clear", binding, webCommand("web_clear_attachments", { tab_id: binding.tab_id }));
+  assert.equal(result.outcome.status, "succeeded");
+});
+
 test("web_observe 对不可达 selector 返回 found:false 且 revision 每次递增", async () => {
   const port = webScriptedPort({ observe: { nodes: [{ found: false }] } });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -2479,4 +2582,50 @@ test("同一临时对话多轮复用页面适配器，导航代次变化后重�
     && String(request.params.expression).includes("globalThis.__magiWebModel ="),
   ).length;
   assert.equal(installCount, 2);
+});
+
+
+test("web_answer_question 经站点激活入口选择与提交，并先回读选择", async () => {
+  const port = webScriptedPort({});
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("answer-card", binding, webCommand("web_answer_question", {
+    tab_id: binding.tab_id, question_id: "card:one", answer: { kind: "answered", answers: [{ selected: [0], text: null }] },
+  }));
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(port.requests.filter((r) => String(r.params.expression).includes("activateQuestionAction(")).length, 2);
+  assert.ok(port.requests.some((r) => String(r.params.expression).includes("verifyQuestionAnswer")));
+});
+
+test("web_answer_question 拒绝旧卡片且不点击；选中回读未确认时不提交", async () => {
+  for (const [responses, expectedClicks] of [[{ questionStale: true }, 0], [{ questionConfirmed: false }, 1]] as const) {
+    const port = webScriptedPort(responses);
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute("bad-answer", binding, webCommand("web_answer_question", {
+      tab_id: binding.tab_id, question_id: "card:old", answer: { kind: "answered", answers: [{ selected: [0], text: null }] },
+    }));
+    assert.equal(result.outcome.status, expectedClicks === 0 ? "failed" : "indeterminate");
+    assert.equal(port.requests.filter((r) => String(r.params.expression).includes("activateQuestionAction(")).length, expectedClicks);
+  }
+});
+
+
+test("web_attach_files 拒绝已有网页草稿；附图后读状态失败会撤销附件", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "magi-attach-review-"));
+  try {
+    const file = join(dir, "a.png"); await writeFile(file, PNG_BYTES);
+    for (const [responses, expectClear] of [
+      [{ attachmentStates: [{ count: 1, uploading: false }] }, false],
+      [{ attachmentReadFails: true }, true],
+    ] as Array<[WebScriptResponses, boolean]>) {
+      const port = webScriptedPort(responses);
+      const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+      const result = await runtime.execute("attach-review", binding, webCommand("web_attach_files", { tab_id: binding.tab_id, file_paths: [file] }));
+      assert.equal(result.outcome.status, "failed");
+      assert.equal(port.requests.some((r) => String(r.params.expression).includes("clearAttachments()")), expectClear);
+      assert.equal(port.requests.some((r) => r.method === "DOM.setFileInputFiles"), expectClear);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

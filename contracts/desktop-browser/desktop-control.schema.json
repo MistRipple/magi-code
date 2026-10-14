@@ -492,6 +492,58 @@
       "required": ["tab_id"],
       "properties": { "tab_id": { "$ref": "#/$defs/id" } }
     },
+    "webAttachFilesPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "file_paths"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "file_paths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      }
+    },
+    "webClearAttachmentsPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id"],
+      "properties": { "tab_id": { "$ref": "#/$defs/id" } }
+    },
+    "webAnswerQuestionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "question_id", "answer"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "question_id": { "type": "string", "minLength": 1 },
+        "answer": {
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind", "answers"],
+              "properties": {
+                "kind": { "const": "answered" },
+                "answers": { "type": "array", "minItems": 1, "items": {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["selected", "text"],
+                  "properties": {
+                    "selected": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                    "text": { "type": ["string", "null"] }
+                  }
+                } }
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["kind"], "properties": { "kind": { "const": "skipped" } }
+            }
+          ]
+        }
+      }
+    },
     "webTurnStatePayload": {
       "type": "object",
       "additionalProperties": false,
@@ -1459,6 +1511,33 @@
           "properties": {
             "type": { "const": "web_submit" },
             "payload": { "$ref": "#/$defs/webSubmitPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_attach_files" },
+            "payload": { "$ref": "#/$defs/webAttachFilesPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_clear_attachments" },
+            "payload": { "$ref": "#/$defs/webClearAttachmentsPayload" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_answer_question" },
+            "payload": { "$ref": "#/$defs/webAnswerQuestionPayload" }
           }
         },
         {

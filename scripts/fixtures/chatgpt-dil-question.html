@@ -1,0 +1,67 @@
+<!doctype html>
+<!-- 受控验收夹具：控件属性取自 2026-10-13 Edge 上的 ChatGPT DIL 卡片；不连接远端模型。 -->
+<html data-magi-account-plan="plus"><meta charset="utf-8"><title>DIL question fixture</title>
+<style>
+body { font: 18px sans-serif; margin: 32px; } main { max-width: 600px; min-height: 32px; } label { display: flex; gap: 12px; padding: 12px; }
+button { min-width: 28px; min-height: 28px; } button[aria-checked="true"] { background: #4466ff; }
+[data-d-component="button"] { width: 100%; margin: 20px 0; padding: 16px; }
+#prompt-textarea { min-height: 48px; border: 1px solid #999; padding: 12px; }
+</style>
+<main></main>
+<form data-chatgpt-composer><div id="prompt-textarea" class="ProseMirror" contenteditable="true" role="textbox"></div><button data-testid="send-button" type="submit">Send</button></form>
+<script>
+window.__fixtureEvents = [];
+for (const type of ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'submit']) document.addEventListener(type, event => { window.__fixtureEvents.push({type, trusted: event.isTrusted, tag:event.target.tagName, id:event.target.id}); }, true);
+window.addEventListener('error', event => window.__fixtureEvents.push({error:event.message}));
+// 保持夹具离线：页面适配器只读登录探测获得明确的测试身份。
+window.fetch = async () => ({ ok: true, json: async () => ({ user: { name: 'fixture' } }) });
+let stage = 0;
+let choice = null;
+let food = null;
+let style = null;
+let custom = null;
+const messages = document.querySelector('main');
+const composer = document.querySelector('#prompt-textarea');
+function card() {
+  choice = null;
+  const question = stage === 1 ? '晚上想吃什么？先选主食' : '面条想选哪种吃法？';
+  const options = stage === 1 ? ['米饭', '面条', '米粉', '饺子', '炸物', '其他'] : ['汤面', '拌面', '炒面'];
+  const longDescription = stage === 1 ? 'https://example.invalid/' + 'very-long-unbroken-option-description-'.repeat(10) : '';
+  const assistant = messages.querySelector('[data-message-author-role="assistant"]');
+  if (stage >= 3) {
+    assistant.innerHTML = `<div data-markdown-text-style="assistant-message"><div data-dil-message-id="fixture-assistant"><p data-d-component="text">${stage === 3 ? '自定义口味？' : '是否还需要配菜？'}</p><div data-d-component="box"><div role="radiogroup" data-d-component="radio-group"><div data-d-component="radio"><label><button type="button" role="radio" aria-checked="true" value="默认"></button>默认</label></div><div data-d-component="radio"><label><button type="button" role="radio" aria-checked="false" value="清淡"></button>清淡</label></div>${stage === 3 ? '<div data-d-component="radio"><label><button type="button" role="radio" aria-checked="false" value="custom"></button>自定义<input type="text" placeholder="输入口味"></label></div>' : ''}</div>${stage === 4 ? '<button type="button" data-d-component="button">跳过</button>' : ''}<button type="button" data-d-component="button">确认选择</button></div></div></div>`;
+    choice = '默认';
+    assistant.querySelectorAll('[role="radio"]').forEach((button) => button.addEventListener('click', (event) => {
+      choice = button.value;
+      assistant.querySelectorAll('[role="radio"]').forEach((node) => node.setAttribute('aria-checked', String(node === button)));
+    }));
+    assistant.querySelectorAll('[data-d-component="button"]').forEach((button) => button.addEventListener('click', (event) => {
+      if (stage === 3) {
+        if (choice !== 'custom') throw new Error('必须撤销默认单选');
+        custom = assistant.querySelector('input').value; stage = 4; card();
+      } else if (button.textContent === '跳过') {
+        stage = 5; assistant.innerHTML = `<div data-markdown-text-style="assistant-message">MAGI_QUESTION_E2E_OK:${food}:${style}:${custom}:skipped<p>https://example.invalid/${'long-unbroken-url-part'.repeat(40)}</p><p><code>${'long_identifier_'.repeat(40)}</code></p><pre><code class="language-javascript">${'const long_source_line = '.repeat(40)}</code></pre><table><thead><tr>${Array.from({length:14}, (_, index) => '<th>列' + index + '</th>').join('')}</tr></thead><tbody><tr>${Array.from({length:14}, (_, index) => '<td>数据内容' + index + '</td>').join('')}</tr></tbody></table></div>`;
+      }
+    }));
+    return;
+  }
+  assistant.innerHTML = `<div data-markdown-text-style="assistant-message"><div data-dil-message-id="fixture-assistant"><p data-d-component="text">${question}</p><div data-d-component="box"><div role="radiogroup" aria-label="Options" data-d-component="radio-group">${options.map((option, index) => `<div data-d-component="radio"><label><button type="button" role="radio" aria-checked="false" data-state="unchecked" value="${option}" id="choice-${index}"></button>${option}<span>${longDescription}</span></label></div>`).join('')}</div><button type="button" data-d-component="button">${stage === 1 ? '下一步：选择吃法' : '确认选择'}</button></div></div></div>`;
+  assistant.querySelectorAll('[role="radio"]').forEach((button) => button.addEventListener('click', (event) => {
+    choice = button.value;
+    assistant.querySelectorAll('[role="radio"]').forEach((node) => node.setAttribute('aria-checked', String(node === button)));
+  }));
+  assistant.querySelector('[data-d-component="button"]').addEventListener('click', (event) => {
+    if (!choice) throw new Error('选择未确认');
+    if (stage === 1) { food = choice; stage = 2; card(); }
+    else { style = choice; stage = 3; card(); }
+  });
+}
+document.querySelector('form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const text = composer.innerText.trim();
+  if (!text) return;
+  const user = document.createElement('div'); user.setAttribute('data-message-author-role', 'user'); user.textContent = text; messages.append(user);
+  const assistant = document.createElement('div'); assistant.setAttribute('data-message-author-role', 'assistant'); messages.append(assistant);
+  composer.innerHTML = '<p><br></p>'; stage = 1; card();
+});
+</script></html>

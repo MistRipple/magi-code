@@ -354,11 +354,26 @@ export type BrowserHostCommand =
       payload: { tab_id: BrowserTabId };
     }
   /**
-   * 回合语义状态。
+   * 把图片附加到 GPT Web 输入框。
    *
-   * 站点适配层给出原始语义信号（生成中标志、助手文本、消息计数、隐藏推理）；
-   * 「文本稳定且无生成标志」的完成谓词由推理通道跨两个读取周期叠加判定。
+   * 文件由 daemon 落在 Magi 私有目录后只传绝对路径（图片字节不过控制通道）；Worker 通过文件输入
+   * 附加并等待上传完成。附加失败时 Worker 会撤掉本次已附加的文件，调用方据此判定未提交。
    */
+  | {
+      type: "web_attach_files";
+      payload: { tab_id: BrowserTabId; file_paths: string[] };
+    }
+  /** 只撤销 Magi 上传且尚未发送的附件，不接管用户的网页草稿。 */
+  | {
+      type: "web_clear_attachments";
+      payload: { tab_id: BrowserTabId };
+    }
+  /** 校验卡片身份后回写用户回答；副作用不得自动重放。 */
+  | {
+      type: "web_answer_question";
+      payload: { tab_id: BrowserTabId; question_id: string; answer: BrowserWebQuestionAnswer };
+    }
+  /** 页面原始回合快照；完成谓词与原生问题等待由推理通道负责。 */
   | {
       type: "web_turn_state";
       payload: { tab_id: BrowserTabId };
@@ -496,6 +511,27 @@ export interface BrowserWebSubmitResult {
   reason: "composer_missing" | "composer_empty" | null;
 }
 
+/** 一道网页问题的用户回答：选项索引或自定义文字。 */
+export interface BrowserWebQuestionSelection {
+  selected: number[];
+  text: string | null;
+}
+
+export type BrowserWebQuestionAnswer =
+  | { kind: "answered"; answers: BrowserWebQuestionSelection[] }
+  | { kind: "skipped" };
+
+export interface BrowserWebQuestion {
+  id: string;
+  questions: Array<{
+    question: string;
+    options: Array<{ label: string; description: string }>;
+    multi_select: boolean;
+    allows_text: boolean;
+  }>;
+  can_skip: boolean;
+}
+
 /** `web_turn_state` 的回合语义状态。 */
 export interface BrowserWebTurnStateResult {
   site_revision: string;
@@ -515,6 +551,7 @@ export interface BrowserWebTurnStateResult {
   /** 页面当前最后一条可见消息，用于临时 Web 对话存活判定。 */
   last_message_role: "user" | "assistant" | null;
   last_message_text: string | null;
+  question: BrowserWebQuestion | null;
 }
 
 export type BrowserCommandResult =

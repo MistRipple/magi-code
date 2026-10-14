@@ -1,8 +1,7 @@
 //! GPT Web 的最小桥接 client。
 //!
-//! ChatGPT Web 自己拥有上下文。本模块只把本轮 `prompt` 写进唯一页面的
-//! composer，再把同一页产生的回复读回 Magi；绝不把 `messages`、工具清单或
-//! 压缩结果拼进网页消息。
+//! ChatGPT Web 自己拥有上下文。本模块只发送本轮原文与图片到唯一页面，
+//! 再把回复和原生选择卡片映射回 Magi；不重放历史、工具清单或压缩结果。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +100,7 @@ pub struct BrowserWebModelBridgeClient {
     page_id: String,
     saved_sink: Option<Arc<dyn SavedConversationSink>>,
     image_sink: Option<Arc<dyn crate::images::WebImageSink>>,
+    question_sink: Option<Arc<dyn crate::WebQuestionSink>>,
 }
 
 impl BrowserWebModelBridgeClient {
@@ -121,6 +121,7 @@ impl BrowserWebModelBridgeClient {
             page_id: "browser-tab-web-model-home".to_string(),
             saved_sink: None,
             image_sink: None,
+            question_sink: None,
         }
     }
 
@@ -132,6 +133,11 @@ impl BrowserWebModelBridgeClient {
     /// 回复里的图片落地：不配置时，回复里的页面图片引用会被去掉（页面地址在 Magi 里不可用）。
     pub fn with_image_sink(mut self, sink: Arc<dyn crate::images::WebImageSink>) -> Self {
         self.image_sink = Some(sink);
+        self
+    }
+
+    pub fn with_question_sink(mut self, sink: Arc<dyn crate::WebQuestionSink>) -> Self {
+        self.question_sink = Some(sink);
         self
     }
 
@@ -345,7 +351,15 @@ impl BrowserWebModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, WebModelError> {
-        if request.prompt.is_empty() {
+        // 本轮用户消息携带的图片：GPT Web 请求只带本轮，所以取最后一条 user 消息的图片。
+        let images: Vec<magi_bridge_client::llm_types::ImageSource> = request
+            .messages
+            .as_deref()
+            .and_then(|messages| messages.iter().rev().find(|message| message.role == "user"))
+            .map(|message| message.images.clone())
+            .unwrap_or_default();
+        // 纯图片消息没有文字，ChatGPT 本身允许；文字和图片都没有才是空消息。
+        if request.prompt.is_empty() && images.is_empty() {
             return Err(WebModelError::new(
                 WebModelErrorCode::WebSendRejected,
                 "GPT Web 本轮消息不能为空",
@@ -427,24 +441,46 @@ impl BrowserWebModelBridgeClient {
                     ));
                 }
             }
-            let write = self
-                .driver
-                .write_text(&self.page_id, &request.prompt)
-                .await?;
-            if !write.confirmed || write.became_attachment {
-                return Err(WebModelError::new(
-                    WebModelErrorCode::WebWriteNotConfirmed,
-                    "网页输入框回读未确认，本次消息未提交",
-                ));
+            // 只撤销此前 Magi 上传的未发送附件；用户网页草稿没有授权接管，直接拒绝。
+            self.driver.clear_attachments(&self.page_id).await?;
+            if is_cancelled() { return Err(WebModelError::cancelled()); }
+            // 图片先于文字附加：写入阶段「文字被转成附件」的判定是写入前后对比，已有的图片
+            // 附件不会被误判。附图失败由驱动先撤销再报错；附图成功之后到提交之前的任何失败
+            // 都要撤掉输入框里的附件，保证「被接受前失败 = 无副作用」。
+            if !images.is_empty() {
+                self.driver.attach_images(&self.page_id, &images).await?;
             }
-            let submitted = self.driver.submit(&self.page_id).await?;
-            if !submitted.submitted || !submitted.composer_empty {
-                return Err(WebModelError::new(
-                    WebModelErrorCode::WebSendRejected,
-                    submitted
-                        .reason
-                        .unwrap_or_else(|| "ChatGPT Web 未接受本次消息".to_string()),
-                ));
+            let composed: Result<(), WebModelError> = async {
+                if is_cancelled() { return Err(WebModelError::cancelled()); }
+                // 纯图片也要替换为空文本，不能把网页里上次失败的草稿一起发出。
+                let write = self
+                    .driver
+                    .write_text(&self.page_id, &request.prompt)
+                    .await?;
+                if !write.confirmed || write.became_attachment {
+                    return Err(WebModelError::new(
+                        WebModelErrorCode::WebWriteNotConfirmed,
+                        "网页输入框回读未确认，本次消息未提交",
+                    ));
+                }
+                if is_cancelled() { return Err(WebModelError::cancelled()); }
+                let submitted = self.driver.submit(&self.page_id).await?;
+                if !submitted.submitted || !submitted.composer_empty {
+                    return Err(WebModelError::new(
+                        WebModelErrorCode::WebSendRejected,
+                        submitted
+                            .reason
+                            .unwrap_or_else(|| "ChatGPT Web 未接受本次消息".to_string()),
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = composed {
+                if !images.is_empty() {
+                    let _ = self.driver.clear_attachments(&self.page_id).await;
+                }
+                return Err(error);
             }
             message_accepted = true;
             if let Some(sink) = &self.saved_sink {
@@ -467,7 +503,8 @@ impl BrowserWebModelBridgeClient {
             // 本轮是否观察到过「正在生成」：重置基线后，回复恰好和上一条相同时靠它收口。
             let mut saw_generating = false;
             let mut accepted = false;
-            let completion_deadline = tokio::time::Instant::now() + self.config.completion_timeout;
+            let mut answered_questions = std::collections::HashSet::new();
+            let mut completion_deadline = tokio::time::Instant::now() + self.config.completion_timeout;
             loop {
                 if is_cancelled() {
                     let _ = self.driver.cancel_generation(&self.page_id).await;
@@ -555,6 +592,46 @@ impl BrowserWebModelBridgeClient {
                     stable_reads = stable_reads.saturating_add(1);
                 } else {
                     stable_reads = 0;
+                }
+                if accepted && reply_started && !state.generating
+                    && let Some(question) = state.question.as_ref()
+                {
+                    stable_reads = 0;
+                    if !answered_questions.contains(&question.id) {
+                        let sink = self.question_sink.as_ref().ok_or_else(|| WebModelError::new(
+                            WebModelErrorCode::WebSelectorsDrift, "网页有选择卡片，但 Magi 问题面板未装配"))?;
+                        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        // 包括 future 被上层丢弃的取消路径，不能留下 spawn_blocking 等待线程。
+                        struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                        impl Drop for CancelOnDrop {
+                            fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+                        }
+                        let _guard = CancelOnDrop(cancelled.clone());
+                        let answer = sink.ask(&self.identity, question, cancelled.clone());
+                        tokio::pin!(answer);
+                        let response = loop {
+                            tokio::select! {
+                                result = &mut answer => break result?,
+                                _ = tokio::time::sleep(self.config.poll_interval) => {
+                                    if is_cancelled() {
+                                        cancelled.store(true, std::sync::atomic::Ordering::Release);
+                                        let _ = self.driver.cancel_generation(&self.page_id).await;
+                                        return Err(WebModelError::cancelled());
+                                    }
+                                }
+                            }
+                        };
+                        if is_cancelled() { return Err(WebModelError::cancelled()); }
+                        self.driver.answer_question(&self.page_id, &question.id, &response).await?;
+                        answered_questions.insert(question.id.clone());
+                        // 用户思考时间不计入网页生成超时；作答后继续同一回合轮询。
+                        completion_deadline = tokio::time::Instant::now() + self.config.completion_timeout;
+                    }
+                    if tokio::time::Instant::now() >= completion_deadline {
+                        return Err(WebModelError::new(WebModelErrorCode::WebTurnTimeout, "网页没有确认选择卡片进入下一阶段"));
+                    }
+                    tokio::time::sleep(self.config.poll_interval).await;
+                    continue;
                 }
                 if accepted && reply_started && !state.generating && stable_reads >= 2 {
                     break;
@@ -669,6 +746,125 @@ impl ModelBridgeClient for BrowserWebModelBridgeClient {
 mod tests {
     use super::*;
 
+    fn card(id: &str) -> crate::WebQuestion {
+        crate::WebQuestion {
+            id: id.into(),
+            can_skip: false,
+            questions: vec![crate::WebQuestionItem {
+                question: id.into(),
+                multi_select: false,
+                allows_text: false,
+                options: vec![
+                    crate::WebQuestionOption {
+                        label: "A".into(),
+                        description: String::new(),
+                    },
+                    crate::WebQuestionOption {
+                        label: "B".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingQuestionSink(Mutex<Vec<String>>);
+    impl crate::WebQuestionSink for RecordingQuestionSink {
+        fn ask<'a>(
+            &'a self,
+            _identity: &'a WebModelIdentity,
+            question: &'a crate::WebQuestion,
+            _cancelled: Arc<std::sync::atomic::AtomicBool>,
+        ) -> DriverFuture<'a, crate::WebQuestionAnswer> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(question.id.clone());
+                // 比网页完成窗口更久；用户思考不能算网页超时。
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(crate::WebQuestionAnswer::Answered {
+                    answers: vec![crate::WebQuestionSelection {
+                        selected: vec![0],
+                        text: None,
+                    }],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_cards_do_not_finish_early_and_each_stage_is_answered_once() {
+        let driver = FakeDriver::new("等待选择后完成");
+        driver
+            .questions
+            .lock()
+            .unwrap()
+            .extend([card("主食"), card("吃法")]);
+        let sink = Arc::new(RecordingQuestionSink::default());
+        let client = client_with(
+            driver.clone(),
+            crate::new_web_slot_table(),
+            "question-test",
+            WebModelClientConfig {
+                completion_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .with_question_sink(sink.clone());
+        let result = client
+            .execute(request("晚餐", vec![]), &|_| {}, &|| false)
+            .await
+            .unwrap();
+        assert_eq!(result.content.as_deref(), Some("等待选择后完成"));
+        assert_eq!(*sink.0.lock().unwrap(), vec!["主食", "吃法"]);
+        assert_eq!(
+            driver
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("answer:"))
+                .count(),
+            2
+        );
+    }
+
+    struct WaitingQuestionSink(Arc<std::sync::atomic::AtomicBool>);
+    impl crate::WebQuestionSink for WaitingQuestionSink {
+        fn ask<'a>(
+            &'a self,
+            _identity: &'a WebModelIdentity,
+            _question: &'a crate::WebQuestion,
+            cancelled: Arc<std::sync::atomic::AtomicBool>,
+        ) -> DriverFuture<'a, crate::WebQuestionAnswer> {
+            Box::pin(async move {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(WebModelError::cancelled())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_answering_never_writes_back_to_the_page() {
+        let driver = FakeDriver::new("请选择");
+        driver.questions.lock().unwrap().push_back(card("主食"));
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = client_with(
+            driver.clone(),
+            crate::new_web_slot_table(),
+            "question-test",
+            WebModelClientConfig::default(),
+        )
+        .with_question_sink(Arc::new(WaitingQuestionSink(waiting.clone())));
+        let result = client
+            .execute(request("晚餐", vec![]), &|_| {}, &|| {
+                waiting.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!driver.calls().iter().any(|c| c.starts_with("answer:")));
+    }
+
     // ── 假页面驱动：脚本化一个 ChatGPT 页面 ───────────────────────────────
 
     use std::sync::Mutex;
@@ -702,6 +898,11 @@ mod tests {
         image: Mutex<Option<Vec<u8>>>,
         /// 回复生成期间页面上显示的推理文字；空表示没有推理区块。
         thinking: Mutex<String>,
+        /// 模拟图片附加失败（上传超时 / 找不到文件输入）。
+        attach_fails: std::sync::atomic::AtomicBool,
+        /// 模拟输入框回读未确认。
+        write_unconfirmed: std::sync::atomic::AtomicBool,
+        questions: Mutex<std::collections::VecDeque<crate::WebQuestion>>,
     }
 
     impl FakeDriver {
@@ -714,6 +915,9 @@ mod tests {
                 rewrite_midstream: std::sync::atomic::AtomicBool::new(false),
                 image: Mutex::new(None),
                 thinking: Mutex::new(String::new()),
+                attach_fails: std::sync::atomic::AtomicBool::new(false),
+                write_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                questions: Mutex::new(std::collections::VecDeque::new()),
             })
         }
         fn with_thinking(&self, text: &str) {
@@ -775,6 +979,16 @@ mod tests {
         ) -> DriverFuture<'a, WriteOutcome> {
             Box::pin(async move {
                 self.push_call(&format!("write:{text}"));
+                if self
+                    .write_unconfirmed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(WriteOutcome {
+                        confirmed: false,
+                        char_count: 0,
+                        became_attachment: false,
+                    });
+                }
                 self.page.lock().unwrap().composer = text.to_string();
                 Ok(WriteOutcome {
                     confirmed: true,
@@ -783,6 +997,48 @@ mod tests {
                 })
             })
         }
+        fn attach_images<'a>(
+            &'a self,
+            _page_id: &'a str,
+            images: &'a [magi_bridge_client::llm_types::ImageSource],
+        ) -> DriverFuture<'a, ()> {
+            Box::pin(async move {
+                self.push_call(&format!("attach:{}", images.len()));
+                if self.attach_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(WebModelError::new(
+                        WebModelErrorCode::WebAttachFailed,
+                        "图片未能上传完成",
+                    ));
+                }
+                Ok(())
+            })
+        }
+        fn clear_attachments<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, ()> {
+            Box::pin(async move {
+                self.push_call("clear_attachments");
+                Ok(())
+            })
+        }
+        fn answer_question<'a>(
+            &'a self,
+            _page_id: &'a str,
+            id: &'a str,
+            _answer: &'a crate::WebQuestionAnswer,
+        ) -> DriverFuture<'a, ()> {
+            Box::pin(async move {
+                let mut questions = self.questions.lock().unwrap();
+                if questions.front().map(|q| q.id.as_str()) != Some(id) {
+                    return Err(WebModelError::new(
+                        WebModelErrorCode::WebSelectorsDrift,
+                        "stale",
+                    ));
+                }
+                self.push_call(&format!("answer:{id}"));
+                questions.pop_front();
+                Ok(())
+            })
+        }
+
         fn submit<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, SubmitOutcome> {
             Box::pin(async move {
                 self.push_call("submit");
@@ -903,6 +1159,11 @@ mod tests {
                     } else {
                         LoginState::SignedIn
                     },
+                    question: if !generating && assistants > 0 {
+                        self.questions.lock().unwrap().front().cloned()
+                    } else {
+                        None
+                    },
                     blocked: false,
                     generating,
                     composer_found: true,
@@ -997,6 +1258,176 @@ mod tests {
             tools: Some(Vec::new()),
             tool_choice: None,
         }
+    }
+
+    fn request_with_images(prompt: &str, image_count: usize) -> ModelInvocationRequest {
+        let mut request = request(prompt, vec![]);
+        if let Some(message) = request
+            .messages
+            .as_mut()
+            .and_then(|messages| messages.last_mut())
+        {
+            message.images = (0..image_count)
+                .map(|index| magi_bridge_client::llm_types::ImageSource {
+                    kind: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: format!("aW1hZ2Ut{index}"),
+                })
+                .collect();
+        }
+        request
+    }
+
+    fn position(calls: &[String], name: &str) -> usize {
+        calls
+            .iter()
+            .position(|call| call == name || call.starts_with(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("缺少调用 {name}: {calls:?}"))
+    }
+
+    #[tokio::test]
+    async fn images_are_attached_before_the_text_and_the_turn_completes() {
+        let driver = FakeDriver::new("看到了两张图");
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots, "s1", WebModelClientConfig::default());
+        let response = client
+            .execute(request_with_images("这两张图是什么", 2), &|_| {}, &|| false)
+            .await
+            .expect("turn completes");
+        assert_eq!(response.content.as_deref(), Some("看到了两张图"));
+        let calls = driver.calls();
+        assert!(
+            calls.contains(&"attach:2".to_string()),
+            "多图一次附加: {calls:?}"
+        );
+        assert!(
+            position(&calls, "attach") < position(&calls, "write"),
+            "先附图后写字: {calls:?}"
+        );
+        assert!(position(&calls, "write") < position(&calls, "submit"));
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "clear_attachments")
+                .count()
+                == 1,
+            "成功只做提交前的旧附件清理: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_only_message_clears_the_old_draft_and_submits() {
+        let driver = FakeDriver::new("收到图片");
+        driver.page.lock().unwrap().composer = "上次失败的文字".to_string();
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots, "s1", WebModelClientConfig::default());
+        client
+            .execute(request_with_images("", 1), &|_| {}, &|| false)
+            .await
+            .expect("image-only turn completes");
+        let calls = driver.calls();
+        assert!(calls.contains(&"attach:1".to_string()), "{calls:?}");
+        assert!(
+            calls.iter().any(|call| call == "write:"),
+            "纯图片清空旧草稿: {calls:?}"
+        );
+        assert!(calls.contains(&"submit".to_string()), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn a_message_with_neither_text_nor_images_is_still_rejected() {
+        let driver = FakeDriver::new("x");
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots, "s1", WebModelClientConfig::default());
+        let error = client
+            .execute(request_with_images("", 0), &|_| {}, &|| false)
+            .await
+            .expect_err("empty message");
+        assert_eq!(error.code, WebModelErrorCode::WebSendRejected);
+        assert!(
+            driver.calls().is_empty(),
+            "空消息不碰页面: {:?}",
+            driver.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attach_never_writes_or_submits() {
+        let driver = FakeDriver::new("x");
+        driver
+            .attach_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots, "s1", WebModelClientConfig::default());
+        let error = client
+            .execute(request_with_images("带图", 1), &|_| {}, &|| false)
+            .await
+            .expect_err("attach fails");
+        assert_eq!(error.code, WebModelErrorCode::WebAttachFailed);
+        let calls = driver.calls();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("write:")),
+            "{calls:?}"
+        );
+        assert!(!calls.contains(&"submit".to_string()), "{calls:?}");
+        assert!(
+            client
+                .runtime()
+                .snapshot(None)
+                .iter()
+                .all(|entry| entry.sent_messages == 0),
+            "未提交不计发送"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_attach_or_write_never_submits() {
+        for cancelled_at in ["attach:1", "write:带图"] {
+            let driver = FakeDriver::new("不应发送");
+            let client = client_with(
+                driver.clone(),
+                crate::new_web_slot_table(),
+                "s1",
+                Default::default(),
+            );
+            let error = client
+                .execute(request_with_images("带图", 1), &|_| {}, &|| {
+                    driver.calls().contains(&cancelled_at.to_string())
+                })
+                .await
+                .expect_err("cancelled");
+            assert!(error.is_cancelled());
+            assert!(!driver.calls().contains(&"submit".to_string()));
+            assert_eq!(
+                driver
+                    .calls()
+                    .iter()
+                    .filter(|call| call.as_str() == "clear_attachments")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_failure_after_attach_clears_the_attachments() {
+        let driver = FakeDriver::new("x");
+        driver
+            .write_unconfirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let slots = Arc::new(WebSlotTable::new());
+        let client = client_with(driver.clone(), slots, "s1", WebModelClientConfig::default());
+        let error = client
+            .execute(request_with_images("带图", 2), &|_| {}, &|| false)
+            .await
+            .expect_err("write unconfirmed");
+        assert_eq!(error.code, WebModelErrorCode::WebWriteNotConfirmed);
+        let calls = driver.calls();
+        assert!(
+            calls.contains(&"clear_attachments".to_string()),
+            "回读失败要撤掉附件: {calls:?}"
+        );
+        assert!(!calls.contains(&"submit".to_string()), "{calls:?}");
     }
 
     #[tokio::test]
@@ -1208,7 +1639,8 @@ mod tests {
         let polls = std::sync::atomic::AtomicU32::new(0);
         let error = client
             .execute(request("问", vec![]), &|_| {}, &|| {
-                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3
+                driver.calls().contains(&"submit".to_string())
+                    && polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
             })
             .await
             .expect_err("cancelled");

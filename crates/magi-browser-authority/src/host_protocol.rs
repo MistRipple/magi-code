@@ -2,6 +2,22 @@ use crate::{BrowserDeviceType, BrowserNormalizedRect};
 use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWebQuestionSelection {
+    pub selected: Vec<usize>,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserWebQuestionAnswer {
+    Answered {
+        answers: Vec<BrowserWebQuestionSelection>,
+    },
+    Skipped,
+}
+
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
 pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 7;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 96;
@@ -276,10 +292,26 @@ pub enum BrowserHostCommand {
     WebSubmit {
         tab_id: BrowserTabId,
     },
-    /// 回合语义状态：生成中标志、助手与思考文本、消息计数。
+    /// 把图片附加到 GPT Web 输入框并等待上传完成。
     ///
-    /// 站点适配层给出原始语义信号与单次快照；「文本稳定且无生成标志」的
-    /// 完成谓词由推理通道叠加两个读取周期判定（设计基线 §5.6 步骤 6）。
+    /// 文件由 daemon 落在 Magi 私有目录，只传绝对路径（图片字节不过控制通道）。附加失败时
+    /// Worker 先撤掉本次已附加的文件再报错，调用方据此判定本次消息未提交。
+    WebAttachFiles {
+        tab_id: BrowserTabId,
+        file_paths: Vec<String>,
+    },
+    /// 撤销 Magi 上传且尚未发送的附件，不接管用户的网页草稿。
+    WebClearAttachments {
+        tab_id: BrowserTabId,
+    },
+    /// 回写当前网页选择卡片；卡片身份与回答由站点适配层校验，副作用不得重放。
+    WebAnswerQuestion {
+        tab_id: BrowserTabId,
+        question_id: String,
+        answer: BrowserWebQuestionAnswer,
+    },
+    /// 回合语义状态：生成中标志、助手与思考文本、消息计数、原生问题。
+    /// 完成谓词由推理通道跨读取周期判定；页面存在问题时继续等待用户。
     WebTurnState {
         tab_id: BrowserTabId,
     },
@@ -336,6 +368,9 @@ impl BrowserHostCommand {
             | Self::Scroll { .. }
             | Self::WebWriteText { .. }
             | Self::WebSubmit { .. }
+            | Self::WebAttachFiles { .. }
+            | Self::WebClearAttachments { .. }
+            | Self::WebAnswerQuestion { .. }
             | Self::WebCancelGeneration { .. }
             | Self::WebConfigureConnector { .. } => true,
             Self::Ping
@@ -800,6 +835,60 @@ pub enum BrowserAgentCursorAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_attachment_commands_match_typescript_contract() {
+        let attach = BrowserHostCommand::WebAttachFiles {
+            tab_id: BrowserTabId::new("tab-1"),
+            file_paths: vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()],
+        };
+        let wire = serde_json::json!({
+            "type": "web_attach_files",
+            "payload": { "tab_id": "tab-1", "file_paths": ["/tmp/a.png", "/tmp/b.png"] }
+        });
+        assert_eq!(serde_json::to_value(&attach).expect("serialize"), wire);
+        assert_eq!(
+            serde_json::from_value::<BrowserHostCommand>(wire).expect("deserialize"),
+            attach
+        );
+        assert!(attach.is_side_effecting());
+
+        let clear = BrowserHostCommand::WebClearAttachments {
+            tab_id: BrowserTabId::new("tab-1"),
+        };
+        assert_eq!(
+            serde_json::to_value(&clear).expect("serialize"),
+            serde_json::json!({ "type": "web_clear_attachments", "payload": { "tab_id": "tab-1" } })
+        );
+        assert!(clear.is_side_effecting());
+
+        let answer = BrowserHostCommand::WebAnswerQuestion {
+            tab_id: BrowserTabId::new("tab-1"),
+            question_id: "card-1".to_string(),
+            answer: BrowserWebQuestionAnswer::Answered {
+                answers: vec![BrowserWebQuestionSelection {
+                    selected: vec![1],
+                    text: None,
+                }],
+            },
+        };
+        let answer_wire = serde_json::json!({
+            "type": "web_answer_question",
+            "payload": {
+                "tab_id": "tab-1", "question_id": "card-1",
+                "answer": { "kind": "answered", "answers": [{ "selected": [1], "text": null }] }
+            }
+        });
+        assert_eq!(
+            serde_json::to_value(&answer).expect("serialize"),
+            answer_wire
+        );
+        assert_eq!(
+            serde_json::from_value::<BrowserHostCommand>(answer_wire).expect("deserialize"),
+            answer
+        );
+        assert!(answer.is_side_effecting());
+    }
 
     #[test]
     fn desktop_handshake_matches_typescript_contract() {

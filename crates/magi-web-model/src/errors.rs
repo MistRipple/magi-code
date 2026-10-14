@@ -15,6 +15,7 @@ pub enum WebModelErrorCode {
     WebDesktopUnavailable,
     WebSendRejected,
     WebWriteNotConfirmed,
+    WebAttachFailed,
     WebTurnTimeout,
     WebQuotaExhausted,
     WebTunnelUnavailable,
@@ -36,6 +37,7 @@ impl WebModelErrorCode {
             Self::WebDesktopUnavailable => "web_desktop_unavailable",
             Self::WebSendRejected => "web_send_rejected",
             Self::WebWriteNotConfirmed => "web_write_not_confirmed",
+            Self::WebAttachFailed => "web_attach_failed",
             Self::WebTurnTimeout => "web_turn_timeout",
             Self::WebQuotaExhausted => "web_quota_exhausted",
             Self::WebTunnelUnavailable => "web_tunnel_unavailable",
@@ -45,7 +47,7 @@ impl WebModelErrorCode {
         }
     }
 
-    pub const ALL: [WebModelErrorCode; 16] = [
+    pub const ALL: [WebModelErrorCode; 17] = [
         Self::WebSessionBusy,
         Self::WebContextLost,
         Self::WebSavedConversationUnavailable,
@@ -56,6 +58,7 @@ impl WebModelErrorCode {
         Self::WebDesktopUnavailable,
         Self::WebSendRejected,
         Self::WebWriteNotConfirmed,
+        Self::WebAttachFailed,
         Self::WebTurnTimeout,
         Self::WebQuotaExhausted,
         Self::WebTunnelUnavailable,
@@ -96,6 +99,7 @@ impl WebModelErrorCode {
             Self::WebDesktopUnavailable => "GPT Web 需要 Magi Desktop。",
             Self::WebSendRejected => "ChatGPT 未接受这条消息，本次没有产生任何副作用，可以重试。",
             Self::WebWriteNotConfirmed => "网页输入框回读未确认，本次消息未提交，可以重试。",
+            Self::WebAttachFailed => "图片没能附加到 ChatGPT 输入框，本次消息未提交，可以重试。",
             Self::WebTurnTimeout => "消息已被 ChatGPT 接受，但回复没有在时限内完成。",
             Self::WebQuotaExhausted => "ChatGPT 账号额度已用尽，可以切换本地模型继续。",
             Self::WebTunnelUnavailable => "项目工具通道不可用，GPT Web 只能纯对话。",
@@ -107,7 +111,10 @@ impl WebModelErrorCode {
 
     /// 用户可以直接重试且不会重复提交的情形。
     pub const fn user_retryable(self) -> bool {
-        matches!(self, Self::WebSendRejected | Self::WebWriteNotConfirmed)
+        matches!(
+            self,
+            Self::WebSendRejected | Self::WebWriteNotConfirmed | Self::WebAttachFailed
+        )
     }
 
     pub const fn engine_state(self) -> Option<EngineState> {

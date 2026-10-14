@@ -781,6 +781,8 @@ function rejectPending(pending: PendingCommand, error: Error): void {
 }
 
 function workerTimeout(command: BrowserHostCommand): number {
+  // 网页上传图片要十几秒；Worker 自己最多等 60 秒上传完成，这里留出收口余量（daemon 侧是 75 秒）。
+  if (command.type === "web_attach_files") return 70_000;
   if (command.type !== "devtools") return 30_000;
   if (["lighthouse", "heap"].includes(command.payload.operation)) return 120_000;
   if (command.payload.operation === "wait_for") {

@@ -45,6 +45,7 @@ mod turn_service;
 mod web_model_channel;
 mod web_model_driver;
 pub mod web_model_ops;
+mod web_question;
 pub mod web_slot_mcp;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;

@@ -287,7 +287,7 @@ async fn resolve_session_user_question(
         )
         .with_context(EventContext {
             session_id: Some(session_id.clone()),
-            task_id: Some(pending.task_id),
+            task_id: pending.task_id,
             ..EventContext::default()
         }),
     );
@@ -5404,9 +5404,10 @@ mod tests {
             .conversation_registry
             .user_questions()
             .request(PendingUserQuestion {
+                can_skip: true,
                 question_id: "question-route-1".to_string(),
                 session_id: session_id.clone(),
-                task_id: TaskId::new("task-user-question-route"),
+                task_id: Some(TaskId::new("task-user-question-route")),
                 turn_id: "turn-user-question-route".to_string(),
                 tool_call_id: "call-user-question-route".to_string(),
                 questions,

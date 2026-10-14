@@ -9,6 +9,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+fn default_true() -> bool {
+    true
+}
+
 pub const MAX_QUESTIONS: usize = 4;
 pub const MIN_OPTIONS: usize = 2;
 pub const MAX_OPTIONS: usize = 4;
@@ -28,6 +32,8 @@ pub struct UserQuestion {
     pub question: String,
     pub header: String,
     pub multi_select: bool,
+    #[serde(default = "default_true")]
+    pub allow_other: bool,
     pub options: Vec<UserQuestionOption>,
 }
 
@@ -36,11 +42,14 @@ pub struct UserQuestion {
 pub struct PendingUserQuestion {
     pub question_id: String,
     pub session_id: SessionId,
-    pub task_id: TaskId,
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
     pub turn_id: String,
     pub tool_call_id: String,
     pub questions: Vec<UserQuestion>,
     pub requested_at: UtcMillis,
+    #[serde(default = "default_true")]
+    pub can_skip: bool,
 }
 
 /// 用户对一道题的回答：选中的选项 label（可多个），以及“其他”里输入的原文。
@@ -131,6 +140,7 @@ pub fn parse_questions(arguments: &str) -> Result<Vec<UserQuestion>, String> {
             question,
             header,
             multi_select: item.multi_select,
+            allow_other: true,
             options,
         });
     }
@@ -167,6 +177,9 @@ pub fn validate_answers(
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
+        if other.is_some() && !question.allow_other {
+            return Err(format!("第 {number} 个问题不支持自定义输入"));
+        }
         if let Some(text) = &other
             && text.chars().count() > MAX_TEXT_CHARS
         {
@@ -289,6 +302,9 @@ impl UserQuestionRegistry {
         if &entry.request.session_id != session_id {
             return Err("问题不属于当前会话".to_string());
         }
+        if matches!(response, UserQuestionResponse::Skipped) && !entry.request.can_skip {
+            return Err("这个问题不支持跳过".to_string());
+        }
         let response = match response {
             UserQuestionResponse::Answered { answers } => UserQuestionResponse::Answered {
                 answers: validate_answers(&entry.request.questions, &answers)?,
@@ -312,7 +328,8 @@ impl UserQuestionRegistry {
 
     pub fn remove_task(&self, session_id: &SessionId, task_id: &TaskId) {
         self.lock().retain(|_, entry| {
-            !(&entry.request.session_id == session_id && &entry.request.task_id == task_id)
+            !(&entry.request.session_id == session_id
+                && entry.request.task_id.as_ref() == Some(task_id))
         });
     }
 }
@@ -352,11 +369,12 @@ mod tests {
         PendingUserQuestion {
             question_id: "q1".to_string(),
             session_id: SessionId::new("s1"),
-            task_id: TaskId::new("t1"),
+            task_id: Some(TaskId::new("t1")),
             turn_id: "turn1".to_string(),
             tool_call_id: "call1".to_string(),
             questions,
             requested_at: UtcMillis(1),
+            can_skip: true,
         }
     }
 
