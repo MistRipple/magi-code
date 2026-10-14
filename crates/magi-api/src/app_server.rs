@@ -45,6 +45,7 @@ use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 use crate::{
     dto::SessionDirectoryEntryDto,
     errors::ApiError,
+    public_canonical::{public_canonical_turn, public_event_envelope},
     session_activity::session_running_task_count,
     sse::{EventStreamScope, canonical_recovery_event},
     state::ApiState,
@@ -671,7 +672,7 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                         {
                             let notification = match typed_notification_from_json::<EventNotificationParams>(
                                 format!("event/{}", event.event_type),
-                                json!({"sequence": event.sequence, "event": event}),
+                                json!({"sequence": event.sequence, "event": public_event_envelope(event.clone())}),
                             ) {
                                 Ok(notification) => notification,
                                 Err(error) => {
@@ -909,7 +910,7 @@ async fn subscribe_events(
         snapshot.next_sequence = snapshot
             .next_sequence
             .max(recovery.sequence.saturating_add(1));
-        snapshot.recent_events.push(recovery);
+        snapshot.recent_events.push(public_event_envelope(recovery));
         snapshot.recent_events.sort_by_key(|event| event.sequence);
     }
     let next_sequence = snapshot.next_sequence;
@@ -1781,7 +1782,13 @@ async fn read_session(
         );
     };
     let turns = if params.include_turns {
-        match serde_json::to_value(state.session_store.canonical_turns_for_session(&session_id)) {
+        let turns = state
+            .session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .map(public_canonical_turn)
+            .collect::<Vec<_>>();
+        match serde_json::to_value(turns) {
             Ok(turns) => turns,
             Err(error) => {
                 return error_response(
@@ -2082,6 +2089,7 @@ async fn filtered_snapshot(
             .iter()
             .filter(|event| event_matches(event, &subscription))
             .cloned()
+            .map(public_event_envelope)
             .collect(),
     }
 }
@@ -2299,6 +2307,40 @@ mod tests {
         assert!(snapshot_requires_resync(&snapshot, 3));
         assert!(!snapshot_requires_resync(&snapshot, 4));
         assert!(!snapshot_requires_resync(&snapshot, 0));
+    }
+
+    #[tokio::test]
+    async fn subscription_snapshot_uses_public_facts_without_mutating_the_event_bus() {
+        let mut stored = event(1, Some("session-1"), None);
+        stored.payload = json!({"tool_result": "read /private/tmp/result with Bearer secret"});
+        let snapshot = EventStreamSnapshot {
+            next_sequence: 2,
+            recent_events: vec![stored.clone()],
+        };
+        let connection = Arc::new(Mutex::new(ConnectionState::default()));
+        connection.lock().await.subscription = EventSubscription {
+            active: true,
+            session_id: Some(SessionId::new("session-1")),
+            workspace_id: None,
+            after_sequence: 0,
+        };
+        let public = filter_snapshot(snapshot.clone(), 0, &connection).await;
+        assert_eq!(
+            public.recent_events[0].payload,
+            public_event_envelope(stored).payload
+        );
+        assert!(
+            !public.recent_events[0]
+                .payload
+                .to_string()
+                .contains("Bearer secret")
+        );
+        assert!(
+            snapshot.recent_events[0]
+                .payload
+                .to_string()
+                .contains("Bearer secret")
+        );
     }
 
     #[tokio::test]
@@ -2740,14 +2782,30 @@ mod tests {
         assert_eq!(read["result"]["session"]["title"], "App Server integration");
         assert_eq!(read["result"]["turns"].as_array().map(Vec::len), Some(0));
 
-        event_state.event_bus.publish(event(
-            1,
-            Some("session-app-server-read"),
-            Some("workspace-test"),
-        ));
+        let mut tool_event = event(1, Some("session-app-server-read"), Some("workspace-test"));
+        let item: magi_session_store::CanonicalTurnItem = serde_json::from_value(json!({
+            "sessionId": session_id, "turnId": "turn-live-tool", "turnSeq": 1,
+            "itemId": "item-live-tool", "itemSeq": 1, "itemVersion": 2,
+            "kind": "tool_call", "status": "completed", "createdAt": 1, "updatedAt": 2,
+            "sourceThreadId": "thread-live-tool", "visibility": {"renderable": true},
+            "tool": {"callId": "call-live-tool", "name": "file_read",
+                "arguments": {"path": "/private/tmp/live.txt", "token": "sk-live-secret"},
+                "result": {"path": "/private/tmp/live.txt", "summary": "read /private/tmp/live.txt"}}
+        })).unwrap();
+        let expected = serde_json::to_value(crate::public_canonical::public_canonical_turn_item(
+            item.clone(),
+        ))
+        .unwrap();
+        tool_event.payload = json!({"canonical_item": item, "tool_result": "Bearer live-secret"});
+        event_state.event_bus.publish(tool_event);
         let event_notification = next_text_message(&mut socket).await;
         assert_eq!(event_notification["method"], "event/session.changed");
         assert_eq!(event_notification["params"]["event"]["sequence"], 1);
+        assert_eq!(
+            event_notification["params"]["event"]["payload"]["canonical_item"],
+            expected
+        );
+        assert!(!event_notification.to_string().contains("live-secret"));
 
         socket
             .send(ClientMessage::Ping(vec![1, 2, 3].into()))

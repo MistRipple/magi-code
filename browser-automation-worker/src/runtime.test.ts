@@ -2286,6 +2286,7 @@ test("GPT Web 探测只返回登录与页面可用性，不含网页模型菜单
       path: "/?temporary-chat=true",
       blocked: false,
       composerFound: true,
+      accountPresent: true,
       conversationFound: true,
       accountHint: "Plus",
     },

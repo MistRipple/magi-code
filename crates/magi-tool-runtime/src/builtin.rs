@@ -77,7 +77,9 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::SearchSemantic => {
                 knowledge::execute_search_semantic(input, context, resources)
             }
-            BuiltinToolName::ShellExec => shell::execute_shell_exec(input, context, None),
+            BuiltinToolName::ShellExec => {
+                shell::execute_shell_exec(input, context, None, resources.cancellation.as_ref())
+            }
             BuiltinToolName::ProcessLaunch => process::execute_process_launch(input, context),
             BuiltinToolName::ProcessRead => process::execute_process_read(input, context),
             BuiltinToolName::ProcessWrite => process::execute_process_write(input, context),
@@ -167,7 +169,12 @@ impl BuiltinTool for NormalizedBuiltinTool {
         on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
     ) -> String {
         if self.name == BuiltinToolName::ShellExec {
-            shell::execute_shell_exec(input, context, Some((tool_call_id, on_progress)))
+            shell::execute_shell_exec(
+                input,
+                context,
+                Some((tool_call_id, on_progress)),
+                resources.cancellation.as_ref(),
+            )
         } else {
             self.execute(tool_call_id, input, context, resources)
         }

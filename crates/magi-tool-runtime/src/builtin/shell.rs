@@ -205,6 +205,7 @@ pub(super) fn execute_shell_exec(
     input: &str,
     context: &ToolExecutionContext,
     progress: Option<(&ToolCallId, &(dyn Fn(ToolExecutionProgress) + Sync))>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> String {
     let request = parse_json_object(input);
     if let Some(payload) = execute_shell_exec_background_action(input, request.as_ref(), context) {
@@ -279,7 +280,13 @@ pub(super) fn execute_shell_exec(
     let ShellInvocation { cwd, shell } = invocation;
 
     let output = match execute_shell_command_with_timeout(
-        &shell, &command, &cwd, timeout_ms, context, progress,
+        &shell,
+        &command,
+        &cwd,
+        timeout_ms,
+        context,
+        progress,
+        cancellation,
     ) {
         Ok(output) => output,
         Err(error) => {
@@ -629,6 +636,7 @@ pub(super) fn execute_shell_command_with_timeout(
     timeout_ms: u64,
     context: &ToolExecutionContext,
     progress: Option<(&ToolCallId, &(dyn Fn(ToolExecutionProgress) + Sync))>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ShellExecOutput, String> {
     let mut command_builder = std_command(&shell.program);
     command_builder
@@ -642,7 +650,8 @@ pub(super) fn execute_shell_command_with_timeout(
     let stdout = child.take_stdout();
     let stderr = child.take_stderr();
     let child = Arc::new(Mutex::new(child));
-    let (execution_id, cancellation_requested) = register_active_shell_exec(context, &child);
+    let (execution_id, cancellation_requested) =
+        register_active_shell_exec(context, &child, cancellation);
     let progress_state = Arc::new(Mutex::new(ShellProgressState::default()));
     let started_at = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -838,9 +847,12 @@ pub(super) fn publish_shell_progress(
 pub(super) fn register_active_shell_exec(
     context: &ToolExecutionContext,
     child: &Arc<Mutex<ManagedChild>>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> (u64, Arc<AtomicBool>) {
     let execution_id = SHELL_EXECUTION_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = cancellation
+        .cloned()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let process = ActiveShellExec {
         execution_id,
         scope: ProcessExecutionScope::from_context(context),

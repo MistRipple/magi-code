@@ -181,6 +181,7 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut reader = BufReader::new(reader);
+    let scope = server.connection_scope();
 
     // 令牌端点：第一行必须是令牌握手。失败统一回 unauthorized 并关闭，不区分原因。
     let secret = match &auth {
@@ -240,15 +241,26 @@ where
         };
         let server = Arc::clone(&server);
         let writer = Arc::clone(&writer);
+        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(request) => request,
+            Err(parse_error) => {
+                write_line(
+                    &writer,
+                    &error(
+                        Value::Null,
+                        JSONRPC_PARSE_ERROR,
+                        format!("请求不是合法 JSON-RPC：{parse_error}"),
+                    ),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let registration = server.prepare_request(&principal, &request, scope.id);
         tokio::spawn(async move {
-            let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-                Ok(request) => server.handle(&principal, request, now).await,
-                Err(parse_error) => Some(error(
-                    Value::Null,
-                    JSONRPC_PARSE_ERROR,
-                    format!("请求不是合法 JSON-RPC：{parse_error}"),
-                )),
-            };
+            let response = server
+                .handle_prepared(&principal, request, now, registration)
+                .await;
             if let Some(response) = response {
                 let _ = write_line(&writer, &response).await;
             }
@@ -406,6 +418,7 @@ mod tests {
         BoxFuture, InvocationOutcome, ToolBackend, ToolInvocation, WorkspaceResolver,
     };
     use crate::token::{AttributionMode, IssueTokenRequest};
+    use std::time::Duration;
 
     struct Schemas;
     impl ToolSchemaProvider for Schemas {
@@ -440,6 +453,86 @@ mod tests {
     impl WorkspaceResolver for Root {
         fn root_of(&self, _: &str) -> Option<PathBuf> {
             Some(std::env::temp_dir())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_arriving_immediately_and_disconnect_reach_the_backend() {
+        struct CancellableBackend(tokio::sync::mpsc::UnboundedSender<bool>);
+        impl ToolBackend for CancellableBackend {
+            fn schemas(&self) -> &dyn ToolSchemaProvider {
+                static SCHEMAS: Schemas = Schemas;
+                &SCHEMAS
+            }
+            fn path_requests(&self, _: &str, _: &Value, _: &Path) -> Vec<PathRequest> {
+                Vec::new()
+            }
+            fn invoke<'a>(
+                &'a self,
+                invocation: ToolInvocation,
+            ) -> BoxFuture<'a, InvocationOutcome> {
+                Box::pin(async move {
+                    let _ = self.0.send(false);
+                    while !invocation.cancellation.is_cancelled() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let _ = self.0.send(true);
+                    InvocationOutcome {
+                        text: "cancelled".into(),
+                        is_error: true,
+                    }
+                })
+            }
+        }
+        let (sender, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let server = Arc::new(McpServer::new(
+            "test",
+            "1",
+            Arc::new(CancellableBackend(sender)),
+            Arc::new(Root),
+        ));
+        let principal = ClientPrincipal {
+            token_id: "client".into(),
+            token_prefix: "prefix".into(),
+            client_name: "test".into(),
+            workspace_id: "workspace".into(),
+            profile: Profile::Exec,
+            approval_mode: ApprovalMode::Always,
+            attribution: AttributionMode::External,
+        };
+        for disconnect in [false, true] {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let principal = principal.clone();
+            let serving = tokio::spawn(serve_stream(
+                stream,
+                server.clone(),
+                SocketAuth::Principal(Arc::new(move || Some(principal.clone()))),
+            ));
+            client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"magi.fs.read\"}}\n").await.unwrap();
+            if !disconnect {
+                client.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n").await.unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), results.recv())
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+            if disconnect {
+                client.shutdown().await.unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), results.recv())
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), serving)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         }
     }
 

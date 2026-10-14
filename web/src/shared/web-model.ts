@@ -16,7 +16,7 @@ export const WEB_MODEL_PARTITION = 'persist:magi-web-model';
 /**
  * 应用级 GPT Web 会话的固定主页 Tab id。
  *
- * 与 daemon 的 `WEB_MODEL_HOME_TAB_ID`（`crates/magi-api/src/routes/browser.rs`）
+ * 与 daemon 的 `WEB_MODEL_HOME_TAB_ID`（`crates/magi-api/src/web_model_ops.rs`）
  * 必须保持一致；推理页面由推理通道按需创建，不在这里创建。
  */
 export const WEB_MODEL_HOME_TAB_ID = 'browser-tab-web-model-home';

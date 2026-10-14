@@ -17,7 +17,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::session_scope;
+use crate::scope_binding as session_scope;
 use crate::{dto::SessionScopeKindDto, errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {

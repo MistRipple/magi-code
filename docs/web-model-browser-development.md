@@ -1,7 +1,6 @@
 # Magi GPT Web · 最终开发文档
 
-> 状态：**最终开发基线（实现口径）**，取代此前的设计基线与实现计划（已从仓库移除，需要追溯请查 git 历史）。
-> 更新日期：2026-09-30。
+> 本文定义 GPT Web 当前架构和维护合同；实现与平台覆盖以源码及对应构建的运行证据为准。
 > 相关文档：[Magi MCP 服务设计](./magi-mcp-server-design.md)（工具能力的唯一来源）、[工程约束与运行入口](./README.md)、[内置浏览器完整设计](./browser-runtime-design.md)、[Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)。
 
 ---
@@ -406,14 +405,10 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 ### 当前交付状态（与源码核对）
 已实现并有自动化覆盖：单槽位（占用即拒绝、结束 / 释放钩子）、临时 / 已保存模式、只发送本轮原文与图片、图片上传 / 取消 / 失败撤销与私有暂存文件清理、原生选择卡片映射与多阶段作答、窄面板换行与局部滚动、存活判定与 `web_context_lost`、取消、登录过期 / 站点被拦等错误上报到引擎可用性投影、已保存对话的绑定（单向导入）/ 发送前尾部同步 / 同步指针前移、停止 / 释放（切本地、会话删除、清除数据）、重启后自动恢复探测、选择器固定入口与对话方式 / 历史选择、设置分区（登录与可用性、占用与停止、OpenAI Tunnel 与权限档、连接器检查 / 显式配置、清除数据）、槽位端点网关（内置 + 下游 MCP + Skill，审批、规范工具条目）。
 
-**已取得的运行证据（2026-10-14，本机 macOS Apple Silicon 目录包）：**
-- `npm run test:electron-gpt-web` 使用真实已登录 ChatGPT 分区的独立副本，文本收发、Magi 粘贴红 / 蓝两图并由网页同时识别、暂存目录清空、插件停用与资源释放验收 15/15 通过；不是完整登录方式、所有平台或连接器验收。
-- `MAGI_GPT_WEB_QUESTION_FIXTURE=1 MAGI_GPT_WEB_LAYOUT_CHECK=1 npm run test:electron-gpt-web` 在真实 Desktop / Worker / daemon / UI 链路中使用按 Edge DIL DOM 构造的受控页面，覆盖多阶段选择、自定义输入、跳过、960/1100/1440px 布局与 320/600px 可见右栏视口宽度，32/32 通过；不证明远端模型能生成卡片。
-
-**尚未关闭的真实环境验收：** 上游原生卡片生成与作答。本次 Desktop 分区的真账号测试只返回普通文字选项，未生成 DIL 控件，不能标记为通过。完整登录方式与跨重启保持、风控、页面失效 / 取消恢复、已保存历史列表与分支 / 账号切换、真实 OpenAI Tunnel 连接器配置 / 握手与挂起上限仍需分别验证。端到端入口需要打包产物（`target/electron-dist`）；前置条件见[脚本与验证入口](./validation.md)，其通过不替代未覆盖的真实账号或平台场景。
+真实环境验收必须按构建单独记录：上游原生卡片生成与作答、登录方式与跨重启保持、风控、页面失效 / 取消恢复、已保存历史列表与分支 / 账号切换、OpenAI Tunnel 连接器握手与挂起上限。受控卡片页面只能证明桥接，不代表真实账号能生成卡片。端到端入口依赖打包产物，前置条件及场景开关见[验证入口](validation.md)。
 
 ### 检查命令
-- Rust：`cargo check --workspace --tests`，`cargo test -p magi-web-model`、`-p magi-api`、`-p magi-browser-authority`、`-p magi-conversation-runtime`
+- Rust：按改动运行 `cargo check -p <受影响的包>`，以及 `magi-web-model`、`magi-api`、`magi-browser-authority`、`magi-conversation-runtime` 的对应测试
 - 前端与桌面：`npm --prefix web run check`、`npm run check --workspace @magi/desktop`、`npm run check --workspace @magi/browser-automation-worker` 及对应 test
 - 协议与工具目录：`npm run protocol:check`、`npm run browser-tool-catalog:check`
 - 涉及真实 Electron 行为时按 `apps/desktop/AGENTS.md` 做运行验收；**假页面 fixture 的通过不能代替真实站点验收**。
@@ -435,9 +430,6 @@ ChatGPT 连接器需要一个从 OpenAI 云端可达的入口。可用形态（�
 
 ---
 
-## 15. 文档处理
+## 15. 文档所有权
 
-- 本文是 GPT Web 的唯一开发基线；工具能力的唯一来源是《[Magi MCP 服务设计](./magi-mcp-server-design.md)》，两份文档互相引用，同一件事不写两遍；GPT Web 槽位端点的接线细节在 MCP 文档 §12。
-- 《[内置浏览器完整设计](./browser-runtime-design.md)》的 `webSession` 条目必须同步为“单宿主、单 WebView、右栏隐藏不卸载、应用级 owner 不激活右栏、重启后临时上下文失效”；不能继续保留“每个活跃对话一个推理页面”或“重启后按最后一条恢复临时会话”的描述。
-- 《[工程约束与运行入口](./README.md)》中的入口条目应改为指向本文，并把状态从“未实现的最终设计基线”更新为“最终开发基线：按本文实现”。
-- 参考项目链接固定为 [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)；它只作为页面交互参考，不改变 Magi 的实现边界。
+本文记录 GPT Web 的页面驱动、槽位与用户流程；工具、身份和通道接线统一见 [MCP 服务设计](magi-mcp-server-design.md#12-与-gpt-web-的关系)，物理 guest 与右栏生命周期见 [Browser 设计](browser-runtime-design.md)。一次性实现计划和验收统计通过 Git 或本次运行产物追溯。

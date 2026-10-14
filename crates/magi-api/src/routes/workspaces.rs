@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::session_scope::require_registered_workspace_binding;
+use crate::scope_binding::require_registered_workspace_binding;
 use crate::session_activity::session_running_task_count;
 use crate::{errors::ApiError, state::ApiState};
 

@@ -422,6 +422,8 @@ pub struct RuntimeCapabilityDependencyEntry {
 /// daemon 进程内的共享服务引用，由 ToolRegistry 持有并在 dispatch 时传入。
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
+    /// 单次执行的取消信号；注册表默认资源不持有该信号。
+    pub cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 由受控工具入口派生，供递归读取逐项复核权限。
     pub(crate) file_read_policy: magi_permissions::PermissionPolicy,
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,

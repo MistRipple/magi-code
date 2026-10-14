@@ -7,7 +7,7 @@ use magi_core::UtcMillis;
 use magi_session_store::{CanonicalTurn, CanonicalTurnItem, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
-use super::session_scope::{
+use crate::scope_binding::{
     parse_session_id, require_session_record_in_scope, resolve_explicit_session_scope,
 };
 use crate::{

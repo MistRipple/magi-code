@@ -8,6 +8,7 @@
     getQueuedMessages,
     isPersistedSessionId,
     messagesState,
+    onDraftSessionAdopted,
   } from '../stores/messages.svelte';
   import type { MessageBrowserNodeSelection, QueuedMessage } from '../types/message';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
@@ -401,6 +402,15 @@
     ].join('\u0000');
   }
 
+  $effect(() => onDraftSessionAdopted((workspaceId, sessionId) => {
+    // 首条消息的接纳是同一会话的绑定交接，期间继续输入的草稿也随之保留。
+    const previousScopeKey = composerReferenceScopeKey;
+    composerReferenceScopeKey = [workspaceId, messagesState.currentWorkspacePath?.trim() || '', sessionId].join('\u0000');
+    const draft = scopedComposerDrafts.get(previousScopeKey);
+    if (draft) scopedComposerDrafts.set(composerReferenceScopeKey, draft);
+    scopedComposerDrafts.delete(previousScopeKey);
+  }));
+
   $effect(() => {
     // 这些直接读取是作用域切换的唯一响应式依赖。InputArea 在导航时保持挂载，
     // 不能依赖组件重建来清空 contenteditable 的旧 DOM。
@@ -472,9 +482,10 @@
   });
   /** GPT Web 状态条判定发送必然被 daemon 拒绝（对话已失效 / 冲突 / 被占用）。 */
   let webSendBlocked = $state(false);
+  // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
     sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0 || !mainModelReady
-    || webSendBlocked
+    || (isDraftSession && isSending) || webSendBlocked
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -1847,6 +1858,7 @@
         (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
+        || (isDraftSession && isSending)
       ) return;
       if (selectedSessionCommand !== null && attachmentTotal > 0) {
         addToast('warning', i18n.t('input.compact.disabled.attachments'));
@@ -1998,7 +2010,7 @@
 
   // 代理运行运行时，输入框停止入口与目标面板共用同一条可恢复中断链路。
   async function stopTask() {
-    if (stopLoading) return;
+    if (stopLoading || isDraftSession) return;
     stopLoading = true;
     try {
       vscode.postMessage({ type: 'interruptTask' });
@@ -3629,7 +3641,7 @@
             class="ia-send stop"
             data-testid="input-stop-button"
             onclick={stopTask}
-            disabled={stopLoading}
+            disabled={stopLoading || isDraftSession}
             title={shouldInterruptAgentRunFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />

@@ -112,7 +112,7 @@ fn run_approval(
             approval_id,
             ExecutionResultStatus::Cancelled,
             "tool_approval_cancelled",
-            "连接已失效，待授权操作未执行",
+            "调用已取消或连接已失效，待授权操作未执行",
         ));
     }
     let pending = PendingToolApproval {
@@ -185,7 +185,7 @@ fn run_approval(
                         approval_id,
                         ExecutionResultStatus::Cancelled,
                         "tool_approval_cancelled",
-                        "连接已失效，待授权操作未执行",
+                        "调用已取消或连接已失效，待授权操作未执行",
                     ));
                 }
                 return Ok(());
@@ -205,7 +205,7 @@ fn run_approval(
                         approval_id,
                         ExecutionResultStatus::Cancelled,
                         "tool_approval_cancelled",
-                        "令牌已吊销或连接已断开，待授权操作未执行",
+                        "调用已取消或连接已失效，待授权操作未执行",
                     ));
                 }
                 if registry.is_expired(request.session_id, approval_id) {

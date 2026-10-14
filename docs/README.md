@@ -20,7 +20,7 @@
 - `apps/desktop` 是 Windows、Linux、macOS 的 Electron/Chromium 桌面产品入口，负责原生窗口、单实例、布局和进程生命周期。主 Renderer 管理右栏 DOM；当前 Browser Tab 在右栏内容槽中渲染唯一的真实 Electron `<webview>`，Main 只负责 guest WebContents 生命周期与自动化控制，不参与浏览器内容几何映射。
 - `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
-- `magi-daemon-app` 仅保留为开发和无头部署入口，不参与桌面安装包，也不复制桌面宿主逻辑。
+- `magi-daemon-app` 承载开发、无头部署及桌面包中的 daemon sidecar 入口；业务实现复用 `magi-daemon`，不复制 Electron 宿主逻辑。
 
 开发模式仍使用 daemon 托管入口：
 
@@ -63,8 +63,7 @@ npm run desktop:dev
 - [对话展示：完整模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
 - [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
-- [对话性能验证](./conversation-performance-validation.md)：按性能问题选择测量阶段、证据和比较口径。
-- [用户自定义子代理角色设计方案](./custom-worker-role-design.md)：在现有 Worker 体系中统一支持用户角色的创建、注册、调度、导入和导出。
+- [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
 - [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与授权方式、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
 
@@ -72,7 +71,7 @@ npm run desktop:dev
 - [持久日志的追加写入与压缩](./durable-log-compaction-design.md)：用量账本分段、canonical 事件检查点和崩溃恢复。
 - [会话 Git 工作流](./session-git-workflow.md)与[会话隔离工作副本](./session-isolation.md)：工作目录、执行租约、子代理产出与合并。
 - [Rust crate 依赖图](./architecture.html)：由 Cargo workspace 生成；维护命令见[脚本与验证入口](./validation.md)。
-- [脚本与验证入口](./validation.md)：构建、定向回归、真实集成验收和文档维护规则。
+- [脚本与验证入口](./validation.md)：构建、定向回归、真实集成验收、性能测量和文档维护规则。
 
 ## 用户场景与产品要求
 

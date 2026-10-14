@@ -1,5 +1,5 @@
 //! 会话隔离副本的 HTTP 入口：查询状态、启用、丢弃、预览与应用合并。
-use super::session_scope::{SessionScope, parse_session_id, resolve_existing_session_scope};
+use crate::scope_binding::{SessionScope, parse_session_id, resolve_existing_session_scope};
 use crate::{errors::ApiError, state::ApiState};
 use axum::{
     Json, Router,

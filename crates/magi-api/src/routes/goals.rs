@@ -8,7 +8,7 @@ use magi_core::{AccessProfile, DomainError, GoalId, SessionId, UtcMillis};
 use magi_session_store::{GoalStatus, SessionGoal, SessionPlan};
 use serde::{Deserialize, Serialize};
 
-use super::session_scope::{SessionRequestScope, require_session_request_scope};
+use crate::scope_binding::{SessionRequestScope, require_session_request_scope};
 use crate::{
     dto::SessionScopeKindDto, errors::ApiError, session_activity::current_turn_status_is_active,
     state::ApiState,
@@ -343,7 +343,7 @@ async fn resume_current_goal(
             "预算受限目标必须设置高于已用 Token 的新预算".to_string(),
         ));
     }
-    super::sessions::ensure_goal_continuation_runtime_available(&state, &scope.session_id)?;
+    crate::turn_service::ensure_goal_continuation_runtime_available(&state, &scope.session_id)?;
     let (_goal, _, resume_checkpoint) = state
         .session_store
         .resume_goal_with_plan(
@@ -362,12 +362,13 @@ async fn resume_current_goal(
             .ensure_current_turn_acceptance_available(&scope.session_id)
             .is_ok();
     if can_start_now
-        && let Err(error) = super::sessions::resume_active_goal_continuation_turn_after_turn_commit(
-            state.clone(),
-            scope.session_id.clone(),
-            scope.workspace_id(),
-        )
-        .await
+        && let Err(error) =
+            crate::turn_service::resume_active_goal_continuation_turn_after_turn_commit(
+                state.clone(),
+                scope.session_id.clone(),
+                scope.workspace_id(),
+            )
+            .await
     {
         state
             .session_store

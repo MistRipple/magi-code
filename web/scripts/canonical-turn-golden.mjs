@@ -21,6 +21,7 @@ await withGoldenViteServer(async (server) => {
   runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, conversationPresentation, markdownUrl);
   assertUserCommandSurvivesAcceptanceAndReload(reducer, projection, userMessageCommand);
   assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore);
+  assertSnapshotMergeKeepsLiveTurnIdentity(turnStore);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -309,6 +310,34 @@ function assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore) {
   assert.equal(turnStore.mergeEarlierCanonicalTurnItems({
     sessionId: 'session-other', turnId: c.turnId, items: [], hasMoreBefore: false, beforeItemSeq: null, omittedItemCount: 0,
   }), null);
+}
+
+function assertSnapshotMergeKeepsLiveTurnIdentity(turnStore) {
+  const c = baseCase('external-snapshot-merge', 'external-tool-golden', 'external-turn-golden', 11_708);
+  const running = turn(c, 'running', [user(c, 1, '外部调用')]);
+  turnStore.replaceCanonicalSessionTurns(c.sessionId, []);
+  turnStore.mergeCanonicalSessionTurns(c.sessionId, [running], 1);
+  const completed = turn(c, 'completed', running.items);
+  const completedEvent = {
+    eventId: 'external-turn-completed', eventSeq: 2, kind: 'turn_completed',
+    sessionId: c.sessionId, turnId: c.turnId, turnSeq: running.turnSeq,
+    occurredAt: completed.completedAt, turn: completed,
+  };
+  turnStore.applyCanonicalTurnEvent(completedEvent);
+  const turns = turnStore.turnStoreState.reducer.turns;
+  assert.equal(turns.length, 1, '快照合并后的实时事件更新同一轮，不追加同 ID 的影子轮次');
+  assert.equal(turns[0].status, 'completed', '外部轮次终态必须覆盖原运行态');
+  assert.equal(turnStore.turnStoreState.reducer.turnIndexById[c.turnId], 0);
+
+  const call = tool(c, 2, 'snapshot-tool', 'snapshot-call', 'echo ok', 'running');
+  call.itemVersion = 1;
+  turnStore.replaceCanonicalSessionTurns(c.sessionId, [running], 2);
+  turnStore.mergeCanonicalSessionTurns(c.sessionId, [turn(c, 'running', [...running.items, call])], 3);
+  const finished = { ...call, status: 'completed', itemVersion: 2, tool: { ...call.tool, result: { stdout: 'ok' } } };
+  turnStore.applyCanonicalTurnEvent(event(c, 4, 'turn_item_upsert', { item: finished }));
+  assert.equal(turnStore.turnStoreState.lastError, null);
+  assert.equal(turnStore.turnStoreState.reducer.turns[0].items.length, 2, '快照新增的工具随后更新同一条目');
+  assert.equal(turnStore.turnStoreState.reducer.turns[0].items[1].status, 'completed');
 }
 
 function assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, canonicalProtocol) {

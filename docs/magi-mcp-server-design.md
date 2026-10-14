@@ -99,7 +99,7 @@ MCP 客户端（Claude Desktop / Cursor / Cline / ChatGPT 连接器 / …）
 - 创建：设置页选择工作区、授权方式和有效期；创建后立即展示原文，之后可随时重新查看（§5.3）。
 - 存储：校验用的**哈希**（不可逆）、前缀（用于列表识别）、名称、工作区、完整工具目录标记、授权方式、归属模式、创建与最近使用时间、过期时间，与**原文**分开存放：原文在 state root 下的私有文件里（仅当前 OS 用户可读写，0600），只服务于“重新查看 / 复制”，不参与校验。原文不进日志、不进诊断、不进 canonical、不进导出与备份。
 - 校验：恒定时间比较；过期、吊销、工作区被移除即失效；失败统一返回认证错误，不区分原因。
-- 吊销：即时生效，同时断开该令牌的所有连接并使挂起调用以错误收口。吊销后的令牌只读，不可再编辑或查看原文。
+- 吊销：认证即时失效，已有连接的后续请求一律拒绝（本地 socket 在下一条请求时关闭连接）；在途调用按 §12.1 通知取消并结算，待审批调用以错误收口。吊销后的令牌只读，不可再编辑或查看原文。
 
 ### 5.2 协议层认证
 - **本机 stdio：** 客户端启动 daemon 自带的中继：`<daemon 可执行文件> mcp-relay --stdio --endpoint <socket> [--token-file <path>]`（令牌也可由环境变量 `MAGI_MCP_TOKEN` 提供；设置页生成的配置已填好绝对路径）；stdio 进程只是轻量中继，经仅当前 OS 用户可访问的本地 socket 连到 daemon，令牌校验在 daemon 侧完成。
@@ -321,6 +321,10 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 
 槽位在 turn 结束、被释放（停止 / 退出 / 切换到本地 / 清除数据 / 会话删除）时通过 `WebSlotTable::set_end_hook` 取消该槽位遗留的待审批，等待中的调用以“已取消”收口，不会补执行。
 
+`notifications/cancelled` 按客户端和原始请求 ID 取消单次调用，字符串 ID 与数字 ID 不混用；stdio/local socket 还按连接隔离，断连只取消该连接的调用。无会话的 HTTP 入口按令牌和请求 ID 定位，客户端必须为并发调用使用不同 ID。取消信号复用工具运行时的标记，待审批、长时间文件读取和前台 Shell 会响应取消。已经开始且不能中断的操作继续结算真实结果、canonical 工具项与审计；请求断开也不会提前释放其并发名额或伪报无副作用。
+
+宿主在执行期间每 100ms 核对调用身份；令牌吊销、到期或密钥轮换，以及 GPT Web 槽位释放或 Turn 结束，都会通知既有工具运行时取消。调用仍须等待执行层结算后释放并发名额并写回真实终态，不把不可中断操作伪报为已取消。
+
 ### 12.2 工具目录
 
 槽位端点向模型暴露**项目允许的全部可用工具**，不是一个手写白名单：
@@ -335,7 +339,7 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 ### 12.3 连接器与通道
 
 - 通道配置在设置 → GPT Web：Tunnel id、运行时 API 密钥（粘贴后由 Magi 存进 state root 下的私有文件，之后不再显示）、工具权限档。`tunnel-client` 由 Magi 自动下载（固定版本，发布包 SHA-256 固定在代码里，校验通过才安装并记录解压后摘要供每次启动复核），失败 fail-closed 并报告原因。详见 GPT Web 文档 §8.3。
-- stdio 中继是 daemon 可执行文件的 `mcp-relay` 子命令：GPT Web 通道与外部 MCP 客户端（设置页生成的 stdio 配置）都用它，不需要另行分发 `magi-mcp`；`magi-mcp` 二进制只保留给开发期端到端脚本。
+- stdio 中继是 daemon 可执行文件的 `mcp-relay` 子命令：GPT Web 通道与外部 MCP 客户端（设置页生成的 stdio 配置）都用它。桌面集成验收直接执行这份配置，不依赖额外中继二进制。
 - 通道不可用（`web_tunnel_unavailable`）**不是 turn 失败**：GPT Web 仍可纯对话，会话只是没有项目工具，选择器入口显示“无工具”，设置页说明缺什么。
 - Magi 公网隧道（Cloudflare Quick Tunnel 或命名隧道的 MCP 网络模式）是**外部 agent 的入口**，不用于 GPT Web 槽位：GPT Web 只走 OpenAI Tunnel。
 
@@ -354,7 +358,7 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 
 ```bash
 CARGO_INCREMENTAL=0 cargo test -p magi-mcp-server -p magi-api web_slot
-node scripts/verify-mcp-server.mjs --base <daemon> --mcp-bin target/debug/magi-mcp   # 外部客户端端到端
+npm run test:electron-plugins   # 打包 Desktop 的 HTTP/stdio 与外部会话端到端
 ```
 
 仍需真实环境验证（不能被自动化替代）：ChatGPT 连接器对 Tunnel stdio 的实际握手、单次 `tools/call` 的等待上限（审批默认 90 秒超时，若连接器更短则需做成可配置）、连接器自动配置的页面选择器。
@@ -389,7 +393,7 @@ OAuth 尚未实现；第三方客户端兼容矩阵、真实命名隧道与 Open
 
 ### 检查命令
 
-- Rust：按改动运行 `cargo check -p magi-mcp-server`、`cargo check -p magi-api` 和受影响的测试；真实外部客户端通路使用 `scripts/verify-mcp-server.mjs`。
+- Rust：按改动运行 `cargo check -p magi-mcp-server`、`cargo check -p magi-api` 和受影响的测试；真实外部客户端通路并入 `npm run test:electron-plugins`，使用设置页生成的发行包 stdio 配置与 HTTP。
 - 涉及设置页：`npm --prefix web run check` 与 `test:mcp-server` 等对应回归。
 - 网络与安全边界变化时验证第 15 节所列风险场景，记录实际运行的范围。
 

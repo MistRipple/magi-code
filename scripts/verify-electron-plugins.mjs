@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -90,17 +91,23 @@ const provider = createServer((request, response) => {
 });
 await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
 const providerPort = provider.address().port;
+const frameTrace = [];
+const frameResponses = [];
 
 /**
  * 沙箱 iframe（opaque origin）是独立的 OOPIF 目标，不在宿主页面的帧树里。
  * 这里按 CDP 目标列表单独连接它，以只读方式检查视图 DOM，不扩大插件的任何权限。
  */
-async function inFrame(expression) {
-  // 主页卡片与主视图可能同时存在且 URL 相同；后创建的才是用户当前操作的视图。
+async function inFrame(expression, selector = '.top-tab-pane.active iframe[data-testid="plugin-view"]') {
+  const { root } = await page.call("DOM.getDocument");
+  const { nodeId } = await page.call("DOM.querySelector", { nodeId: root.nodeId, selector });
+  if (!nodeId) throw new Error(`缺少插件 iframe: ${selector}`);
+  const { node } = await page.call("DOM.describeNode", { nodeId });
   const targets = (await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json())
     .filter((item) => item.type === "iframe" && item.url.includes(`/api/plugins/${PLUGIN_ID}/ui/`));
-  const latest = targets.at(-1);
-  const frame = await connectTarget(cdpPort, (item) => item.id === latest?.id, "插件视图 iframe 目标");
+  frameTrace.push({ at: Date.now(), selector, frameId: node.frameId, attributes: node.attributes, targets: targets.map(({ id, url }) => ({ id, url })) });
+  if (frameTrace.length > 80) frameTrace.shift();
+  const frame = await connectTarget(cdpPort, (item) => item.id === node.frameId, "指定插件 iframe", rendererErrors);
   try {
     return await frame.evaluate(expression);
   } finally {
@@ -182,6 +189,12 @@ try {
     return candidate;
   }, "打包 Electron App Renderer 就绪", 60_000, 500);
   tools = pageTools(page);
+  await page.call("Network.enable");
+  page.on("Network.responseReceived", ({ frameId, response }) => {
+    if (response.url.includes(`/api/plugins/${PLUGIN_ID}/ui/`)) {
+      frameResponses.push({ frameId, url: response.url, status: response.status });
+    }
+  });
   check("打包 Electron 启动并渲染工作台", true);
 
   // 1. 安装（本地包）+ 工作区
@@ -358,9 +371,25 @@ try {
   await click(page, '[aria-label="新增面板"]');
   await waitFor(() => exists(page, '.right-pane-add-menu button[data-kind="plugin"]'), "右栏新增菜单出现插件视图");
   await click(page, '.right-pane-add-menu button[data-kind="plugin"]');
-  await waitFor(() => exists(page, '[data-testid="plugin-view"]'), "右栏插件视图 iframe");
-  await waitFor(async () => (await inFrame(`document.getElementById('title').textContent`)) === "验收看板", "右栏视图与主页面共用同一设置与资源");
+  await waitFor(() => exists(page, '.right-pane iframe[data-testid="plugin-view"]'), "右栏插件视图 iframe");
+  const rightFrameUrl = await page.evaluate(`document.querySelector('.right-pane iframe[data-testid="plugin-view"]').src`);
+  await waitFor(async () => (await inFrame(`document.getElementById('title')?.textContent`, '.right-pane iframe[data-testid="plugin-view"]')) === "验收看板", "右栏视图与主页面共用同一设置与资源");
+  const rightFrameId = frameTrace.at(-1).frameId;
+  check("右栏插件视图使用唯一应用作用域并成功加载", new URL(rightFrameUrl).searchParams.get("scope") === "application"
+    && await waitFor(() => frameResponses.some((response) => response.frameId === rightFrameId && response.url === rightFrameUrl && response.status === 200), "右栏插件页面 HTTP 200"));
   check("右栏可打开同一插件视图并读取同一数据源", true);
+  for (let cycle = 0; cycle < 6; cycle++) {
+    await click(page, '.right-pane-tab.active .right-pane-tab-close');
+    await waitFor(async () => !(await exists(page, '.right-pane iframe[data-testid="plugin-view"]')), "右栏插件视图关闭");
+    await waitFor(async () => {
+      await page.evaluate(`document.querySelector('[aria-label="展开右侧面板"]')?.click()`);
+      return exists(page, '[aria-label="新增面板"]');
+    }, "关闭后重新展开右栏");
+    await click(page, '[aria-label="新增面板"]');
+    await click(page, '.right-pane-add-menu button[data-kind="plugin"]');
+    await waitFor(async () => (await inFrame(`document.getElementById('title')?.textContent`, '.right-pane iframe[data-testid="plugin-view"]')) === "验收看板", "重新挂载的右栏插件视图读取设置");
+  }
+  check("右栏连续关闭重开六次仍读取同一设置且主页面保持独立", (await inFrame(`document.getElementById('title').textContent`)) === "验收看板");
 
   // 添加菜单由插件投影驱动：插件视图项带稳定身份，末尾固定「管理插件」直达设置页插件分类。
   await click(page, '[aria-label="新增面板"]');
@@ -650,6 +679,60 @@ try {
   check("开放权限也自动执行删除类 MCP 工具", autoRemove.result?.isError !== true && !removedFileStillExists, JSON.stringify(autoRemove).slice(0, 200));
   const autoExec = await autoCall("magi.shell.exec", { command: "printf open-mode" });
   check("开放权限也自动执行命令工具", autoExec.result?.isError !== true && JSON.stringify(autoExec).includes("open-mode"), JSON.stringify(autoExec).slice(0, 200));
+  // 使用设置页实际生成的配置，验证发行包自己的 stdio 中继，避免维护另一套命令与权限合同。
+  const snippets = JSON.parse((await api(page, `/api/mcp-server/config-snippets?tokenId=${autoIssued.token.tokenId}`)).body);
+  const relayConfig = Object.values(snippets.stdioJson.mcpServers)[0];
+  const relay = spawn(relayConfig.command, relayConfig.args, {
+    env: { ...process.env, ...relayConfig.env }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  const replies = new Map();
+  const lines = createInterface({ input: relay.stdout });
+  let relayError = null;
+  relay.on("error", (error) => { relayError = error; });
+  relay.stderr.on("data", () => {});
+  lines.on("line", (line) => { const reply = JSON.parse(line); replies.set(reply.id, reply); });
+  let relayId = 0;
+  const send = async (method, params) => {
+    const id = ++relayId;
+    relay.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    return waitFor(() => {
+      if (relayError) throw relayError;
+      if (relay.exitCode !== null && !replies.has(id)) throw new Error("stdio 中继提前退出");
+      return replies.get(id);
+    }, `stdio ${method}`, 10_000);
+  };
+  try {
+    const initialized = await send("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "plugin-e2e-stdio", version: "1" } });
+    check("生成的客户端配置可通过发行包 stdio 中继握手", initialized.result?.serverInfo?.name === "magi");
+    const listed = await send("tools/list", {});
+    const names = (listed.result?.tools ?? []).map((tool) => tool.name);
+    check("stdio 目录统一包含读取、写入、删除和命令", ["magi.fs.read", "magi.fs.write", "magi.fs.remove", "magi.shell.exec"].every((name) => names.includes(name)));
+    const read = await send("tools/call", { name: "magi.fs.read", arguments: { path: "external-read.txt" } });
+    check("stdio 读取真实工作区内容", read.result?.isError === false && JSON.stringify(read).includes("hello from an external agent"));
+    const write = await send("tools/call", { name: "magi.fs.write", arguments: { path: "stdio-write.txt", content: "via packaged stdio" } });
+    check("stdio 开放权限写入实际文件", write.result?.isError === false && (await readFile(join(workspaceRoot, "stdio-write.txt"), "utf8")) === "via packaged stdio");
+    const escape = await send("tools/call", { name: "magi.fs.read", arguments: { path: "../outside.txt" } });
+    check("stdio 越出工作区拒绝", escape.result?.isError === true);
+    const cancelId = relayId + 1;
+    const pendingShell = send("tools/call", { name: "magi.shell.exec", arguments: {
+      command: "printf started > stdio-cancel-started.txt; sleep 30; printf finished > stdio-cancel-finished.txt",
+    } });
+    await waitFor(() => access(join(workspaceRoot, "stdio-cancel-started.txt")).then(() => true).catch(() => false), "stdio 命令实际开始");
+    const concurrentRead = await send("tools/call", { name: "magi.fs.read", arguments: { path: "external-read.txt" } });
+    relay.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: cancelId } })}\n`);
+    const cancelledShell = await pendingShell;
+    check("stdio 取消通知终止指定命令并保留另一条读取结果", cancelledShell.result?.isError === true
+      && JSON.stringify(cancelledShell).includes("cancelled") && concurrentRead.result?.isError === false
+      && !(await access(join(workspaceRoot, "stdio-cancel-finished.txt")).then(() => true).catch(() => false)), JSON.stringify(cancelledShell).slice(0, 250));
+  } finally {
+    lines.close();
+    relay.stdin.end();
+    relay.kill();
+  }
+  const invalidRelay = await execFileAsync(relayConfig.command, relayConfig.args, {
+    env: { ...process.env, ...relayConfig.env, MAGI_MCP_TOKEN: "magi_mcp_wrong" }, timeout: 5_000,
+  }).then((output) => output, (error) => error);
+  check("stdio 错误令牌被拒绝并断开", /unauthorized/u.test(invalidRelay.stdout ?? ""));
   const issued = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "e2e-agent", workspaceId, ttlDays: 1 })).body);
   const mcpCall = (name, args_) => fetch(restoredUrl, {
     method: "POST",
@@ -721,6 +804,28 @@ try {
   }
   const writtenAgain = await writingAgain;
   check("每次询问模式对下一次写入再次确认", secondApprovalAppeared && writtenAgain.result?.isError !== true, JSON.stringify(writtenAgain).slice(0, 200));
+  const deniedWritePending = mcpCall("magi.fs.write", { path: "denied-write.txt", content: "must not be written" });
+  const deniedApproval = await waitFor(async () => JSON.parse((await api(page, "/api/mcp-server/approvals")).body).approvals.find((approval) => approval.tokenId === issued.token.tokenId), "拒绝写入的待确认");
+  await post(page, "/api/mcp-server/approvals/resolve", { approvalId: deniedApproval.approvalId, decision: "deny" });
+  const deniedWrite = await deniedWritePending;
+  check("拒绝当前 MCP 写入不产生文件", deniedWrite.result?.isError === true && !(await access(join(workspaceRoot, "denied-write.txt")).then(() => true).catch(() => false)));
+  const cancelledWritePending = mcpCall("magi.fs.write", { path: "cancelled-write.txt", content: "must not be written" });
+  await waitFor(() => page.evaluate(`[...document.querySelectorAll('[data-approval-id]')].some((tray) => tray.innerText.includes('cancelled-write.txt'))`), "取消前出现对应写入的授权托盘");
+  const cancelledNotification = await fetch(restoredUrl, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}` },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } }),
+  });
+  const cancelledWrite = await cancelledWritePending;
+  check("HTTP 取消待审批调用不产生文件", cancelledNotification.status === 202 && cancelledWrite.result?.isError === true
+    && JSON.stringify(cancelledWrite).includes("cancelled")
+    && !(await access(join(workspaceRoot, "cancelled-write.txt")).then(() => true).catch(() => false)));
+  await waitFor(async () => !(await exists(page, '[data-approval-id]')), "取消后授权托盘消失");
+  const cancelledCard = await waitFor(() => page.evaluate(`(() => { const card = [...document.querySelectorAll('.tool-call')].find((card) => card.innerText.includes('cancelled-write.txt') && card.querySelector('.status-cancelled')); return card ? card.innerText + ' ' + card.querySelector('.status-cancelled').getAttribute('aria-label') : ''; })()`), "取消写入的工具卡片显示已取消");
+  check("取消后的界面没有遗留审批且工具卡片标记已取消", /已取消|Cancelled/iu.test(cancelledCard), cancelledCard.slice(0, 200));
+  const changes = await autoCall("magi.changes.list", {});
+  check("MCP 变更账本包含真实写入", changes.result?.isError === false && JSON.stringify(changes).includes("auto-mode.txt"));
+  const audit = await api(page, "/api/mcp-server/audit?limit=20");
+  check("MCP 审计保留记录且不回显令牌", JSON.parse(audit.body).entries.length > 0 && !audit.body.includes(issued.secret) && !audit.body.includes(autoIssued.secret));
   // 不保存调用内容：读到的内容不落库，动作与路径保留。
   const retention = await fetch(`http://127.0.0.1:${daemonPort}/api/mcp-server/external`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ saveContent: false, retentionDays: 30 }) });
   check("可关闭保存调用内容", retention.status === 200);
@@ -739,14 +844,40 @@ try {
   check("关闭保存后外部调用本身仍然成功", privateRead.result?.isError !== true);
   const turnsText = JSON.stringify(JSON.parse((await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body));
   check("关闭保存后读到的内容不落库、动作与路径保留", !turnsText.includes("very private body") && turnsText.includes("private.txt"), turnsText.slice(0, 200));
+  await waitFor(async () => {
+    const history = JSON.parse((await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body);
+    return history.canonicalTurns.at(-1)?.status === 'completed';
+  }, "外部调用空闲后 daemon 收口活动段", 45_000);
+  await waitFor(() => page.evaluate(`!document.querySelector('.runtime-diagnostics-slot')?.innerText.includes('运行中')
+    && !document.querySelector('.turn-runtime-indicator')`), "外部活动段完成后界面不再显示运行中");
+  check("外部活动段自动收口且实时清理运行状态，无需刷新", true);
   await fetch(`http://127.0.0.1:${daemonPort}/api/mcp-server/external`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ saveContent: true, retentionDays: 30 }) });
+
+  const revokedShellPending = autoCall("magi.shell.exec", { command: "printf started > revoke-shell-started.txt; sleep 2; printf finished > revoke-shell-finished.txt" });
+  await waitFor(() => access(join(workspaceRoot, "revoke-shell-started.txt")).then(() => true).catch(() => false), "吊销前命令实际开始");
+  await api(page, `/api/mcp-server/tokens/${autoIssued.token.tokenId}`, { method: "DELETE" });
+  const revokedShell = await revokedShellPending;
+  check("吊销令牌停止在途命令且不产生后续写入", revokedShell.result?.isError === true
+    && JSON.parse(revokedShell.result.content[0].text).cancelled === true
+    && !(await access(join(workspaceRoot, "revoke-shell-finished.txt")).then(() => true).catch(() => false)), JSON.stringify(revokedShell).slice(0, 200));
+  const revoked = await fetch(restoredUrl, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${autoIssued.secret}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping", params: {} }) });
+  check("吊销客户端令牌后 HTTP 立即拒绝", revoked.status === 401);
+  const revokedSession = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions.find((session) => session.tokenId === autoIssued.token.tokenId);
+  await click(page, `.session-item[data-session-id="${revokedSession.sessionId}"]`);
+  await waitFor(() => page.evaluate(`(() => {
+    const card = [...document.querySelectorAll('.tool-call')].find((card) => card.innerText.includes('revoke-shell-started.txt'));
+    return Boolean(card?.querySelector('.status-cancelled'));
+  })()`), "吊销命令的会话卡片显示已取消");
+  check("吊销后会话卡片显示实际取消状态", true);
 
   await post(page, "/api/mcp-server/enabled", { enabled: false });
   await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
 
   // 11. Renderer 无未处理异常
   const logText = electronLog.join("");
+  check("历史快照与实时事件无 canonical 事实冲突", !rendererErrors.some((error) => error.includes('[canonical-turn-store]')), rendererErrors.slice(-4).join('\n'));
   check("Electron 日志没有 Desktop IPC 协议拒绝", !/IPC.*(validation|拒绝)/iu.test(logText));
+  check("插件 iframe 没有 sandbox 初始化异常或串入应用消息协议", !/sandboxed_renderer.bundle.js script failed|binding.startupData|未知消息类型: request/u.test([...rendererErrors, logText].join("\n")));
 } catch (error) {
   failure = error;
   if (page) {
@@ -759,11 +890,22 @@ try {
   }
   process.stderr.write(`\n[Electron 日志尾部]\n${electronLog.join("").slice(-2500)}\n`);
 } finally {
+  if (failure || process.env.MAGI_ELECTRON_PLUGINS_DIAGNOSTICS_DIR) {
+    const diagnostics = process.env.MAGI_ELECTRON_PLUGINS_DIAGNOSTICS_DIR || workRoot;
+    await mkdir(diagnostics, { recursive: true });
+    await writeFile(join(diagnostics, "frames.json"), JSON.stringify({ failure: failure?.message, frameTrace, frameResponses, rendererErrors }, null, 2));
+    await writeFile(join(diagnostics, "electron.log"), electronLog.join(""));
+    if (page) {
+      const screenshot = await page.call("Page.captureScreenshot", { format: "png" }).catch(() => null);
+      if (screenshot) await writeFile(join(diagnostics, "screen.png"), Buffer.from(screenshot.data, "base64"));
+    }
+    process.stdout.write(`验收现场已保存: ${diagnostics}\n`);
+  }
   page?.close();
   await app.stop();
   provider.closeAllConnections?.();
   provider.close();
-  await rm(workRoot, { recursive: true, force: true }).catch(() => {});
+  if (!failure) await rm(workRoot, { recursive: true, force: true }).catch(() => {});
 }
 
 process.stdout.write(`\n${summary()}\n`);

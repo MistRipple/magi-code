@@ -34,6 +34,7 @@ const EXTERNAL_DENIED_RELATIVE_PATHS: &[&str] = &[".magi"];
 
 /// 一次外部工具调用。`tool_name` 必须是内部内置工具名（公开名到内部名的映射在 MCP 层）。
 pub struct ExternalToolCall<'a> {
+    pub cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub call_id: &'a str,
     pub tool_name: &'a str,
     pub arguments_json: &'a str,
@@ -253,6 +254,13 @@ pub fn execute_external_tool_call(
     call: &ExternalToolCall<'_>,
     approval_granted: bool,
 ) -> (String, ExecutionResultStatus) {
+    if call
+        .cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return (serde_json::json!({ "tool": call.tool_name, "status": "cancelled", "error_code": "tool_cancelled", "error": "调用已取消，工具未执行" }).to_string(), ExecutionResultStatus::Cancelled);
+    }
     let Some(target) = resolve_target(registry, call.tool_name) else {
         return rejected(call.tool_name, "该工具不对外部调用开放");
     };
@@ -336,7 +344,12 @@ pub fn execute_external_tool_call(
                     tool.as_str(),
                     call.arguments_json.to_string(),
                 );
-                let output = registry.execute_with_policy(input, context, &tool_policy);
+                let output = registry.execute_with_cancellation(
+                    input,
+                    context,
+                    &tool_policy,
+                    call.cancellation.clone(),
+                );
                 (output.payload, output.status)
             }
             ExternalTarget::DownstreamMcp => registry
@@ -426,6 +439,7 @@ mod tests {
         session: &'a SessionId,
     ) -> ExternalToolCall<'a> {
         ExternalToolCall {
+            cancellation: None,
             call_id: "call-1",
             tool_name: tool,
             arguments_json: args,

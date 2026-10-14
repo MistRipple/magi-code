@@ -41,18 +41,9 @@
 
 “禁止兼容和补丁”在本方案中指不保留旧功能执行分支、影子实现或静默兜底。新插件仍须声明支持的 SDK 契约版本；不受支持时明确拒绝加载，不尝试另一种解释执行。
 
-## 2. 当前基础与设计缺口
+## 2. 当前实现入口
 
-本节根据本次源码和架构文档检查记录，不把已有原生能力等同于插件系统。
-
-| 当前入口 | 已有基础 | 本方案需要补齐 |
-| --- | --- | --- |
-| [`settings-tabs.ts`](../web/src/lib/settings-tabs.ts)、[`SettingsPanel.svelte`](../web/src/components/SettingsPanel.svelte) | 设置分类静态清单和内容分支 | 受控的贡献注册、动态导航和统一设置存储 |
-| [`right-pane.svelte.ts`](../web/src/stores/right-pane.svelte.ts) | 右侧 Tab、作用域、布局和实体引用 | 通用插件视图身份与承载接口，不再为每个插件增加业务 kind |
-| [`daemon/runtime.rs`](../crates/magi-daemon/src/daemon/runtime.rs) | 工具、Skill、任务运行及状态装配 | 插件安装、激活、资源释放和能力桥接的统一所有者 |
-| [`magi-tool-runtime`](../crates/magi-tool-runtime/src/lib.rs) | 工具目录、调用上下文、治理和执行 | 插件工具全局注册，所有工作区共用，继续复用原工具治理入口 |
-| [`task_execution_dispatcher.rs`](../crates/magi-conversation-runtime/src/task_execution_dispatcher.rs) | 现有任务执行入口；同一文件内还承担上下文预算、Skill 调度与 worktree 清理 | 会话引擎统一经 `SessionEngineFactory` 路由；仍需继续抽取工作流决策合同，保留既有调度和终态责任 |
-| [`magi-web-model`](../crates/magi-web-model/src/lib.rs) | GPT Web 功能实现 | 划分可选功能与原生浏览器/MCP 边界，完成单次切换 |
+本节记录已接入的唯一入口；未关闭的设计与平台边界见第 10、12 节。
 
 当前已接入的实现入口：`magi-plugin-system::PluginManager` 由 daemon 恢复并通过 `/api/plugins/*` 提供唯一安装、升级、授权、启用、激活、停用、禁用和卸载入口；`PluginResourceStore` 由同一管理器持有，资源键包含插件、作用域（固定为 `application`）和资源 ID，并执行版本冲突检查；插件设置使用同一版本化资源服务并按声明 schema 校验；激活插件的工具贡献全局进入 `ToolRegistry`，模型调用和实际执行使用同一工具目录与插件 Worker。`/api/plugins/{id}/ui/{path}` 只服务已激活包内的 `ui/` 资源，隔离 iframe 通过受控消息桥读取和提交资源。Web 右栏对 active manifest 的 `rightPane` 视图提供隔离 iframe 承载，设置页展示插件声明的权限后再执行授权激活。未声明的贡献仍不会注册到任何目录或入口。
 

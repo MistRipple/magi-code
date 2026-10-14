@@ -11,7 +11,7 @@ use crate::mcp_config::{
     build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
     normalize_mcp_server_snapshot_entry,
 };
-use crate::routes::settings::{
+use crate::model_config::{
     registered_role_template_ids, resolve_registry_agents, role_templates_for_registry,
 };
 use crate::scope_binding::strip_scope_binding_fields;
@@ -24,8 +24,7 @@ use magi_browser_authority::{
     BrowserAuthority, BrowserAuthorityError, BrowserCapabilitySnapshot, BrowserControlLease,
     BrowserDurableState, BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome,
     BrowserHostControlUpdate, BrowserHostStatus, BrowserLeaseEndReason, BrowserLeaseSelector,
-    BrowserProfile, BrowserProfileKind, BrowserSession, BrowserSessionLifecycle,
-    BrowserSurfaceControlSnapshot,
+    BrowserProfile, BrowserProfileKind, BrowserSessionLifecycle, BrowserSurfaceControlSnapshot,
 };
 #[cfg(test)]
 use magi_conversation_runtime::task_runner_bridge::EventBasedResultReceiver;
@@ -2711,7 +2710,8 @@ impl ApiState {
         let state = self.clone();
         spawn_session_turn_work("magi-browser-child-tab-close", async move {
             for tab_id in created_tabs {
-                if let Err(error) = crate::routes::browser::close_browser_tab(&state, &tab_id).await
+                if let Err(error) =
+                    crate::browser_tool_runtime::close_browser_tab(&state, &tab_id).await
                 {
                     tracing::warn!(%tab_id, ?error, "关闭子任务新开的浏览器标签页失败");
                 }
@@ -2946,70 +2946,6 @@ impl ApiState {
             .read()
             .expect("browser Host client lock poisoned")
             .clone()
-    }
-
-    /// 关闭一个 Magi 会话拥有的 Browser Session 及其物理 Page。
-    ///
-    /// Browser Session 不是独立于 Magi 会话的全局资源。会话关闭或删除时，
-    /// 必须先让 Host 释放 Chromium Page，再收口 Authority，避免历史逻辑 Tab
-    /// 在重启后继续占用全局容量。
-    pub async fn close_browser_session_for_magi_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<BrowserSession>, ApiError> {
-        let tab_ids = self
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned")
-            .session_for_magi_session(session_id)
-            .map(|session| session.tab_ids.clone())
-            .unwrap_or_default();
-        let _control_guards = self.browser_control_locks.lock_tabs(&tab_ids).await;
-        let browser_session = self
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned")
-            .session_for_magi_session(session_id)
-            .cloned();
-        let Some(browser_session) = browser_session else {
-            return Ok(None);
-        };
-
-        if let Some(client) = self.browser_host_client() {
-            for tab_id in &browser_session.tab_ids {
-                match client
-                    .request(BrowserHostCommand::ClosePage {
-                        tab_id: tab_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(reply)
-                        if matches!(
-                            reply.response.outcome,
-                            BrowserHostCommandOutcome::Succeeded(_)
-                        ) => {}
-                    Ok(reply) => tracing::warn!(
-                        %tab_id,
-                        outcome = ?reply.response.outcome,
-                        "会话生命周期结束时 Host 未能关闭浏览器 Page，继续收口权威状态"
-                    ),
-                    Err(error) => tracing::warn!(
-                        %tab_id,
-                        ?error,
-                        "会话生命周期结束时 Browser Host 不可用，继续收口权威状态"
-                    ),
-                }
-            }
-        }
-
-        self.mutate_browser_authority(|authority| {
-            authority.transition_session(
-                &browser_session.browser_session_id,
-                BrowserSessionLifecycle::Closed,
-                UtcMillis::now(),
-            )
-        })
-        .map(Some)
     }
 
     /// 清理孤儿 Browser Session。
@@ -3401,7 +3337,7 @@ impl ApiState {
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": role_templates_for_registry(self.agent_role_registry.as_ref()),
-            "registryEngines": crate::routes::settings::load_registry_engines(self),
+            "registryEngines": crate::model_config::load_registry_engines(self),
             "registryAgents": resolve_registry_agents(self),
             "bootstrapScope": if hydrate_mcp_servers { "full" } else { "core" },
             "mcpServersHydrated": hydrate_mcp_servers,

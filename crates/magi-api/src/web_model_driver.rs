@@ -1397,8 +1397,6 @@ impl magi_plugin_system::SessionEngineFactory for WebModelHostFactory {
     }
 }
 
-static UPLOAD_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// 一次发送的暂存图片文件；drop 时无条件删除。
 struct StagedUploads {
     paths: Vec<PathBuf>,
@@ -1407,7 +1405,6 @@ struct StagedUploads {
 impl StagedUploads {
     fn stage(dir: &Path, images: &[ImageSource]) -> Result<Self, WebModelError> {
         use base64::Engine as _;
-        use sha2::Digest as _;
         let attach_failed =
             |message: String| WebModelError::new(WebModelErrorCode::WebAttachFailed, message);
         std::fs::create_dir_all(dir)
@@ -1417,13 +1414,12 @@ impl StagedUploads {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(image.data.trim())
                 .map_err(|_| attach_failed(format!("第 {} 张图片不是有效的 base64", index + 1)))?;
-            let digest = hex_prefix(&sha2::Sha256::digest(&bytes));
-            // 文件名带进程内唯一序号：并发发送同一张图时互不覆盖，也互不误删。
-            let sequence = UPLOAD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = dir.join(format!(
-                "{digest}-{sequence}.{}",
-                image_extension(&image.media_type)
-            ));
+            // 跨进程也不复用文件名，避免站点给历史同名上传添加后缀后丢失附件归属。
+            let mut nonce = [0_u8; 16];
+            getrandom::fill(&mut nonce)
+                .map_err(|error| attach_failed(format!("无法生成图片暂存文件名：{error}")))?;
+            let name: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+            let path = dir.join(format!("{name}.{}", image_extension(&image.media_type)));
             write_private_file(&path, &bytes)
                 .map_err(|error| attach_failed(format!("无法写入图片暂存文件：{error}")))?;
             staged.paths.push(path);
@@ -1445,14 +1441,6 @@ impl Drop for StagedUploads {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-fn hex_prefix(digest: &[u8]) -> String {
-    digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn image_extension(media_type: &str) -> &'static str {

@@ -1467,7 +1467,7 @@
         pluginId={pluginPayload.pluginId}
         entry={pluginPayload.entry}
         label={activeTab.label}
-        scope={pluginPayload.workspaceId ? `workspace:${pluginPayload.workspaceId}` : 'application'}
+        scope={APPLICATION_PLUGIN_SCOPE}
       />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>

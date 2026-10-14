@@ -1572,11 +1572,11 @@ export function normalizeWebModelProbe(snapshot: WebModelRawSnapshot): WebModelP
   const originSupported = isSupportedChatGptOrigin(snapshot.origin);
   const onChatPage = isChatRoute(snapshot.path);
   // 登录态以站点会话为准，不随用户停在哪个页面变化（插件、设置等二级页面没有输入框是正常的）。
-  // 会话接口没拿到答案时才回到页面证据：对话页要输入框与会话区，二级页面看账号入口。
+  // 会话接口没拿到答案时需账号入口；访客页面同样有输入框与会话区。
   const authenticated = typeof snapshot.sessionActive === "boolean"
     ? snapshot.sessionActive
     : onChatPage
-      ? snapshot.conversationFound && snapshot.composerFound
+      ? snapshot.accountPresent === true && snapshot.conversationFound && snapshot.composerFound
       : snapshot.accountPresent === true;
   const loginState: WebModelProbe["loginState"] = snapshot.blocked
     ? "blocked"

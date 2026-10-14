@@ -9,6 +9,7 @@ import {
   createCanonicalTurnReducerState,
   isLocalOptimisticTurn,
   reduceCanonicalTurnEvent,
+  rebuildCanonicalTurnIndexes,
   replaceCanonicalTurns,
 } from './turn-reducer';
 import { canonicalTurnRequestId } from '../shared/protocol/canonical-processing';
@@ -193,6 +194,8 @@ function normalizeSessionId(value: string | null | undefined): string {
 }
 
 function publishProjection(): SessionTimelineProjection | null {
+  // 快照合并、历史分页会替换并重排 turns；实时事件必须使用同步后的索引。
+  turnStoreState.reducer = rebuildCanonicalTurnIndexes(turnStoreState.reducer);
   turnStoreState.projection = buildCanonicalTimelineProjection(turnStoreState.reducer);
   return turnStoreState.projection;
 }

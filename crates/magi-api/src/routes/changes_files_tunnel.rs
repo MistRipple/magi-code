@@ -22,7 +22,7 @@ use magi_snapshot::SnapshotSession;
 #[cfg(test)]
 use magi_snapshot::{ToolHook, ToolHookCtx};
 
-use super::session_scope::{
+use crate::scope_binding::{
     parse_session_id, require_registered_workspace_binding,
     resolve_optional_session_workspace_scope,
 };

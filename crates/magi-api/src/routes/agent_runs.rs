@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use super::agent_run_actions::{AgentRunActionKind, available_agent_run_actions};
-use super::session_scope::{SessionRequestScope, parse_session_id, require_session_request_scope};
+use crate::scope_binding::{SessionRequestScope, parse_session_id, require_session_request_scope};
 use crate::{
     errors::ApiError,
-    routes::settings::{load_registry_engines, resolve_registry_agents},
+    model_config::{load_registry_engines, resolve_registry_agents},
     session_continue::active_execution_branch_is_continue_recoverable,
     state::ApiState,
 };
@@ -815,7 +815,7 @@ fn normalize_runner_status(status: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::session_scope::{RegisteredWorkspaceBinding, SessionScope};
+    use crate::scope_binding::{RegisteredWorkspaceBinding, SessionScope};
     use crate::state::ApiState;
     use magi_core::task::public_task_failure_output;
     use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};

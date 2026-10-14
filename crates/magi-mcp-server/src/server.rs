@@ -10,7 +10,10 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use serde_json::{Value, json};
 
@@ -117,6 +120,8 @@ pub struct ToolInvocation {
     pub attribution: AttributionTarget,
     /// 已通过校验的规范化路径。
     pub resolved_paths: Vec<PathBuf>,
+    /// 请求级取消信号；并发租约由服务端保留到宿主结算完成。
+    pub cancellation: RequestCancellation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,38 +185,113 @@ impl AuditSink for NoopAudit {
 /// 本机一个失控的客户端不应该能无限并发地占用工具运行时和审批队列。
 pub const MAX_CONCURRENT_CALLS_PER_CLIENT: usize = 8;
 
-/// 按客户端（令牌）计数的并发调用。守卫析构时归还名额。
-#[derive(Default)]
-struct InFlightCalls(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+/// 请求 ID 与取消信号复用并发登记；令牌下所有连接共用并发上限。
+#[derive(Default, Debug)]
+struct InFlightCalls(
+    std::sync::Mutex<std::collections::HashMap<(u64, String, String), Weak<AtomicBool>>>,
+);
 
-struct InFlightGuard {
-    calls: Arc<InFlightCalls>,
-    client: String,
+#[derive(Clone, Debug)]
+pub struct RequestCancellation(Arc<AtomicBool>);
+
+impl RequestCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+    fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
-impl InFlightCalls {
-    fn acquire(self: &Arc<Self>, client: &str) -> Option<InFlightGuard> {
-        let mut counts = self.0.lock().expect("in-flight counter poisoned");
-        let count = counts.entry(client.to_string()).or_insert(0);
-        if *count >= MAX_CONCURRENT_CALLS_PER_CLIENT {
-            return None;
-        }
-        *count += 1;
-        Some(InFlightGuard {
-            calls: Arc::clone(self),
-            client: client.to_string(),
-        })
-    }
+pub(crate) struct InFlightGuard {
+    cancellation: RequestCancellation,
+    key: (u64, String, String),
+    calls: Arc<InFlightCalls>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        let mut counts = self.calls.0.lock().expect("in-flight counter poisoned");
-        if let Some(count) = counts.get_mut(&self.client) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&self.client);
+        self.calls
+            .0
+            .lock()
+            .expect("in-flight counter poisoned")
+            .remove(&self.key);
+    }
+}
+
+struct CancelOnDrop(RequestCancellation);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// 每条 stdio 连接拥有独立请求身份；断连只取消该连接的调用。
+pub(crate) struct ConnectionScope {
+    pub(crate) id: u64,
+    calls: Arc<InFlightCalls>,
+}
+
+impl Drop for ConnectionScope {
+    fn drop(&mut self) {
+        let calls: Vec<_> = self
+            .calls
+            .0
+            .lock()
+            .expect("in-flight counter poisoned")
+            .iter()
+            .filter(|((scope, _, _), _)| *scope == self.id)
+            .map(|(_, call)| call.clone())
+            .collect();
+        for call in calls {
+            if let Some(call) = call.upgrade() {
+                call.store(true, Ordering::SeqCst);
             }
+        }
+    }
+}
+
+impl InFlightCalls {
+    fn acquire(
+        self: &Arc<Self>,
+        scope: u64,
+        client: &str,
+        id: &Value,
+    ) -> Result<InFlightGuard, &'static str> {
+        let mut counts = self.0.lock().expect("in-flight counter poisoned");
+        let key = (scope, client.to_string(), id.to_string());
+        if counts.contains_key(&key) {
+            return Err("该请求 ID 已有进行中的调用");
+        }
+        if counts
+            .keys()
+            .filter(|(_, token, _)| token == client)
+            .count()
+            >= MAX_CONCURRENT_CALLS_PER_CLIENT
+        {
+            return Err("该客户端同时进行的调用已达上限，请等当前调用完成后再试");
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        counts.insert(key.clone(), Arc::downgrade(&flag));
+        Ok(InFlightGuard {
+            cancellation: RequestCancellation(flag),
+            key,
+            calls: self.clone(),
+        })
+    }
+
+    fn cancel(&self, scope: u64, client: &str, id: &Value) {
+        let call = self
+            .0
+            .lock()
+            .expect("in-flight counter poisoned")
+            .get(&(scope, client.to_string(), id.to_string()))
+            .cloned();
+        if let Some(call) = call.and_then(|call| call.upgrade()) {
+            call.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -270,6 +350,52 @@ impl McpServer {
         request: JsonRpcRequest,
         now_ms: u64,
     ) -> Option<Value> {
+        let registration = self.prepare_request(principal, &request, 0);
+        self.handle_prepared(principal, request, now_ms, registration)
+            .await
+    }
+
+    pub(crate) fn connection_scope(&self) -> ConnectionScope {
+        static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
+        ConnectionScope {
+            id: NEXT_SCOPE.fetch_add(1, Ordering::Relaxed),
+            calls: self.in_flight.clone(),
+        }
+    }
+
+    /// stdio 在派发异步执行之前登记，保证紧随其后的取消通知不会越过登记。
+    pub(crate) fn prepare_request(
+        &self,
+        principal: &ClientPrincipal,
+        request: &JsonRpcRequest,
+        scope: u64,
+    ) -> Option<Result<InFlightGuard, &'static str>> {
+        if !request.is_well_formed() {
+            return None;
+        }
+        if request.is_notification()
+            && request.method == "notifications/cancelled"
+            && let Some(id) = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("requestId"))
+            && (id.is_string() || id.is_number())
+        {
+            self.in_flight.cancel(scope, &principal.token_id, id);
+        }
+        (request.method == "tools/call" && !request.is_notification()).then(|| {
+            self.in_flight
+                .acquire(scope, &principal.token_id, &request.response_id())
+        })
+    }
+
+    pub(crate) async fn handle_prepared(
+        &self,
+        principal: &ClientPrincipal,
+        request: JsonRpcRequest,
+        now_ms: u64,
+        registration: Option<Result<InFlightGuard, &'static str>>,
+    ) -> Option<Value> {
         if !request.is_well_formed() {
             return Some(error(
                 request.response_id(),
@@ -278,7 +404,6 @@ impl McpServer {
             ));
         }
         if request.is_notification() {
-            // 通知（如 notifications/initialized、notifications/cancelled）不产生响应。
             return None;
         }
         let id = request.response_id();
@@ -288,7 +413,15 @@ impl McpServer {
             "tools/list" => Some(success(id, tools_list_result(&self.catalog_for(principal)))),
             "tools/call" => {
                 let params = request.params.unwrap_or(Value::Null);
-                match self.call_tool(principal, &params, now_ms).await {
+                match self
+                    .call_tool(
+                        principal,
+                        &params,
+                        now_ms,
+                        registration.expect("tool request registered"),
+                    )
+                    .await
+                {
                     Ok(result) => Some(success(id, result)),
                     Err(message) => Some(error(id, JSONRPC_INVALID_PARAMS, message)),
                 }
@@ -307,6 +440,7 @@ impl McpServer {
         principal: &ClientPrincipal,
         params: &Value,
         now_ms: u64,
+        registration: Result<InFlightGuard, &'static str>,
     ) -> Result<Value, String> {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return Err("缺少工具名 name".to_string());
@@ -363,15 +497,12 @@ impl McpServer {
         }
 
         // 并发上限：占住名额直到本次调用结束（含等待审批的时间）。
-        let Some(_in_flight) = self.in_flight.acquire(&principal.token_id) else {
-            return Ok(deny(
-                format!(
-                    "该客户端同时进行的调用已达上限（{MAX_CONCURRENT_CALLS_PER_CLIENT} 个），请等当前调用完成后再试"
-                ),
-                Vec::new(),
-                false,
-            ));
+        let in_flight = match registration {
+            Ok(guard) => guard,
+            Err(message) => return Ok(deny(message.to_string(), Vec::new(), false)),
         };
+        let cancellation = in_flight.cancellation.clone();
+        let _cancel_on_drop = CancelOnDrop(cancellation.clone());
 
         let attribution = match self.attribution.resolve(principal) {
             Ok(target) => target,
@@ -416,20 +547,36 @@ impl McpServer {
             requires_approval,
             attribution,
             resolved_paths: resolved_paths.clone(),
+            cancellation,
         };
-        let outcome = self.backend.invoke(invocation).await;
-
-        self.audit.record(AuditEvent {
+        let backend = self.backend.clone();
+        let audit = self.audit.clone();
+        let event = AuditEvent {
             token_id: principal.token_id.clone(),
             client_name: principal.client_name.clone(),
             workspace_id: principal.workspace_id.clone(),
             tool: mapping.public_name.clone(),
             requires_approval,
             paths: paths_summary(&resolved_paths),
-            outcome: AuditOutcome::Executed {
-                is_error: outcome.is_error,
-            },
+            outcome: AuditOutcome::Executed { is_error: false },
             at_ms: now_ms,
+        };
+        // 请求被丢弃时通知取消，但后端必须结算实际副作用、时间线和审计。
+        let outcome = tokio::spawn(async move {
+            let _in_flight = in_flight;
+            let outcome = backend.invoke(invocation).await;
+            audit.record(AuditEvent {
+                outcome: AuditOutcome::Executed {
+                    is_error: outcome.is_error,
+                },
+                ..event
+            });
+            outcome
+        })
+        .await
+        .unwrap_or_else(|_| InvocationOutcome {
+            text: "工具执行意外中断".into(),
+            is_error: true,
         });
 
         let text = truncate_with_notice(outcome.text, MAX_RESULT_BYTES);
@@ -877,6 +1024,7 @@ mod tests {
     /// 调用会一直挂起直到被放行的后端，用来占住并发名额。
     #[derive(Default)]
     struct BlockingBackend {
+        entered: tokio::sync::Notify,
         gate: tokio::sync::Notify,
     }
 
@@ -890,6 +1038,7 @@ mod tests {
         }
         fn invoke<'a>(&'a self, _invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
             Box::pin(async move {
+                self.entered.notify_one();
                 self.gate.notified().await;
                 InvocationOutcome {
                     text: "ok".to_string(),
@@ -897,6 +1046,69 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn dropped_request_keeps_its_permit_until_actual_execution_and_audit_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let audit = Arc::new(Audit::default());
+        let server = Arc::new(
+            McpServer::new(
+                "magi",
+                "test",
+                backend.clone(),
+                Arc::new(Root(dir.path().into())),
+            )
+            .with_audit(audit.clone()),
+        );
+        let running = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .handle(
+                        &principal(Profile::Exec),
+                        call("magi.fs.read", json!({})),
+                        1,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+            .await
+            .unwrap();
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        {
+            let calls = server.in_flight.0.lock().unwrap();
+            assert_eq!(calls.len(), 1, "执行尚未结算，不得提前归还并发名额");
+            assert!(
+                calls
+                    .values()
+                    .next()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .load(Ordering::SeqCst)
+            );
+        }
+        backend.gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !server.in_flight.0.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                events[0].outcome,
+                AuditOutcome::Executed { is_error: false }
+            ),
+            "已完成的真实副作用不能伪报取消"
+        );
     }
 
     #[tokio::test]
@@ -911,19 +1123,34 @@ mod tests {
         ));
         let busy = principal(Profile::ReadOnly);
         let mut pending = Vec::new();
-        for _ in 0..MAX_CONCURRENT_CALLS_PER_CLIENT {
+        for id in 0..MAX_CONCURRENT_CALLS_PER_CLIENT {
             let server = Arc::clone(&server);
             let busy = busy.clone();
             pending.push(tokio::spawn(async move {
                 server
-                    .handle(&busy, call("magi.fs.read", json!({})), 1)
+                    .handle(
+                        &busy,
+                        request(
+                            "tools/call",
+                            Some(json!(id)),
+                            json!({"name":"magi.fs.read"}),
+                        ),
+                        1,
+                    )
                     .await
             }));
         }
         // 等所有调用都占住名额。
         for _ in 0..200 {
-            if server.in_flight.0.lock().unwrap().get("tok-1").copied()
-                == Some(MAX_CONCURRENT_CALLS_PER_CLIENT)
+            if server
+                .in_flight
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(_, token, _)| token == "tok-1")
+                .count()
+                == MAX_CONCURRENT_CALLS_PER_CLIENT
             {
                 break;
             }
@@ -931,7 +1158,15 @@ mod tests {
         }
 
         let refused = server
-            .handle(&busy, call("magi.fs.read", json!({})), 1)
+            .handle(
+                &busy,
+                request(
+                    "tools/call",
+                    Some(json!(99)),
+                    json!({"name":"magi.fs.read"}),
+                ),
+                1,
+            )
             .await
             .unwrap();
         assert!(is_error(&refused), "{refused}");
@@ -960,5 +1195,54 @@ mod tests {
             server.in_flight.0.lock().unwrap().is_empty(),
             "名额必须全部归还"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_bound_to_connection_client_and_typed_request_id() {
+        let h = harness();
+        let p = principal(Profile::Exec);
+        let first = h.server.connection_scope();
+        let second = h.server.connection_scope();
+        let numeric = request("tools/call", Some(json!(1)), json!({"name":"magi.fs.read"}));
+        let text = request(
+            "tools/call",
+            Some(json!("1")),
+            json!({"name":"magi.fs.read"}),
+        );
+        let a = h
+            .server
+            .prepare_request(&p, &numeric, first.id)
+            .unwrap()
+            .unwrap();
+        let b = h
+            .server
+            .prepare_request(&p, &numeric, second.id)
+            .unwrap()
+            .unwrap();
+        let c = h
+            .server
+            .prepare_request(&p, &text, first.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            h.server
+                .prepare_request(&p, &numeric, first.id)
+                .unwrap()
+                .is_err()
+        );
+        let cancellation = request("notifications/cancelled", None, json!({"requestId":1}));
+        let mut other = p.clone();
+        other.token_id = "other".into();
+        h.server.prepare_request(&other, &cancellation, first.id);
+        assert!(!a.cancellation.is_cancelled());
+        h.server.prepare_request(&p, &cancellation, first.id);
+        assert!(a.cancellation.is_cancelled());
+        assert!(!b.cancellation.is_cancelled());
+        assert!(!c.cancellation.is_cancelled());
+        drop(first);
+        assert!(c.cancellation.is_cancelled());
+        assert!(!b.cancellation.is_cancelled());
+        drop((a, b, c));
+        assert!(h.server.in_flight.0.lock().unwrap().is_empty());
     }
 }

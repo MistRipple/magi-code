@@ -1,9 +1,8 @@
 mod agent_run_actions;
 mod agent_runs;
 mod appearance;
-pub(crate) mod browser;
+mod browser;
 mod changes_files_tunnel;
-mod dispatch_flow;
 mod file_site;
 mod goals;
 mod knowledge;
@@ -13,12 +12,10 @@ mod messages;
 mod plugins;
 pub use plugins::{write_plugin_resource_with_event, write_plugin_settings_with_event};
 mod session_isolation;
-mod session_scope;
-pub(crate) mod sessions;
-pub(crate) mod settings;
+mod sessions;
+mod settings;
 mod terminal;
 mod tools;
-mod turn_input;
 mod workspace_vcs;
 mod workspaces;
 
@@ -208,6 +205,17 @@ pub(crate) mod test_turn_fixtures {
     }
 }
 
+use crate::scope_binding::{require_session_record_in_scope, resolve_explicit_session_scope};
+use crate::{
+    dto::{
+        AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
+        BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
+        SessionScopeKindDto, VersionHandshakeDto,
+    },
+    errors::ApiError,
+    sse,
+    state::ApiState,
+};
 use axum::{
     Json, Router,
     extract::{Query, Request, State},
@@ -219,73 +227,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use magi_core::{SessionId, UtcMillis, WorkspaceId};
-use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn};
+use magi_core::SessionId;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static ACCEPTED_AT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn monotonic_accepted_at() -> UtcMillis {
-    let now = UtcMillis::now().0;
-    let prev = ACCEPTED_AT_COUNTER.fetch_max(now, Ordering::SeqCst);
-    let ts = if now <= prev { prev + 1 } else { now };
-    ACCEPTED_AT_COUNTER.store(ts, Ordering::SeqCst);
-    UtcMillis(ts)
-}
-
-pub(super) fn new_session_id() -> SessionId {
-    let nonce = SESSION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-    SessionId::new(format!("session-{}-{}", UtcMillis::now().0, nonce))
-}
-
-pub(super) fn publish_superseded_turn_event(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<&WorkspaceId>,
-    turn: &CanonicalTurn,
-) {
-    state.event_bus.publish(
-        EventEnvelope::domain(
-            magi_core::EventId::unique(format!("event-session-turn-superseded-{}", turn.turn_id)),
-            "session.turn.superseded",
-            serde_json::json!({
-                "session_id": session_id,
-                "workspace_id": workspace_id,
-                "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
-                "canonical_event_kind": "turn_superseded",
-                "canonical_turn": turn,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.cloned(),
-            ..EventContext::default()
-        }),
-    );
-}
-
-use crate::{
-    dto::{
-        AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
-        BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
-        SessionScopeKindDto, VersionHandshakeDto,
-    },
-    errors::ApiError,
-    sse,
-    state::ApiState,
-};
-use session_scope::{require_session_record_in_scope, resolve_explicit_session_scope};
-
-pub(crate) use dispatch_flow::schedule_restored_session_task_dispatches;
-use dispatch_flow::{
-    SessionTaskSubmissionInput, accept_goal_continuation_task_submission,
-    accept_session_task_submission_at, dispatch_accepted_canonical_event,
-    schedule_session_task_dispatch,
-};
-use turn_input::user_signal_from_request;
 
 pub fn build_router(state: ApiState) -> Router {
     let tunnel_manager = state.tunnel_manager.clone();

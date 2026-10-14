@@ -369,6 +369,35 @@ try {
 
   }
 
+  if (questionFixture) {
+    // 页面在等待作答时停止：覆盖项目归属、canonical 终态与 Web 槽位结算。
+    await sendComposerMessage('停止验收：问我晚餐想吃什么并等待我的回答');
+    await waitFor(() => tools.exists('[data-user-question-id]'), "停止前网页问题处于等待回答");
+    const runtime = await tools.api('/api/browser/web-models/runtime');
+    const owner = JSON.parse(runtime.body).entries.find(entry => entry.active);
+    const activeHistory = await tools.api('/api/messages?' + new URLSearchParams({ scope: 'workspace', sessionId: owner.sessionId, workspaceId }));
+    const turnId = JSON.parse(activeHistory.body).canonicalTurns.at(-1)?.turnId;
+    check("停止前 GPT Web 活跃会话绑定到项目", owner?.workspaceId === workspaceId && Boolean(turnId), runtime.body);
+    await tools.click('[data-testid="sidebar-settings"]');
+    await waitFor(() => tools.exists('[data-testid="settings-nav-webModel"]'), "停止验收设置入口");
+    await tools.click('[data-testid="settings-nav-webModel"]');
+    await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-web-model-stop]:not([disabled])'))`), "设置停止按钮可用");
+    await tools.click('[data-web-model-stop]');
+    await waitFor(() => tools.exists('.confirm-btn--danger'), "停止活跃推理的确认框");
+    await tools.click('.confirm-btn--danger');
+    await waitFor(async () => {
+      const status = await tools.api('/api/browser/web-models/runtime');
+      return status.status === 200 && JSON.parse(status.body).entries.length === 0;
+    }, "设置停止释放 Web 槽位", 30_000);
+    const history = await tools.api('/api/messages?' + new URLSearchParams({ scope: 'workspace', sessionId: owner.sessionId, workspaceId }));
+    const turn = JSON.parse(history.body).canonicalTurns.find(turn => turn.turnId === turnId);
+    check("设置停止使项目会话的 canonical Turn 进入 cancelled", turn?.status === 'cancelled', JSON.stringify(turn));
+    await tools.click('[data-testid="settings-back"]');
+    await waitFor(async () => !(await tools.exists('[data-testid="input-stop-button"]')) && !(await tools.exists('[data-user-question-id]')), "停止后输入恢复且无遗留问题面板");
+    check("停止后输入恢复且问题面板清理", true);
+    await snap('stopped-workspace-turn');
+  }
+
   // 停用：插件全局生效，一次停用后入口、接口与右栏视图全部消失。
   const offApp = await tools.post(`/api/plugins/${PLUGIN_ID}/deactivate`, { scope: "application" });
   check("应用级停用成功并释放宿主资源", offApp.status === 200, offApp.body.slice(0, 200));
@@ -378,6 +407,7 @@ try {
   check("停用后右栏 GPT Web 视图消失", true);
   }
   void sleep;
+  check("验收期间 Renderer 无 canonical 事实冲突或运行时异常", rendererErrors.length === 0, rendererErrors.slice(-4).join('\n'));
 } catch (error) {
   failure = error;
   if (lastProbe) process.stderr.write(`\n[最后一次探测] ${lastProbe}\n`);

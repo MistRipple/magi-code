@@ -1,7 +1,7 @@
 # Magi 消息响应核心架构：目标与验收合同
 
 > 本文是目标架构和验收合同的唯一来源：定义职责边界、持久化/事件合同、场景范围及整体完成条件。
-> 性能测量见[性能验证](conversation-performance-validation.md)，可执行验证入口见[脚本与验证入口](validation.md)。历史重构进度与验收记录通过 Git 历史追溯。
+> 性能测量与可执行入口见[脚本与验证入口](validation.md)。历史重构进度与验收记录通过 Git 历史追溯。
 >
 > 本文中的“必须/不得”是规范性约束，不是当前实现声明；是否满足须核对当前源码、测试、构建和本次真实运行证据。
 
@@ -78,7 +78,11 @@ Goal、Continue、子代理等待和恢复都是 `TaskRun` 内部行为，不创
 
 ### 3.1 `TurnService`
 
-HTTP 和 App Server 适配器必须调用同一个 `TurnService`。它只负责：
+HTTP 和 App Server 适配器必须调用同一个 `TurnService`。当前提交业务实现位于 `crates/magi-api/src/turn_service.rs`；HTTP 提交路由只补充可信 Desktop 来源标记并传入 DTO，App Server 也调用该服务。队列推进、Goal 自动续轮与任务终态回调引用同一份服务实现。
+
+服务依赖按职责归位：`scope_binding` 统一校验会话/工作区归属并解析 Turn 所属会话；`task_dispatch` 负责 Task Turn 的接纳、准备、调度及恢复；`model_config` 负责会话模型绑定、Web 转换门禁、持久化与配置更新事件；浏览器标记上下文及 artifact 边界由 `browser_tool_runtime` 从 BrowserAuthority 读取。输入转换和接纳时间由 `TurnService` 管理，接纳时间以原子更新保证并发唯一、递增。上述业务模块不反向引用路由，路由直接调用对应实现，不保留辅助逻辑的旧转导出。中断、生命周期取消和显式继续执行也由 Turn 服务统一负责；HTTP、浏览器用户接管、GPT Web 停止和代理继续动作直接调用服务，不能通过构造 HTTP extractor 或调用路由函数执行业务。角色模板、引擎与角色绑定的读取和写入统一归 `model_config`，`ApiState` 不依赖设置路由。
+
+它负责：
 
 - 输入、范围和权限前置校验；
 - `request_id + request_fingerprint` 幂等；
@@ -248,6 +252,7 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 - Git dirty、branch drift、merge conflict、审批取消/过期和重复审批决定必须产生可审计结果。审批过期固定以 `tool_approval_expired` 拒绝工具、保持无副作用并由 canonical Turn 进入失败终态；不得伪造成功文本或 `approval.resolved`。
 - Browser/MCP/process 和子代理不能绕过 Turn、权限、审批、Git 或 TaskStore 边界；Host protocol double 不能替代真实 GUI 或外部副作用。
 - HTTP `/api/session/turn` 与 App Server `turn/start` 直接进入同一个 `TurnService`。前端只消费统一 Turn notification，不根据 child task、定时器、bootstrap 或 loading 动画猜测终态。
+- HTTP 历史与接纳响应、SSE 和 App Server 实时/恢复通知共用公开 canonical 投影；同一 itemVersion 的脱敏结果必须一致。增量帧的 occurred_at 使用存储 item.updated_at，前端据此还原更新时刻；合并历史窗口后重建 turn/item 索引，后续事件更新原实体。
 - accepted 立即显示用户消息和准备状态；preparing、streaming、blocked、failed、completed 各呈现其 canonical 状态。原始/摘要视图和 Agent 详情共用事实投影，只允许布局不同。
 
 ### 5.4 模型调用失败的重试归属
@@ -266,7 +271,7 @@ EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口�
 
 ### 6.1 真实入口与轨迹
 
-`MagiTurnHarness` 必须经过真实 `TurnService`、Coordinator、事件投递和 projection；只调用 Sink 内部函数的单测只能证明局部 mutation。检查结果保留请求身份、实际 outcome 和终态；性能问题的观察边界见[性能验证](conversation-performance-validation.md)。
+`MagiTurnHarness` 必须经过真实 `TurnService`、Coordinator、事件投递和 projection；只调用 Sink 内部函数的单测只能证明局部 mutation。检查结果保留请求身份、实际 outcome 和终态；性能问题的观察边界见[验证入口的性能测量](validation.md#性能测量)。
 
 关闭测试宿主必须遵循：
 

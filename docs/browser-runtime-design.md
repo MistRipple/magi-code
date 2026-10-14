@@ -171,6 +171,8 @@ Browser 工具、任务和消息最终都进入同一 Session/Turn/Item 主链�
 
 Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一窗口 Renderer 重载；Web 使用 `localStorage`。两端都不保存 Browser 实体，避免与 BrowserAuthority 形成双事实源。正常窗口关闭必须经过 Electron `before-quit` 事务；强制进程终止属于崩溃边界，不得伪装成正常关闭完成。
 
+会话级 Tab 关闭由 daemon 的 `browser_tool_runtime::close_browser_tab` 统一提交：先持久化逻辑关闭并发布 `browser.tab.closed`，让 Renderer 卸载内容槽，再通知 Host 释放物理 guest。用户关闭、任务结束清理和 Magi 会话关闭复用该事务；应用级 GPT Web 不进入会话关闭路径，其固定主页身份与停止操作由 `web_model_ops` 管理。
+
 ### 4.3 应用级 Web 模型会话（GPT Web）的显式例外
 
 本节是对本文件既有「折叠即卸载」「关闭 Tab = 全局关闭逻辑 Tab」「每个内容槽只有一个 guest」三条规则的**唯一显式例外**，只为应用级 GPT Web 会话（`webSession`）引入，并以《[Magi GPT Web 最终开发文档](./web-model-browser-development.md)》为实现口径。理由：该会话承载的是应用级、登录态长期保留的 ChatGPT 页面，且推理必须能在视图不可见时继续——而 `<webview>` guest 会随宿主组件卸载而销毁，与「后台可驱动」直接冲突。

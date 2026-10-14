@@ -1169,6 +1169,8 @@ function ensureWindowListener(): void {
   bridgeListenerRegistered = true;
 
   window.addEventListener('message', (event) => {
+    // 插件消息由对应 iframe 的实例桥处理，不进入应用消息协议。
+    if (event.data?.channel === 'magi-plugin-v1') return;
     const message = event.data as ClientBridgeMessage;
     if (!message || typeof message !== 'object' || !message.type) return;
     // 传输层内部消息（agentApiProxyResponse / agentSseEvent / agentSseStatus）
@@ -1904,6 +1906,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   // 外部会话有变化（不属于当前工作区的事件流过滤）：转成窗口事件，侧栏据此刷新外部客户端入口。
   if (eventType === 'mcp.activity') {
     window.dispatchEvent(new Event(MCP_ACTIVITY_EVENT));
+    // 调用结算包括取消、超时与设置页审批；重新读取 daemon 的审批事实。
+    window.dispatchEvent(new Event(MCP_APPROVALS_CHANGED_EVENT));
+    if (rustEventSessionId(event) === currentSessionId.trim()) {
+      refreshCurrentSessionToolApprovals(eventType);
+    }
     return;
   }
 

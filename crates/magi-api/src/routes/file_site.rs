@@ -10,7 +10,7 @@ use magi_browser_authority::{PREVIEW_OPEN_PATH, PREVIEW_PATH_PREFIX};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
-use super::session_scope::require_registered_workspace_binding;
+use crate::scope_binding::require_registered_workspace_binding;
 use crate::{change_projection::safe_workspace_path, errors::ApiError, state::ApiState};
 
 const SITE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'";

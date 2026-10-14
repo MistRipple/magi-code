@@ -8,18 +8,19 @@ use std::{
 };
 
 use magi_browser_authority::{
-    AcquireBrowserLease, AgentTabTarget, BeforeUnloadAction, BrowserCapabilitySnapshot,
-    BrowserDeviceType, BrowserHostClient, BrowserHostClientError, BrowserHostCommand,
-    BrowserHostCommandError, BrowserHostCommandOutcome, BrowserHostCommandResult,
-    BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot, BrowserLeaseEndReason,
-    BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget, BrowserSurfaceBinding,
+    AcquireBrowserLease, AgentTabTarget, BeforeUnloadAction, BrowserAnnotationStatus,
+    BrowserCapabilitySnapshot, BrowserDeviceType, BrowserHostClient, BrowserHostClientError,
+    BrowserHostCommand, BrowserHostCommandError, BrowserHostCommandOutcome,
+    BrowserHostCommandResult, BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot,
+    BrowserLeaseEndReason, BrowserNavigation, BrowserSession, BrowserSnapshotNode,
+    BrowserSnapshotTarget, BrowserSurfaceBinding, BrowserTab, BrowserTabLifecycle,
     BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
     CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
     validate_browser_navigation_url_with,
 };
 use magi_core::{
-    BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, ExecutionOwnership,
-    ExecutionResultStatus, SessionId, ToolCallId, UtcMillis, WorkspaceId,
+    BrowserAnnotationId, BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId,
+    ExecutionOwnership, ExecutionResultStatus, SessionId, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_session_store::SessionStore;
@@ -27,8 +28,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    RuntimeStatePersistence, browser_image::crop_browser_screenshot,
-    state::BrowserHostStatusSnapshot,
+    RuntimeStatePersistence, browser_image::crop_browser_screenshot, errors::ApiError,
+    state::ApiState, state::BrowserHostStatusSnapshot,
 };
 
 /// Host 的页面事件追平 Authority 的最多确认次数（见 `ensure_surface`）。
@@ -2855,6 +2856,262 @@ fn should_resync_surface(
 ) -> bool {
     attempt < SURFACE_SYNC_ATTEMPTS
         && authority_revision.is_some_and(|revision| host_revision > revision)
+}
+
+pub(crate) fn browser_artifact_path(
+    state: &ApiState,
+    artifact_id: &str,
+) -> Result<Option<std::path::PathBuf>, ApiError> {
+    let relative = std::path::Path::new(artifact_id);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ApiError::Conflict("浏览器 artifact 引用无效".to_string()));
+    }
+    let Some(state_root) = state
+        .runtime_persistence()
+        .and_then(|persistence| persistence.state_root())
+    else {
+        return Ok(None);
+    };
+    let artifact_root = state_root.join(crate::browser_tool_runtime::BROWSER_ARTIFACT_DIR);
+    let path = artifact_root.join(relative);
+    let canonical_root = std::fs::canonicalize(&artifact_root)
+        .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 根目录失败", error))?;
+    let canonical_path = std::fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::NotFound("浏览器 artifact 不存在".to_string())
+        } else {
+            ApiError::internal_assembly("解析浏览器 artifact 失败", error)
+        }
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(ApiError::Conflict("浏览器 artifact 引用越界".to_string()));
+    }
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|error| ApiError::internal_assembly("读取浏览器 artifact 元数据失败", error))?;
+    if !metadata.is_file() {
+        return Err(ApiError::NotFound("浏览器 artifact 不是文件".to_string()));
+    }
+    Ok(Some(canonical_path))
+}
+
+/// 将用户提交的浏览器标记 ID 解析为当前 session 范围内的权威上下文。
+///
+/// 前端只提交 ID，页面 URL、锚点、评论和截图 artifact 均从 BrowserAuthority
+/// 读取，避免把客户端坐标或伪造的页面状态写入模型上下文。
+pub(crate) fn resolve_browser_annotation_context(
+    state: &ApiState,
+    session_id: &SessionId,
+    requested_ids: &[String],
+) -> Result<Vec<Value>, ApiError> {
+    const MAX_BROWSER_ANNOTATIONS: usize = 20;
+    let ids = requested_ids
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if ids.len() > MAX_BROWSER_ANNOTATIONS {
+        return Err(ApiError::InvalidInput(format!(
+            "单轮最多添加 {MAX_BROWSER_ANNOTATIONS} 个浏览器标记"
+        )));
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
+    let browser_session = authority
+        .session_for_magi_session(session_id)
+        .ok_or_else(|| ApiError::Conflict("当前会话没有可用的浏览器上下文".to_string()))?;
+    let mut resolved = Vec::with_capacity(ids.len());
+    for id in ids {
+        let annotation_id = BrowserAnnotationId::new(id);
+        let annotation = authority
+            .annotation(&annotation_id)
+            .ok_or_else(|| ApiError::NotFound(format!("浏览器标记不存在: {id}")))?;
+        if annotation.browser_session_id != browser_session.browser_session_id
+            || !browser_session
+                .tab_ids
+                .iter()
+                .any(|tab_id| tab_id == &annotation.tab_id)
+        {
+            return Err(ApiError::Conflict(format!(
+                "浏览器标记不属于当前会话: {id}"
+            )));
+        }
+        if matches!(
+            annotation.status,
+            BrowserAnnotationStatus::Resolved | BrowserAnnotationStatus::Deleted
+        ) {
+            return Err(ApiError::Conflict(format!(
+                "浏览器标记已失效，不能作为本轮上下文: {id}"
+            )));
+        }
+        let anchor = serde_json::to_value(&annotation.anchor)
+            .map_err(|error| ApiError::internal_assembly("序列化浏览器标记锚点失败", error))?;
+        let screenshot_path = annotation
+            .screenshot_artifact_id
+            .as_deref()
+            .map(|artifact_id| browser_artifact_path(state, artifact_id))
+            .transpose()?
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned());
+        resolved.push(serde_json::json!({
+            "sequence": annotation.sequence,
+            "annotationId": annotation.annotation_id,
+            "browserSessionId": annotation.browser_session_id,
+            "tabId": annotation.tab_id,
+            "kind": annotation.kind,
+            "comment": annotation.comment,
+            "anchor": anchor,
+            "screenshotArtifactId": annotation.screenshot_artifact_id,
+            "screenshotPath": screenshot_path,
+            "status": annotation.status,
+            "resolvedAtRevision": authority.revision(),
+        }));
+    }
+    Ok(resolved)
+}
+
+/// 关闭一个浏览器 Tab 的唯一路径：先提交逻辑关闭并发布事件，让 Renderer 卸载内容槽，
+/// 再请求 Host 清理物理 guest。用户关闭与任务结束清理共用。
+pub(crate) async fn close_browser_tab(
+    state: &ApiState,
+    tab_id: &BrowserTabId,
+) -> Result<(), ApiError> {
+    let (tab, session) = browser_tab_scope(state, tab_id)?;
+    let session_id = require_session_scope(&session)?.clone();
+    let _control_guard = state.browser_control_locks.lock_tab(tab_id).await;
+    state.mutate_browser_authority(|authority| {
+        authority.transition_tab(tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
+    })?;
+    // 先发布逻辑关闭事实，让 App Renderer 卸载其 <webview> 内容槽；
+    // Host 的 ClosePage 只能清理已经由 Renderer 放弃所有权的物理 guest。
+    // 不能反过来在 Renderer 仍持有 guest 时让 Main 直接 close WebContents。
+    publish_browser_event(
+        state,
+        "browser.tab.closed",
+        session.owner_workspace_id(),
+        &session_id,
+        serde_json::json!({
+            "browser_session_id": tab.browser_session_id,
+            "tab_id": tab_id,
+        }),
+    );
+    if let Some(client) = state.browser_host_client() {
+        match client
+            .request(BrowserHostCommand::ClosePage {
+                tab_id: tab_id.clone(),
+            })
+            .await
+        {
+            Ok(reply)
+                if matches!(
+                    reply.response.outcome,
+                    BrowserHostCommandOutcome::Succeeded(_)
+                ) => {}
+            Ok(reply) => tracing::warn!(
+                tab_id = %tab_id,
+                outcome = ?reply.response.outcome,
+                "关闭浏览器 Tab 时 Host 返回失败，逻辑状态已经关闭"
+            ),
+            Err(error) => tracing::warn!(
+                tab_id = %tab_id,
+                ?error,
+                "关闭浏览器 Tab 时 Host 不可用，逻辑状态已经关闭"
+            ),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn browser_tab_scope(
+    state: &ApiState,
+    tab_id: &BrowserTabId,
+) -> Result<(BrowserTab, BrowserSession), ApiError> {
+    let authority = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned");
+    let tab = authority
+        .tab(tab_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("浏览器 Tab 不存在", tab_id.as_str()))?;
+    let session = authority
+        .session(&tab.browser_session_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("浏览器会话不存在", tab.browser_session_id.as_str()))?;
+    Ok((tab, session))
+}
+
+/// 会话作用域的 Magi 会话身份。
+///
+/// App 级（GPT Web）会话不属于任何 Magi 会话，`browser_*` 路由一律不暴露它
+/// 。
+pub(crate) fn require_session_scope(session: &BrowserSession) -> Result<&SessionId, ApiError> {
+    session.magi_session_id().ok_or_else(|| {
+        ApiError::not_found("浏览器会话不存在", "应用级浏览器会话不支持会话作用域操作")
+    })
+}
+
+pub(crate) fn publish_browser_event(
+    state: &ApiState,
+    event_type: &str,
+    workspace_id: Option<&WorkspaceId>,
+    session_id: &SessionId,
+    payload: serde_json::Value,
+) {
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::unique(format!("event-{}", event_type.replace('.', "-"))),
+            event_type,
+            payload,
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+}
+
+impl ApiState {
+    /// 会话结束时复用 Tab 关闭事务：逻辑关闭与事件先提交，Renderer 卸载后 Host 释放 guest。
+    pub async fn close_browser_session_for_magi_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<BrowserSession>, ApiError> {
+        let session = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .session_for_magi_session(session_id)
+            .cloned();
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        for tab_id in &session.tab_ids {
+            close_browser_tab(self, tab_id).await?;
+        }
+        let _control_guards = self.browser_control_locks.lock_tabs(&session.tab_ids).await;
+        self.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &session.browser_session_id,
+                magi_browser_authority::BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })
+        .map(Some)
+    }
 }
 
 #[cfg(test)]

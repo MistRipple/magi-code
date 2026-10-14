@@ -22,11 +22,14 @@ use magi_browser_authority::{BrowserHostCommand, BrowserHostCommandOutcome, Brow
 use magi_core::{BrowserTabId, UtcMillis, WorkspaceId};
 
 use crate::ApiError;
-use crate::routes::browser::WEB_MODEL_HOME_TAB_ID;
 use crate::state::ApiState;
 
-/// 驱动使用的页面 id：应用级只有一个 WebView，驱动实现忽略它。
-const SLOT_PAGE_ID: &str = "browser-tab-web-model-home";
+/// 应用级（GPT Web）浏览器会话的固定主页 Tab 标识。
+///
+/// 全局只有一个应用级会话，因此主页 Tab 用一个稳定 id；推理页面由推理通道
+/// 按需创建，不在这里创建。
+pub const WEB_MODEL_HOME_TAB_ID: &str = "browser-tab-web-model-home";
+
 /// ChatGPT 侧连接器的显示名。
 const WEB_CONNECTOR_NAME: &str = "Magi";
 const HOME_RECOVERY_ATTEMPTS: usize = 4;
@@ -364,7 +367,7 @@ impl ApiState {
     /// 由后续命令自己报告具体错误）。
     pub(crate) async fn resync_web_home_surface(&self) {
         if let Ok(driver) = self.web_driver()
-            && let Err(error) = driver.refresh_surface(SLOT_PAGE_ID).await
+            && let Err(error) = driver.refresh_surface(WEB_MODEL_HOME_TAB_ID).await
         {
             tracing::debug!(%error, "GPT Web 主页 Surface 重新对齐未成功");
         }
@@ -397,7 +400,7 @@ impl ApiState {
                 self.resync_web_home_surface().await;
                 tokio::time::sleep(HOME_RECOVERY_DELAY).await;
             }
-            match driver.open_saved_chat(SLOT_PAGE_ID, None).await {
+            match driver.open_saved_chat(WEB_MODEL_HOME_TAB_ID, None).await {
                 Ok(()) => return Ok(()),
                 Err(error) if error.message.contains("browser_surface") => {
                     tracing::warn!(attempt, error = %error.message, "回到 ChatGPT 主页遇到页面交接，将重新对齐后重试");
@@ -436,13 +439,16 @@ impl ApiState {
             WebModelPageTarget::Chat => self.open_home_with_recovery(&driver).await,
             WebModelPageTarget::Tunnels => {
                 driver
-                    .open_page(SLOT_PAGE_ID, &magi_web_model::openai_platform_tunnels_url())
+                    .open_page(
+                        WEB_MODEL_HOME_TAB_ID,
+                        &magi_web_model::openai_platform_tunnels_url(),
+                    )
                     .await
             }
             WebModelPageTarget::ApiKeys => {
                 driver
                     .open_page(
-                        SLOT_PAGE_ID,
+                        WEB_MODEL_HOME_TAB_ID,
                         &magi_web_model::openai_platform_api_keys_url(),
                     )
                     .await
@@ -463,7 +469,7 @@ impl ApiState {
                 self.resync_web_home_surface().await;
                 tokio::time::sleep(HOME_RECOVERY_DELAY).await;
             }
-            match driver.reload_page(SLOT_PAGE_ID).await {
+            match driver.reload_page(WEB_MODEL_HOME_TAB_ID).await {
                 Ok(()) => return Ok(()),
                 Err(error) if error.message.contains("browser_surface") => last = Some(error),
                 Err(error) => return Err(error),
@@ -482,7 +488,7 @@ impl ApiState {
         let driver = self.web_driver()?;
         self.open_home_with_recovery(&driver).await?;
         driver
-            .connector_status(SLOT_PAGE_ID, WEB_CONNECTOR_NAME)
+            .connector_status(WEB_MODEL_HOME_TAB_ID, WEB_CONNECTOR_NAME)
             .await
     }
 
@@ -503,7 +509,7 @@ impl ApiState {
         let driver = self.web_driver()?;
         self.open_home_with_recovery(&driver).await?;
         driver
-            .configure_connector(SLOT_PAGE_ID, WEB_CONNECTOR_NAME, &status.tunnel_id)
+            .configure_connector(WEB_MODEL_HOME_TAB_ID, WEB_CONNECTOR_NAME, &status.tunnel_id)
             .await
     }
 
@@ -516,7 +522,7 @@ impl ApiState {
         // 侧栏历史只在普通（非临时）主页上可读；槽位空闲时先回到主页再读。
         let driver = self.web_driver()?;
         self.open_home_with_recovery(&driver).await?;
-        driver.list_saved_conversations(SLOT_PAGE_ID).await
+        driver.list_saved_conversations(WEB_MODEL_HOME_TAB_ID).await
     }
 
     fn import_exchanges(
@@ -596,10 +602,10 @@ impl ApiState {
         }
         let driver = self.web_driver()?;
         driver
-            .open_saved_chat(SLOT_PAGE_ID, Some(conversation_id))
+            .open_saved_chat(WEB_MODEL_HOME_TAB_ID, Some(conversation_id))
             .await?;
         let snapshot = driver
-            .read_saved_conversation(SLOT_PAGE_ID, conversation_id)
+            .read_saved_conversation(WEB_MODEL_HOME_TAB_ID, conversation_id)
             .await?;
         if !snapshot.exists {
             return Err(WebModelError::new(
@@ -657,10 +663,10 @@ impl ApiState {
         }
         let driver = self.web_driver()?;
         driver
-            .open_saved_chat(SLOT_PAGE_ID, Some(&conversation_id))
+            .open_saved_chat(WEB_MODEL_HOME_TAB_ID, Some(&conversation_id))
             .await?;
         let snapshot = driver
-            .read_saved_conversation(SLOT_PAGE_ID, &conversation_id)
+            .read_saved_conversation(WEB_MODEL_HOME_TAB_ID, &conversation_id)
             .await?;
         if !snapshot.exists {
             binding.sync_state = WebConversationSyncState::Stale;
@@ -719,12 +725,20 @@ impl ApiState {
         if let Some(owner) = owner {
             let session_id = SessionId::new(owner.session_id.clone());
             // 先中断 Magi 侧 turn（它会取消网页生成并收口为取消），再释放。
-            let _ = crate::routes::sessions::interrupt_session_turn_for_browser_takeover(
+            let workspace_id = self
+                .session_store
+                .session(&session_id)
+                .and_then(|session| self.session_workspace_id(&session));
+            if let Err(error) = crate::turn_service::interrupt_session_turn(
                 self,
                 &session_id,
+                workspace_id.as_ref().map(|id| id.as_str()),
                 None,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(%session_id, ?error, "停止 GPT Web 时中断会话失败，继续释放槽位");
+            }
             self.release_web_slot_for_session(&session_id).await;
         } else {
             self.close_web_page().await;
@@ -734,7 +748,7 @@ impl ApiState {
     /// 销毁应用级 GPT Web 的物理页面，逻辑 Tab 保留（再次打开会重新物化主页，不是重新登录）。
     async fn close_web_page(&self) {
         if let Ok(driver) = self.web_driver() {
-            let _ = driver.cancel_generation(SLOT_PAGE_ID).await;
+            let _ = driver.cancel_generation(WEB_MODEL_HOME_TAB_ID).await;
         }
         let Some(client) = self.browser_host_client() else {
             return;
@@ -771,6 +785,75 @@ impl ApiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopping_web_model_cancels_the_owned_turn_in_personal_and_workspace_sessions() {
+        for workspace in [None, Some("workspace-web-stop")] {
+            let state = ApiState::new(
+                "magi-test",
+                Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+                Arc::new(magi_session_store::SessionStore::default()),
+                Arc::new(magi_workspace::WorkspaceStore::default()),
+                Arc::new(magi_governance::GovernanceService::default()),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            if let Some(id) = workspace {
+                state
+                    .workspace_registry
+                    .register(
+                        WorkspaceId::new(id),
+                        magi_core::AbsolutePath::new(directory.path().display().to_string()),
+                    )
+                    .unwrap();
+            }
+            let session_id = SessionId::new("session-web-stop");
+            state
+                .session_store
+                .create_session_for_workspace(
+                    session_id.clone(),
+                    "Web stop",
+                    workspace.map(str::to_owned),
+                )
+                .unwrap();
+            let slots = Arc::new(magi_web_model::WebSlotTable::new());
+            slots
+                .claim(
+                    magi_web_model::WebSlotOwner::new(session_id.as_str(), workspace.unwrap_or("")),
+                    WebConversationBinding::temporary(),
+                    WEB_MODEL_HOME_TAB_ID,
+                )
+                .unwrap();
+            state.web_model.set_bindings(slots.clone());
+            crate::routes::test_turn_fixtures::seed_conversation_turn(
+                &state.session_store,
+                state.turn_coordinator(),
+                &session_id,
+                "turn-web-stop",
+                1,
+                UtcMillis::now(),
+                "running",
+                "stop this generation",
+            );
+
+            state.stop_web_model().await;
+
+            assert!(slots.owner().is_none());
+            assert_eq!(
+                state
+                    .session_store
+                    .canonical_turn_for_session_turn_id(&session_id, "turn-web-stop")
+                    .unwrap()
+                    .status,
+                magi_session_store::CanonicalTurnStatus::Cancelled
+            );
+            assert!(
+                state
+                    .session_store
+                    .ensure_current_turn_acceptance_available(&session_id)
+                    .is_ok()
+            );
+        }
+    }
 
     fn message(role: &str, text: &str, id: &str) -> WebMessage {
         WebMessage {

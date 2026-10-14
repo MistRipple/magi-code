@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use portable_pty::PtySize;
 use serde::Deserialize;
 
-use super::session_scope;
+use crate::scope_binding as session_scope;
 use crate::{
     errors::ApiError,
     state::ApiState,

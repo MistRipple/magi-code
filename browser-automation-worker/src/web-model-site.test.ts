@@ -25,6 +25,7 @@ function snapshot(overrides: Partial<WebModelRawSnapshot> = {}): WebModelRawSnap
     composerFound: true,
     conversationFound: true,
     accountHint: null,
+    accountPresent: true,
     ...overrides,
   };
 }
@@ -324,6 +325,9 @@ test("停在 OpenAI 平台页面时只报告页面类型，不当成未登录或
 test("会话接口没拿到答案时回到页面证据，不把“不知道”当成未登录", () => {
   const unknown = { sessionActive: null } as const;
   assert.equal(normalizeWebModelProbe(snapshot({ ...unknown })).loginState, "signed_in");
+  assert.equal(normalizeWebModelProbe(snapshot({
+    ...unknown, accountPresent: false,
+  })).loginState, "signed_out", "访客输入框不能在会话接口不可用时成为登录证据");
   assert.equal(normalizeWebModelProbe(snapshot({
     ...unknown, path: "/plugins", composerFound: false, conversationFound: false, accountPresent: true,
   })).loginState, "signed_in");

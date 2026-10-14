@@ -27,7 +27,7 @@ function card() {
   const question = stage === 1 ? '晚上想吃什么？先选主食' : '面条想选哪种吃法？';
   const options = stage === 1 ? ['米饭', '面条', '米粉', '饺子', '炸物', '其他'] : ['汤面', '拌面', '炒面'];
   const longDescription = stage === 1 ? 'https://example.invalid/' + 'very-long-unbroken-option-description-'.repeat(10) : '';
-  const assistant = messages.querySelector('[data-message-author-role="assistant"]');
+  const assistant = messages.querySelector('[data-message-author-role="assistant"]:last-child');
   if (stage >= 3) {
     assistant.innerHTML = `<div data-markdown-text-style="assistant-message"><div data-dil-message-id="fixture-assistant"><p data-d-component="text">${stage === 3 ? '自定义口味？' : '是否还需要配菜？'}</p><div data-d-component="box"><div role="radiogroup" data-d-component="radio-group"><div data-d-component="radio"><label><button type="button" role="radio" aria-checked="true" value="默认"></button>默认</label></div><div data-d-component="radio"><label><button type="button" role="radio" aria-checked="false" value="清淡"></button>清淡</label></div>${stage === 3 ? '<div data-d-component="radio"><label><button type="button" role="radio" aria-checked="false" value="custom"></button>自定义<input type="text" placeholder="输入口味"></label></div>' : ''}</div>${stage === 4 ? '<button type="button" data-d-component="button">跳过</button>' : ''}<button type="button" data-d-component="button">确认选择</button></div></div></div>`;
     choice = '默认';

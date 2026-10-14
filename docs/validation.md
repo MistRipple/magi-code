@@ -32,18 +32,34 @@
 | `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
 | `npm run test:electron-browser-network-policy` | 开发依赖 Electron 的网络边界验收；验证 iframe、fetch、重定向和 localhost 预览来源 |
 | `npm run test:browser-core-live -- --session-id <id>` | 已运行 daemon 的真实会话/Tab；`--app-renderer` 使用已启动 Desktop 的可信 Renderer，`--lifecycle-regression` 覆盖生命周期。环境变量和可写操作开关见 scripts/verify-browser-core-live.mjs |
-| `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、终态、取消、恢复和时序。应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部 |
-| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与脚本提供的本地 Provider；用示例插件走完安装、授权激活（插件页为左右分栏：左侧按「有更新/已安装/可安装」分组的可滚动列表，右侧在同一页面展示所选插件的详情与全部操作，默认选中第一项、不弹窗；含分页、搜索、过滤与「打开设置」快捷入口）、设置表单、主页入口与主内容区页面、隔离视图资源订阅、视图选中引用、模型发起的插件工具调用、命令、右栏视图与添加菜单（插件视图项、管理插件直达）、停用清理、MCP 服务插件壳（未激活拒绝、激活监听、停用释放、重新激活恢复）、外部会话（外部 agent 经 MCP 的读取、越界拒绝、待确认写入：外部会话是对应工作区下的真正会话，在主对话区只读打开，调用在 canonical 时间线里按工具卡片展示，待确认出现在会话自己的授权托盘并批准，窗口不在前台时发系统通知、停在其他标签时点外部会话回到「对话」，关闭「保存调用内容」后读到的内容不落库）、主页卡片、升级候选包预览与确认面板及升级排空、数据格式升级（新版入口在 Worker 内转换已有数据）、插件中心（发布工具签名目录 → daemon 验签 → 安装）。应用路径与端口通过 MAGI_ELECTRON_PLUGINS_* 设置 |
+| `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、首轮接纳期间草稿保留、排队与会话归属、停止和继续、终态、重启恢复及时序。应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部 |
+| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；覆盖插件安装、授权激活、设置、隔离视图与资源同步、工具/命令、升级排空与数据转换、插件中心和停用；MCP 覆盖服务生命周期、完整工具目录、询问/开放模式、外部会话排序与审批、拒绝写入、变更账本、审计与内容留存、实际生成的 stdio 配置握手与文件读写、越界及错误令牌拒绝、HTTP 吊销。通过 MAGI_ELECTRON_PLUGINS_* 设置应用路径与端口 |
 | `cargo test -p magi-plugin-system --test catalog_tool` | 用 `scripts/plugin-center.mjs` 发布工具签名目录，再由 daemon 的 `PluginCatalog::verify` 校验；需要 Node.js，缺失时跳过 |
-| `npm run test:electron-gpt-web` | 已打包 Electron；把本机已登录的 `persist:magi-web-model` 分区复制到一次性状态根，验证第一方 GPT Web 插件安装激活、首次使用物化主页、探测、临时对话收发和停用释放，会向真实 ChatGPT 账号发送一条消息。`MAGI_GPT_WEB_FRESH=1` 只验证全新环境到“需要登录”；未找到登录分区时跳过。通过 MAGI_GPT_WEB_* 设置 |
+| `npm run test:electron-gpt-web` | 已打包 Electron；复制本机已登录的 `persist:magi-web-model` 分区到一次性状态根，向真实 ChatGPT 发送文字和两张图片，验证收发、暂存清理与停用；`MAGI_GPT_WEB_MODE=saved` 验证已保存模式，默认临时模式。`MAGI_GPT_WEB_FRESH=1` 只验证需要登录；`MAGI_GPT_WEB_QUESTION_FIXTURE=1 MAGI_GPT_WEB_LAYOUT_CHECK=1` 验证受控问答与布局；`MAGI_GPT_WEB_REAL_QUESTION=1` 单独验证真账号原生卡片，不能以受控页面替代。未找到登录分区时真实账号场景跳过 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
-| `node scripts/verify-mcp-server.mjs --base <daemon-url> --mcp-bin <magi-mcp-path>` | 在独立状态根运行的 daemon 与已构建 magi-mcp；通过真实 HTTP/stdio 检查令牌、工具、审批与吊销；会注册工作区、安装并激活 MCP 服务插件并修改测试实例设置 |
+| `npm run test:electron-right-pane-links` | 已打包 Electron、全新状态根与本地 Provider；从右栏未挂载开始，验证链接点击展开、真实页面加载、同 URL 复用、会话绑定、GPT Web 激活时切换、关闭 Tab 和关闭会话后 Browser 资源结算 |
 
 核心集成按改动触发，不接入日常 npm test。Browser actions 负责页面交互和快照，network policy 负责 Chromium 网络边界；DOM 入口负责消息、工具、审批、取消和重启恢复；Browser live 检查当前 Tab 的物理生命周期，权限矩阵验证真实工具授权，MCP 入口验证 HTTP/stdio 对外协议。
 
-DOM 的 recovery、Git preflight、approval expiry、compaction 场景仍可单独选择（MAGI_ELECTRON_DOM_*）。压缩场景保留历史预填充和 3 个连续 Turn，至少一次 completed；移除只为统计时延而重复执行的 timing 采样模式。时序原始记录保留用于诊断，性能分析原则见[对话性能验证](conversation-performance-validation.md)。
+DOM 的确定性 Provider 失败场景使用 400，避免混入 5xx 的退避重试预算；并行可写子代理场景使用已提交的 Git 工作区，沿生产隔离规则创建真实工作副本。
+
+DOM 的 recovery、Git preflight、approval expiry、compaction 场景可单独选择（MAGI_ELECTRON_DOM_*）。压缩场景包含历史预填充和 3 个连续 Turn，至少一次 completed；时序原始记录用于诊断。
 
 发布预检仍执行一次 Rust workspace 全量测试；不再紧接着重复执行已覆盖的本机平台测试。CI 的 Windows/macOS 专项任务继续验证对应操作系统差异。
+
+## 性能测量
+
+只在处理性能问题或明确比较收益时采样，先验证终态、幂等、权限、取消和恢复。后端与 Renderer 使用各自时钟，不拼接为总延迟；辅助模型调用、失败、取消、阻塞和恢复单列。
+
+| 阶段 | 观察范围 |
+| --- | --- |
+| 接纳 | submit_received → accepted_response_sent |
+| 本地准备 | accepted_response_sent → provider_request_started |
+| Provider | provider_request_started → provider_first_raw_delta；首个可见文本单列 |
+| 后端完成 | accepted_response_sent → canonical_terminal_published |
+| Renderer | frontend_event_received → reducer_completed → projection_completed → dom_painted |
+
+每条记录关联 session_id、turn_id、request_id、实际执行 profile、场景和 outcome；事件序号只用服务端事实，缺失阶段保持缺失。比较时记录源码、构建、模型参数、输入和历史形态。P50/P95 另定样本量与口径并保留失败样本，少量行为用例不能作为稳定 P95 的证据。本地 Provider 只证明 Magi 行为，上游可用性与延迟须独立测量。
 
 ## 文档与脚本维护
 

@@ -182,12 +182,14 @@ try {
   check("不同 URL 新建第二个顶级 Tab", afterSecond.length === 2, JSON.stringify(afterSecond));
 
   // 5. 浏览器 Tab 归属当前 Magi 会话，而不是 GPT Web 的应用级会话。
-  const sessionId = await page.evaluate(`document.querySelector('[data-session-id]')?.getAttribute('data-session-id') || ''`);
+  const sessionId = await page.evaluate(`new URL(location.href).searchParams.get('sessionId') || ''`);
+  let browserSessionId = '';
   if (sessionId) {
     const query = new URLSearchParams({ scope: 'personal', sessionId }).toString();
     const current = await tools.api(`/api/browser/sessions/current?${query}`);
     const body = current.status === 200 ? JSON.parse(current.body) : null;
     const session = body?.session ?? null;
+    browserSessionId = session?.browserSessionId || '';
     check(
       "浏览器 Tab 归属当前 Magi 会话",
       Boolean(session) && !String(session.browserSessionId).startsWith("browser-session-app-") && (session.tabs?.length ?? 0) === 2,
@@ -228,6 +230,20 @@ try {
   }, "新建的浏览器 Tab 成为当前 Tab", 20_000, 300).catch(() => null);
   check("GPT Web 激活时点链接，新 Tab 成为当前 Tab（而不是留在 GPT Web）", Boolean(activeAfterThird), `active=${await activeTabId()}`);
   check("GPT Web 宿主仍保留在 Tab 条中（未被销毁）", await page.evaluate(`Boolean(document.querySelector('.right-pane-tabbar [data-tab-id="webSession:app"]'))`));
+
+  // 用户关闭与会话结束复用 daemon 的 Tab 关闭事务，应用级 GPT Web 保持独立。
+  await tools.click(`[data-tab-id="${activeAfterThird}"] .right-pane-tab-close`);
+  await waitFor(async () => !(await browserTabIds()).includes(activeAfterThird), "逻辑关闭事件移除真实右栏 Tab");
+  check("关闭后的 Tab 从真实界面移除", true);
+  const closeSession = await tools.post('/api/session/close', { sessionId });
+  check("Magi 会话关闭完成", closeSession.status === 200, closeSession.body.slice(0, 300));
+  const currentAfterClose = await tools.api('/api/browser/sessions/' + encodeURIComponent(browserSessionId));
+  const closedSession = JSON.parse(currentAfterClose.body);
+  check("会话关闭后 Browser 会话已关闭且没有活动 Tab", currentAfterClose.status === 200
+    && closedSession.lifecycle === 'closed' && closedSession.activeTabId === null
+    && closedSession.tabs.every(tab => tab.lifecycle === 'closed'), currentAfterClose.body.slice(0, 400));
+  const appSession = await tools.api('/api/browser/sessions/app');
+  check("会话关闭保留应用级 GPT Web 宿主", appSession.status === 200 && JSON.parse(appSession.body).session?.lifecycle !== 'closed', appSession.body.slice(0, 300));
 
   check("验收期间 App Renderer 无运行时异常", rendererErrors.length === 0, rendererErrors.slice(0, 3).join(" | "));
 } finally {

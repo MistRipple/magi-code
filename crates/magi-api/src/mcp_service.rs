@@ -294,15 +294,6 @@ impl ApiToolBackend {
         self
     }
 
-    /// 令牌仍然有效（未吊销、未过期）。审批等待用它作为存活判据。
-    fn token_is_active(tokens: &TokenStore, token_id: &str) -> bool {
-        let now_ms = UtcMillis::now().0;
-        tokens
-            .records()
-            .iter()
-            .any(|record| record.token_id == token_id && record.is_active(now_ms))
-    }
-
     /// 变更账本工具：直接操作该外部会话的 `SnapshotSession`。
     async fn run_changes_tool(
         &self,
@@ -382,12 +373,20 @@ impl ApiToolBackend {
                     Ok(Some(message)) => return error_outcome(message),
                     Err(message) => return error_outcome(message),
                 }
-                let reverted = tokio::task::spawn_blocking(move || snapshot.revert(&paths)).await;
+                let cancellation = invocation.cancellation.clone();
+                let reverted = tokio::task::spawn_blocking(move || {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    snapshot.revert(&paths).map(Some)
+                })
+                .await;
                 match reverted {
-                    Ok(Ok(count)) => InvocationOutcome {
+                    Ok(Ok(Some(count))) => InvocationOutcome {
                         text: serde_json::json!({ "reverted": count }).to_string(),
                         is_error: false,
                     },
+                    Ok(Ok(None)) => cancelled_outcome(),
                     Ok(Err(error)) => error_outcome(format!("回退失败: {error}")),
                     Err(_) => error_outcome("回退失败"),
                 }
@@ -611,7 +610,7 @@ pub(crate) fn install_web_slot_end_hook(state: &ApiState) {
     )));
 }
 
-/// 审批等待的存活判据：外部令牌要求令牌有效；槽位调用要求它归属的 Web turn 仍在进行
+/// 调用存活判据：外部令牌要求同一密钥仍有效；槽位调用要求它归属的 Web turn 仍在进行
 /// （槽位释放或 turn 结束都会使它失效）。
 fn liveness(
     state: &ApiState,
@@ -621,12 +620,29 @@ fn liveness(
     let tokens = tokens.clone();
     let state = state.clone();
     let token_id = invocation.principal.token_id.clone();
+    let token_hash = tokens
+        .records()
+        .iter()
+        .find(|record| {
+            record.token_id == token_id && record.prefix == invocation.principal.token_prefix
+        })
+        .map(|record| record.hash.clone());
     let attribution = invocation.attribution.clone();
-    move || match &attribution {
-        AttributionTarget::WebSlotTurn { turn_id, .. } => slot_turn_is_active(&state, turn_id),
-        AttributionTarget::ExternalSession { .. } => {
-            ApiToolBackend::token_is_active(&tokens, &token_id)
-        }
+    let cancellation = invocation.cancellation.clone();
+    move || {
+        !cancellation.is_cancelled()
+            && match &attribution {
+                AttributionTarget::WebSlotTurn { turn_id, .. } => {
+                    slot_turn_is_active(&state, turn_id)
+                }
+                AttributionTarget::ExternalSession { .. } => {
+                    tokens.records().iter().any(|record| {
+                        record.token_id == token_id
+                            && record.is_active(UtcMillis::now().0)
+                            && Some(&record.hash) == token_hash.as_ref()
+                    })
+                }
+            }
     }
 }
 
@@ -686,6 +702,10 @@ fn error_outcome(text: impl Into<String>) -> InvocationOutcome {
         text: text.into(),
         is_error: true,
     }
+}
+
+fn cancelled_outcome() -> InvocationOutcome {
+    error_outcome(serde_json::json!({ "status": "cancelled", "error_code": "tool_cancelled", "error": "调用已取消，工具未执行" }).to_string())
 }
 
 impl ToolBackend for ApiToolBackend {
@@ -797,9 +817,33 @@ impl ToolBackend for ApiToolBackend {
                 }
                 tracing::warn!(%error, "外部调用开始项写入失败");
             }
-            let outcome = self.invoke_resolved(invocation, &call_id).await;
+            // 身份失效也须停止在途调用，而不只是拒绝下一条请求。复用工具运行时取消
+            // 标记，并等待执行层结算；不可中断的操作仍记录其真实结果。
+            let is_alive = liveness(&self.state, &self.tokens, &invocation);
+            let cancellation = invocation.cancellation.flag();
+            if !is_alive() {
+                cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let execution = self.invoke_resolved(invocation, &call_id);
+            tokio::pin!(execution);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut execution => break outcome,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if !is_alive() {
+                            cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+            };
             if let Some(writer) = &writer {
-                let status = if outcome.is_error {
+                let status = if outcome.is_error
+                    && magi_conversation_runtime::tool_result_utils::tool_result_execution_status(
+                        &outcome.text,
+                    ) == ExecutionResultStatus::Cancelled
+                {
+                    ExecutionResultStatus::Cancelled
+                } else if outcome.is_error {
                     ExecutionResultStatus::Failed
                 } else {
                     ExecutionResultStatus::Succeeded
@@ -858,6 +902,9 @@ impl ApiToolBackend {
         invocation: ToolInvocation,
         call_id: &str,
     ) -> InvocationOutcome {
+        if invocation.cancellation.is_cancelled() {
+            return cancelled_outcome();
+        }
         {
             let Some(registry) = self.state.tool_registry().cloned() else {
                 return error_outcome("工具运行时未就绪");
@@ -1039,6 +1086,9 @@ fn run_blocking(
     };
 
     let approval_mode = slot_approval_mode(state, invocation);
+    if invocation.cancellation.is_cancelled() {
+        return cancelled_outcome();
+    }
     // MCP 的开放权限代表用户已授予完整工具调用；传入 granted 让既有执行链跳过重复审批，
     // 但路径越界等硬性策略仍由执行层拒绝。
     let mut granted = approval_mode == crate::web_model_channel::WebApprovalMode::Always;
@@ -1058,6 +1108,7 @@ fn run_blocking(
     }
     let access_profile = access_profile_for(invocation.principal.profile);
     let external_call = ExternalToolCall {
+        cancellation: Some(invocation.cancellation.flag()),
         call_id,
         tool_name: &invocation.internal_name,
         arguments_json: &arguments_json,
@@ -1249,6 +1300,7 @@ mod tests {
     struct Fixture {
         state: ApiState,
         router: axum::Router,
+        tokens: Arc<TokenStore>,
         secret: String,
         token_id: String,
         root: PathBuf,
@@ -1397,7 +1449,12 @@ mod tests {
         );
         Fixture {
             state,
-            router: router(HttpState::new(server, tokens, HttpConfig::default())),
+            router: router(HttpState::new(
+                server,
+                tokens.clone(),
+                HttpConfig::default(),
+            )),
+            tokens,
             secret: issued.secret,
             token_id: issued.record.token_id,
             root,
@@ -1409,6 +1466,10 @@ mod tests {
     async fn rpc(fixture: &Fixture, method: &str, params: Value) -> Value {
         let body =
             serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        rpc_message(fixture, body).await
+    }
+
+    async fn rpc_message(fixture: &Fixture, body: Value) -> Value {
         let response = fixture
             .router
             .clone()
@@ -1427,7 +1488,11 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
     }
 
     fn call(name: &str, arguments: Value) -> Value {
@@ -1461,6 +1526,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_cancellation_and_disconnect_settle_approval_without_writing() {
+        for disconnect in [false, true] {
+            let f = Arc::new(fixture(Duration::from_secs(10)));
+            let running = {
+                let f = f.clone();
+                tokio::spawn(async move {
+                    rpc(
+                        &f,
+                        "tools/call",
+                        call(
+                            "magi.fs.write",
+                            serde_json::json!({"path":"cancelled.txt", "content":"must not write"}),
+                        ),
+                    )
+                    .await
+                })
+            };
+            let session = external_session_id(&f.token_id);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !f
+                        .state
+                        .conversation_registry
+                        .tool_approvals()
+                        .pending_for_session(&session)
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if disconnect {
+                running.abort();
+                assert!(running.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(rpc_message(&f, serde_json::json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}})).await.is_null());
+                let result = tokio::time::timeout(Duration::from_secs(5), running)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(result.to_string().contains("cancelled"), "{result}");
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if f.state.mcp_service.external_turns.in_flight(&session) == 0
+                        && f.state
+                            .event_bus
+                            .snapshot()
+                            .recent_events
+                            .iter()
+                            .any(|event| event.event_type == "mcp.tool.call")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                f.state
+                    .conversation_registry
+                    .tool_approvals()
+                    .pending_for_session(&session)
+                    .is_empty()
+            );
+            assert!(!f.root.join("cancelled.txt").exists());
+            assert!(
+                f.state
+                    .event_bus
+                    .snapshot()
+                    .recent_events
+                    .iter()
+                    .any(|event| {
+                        event.event_type == "mcp.activity"
+                            && event.session_id.as_ref() == Some(&session)
+                    }),
+                "调用结算通知必须能通过 Desktop 的会话事件过滤"
+            );
+            assert!(
+                external_tool_items(&f)
+                    .iter()
+                    .any(|(_, _, result, status)| result.contains("cancelled")
+                        && status == "Cancelled")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_stops_only_the_requested_shell_call_and_records_actual_status() {
+        let f = Arc::new(fixture_with_approval(
+            ApprovalMode::Always,
+            Duration::from_secs(5),
+        ));
+        let running = {
+            let f = f.clone();
+            tokio::spawn(async move {
+                rpc(&f, "tools/call", call("magi.shell.exec", serde_json::json!({"command":"printf started > started.txt; sleep 30; printf finished > finished.txt"}))).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !f.root.join("started.txt").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let read = rpc_message(&f, serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":call("magi.fs.read", serde_json::json!({"path":"started.txt"}))})).await;
+        assert!(!is_error(&read), "{read}");
+        rpc_message(&f, serde_json::json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}})).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.to_string().contains("cancelled"), "{result}");
+        assert!(!f.root.join("finished.txt").exists());
+        assert_eq!(
+            f.state
+                .mcp_service
+                .external_turns
+                .in_flight(&external_session_id(&f.token_id)),
+            0
+        );
+        let items = external_tool_items(&f);
+        assert!(
+            items
+                .iter()
+                .any(|(name, _, _, status)| name == "shell_exec" && status == "Cancelled"),
+            "{items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(name, _, _, status)| name == "file_read" && status == "Completed"),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn tokens_list_the_full_tool_catalog_including_shell() {
         let f = fixture(Duration::from_secs(5));
         let response = rpc(&f, "tools/list", serde_json::json!({})).await;
@@ -1476,6 +1684,70 @@ mod tests {
             names.contains(&"magi.shell.exec".to_string()),
             "令牌不按工具档过滤，命令执行也在目录里（是否询问由授权方式决定）"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalidating_a_token_stops_its_running_shell_and_records_cancellation() {
+        for invalidation in ["revoke", "expire", "rotate"] {
+            let f = Arc::new(fixture_with_approval(
+                ApprovalMode::Always,
+                Duration::from_secs(5),
+            ));
+            let running = {
+                let f = f.clone();
+                tokio::spawn(async move {
+                    rpc(&f, "tools/call", call("magi.shell.exec", serde_json::json!({"command":"printf started > started.txt; sleep 2; printf finished > finished.txt"}))).await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !f.root.join("started.txt").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            match invalidation {
+                "revoke" => assert!(f.tokens.revoke(&f.token_id, UtcMillis::now().0)),
+                "expire" => {
+                    f.tokens
+                        .update(
+                            &f.token_id,
+                            magi_mcp_server::TokenPatch {
+                                expires_at_ms: Some(Some(UtcMillis::now().0)),
+                                ..Default::default()
+                            },
+                            UtcMillis::now().0,
+                        )
+                        .unwrap();
+                }
+                "rotate" => {
+                    f.tokens.rotate(&f.token_id).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                is_error(&result) && result.to_string().contains("cancelled"),
+                "{result}"
+            );
+            assert!(!f.root.join("finished.txt").exists());
+            assert_eq!(
+                f.state
+                    .mcp_service
+                    .external_turns
+                    .in_flight(&external_session_id(&f.token_id)),
+                0
+            );
+            assert!(
+                external_tool_items(&f)
+                    .iter()
+                    .any(|(name, _, _, status)| name == "shell_exec" && status == "Cancelled")
+            );
+        }
     }
 
     #[tokio::test]

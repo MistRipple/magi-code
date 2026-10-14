@@ -205,7 +205,7 @@ pub const ENFORCED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
 /// 施加限制后逐项尝试被禁止的操作，返回 `(操作, 是否被拒绝)`。
 fn probe() -> Vec<(&'static str, bool)> {
-    use std::{fs, net::TcpStream, process::Command};
+    use std::{fs, net::TcpStream};
     let path = std::env::temp_dir().join(format!("magi-sandbox-{}", std::process::id()));
     vec![
         ("readFile", fs::read("/etc/hosts").is_err()),
@@ -214,7 +214,10 @@ fn probe() -> Vec<(&'static str, bool)> {
         ("network", TcpStream::connect(("127.0.0.1", 9)).is_err()),
         (
             "spawn",
-            Command::new("/bin/echo").arg("x").output().is_err(),
+            magi_process::std_command("/bin/echo")
+                .arg("x")
+                .output()
+                .is_err(),
         ),
     ]
 }

@@ -515,6 +515,12 @@ function providerResponse(body) {
       : openAiStream(contextCompactionSummaryText);
   }
   const compactionToken = compactionResponseToken(promptText);
+  if (promptText.includes("服务边界挂起")) {
+    if (latestPromptText(messages).includes("服务边界排队")) return openAiStream("ELECTRON_BOUNDARY_QUEUE_OK");
+    if (latestPromptText(messages).includes("继续")) return openAiStream("ELECTRON_BOUNDARY_CONTINUE_OK");
+    return null;
+  }
+
 
   if (promptText.includes("审批拒绝 DOM 验收")) {
     if (messages.some((message) => message?.role === "tool")) {
@@ -638,7 +644,8 @@ function createProvider() {
         approvalStates.set("approval", approvalState);
         payload = openAiStream(approvalResponseText);
       } else if (isGoalFailurePrompt) {
-        response.writeHead(500, { "content-type": "application/json" });
+        // 验证确定性失败与手动恢复；5xx 属于暂态故障，会触发生产退避重试。
+        response.writeHead(400, { "content-type": "application/json" });
         response.end(JSON.stringify({
           error: "electron_goal_provider_failure",
           message: "Electron Goal failure recovery probe",
@@ -734,7 +741,7 @@ function createProvider() {
         // 收口为 Provider failure。这样 GUI 验收的是生产的失败/恢复投影，
         // 不是测试代码直接写入 agent read model。
         if (hasAgentFailureToolResult) {
-          response.writeHead(500, { "content-type": "application/json" });
+          response.writeHead(400, { "content-type": "application/json" });
           response.end(JSON.stringify({
             error: "electron_agent_failure_probe",
             message: agentFailureResponseText,
@@ -754,7 +761,7 @@ function createProvider() {
           },
         }, "electron-dom-agent-failure-1");
       } else if (isAgentMultiStatusChildFailurePrompt) {
-        response.writeHead(500, { "content-type": "application/json" });
+        response.writeHead(400, { "content-type": "application/json" });
         response.end(JSON.stringify({
           error: "electron_agent_multi_status_child_failure",
           message: "Electron DOM 多状态失败子代理",
@@ -3080,15 +3087,15 @@ try {
     const footer = item?.querySelector('.user-time');
     if (!bubble || !footer) return null;
     return {
-      text: bubble.textContent || '',
-      footerHeight: footer.getBoundingClientRect().height,
+      text: bubble.querySelector('.markdown-content')?.innerText || '',
+      footerPosition: getComputedStyle(footer).position,
       footerVisibility: getComputedStyle(footer).visibility,
     };
   })()`);
-  check("个人 Chat 用户消息内容完整", userMessageLayout?.text.trimEnd() === "请只回复 ELECTRON_DOM_CHAT_OK");
+  check("个人 Chat 用户消息内容完整", userMessageLayout?.text.trim() === "请只回复 ELECTRON_DOM_CHAT_OK", JSON.stringify(userMessageLayout));
   check(
     "个人 Chat 隐藏时间/操作行不占布局",
-    userMessageLayout?.footerHeight === 0 && userMessageLayout.footerVisibility === "hidden",
+    userMessageLayout?.footerPosition === "absolute" && userMessageLayout.footerVisibility === "hidden",
     JSON.stringify(userMessageLayout),
   );
   const personalTurnId = assistantTurnId(personal, responseText);
@@ -3106,7 +3113,41 @@ try {
   ));
   checkTimingStages("个人 Chat 生产 Renderer", personalTiming);
 
+  // 真实输入、排队和停止入口必须共同驱动同一 Turn 事务。
+  await openPersonalDraft(page);
+  const beforeQueueSessionIds = (await rendererState(page)).personalSessionIds;
+  await setComposerText(page, "服务边界挂起：保持响应直到我停止");
+  await clickSend(page);
+  await waitFor(async () => (await rendererState(page)).stop, "服务边界活动 Turn");
+  await setComposerText(page, "服务边界排队：请回复 ELECTRON_BOUNDARY_QUEUE_OK");
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-followup-send-button"]:not([disabled])'))`), "响应中的排队发送按钮");
+  check("首轮接纳后保留期间输入的追加草稿", await page.evaluate(`document.querySelector('[data-testid="input-textarea"]')?.innerText.includes('服务边界排队')`));
+  const queueSessionId = new URL((await rendererState(page)).url).searchParams.get('sessionId');
+  await page.evaluate(`document.querySelector('[data-testid="input-followup-send-button"]').click()`);
+  await waitFor(() => page.evaluate(`document.querySelector('.ia-queue-item')?.innerText.includes('服务边界排队')`), "排队消息进入输入区");
+  check("响应期间新消息显示为排队", true);
+  check("排队时原 Turn 的停止入口可用", await clickStop(page));
+  await waitForAssistant(page, "ELECTRON_BOUNDARY_QUEUE_OK", "停止后自动执行队列下一轮");
+  check("停止后排队消息独立执行并产生正确回复", true);
+  check("执行后的消息从队列移除", await page.evaluate(`document.querySelectorAll('.ia-queue-item').length === 0`));
+  const afterQueueState = await rendererState(page);
+  check("快速追加和队列执行始终属于同一会话", new URL(afterQueueState.url).searchParams.get('sessionId') === queueSessionId
+    && afterQueueState.personalSessionIds.filter(id => !beforeQueueSessionIds.includes(id)).length === 1);
+
+  await openPersonalDraft(page);
+  await setComposerText(page, "服务边界挂起：保持响应，测试恢复入口");
+  await clickSend(page);
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-stop-button"]:not([disabled])'))`), "继续验收已确认会话的活动 Turn");
+  check("继续验收可停止当前 Turn", await clickStop(page));
+  await waitFor(async () => !(await rendererState(page)).stop, "继续验收取消完成");
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('button[title="从中断处继续"]'))`), "中断后的继续按钮");
+  await page.evaluate(`document.querySelector('button[title="从中断处继续"]').click()`);
+  await waitForAssistant(page, "ELECTRON_BOUNDARY_CONTINUE_OK", "从中断处继续的最终回复");
+  check("真实继续按钮恢复执行并产生正确回复", true);
+
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
+  // 多代理验收需要 Git 工作副本，才能按生产规则隔离并行可写代理。
+  await createGitRepository(workspaceRoot);
   const workspaceId = await registerWorkspace(page, workspaceRoot);
   approvalTarget = join(workspaceRoot, ".magi-electron-dom-approval.txt");
   approvalDenyTarget = join(workspaceRoot, ".magi-electron-dom-approval-deny.txt");
@@ -3405,7 +3446,7 @@ try {
 
   // 多子代理必须沿真实 agent_spawn 批量创建、agent_wait、TaskStore projection
   // 和 Agent Center 展示链路收口；成功与失败子代理同时存在时，不得只展示一个汇总状态。
-  await openPersonalDraft(page);
+  await registerWorkspace(page, workspaceRoot);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;

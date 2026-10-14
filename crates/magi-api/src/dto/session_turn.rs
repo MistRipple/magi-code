@@ -804,8 +804,8 @@ impl SessionTurnResponseDto {
         if turn.is_some() || item.is_some() {
             self.canonical_schema_version = Some(CANONICAL_TURN_SCHEMA_VERSION);
             self.canonical_event_kind = Some(event_kind.to_string());
-            self.canonical_turn = turn;
-            self.canonical_item = item;
+            self.canonical_turn = turn.map(crate::public_canonical::public_canonical_turn);
+            self.canonical_item = item.map(crate::public_canonical::public_canonical_turn_item);
         }
         self
     }
@@ -1279,4 +1279,54 @@ mod tests {
             "缺失 outerHtmlTruncated 的跨端事件不得被默认为完整 HTML"
         );
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContinueSessionRequest {
+    pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) workspace_id: Option<String>,
+    #[serde(default)]
+    pub(crate) workspace_path: Option<String>,
+    pub(crate) prompt_text: Option<String>,
+    #[serde(default)]
+    pub(crate) requested_agent_ids: Vec<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) user_message_id: Option<String>,
+    pub(crate) placeholder_message_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContinueSessionResponseDto {
+    pub(crate) session_id: String,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) mission_id: String,
+    pub(crate) root_task_id: String,
+    pub(crate) execution_chain_ref: String,
+    pub(crate) resumed_branch_count: usize,
+    pub(crate) status: String,
+    pub(crate) runner_started: bool,
+    pub(crate) event_id: String,
+    pub(crate) continued_at: UtcMillis,
+    pub(crate) turn_id: String,
+    pub(crate) request_id: String,
+    pub(crate) execution_profile: ExecutionProfile,
+    pub(crate) event_sequence: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionInterruptResponseDto {
+    pub(crate) interrupted: bool,
+    pub(crate) session_id: String,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) event_id: String,
+    pub(crate) requested_at: UtcMillis,
+    pub(crate) cancelled_tool_process_count: usize,
+    pub(crate) remaining_queued_turn_count: usize,
+    pub(crate) next_queued_turn_started: bool,
+    pub(crate) removed_timeline_entry_ids: Vec<String>,
 }

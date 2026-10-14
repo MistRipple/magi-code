@@ -7,7 +7,7 @@ use magi_core::AccessProfile;
 use serde::Deserialize;
 use std::str::FromStr;
 
-use super::session_scope;
+use crate::scope_binding as session_scope;
 use crate::{dto::SessionScopeKindDto, errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {

@@ -1432,12 +1432,14 @@ impl MagiTurnHarness {
         session_id: &SessionId,
         workspace_id: Option<&magi_core::WorkspaceId>,
     ) -> Result<(), crate::errors::ApiError> {
-        crate::routes::sessions::interrupt_session_turn_for_browser_takeover(
+        crate::turn_service::interrupt_session_turn(
             &self.state,
             session_id,
-            workspace_id,
+            workspace_id.map(|id| id.as_str()),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn wait_for_terminal(&self, session_id: &SessionId, turn_id: &str) -> CanonicalTurn {

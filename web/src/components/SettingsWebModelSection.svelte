@@ -267,10 +267,11 @@
   /** 「停止」：取消在飞推理、销毁页面、释放槽位；登录态保留。 */
   async function stopWeb(): Promise<void> {
     if (stopping) return;
-    if (slotOwner?.active && !(await confirmMessage(i18n.t('webModel.stop.confirmBody'), { tone: 'danger' }))) return;
     stopping = true;
     errorMessage = '';
     try {
+      await refreshWebModelRuntime();
+      if (slotOwner?.active && !(await confirmMessage(i18n.t('webModel.stop.confirmBody'), { tone: 'danger' }))) return;
       await stopWebModel();
       markWebModelStoppedByUser(true);
       await refreshWebModelRuntime();

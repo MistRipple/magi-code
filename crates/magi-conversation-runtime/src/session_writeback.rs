@@ -1207,7 +1207,7 @@ fn publish_session_turn_item_event_raw(
         "canonical_turn": published.canonical_turn,
         "canonical_item": published.canonical_item,
     });
-    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload)
+    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload, None)
 }
 
 pub fn publish_model_retry_runtime_event(
@@ -1387,6 +1387,7 @@ fn publish_session_turn_item_stream_event_raw(
         session_id,
         workspace_id,
         payload,
+        Some(canonical_item.updated_at),
     ))
 }
 
@@ -1395,19 +1396,23 @@ fn publish_session_turn_item_payload(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     payload: Value,
+    item_updated_at: Option<UtcMillis>,
 ) -> u64 {
-    event_bus.publish(
-        EventEnvelope::domain(
-            EventId::unique("event-session-turn-item"),
-            "session.turn.item",
-            payload,
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            ..EventContext::default()
-        }),
+    let mut event = EventEnvelope::domain(
+        EventId::unique("event-session-turn-item"),
+        "session.turn.item",
+        payload,
     )
+    .with_context(EventContext {
+        workspace_id: workspace_id.clone(),
+        session_id: Some(session_id.clone()),
+        ..EventContext::default()
+    });
+    // 增量帧省略完整 item；Renderer 用 occurred_at 还原 updatedAt，必须与存储版本一致。
+    if let Some(updated_at) = item_updated_at {
+        event.occurred_at = updated_at;
+    }
+    event_bus.publish(event)
 }
 
 pub fn publish_current_session_turn_item_event(
@@ -2103,6 +2108,14 @@ mod tests {
 
         let events = event_bus.snapshot().recent_events;
         assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].occurred_at,
+            first_published.canonical_item.as_ref().unwrap().updated_at
+        );
+        assert_eq!(
+            events[1].occurred_at,
+            second_published.canonical_item.as_ref().unwrap().updated_at
+        );
         let first_payload = &events[0].payload;
         assert!(first_payload.get("canonical_turn").is_none());
         assert!(first_payload.get("item").is_none());

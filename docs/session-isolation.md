@@ -36,7 +36,7 @@
 
 | 位置 | 行为 |
 |---|---|
-| `dispatch_flow` / `session_continue` / 终端 | 执行根目录取副本；身份根目录仍是主工作区，策略路径由 dispatcher 投影到副本 |
+| `task_dispatch` / `session_continue` / 终端 | 执行根目录取副本；身份根目录仍是主工作区，策略路径由 dispatcher 投影到副本 |
 | `snapshot_root_for_session` | 按「会话 + 工作区」取变更账本的入口统一把主工作区路径换成副本路径，账本以副本建立时的内容为基线 |
 | `ensure_session_code_context` / `synchronize_session_changes` | 隔离会话没有主工作区的 Git 上下文，不占执行租约，不做 Git 漂移检查 |
 | 文件预览（`/files/content`、`/files/raw`、定位文件） | 带会话时读副本里的版本，不带会话（工作区级）仍读主工作区 |

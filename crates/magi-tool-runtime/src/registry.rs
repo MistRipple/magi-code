@@ -360,7 +360,7 @@ impl ToolRegistry {
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
     ) -> ToolExecutionOutput {
-        self.execute_with_policy_for_surface(input, context, policy, false, None)
+        self.execute_with_policy_for_surface(input, context, policy, false, None, None)
     }
 
     pub fn execute_with_policy_and_progress(
@@ -370,7 +370,7 @@ impl ToolRegistry {
         policy: &ToolExecutionPolicy,
         on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
     ) -> ToolExecutionOutput {
-        self.execute_with_policy_for_surface(input, context, policy, false, Some(on_progress))
+        self.execute_with_policy_for_surface(input, context, policy, false, Some(on_progress), None)
     }
 
     pub fn cancel_active_executions(&self, query: &ToolExecutionContextQuery) -> usize {
@@ -388,7 +388,17 @@ impl ToolRegistry {
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
     ) -> ToolExecutionOutput {
-        self.execute_with_policy_for_surface(input, context, policy, true, None)
+        self.execute_with_policy_for_surface(input, context, policy, true, None, None)
+    }
+
+    pub fn execute_with_cancellation(
+        &self,
+        input: ToolExecutionInput,
+        context: ToolExecutionContext,
+        policy: &ToolExecutionPolicy,
+        cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> ToolExecutionOutput {
+        self.execute_with_policy_for_surface(input, context, policy, false, None, cancellation)
     }
 
     fn execute_with_policy_for_surface(
@@ -398,8 +408,22 @@ impl ToolRegistry {
         policy: &ToolExecutionPolicy,
         allow_internal_builtin_surface: bool,
         on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+        cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> ToolExecutionOutput {
         context.access_profile = policy.effective_access_profile();
+        if cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            let output = ToolExecutionOutput {
+                tool_call_id: input.tool_call_id.clone(),
+                status: ExecutionResultStatus::Cancelled,
+                governance: magi_governance::GovernanceDecision::allowed(magi_governance::DecisionPhase::ToolPolicy, input.risk_level, None),
+                payload: serde_json::json!({ "tool": input.tool_name, "status": "cancelled", "error_code": "tool_cancelled", "error": "调用已取消，工具未执行" }).to_string(),
+            };
+            self.record_invocation(&input, &context, &output);
+            return output;
+        }
         if input.tool_kind == ToolKind::Builtin
             && let Some(canonical_name) = BuiltinToolName::from_name(input.tool_name.trim())
         {
@@ -473,6 +497,7 @@ impl ToolRegistry {
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
                     let mut resources = self.runtime_resources.clone();
+                    resources.cancellation = cancellation.clone();
                     // 读工具只做读取：与权限预检同一规则，读取不受默认的工作区范围约束。
                     let execution_policy = crate::policy::execution_permission_policy(
                         policy,

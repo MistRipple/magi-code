@@ -83,7 +83,10 @@ impl ReadOperation {
     ) -> Result<Arc<Self>, String> {
         let timeout = bounded_usize(request, "timeout_ms", 10_000, 60_000, tool)?;
         let id = NEXT_READ.fetch_add(1, Ordering::Relaxed);
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = resources
+            .cancellation
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         ACTIVE_READS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -437,6 +440,29 @@ mod tests {
         assert_eq!(payload["status"], "cancelled");
         drop(operation);
         assert_eq!(registry.cancel_active_executions(&query), 0);
+    }
+
+    #[test]
+    fn request_cancellation_stops_only_the_read_using_its_flag() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let resources = ToolRuntimeResources {
+            cancellation: Some(cancellation.clone()),
+            ..Default::default()
+        };
+        let context = ToolExecutionContext::default();
+        let cancelled = ReadOperation::new("file_read", &Map::new(), &context, &resources).unwrap();
+        let other = ReadOperation::new(
+            "file_read",
+            &Map::new(),
+            &context,
+            &ToolRuntimeResources::default(),
+        )
+        .unwrap();
+        assert!(cancelled.check().is_ok());
+        cancellation.store(true, Ordering::SeqCst);
+        let payload: Value = serde_json::from_str(&cancelled.check().unwrap_err()).unwrap();
+        assert_eq!(payload["status"], "cancelled");
+        assert!(other.check().is_ok());
     }
     #[test]
     fn native_file_read_stops_in_flight_and_reports_timeout_through_registry() {

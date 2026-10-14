@@ -415,12 +415,12 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
             .is_some_and(|task| task.status == magi_core::TaskStatus::Completed);
         let mut goal_retrying = false;
         if root_completed {
-            crate::routes::sessions::record_active_goal_turn_success(
+            crate::turn_service::record_active_goal_turn_success(
                 state,
                 session_id,
                 root_task_id.as_str(),
             );
-            crate::routes::sessions::settle_goal_start_turn(
+            crate::turn_service::settle_goal_start_turn(
                 state,
                 session_id,
                 root_task_id,
@@ -438,13 +438,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
                 })
                 .map(|value| public_runtime_excerpt(&value, 4096))
                 .unwrap_or_else(|| runner_status.to_string());
-            goal_retrying = crate::routes::sessions::record_active_goal_turn_failure(
+            goal_retrying = crate::turn_service::record_active_goal_turn_failure(
                 state,
                 session_id,
                 root_task_id.as_str(),
                 &failure_reason,
             );
-            crate::routes::sessions::settle_goal_start_turn(
+            crate::turn_service::settle_goal_start_turn(
                 state,
                 session_id,
                 root_task_id,
@@ -517,7 +517,7 @@ fn schedule_next_queued_session_turn(state: &ApiState, session_id: &SessionId) {
         .session_store
         .session(session_id)
         .and_then(|session| state.session_workspace_id(&session));
-    crate::routes::sessions::schedule_next_queued_regular_session_turn(
+    crate::turn_service::schedule_next_queued_regular_session_turn(
         state.clone(),
         session_id.clone(),
         workspace_id,

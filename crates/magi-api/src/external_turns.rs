@@ -304,6 +304,7 @@ fn publish_changed(state: &ApiState, session_id: &SessionId) {
             serde_json::json!({ "session_id": session_id.as_str() }),
         )
         .with_context(EventContext {
+            session_id: Some(session_id.clone()),
             workspace_id,
             ..EventContext::default()
         }),

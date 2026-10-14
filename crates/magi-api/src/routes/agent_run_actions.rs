@@ -4,14 +4,12 @@ use magi_event_bus::{EventContext, EventEnvelope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    dispatch_flow::{accept_session_task_submission, schedule_session_task_dispatch},
-    session_scope::{SessionRequestScope, require_session_request_scope},
-};
 use crate::{
     dto::{SessionScopeKindDto, SessionTurnRequestDto},
     errors::ApiError,
+    scope_binding::{SessionRequestScope, require_session_request_scope},
     state::ApiState,
+    task_dispatch::{accept_session_task_submission, schedule_session_task_dispatch},
 };
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionPlan};
@@ -418,9 +416,20 @@ async fn continue_task(
     )?;
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "继续")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Continue, "继续")?;
-    let response =
-        super::sessions::continue_agent_run(&state, &scope.session_id, &scope.workspace_id())
-            .await?;
+    let response = crate::turn_service::continue_session(
+        &state,
+        crate::dto::ContinueSessionRequest {
+            session_id: scope.session_id.to_string(),
+            workspace_id: scope.workspace_id().as_ref().map(ToString::to_string),
+            workspace_path: None,
+            prompt_text: Some("继续执行中断的任务".to_string()),
+            requested_agent_ids: Vec::new(),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        },
+    )
+    .await?;
     let mut payload = serde_json::to_value(response)
         .map_err(|error| ApiError::internal_assembly("序列化任务继续结果失败", error))?;
     payload["action"] = json!("continue");
