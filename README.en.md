@@ -134,12 +134,12 @@ When you need to move a project forward instead of receiving a one-off answer, M
 
 ### Quick start
 
-Requirements: stable Rust, Node.js 22 or newer, npm, and the native packaging toolchain required by Electron Desktop builds.
+Requirements: Rust (pinned by `rust-toolchain.toml`), Node.js 22 or newer, npm, and the native packaging toolchain required by Electron Desktop builds.
 
 ~~~bash
 git clone https://github.com/MistRipple/magi-code.git
 cd magi-code
-npm --prefix web ci
+npm ci
 ./scripts/dev-daemon.sh
 ~~~
 
@@ -157,7 +157,7 @@ npm run desktop:package -- --dir
 
 The Electron desktop host uses the same Chromium runtime for the Magi UI and embedded browser. It targets macOS DMG for both Apple Silicon and Intel, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, sign update metadata, and create a Release. Installed desktop builds check for desktop updates at startup and periodically while running. Updates download and verify in the background, then wait for the user to choose **Restart now** or **Restart later** instead of interrupting active work. Electron, Chromium, the daemon, and the Automation Worker are updated atomically as one desktop package. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
 
-Release builds require the Electron Builder macOS/Windows signing, notarization, and Release-signing secrets configured in GitHub Actions. Private keys are used only by GitHub Actions and are never committed or bundled.
+Electron installers currently ship without Apple/Windows code signing or notarization. Legacy client migration packages still require updater-signing credentials, which are separate from operating-system code signing. Those credentials are used only by GitHub Actions and are never committed or bundled. See the [release process](docs/release-process.md) for the complete gates.
 
 ### Configure models and roles
 

@@ -87,7 +87,7 @@ const BUSINESS_FLOW = [
   {
     id: 'routing',
     title: '任务接纳与分派',
-    desc: 'TurnService 统一接纳请求；HTTP Provider 经 TaskStore 与调度器执行，子代理使用同一任务树和角色注册表。',
+    desc: 'TurnService 统一接纳请求；conversation profile 直接进入会话执行，task profile 由 TaskStore 与调度器执行，子代理使用同一任务树和角色注册表。',
     crates: ['magi-orchestrator', 'magi-agent-role', 'magi-worker-runtime'],
     risk: '显式绑定的任务模型失败必须可见，不能静默 failover 到编排模型。',
   },

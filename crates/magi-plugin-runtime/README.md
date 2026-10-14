@@ -1,6 +1,6 @@
 # 插件执行边界
 
-本 crate 实现[插件系统方案](../../docs/plugin-system-requirements-design.md)第 4.1、5.1 节选定的唯一后台执行基线：QuickJS 和独立受管 Worker。构建与 Desktop 打包已纳入 Worker；插件安装服务、生命周期 API 和右栏视图已接入，业务 SDK 与原生工具/设置/工作流桥接仍按阶段计划推进。
+本 crate 实现[插件系统方案](../../docs/plugin-system-requirements-design.md)第 4.1、5.1 节选定的唯一后台执行基线：QuickJS 和独立受管 Worker。构建与 Desktop 打包已纳入 Worker；插件安装服务、生命周期 API 和右栏视图已接入，资源、设置、工具与工作流桥接沿 daemon 的原生权限和执行入口接入。
 
 ## 所有权
 
@@ -11,26 +11,19 @@
 - `sdk.call(operation, payload)` 只提交操作与参数。宿主重新绑定 Invocation 身份，业务处理器仍须经过原生权限与状态校验，不能从 payload 中接受自报工作区或任务身份。
 - 宿主超时覆盖排队、JavaScript 和等待能力结果的全过程。取消和 future 被丢弃都失效能力调用上下文；正常退出有短暂收口期限，超过期限使用现有受管进程释放入口终止，不建立另一套进程管理。
 
-## 候选取舍
+## 执行基线与平台边界
 
-| 候选 | 构建与运行特点 | 当前证据 |
-| --- | --- | --- |
-| QuickJS + 独立受管 Worker | 作者打包 ESM；引擎随 Rust Worker 构建；通过引擎内存/栈限制和中断回调，以及宿主期限和进程释放控制执行 | macOS Apple Silicon 和 Linux aarch64 的 9 项实际子进程回归通过；TypeScript 经 esbuild 构建的 ESM 在 release Worker 返回预期 JSON；Windows CI 尚待执行 |
-| TypeScript → JavaScript → WASM 组件 | 作者另需组件化构建和 WIT 合同；组件内嵌 JavaScript 引擎，宿主还需 Wasmtime 及 typed import 桥接 | 用 jco 1.37.0 / ComponentizeJS 0.23.0 将 TypeScript 转为禁用 WASI 功能的组件，在 Wasmtime 49.0.2 执行；基础结果、燃料耗尽、64MiB 线性内存限制均得到预期结果；未验证完整 SDK 异步桥或三平台打包 |
+后台格式固定为 QuickJS + ESM，独立 Worker 复用 daemon 的受管进程生命周期。WASM 组件和插件自带原生程序不属于后台加载合同；历史选型实验通过 Git 追溯，不维护第二套运行时。
 
-选定 QuickJS + ESM，原因是目前需要跨平台的 JavaScript 决策与受控 SDK 调用，独立 Worker 已能复用现有 daemon 进程管理；WASM 对本方案增加了作者组件化构建、引擎内嵌与宿主组件桥接。比较中的基础 WASM 样例约 11.4MiB，本机 release Worker 约 1.73MiB；两者样例功能与构建优化不同，这只是制品形态记录，不作为速度或安全性排名。未选方案的临时脚本和制品不进入生产代码，也不保留第二套运行时。
-
-阶段 A 尚不能关闭：需要取得 Windows 实际执行、三平台正式安装包及 daemon 业务 SDK 取消结算的证据。Linux 容器使用仓库固定的 Rust 1.97.0 执行上述回归。三平台 CI 已加入执行和包校验回归，以及 Worker 实际 preflight，尚未产生本分支的 CI 结果；macOS 与 Linux 已有 OS 级沙箱并由自检证明；Windows 没有 Worker 级限制：这是已接受的取舍（设计文档 §5.1），Windows 上只有 JS 层不暴露 API 与资源上限的防护，自检如实报告 `enforced=false`，不得表述为已隔离。
+macOS 与 Linux 的 OS 沙箱由 `--sandbox-selftest` 检查；Windows 没有 Worker 级 OS 限制，只依靠 JavaScript API 隔离与资源上限，自检如实报告 `enforced=false`（设计文档 §5.1 的已接受取舍）。平台执行、正式安装器和异步 SDK 取消结算仍需分别取得对应源码/构建的运行证据，不能用某次本机 preflight 或目录包通过替代全部交付门禁。
 
 ## 产品构建与发行边界
 
 - `scripts/dev-daemon.sh` 与 Desktop Rust 构建入口同步构建 `magi-plugin-worker`，不依赖机器上的 Node.js、Python 或外部 QuickJS。
-- Electron Builder 将 Worker 放入 `resources/daemon`；macOS 签名清单包含该二进制。能力清单记录 Worker 哈希，解包校验从最终资源目录启动 Worker，并核对与产品一致的编译版本。
+- Electron Builder 将 Worker 放入 `resources/daemon`；macOS 打包二进制清单包含该二进制，当前安装包不做代码签名和公证。能力清单记录 Worker 哈希，解包校验从最终资源目录启动 Worker，并核对与产品一致的编译版本。
 - `magi-plugin-worker --preflight` 使用当前二进制路径建立真实 `PluginHost`，经私有 stdio、QuickJS 和受控 SDK 完成 ESM/Promise/回调探测。正常 Worker 无参数仍走唯一执行入口；不接受未知参数。
 - 发行脚本在清空环境的条件下运行 preflight。rquickjs 三个 crate 共用其仓库 MIT 许可，QuickJS 引擎另附 MIT 正文；许可与告知清单进入现有资源哈希和 SBOM 流程。
-- 本机已验证 release Worker 在含空格的临时资源目录中执行、版本不匹配拒绝及许可收集；`npm run desktop:package -- --dir` 生成 macOS Apple Silicon 目录包，最终 `.app` 内 Worker 的实际 preflight、资源哈希与许可清单通过解包检查。目录包不等于正式安装器验收，其他平台仍待验证；未接通安装与业务授权前不开放插件功能入口。
-
-参考：[rquickjs Runtime 限制接口](https://docs.rs/rquickjs/0.14.0/rquickjs/struct.Runtime.html)、[组件模型 JavaScript 构建链](https://component-model.bytecodealliance.org/language-support/building-a-simple-component/javascript.html)。
+- 目录包与正式安装器分别验收；安装、授权与激活由 `PluginManager` 决定，Worker preflight 通过不能替代业务准入。验证入口见[脚本与验证入口](../../docs/validation.md)与[发布流程](../../docs/release-process.md)。
 
 ## 验证
 

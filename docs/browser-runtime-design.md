@@ -182,7 +182,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | 关闭按钮 | 只从 Tab 条隐藏该视图、保留在应用级 Tab 集合（`appTabs`）并保持挂载：**不调用 `closeBrowserTab`、不发起任何 Authority 关闭命令、不弹确认、不取消进行中的推理**；登录态与后台推理都保留。仅「设置停止 / Tab 退出 / 清除 Web 数据」、显式切到本地或应用退出才释放 guest |
 | 驱动路径 | 应用级 owner 走**不激活路径**：目标 Tab 的 Surface 已在当前窗口注册且 content-slot 绑定有效时，命令直接复用该 binding，**不写 `right_pane_visibility` / `active_panel`**；只有 Surface 尚未注册时才物化，且物化不附带激活意图。该不激活路径已推广为所有浏览器自动化的统一规则（§4.4） |
 | Primary / 多窗口 | 仍遵守 §4.1：同一逻辑 Tab 全局只有一个 Primary，推理只使用承载该 Tab Primary 的窗口；非 Primary 窗口显示「本窗口未承载当前推理，打开主窗口继续」，不复制用于推理的第二份 Surface |
-| 会话隔离与释放 | 该宿主不随项目 / 会话切换释放，也不参与 `/browser/resources/reclaim`（`is_reclaimable_tab` 需补 owner 分支）；槽位 owner、模式和项目范围在内存中固定；「清理浏览数据」按应用级分区粒度执行，执行前先取消进行中的推理并失效绑定 |
+| 会话隔离与释放 | 该宿主不随项目 / 会话切换释放，也不参与 `/browser/resources/reclaim`（`is_reclaimable_tab` 拒绝回收应用级 owner 的页面）；槽位 owner、模式和项目范围在内存中固定；「清理浏览数据」按应用级分区粒度执行，执行前先取消进行中的推理并失效绑定 |
 | 登录态 | 使用带 `persist:` 前缀的专用分区 `persist:magi-web-model`（本文件既有的 partition 白名单与 `clearBrowsingData` 规则按此扩展放行），因此登录态可跨应用重启保留 |
 
 除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。

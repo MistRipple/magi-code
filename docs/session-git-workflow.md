@@ -146,7 +146,7 @@ Mutation 推荐始终携带：
 时必须已经持有该 repository 的 execution lease，因此不会与其他 session 竞态。mutation
 成功后更新 session baseline、持久化 context、发布刷新事件并重建代码索引。
 
-工具调用目录与产品统计是两个独立视图：模型目录继续保留 10 个具体 `git_*` 动作，确保
+工具调用目录与产品统计是两个独立视图：模型目录保留各个具体 `git_*` 动作，确保
 schema、权限和审批能够逐操作表达；设置页和 `tool_catalog` 的内建能力统计按 `category`
 去重，所有 Git 动作统一归入一个 `git` 类型。设置页顶层只展示能力类型，具体动作收在该
 类型的可展开明细中，避免新增 Git 动作虚增“内建能力种类”。

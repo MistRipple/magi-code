@@ -216,12 +216,12 @@ Magi 的目标很直接：把模型能力变成一套能够长期协作、可恢
 
 ### 快速开始
 
-环境要求：Rust stable、Node.js 22 或更高版本、npm，以及 Electron 桌面构建所需的本机打包工具链。
+环境要求：Rust（版本由 `rust-toolchain.toml` 固定）、Node.js 22 或更高版本、npm，以及 Electron 桌面构建所需的本机打包工具链。
 
 ~~~bash
 git clone https://github.com/MistRipple/magi-code.git
 cd magi-code
-npm --prefix web ci
+npm ci
 ./scripts/dev-daemon.sh
 ~~~
 
@@ -249,7 +249,7 @@ npm run desktop:package -- --dir
 
 推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名更新元数据并创建 Release。已安装的桌面端会在启动时和运行期间检查桌面版本更新；用户可以在后台下载并校验更新，下载完成后自行选择“立即重启”或“稍后重启”，应用不会在下载结束时打断当前工作。重启安装前会先持久化状态并优雅停止本地服务。Electron、Chromium、daemon 和 Automation Worker 作为同一桌面包原子更新，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
 
-正式发布需要在 GitHub Repository Secrets 中配置 Electron Builder 使用的 macOS/Windows 签名、公证和 Release 签名凭据。私钥只供 GitHub Actions 使用，不应写入代码仓库或桌面包。
+Electron 安装包当前不做 Apple/Windows 代码签名和公证。旧版客户端升级迁移包仍需更新器签名凭据，与操作系统代码签名是不同的合同；凭据仅供 GitHub Actions 使用，不应写入仓库或桌面包。完整门禁见[发布流程](docs/release-process.md)。
 
 ### 配置模型与角色
 

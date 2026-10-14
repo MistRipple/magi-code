@@ -19,7 +19,7 @@ TypeScript 侧的 App Server 客户端必须从 `app-server-protocol.generated.t
 Bridge 可以拥有不同传输实现，但不得重新定义同形状的 wire DTO；事件 payload
 也必须沿用 canonical session/turn/item 语义。
 
-插件系统的 `Plugin*` 清单与 DTO 也定义于本 schema，复用同一生成入口。当前新增
-定义用于插件包合同，不增加可调用的 App Server method，也不表示运行时已经注册
-插件能力。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
+插件系统的 `Plugin*` 清单与 DTO 也定义于本 schema，复用同一生成入口。清单类型
+定义本身不增加可调用的 App Server method；能力准入仍由 daemon 的插件安装、授权
+与激活状态决定。`magi-plugin-system` 使用生成类型并对包资源与作用域补充语义校验；不得
 在插件 SDK、HTTP 适配器或 UI 手写另一份清单结构。
