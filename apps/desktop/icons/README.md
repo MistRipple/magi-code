@@ -18,4 +18,4 @@ Electron Main 在开发与打包模式下均选择独立的 macOS 模板图标�
 
 Electron Builder 将模板目录按原文件名复制到 resources/tray；after-pack 会检查 macOS 包同时包含 1x 和 2x 模板。参考：https://www.electronjs.org/docs/latest/api/tray
 
-本目录源文件是后续导出的依据；design/ 中的探索稿不参与打包。修改图片后需重新导出，并运行 Desktop 检查和相关原生图像加载验收。
+本目录源文件是后续导出的依据；历史探索稿通过 Git 历史追溯。修改图片后需重新导出，并运行 Desktop 检查和相关原生图像加载验收。
