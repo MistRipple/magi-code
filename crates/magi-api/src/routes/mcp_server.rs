@@ -102,6 +102,15 @@ fn runtime_error(error: McpRuntimeError) -> ApiError {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenState {
+    Active,
+    Expired,
+    Revoked,
+    WorkspaceUnavailable,
+}
+
 /// 令牌的对外形态：不含哈希。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +119,7 @@ struct TokenDto {
     prefix: String,
     client_name: String,
     workspace_id: String,
+    workspace_available: bool,
     approval_mode: ApprovalMode,
     attribution: AttributionMode,
     /// 是否允许经公网隧道使用。
@@ -119,17 +129,22 @@ struct TokenDto {
     revoked_at_ms: Option<u64>,
     last_used_at_ms: Option<u64>,
     active: bool,
+    state: TokenState,
     /// 是否可以重新查看原文（没有保存原文的令牌只能重新生成）。
     has_secret: bool,
 }
 
 impl TokenDto {
     fn from_record(state: &ApiState, record: &TokenRecord, now_ms: u64) -> Self {
+        let workspace_available = state
+            .workspace_root_path(&Some(WorkspaceId::new(&record.workspace_id)))
+            .is_some();
         Self {
             token_id: record.token_id.clone(),
             prefix: record.prefix.clone(),
             client_name: record.client_name.clone(),
             workspace_id: record.workspace_id.clone(),
+            workspace_available,
             approval_mode: record.approval_mode,
             attribution: record.attribution,
             network: record.network,
@@ -138,6 +153,15 @@ impl TokenDto {
             revoked_at_ms: record.revoked_at_ms,
             last_used_at_ms: record.last_used_at_ms,
             active: record.is_active(now_ms),
+            state: if record.revoked_at_ms.is_some() {
+                TokenState::Revoked
+            } else if !record.is_active(now_ms) {
+                TokenState::Expired
+            } else if !workspace_available {
+                TokenState::WorkspaceUnavailable
+            } else {
+                TokenState::Active
+            },
             has_secret: state.mcp_service.token_has_secret(&record.token_id),
         }
     }
@@ -232,18 +256,18 @@ struct SetDirectAccessRequest {
     /// 监听地址，缺省 `0.0.0.0`（所有网卡）。
     #[serde(default)]
     bind_host: Option<String>,
-    /// 客户端实际使用的公网域名 / IP。
+    /// 客户端实际访问的域名或内网／公网 IP。
     #[serde(default)]
     public_hosts: Vec<String>,
     /// 固定监听端口（防火墙需放行）；缺省沿用当前端口。
     #[serde(default)]
     port: Option<u16>,
-    /// 开启必须显式确认：直接对公网开放用的是明文 HTTP，令牌在网络上不加密。
+    /// 开启必须显式确认：网络直连用的是明文 HTTP，令牌在网络上不加密。
     #[serde(default)]
     confirm_risk: bool,
 }
 
-/// 直接对公网开放：不经隧道，HTTP 入口改为监听公网地址。
+/// 网络直连：不经隧道，HTTP 入口监听指定网卡或所有网卡。
 async fn set_direct_access(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -252,7 +276,7 @@ async fn set_direct_access(
     require_local(&headers)?;
     if request.enabled && !request.confirm_risk {
         return Err(ApiError::InvalidInput(
-            "直接对公网开放用的是明文 HTTP，令牌在网络上不加密，需要显式确认风险".to_string(),
+            "网络直连用的是明文 HTTP，令牌在网络上不加密，需要显式确认风险".to_string(),
         ));
     }
     if request.port == Some(0) {
@@ -626,7 +650,7 @@ async fn revoke_all(
 #[serde(rename_all = "camelCase")]
 struct ConfigSnippets {
     url: Option<String>,
-    /// 配置里的服务名（带上客户端名，避免多套配置互相覆盖）。
+    /// 配置里的服务名（工作区 + 客户端名，便于在外部客户端识别操作目标）。
     server_name: String,
     /// 带令牌的配置里是否已经填入真实原文；否则是 `<MAGI_MCP_TOKEN>` 占位符。
     secret_filled: bool,
@@ -650,10 +674,10 @@ struct SnippetsQuery {
     token_id: Option<String>,
 }
 
-/// 配置里的服务名：`magi-` + 客户端名里的字母数字（中文等保留），其余折叠成 `-`。
-fn server_name_for(client_name: &str) -> String {
+/// 配置里的服务名：`magi-<工作区>-<客户端>`，其余字符折叠成 `-`。
+fn server_name_for(workspace_name: &str, client_name: &str) -> String {
     let mut slug = String::new();
-    for ch in client_name.trim().chars() {
+    for ch in format!("{}-{}", workspace_name.trim(), client_name.trim()).chars() {
         if ch.is_alphanumeric() {
             slug.extend(ch.to_lowercase());
         } else if !slug.ends_with('-') && !slug.is_empty() {
@@ -689,7 +713,12 @@ async fn config_snippets(
             if secret.is_some() {
                 audit_management(&state, &record, "token.view_secret", None);
             }
-            (server_name_for(&record.client_name), secret)
+            let workspace_name = crate::mcp_service::workspace_name(&state, &record.workspace_id)
+                .unwrap_or_else(|| record.workspace_id.clone());
+            (
+                server_name_for(&workspace_name, &record.client_name),
+                secret,
+            )
         }
         None => ("magi".to_string(), None),
     };
@@ -968,6 +997,7 @@ struct ExternalSessionDto {
     session_id: String,
     client_name: String,
     workspace_id: Option<String>,
+    workspace_available: bool,
     last_activity_at_ms: u64,
     /// 在途调用数（含等待人工确认的）。
     running: usize,
@@ -1016,6 +1046,11 @@ async fn list_sessions(
                     .in_flight(&session.session_id),
                 session_id: session.session_id.to_string(),
                 client_name,
+                workspace_available: session.workspace_id.as_ref().is_some_and(|id| {
+                    state
+                        .workspace_root_path(&Some(WorkspaceId::new(id)))
+                        .is_some()
+                }),
                 workspace_id: session.workspace_id,
                 last_activity_at_ms: session.updated_at.0,
             })
@@ -1169,6 +1204,49 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_status_reports_expiry_revocation_and_workspace_availability() {
+        let (state, dir) = state_with_workspace();
+        let issued = state
+            .mcp_service
+            .issue_token(IssueTokenRequest {
+                client_name: "status-client".into(),
+                workspace_id: "ws-1".into(),
+                approval_mode: ApprovalMode::Ask,
+                attribution: AttributionMode::External,
+                ttl_ms: Some(10),
+                network: false,
+            })
+            .await
+            .unwrap();
+        let at = issued.record.created_at_ms;
+        let dto = |time| {
+            serde_json::to_value(TokenDto::from_record(&state, &issued.record, time)).unwrap()
+        };
+        assert_eq!(dto(at)["state"], "active");
+        assert_eq!(dto(at + 10)["state"], "expired");
+        state
+            .workspace_registry
+            .deregister(&WorkspaceId::new("ws-1"))
+            .unwrap();
+        assert_eq!(dto(at)["state"], "workspace_unavailable");
+        assert_eq!(dto(at)["workspaceAvailable"], false);
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("ws-1"),
+                AbsolutePath::new(dir.path().display().to_string()),
+            )
+            .unwrap();
+        assert_eq!(dto(at)["state"], "active");
+        let mut revoked = issued.record.clone();
+        revoked.revoked_at_ms = Some(at);
+        assert_eq!(
+            serde_json::to_value(TokenDto::from_record(&state, &revoked, at + 10)).unwrap()["state"],
+            "revoked"
+        );
     }
 
     #[tokio::test]
@@ -1468,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn snippets_are_per_client_with_the_real_secret_and_a_working_stdio_command() {
-        let (state, _dir) = state_with_workspace();
+        let (state, dir) = state_with_workspace();
         let (token_id, secret) = create(
             &state,
             serde_json::json!({"clientName": "Cursor Work", "workspaceId": "ws-1"}),
@@ -1496,7 +1574,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(snippets["serverName"], "magi-cursor-work");
+        let workspace_name = dir.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            snippets["serverName"],
+            server_name_for(workspace_name, "Cursor Work")
+        );
         assert_eq!(snippets["secretFilled"], true);
         // 服务没启动时没有地址，片段正文为空；正文由纯函数构造，下面直接验证。
         let built = build_snippets(
@@ -1526,8 +1608,11 @@ mod tests {
             built.remote_json.as_ref().unwrap()["mcpServers"]["magi-cursor-work"]["url"],
             "https://mcp.example.com/mcp"
         );
-        assert_eq!(server_name_for("  ///  "), "magi");
-        assert_eq!(server_name_for("我的 Claude"), "magi-我的-claude");
+        assert_eq!(server_name_for("", "  ///  "), "magi");
+        assert_eq!(
+            server_name_for("项目 A", "我的 Claude"),
+            "magi-项目-a-我的-claude"
+        );
         let _ = relay_command();
     }
 
@@ -1982,6 +2067,25 @@ mod tests {
                 .starts_with("external-tool-")
         );
         assert_eq!(sessions[0]["running"], 0);
+        assert_eq!(sessions[0]["workspaceAvailable"], true);
+        state
+            .workspace_registry
+            .deregister(&WorkspaceId::new("ws-1"))
+            .unwrap();
+        let (_, unavailable) = call(
+            &state,
+            "GET",
+            "/mcp-server/sessions",
+            serde_json::json!({}),
+            false,
+        )
+        .await;
+        assert_eq!(
+            unavailable["sessions"].as_array().unwrap().len(),
+            2,
+            "removing a workspace preserves history"
+        );
+        assert_eq!(unavailable["sessions"][0]["workspaceAvailable"], false);
 
         // 外部会话不进入用户的会话列表，清理记录时一并清除。
         call(

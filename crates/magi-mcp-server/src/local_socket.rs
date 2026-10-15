@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -99,11 +100,17 @@ impl StdioRelay {
 /// daemon 侧的本地 socket 监听句柄。
 pub struct LocalSocketServer {
     pub endpoint: PathBuf,
+    connections: Arc<AtomicUsize>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl LocalSocketServer {
+    /// 已通过认证且尚未断开的本地 socket 连接。
+    pub fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
+    }
+
     pub fn stop(self) {
         let _ = self.shutdown.send(());
         self.handle.abort();
@@ -145,16 +152,21 @@ pub async fn serve_local_socket_with_auth(
 ) -> std::io::Result<LocalSocketServer> {
     let mut listener = imp::bind(&endpoint).await?;
     let (shutdown, mut receiver) = tokio::sync::oneshot::channel::<()>();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let stream_connections = connections.clone();
     let handle = tokio::spawn(async move {
+        let mut streams = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = &mut receiver => break,
+                _ = streams.join_next(), if !streams.is_empty() => {},
                 accepted = imp::accept(&mut listener) => {
                     let Ok(stream) = accepted else { break };
                     let server = Arc::clone(&server);
                     let auth = auth.clone();
-                    tokio::spawn(async move {
-                        let _ = serve_stream(stream, server, auth).await;
+                    let connections = stream_connections.clone();
+                    streams.spawn(async move {
+                        let _ = serve_stream(stream, server, auth, connections).await;
                     });
                 }
             }
@@ -162,6 +174,7 @@ pub async fn serve_local_socket_with_auth(
     });
     Ok(LocalSocketServer {
         endpoint,
+        connections,
         shutdown,
         handle,
     })
@@ -174,7 +187,20 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn serve_stream<S>(stream: S, server: Arc<McpServer>, auth: SocketAuth) -> std::io::Result<()>
+struct ConnectedStream(Arc<AtomicUsize>);
+
+impl Drop for ConnectedStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn serve_stream<S>(
+    stream: S,
+    server: Arc<McpServer>,
+    auth: SocketAuth,
+    connections: Arc<AtomicUsize>,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -202,6 +228,9 @@ where
         }
         SocketAuth::Principal(_) => None,
     };
+
+    connections.fetch_add(1, Ordering::Relaxed);
+    let _connected = ConnectedStream(connections);
 
     while let Some(raw_line) = read_bounded_line(&mut reader, MAX_MESSAGE_BYTES).await? {
         let line = String::from_utf8_lossy(&raw_line).trim().to_string();
@@ -507,6 +536,7 @@ mod tests {
                 stream,
                 server.clone(),
                 SocketAuth::Principal(Arc::new(move || Some(principal.clone()))),
+                Arc::new(AtomicUsize::new(0)),
             ));
             client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"magi.fs.read\"}}\n").await.unwrap();
             if !disconnect {
@@ -642,6 +672,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_the_listener_closes_authenticated_streams() {
+        let mut f = fixture().await;
+        let (mut write, mut lines) = connect_lines(&f, &handshake(&f.secret)).await;
+        write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        assert!(lines.next_line().await.unwrap().unwrap().contains("result"));
+        let server = f.server.take().unwrap();
+        assert_eq!(server.connection_count(), 1);
+        server.stop();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn wrong_missing_or_malformed_handshakes_are_rejected_uniformly() {
         let f = fixture().await;
         for first_line in [
@@ -669,6 +720,7 @@ mod tests {
             .unwrap();
         let line = lines.next_line().await.unwrap().unwrap();
         assert!(line.contains("\"result\""), "{line}");
+        assert_eq!(f.server.as_ref().unwrap().connection_count(), 1);
 
         assert!(f.tokens.revoke(&f.token_id, now_ms()));
         write
@@ -678,6 +730,7 @@ mod tests {
         let line = lines.next_line().await.unwrap().unwrap();
         assert!(line.contains("-32001"), "{line}");
         assert!(lines.next_line().await.unwrap().is_none());
+        assert_eq!(f.server.as_ref().unwrap().connection_count(), 0);
     }
 
     #[tokio::test]

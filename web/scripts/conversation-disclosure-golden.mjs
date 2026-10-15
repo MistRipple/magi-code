@@ -30,6 +30,38 @@ await withGoldenViteServer(async (server) => {
 
   // ---- 预览：只去语法标记，保留词内连字符、路径与标点，不凭空插入空格 ----
   const label = (content) => disclosure.resolveConversationProcessLabel(message({ content }), translate);
+  {
+    const { render } = await server.ssrLoadModule('svelte/server');
+    const { i18n } = await server.ssrLoadModule('/src/stores/i18n.svelte.ts');
+    const messageItem = await server.ssrLoadModule('/src/components/MessageItem.svelte');
+    const processRow = await server.ssrLoadModule('/src/components/ConversationProcessRow.svelte');
+    const external = message({
+      content: '来自 Claude Desktop 的外部调用',
+      source: 'system',
+      metadata: { noticeKind: 'external_client', clientName: 'Claude Desktop' },
+    });
+    try {
+      for (const [locale, expected] of [
+        ['en-US', 'External calls from Claude Desktop'],
+        ['zh-CN', '来自 Claude Desktop 的外部调用'],
+        ['en-US', 'External calls from Claude Desktop'],
+      ]) {
+        i18n.setLocale(locale);
+        assert.equal(disclosure.resolveConversationMessageText(external, i18n.t.bind(i18n)), expected);
+        for (const html of [
+          render(messageItem.default, { props: { message: external } }).body,
+          render(processRow.default, { props: { item: { key: 'external', message: external } } }).body,
+        ]) {
+          assert.ok(html.includes(expected), `${locale} 原始与摘要展示都应本地化`);
+          if (locale === 'en-US') assert.ok(!html.includes('来自 Claude Desktop'));
+        }
+        assert.equal(external.content, '来自 Claude Desktop 的外部调用', '展示语言不得改写历史事实');
+        assert.equal(disclosure.resolveConversationMessageText(message({ content: '用户原文' }), i18n.t.bind(i18n)), '用户原文');
+      }
+    } finally {
+      i18n.setLocale('zh-CN');
+    }
+  }
   assert.equal(
     label('**项目分析**：`magi-rust-rewrite`（Magi）'),
     '项目分析：magi-rust-rewrite（Magi）',

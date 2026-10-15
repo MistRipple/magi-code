@@ -90,13 +90,21 @@ pub fn tool_success(text: impl Into<String>) -> Value {
 }
 
 /// `initialize` 的返回：声明协议版本、`tools` 能力与服务信息。
-pub fn initialize_result(server_name: &str, server_version: &str) -> Value {
-    json!({
+pub fn initialize_result(
+    server_name: &str,
+    server_version: &str,
+    instructions: Option<&str>,
+) -> Value {
+    let mut result = json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         // 工具目录在令牌生命周期内固定，因此不声明 listChanged。
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": server_name, "version": server_version }
-    })
+    });
+    if let Some(instructions) = instructions {
+        result["instructions"] = json!(instructions);
+    }
+    result
 }
 
 pub fn ping_result() -> Value {

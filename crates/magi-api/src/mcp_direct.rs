@@ -1,11 +1,11 @@
-//! 直接对公网开放（监听公网地址，不经隧道）的输入校验。
+//! 网络直连（内网或公网，不经隧道）的输入校验。
 //!
-//! 监听地址是 IP（`0.0.0.0` 表示所有网卡）；公网主机名是客户端实际使用的域名或 IP，
+//! 监听地址是 IP（`0.0.0.0` 表示所有网卡）；访问主机名是客户端实际使用的域名或 IP，
 //! 它同时是 HTTP 入口 `Host` 白名单的内容（防 DNS 重绑定），所以必须规整成不含端口和路径的形态。
 
 use std::net::{IpAddr, Ipv6Addr};
 
-/// 同时登记的公网主机名上限。
+/// 同时登记的访问主机名上限。
 pub(crate) const MAX_PUBLIC_HOSTS: usize = 8;
 
 pub(crate) fn parse_bind_host(input: &str) -> Result<IpAddr, String> {
@@ -17,7 +17,7 @@ pub(crate) fn parse_bind_host(input: &str) -> Result<IpAddr, String> {
         .map_err(|_| "监听地址必须是 IP，例如 0.0.0.0（所有网卡）或某块网卡的 IP".to_string())
 }
 
-/// 规整一个公网主机名：去掉协议、路径和端口，域名转小写，IPv6 用方括号。
+/// 规整一个访问主机名：去掉协议、路径和端口，域名转小写，IPv6 用方括号。
 pub(crate) fn normalize_public_host(input: &str) -> Result<String, String> {
     let trimmed = input.trim();
     let rest = trimmed
@@ -42,7 +42,7 @@ pub(crate) fn normalize_public_host(input: &str) -> Result<String, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
             return Err(
-                "公网地址不能是 0.0.0.0、回环或组播地址，请填写客户端实际使用的 IP 或域名"
+                "客户端访问地址不能是 0.0.0.0、回环或组播地址，请填写客户端实际使用的 IP 或域名"
                     .to_string(),
             );
         }
@@ -79,7 +79,7 @@ pub(crate) fn normalize_public_hosts(inputs: &[String]) -> Result<Vec<String>, S
         return Err("请至少填写一个客户端用来访问的域名或 IP".to_string());
     }
     if hosts.len() > MAX_PUBLIC_HOSTS {
-        return Err(format!("最多登记 {MAX_PUBLIC_HOSTS} 个公网地址"));
+        return Err(format!("最多登记 {MAX_PUBLIC_HOSTS} 个访问地址"));
     }
     Ok(hosts)
 }

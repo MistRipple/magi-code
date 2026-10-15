@@ -402,11 +402,18 @@ fn event_session_workspace_id(state: &ApiState, event: &EventEnvelope) -> Option
 
 /// 与用户当前所在的工作区或个人空间无关、所有事件流都收到的事件。
 /// 外部会话活动属于用户级：不管此刻打开的是哪个工作区，侧栏里的外部客户端都要更新。
-fn event_is_user_global(event: &EventEnvelope) -> bool {
+pub(crate) fn event_is_user_global(event: &EventEnvelope) -> bool {
     matches!(
         event.event_type.as_str(),
         "model.context_window.updated" | "mcp.activity"
-    )
+    ) || (matches!(
+        event.event_type.as_str(),
+        "tool.approval.requested" | "tool.approval.resolved"
+    ) && event
+        .payload
+        .get("external")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true))
 }
 
 fn event_payload_workspace_matches(
@@ -427,6 +434,9 @@ fn event_payload_workspace_id(event: &EventEnvelope) -> Option<&str> {
 }
 
 fn event_matches_session(event: &EventEnvelope, requested_session_id: Option<&SessionId>) -> bool {
+    if event_is_user_global(event) {
+        return true;
+    }
     let Some(requested_session_id) = requested_session_id else {
         return true;
     };
@@ -635,6 +645,7 @@ mod tests {
         )
         .with_context(EventContext {
             workspace_id: Some(workspace_id("workspace-b")),
+            session_id: Some(SessionId::new("external-tool-client-b")),
             ..EventContext::default()
         });
 
@@ -644,6 +655,12 @@ mod tests {
             EventStreamScope::Workspace(workspace_id("workspace-b")),
         ] {
             assert!(event_matches_event_stream_scope(&state, &event, &scope));
+            assert!(event_matches_scope(
+                &state,
+                &event,
+                &scope,
+                Some(&SessionId::new("session-a"))
+            ));
         }
     }
 

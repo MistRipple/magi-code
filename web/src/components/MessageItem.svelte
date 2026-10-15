@@ -29,6 +29,7 @@
   import { resolveBrowserAnnotationArtifactUrl } from '../web/agent-api';
   import { inferConversationPresentationRole } from '../lib/conversation-presentation';
   import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
+  import { resolveConversationMessageText } from '../lib/conversation-disclosure';
 
   // Props
   interface Props {
@@ -58,6 +59,7 @@
   // 呈现角色（过程、产物、待处理交互、最终输出……）是投影写入消息的事实。
   // 原始与摘要两种模式都按同一事实决定卡片默认展开与否，只是布局不同。
   const presentationRole = $derived(inferConversationPresentationRole(message));
+  const displayText = $derived(resolveConversationMessageText(message, i18n.t.bind(i18n)));
 
   let copied = $state(false);
   let interruptedRecoverySubmitting = $state(false);
@@ -220,7 +222,7 @@
         .join(' ');
       if (visibleUserText) return visibleUserText;
     }
-    if (content) return message.content;
+    if (content) return displayText;
     const blockText = safeBlocks
       .map((block) => {
         if (typeof block.content === 'string' && block.content.trim()) return block.content;
@@ -388,7 +390,7 @@
         },
       );
     }
-    return message.content;
+    return displayText;
   });
 
   const messageImages = $derived(message.images || []);
@@ -643,7 +645,7 @@
             <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} {presentationRole} />
           {/each}
         {:else if message.content}
-          <MarkdownContent content={message.content} {isStreaming} {filePreviewScope} />
+          <MarkdownContent content={displayText} {isStreaming} {filePreviewScope} />
         {/if}
 
         {#if showResponseDuration}

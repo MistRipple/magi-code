@@ -1914,6 +1914,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  // 外部审批属于全局托盘，必须在工作区和会话过滤之前接收。
+  if ((eventType === 'tool.approval.requested' || eventType === 'tool.approval.resolved')
+    && event.payload?.external === true) {
+    window.dispatchEvent(new CustomEvent(MCP_APPROVALS_CHANGED_EVENT));
+    if (rustEventSessionId(event) === currentSessionId.trim()) {
+      refreshCurrentSessionToolApprovals(eventType);
+    }
+    return;
+  }
+
   // 事件流可能携带当前主对话之外的会话事件。它们不能进入消息时间轴，
   // 但必须继续驱动对应的工作区目录投影，否则后台会话的状态灯会停留在旧状态。
   if (!eventMatchesCurrentWorkspace(event)) {
@@ -2055,15 +2065,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   // 授权请求与授权结果都通过同一事件流进入前端。这里刷新会话级授权投影，
   // 让主会话和子代理共用一个待处理托盘，不依赖轮询或“重新打开会话”才能看到按钮。
   if (eventType === 'tool.approval.requested' || eventType === 'tool.approval.resolved') {
-    // 外部 MCP 客户端的确认不属于当前会话，走跨会话托盘，不能刷新当前会话的授权投影。
-    if (event.payload?.external === true) {
-      window.dispatchEvent(new CustomEvent(MCP_APPROVALS_CHANGED_EVENT));
-      // 正在这个外部会话里：同一份待确认也要出现在会话自己的授权托盘（和内部对话同一个组件）。
-      if (rustEventSessionId(event) && rustEventSessionId(event) === currentSessionId.trim()) {
-        refreshCurrentSessionToolApprovals(eventType);
-      }
-      return;
-    }
     refreshCurrentSessionToolApprovals(eventType);
     return;
   }

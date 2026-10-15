@@ -3175,6 +3175,28 @@ await withGoldenViteServer(async (server) => {
   messagesStore.clearRequestBinding('request-electron-reuse-1');
   messagesStore.clearRequestBinding('request-electron-reuse-2');
 
+  const externalApprovalEvents = [];
+  const onExternalApproval = () => externalApprovalEvents.push(true);
+  window.addEventListener('magi:mcp-approvals-changed', onExternalApproval);
+  for (const eventType of ['tool.approval.requested', 'tool.approval.resolved']) {
+    electronSocket.message({
+      jsonrpc: '2.0',
+      method: `event/${eventType}`,
+      params: {
+        sequence: 10000 + externalApprovalEvents.length,
+        event: {
+          ...acceptedEnvelope(),
+          event_type: eventType,
+          workspace_id: 'other-workspace',
+          session_id: 'external-tool-other-client',
+          payload: { external: true },
+        },
+      },
+    });
+  }
+  await waitFor(() => externalApprovalEvents.length === 2, '外部审批必须在工作区和会话过滤前通知全局托盘');
+  window.removeEventListener('magi:mcp-approvals-changed', onExternalApproval);
+
   console.log('web client bridge golden replay passed');
 }, {
   configFile: 'vite.web.config.ts',

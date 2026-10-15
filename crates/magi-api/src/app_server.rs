@@ -2123,6 +2123,9 @@ fn snapshot_requires_resync(snapshot: &EventStreamSnapshot, after_sequence: u64)
 }
 
 fn event_matches(event: &EventEnvelope, subscription: &EventSubscription) -> bool {
+    if crate::sse::event_is_user_global(event) {
+        return true;
+    }
     if let Some(session_id) = subscription.session_id.as_ref()
         && event.session_id.as_ref() != Some(session_id)
     {
@@ -2296,6 +2299,31 @@ mod tests {
             &event(3, Some("session-1"), Some("workspace-2")),
             &subscription
         ));
+    }
+
+    #[test]
+    fn external_activity_and_approvals_reach_other_session_subscriptions() {
+        let subscription = EventSubscription {
+            active: true,
+            session_id: Some(SessionId::new("session-1")),
+            workspace_id: Some(WorkspaceId::new("workspace-1")),
+            after_sequence: 0,
+        };
+        for event_type in [
+            "mcp.activity",
+            "tool.approval.requested",
+            "tool.approval.resolved",
+        ] {
+            let mut external = event(1, Some("external-tool-client"), Some("workspace-2"));
+            external.event_type = event_type.into();
+            external.payload = json!({"external": true});
+            assert!(event_matches(&external, &subscription), "{event_type}");
+            external.payload = json!({});
+            assert_eq!(
+                event_matches(&external, &subscription),
+                event_type == "mcp.activity"
+            );
+        }
     }
 
     #[test]

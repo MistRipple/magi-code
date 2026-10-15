@@ -1,6 +1,7 @@
 import { app } from "electron";
 import { createHash } from "node:crypto";
-import { accessSync, constants, createReadStream, existsSync, readFileSync } from "node:fs";
+import { accessSync, closeSync, constants, createReadStream, existsSync, openSync, readFileSync } from "node:fs";
+import { once } from "node:events";
 import { mkdir, open, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { execFile, spawn } from "node:child_process";
@@ -181,10 +182,15 @@ export class UpdateManager {
     return this.#downloadPromise;
   }
 
-  async install(): Promise<never> {
+  async install(prepareToQuit: () => Promise<void>): Promise<never> {
     if (this.#snapshot.status !== "downloaded") throw new Error("desktop_update_not_downloaded");
     if (process.platform === "darwin") {
-      installUnsignedMacUpdate(this.#snapshot.availableVersion!);
+      try {
+        await installUnsignedMacUpdate(this.#snapshot.availableVersion!, prepareToQuit);
+      } catch (cause) {
+        this.patch({ status: "failed", error: errorMessage(cause) });
+        throw cause;
+      }
       return new Promise<never>(() => undefined);
     }
     autoUpdater.quitAndInstall(false, true);
@@ -307,7 +313,7 @@ function macAppBundlePath(): string {
   return resolve(process.resourcesPath, "..", "..");
 }
 
-function installUnsignedMacUpdate(version: string): void {
+async function installUnsignedMacUpdate(version: string, prepareToQuit: () => Promise<void>): Promise<void> {
   const bundlePath = macAppBundlePath();
   const stagingRoot = join(app.getPath("userData"), "updates", `staged-${version}-${process.pid}`);
   const stagedBundlePath = join(stagingRoot, "Magi.app");
@@ -321,7 +327,7 @@ pid="$1"
 current="$2"
 staged="$3"
 backup="$4"
-for _ in $(seq 1 100); do
+for _ in $(seq 1 600); do
   state="$(ps -p "$pid" -o state= 2>/dev/null | tr -d ' ')"
   if [ -z "$state" ] || [ "$state" = "Z" ]; then break; fi
   sleep 0.1
@@ -330,18 +336,29 @@ state="$(ps -p "$pid" -o state= 2>/dev/null | tr -d ' ')"
 [ -z "$state" ] || [ "$state" = "Z" ] || exit 1
 if ! mv "$current" "$backup"; then exit 1; fi
 if ! mv "$staged" "$current"; then mv "$backup" "$current"; exit 1; fi
-rm -rf "$backup"
-/usr/bin/open "$current"
+# 旧包内可能有只读目录；先重新打开新版本，清理失败不能阻断重启。
+/usr/bin/open -n "$current"
+rm -rf "$backup" || true
 `;
-  const child = spawn("/bin/sh", ["-c", script, "magi-unsigned-update", String(process.pid), bundlePath, stagedBundlePath, backupPath], {
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
-  // app.quit() 会进入 before-quit 的异步清理链；Electron 在该链路中可能
-  // 长时间保持主进程存活，更新助手就无法安全替换应用目录。更新已经由
-  // 独立进程接管，直接退出主进程，子进程和 daemon 会按父进程生命周期收敛。
-  app.exit(0);
+  const log = openSync(join(app.getPath("userData"), "updates", "install.log"), "a", 0o600);
+  try {
+    const child = spawn("/bin/sh", ["-c", script, "magi-unsigned-update", String(process.pid), bundlePath, stagedBundlePath, backupPath], {
+      detached: true,
+      stdio: ["ignore", log, log],
+    });
+    // 助手成功启动后才退出，启动失败仍可在当前界面显示错误。
+    await once(child, "spawn");
+    child.unref();
+  } finally {
+    closeSync(log);
+  }
+  // 更新助手已接管替换；先复用 Main 的关闭事务结算 daemon/Worker，
+  // 再退出主进程，避免新实例与遗留 daemon 争用端口和状态锁。
+  try {
+    await prepareToQuit();
+  } finally {
+    app.exit(0);
+  }
 }
 
 function readDistributionKind(): "directory" | "release" | null {

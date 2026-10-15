@@ -189,7 +189,6 @@ import {
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
   let workspacesCollapsed = $state(readInitialWorkspacesCollapsed());
   let recentSessionsCollapsed = $state(readInitialRecentSessionsCollapsed());
-  let workspaceSelectionPending = $state(false);
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
@@ -408,6 +407,7 @@ import {
   // 外部客户端会话（Magi MCP）：首次、以及插件注册表变化（激活、停用、窗口重新获得焦点）后读取；调用过程由事件驱动。
   $effect(() => {
     void pluginRegistryRevision();
+    void workspaces;
     void refreshExternalSessions();
   });
   /** 切换到外部会话，并回到「对话」标签：停在变更、知识或插件页时点外部会话也要看到它。 */
@@ -1186,6 +1186,10 @@ import {
       workspaceId,
     );
   }
+
+  const unavailableExternalSessions = $derived(
+    externalSessions.sessions.filter((session) => !session.workspaceAvailable),
+  );
 
   function externalSessionForSidebarRow(sessionId: string): McpExternalSession | undefined {
     return externalSessions.sessions.find((session) => session.sessionId === sessionId);
@@ -2155,7 +2159,7 @@ import {
   }
 
   function openRemoveWorkspaceDialog(workspace: AgentWorkspaceSummary): void {
-    if (workspaceActionPending || workspaceSelectionPending || pendingNavigation) {
+    if (workspaceActionPending || pendingNavigation) {
       return;
     }
     workspaceDialogError = '';
@@ -2240,64 +2244,6 @@ import {
     } finally {
       workspaceActionPending = false;
     }
-  }
-
-  async function selectWorkspace(workspace: AgentWorkspaceSummary): Promise<void> {
-    if (workspaceActionPending || messagesState.sessionHydrating || workspaceSelectionPending) {
-      return;
-    }
-    const workspaceId = workspace.workspaceId.trim();
-    const workspacePath = workspaceNavigationPath(workspace);
-    if (!workspaceId || !workspacePath || workspaceId === selectedWorkspaceId) {
-      return;
-    }
-
-    workspaceSelectionPending = true;
-    try {
-      const hasLoadedSessions = Object.prototype.hasOwnProperty.call(sessionsByWorkspace, workspaceId);
-      if (!hasLoadedSessions) {
-        const loaded = await loadWorkspaceSessionsForSidebar(workspace);
-        if (!loaded) {
-          return;
-        }
-      }
-
-      const nextSession = getWorkspaceSidebarSessionList(workspaceId)[0];
-      navigateSession(nextSession
-          ? {
-            kind: 'session',
-            scope: 'workspace',
-            workspaceId,
-            workspacePath,
-            sessionId: nextSession.id,
-          }
-          : {
-            kind: 'draft',
-            scope: 'workspace',
-            workspaceId,
-            workspacePath,
-          });
-      if (sidebarIsDrawer) {
-        sidebarOpen = false;
-      }
-    } finally {
-      workspaceSelectionPending = false;
-    }
-  }
-
-  function handleWorkspaceClick(workspace: AgentWorkspaceSummary): void {
-    if (workspaceSelectionPending || workspaceActionPending || messagesState.sessionHydrating) {
-      return;
-    }
-    if (workspace.workspaceId === selectedWorkspaceId) {
-      toggleWorkspaceExpansion(workspace);
-      return;
-    }
-    expandedWorkspaceIds = {
-      ...expandedWorkspaceIds,
-      [workspace.workspaceId]: true,
-    };
-    void selectWorkspace(workspace);
   }
 
   function toggleWorkspaceExpansion(workspace: AgentWorkspaceSummary): void {
@@ -3401,7 +3347,7 @@ import {
                     aria-expanded={!!expandedWorkspaceIds[workspace.workspaceId]}
                     data-workspace-id={workspace.workspaceId}
                     title={workspace.rootPath}
-                    onclick={() => handleWorkspaceClick(workspace)}
+                    onclick={() => toggleWorkspaceExpansion(workspace)}
                   >
                     <span
                       class="workspace-chevron"
@@ -3601,6 +3547,25 @@ import {
                     <UnavailableSessionList sessions={unavailableSessionsByWorkspace[workspace.workspaceId] ?? []} />
                   </div>
                 {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+        {#if unavailableExternalSessions.length > 0}
+          <div class="sidebar-empty unavailable-external-history">
+            <span>{i18n.t('externalSession.workspaceUnavailableHint')}</span>
+            <button type="button" class="btn btn--secondary btn--sm" data-testid="unavailable-external-restore" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending}>
+              {i18n.t('externalSession.restoreWorkspace')}
+            </button>
+          </div>
+          <div class="session-list session-list--nested">
+            {#each unavailableExternalSessions as session (session.sessionId)}
+              <div class="session-row" data-testid="unavailable-external-session" data-session-id={session.sessionId}>
+                <span class="session-item unavailable-session-item" aria-disabled="true" title={i18n.t('externalSession.workspaceUnavailableHint')}>
+                  <Icon name="plug" size={12} />
+                  <span class="session-name">{session.clientName}</span>
+                  <span class="session-meta">{i18n.t('mcpServer.token.workspaceUnavailable')}</span>
+                </span>
               </div>
             {/each}
           </div>
@@ -3895,6 +3860,7 @@ import {
   >
     <p class="workspace-dialog-text">{i18n.t('web.removeWorkspaceDescPrefix')}<strong>{pendingRemoveWorkspace.name}</strong>{i18n.t('web.removeWorkspaceDescSuffix')}</p>
     <p class="workspace-dialog-text workspace-dialog-text--muted">{i18n.t('web.removeWorkspaceKeepData')}</p>
+    <p class="workspace-dialog-text workspace-dialog-text--muted">{i18n.t('web.removeWorkspaceMcpEffect')}</p>
     {#if workspaceDialogError}
       <div class="workspace-dialog-error">{workspaceDialogError}</div>
     {/if}
@@ -4643,6 +4609,13 @@ import {
     background: color-mix(in srgb, var(--surface-selected) 78%, transparent);
   }
 
+  .unavailable-external-history {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
   .external-session-item {
     gap: var(--space-2);
   }
@@ -4708,8 +4681,10 @@ import {
     opacity: 0.78;
   }
 
-  .session-item:disabled {
+  .session-item:disabled,
+  .session-item.unavailable-session-item {
     cursor: default;
+    color: var(--foreground-muted);
   }
 
   .session-running-dot {

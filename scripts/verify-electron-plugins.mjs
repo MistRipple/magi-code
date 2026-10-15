@@ -3,7 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
@@ -216,6 +216,49 @@ try {
     create.click();
   })()`);
   await waitFor(async () => exists(page, '[data-testid="input-textarea"]'), "工作区会话输入区");
+
+  // 工作区标题只展开/收起；普通会话、草稿和工作区绑定只由明确导航改变。
+  const otherRoot = join(workRoot, "other-workspace");
+  await mkdir(otherRoot);
+  const otherWorkspace = JSON.parse((await post(page, "/api/workspaces/register", { path: otherRoot })).body).workspaceId;
+  const sidebarSessions = [];
+  for (const [id, name] of [[workspaceId, "侧栏会话 A"], [otherWorkspace, "侧栏会话 B"]]) {
+    const created = JSON.parse((await post(page, "/api/session/materialize", { scope: "workspace", workspaceId: id })).body);
+    check("为工作区导航验收建立真实会话", Boolean(created.sessionId));
+    // 目录按产品规则隐藏空白历史，因此先通过真实 Turn 写入可展示的会话内容。
+    const turn = await post(page, "/api/session/turn", { scope: "workspace", workspaceId: id, sessionId: created.sessionId, text: `记录${name}`, requestId: `sidebar-${id}` });
+    check("导航验收会话写入真实对话内容", turn.status === 200, turn.body.slice(0, 180));
+    await waitFor(async () => (await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(id)}&sessionId=${encodeURIComponent(created.sessionId)}`)).body.includes("PLUGIN_E2E_OK"), "导航验收会话回复完成", 30_000);
+    await post(page, "/api/session/rename", { sessionId: created.sessionId, workspaceId: id, name });
+    sidebarSessions.push(created.sessionId);
+  }
+  const navigationUrl = new URL(await page.evaluate("location.href"));
+  navigationUrl.searchParams.set("scope", "workspace");
+  navigationUrl.searchParams.set("workspaceId", workspaceId);
+  navigationUrl.searchParams.set("workspacePath", workspaceRoot);
+  navigationUrl.searchParams.set("sessionId", sidebarSessions[0]);
+  await page.call("Page.navigate", { url: navigationUrl.href });
+  const activeSession = () => page.evaluate("document.querySelector('.session-item.active')?.dataset.sessionId ?? ''");
+  await waitFor(async () => (await activeSession()) === sidebarSessions[0], "当前会话 A 已恢复");
+  const otherHeader = `[data-workspace-id="${otherWorkspace}"]`;
+  if (await page.evaluate(`document.querySelector(${JSON.stringify(otherHeader)}).getAttribute('aria-expanded') === 'true'`)) await click(page, otherHeader);
+  await click(page, otherHeader);
+  await waitFor(() => exists(page, `.session-item[data-session-id="${sidebarSessions[1]}"]`), "点击另一工作区后加载其会话列表");
+  check("首次展开另一工作区不自动打开第一条会话", (await activeSession()) === sidebarSessions[0] && (await page.evaluate("new URL(location.href).searchParams.get('sessionId')")) === sidebarSessions[0]);
+  await click(page, otherHeader);
+  await click(page, otherHeader);
+  check("收起和再次展开已加载工作区仍保留当前会话", (await activeSession()) === sidebarSessions[0]);
+  await click(page, `.session-item[data-session-id="${sidebarSessions[1]}"]`);
+  await waitFor(async () => (await activeSession()) === sidebarSessions[1], "明确点击会话 B 后切换成功");
+  check("只有点击具体会话才切换到对应工作区会话", (await page.evaluate("new URL(location.href).searchParams.get('workspaceId')")) === otherWorkspace);
+  await click(page, `[data-workspace-id="${workspaceId}"]`);
+  check("点击原工作区标题不会从会话 B 跳回会话 A", (await activeSession()) === sidebarSessions[1]);
+  await page.evaluate(`document.querySelector('[data-workspace-id="${workspaceId}"]').closest('.workspace-row').querySelector('button.row-action').click()`);
+  await waitFor(async () => !(await activeSession()) && (await page.evaluate("new URL(location.href).searchParams.get('workspaceId')")) === workspaceId, "新建按钮进入工作区 A 的草稿");
+  await page.evaluate(`(() => { const input = document.querySelector('[data-testid="input-textarea"]'); input.textContent = '未发送的工作区草稿'; input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '未发送的工作区草稿' })); })()`);
+  await click(page, otherHeader);
+  check("浏览其他工作区也保留当前草稿和输入区", !(await activeSession()) && (await page.evaluate("new URL(location.href).searchParams.get('workspaceId')")) === workspaceId && (await text(page, '[data-testid="input-textarea"]')).includes("未发送的工作区草稿"));
+  await page.evaluate(`(() => { const input = document.querySelector('[data-testid="input-textarea"]'); input.textContent = ''; input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null })); })()`);
 
   // 2. 设置页：插件卡片、来源与摘要、授权激活
   await openSettingsTab(page, "plugins");
@@ -639,6 +682,8 @@ try {
   await waitFor(() => exists(page, '[data-mcp-create-open="1"]'), "MCP 客户端设置出现");
   await click(page, '[data-mcp-create-open="1"]');
   await waitFor(() => exists(page, '[data-mcp-approval-mode="1"]'), "MCP 客户端授权方式选择器出现");
+  check("创建 MCP 时展示完整工作区路径与固定绑定说明", await text(page, `[data-mcp-bound-workspace="${workspaceId}"]`).then((value) => value.includes(workspaceRoot))
+    && await documentBodyIncludes("不随外部客户端当前项目切换"));
   check("新令牌默认完整工具目录并逐次询问", await page.evaluate(`(() => ({
     hasProfile: Boolean(document.querySelector('[data-mcp-profile="1"]')),
     approval: document.querySelector('[data-mcp-approval-mode="1"]')?.value,
@@ -663,8 +708,10 @@ try {
     clientName: "e2e-auto-agent",
     workspaceId,
     approvalMode: "always",
+    allowNetwork: true,
     ttlDays: 1,
   })).body);
+  check("开放权限网络令牌创建成功", Boolean(autoIssued.token?.tokenId && autoIssued.secret));
   const autoCall = (name, args_) => fetch(restoredUrl, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${autoIssued.secret}` },
@@ -679,8 +726,62 @@ try {
   check("开放权限也自动执行删除类 MCP 工具", autoRemove.result?.isError !== true && !removedFileStillExists, JSON.stringify(autoRemove).slice(0, 200));
   const autoExec = await autoCall("magi.shell.exec", { command: "printf open-mode" });
   check("开放权限也自动执行命令工具", autoExec.result?.isError !== true && JSON.stringify(autoExec).includes("open-mode"), JSON.stringify(autoExec).slice(0, 200));
+  // 同一令牌共享 Magi 会话，标准 HTTP 传输会话隔离相同请求 ID 和取消。
+  const transportRpc = (session, method, params = {}, id = 1) => fetch(restoredUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${autoIssued.secret}`,
+      ...(session ? { "mcp-session-id": session } : {}) },
+    body: JSON.stringify({ jsonrpc: "2.0", ...(id === null ? {} : { id }), method, params }),
+  });
+  const transportIds = [];
+  for (const name of ["gpt-web-test", "claude-test"]) {
+    const initialized = await transportRpc(null, "initialize", { clientInfo: { name, version: "1" } });
+    transportIds.push(initialized.headers.get("mcp-session-id"));
+  }
+  check("同一令牌两次 HTTP 初始化签发不同传输会话", transportIds.every(Boolean) && transportIds[0] !== transportIds[1]);
+  const beforeHttpDelete = JSON.parse((await api(page, "/api/mcp-server/status")).body).httpSessions;
+  check("HTTP 统计来自真实传输会话", beforeHttpDelete >= 2);
+  await openSettingsTab(page, "mcpServer");
+  await click(page, '[data-mcp-tab="connect"]');
+  await waitFor(async () => (await text(page, '[data-mcp-connections="1"]'))?.includes(`HTTP 传输会话：${beforeHttpDelete}`), "桌面设置展示 daemon 的连接统计");
+  await click(page, '[data-testid="settings-back"]');
+  await Promise.all([0, 1].map((index) => mkdir(join(workspaceRoot, `http-${index}`))));
+  const runningShells = transportIds.map((session, index) => transportRpc(session, "tools/call", {
+    name: "magi.shell.exec", arguments: { cwd: `http-${index}`, command: `printf started > started.txt; sleep 30; printf finished > finished.txt` },
+  }).then((response) => response.json()).catch((error) => ({ transportError: String(error) })));
+  await waitFor(async () => (await Promise.all([0, 1].map((index) => access(join(workspaceRoot, `http-${index}`, "started.txt")).then(() => true, () => false)))).every(Boolean), "相同请求 ID 的两个 HTTP Shell 均已执行", 15_000);
+  const conflicting = await transportRpc(transportIds[1], "tools/call", { name: "magi.shell.exec", arguments: { cwd: "http-0", command: "printf conflict > conflict.txt" } }, 3).then((response) => response.json());
+  check("共享工作区中的同目录并发写入仍明确拒绝", conflicting.result?.isError === true && JSON.stringify(conflicting).includes("write_conflict"));
+  const cancelled = await transportRpc(transportIds[0], "notifications/cancelled", { requestId: 1 }, null);
+  const firstCancelled = await runningShells[0];
+  const secondRead = await transportRpc(transportIds[1], "tools/call", { name: "magi.fs.read", arguments: { path: "http-1/started.txt" } }, 2).then((response) => response.json());
+  check("取消第一个 HTTP 会话不会中断第二个会话", cancelled.status === 202 && firstCancelled.result?.isError === true && secondRead.result?.isError === false);
+  const terminated = await fetch(restoredUrl, { method: "DELETE", headers: { authorization: `Bearer ${autoIssued.secret}`, "mcp-session-id": transportIds[1] } });
+  const secondCancelled = await runningShells[1];
+  check("终止 HTTP 传输会话取消其 Shell 且不落地迟到副作用", terminated.status === 204 && secondCancelled.result?.isError === true
+    && (await Promise.all([0, 1].map((index) => access(join(workspaceRoot, `http-${index}`, "finished.txt")).then(() => false, () => true)))).every(Boolean));
+  check("已终止传输会话返回 404", (await transportRpc(transportIds[1], "tools/list")).status === 404);
+  check("终止后 HTTP 统计减少一个", JSON.parse((await api(page, "/api/mcp-server/status")).body).httpSessions === beforeHttpDelete - 1);
+  const sharedSessions = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions.filter((entry) => entry.tokenId === autoIssued.token.tokenId);
+  check("多个 HTTP 传输会话仍合并到同一 Magi 外部会话", sharedSessions.length === 1 && sharedSessions[0].workspaceId === workspaceId);
+  // 非回环网卡上的真实 HTTP 直连；不使用 tunnel 或伪造来源。
+  const lanIp = Object.values(networkInterfaces()).flat().find((entry) => entry?.family === "IPv4" && !entry.internal)?.address;
+  if (!lanIp) throw new Error("缺少可用于网络直连验收的非回环 IPv4 网卡");
+  const direct = await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, bindHost: "0.0.0.0", publicHosts: [lanIp], confirmRisk: true }) });
+  check("无需 tunnel 即可监听真实网卡地址", direct.status === 200, direct.body.slice(0, 150));
+  const lanUrl = JSON.parse(direct.body).direct.mcpUrl;
+  const localOnly = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "lan-local-only", workspaceId, ttlDays: 1 })).body);
+  const lanList = (secret) => fetch(lanUrl, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${secret}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  check("内网直连接受网络令牌并拒绝本机令牌", (await lanList(autoIssued.secret)).status === 200 && (await lanList(localOnly.secret)).status === 401);
+  await openSettingsTab(page, "mcpServer");
+  await click(page, '[data-mcp-tab="remote"]');
+  await waitFor(() => documentBodyIncludes("网络直连（内网／公网）"), "桌面端展示网络直连文案");
+  check("网络设置明确区分直连与公网隧道", await documentBodyIncludes("公网隧道") && await documentBodyIncludes("客户端访问地址"));
+  await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+  await click(page, '[data-testid="settings-back"]');
   // 使用设置页实际生成的配置，验证发行包自己的 stdio 中继，避免维护另一套命令与权限合同。
   const snippets = JSON.parse((await api(page, `/api/mcp-server/config-snippets?tokenId=${autoIssued.token.tokenId}`)).body);
+  check("客户端配置服务名包含工作区和客户端", snippets.serverName === "magi-workspace-e2e-auto-agent");
   const relayConfig = Object.values(snippets.stdioJson.mcpServers)[0];
   const relay = spawn(relayConfig.command, relayConfig.args, {
     env: { ...process.env, ...relayConfig.env }, stdio: ["pipe", "pipe", "pipe"],
@@ -704,6 +805,10 @@ try {
   try {
     const initialized = await send("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "plugin-e2e-stdio", version: "1" } });
     check("生成的客户端配置可通过发行包 stdio 中继握手", initialized.result?.serverInfo?.name === "magi");
+    check("已认证 stdio 连接计入本地统计", JSON.parse((await api(page, "/api/mcp-server/status")).body).localConnections === 1);
+    check("stdio 握手告知真实绑定工作区及相对路径基准", initialized.result?.instructions?.includes(workspaceRoot)
+      && initialized.result.instructions.includes('"name":"workspace"')
+      && initialized.result.instructions.includes("Resolve relative paths against this workspace root"));
     const listed = await send("tools/list", {});
     const names = (listed.result?.tools ?? []).map((tool) => tool.name);
     check("stdio 目录统一包含读取、写入、删除和命令", ["magi.fs.read", "magi.fs.write", "magi.fs.remove", "magi.shell.exec"].every((name) => names.includes(name)));
@@ -729,14 +834,21 @@ try {
     relay.stdin.end();
     relay.kill();
   }
+  await waitFor(async () => JSON.parse((await api(page, "/api/mcp-server/status")).body).localConnections === 0, "stdio 断开后统计归零");
   const invalidRelay = await execFileAsync(relayConfig.command, relayConfig.args, {
     env: { ...process.env, ...relayConfig.env, MAGI_MCP_TOKEN: "magi_mcp_wrong" }, timeout: 5_000,
   }).then((output) => output, (error) => error);
   check("stdio 错误令牌被拒绝并断开", /unauthorized/u.test(invalidRelay.stdout ?? ""));
   const issued = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "e2e-agent", workspaceId, ttlDays: 1 })).body);
+  const issuedInitialization = await fetch(restoredUrl, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize" }),
+  });
+  const issuedSessionId = issuedInitialization.headers.get("mcp-session-id");
+  check("询问模式客户端初始化 HTTP 传输会话", Boolean(issuedSessionId));
   const mcpCall = (name, args_) => fetch(restoredUrl, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}` },
+    headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}`, "mcp-session-id": issuedSessionId },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args_ } }),
   }).then((response) => response.json());
   const externalReadPending = mcpCall("magi.fs.read", { path: "external-read.txt" });
@@ -777,6 +889,22 @@ try {
   check("点外部会话后顶部标签回到「对话」", await page.evaluate(`document.querySelector('.tab-bar--top .tab-item')?.classList.contains('active') === true`));
   check("外部会话在主对话区打开，没有对话输入框", !(await exists(page, '[data-testid="input-textarea"]')));
   check("打开外部会话后仍保留在统一会话列表", await exists(page, `.session-item[data-session-id="${externalSession.sessionId}"]`));
+  for (const [locale, expected] of [
+    ["en-US", "External calls from e2e-agent"],
+    ["zh-CN", "来自 e2e-agent 的外部调用"],
+  ]) {
+    await post(page, "/api/settings/update", { key: "locale", value: locale });
+    await page.call("Page.reload", { ignoreCache: true });
+    await waitFor(() => exists(page, '[data-testid="external-session-bar"]'), "重载后恢复外部会话", 30_000);
+    for (const mode of ["original", "summary"]) {
+      await post(page, "/api/settings/update", { key: "conversationDisplayMode", value: mode });
+      await page.call("Page.reload", { ignoreCache: true });
+      await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes(expected), `${locale}/${mode} 外部活动提示本地化`, 30_000);
+      check(`${locale}/${mode} 历史外部调用按界面语言显示`, true);
+    }
+  }
+  await post(page, "/api/settings/update", { key: "conversationDisplayMode", value: "original" });
+  await page.call("Page.reload", { ignoreCache: true });
   await waitFor(async () => (await page.evaluate(`document.body.innerText`)).includes("external-read.txt"), "时间线里出现外部调用的工具卡片", 30_000).catch(async (error) => {
     const dom = await page.evaluate(`JSON.stringify({ thread: document.querySelector('.thread-panel')?.innerText?.slice(0, 300), html: document.querySelector('.main-content')?.innerHTML?.replace(/<style[\\s\\S]*?<\\/style>/g, '').slice(0, 1200), bar: Boolean(document.querySelector('[data-testid="external-session-bar"]')), settings: Boolean(document.querySelector('[data-testid="settings-page"]')?.getClientRects().length), vis: document.visibilityState })`);
     const api_ = (await api(page, `/api/messages?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&sessionId=${encodeURIComponent(externalSession.sessionId)}`)).body;
@@ -812,7 +940,7 @@ try {
   const cancelledWritePending = mcpCall("magi.fs.write", { path: "cancelled-write.txt", content: "must not be written" });
   await waitFor(() => page.evaluate(`[...document.querySelectorAll('[data-approval-id]')].some((tray) => tray.innerText.includes('cancelled-write.txt'))`), "取消前出现对应写入的授权托盘");
   const cancelledNotification = await fetch(restoredUrl, {
-    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}` },
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${issued.secret}`, "mcp-session-id": issuedSessionId },
     body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } }),
   });
   const cancelledWrite = await cancelledWritePending;
@@ -870,7 +998,24 @@ try {
   })()`), "吊销命令的会话卡片显示已取消");
   check("吊销后会话卡片显示实际取消状态", true);
 
+  await post(page, "/api/workspaces/remove", { workspaceId });
+  const removedHistory = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions;
+  check("移除工作区后保留历史并标记不可用", removedHistory.some((session) => session.sessionId === revokedSession.sessionId && session.workspaceAvailable === false));
+  await click(page, '[data-testid="sidebar-refresh"]');
+  await waitFor(() => exists(page, `[data-testid="unavailable-external-session"][data-session-id="${revokedSession.sessionId}"]`), "工作区移除后侧栏保留不可用历史提示");
+  check("不可用历史没有绕过工作区校验的会话按钮", !(await exists(page, `[data-testid="unavailable-external-session"][data-session-id="${revokedSession.sessionId}"] button`)));
+  await openSettingsTab(page, "mcpServer");
+  await click(page, '[data-mcp-tab="clients"]');
+  await click(page, '[data-mcp-toggle-inactive="1"]');
+  await waitFor(async () => (await text(page, `[data-mcp-token="${issued.token.tokenId}"]`))?.includes("已吊销"), "令牌展示 daemon 的吊销状态");
+  const restoredWorkspace = JSON.parse((await post(page, "/api/workspaces/register", { path: workspaceRoot })).body);
+  check("重新添加原目录复用工作区身份", restoredWorkspace.workspaceId === workspaceId);
+  const restoredHistory = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions;
+  check("原工作区恢复后历史重新可用", restoredHistory.some((session) => session.sessionId === revokedSession.sessionId && session.workspaceAvailable === true));
+  check("恢复工作区不复活已吊销令牌", JSON.parse((await api(page, "/api/mcp-server/status")).body).tokens.find((token) => token.tokenId === issued.token.tokenId)?.state === "revoked");
   await post(page, "/api/mcp-server/enabled", { enabled: false });
+  const stoppedStatus = JSON.parse((await api(page, "/api/mcp-server/status")).body);
+  check("服务关闭后两种连接统计归零", stoppedStatus.httpSessions === 0 && stoppedStatus.localConnections === 0);
   await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
 
   // 11. Renderer 无未处理异常

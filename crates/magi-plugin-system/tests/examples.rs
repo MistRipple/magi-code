@@ -66,3 +66,67 @@ fn board_example_is_a_valid_package_using_every_author_facing_contribution() {
         assert!(source.contains(&format!("'{id}'")), "入口没有处理 {id}");
     }
 }
+
+#[test]
+fn author_guide_examples_are_installable_at_each_tutorial_stage() {
+    let guide = include_str!("../../../docs/plugin-authoring.md");
+    let section = |number| {
+        guide
+            .split_once(&format!("\n## {number}. "))
+            .expect("指南章节存在")
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap()
+    };
+    let code = |text: &str, language| {
+        let marker = format!("```{language}\n");
+        text.split_once(&marker)
+            .and_then(|(_, tail)| tail.split_once("\n```"))
+            .expect("指南须内嵌完整示例文件")
+            .0
+            .to_owned()
+    };
+    for (chapter, id) in [(2, "example.echo"), (4, "example.note")] {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = code(section(chapter), "json");
+        fs::write(directory.path().join("manifest.json"), &manifest).unwrap();
+        fs::write(
+            directory.path().join("plugin.mjs"),
+            code(section(chapter), "js"),
+        )
+        .unwrap();
+        let package = PluginPackage::from_archive(&pack(directory.path()))
+            .expect("仅复制指南中的文件就必须能通过安装校验");
+        assert_eq!(package.manifest().id, id);
+        assert_eq!(package.files().len(), 2);
+        if chapter == 4 {
+            let mut manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+            manifest["version"] = "1.1.0".into();
+            manifest["permissions"][0]["targets"]
+                .as_array_mut()
+                .unwrap()
+                .push("__settings".into());
+            manifest["settingsSchema"] = serde_json::from_str(&code(section(5), "json")).unwrap();
+            fs::write(directory.path().join("manifest.json"), manifest.to_string()).unwrap();
+            PluginPackage::from_archive(&pack(directory.path())).expect("设置教程必须可安装");
+            manifest["version"] = "1.2.0".into();
+            manifest["contributions"]["views"] = serde_json::from_str::<serde_json::Value>(&code(
+                section(6),
+                "json",
+            ))
+            .unwrap()["views"]
+                .clone();
+            fs::write(directory.path().join("manifest.json"), manifest.to_string()).unwrap();
+            fs::create_dir(directory.path().join("ui")).unwrap();
+            fs::write(
+                directory.path().join("ui/index.html"),
+                code(section(6), "html"),
+            )
+            .unwrap();
+            let package = PluginPackage::from_archive(&pack(directory.path()))
+                .expect("按页面教程添加视图后必须可安装");
+            assert_eq!(package.files().len(), 3);
+        }
+    }
+}

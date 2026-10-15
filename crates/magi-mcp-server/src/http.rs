@@ -1,7 +1,8 @@
 //! Streamable HTTP 传输（回环与网络模式共用同一个处理器）。
 //!
 //! 检查顺序固定：**Host → Origin → 认证 → 请求体解析 → 调用管线**。认证之前不解析请求体；
-//! 认证失败对外统一为 401，不区分原因。只提供 `POST /mcp`：不提供 SSE 与会话续传，
+//! 认证失败对外统一为 401，不区分原因。`initialize` 签发传输会话以隔离请求与取消；
+//! 不带会话头的调用按独立请求处理，不能通过通知取消。不提供 SSE 与会话续传，
 //! 服务没有需要服务端主动推送的内容。
 //!
 //! **对端地址决定“本机请求”**：监听公网地址（如 `0.0.0.0`）时，来自非回环地址的连接无论
@@ -11,13 +12,14 @@
 //!
 //! 这是**独立入口**：不挂到 Magi 主应用、不共享其鉴权中间件、不暴露任何 `/api/*` 路由（M10）。
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -25,7 +27,7 @@ use serde_json::{Value, json};
 
 use crate::protocol::{JSONRPC_PARSE_ERROR, JsonRpcRequest, error};
 use crate::rate_limit::RateLimiter;
-use crate::server::{ClientPrincipal, MAX_ARGUMENT_BYTES, McpServer};
+use crate::server::{ClientPrincipal, ConnectionScope, MAX_ARGUMENT_BYTES, McpServer};
 use crate::token::TokenStore;
 
 /// 本服务接受的 `MCP-Protocol-Version` 请求头取值。
@@ -57,6 +59,16 @@ impl Default for HttpConfig {
     }
 }
 
+const SESSION_HEADER: &str = "mcp-session-id";
+const SESSION_IDLE_MS: u64 = 30 * 60 * 1000;
+const MAX_HTTP_SESSIONS: usize = 1024;
+
+struct HttpSession {
+    token_id: String,
+    scope: Arc<ConnectionScope>,
+    last_used_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct HttpState {
     pub server: Arc<McpServer>,
@@ -72,9 +84,28 @@ pub struct HttpState {
     /// 与 `tunnel_hosts` 一样，命中这里的请求按网络请求处理。
     pub public_hosts: Arc<RwLock<Vec<String>>>,
     pub limiter: Arc<RateLimiter>,
+    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
 }
 
 impl HttpState {
+    /// 尚未终止或闲置过期的 HTTP 传输会话；不代表在线客户端数量。
+    pub fn session_count(&self) -> usize {
+        let now = (self.clock)();
+        let records = self.tokens.records();
+        self.sessions
+            .lock()
+            .expect("HTTP sessions poisoned")
+            .values()
+            .filter(|session| {
+                (now.saturating_sub(session.last_used_ms) < SESSION_IDLE_MS
+                    || Arc::strong_count(&session.scope) > 1)
+                    && records
+                        .iter()
+                        .any(|record| record.token_id == session.token_id && record.is_active(now))
+            })
+            .count()
+    }
+
     pub fn new(server: Arc<McpServer>, tokens: Arc<TokenStore>, config: HttpConfig) -> Self {
         Self {
             server,
@@ -84,6 +115,7 @@ impl HttpState {
             tunnel_hosts: Arc::new(RwLock::new(Vec::new())),
             public_hosts: Arc::new(RwLock::new(Vec::new())),
             limiter: Arc::new(RateLimiter::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -114,7 +146,12 @@ fn system_now_ms() -> u64 {
 
 pub fn router(state: HttpState) -> Router {
     Router::new()
-        .route("/mcp", post(handle_post).fallback(method_not_allowed))
+        .route(
+            "/mcp",
+            post(handle_post)
+                .delete(handle_post)
+                .fallback(method_not_allowed),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -123,7 +160,7 @@ async fn method_not_allowed() -> Response {
     let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
     response
         .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("POST"));
+        .insert(header::ALLOW, HeaderValue::from_static("POST, DELETE"));
     response
 }
 
@@ -203,6 +240,7 @@ fn forwarded_source(headers: &HeaderMap) -> String {
 async fn handle_post(
     State(state): State<HttpState>,
     Peer(peer): Peer,
+    method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -294,21 +332,94 @@ async fn handle_post(
             .into_response();
     }
 
-    // 5) 请求体与调用管线。
-    let request: JsonRpcRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(parse_error) => {
-            return Json(error(
-                Value::Null,
-                JSONRPC_PARSE_ERROR,
-                format!("请求体不是合法 JSON-RPC：{parse_error}"),
-            ))
-            .into_response();
+    let request = if method == Method::POST {
+        match serde_json::from_slice::<JsonRpcRequest>(&body) {
+            Ok(request) => Some(request),
+            Err(parse_error) => {
+                return Json(error(
+                    Value::Null,
+                    JSONRPC_PARSE_ERROR,
+                    format!("请求体不是合法 JSON-RPC：{parse_error}"),
+                ))
+                .into_response();
+            }
         }
+    } else {
+        None
     };
     let principal = ClientPrincipal::from(&record);
-    match state.server.handle(&principal, request, now_ms).await {
-        Some(response) => Json(response).into_response(),
+    // 传输会话只隔离请求与取消，不改变令牌对应的 Magi 会话、工作区和权限。
+    // 无会话请求各用独立 scope，不能用相同的 JSON-RPC ID 取消其他客户端的调用。
+    if method == Method::DELETE && !headers.contains_key(SESSION_HEADER) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let (scope, registration) = {
+        let mut sessions = state.sessions.lock().expect("HTTP sessions poisoned");
+        sessions.retain(|_, session| {
+            now_ms.saturating_sub(session.last_used_ms) < SESSION_IDLE_MS
+                || Arc::strong_count(&session.scope) > 1
+        });
+        let scope = if let Some(id) = headers.get(SESSION_HEADER) {
+            let Ok(id) = id.to_str() else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let Some(session) = sessions
+                .get_mut(id)
+                .filter(|s| s.token_id == record.token_id)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if method == Method::DELETE {
+                let session = sessions.remove(id).expect("session exists");
+                session.scope.cancel();
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            session.last_used_ms = now_ms;
+            session.scope.clone()
+        } else {
+            Arc::new(state.server.connection_scope())
+        };
+        // 与 DELETE 共用锁：登记完成后才允许会话终止，避免漏掉刚进入的调用。
+        let registration = request
+            .as_ref()
+            .and_then(|request| state.server.prepare_request(&principal, request, scope.id));
+        (scope, registration)
+    };
+    let request = request.expect("DELETE returned above");
+    let initialize = request.method == "initialize" && !headers.contains_key(SESSION_HEADER);
+    match state
+        .server
+        .handle_prepared(&principal, request, now_ms, registration)
+        .await
+    {
+        Some(response) => {
+            let mut session_header = None;
+            if initialize && response.get("result").is_some() {
+                let mut random = [0u8; 32];
+                if getrandom::fill(&mut random).is_err() {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+                let mut sessions = state.sessions.lock().expect("HTTP sessions poisoned");
+                if sessions.len() >= MAX_HTTP_SESSIONS {
+                    return too_many_requests();
+                }
+                sessions.insert(
+                    id.clone(),
+                    HttpSession {
+                        token_id: record.token_id,
+                        scope,
+                        last_used_ms: now_ms,
+                    },
+                );
+                session_header = Some(HeaderValue::from_str(&id).expect("hex session ID"));
+            }
+            let mut response = Json(response).into_response();
+            if let Some(id) = session_header {
+                response.headers_mut().insert(SESSION_HEADER, id);
+            }
+            response
+        }
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
@@ -369,9 +480,15 @@ mod tests {
         router: Router,
         secret: String,
         tokens: Arc<TokenStore>,
+        state: HttpState,
+        clock: Arc<std::sync::atomic::AtomicU64>,
     }
 
     fn fixture(config: HttpConfig) -> Fixture {
+        fixture_with_backend(config, Arc::new(Backend))
+    }
+
+    fn fixture_with_backend(config: HttpConfig, backend: Arc<dyn ToolBackend>) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let tokens = Arc::new(TokenStore::new());
         let issued = tokens
@@ -390,16 +507,22 @@ mod tests {
         let server = Arc::new(McpServer::new(
             "magi-mcp",
             "test",
-            Arc::new(Backend),
+            backend,
             Arc::new(Root(dir.path().to_path_buf())),
         ));
         let mut state = HttpState::new(server, tokens.clone(), config);
-        state.clock = Arc::new(|| 10);
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        state.clock = {
+            let clock = clock.clone();
+            Arc::new(move || clock.load(std::sync::atomic::Ordering::SeqCst))
+        };
         Fixture {
             _dir: dir,
-            router: router(state),
+            router: router(state.clone()),
             secret: issued.secret,
             tokens,
+            state,
+            clock,
         }
     }
 
@@ -422,6 +545,269 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#;
+    const CALL: &str =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"magi.fs.read"}}"#;
+    const CANCEL: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+
+    fn session_request(secret: &str, session: Option<&str>, body: &str) -> Request<Body> {
+        let mut request = post_request(Some(secret), "localhost", body);
+        if let Some(id) = session {
+            request
+                .headers_mut()
+                .insert(SESSION_HEADER, id.parse().unwrap());
+        }
+        request
+    }
+
+    async fn initialize(f: &Fixture) -> String {
+        let response = f
+            .router
+            .clone()
+            .oneshot(session_request(&f.secret, None, INITIALIZE))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = response.headers()[SESSION_HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(json_of(response).await["result"].is_object());
+        id
+    }
+
+    struct CancellableBackend(
+        tokio::sync::mpsc::UnboundedSender<crate::server::RequestCancellation>,
+    );
+    impl ToolBackend for CancellableBackend {
+        fn schemas(&self) -> &dyn ToolSchemaProvider {
+            static SCHEMAS: Schemas = Schemas;
+            &SCHEMAS
+        }
+        fn path_requests(&self, _: &str, _: &Value, _: &std::path::Path) -> Vec<PathRequest> {
+            Vec::new()
+        }
+        fn invoke<'a>(&'a self, invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
+            Box::pin(async move {
+                self.0.send(invocation.cancellation.clone()).unwrap();
+                while !invocation.cancellation.is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                InvocationOutcome {
+                    text: "cancelled".into(),
+                    is_error: true,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_token_http_sessions_isolate_duplicate_ids_cancellation_and_termination() {
+        let (tx, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let f = fixture_with_backend(HttpConfig::default(), Arc::new(CancellableBackend(tx)));
+        let first = initialize(&f).await;
+        let second = initialize(&f).await;
+        assert_ne!(first, second);
+        assert_eq!(f.state.session_count(), 2);
+        let mut tasks = Vec::new();
+        let mut signals = Vec::new();
+        // 两个有会话客户端和两个无会话客户端都使用 id=1，均须进入后端。
+        for session in [Some(first.as_str()), Some(second.as_str()), None, None] {
+            let router = f.router.clone();
+            let request = session_request(&f.secret, session, CALL);
+            tasks.push(tokio::spawn(async move {
+                router.oneshot(request).await.unwrap()
+            }));
+            signals.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), calls.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let duplicate = f
+            .router
+            .clone()
+            .oneshot(session_request(&f.secret, Some(&first), CALL))
+            .await
+            .unwrap();
+        assert_eq!(json_of(duplicate).await["result"]["isError"], true);
+        // 未携带会话头的取消不能猜测/命中任一客户端的请求。
+        f.router
+            .clone()
+            .oneshot(session_request(&f.secret, None, CANCEL))
+            .await
+            .unwrap();
+        assert!(signals.iter().all(|signal| !signal.is_cancelled()));
+        f.router
+            .clone()
+            .oneshot(session_request(&f.secret, Some(&first), CANCEL))
+            .await
+            .unwrap();
+        assert!(signals[0].is_cancelled());
+        assert!(signals[1..].iter().all(|signal| !signal.is_cancelled()));
+        let mut terminate = session_request(&f.secret, Some(&second), "");
+        *terminate.method_mut() = Method::DELETE;
+        assert_eq!(
+            f.router.clone().oneshot(terminate).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(signals[1].is_cancelled());
+        assert!(!signals[2].is_cancelled() && !signals[3].is_cancelled());
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(session_request(&f.secret, Some(&second), LIST))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for task in tasks.drain(..2) {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(json_of(response).await["result"]["isError"], true);
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_ids_are_bound_to_authenticated_tokens_and_missing_headers_remain_stateless() {
+        let f = fixture(HttpConfig::default());
+        let id = initialize(&f).await;
+        let other = f
+            .tokens
+            .issue(
+                IssueTokenRequest {
+                    client_name: "other".into(),
+                    workspace_id: "ws".into(),
+                    approval_mode: ApprovalMode::Ask,
+                    attribution: AttributionMode::External,
+                    ttl_ms: None,
+                    network: false,
+                },
+                0,
+            )
+            .unwrap();
+        for method in [Method::POST, Method::DELETE] {
+            let mut request = session_request(&other.secret, Some(&id), LIST);
+            *request.method_mut() = method;
+            assert_eq!(
+                f.router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(session_request(&f.secret, Some(&id), LIST))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(session_request(&f.secret, None, LIST))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let mut delete = session_request(&f.secret, None, "");
+        *delete.method_mut() = Method::DELETE;
+        assert_eq!(
+            f.router.oneshot(delete).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn session_count_excludes_revoked_credentials() {
+        let f = fixture(HttpConfig::default());
+        initialize(&f).await;
+        assert_eq!(f.state.session_count(), 1);
+        let token = &f.tokens.records()[0].token_id;
+        f.tokens.revoke(token, (f.state.clock)());
+        assert_eq!(f.state.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_expire_but_running_calls_remain_cancellable() {
+        let (tx, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let f = fixture_with_backend(HttpConfig::default(), Arc::new(CancellableBackend(tx)));
+        let idle = initialize(&f).await;
+        let active = initialize(&f).await;
+        assert_eq!(f.state.session_count(), 2);
+        let router = f.router.clone();
+        let request = session_request(&f.secret, Some(&active), CALL);
+        let task = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), calls.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        f.clock
+            .store(SESSION_IDLE_MS + 11, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            f.state.session_count(),
+            1,
+            "idle sessions are excluded even before another request"
+        );
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(session_request(&f.secret, Some(&idle), LIST))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        f.router
+            .clone()
+            .oneshot(session_request(&f.secret, Some(&active), CANCEL))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        // 初始化洪泛受限，清理空闲会话后仍可建立新连接。
+        {
+            let mut sessions = f.state.sessions.lock().unwrap();
+            for i in sessions.len()..MAX_HTTP_SESSIONS {
+                sessions.insert(
+                    format!("test-{i}"),
+                    HttpSession {
+                        token_id: f.tokens.records()[0].token_id.clone(),
+                        scope: Arc::new(f.state.server.connection_scope()),
+                        last_used_ms: SESSION_IDLE_MS + 11,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            f.router
+                .clone()
+                .oneshot(session_request(&f.secret, None, INITIALIZE))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        f.clock.store(
+            2 * SESSION_IDLE_MS + 12,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        initialize(&f).await;
+        assert_eq!(f.state.sessions.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -522,6 +908,10 @@ mod tests {
     }
 
     fn direct_fixture() -> DirectFixture {
+        direct_fixture_for("203.0.113.5")
+    }
+
+    fn direct_fixture_for(host: &str) -> DirectFixture {
         let dir = tempfile::tempdir().unwrap();
         let tokens = Arc::new(TokenStore::new());
         let issue = |network: bool| {
@@ -549,11 +939,7 @@ mod tests {
         ));
         let mut state = HttpState::new(server, tokens, HttpConfig::default());
         state.clock = Arc::new(|| 10);
-        state
-            .public_hosts
-            .write()
-            .unwrap()
-            .push("203.0.113.5".to_string());
+        state.public_hosts.write().unwrap().push(host.to_string());
         DirectFixture {
             _dir: dir,
             router: router(state),
@@ -566,6 +952,37 @@ mod tests {
         let addr: SocketAddr = format!("{peer}:50000").parse().unwrap();
         request.extensions_mut().insert(ConnectInfo(addr));
         request
+    }
+
+    #[tokio::test]
+    async fn lan_addresses_use_the_same_network_token_and_host_checks() {
+        for host in ["10.0.0.8", "192.168.1.8"] {
+            let f = direct_fixture_for(host);
+            for (secret, expected) in [
+                (&f.network_secret, StatusCode::OK),
+                (&f.local_secret, StatusCode::UNAUTHORIZED),
+            ] {
+                let response = f
+                    .router
+                    .clone()
+                    .oneshot(from_peer(
+                        post_request(Some(secret), host, LIST),
+                        "10.0.0.9",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+            }
+            let response = f
+                .router
+                .oneshot(from_peer(
+                    post_request(Some(&f.network_secret), "10.0.0.99", LIST),
+                    "10.0.0.9",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]
@@ -688,7 +1105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_post_is_served_and_unsupported_protocol_versions_are_refused() {
+    async fn unsupported_methods_and_protocol_versions_are_refused() {
         let f = fixture(HttpConfig::default());
         let get = Request::builder()
             .method("GET")
@@ -698,7 +1115,7 @@ mod tests {
             .unwrap();
         let response = f.router.clone().oneshot(get).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[header::ALLOW], "POST");
+        assert_eq!(response.headers()[header::ALLOW], "POST, DELETE");
 
         let mut old = post_request(Some(&f.secret), "localhost", LIST);
         old.headers_mut().insert(

@@ -134,7 +134,7 @@ assert.match(section, /hasNetworkToken/);
 assert.match(events, /MCP_APPROVALS_CHANGED_EVENT = 'magi:mcp-approvals-changed'/);
 assert.match(
   bridge,
-  /event\.payload\?\.external === true\) \{[\s\S]*?MCP_APPROVALS_CHANGED_EVENT[\s\S]*?return;[\s\S]*?\}\s*refreshCurrentSessionToolApprovals\(eventType\)/,
+  /event\.payload\?\.external === true\) \{\s*window\.dispatchEvent\(new CustomEvent\(MCP_APPROVALS_CHANGED_EVENT\)\);\s*if \(rustEventSessionId\(event\) === currentSessionId\.trim\(\)\) \{\s*refreshCurrentSessionToolApprovals\(eventType\);\s*\}\s*return;/,
 );
 assert.match(shell, /<ExternalApprovalTray \/>/);
 assert.match(shell, /mergeExternalSessionsIntoSidebar/);

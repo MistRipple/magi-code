@@ -4018,6 +4018,7 @@ export interface McpServerToken {
   prefix: string;
   clientName: string;
   workspaceId: string;
+  workspaceAvailable: boolean;
   approvalMode: McpServerApprovalMode;
   attribution: 'external' | 'follow_web_slot';
   /** 是否允许经公网隧道使用。 */
@@ -4027,6 +4028,7 @@ export interface McpServerToken {
   revokedAtMs: number | null;
   lastUsedAtMs: number | null;
   active: boolean;
+  state: 'active' | 'expired' | 'revoked' | 'workspace_unavailable';
   /** 是否可以重新查看原文（没有保存原文的令牌只能重新生成）。 */
   hasSecret: boolean;
 }
@@ -4067,6 +4069,8 @@ export interface McpServerStatus {
   stdioEndpoint: string | null;
   stateRoot: string | null;
   activeTokens: number;
+  httpSessions: number;
+  localConnections: number;
   network: McpServerNetworkStatus;
   direct: McpServerDirectStatus;
   tokens: McpServerToken[];
@@ -4328,6 +4332,7 @@ export interface McpExternalSession {
   sessionId: string;
   clientName: string;
   workspaceId: string | null;
+  workspaceAvailable: boolean;
   lastActivityAtMs: number;
   /** 在途调用数（含等待人工确认的）。 */
   running: number;

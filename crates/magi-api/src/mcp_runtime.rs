@@ -149,6 +149,7 @@ pub(crate) struct DirectStatus {
 }
 
 struct Running {
+    http_state: HttpState,
     addr: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -194,6 +195,8 @@ pub(crate) struct McpServiceStatus {
     /// state root（`magi-mcp --state-root`），用于生成 stdio 配置。
     pub state_root: Option<String>,
     pub active_tokens: usize,
+    pub http_sessions: usize,
+    pub local_connections: usize,
     pub network: NetworkStatus,
     pub direct: DirectStatus,
     pub external: ExternalRetention,
@@ -609,6 +612,15 @@ impl McpServiceRuntime {
                 .iter()
                 .filter(|record| record.is_active(now))
                 .count(),
+            http_sessions: control
+                .running
+                .as_ref()
+                .map_or(0, |running| running.http_state.session_count()),
+            local_connections: control
+                .running
+                .as_ref()
+                .and_then(|running| running.local_socket.as_ref())
+                .map_or(0, LocalSocketServer::connection_count),
             direct: self.direct_status_locked(control),
             external: self.retention(),
             network: NetworkStatus {
@@ -800,7 +812,7 @@ impl McpServiceRuntime {
         } else {
             Vec::new()
         };
-        let app = router(http_state);
+        let app = router(http_state.clone());
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let _ = axum::serve(
@@ -828,6 +840,7 @@ impl McpServiceRuntime {
             None => None,
         };
         control.running = Some(Running {
+            http_state,
             addr,
             stop: Some(stop),
             task,
@@ -979,7 +992,7 @@ impl McpServiceRuntime {
         let next = if request.enabled {
             if !self.has_active_network_token() {
                 return Err(McpRuntimeError::Token(
-                    "需要至少一个有效且允许网络访问的令牌才能直接对公网开放".to_string(),
+                    "需要至少一个有效且允许网络访问的令牌才能开启网络直连".to_string(),
                 ));
             }
             parse_bind_host(&request.bind_host).map_err(McpRuntimeError::Token)?;

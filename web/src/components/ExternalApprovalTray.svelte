@@ -7,7 +7,9 @@
   import { onMount } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { externalApprovals, trackExternalApprovals } from '../stores/external-approvals.svelte';
-  import { externalSessionById } from '../stores/external-sessions.svelte';
+  import { externalSessionById, externalSessions, openExternalSession } from '../stores/external-sessions.svelte';
+  import { closeSettings } from '../stores/shell-ui.svelte';
+  import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
   import { messagesState } from '../stores/messages.svelte';
   import ExternalApprovalActions from './ExternalApprovalActions.svelte';
 
@@ -25,9 +27,17 @@
   <div class="tray" data-external-approval-tray="1" role="alertdialog" aria-label={i18n.t('mcpServer.tray.title')}>
     <div class="tray-title">{i18n.t('mcpServer.tray.title')}</div>
     {#each visible as approval (approval.approvalId)}
+      {@const session = externalSessions.sessions.find((entry) => entry.tokenId === approval.tokenId)}
+      {@const workspace = composerWorkspaceState.workspaces.find((entry) => entry.workspaceId === approval.workspaceId)}
       <div class="item" data-external-approval={approval.approvalId}>
         <div class="summary">{approval.summary}</div>
         <div class="meta">{i18n.t('mcpServer.approvals.from', { client: approval.clientName, prefix: approval.tokenPrefix })}</div>
+        <div class="meta">{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspace?.name ?? approval.workspaceId })}{#if workspace} · {workspace.rootPath}{/if}</div>
+        {#if session}
+          <button type="button" class="btn btn--sm btn--secondary" data-mcp-approval-view-session={approval.approvalId} onclick={() => { closeSettings(); openExternalSession(session); }}>
+            {i18n.t('mcpServer.audit.viewSession')}
+          </button>
+        {/if}
         <ExternalApprovalActions {approval} />
       </div>
     {/each}

@@ -113,6 +113,15 @@ export type ConversationTranslate = (
   vars?: Record<string, string | number>,
 ) => string;
 
+/** 系统活动提示按结构化来源展示，历史存储文案不决定界面语言。 */
+export function resolveConversationMessageText(message: Message, translate: ConversationTranslate): string {
+  if (message.metadata?.noticeKind === 'external_client') {
+    const client = typeof message.metadata.clientName === 'string' ? message.metadata.clientName.trim() : '';
+    return translate('externalSession.activityNotice', { client: client || translate('externalSession.title') });
+  }
+  return message.content;
+}
+
 /** 过程标题只是一行预览，超长内容截断；完整内容由展开后的正文承担。 */
 const PROCESS_LABEL_MAX_CHARS = 160;
 /** 展开后仍以单行紧凑形态呈现的过程文字上限（超过则按完整正文渲染）。 */
@@ -189,7 +198,7 @@ export function resolveConversationProcessLabel(
   message: Message,
   translate: ConversationTranslate,
 ): string {
-  const directContent = typeof message.content === 'string' ? plainText(message.content) : '';
+  const directContent = plainText(resolveConversationMessageText(message, translate));
   if (directContent) return directContent;
   for (const block of message.blocks || []) {
     if (!block || typeof block !== 'object') continue;

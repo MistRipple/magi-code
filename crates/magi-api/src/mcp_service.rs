@@ -104,10 +104,33 @@ pub(crate) struct RegistryWorkspaces {
     state: ApiState,
 }
 
+pub(crate) fn workspace_name(state: &ApiState, workspace_id: &str) -> Option<String> {
+    state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id.as_str() == workspace_id)
+        .map(|workspace| {
+            workspace
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    Path::new(workspace.root_path.as_str())
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| workspace.root_path.to_string())
+                })
+        })
+}
+
 impl WorkspaceResolver for RegistryWorkspaces {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf> {
         self.state
             .workspace_root_path(&Some(WorkspaceId::new(workspace_id)))
+    }
+
+    fn name_of(&self, workspace_id: &str) -> Option<String> {
+        workspace_name(&self.state, workspace_id)
     }
 }
 
@@ -1300,6 +1323,7 @@ mod tests {
     struct Fixture {
         state: ApiState,
         router: axum::Router,
+        transport_session: tokio::sync::OnceCell<String>,
         tokens: Arc<TokenStore>,
         secret: String,
         token_id: String,
@@ -1449,6 +1473,7 @@ mod tests {
         );
         Fixture {
             state,
+            transport_session: tokio::sync::OnceCell::new(),
             router: router(HttpState::new(
                 server,
                 tokens.clone(),
@@ -1469,22 +1494,45 @@ mod tests {
         rpc_message(fixture, body).await
     }
 
-    async fn rpc_message(fixture: &Fixture, body: Value) -> Value {
-        let response = fixture
+    async fn http_message(
+        fixture: &Fixture,
+        body: Value,
+        session: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", fixture.secret));
+        if let Some(id) = session {
+            request = request.header("mcp-session-id", id);
+        }
+        fixture
             .router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header(header::HOST, "127.0.0.1")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", fixture.secret))
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn rpc_message(fixture: &Fixture, body: Value) -> Value {
+        let session = fixture
+            .transport_session
+            .get_or_init(|| async {
+                let response = http_message(
+                    fixture,
+                    serde_json::json!({"jsonrpc":"2.0", "id":0, "method":"initialize"}),
+                    None,
+                )
+                .await;
+                response.headers()["mcp-session-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .await;
+        let response = http_message(fixture, body, Some(session)).await;
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

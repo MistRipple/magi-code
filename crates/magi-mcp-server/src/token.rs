@@ -50,7 +50,7 @@ pub struct TokenRecord {
     pub revoked_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at_ms: Option<u64>,
-    /// 是否允许经公网隧道使用。默认 `false`：只能在本机（回环 HTTP / stdio）使用。
+    /// 是否允许经网络直连（内网／公网）或公网隧道使用。默认 `false`：只能在本机（回环 HTTP / stdio）使用。
     #[serde(default)]
     pub network: bool,
 }
@@ -71,7 +71,7 @@ pub struct IssueTokenRequest {
     pub attribution: AttributionMode,
     /// 有效期（毫秒）。`None` 表示不过期。
     pub ttl_ms: Option<u64>,
-    /// 允许经公网隧道使用（显式选择，默认不允许）。
+    /// 允许经网络直连或公网隧道使用（显式选择，默认不允许）。
     pub network: bool,
 }
 

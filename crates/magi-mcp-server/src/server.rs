@@ -105,6 +105,10 @@ impl AttributionResolver for ExternalOnlyAttribution {
 /// 工作区根目录解析（令牌只绑定工作区 id）。
 pub trait WorkspaceResolver: Send + Sync {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf>;
+
+    fn name_of(&self, _workspace_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 交给后端执行的一次调用。
@@ -229,14 +233,14 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// 每条 stdio 连接拥有独立请求身份；断连只取消该连接的调用。
+/// 每条 stdio 连接或 HTTP 传输会话拥有独立请求身份；释放时只取消该 scope 的调用。
 pub(crate) struct ConnectionScope {
     pub(crate) id: u64,
     calls: Arc<InFlightCalls>,
 }
 
-impl Drop for ConnectionScope {
-    fn drop(&mut self) {
+impl ConnectionScope {
+    pub(crate) fn cancel(&self) {
         let calls: Vec<_> = self
             .calls
             .0
@@ -251,6 +255,12 @@ impl Drop for ConnectionScope {
                 call.store(true, Ordering::SeqCst);
             }
         }
+    }
+}
+
+impl Drop for ConnectionScope {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -408,7 +418,31 @@ impl McpServer {
         }
         let id = request.response_id();
         match request.method.as_str() {
-            "initialize" => Some(success(id, initialize_result(&self.name, &self.version))),
+            "initialize" => {
+                let instructions = if principal.attribution == AttributionMode::External {
+                    let Some(root) = self.workspaces.root_of(&principal.workspace_id) else {
+                        return Some(error(id, JSONRPC_INVALID_PARAMS, "绑定的工作区不可用"));
+                    };
+                    let workspace = json!({
+                        "name": self.workspaces.name_of(&principal.workspace_id)
+                            .unwrap_or_else(|| principal.workspace_id.clone()),
+                        "root": root,
+                    });
+                    Some(format!(
+                        "This Magi MCP connection is bound to workspace {workspace}. \
+                         Paths refer to the machine running Magi, not the client machine. \
+                         Resolve relative paths against this workspace root. \
+                         The target does not change when the client opens another project. \
+                         Use a separate Magi MCP connection for another workspace."
+                    ))
+                } else {
+                    None
+                };
+                Some(success(
+                    id,
+                    initialize_result(&self.name, &self.version, instructions.as_deref()),
+                ))
+            }
             "ping" => Some(success(id, ping_result())),
             "tools/list" => Some(success(id, tools_list_result(&self.catalog_for(principal)))),
             "tools/call" => {
@@ -759,6 +793,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains(&h._dir.path().display().to_string()));
+        assert!(instructions.contains("Resolve relative paths against this workspace root"));
+        assert!(instructions.contains("does not change when the client opens another project"));
         assert_eq!(
             init["result"]["capabilities"]["tools"]["listChanged"],
             false
@@ -781,6 +819,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing["error"]["code"], JSONRPC_METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn initialize_never_falls_back_to_another_workspace_or_binds_a_web_slot() {
+        let h = harness();
+        let mut p = principal(Profile::ReadOnly);
+        p.workspace_id = "unregistered".into();
+        let response = h
+            .server
+            .handle(&p, request("initialize", Some(json!(1)), json!({})), 1)
+            .await
+            .unwrap();
+        assert!(response.get("error").is_some());
+        assert!(
+            !response
+                .to_string()
+                .contains(&h._dir.path().display().to_string())
+        );
+
+        p.attribution = AttributionMode::FollowWebSlot;
+        let response = h
+            .server
+            .handle(&p, request("initialize", Some(json!(2)), json!({})), 1)
+            .await
+            .unwrap();
+        assert!(response["result"].get("instructions").is_none());
+        assert_eq!(response["result"]["serverInfo"]["name"], "magi-mcp");
     }
 
     #[tokio::test]

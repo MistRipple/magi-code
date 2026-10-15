@@ -723,7 +723,10 @@ function registerIpc(): void {
   });
   handleIpc("magi-desktop:install-update", (event) => {
     trustedAppSender(event.sender.id);
-    return updateManager!.install();
+    return updateManager!.install(async () => {
+      shuttingDown = true;
+      await shutdown();
+    });
   });
 }
 

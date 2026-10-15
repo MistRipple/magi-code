@@ -6,7 +6,7 @@
    * `/api/mcp-server/*`。令牌原文由 daemon 在本机保存，需要时通过“查看配置”重新取回；
    * 这里不落任何浏览器存储，收起面板或关闭提示卡后即丢弃。
    */
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
@@ -51,6 +51,7 @@
   let showInactive = $state(false);
   let loadError = $state('');
   let busy = $state(false);
+  let refreshing = false;
 
   let clientName = $state('');
   let workspaceId = $state('');
@@ -94,7 +95,7 @@
 
   const workspaces = $derived(composerWorkspaceState.workspaces);
   const hasNetworkToken = $derived(
-    (status?.tokens ?? []).some((token) => token.network && token.active),
+    (status?.tokens ?? []).some((token) => token.network && token.state === 'active'),
   );
   const networkTunnelStatus = $derived(status?.network.status ?? 'stopped');
   const editingToken = $derived(
@@ -106,7 +107,7 @@
       && (editTtl.trim() === '' || /^\d+$/.test(editTtl.trim())),
   );
   const remoteTokens = $derived(
-    (status?.tokens ?? []).filter((token) => token.active && token.network),
+    (status?.tokens ?? []).filter((token) => token.state === 'active' && token.network),
   );
   const tunnelReady = $derived(
     status?.network.status === 'running' && Boolean(status?.network.mcpUrl),
@@ -134,7 +135,8 @@
     (status?.tokens ?? []).filter((token) => showInactive || token.active),
   );
   /** 能直接填进配置的令牌：有效且保存了原文。 */
-  const connectTokens = $derived((status?.tokens ?? []).filter((token) => token.active));
+  const connectTokens = $derived((status?.tokens ?? []).filter((token) => token.state === 'active'));
+  const connectToken = $derived(connectTokens.find((token) => token.tokenId === connectTokenId));
   const STATUS_POLL_MS = 3000;
   const TABS: readonly McpTab[] = ['connect', 'clients', 'remote', 'activity'];
   const activeTokenCount = $derived((status?.tokens ?? []).filter((token) => token.active).length);
@@ -162,12 +164,16 @@
   }
 
   async function refresh(): Promise<void> {
+    if (refreshing) return;
+    refreshing = true;
     try {
       status = await getMcpServerStatus();
       loadError = '';
-      auditVersion += 1;
+      if (tab === 'activity') auditVersion += 1;
     } catch (error) {
       loadError = i18n.t('mcpServer.error.load', { message: messageOf(error) });
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -248,15 +254,17 @@
   }
 
   async function loadConnectSnippets(): Promise<void> {
+    snippets = null;
     if (!status?.running) {
-      snippets = null;
       return;
     }
+    const selectedTokenId = connectTokenId;
     const token = connectTokens.find((entry) => entry.tokenId === connectTokenId);
     try {
-      snippets = await getMcpServerConfigSnippets(token?.hasSecret ? token.tokenId : undefined);
+      const loaded = await getMcpServerConfigSnippets(token?.hasSecret ? token.tokenId : undefined);
+      if (connectTokenId === selectedTokenId && status?.running) snippets = loaded;
     } catch {
-      /* 下一次状态刷新或重新选择客户端时再试 */
+      /* 重新选择客户端或配置入口变化时再试 */
     }
   }
 
@@ -265,9 +273,10 @@
     const token = quickAddToken;
     if (!remoteReady || !token || !token.hasSecret) return;
     try {
-      quickAddSnippets = await getMcpServerConfigSnippets(token.tokenId);
+      const loaded = await getMcpServerConfigSnippets(token.tokenId);
+      if (quickAddTokenId === token.tokenId && remoteReady) quickAddSnippets = loaded;
     } catch {
-      /* 下一次状态刷新或重新选择令牌时再试 */
+      /* 重新选择令牌或配置入口变化时再试 */
     }
   }
 
@@ -437,10 +446,20 @@
   }
 
   function tokenStateLabel(token: McpServerToken): string {
-    if (token.revokedAtMs !== null) return i18n.t('mcpServer.token.revoked');
-    if (!token.active) return i18n.t('mcpServer.token.expired');
+    if (token.state === 'revoked') return i18n.t('mcpServer.token.revoked');
+    if (token.state === 'expired') return i18n.t('mcpServer.token.expired');
+    if (token.state === 'workspace_unavailable') return i18n.t('mcpServer.token.workspaceUnavailable');
     return '';
   }
+
+  $effect(() => {
+    if (viewingTokenId && status && !status.tokens.some((token) => token.tokenId === viewingTokenId && token.state === 'active')) {
+      untrack(toggleViewOff);
+    }
+    if (editingTokenId && status && !status.tokens.some((token) => token.tokenId === editingTokenId && token.state !== 'revoked')) {
+      editingTokenId = '';
+    }
+  });
 
   // 默认选一个能直接填进配置的客户端（没有原文的令牌无法填入）。
   $effect(() => {
@@ -453,12 +472,17 @@
     }
   });
 
-  // 服务状态或所选客户端变化时重新取配置。
+  const configVersion = $derived(JSON.stringify([
+    status?.running, status?.url, status?.stdioEndpoint,
+    status?.network.mcpUrl, status?.direct.mcpUrl, status?.direct.listening,
+    status?.tokens.map((token) => [token.tokenId, token.prefix, token.clientName, token.state, token.hasSecret]),
+  ]));
+
+  // 状态轮询不重复读取令牌原文，只有配置入口或所选客户端变化时重新取配置。
   $effect(() => {
-    void status?.running;
+    void configVersion;
     void connectTokenId;
-    void status?.network.mcpUrl;
-    void loadConnectSnippets();
+    untrack(() => { void loadConnectSnippets(); });
   });
 
   // 选中的公网令牌失效（吊销、过期）或不存在时，回到一个可用的。
@@ -471,9 +495,9 @@
 
   // 隧道就绪、地址变化或令牌变化时重新取配置。
   $effect(() => {
-    void remoteMcpUrl;
+    void configVersion;
     void quickAddTokenId;
-    void loadQuickAdd();
+    untrack(() => { void loadQuickAdd(); });
   });
 
   $effect(() => {
@@ -486,12 +510,20 @@
   onMount(() => {
     void refresh();
     const timer = window.setInterval(() => {
-      // 隧道建立需要几秒：网络模式开启但还没就绪时，跟随刷新状态以拿到公网地址。
-      if (status?.network.enabled && status.network.status !== 'running') void refresh();
+      if (!busy && document.visibilityState === 'visible') void refresh();
     }, STATUS_POLL_MS);
     return () => window.clearInterval(timer);
   });
 </script>
+
+{#snippet workspaceBinding(id: string)}
+  {@const workspace = workspaces.find((entry) => entry.workspaceId === id)}
+  <p class="meta" data-mcp-bound-workspace={id}>
+    {i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaceName(id) })}
+    · <code>{workspace?.rootPath ?? i18n.t('mcpServer.token.workspaceUnavailable')}</code>
+  </p>
+  <p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>
+{/snippet}
 
 <section class="mcp-server-section" data-mcp-server="1">
   <div>
@@ -540,6 +572,8 @@
       {#if status.url}<p class="meta"><code>{i18n.t('mcpServer.status.url', { url: status.url })}</code></p>{/if}
       {#if status.stdioEndpoint}<p class="meta"><code>{i18n.t('mcpServer.status.stdio', { endpoint: status.stdioEndpoint })}</code></p>{/if}
       {#if status.port}<p class="meta">{i18n.t('mcpServer.status.port', { port: status.port })}</p>{/if}
+      <p class="meta" data-mcp-connections="1">{i18n.t('mcpServer.status.connections', { http: status.httpSessions, local: status.localConnections })}</p>
+      <p class="meta">{i18n.t('mcpServer.status.connectionsHint')}</p>
     {/if}
   </div>
 
@@ -609,10 +643,11 @@
             <span>{i18n.t('mcpServer.quickAdd.token')}</span>
             <select bind:value={quickAddTokenId} data-mcp-quick-add-token="1">
               {#each remoteTokens as token (token.tokenId)}
-                <option value={token.tokenId}>{token.clientName} · {token.prefix}…</option>
+                <option value={token.tokenId}>{token.clientName} · {workspaceName(token.workspaceId)} · {token.prefix}…</option>
               {/each}
             </select>
           </label>
+          {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId)}{/if}
           {#if quickAddToken && !quickAddToken.hasSecret}
             <p class="meta" data-mcp-quick-add-no-secret="1">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
           {:else if quickAddSnippets?.remoteJson}
@@ -759,6 +794,7 @@
   {#if tab === 'clients'}
   <div class="card" data-mcp-server-tokens="1">
     <h4>{i18n.t('mcpServer.token.section')}</h4>
+    <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
 
     {#if freshSecret}
       <div class="secret-card" data-mcp-fresh-secret="1" role="status">
@@ -787,21 +823,24 @@
                 {#if token.network}<span class="badge" data-mcp-token-network="1">{i18n.t('mcpServer.token.networkBadge')}</span>{/if}
                 {#if tokenStateLabel(token)}<span class="badge badge--off">{tokenStateLabel(token)}</span>{/if}
               </span>
+              {#if !token.workspaceAvailable}
+                <p class="meta">{i18n.t('mcpServer.token.workspaceRestoreHint')}</p>
+              {/if}
+              {@render workspaceBinding(token.workspaceId)}
               <span class="meta">
-                {workspaceName(token.workspaceId)}
-                · {token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}
+                {token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}
                 · {token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}
               </span>
             </div>
-            {#if token.active}
+            {#if token.state !== 'revoked'}
               <div class="action-row">
-                <button type="button" data-mcp-token-view={token.tokenId} disabled={busy} onclick={() => void toggleView(token)}>
+                <button type="button" data-mcp-token-view={token.tokenId} disabled={busy || token.state !== 'active'} onclick={() => void toggleView(token)}>
                   {viewingTokenId === token.tokenId ? i18n.t('mcpServer.token.hide') : i18n.t('mcpServer.token.view')}
                 </button>
                 <button type="button" data-mcp-token-edit={token.tokenId} disabled={busy || token.attribution !== 'external'} onclick={() => startEdit(token)}>
                   {i18n.t('mcpServer.token.edit')}
                 </button>
-                <button type="button" disabled={busy || token.attribution !== 'external'} onclick={() => void rotate(token)}>
+                <button type="button" disabled={busy || token.attribution !== 'external' || token.state !== 'active'} onclick={() => void rotate(token)}>
                   {i18n.t('mcpServer.token.rotate')}
                 </button>
                 <button type="button" class="danger" disabled={busy} onclick={() => void revoke(token)}>
@@ -812,6 +851,7 @@
           </li>
           {#if viewingTokenId === token.tokenId}
             <li class="detail" data-mcp-token-detail={token.tokenId}>
+              {@render workspaceBinding(token.workspaceId)}
               {#if viewingSecret}
                 <div class="snippet-head">
                   <span class="row-title">{i18n.t('mcpServer.token.secret')}</span>
@@ -917,10 +957,11 @@
             <option value="">{i18n.t('mcpServer.token.workspaceEmpty')}</option>
           {/if}
           {#each workspaces as workspace (workspace.workspaceId)}
-            <option value={workspace.workspaceId}>{workspace.name}</option>
+            <option value={workspace.workspaceId}>{workspace.name} · {workspace.rootPath}</option>
           {/each}
         </select>
       </label>
+      {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
       <label class="field">
         <span>{i18n.t('mcpServer.token.approvalMode')}</span>
         <select bind:value={approvalMode} data-mcp-approval-mode="1">
@@ -953,6 +994,7 @@
   <div class="card" data-mcp-server-snippets="1">
     <h4>{i18n.t('mcpServer.snippets.section')}</h4>
     <p class="meta" data-mcp-token-origin="1">{i18n.t('mcpServer.snippets.hint')}</p>
+    <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
     {#if connectTokens.length === 0}
       <p class="meta" data-mcp-no-tokens="1">{i18n.t('mcpServer.snippets.noTokens')}</p>
       <div class="action-row">
@@ -971,11 +1013,12 @@
           <option value="">{i18n.t('mcpServer.snippets.placeholderOption')}</option>
           {#each connectTokens as token (token.tokenId)}
             <option value={token.tokenId} disabled={!token.hasSecret}>
-              {token.clientName} · {token.prefix}…{token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}
+              {token.clientName} · {workspaceName(token.workspaceId)} · {token.prefix}…{token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}
             </option>
           {/each}
         </select>
       </label>
+      {#if connectToken}{@render workspaceBinding(connectToken.workspaceId)}{/if}
       {#if connectTokens.some((token) => !token.hasSecret)}
         <p class="meta">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
       {/if}
