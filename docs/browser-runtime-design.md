@@ -326,6 +326,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 - App Renderer 的对话输入、右栏工具栏和网页输入框分别拥有清晰焦点边界；浏览器导航完成不能调用 `focus()` 抢走对话输入。
 - 网页内容槽是普通 DOM 子节点；菜单和 Tooltip 使用同一 Renderer 的 Popover Top Layer，并以当前 Tab 唯一 CSS anchor 定位，不能被 guest 视图遮住或越过非活动 Tab 生命周期。
 - App Renderer 绘制左栏、中栏和右栏的主题材质及壁纸；浏览器只消费内容槽，不创建独立背景或模糊层。
+- Desktop 使用隐藏原生标题栏和原生窗口按钮；App Renderer 的可拖动标题区复用工作台主题材质，Main 同步 Windows/Linux 窗口按钮的底色与明暗对比度。macOS 不另叠加系统 vibrancy 背景。
 - Agent 虚拟鼠标是页面隔离世界中 `pointer-events: none` 的装饰层，document 创建后重注入；任务结束时隐藏，但保留任务占用状态历史。
 - Chromium 启动参数禁止默认同步、组件网络更新、首跑提示和无关用户数据采集。浏览器 partition 仅使用 Magi 自己的状态目录，不读取用户系统浏览器资料。
 

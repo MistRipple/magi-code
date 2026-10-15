@@ -167,10 +167,21 @@ export class WindowManager {
       minWidth: WINDOW_LAYOUT.minDesktopWindowWidth,
       minHeight: 520,
       title: DEFAULT_WINDOW_TITLE,
+      // 标题栏底色由 App Renderer 的同一主题材质绘制；保留系统窗口按钮，
+      // 避免原生标题栏只跟随 OS 深浅模式而无法匹配 Magi 的自定义主题。
+      titleBarStyle: "hidden",
+      titleBarOverlay: process.platform === "darwin" ? true : {
+        color: this.#appearance.backgroundColor,
+        symbolColor: this.#appearance.mode === "dark" ? "#ffffff" : "#111827",
+        height: 32,
+      },
       ...(this.#iconPath ? { icon: this.#iconPath } : {}),
       // App Renderer 完成主题握手前窗口保持隐藏；这里的背景只是 native
       // view 的首帧兜底，并始终使用最近一次已同步的主题材质。
       backgroundColor: this.#appearance.backgroundColor,
+      ...(process.platform === "win32"
+        ? { accentColor: this.#appearance.backgroundColor }
+        : {}),
       show: false,
       webPreferences: {
         preload: this.#preloadPath,
@@ -746,11 +757,17 @@ export class WindowManager {
     appearance: DesktopAppearance,
   ): void {
     window.setBackgroundColor(appearance.backgroundColor);
+    if (process.platform !== "darwin") {
+      window.setTitleBarOverlay({
+        color: appearance.backgroundColor,
+        symbolColor: appearance.mode === "dark" ? "#ffffff" : "#111827",
+      });
+    }
     if (process.platform === "win32") {
-      // Windows 的系统强调色会影响非客户区边框和激活状态；它必须和
-      // Magi 主题的 accent 保持一致，不能只改 Renderer 内的按钮颜色。
+      // Windows 将此颜色用于标题栏和边框；跟随窗口底色，不能用按钮
+      // 强调色染满整个非客户区。每次主题握手都更新，避免依赖用户重设。
       try {
-        window.setAccentColor(appearance.accentColor);
+        window.setAccentColor(appearance.backgroundColor);
         window.setBackgroundMaterial(
           nativeWindowsMaterial(appearance.material),
         );
@@ -759,14 +776,6 @@ export class WindowManager {
         console.warn("[WindowManager] Windows 原生外观不可用", error);
       }
       return;
-    }
-    if (process.platform === "darwin") {
-      try {
-        window.setVibrancy(nativeMacVibrancy(appearance.material));
-      } catch (error) {
-        // macOS 的 vibrancy 失败不影响网页壳层和主题令牌。
-        console.warn("[WindowManager] macOS 原生材质不可用", error);
-      }
     }
   }
 
@@ -1217,12 +1226,4 @@ function nativeWindowsMaterial(
   if (material === "immersive") return "mica";
   if (material === "translucent") return "acrylic";
   return "none";
-}
-
-function nativeMacVibrancy(
-  material: DesktopAppearance["material"],
-): "titlebar" | "under-window" | null {
-  if (material === "immersive") return "under-window";
-  if (material === "translucent") return "titlebar";
-  return null;
 }

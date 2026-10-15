@@ -33,4 +33,46 @@
   });
 </script>
 
-<WebWorkbenchShell desktopAppSurface={true} />
+<div class="desktop-app-frame">
+  <div class="desktop-titlebar" data-testid="desktop-titlebar" aria-hidden="true">
+    <span>{currentSessionTitle || 'Magi'}</span>
+  </div>
+  <div class="desktop-workbench">
+    <WebWorkbenchShell desktopAppSurface={true} />
+  </div>
+</div>
+
+<style>
+  .desktop-app-frame {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .desktop-titlebar {
+    flex: 0 0 max(32px, env(titlebar-area-height, 32px));
+    background: var(--magi-surface-main);
+    color: var(--foreground-muted);
+    -webkit-app-region: drag;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    font-size: 12px;
+  }
+
+  .desktop-titlebar span {
+    margin-left: env(titlebar-area-x, 80px);
+    width: env(titlebar-area-width, calc(100% - 160px));
+    padding: 0 12px;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .desktop-workbench {
+    flex: 1;
+    min-height: 0;
+  }
+</style>

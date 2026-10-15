@@ -46,7 +46,11 @@ assert.match(desktopWindowManager, /backgroundColor: this\.#appearance\.backgrou
 assert.match(desktopWindowManager, /handleRightPaneReady[\s\S]*?record\.window\.show\(\)/, '桌面窗口必须在 App Renderer 完成主题握手后显示');
 assert.match(desktopWindowManager, /this\.#appearance = \{ \.\.\.appearance \}[\s\S]*?for \(const record of this\.#records\.values\(\)/, '主题切换必须同步所有现有桌面窗口并作为新窗口的初始材质');
 assert.match(desktopMain, /isDesktopBackgroundColor[\s\S]*?rgba/, 'Electron Main 必须接受主题材质生成的 rgba 外壳背景');
-assert.match(desktopWindowManager, /setAccentColor[\s\S]*?setBackgroundMaterial[\s\S]*?setVibrancy/, '桌面外壳必须将主题强调色和材质同步到可用的原生窗口层');
+assert.match(desktopWindowManager, /titleBarStyle: "hidden"[\s\S]*?titleBarOverlay/, '标题栏由应用主题绘制并保留原生窗口按钮');
+assert.match(desktopWindowManager, /setTitleBarOverlay\([\s\S]*?color: appearance\.backgroundColor[\s\S]*?symbolColor:/, 'Windows/Linux 原生窗口按钮必须同步主题底色和明暗对比度');
+assert.doesNotMatch(desktopWindowManager, /setAccentColor\(appearance\.accentColor\)|setVibrancy|nativeMacVibrancy/, '不得用按钮强调色或系统 vibrancy 作为标题栏的第二套背景');
+const desktopShell = await readFile(new URL('../src/DesktopAppShell.svelte', import.meta.url), 'utf8');
+assert.match(desktopShell, /desktop-titlebar[\s\S]*?--magi-surface-main[\s\S]*?-webkit-app-region: drag/, '桌面标题栏必须共享工作台主题材质并支持拖动');
 assert.doesNotMatch(desktopAppearance + desktopPreload + desktopMain, /@tauri-apps|getCurrentWebviewWindow/, '外观链路不得保留 Tauri 实现');
 assert.match(runtime, /--magi-surface-dialog[\s\S]*?--magi-surface-popover[\s\S]*?--magi-surface-critical[\s\S]*?--magi-window-overlay[\s\S]*?--magi-popover-overlay[\s\S]*?--magi-critical-overlay/, '主题必须提供完整的语义材质表面');
 assert.match(runtime, /'--magi-surface-sidebar': panel[\s\S]*?'--magi-surface-main': panel[\s\S]*?'--magi-surface-right-pane': panel/, '三栏结构面板必须共享同一主题材质令牌');

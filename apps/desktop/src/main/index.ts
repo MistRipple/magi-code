@@ -145,6 +145,9 @@ const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
 
 if (singleInstance) {
+  // 在 ready 前禁用默认菜单，避免 macOS 先安装默认 NSMenu 后仍保留原菜单。
+  // Magi 的操作入口由工作台 UI 和托盘菜单提供。
+  Menu.setApplicationMenu(null);
   app.on("second-instance", () => {
     const manager = windowManager;
     if (!manager) return;
@@ -158,6 +161,34 @@ if (singleInstance) {
   app
     .whenReady()
     .then(async () => {
+      if (process.platform === "darwin") {
+        // macOS 的标准快捷键依赖应用菜单。移除菜单后，在宿主层保留原生
+        // 编辑与窗口操作；监听所有 WebContents，使 Browser guest 同样可用。
+        app.on("web-contents-created", (_event, contents) => {
+          contents.on("before-input-event", (event, input) => {
+            if (input.type !== "keyDown" || !input.meta || input.control || input.alt)
+              return;
+            const key = input.key.toLowerCase();
+            if (input.shift && key !== "z") return;
+            const editActions = {
+              a: "selectAll", c: "copy", v: "paste", x: "cut",
+              z: input.shift ? "redo" : "undo",
+            } as const;
+            const editAction = editActions[key as keyof typeof editActions];
+            if (editAction) {
+              event.preventDefault();
+              contents[editAction]();
+              return;
+            }
+            switch (key) {
+              case "q": event.preventDefault(); app.quit(); break;
+              case "h": event.preventDefault(); app.hide(); break;
+              case "m": event.preventDefault(); BrowserWindow.getFocusedWindow()?.minimize(); break;
+              case "w": event.preventDefault(); BrowserWindow.getFocusedWindow()?.close(); break;
+            }
+          });
+        });
+      }
       const paths = resolveRuntimePaths();
       configureAppRendererAuthentication(controlToken);
       let control: DesktopControlServer | null = null;
