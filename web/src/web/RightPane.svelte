@@ -1633,7 +1633,6 @@
     box-sizing: border-box;
     height: 38px;
     flex-shrink: 0;
-    border-bottom: 1px solid var(--border);
     background: transparent;
     padding-right: var(--space-2);
   }
