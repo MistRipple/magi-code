@@ -128,7 +128,7 @@ pub enum CoordinatorError {
     },
     AlreadyTerminal,
     NoActiveTurn,
-    /// 只有对话轮次会在模型轮次之间读取引导；任务轮次不提供引导。
+    /// 当前 Turn 没有开放引导输入边界。
     SteerUnsupported {
         profile: ExecutionProfile,
     },
@@ -354,7 +354,7 @@ impl SessionTurnCoordinator {
             TurnCommand::Steer { attempt, .. } => {
                 self.validate_attempt(session_id, &attempt)?;
                 let current = self.current_attempt(session_id, &attempt.turn_id)?;
-                if current.profile != ExecutionProfile::Conversation {
+                if !self.active_turn_accepts_steer(session_id) {
                     return Err(CoordinatorError::SteerUnsupported {
                         profile: current.profile,
                     });
@@ -649,6 +649,8 @@ impl SessionTurnCoordinator {
             finished_order: 0,
         };
         session.record_finished(active.admission.request_id.clone(), finished);
+        // 释放 active 槽位前清理输入，避免下一次 Start 看见上一轮残留的边界。
+        self.close_session_turn_input(session_id, &attempt.turn_id);
         Ok(true)
     }
 
@@ -924,18 +926,22 @@ impl SessionTurnCoordinator {
         true
     }
 
-    /// 当前活动轮次是否接受引导（只有对话轮次接受）。
+    /// 活动 Turn 只有在输入边界仍开放时才接受引导；模型结束后不可静默接收。
     pub fn active_turn_accepts_steer(&self, session_id: &SessionId) -> bool {
-        self.state
+        let turn_id = self
+            .state
             .lock()
             .expect("turn coordinator state poisoned")
             .sessions
             .get(session_id)
             .and_then(|session| session.active.as_ref())
-            .is_some_and(|active| {
-                !active.status.is_terminal()
-                    && active.admission.profile == ExecutionProfile::Conversation
-            })
+            .filter(|active| !active.status.is_terminal())
+            .map(|active| active.admission.turn_id.clone());
+        self.session_turn_inputs
+            .lock()
+            .expect("session turn input mutex poisoned")
+            .get(session_id)
+            .is_some_and(|input| Some(&input.turn_id) == turn_id.as_ref())
     }
 
     pub fn current_attempt(
@@ -1265,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn task_turn_rejects_steer_and_reports_no_steer_support() {
+    fn task_turn_accepts_steer_only_while_input_boundary_is_open() {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-task-steer");
         let attempt = match coordinator
@@ -1290,7 +1296,7 @@ mod tests {
                 .execute_command(
                     &session,
                     TurnCommand::Steer {
-                        attempt,
+                        attempt: attempt.clone(),
                         request_id: "steer-task-1".to_string(),
                     },
                 )
@@ -1298,8 +1304,38 @@ mod tests {
             CoordinatorError::SteerUnsupported {
                 profile: ExecutionProfile::Task
             },
-            "任务轮次不读取引导，必须明确拒绝而不是静默吞掉"
+            "未开放输入边界时不得接纳引导"
         );
+        coordinator
+            .begin_session_turn_input(session.clone(), attempt.turn_id.clone())
+            .unwrap();
+        assert!(coordinator.active_turn_accepts_steer(&session));
+        assert!(
+            coordinator
+                .execute_command(
+                    &session,
+                    TurnCommand::Steer {
+                        attempt: attempt.clone(),
+                        request_id: "steer-task-2".to_string(),
+                    }
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            coordinator.take_session_turn_steers_or_close(&session, &attempt.turn_id),
+            SessionTurnInputBoundary::Closed
+        );
+        assert!(!coordinator.active_turn_accepts_steer(&session));
+        assert!(matches!(
+            coordinator.execute_command(
+                &session,
+                TurnCommand::Steer {
+                    attempt,
+                    request_id: "steer-task-late".to_string(),
+                }
+            ),
+            Err(CoordinatorError::SteerUnsupported { .. })
+        ));
     }
 
     #[test]
@@ -1319,6 +1355,9 @@ mod tests {
             CoordinatorCommandResult::Admission(CoordinatorAdmission::Accepted(attempt)) => attempt,
             other => panic!("unexpected Start result: {other:?}"),
         };
+        coordinator
+            .begin_session_turn_input(session.clone(), attempt.turn_id.clone())
+            .unwrap();
         assert!(matches!(
             coordinator.execute_command(
                 &session,

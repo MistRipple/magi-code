@@ -180,6 +180,20 @@ pub fn submit_dispatch_submission(
                     Some(accepted.turn_id.clone()),
                 );
             }
+            if let Err(error) = state
+                .turn_coordinator()
+                .begin_session_turn_input(accepted.session_id.clone(), accepted.turn_id.clone())
+            {
+                let message = format!("建立 task Turn 输入通道失败: {error}");
+                fail_accepted_task_turn(
+                    state,
+                    &accepted.session_id,
+                    &accepted.root_task_id,
+                    &accepted.turn_id,
+                    &message,
+                );
+                return Err(ApiError::Conflict(message));
+            }
             Ok(accepted)
         }
         Err(error) => {

@@ -760,6 +760,31 @@ fn run_conversation_loop_inner(
         persist_session_state,
     } = request;
     let expected_turn_id = execution_registry.turn_id(task_id);
+    // 恢复同一主线任务时也重新开放输入边界；子代理不能取得 Session 引导。
+    if !is_sidechain
+        && let Some(turn_id) = expected_turn_id.as_deref()
+        && conversation_registry
+            .turn_coordinator()
+            .current_attempt(session_id, turn_id)
+            .is_ok()
+    {
+        match conversation_registry
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), turn_id.to_string())
+        {
+            Ok(()) => {}
+            Err(crate::SessionTurnInputError::AlreadyActive { active_turn_id })
+                if active_turn_id == turn_id => {}
+            Err(error) => {
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("建立任务引导输入边界失败: {error}"),
+                    },
+                    context_summary,
+                );
+            }
+        }
+    }
     tracing::info!(
         target: "magi.performance",
         session_id = %session_id,
@@ -1376,6 +1401,14 @@ fn run_conversation_loop_inner(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
+        if !is_sidechain && let Some(turn_id) = expected_turn_id.as_deref() {
+            crate::session_turn_execution::append_session_turn_steers_to_messages(
+                &mut messages,
+                conversation_registry
+                    .turn_coordinator()
+                    .drain_session_turn_steers(session_id, turn_id),
+            );
+        }
         // 浏览器可用性每轮重新判断：桌面端恰好在重连时，不能让整轮都失去浏览器工具。
         let mut browser_capability_snapshot =
             tool_registry.and_then(|registry| registry.browser_capability_snapshot());
@@ -2549,10 +2582,25 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
-            match conversation_registry.take_task_signals_or_close(session_id, task_id) {
+            // 先取走全部已接纳输入；只有引导和代理信号都为空时才关闭通道和授权。
+            match conversation_registry.take_task_inputs_or_close(
+                session_id,
+                task_id,
+                (!is_sidechain)
+                    .then_some(expected_turn_id.as_deref())
+                    .flatten(),
+            ) {
                 TaskSignalBoundary::Pending(signals) => {
                     messages.push(assistant_response_message.clone());
                     append_task_runtime_signals(&mut messages, signals);
+                    continue;
+                }
+                TaskSignalBoundary::PendingSteers(steers) => {
+                    messages.push(assistant_response_message.clone());
+                    crate::session_turn_execution::append_session_turn_steers_to_messages(
+                        &mut messages,
+                        steers,
+                    );
                     continue;
                 }
                 TaskSignalBoundary::Closed => break,

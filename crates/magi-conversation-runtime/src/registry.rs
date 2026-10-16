@@ -5,7 +5,7 @@ use std::time::Duration;
 use magi_core::{SessionId, TaskId};
 
 use crate::conversation::Conversation;
-use crate::mailbox::RuntimeSignal;
+use crate::mailbox::{RuntimeSignal, UserSignal};
 use crate::session_turn_coordinator::SessionTurnCoordinator;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -36,6 +36,7 @@ pub struct ConversationRegistry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSignalBoundary {
     Pending(Vec<RuntimeSignal>),
+    PendingSteers(Vec<UserSignal>),
     Closed,
 }
 
@@ -216,6 +217,17 @@ impl ConversationRegistry {
         session_id: &SessionId,
         task_id: &TaskId,
     ) -> TaskSignalBoundary {
+        self.take_task_inputs_or_close(session_id, task_id, None)
+    }
+
+    /// 主线任务同时检查会话引导和代理信号，再关闭输入。持有 task channel 锁
+    /// 检查 Coordinator 边界，避免引导续跑时提前撤销代理通道及工具授权。
+    pub fn take_task_inputs_or_close(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        steer_turn_id: Option<&str>,
+    ) -> TaskSignalBoundary {
         let mut channels = self
             .task_signal_channels
             .lock()
@@ -225,6 +237,13 @@ impl ConversationRegistry {
             return TaskSignalBoundary::Closed;
         };
         if channel.is_empty() {
+            if let Some(turn_id) = steer_turn_id
+                && let crate::SessionTurnInputBoundary::Pending(steers) = self
+                    .turn_coordinator
+                    .take_session_turn_steers_or_close(session_id, turn_id)
+            {
+                return TaskSignalBoundary::PendingSteers(steers);
+            }
             channels.remove(&key);
             drop(channels);
             self.tool_approvals().remove_task(session_id, task_id);
@@ -395,6 +414,63 @@ mod tests {
             Err(SessionTurnInputError::NoActiveTurn),
             "completion boundary must reject late steer instead of leaking it into the next turn"
         );
+    }
+
+    #[test]
+    fn task_guidance_keeps_runtime_channel_open_until_all_inputs_are_consumed() {
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-task-guidance-boundary");
+        let task_id = TaskId::new("task-guidance-boundary");
+        let turn_id = "turn-task-guidance-boundary";
+        registry.open_task_signal_channel(&session_id, &task_id);
+        registry
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), turn_id.to_string())
+            .unwrap();
+        registry
+            .turn_coordinator()
+            .try_steer_session_turn(
+                &session_id,
+                turn_id,
+                UserSignal {
+                    text: Some("先检查当前状态".to_string()),
+                    request_id: Some("request-guidance".to_string()),
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    accepted_at: UtcMillis(1),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(registry.take_task_inputs_or_close(&session_id, &task_id, Some(turn_id)), TaskSignalBoundary::PendingSteers(steers) if steers.len() == 1)
+        );
+        registry
+            .enqueue_task_signal(
+                &session_id,
+                &task_id,
+                RuntimeSignal {
+                    author: crate::MailboxAuthor::Child("child-task".to_string()),
+                    kind: crate::MailboxKind::Message,
+                    trigger_turn: true,
+                    payload: serde_json::json!({ "text": "代理结果" }),
+                    enqueued_at: UtcMillis(2),
+                },
+            )
+            .expect("引导继续执行时代理信号通道必须保持开放");
+        assert!(
+            matches!(registry.take_task_inputs_or_close(&session_id, &task_id, Some(turn_id)), TaskSignalBoundary::Pending(signals) if signals.len() == 1)
+        );
+        assert_eq!(
+            registry.take_task_inputs_or_close(&session_id, &task_id, Some(turn_id)),
+            TaskSignalBoundary::Closed
+        );
+        assert!(
+            registry
+                .turn_coordinator()
+                .drain_session_turn_steers(&session_id, turn_id)
+                .is_empty()
+        );
+        assert!(!registry.close_task_signal_channel(&session_id, &task_id));
     }
 
     #[test]

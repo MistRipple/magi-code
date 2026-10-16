@@ -99,6 +99,8 @@ Coordinator 采用 Actor 或单写者模型，拥有 active Turn、durable queue
 
 Coordinator 不得在状态锁内执行外部 IO。模型、工具、Git 和 Task 完成后，必须通过带身份的 command/event 回到 Coordinator；外部 API 不得直接改写 current Turn。
 
+纯文字排队消息可通过既有 steer 入口引导当前 `conversation` 或主线 `task` Turn。能力由 Coordinator 的活动输入边界给出：先提交 canonical 用户 item，再进入同一 Turn 的 FIFO；主线 Task 在模型轮次之间消费，子代理不消费会话引导。模型准备结束时必须原子取走待处理引导或关闭边界；关闭后拒绝迟到输入，不得静默丢弃，也不得另建 Turn/Task。队列快照读取与出队、删除及转引导共用会话提交锁，避免 accepted 事件触发的读取早于队列消费确认。
+
 ### 3.3 Task 域
 
 - `TaskStore` 保存任务树、租约、checkpoint 和恢复数据；`TaskScheduler` 负责资源调度。

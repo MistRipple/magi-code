@@ -2028,6 +2028,26 @@ await withGoldenViteServer(async (server) => {
     'daemon-queued turns must not remain as fake running conversation turns',
   );
   messagesStore.clearPendingRequest('busy-before-queued-follow-up');
+  const queueSnapshotBeforeGuide = structuredClone(queuedTurnPayloads);
+  const staleQueueBeforeGuide = deferred();
+  let staleQueueBeforeGuideStarted = false;
+  sessionQueueInterceptors.push(() => {
+    staleQueueBeforeGuideStarted = true;
+    return staleQueueBeforeGuide.promise;
+  });
+  function queueEvent(eventType, eventId) {
+    streamAfterDraftReturn.onmessage?.({ data: JSON.stringify({
+      event_id: eventId,
+      event_type: eventType,
+      category: 'domain',
+      occurred_at: ACCEPTED_AT + 2550,
+      workspace_id: WORKSPACE_ID,
+      session_id: SESSION_ID,
+      payload: { session_id: SESSION_ID },
+    }) });
+  }
+  queueEvent('session.turn.queued', 'queue-read-before-guide');
+  await waitFor(() => staleQueueBeforeGuideStarted, 'queue notification must read the daemon queue');
   bridge.postMessage({
     type: 'guideQueuedMessage',
     queuedMessageId: 'queued-session-turn-guide-golden',
@@ -2046,6 +2066,9 @@ await withGoldenViteServer(async (server) => {
     },
     'queued guidance must use the dedicated server-authoritative endpoint',
   );
+  staleQueueBeforeGuide.resolve(jsonResponse({ sessionId: SESSION_ID, queuedTurns: queueSnapshotBeforeGuide }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messagesStore.messagesState.queuedMessages.length, 1, 'an old GET must not resurrect a message after guidance removed it');
   bridge.postMessage({
     type: 'removeQueuedMessage',
     queuedMessageId: 'queued-session-turn-golden',
@@ -2054,6 +2077,25 @@ await withGoldenViteServer(async (server) => {
     () => messagesStore.messagesState.queuedMessages.length === 0,
     'removing a queued turn must update the daemon queue and then refresh the UI snapshot',
   );
+
+  // 两次队列快照逆序返回：conversation 出队事件必须刷新队列，迟到的旧快照不能覆盖新状态。
+  queuedTurnPayloads = [queueSnapshotBeforeGuide[1]];
+  queueEvent('session.turn.queued', 'queue-refill-for-dequeue');
+  await waitFor(() => messagesStore.messagesState.queuedMessages.length === 1, 'queued event must render the new queue');
+  const staleQueueBeforeDequeue = deferred();
+  let staleQueueBeforeDequeueStarted = false;
+  sessionQueueInterceptors.push(() => {
+    staleQueueBeforeDequeueStarted = true;
+    return staleQueueBeforeDequeue.promise;
+  });
+  queueEvent('session.turn.queued', 'queue-read-before-dequeue');
+  await waitFor(() => staleQueueBeforeDequeueStarted, 'the old queue read must be in flight');
+  queuedTurnPayloads = [];
+  queueEvent('session.turn.conversation.accepted', 'queue-conversation-dequeued');
+  await waitFor(() => messagesStore.messagesState.queuedMessages.length === 0, 'conversation acceptance must remove the sent queue entry');
+  staleQueueBeforeDequeue.resolve(jsonResponse({ sessionId: SESSION_ID, queuedTurns: [queueSnapshotBeforeGuide[1]] }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messagesStore.messagesState.queuedMessages.length, 0, 'a late queue response must not restore an already sent message');
 
   queuedTurnPayloads = [{
     queueId: 'queued-after-interrupt-golden',

@@ -882,6 +882,27 @@ impl ModelBridgeClient for HarnessModelClient {
                 if is_cancelled() {
                     return Err(model_invocation_cancelled_error());
                 }
+                let released_content = {
+                    let state = self
+                        .state
+                        .lock()
+                        .expect("harness provider state should hold");
+                    match state.behavior.as_ref() {
+                        Some(ProviderBehavior::Completed(content)) => Some(content.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(content) = released_content {
+                    self.record_delta(
+                        &ModelStreamingDelta {
+                            content: content.clone(),
+                            ..Default::default()
+                        },
+                        on_delta,
+                        true,
+                    );
+                    return Ok(ModelResponse::completed(content));
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
@@ -12642,7 +12663,7 @@ done
     }
 
     #[tokio::test]
-    async fn task_profile_rejects_steer_without_replacing_the_active_turn() {
+    async fn task_profile_consumes_queued_guidance_without_replacing_the_active_turn() {
         let harness = MagiTurnHarness::new_task("不会先完成");
         harness.provider.set_hold_for_cancellation();
         let initial = harness
@@ -12666,28 +12687,110 @@ done
             !harness.provider.requests().is_empty(),
             "steer 前 Provider 必须已经进入执行"
         );
-        let steer_result = tokio::time::timeout(
-            Duration::from_secs(2),
-            harness.steer(
-                &session_id,
-                &turn_id,
+        let queued = harness
+            .submit(
+                Some(&session_id),
                 "优先收口当前响应",
                 "harness-steer-request",
                 "harness-steer-user",
-            ),
-        )
-        .await
-        .expect("任务模式 steer 必须在有限时间内返回");
-        assert!(
-            matches!(&steer_result, Err(crate::errors::ApiError::TurnConflict { conflict_kind, message, .. }) if conflict_kind == "steer_unsupported" || message.contains("任务模式不支持")),
-            "任务模式 steer 应明确拒绝: {steer_result:?}"
-        );
-        harness
-            .cancel(&session_id)
+            )
             .await
-            .expect("任务 steer 场景应可取消");
+            .expect("忙碌时消息应排队");
+        assert!(queued.queued);
+        let app = crate::routes::build_router(harness.state.clone());
+        let queue_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/session/queue?sessionId={session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue_response.status(), StatusCode::OK);
+        let queue: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(queue_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            queue["queuedTurns"][0]["canGuide"], true,
+            "task 轮次必须允许纯文字引导"
+        );
+        let guided = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/queue/guide")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "sessionId": session_id, "queueId": queued.queue_id })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guided.status(), StatusCode::OK);
+        let guided: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(guided.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(guided["queuedTurns"], serde_json::json!([]));
+        harness.provider.set_completed_response("已按引导收口");
         let terminal = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(terminal.status, CanonicalTurnStatus::Cancelled);
+        assert_eq!(terminal.status, CanonicalTurnStatus::Completed);
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .canonical_turns_for_session(&session_id)
+                .len(),
+            1,
+            "引导不能创建第二轮 Turn"
+        );
+        let requests = harness.provider.requests();
+        assert_eq!(requests.len(), 2, "首轮模型输出后必须携带引导再执行一次");
+        assert!(
+            requests[1]
+                .messages
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|message| message.role == "user"
+                    && message.content.as_deref() == Some("优先收口当前响应")),
+            "引导必须作为真实用户输入送到 Provider"
+        );
+        assert_eq!(
+            terminal
+                .items
+                .iter()
+                .filter(|item| item.item_id == "harness-steer-user")
+                .count(),
+            1
+        );
+        assert!(
+            !harness
+                .state
+                .turn_coordinator()
+                .active_turn_accepts_steer(&session_id)
+        );
+        assert!(
+            harness
+                .steer(
+                    &session_id,
+                    &turn_id,
+                    "迟到引导",
+                    "late-steer",
+                    "late-steer-user"
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

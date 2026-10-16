@@ -1492,7 +1492,7 @@ fn run_session_turn_execution_inner(
     Ok(SessionTurnExecutionOutput::completed(final_content))
 }
 
-fn append_session_turn_steers_to_messages(
+pub(crate) fn append_session_turn_steers_to_messages(
     messages: &mut Vec<ChatMessage>,
     steers: Vec<UserSignal>,
 ) -> bool {

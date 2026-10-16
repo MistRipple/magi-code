@@ -626,7 +626,7 @@ pub(crate) async fn submit_steer_current_turn_after_turn_commit(
                 ApiError::turn_conflict(
                     "steer_unsupported",
                     Some(expected_turn_id.clone()),
-                    "任务模式不支持引导当前回复，消息会在当前任务结束后执行",
+                    "当前回复已关闭引导输入，请等待下一轮执行",
                 )
             }
             other => ApiError::Conflict(format!("steer Turn 命令校验失败: {other}")),

@@ -226,6 +226,7 @@ type ProcessingRequestSnapshot = {
 // 提交时会覆盖第一个，导致 accepted/error 返回后无法找到原请求。
 const sessionTurnSubmissions = new Map<string, SessionTurnSubmissionContext>();
 const guidingQueuedMessageIds = new Set<string>();
+let sessionTurnQueueSyncVersion = 0;
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
@@ -2087,7 +2088,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
-  if (eventType === 'session.turn.task.accepted') {
+  const queueCanonicalEvent = eventType === 'session.turn.item'
+    ? parseCanonicalTurnEventFromRustEvent(event)
+    : null;
+  if (
+    eventType === 'session.turn.task.accepted'
+    || eventType === 'session.turn.conversation.accepted'
+    || eventType === 'session.turn.steered'
+    || TURN_TERMINAL_EVENTS.has(eventType)
+    || (queueCanonicalEvent && isCanonicalTerminalEvent(queueCanonicalEvent))
+  ) {
     void syncSessionTurnQueue().catch((error) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
@@ -4011,6 +4021,7 @@ async function syncSessionTurnQueue(
   workspaceId = currentWorkspaceId,
   workspacePath = currentWorkspacePath,
 ): Promise<void> {
+  const syncVersion = ++sessionTurnQueueSyncVersion;
   const normalizedSessionId = trimBridgeString(sessionId);
   if (!normalizedSessionId) {
     setQueuedMessages([]);
@@ -4019,7 +4030,7 @@ async function syncSessionTurnQueue(
   const snapshot = await getAgentSessionTurnQueue(normalizedSessionId, {
     ...currentSessionBindingOverride(normalizedSessionId, workspaceId, workspacePath),
   });
-  if (currentSessionId !== normalizedSessionId) {
+  if (currentSessionId !== normalizedSessionId || syncVersion !== sessionTurnQueueSyncVersion) {
     return;
   }
   const snapshotSessionId = trimBridgeString(snapshot.sessionId);
@@ -4032,6 +4043,7 @@ async function syncSessionTurnQueue(
 async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
   const normalizedId = queuedMessageId.trim();
   if (!normalizedId || !currentSessionId) return;
+  const syncVersion = ++sessionTurnQueueSyncVersion;
   try {
     const snapshot = await removeAgentSessionTurnQueueItem(
       currentSessionId,
@@ -4039,7 +4051,12 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
-      applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+      if (syncVersion === sessionTurnQueueSyncVersion) {
+        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+      } else {
+        // 操作期间又发生出队/引导时重新读取，不能用较早的变更快照覆盖新状态。
+        await syncSessionTurnQueue();
+      }
     }
   } catch (error) {
     emitBridgeErrorToast(i18n.t('input.queue.delete'), error);
@@ -4051,6 +4068,7 @@ async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<vo
   const normalizedId = queuedMessageId.trim();
   if (!normalizedId || !currentSessionId || guidingQueuedMessageIds.has(normalizedId)) return;
   guidingQueuedMessageIds.add(normalizedId);
+  const syncVersion = ++sessionTurnQueueSyncVersion;
   try {
     const snapshot = await guideAgentSessionTurnQueueItem(
       currentSessionId,
@@ -4058,7 +4076,11 @@ async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<vo
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
-      applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+      if (syncVersion === sessionTurnQueueSyncVersion) {
+        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+      } else {
+        await syncSessionTurnQueue();
+      }
       emitBridgeSuccessToast(
         i18n.t('input.queue.guide'),
         i18n.t('input.queue.guideSuccess'),

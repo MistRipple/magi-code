@@ -472,7 +472,7 @@ fn session_turn_queue_response(
     state: &ApiState,
     session_id: &SessionId,
 ) -> SessionTurnQueueResponseDto {
-    // 能否把排队消息转为引导取决于当前活动轮次：任务轮次不读取引导。
+    // 引导能力由当前 Turn 的输入边界决定，UI 不自行推断执行状态。
     let active_turn_accepts_steer = state
         .turn_coordinator()
         .active_turn_accepts_steer(session_id);
@@ -538,6 +538,9 @@ async fn get_session_turn_queue(
     Query(scope): Query<SessionTurnQueueScope>,
 ) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
     let (session_id, _) = require_session_turn_queue_scope(&state, &scope)?;
+    // accepted 事件在出队确认前发布；读取必须等待同一提交临界区结束，
+    // 否则客户端会重新读到已经进入主线、但尚未从 durable queue 移除的消息。
+    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
     Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
 
@@ -4990,6 +4993,54 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected body: {payload}");
         assert_eq!(payload["queuedTurns"], json!([]));
         assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_snapshot_waits_for_dequeue_commit() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-queue-commit", "queue-commit");
+        let session_id = SessionId::new("session-queue-commit");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "队列提交",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                "queue-commit",
+                UtcMillis(100),
+            ))
+            .unwrap();
+        let commit_guard = state.lock_session_turn_commit(&session_id).await;
+        let snapshot = get_session_turn_queue(
+            State(state.clone()),
+            Query(SessionTurnQueueScope {
+                session_id: session_id.to_string(),
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
+            }),
+        );
+        tokio::pin!(snapshot);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut snapshot)
+                .await
+                .is_err(),
+            "accepted 后的读取必须等待出队事务完成"
+        );
+        state
+            .acknowledge_regular_session_turn(&session_id, "queue-commit")
+            .unwrap();
+        drop(commit_guard);
+        let Json(snapshot) = snapshot.await.unwrap();
+        assert!(
+            snapshot.queued_turns.is_empty(),
+            "不得把已进入主线的消息重新显示为排队"
+        );
     }
 
     #[tokio::test]
