@@ -5511,6 +5511,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
             || (Array.isArray(message.pluginSelections) && message.pluginSelections.length > 0)
+            || (typeof message.pluginCommandId === 'string' && message.pluginCommandId.trim())
             || message.command === 'compact'
           ) {
             void executeTask({
@@ -5522,6 +5523,7 @@ export function createWebClientBridge(): ClientBridge {
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
               command: message.command === 'compact' ? 'compact' : null,
+              pluginCommandId: typeof message.pluginCommandId === 'string' ? message.pluginCommandId : null,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
                 || message.accessProfile === 'full_access'

@@ -45,7 +45,7 @@ pub(crate) fn gpt_web_plugin_manifest() -> magi_app_server_protocol::PluginManif
     serde_json::from_value(serde_json::json!({
         "sdkVersion": 1,
         "id": magi_web_model::WEB_MODEL_PLUGIN_ID,
-        "version": "1.1.0",
+        "version": "1.2.0",
         "name": "GPT Web",
         "description": "Use ChatGPT Web as an optional Magi session engine.",
         "backend": "plugin.mjs",
@@ -54,6 +54,7 @@ pub(crate) fn gpt_web_plugin_manifest() -> magi_app_server_protocol::PluginManif
             {"kind": "models", "scope": "application", "targets": ["default"]}
         ],
         "contributions": {
+            "commands": [{"id": "setup", "title": "gpt-web-setup", "description": "协助配置 GPT Web 工具，遇到登录与密钥输入时等待你完成后继续"}],
             "engines": [{"id": "default", "title": "GPT Web", "description": "ChatGPT Web session engine"}],
             "browserSurfaces": [{
                 "id": "gpt-web",

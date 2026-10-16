@@ -169,6 +169,9 @@ fn normalize_stored_current_turn_status(status: String) -> String {
 }
 
 fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTurnItemStatus> {
+    if status.trim().eq_ignore_ascii_case("indeterminate") {
+        return Ok(CanonicalTurnItemStatus::Indeterminate);
+    }
     Ok(match canonical_current_turn_status(status)? {
         CanonicalTurnStatus::Pending => CanonicalTurnItemStatus::Pending,
         CanonicalTurnStatus::Running => CanonicalTurnItemStatus::Running,

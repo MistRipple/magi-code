@@ -601,6 +601,11 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
   };
   globalThis.__magiBrowserAutomation = {
     runtime_epoch: runtimeEpoch,
+    // 仅供同一隔离世界的站点适配器使用；沿用节点引用的失效和敏感字段检查。
+    reference(element) {
+      if (!isElement(element) || !element.isConnected) throw new Error('browser_element_ref_stale');
+      return refFor(element);
+    },
     viewport() {
       return {
         width: innerWidth,

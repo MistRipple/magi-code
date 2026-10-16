@@ -1175,7 +1175,7 @@ test("浏览器内容槽上方挂载 Magi 光标覆盖层，并随接管或控�
   const normalizedBrowserTab = normalizeSourceWhitespace(browserTabSource);
   assert.match(
     normalizedBrowserTab,
-    /<AgentCursorOverlay anchorName=\{surfaceAnchorName\} signal=\{agentCursorSignal\} hostVisible=\{surfaceSlotVisible && browserReady\} \/>/u,
+    /<AgentCursorOverlay anchorName=\{surfaceAnchorName\} signal=\{agentCursorSignal\} hostVisible=\{surfaceSlotVisible && browserReady\} onpresented=\{completeAgentCursorPresentation\} \/>/u,
   );
   assert.match(normalizedBrowserTab, /point: agentCursorPoint\(event\.displayX, event\.displayY\)/u);
   assert.match(

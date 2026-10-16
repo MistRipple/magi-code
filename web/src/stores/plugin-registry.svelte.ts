@@ -93,10 +93,8 @@ export function pluginRegistryRevision(): number {
 
 /** 取得已加载的作用域投影：尚未加载时发起读取并等待，用于不在 effect 里的一次性判断。 */
 export async function loadedPluginProjection(scope: string): Promise<PluginScopeProjection> {
-  if (!projections[scope]?.loaded) {
-    trackPluginProjection(scope);
-    await inflight.get(scope);
-  }
+  trackPluginProjection(scope);
+  await inflight.get(scope);
   return pluginProjection(scope);
 }
 

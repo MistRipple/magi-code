@@ -105,6 +105,13 @@ export const APP_SERVER_METHOD_SIGNATURES = {
   }
 } as const;
 
+export interface WebModelSetupStatus {
+  sessionId: string;
+  stage: string;
+  reason: string;
+  updatedAt: number;
+}
+
 export type JsonRpcVersion = "2.0";
 
 export type JsonRpcRequestId = string | number;

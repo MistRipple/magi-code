@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   type BrowserHostCommand,
+  type BrowserControl,
   type BrowserCommandOutcome,
   type BrowserSurfaceBinding,
   type MainToWorkerMessage,
@@ -30,6 +31,7 @@ interface PendingCommand {
   cancelSent: boolean;
   /** 写命令已经交给 Worker；此后的失败都可能发生在动作生效之后。 */
   sideEffectDispatched: boolean;
+  expectedAgentControl?: Extract<BrowserControl, { mode: "agent" }>;
 }
 
 interface PendingCdpRequest {
@@ -233,6 +235,8 @@ export class AutomationWorker {
       binding,
       command,
     };
+    const control = "payload" in command && "control" in command.payload ? command.payload.control : null;
+    const expectedAgentControl = control?.mode === "agent" ? control : null;
     return new Promise((resolve, reject) => {
       let pending!: PendingCommand;
       const timer = setTimeout(() => {
@@ -250,6 +254,7 @@ export class AutomationWorker {
         signalCleanup: null,
         cancelSent: false,
         sideEffectDispatched: false,
+        ...(expectedAgentControl ? { expectedAgentControl } : {}),
       };
       this.#pending.set(callId, pending);
       if (signal) {
@@ -529,6 +534,7 @@ export class AutomationWorker {
       {
         allowNavigationAdvance: message.allow_navigation_advance === true,
         signal: controller.signal,
+        expectedAgentControl: this.#pending.get(message.call_id)?.expectedAgentControl,
       },
     )
       .then((result) => {

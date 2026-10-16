@@ -1997,7 +1997,13 @@ impl DaemonRuntime {
                     )
                 }))?;
         let workflow_core_factory = self.plugins.workflow_core_factory()?;
-        let plugin_command_executor = self.plugins.command_executor();
+        state.restore_web_model_setup_reservation();
+        let plugin_command_executor = Arc::new(
+            magi_api::web_model_setup::WebModelSetupCommandExecutor::new(
+                state.clone(),
+                self.plugins.command_executor(),
+            ),
+        );
         let mut llm_task_dispatcher = llm_task_dispatcher;
         llm_task_dispatcher = llm_task_dispatcher
             .with_session_engine_factory(session_engine_factory)

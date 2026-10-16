@@ -6287,3 +6287,50 @@ fn indeterminate_item_status_is_terminal_and_not_rewritable() {
         json!("indeterminate")
     );
 }
+
+#[test]
+fn indeterminate_tool_result_can_be_written_and_restored_without_failing_the_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-indeterminate-browser");
+    store
+        .create_session(session_id.clone(), "Browser result")
+        .unwrap();
+    accept_test_turn(
+        &store,
+        &session_id,
+        test_turn("turn-browser", "running", 10),
+    );
+    let mut item = test_turn_item("browser-click", "浏览器点击");
+    item.kind = "tool_call_started".to_string();
+    item.status = "running".to_string();
+    item.tool_call_id = Some("call-browser".to_string());
+    item.tool_name = Some("browser_click".to_string());
+    item.tool_arguments = Some("{}".to_string());
+    store
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-browser"), item.clone())
+        .unwrap();
+    item.status = "indeterminate".to_string();
+    item.tool_status = Some("indeterminate".to_string());
+    item.tool_result = Some("页面导航，点击结果需确认".to_string());
+    store
+        .upsert_current_turn_item_for_turn(&session_id, Some("turn-browser"), item)
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    let turn = restored
+        .runtime_sidecar(&session_id)
+        .unwrap()
+        .current_turn
+        .unwrap();
+    assert_eq!(turn.status, "running");
+    let tool = turn
+        .items
+        .iter()
+        .find(|item| item.item_id == "browser-click")
+        .unwrap();
+    assert_eq!(tool.status, "indeterminate");
+    assert_eq!(tool.tool_status.as_deref(), Some("indeterminate"));
+}

@@ -1295,17 +1295,6 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   // /settings/plugins-settings 读取已安装列表，/plugins 目录页创建 MCP 应用），脚本只在已经打开
   // 的页面里读或点。找不到入口一律返回具体原因，绝不猜测页面结构去点别的东西。
 
-  // Radix 菜单 / 对话框只响应完整的指针事件序列；单独的 click() 不生效。
-  const press = (element) => {
-    const rect = element.getBoundingClientRect();
-    const init = {
-      bubbles: true, cancelable: true, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true,
-      clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2,
-    };
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-      element.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, init) : new MouseEvent(type, init));
-    }
-  };
   const waitFor = async (find, timeoutMs) => {
     for (let waited = 0; waited <= timeoutMs; waited += 100) {
       const found = find();
@@ -1317,12 +1306,6 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   const buttonWithText = (root, pattern) => allMatches(['button', '[role="button"]', 'a'], root)
     .filter(visible)
     .find((candidate) => pattern.test(textOf(candidate)));
-  const setFieldValue = (input, value) => {
-    const setter = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value')?.set;
-    if (setter) setter.call(input, value); else input.value = value;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-  };
   // 已安装列表的行没有稳定的角色或 test id：先找文本恰好等于应用名的叶子节点（标题），
   // 再取它所在的行（带副标题 / 开关的外层容器）。名称必须完全相等，不做包含匹配。
   const connectorEntry = (root, name) => {
@@ -1366,6 +1349,10 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   // 在 /plugins 目录页创建 MCP 应用：添加 → 创建 MCP 应用 → 连接选“隧道”→ 填名称与 Tunnel id →
   // 身份验证选“无需身份验证”→ 勾选风险确认 → 创建。是否真的创建成功由 daemon 回读已安装列表确认。
   const configureConnector = async ({ name, tunnel_id: tunnelId }) => {
+    // 捕获本次队列，旧脚本不能在下一次命令中恢复输入。
+    const input = globalThis.__magiSetupInput;
+    const press = element => input.perform('click', element);
+    const setFieldValue = (element, value) => input.perform(element.tagName === 'SELECT' ? 'select' : 'type', element, value);
     const fail = (reason) => ({ configured: false, confirmed_enabled: false, reason });
     // 已安装的连接器：ChatGPT 会缓存创建 / 上次刷新时的 MCP 工具列表，Magi 的目录变化后不会自动
     // 同步。此时（页面在设置里的「插件」页）进入该连接器的详情页，点「Refresh tools」重新拉取。
@@ -1375,11 +1362,11 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
       if (!/^\/settings\/plugins-settings\/[^/]+/u.test(location.pathname)) {
         const entry = await waitFor(() => connectorEntry(document.body, name), 8000);
         if (!entry) return fail('connector_not_listed');
-        press(entry);
+        await press(entry);
       }
       const refresh = await waitFor(() => buttonWithText(document, /^(?:refresh tools|刷新工具)$/iu), 8000);
       if (!refresh) return fail('connector_refresh_button_missing');
-      press(refresh);
+      await press(refresh);
       // 刷新是站点向 Magi 的 MCP 端点重新发 tools/list；按钮在请求期间会置为不可用。
       await sleep(400);
       await waitFor(() => {
@@ -1391,17 +1378,17 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     if (!location.pathname.startsWith('/plugins')) return fail('connector_page_not_open');
     const add = await waitFor(() => buttonWithText(document, /^(?:添加|Add)$/iu), 8000);
     if (!add) return fail('connector_create_entry_missing');
-    press(add);
+    await press(add);
     const create = await waitFor(() => allMatches(['[role="menuitem"]']).filter(visible).find((item) => (
       /(?:创建|Create).*MCP/iu.test(textOf(item))
     )), 3000);
     if (!create) return fail('connector_create_entry_missing');
-    press(create);
+    await press(create);
     const form = await waitFor(() => firstVisible(SELECTORS.dialog), 3000);
     if (!form) return fail('connector_form_fields_missing');
     const tunnelTab = buttonWithText(form, /^(?:隧道|Tunnel)$/iu);
     if (!tunnelTab) return fail('connector_tunnel_option_missing');
-    press(tunnelTab);
+    await press(tunnelTab);
     const tunnelField = await waitFor(() => allMatches(['input'], form).filter(visible).find((input) => (
       /(?:tunnel|隧道)/iu.test([input.getAttribute('aria-label'), input.placeholder, input.name].filter(Boolean).join(' '))
     )), 3000);
@@ -1409,20 +1396,20 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
       input !== tunnelField
     ));
     if (!nameField || !tunnelField) return fail('connector_form_fields_missing');
-    setFieldValue(nameField, name);
-    setFieldValue(tunnelField, tunnelId);
+    await setFieldValue(nameField, name);
+    await setFieldValue(tunnelField, tunnelId);
     const auth = allMatches(['select'], form).filter(visible)[0];
     const none = auth && [...auth.options].find((option) => /(?:无需身份验证|no authentication|none)/iu.test(option.text));
     if (!none) return fail('connector_auth_option_missing');
-    setFieldValue(auth, none.value);
+    await setFieldValue(auth, none.value);
     const acknowledge = allMatches(['input[type="checkbox"]'], form).filter(visible)[0];
     if (!acknowledge) return fail('connector_form_fields_missing');
-    if (!acknowledge.checked) press(acknowledge);
+    if (!acknowledge.checked) await press(acknowledge);
     const save = allMatches(['button[type="submit"]', 'button'], form).filter(visible).find((button) => (
       /^(?:create|创建)$/iu.test(textOf(button))
     ));
     if (!save || save.disabled) return fail('connector_save_button_missing');
-    press(save);
+    await press(save);
     const closed = await waitFor(() => (firstVisible(SELECTORS.dialog) ? null : true), 10000);
     if (!closed) {
       const message = textOf(firstVisible(SELECTORS.dialog)).match(/无法[^。]*。|Unable[^.]*\\./u)?.[0];

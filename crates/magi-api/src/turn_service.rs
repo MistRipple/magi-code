@@ -864,6 +864,27 @@ fn validate_plugin_command_selection(
         return Ok(());
     };
     let selected = parse_contribution_selection("插件命令", command_id)?;
+    if command_id == crate::web_model_setup::SETUP_COMMAND_ID {
+        if !request.desktop_browser_tools_allowed {
+            return Err(ApiError::Forbidden(
+                "GPT Web 配置只能从本机 Magi Desktop 发起".into(),
+            ));
+        }
+        if !state.web_model_plugin_active() {
+            return Err(ApiError::Forbidden(
+                "GPT Web 插件未安装或未激活，请先到设置 → 插件安装并激活".into(),
+            ));
+        }
+        if !matches!(
+            request.trimmed_text().as_deref().unwrap_or(""),
+            "" | "start" | "continue" | "confirm_connector" | "cancel"
+        ) {
+            return Err(ApiError::InvalidInput(
+                "配置命令只接受开始、继续或取消；密钥请使用配置卡片的安全输入框".into(),
+            ));
+        }
+    }
+
     if request.command.is_some()
         || request.workflow_id.is_some()
         || request
@@ -1333,7 +1354,7 @@ async fn submit_conversation_session_turn(
     }
     if let Some(plugin_command_id) = request.plugin_command_id.as_ref() {
         metadata.insert(
-            "magi.pluginCommandId".to_string(),
+            "pluginCommandId".to_string(),
             serde_json::Value::String(plugin_command_id.clone()),
         );
     }

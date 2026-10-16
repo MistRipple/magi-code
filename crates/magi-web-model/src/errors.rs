@@ -12,6 +12,8 @@ pub enum WebModelErrorCode {
     WebLoginExpired,
     WebSiteBlocked,
     WebSelectorsDrift,
+    /// GPT Web 第一方插件没有在应用作用域安装并激活。
+    WebPluginInactive,
     WebDesktopUnavailable,
     WebSendRejected,
     WebWriteNotConfirmed,
@@ -34,6 +36,7 @@ impl WebModelErrorCode {
             Self::WebLoginExpired => "web_login_expired",
             Self::WebSiteBlocked => "web_site_blocked",
             Self::WebSelectorsDrift => "web_selectors_drift",
+            Self::WebPluginInactive => "web_plugin_inactive",
             Self::WebDesktopUnavailable => "web_desktop_unavailable",
             Self::WebSendRejected => "web_send_rejected",
             Self::WebWriteNotConfirmed => "web_write_not_confirmed",
@@ -47,7 +50,7 @@ impl WebModelErrorCode {
         }
     }
 
-    pub const ALL: [WebModelErrorCode; 17] = [
+    pub const ALL: [WebModelErrorCode; 18] = [
         Self::WebSessionBusy,
         Self::WebContextLost,
         Self::WebSavedConversationUnavailable,
@@ -55,6 +58,7 @@ impl WebModelErrorCode {
         Self::WebLoginExpired,
         Self::WebSiteBlocked,
         Self::WebSelectorsDrift,
+        Self::WebPluginInactive,
         Self::WebDesktopUnavailable,
         Self::WebSendRejected,
         Self::WebWriteNotConfirmed,
@@ -96,6 +100,7 @@ impl WebModelErrorCode {
             Self::WebSelectorsDrift => {
                 "ChatGPT 页面结构可能已改版，Magi 无法安全操作，请重新检查。"
             }
+            Self::WebPluginInactive => "GPT Web 插件尚未安装并激活，请先在设置 → 插件中完成安装。",
             Self::WebDesktopUnavailable => "GPT Web 需要 Magi Desktop。",
             Self::WebSendRejected => "ChatGPT 未接受这条消息，本次没有产生任何副作用，可以重试。",
             Self::WebWriteNotConfirmed => "网页输入框回读未确认，本次消息未提交，可以重试。",

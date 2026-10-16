@@ -143,6 +143,7 @@ pub type SlotEndHook = Arc<dyn Fn(&WebSlotOwner) + Send + Sync>;
 
 #[derive(Default)]
 struct SlotState {
+    maintenance_owner: Option<String>,
     slot: Option<WebSlot>,
     end_hook: Option<SlotEndHook>,
 }
@@ -158,6 +159,39 @@ impl WebSlotTable {
         Self::default()
     }
 
+    /// 与聊天占用共享同一把锁，避免检查空闲后聊天抢先导航。
+    pub fn reserve_maintenance(&self, owner: &str) -> Result<(), WebModelError> {
+        let mut state = self.state.lock().expect("web slot lock poisoned");
+        if state.slot.is_some()
+            || state
+                .maintenance_owner
+                .as_deref()
+                .is_some_and(|id| id != owner)
+        {
+            return Err(WebModelError::new(
+                WebModelErrorCode::WebSessionBusy,
+                "GPT Web 页面正在使用，请先停止占用会话或结束另一项配置",
+            ));
+        }
+        state.maintenance_owner = Some(owner.to_string());
+        Ok(())
+    }
+
+    pub fn release_maintenance(&self, owner: &str) {
+        let mut state = self.state.lock().expect("web slot lock poisoned");
+        if state.maintenance_owner.as_deref() == Some(owner) {
+            state.maintenance_owner = None;
+        }
+    }
+
+    pub fn maintenance_owner(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("web slot lock poisoned")
+            .maintenance_owner
+            .clone()
+    }
+
     /// 占用槽位；同一拥有者重复 claim 是幂等的，其他拥有者一律 busy。
     pub fn claim(
         &self,
@@ -167,6 +201,12 @@ impl WebSlotTable {
     ) -> Result<WebSlotClaim, WebModelError> {
         let page_id = page_id.into();
         let mut state = self.state.lock().expect("web slot lock poisoned");
+        if state.maintenance_owner.is_some() {
+            return Err(WebModelError::new(
+                WebModelErrorCode::WebSessionBusy,
+                "正在配置 GPT Web，请完成或取消配置后再开始聊天",
+            ));
+        }
         match state.slot.as_mut() {
             None => {
                 let slot = WebSlot {
@@ -394,6 +434,28 @@ impl Drop for WebTurnLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_reservation_excludes_chat_and_other_setup_owners() {
+        let slots = WebSlotTable::new();
+        slots.reserve_maintenance("setup-a").unwrap();
+        slots.reserve_maintenance("setup-a").unwrap();
+        assert!(slots.reserve_maintenance("setup-b").is_err());
+        let owner = WebSlotOwner::new("chat", "project");
+        assert!(
+            slots
+                .claim(owner.clone(), WebConversationBinding::temporary(), "page")
+                .is_err()
+        );
+        slots.release_maintenance("setup-b");
+        assert_eq!(slots.maintenance_owner().as_deref(), Some("setup-a"));
+        slots.release_maintenance("setup-a");
+        slots
+            .claim(owner.clone(), WebConversationBinding::temporary(), "page")
+            .unwrap();
+        assert!(slots.reserve_maintenance("setup-a").is_err());
+        assert_eq!(slots.owner(), Some(owner));
+    }
 
     #[test]
     fn only_one_owner_can_claim_the_slot() {

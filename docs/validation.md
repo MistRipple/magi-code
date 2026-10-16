@@ -31,6 +31,8 @@
 | --- | --- |
 | `npm run test:electron-browser-viewport` | 已打包 Electron、独立状态根与本地 Provider；真实 AI 工具验证固定/自适应视口、窄电脑/手机横屏、DPR/触控、缩放点击、光标常驻/导航/折叠恢复、拖动与网页点击接管后自适应、交还、320px 工具栏/菜单边界和后台页面不改布局 |
 | `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
+| `npm run test:electron-cursor-presentation` | 从当前 Main、Worker 和 Svelte 光标源码启动真实 Electron guest；验证移动完成确认先于原生点击和输入框焦点、原地点击、隐藏/减少动态效果，以及移动途中用户接管、取消、导航和迟到确认；使用本地测试页与独立临时状态目录，需要本机图形环境 |
+| `npm run test:electron-cursor-desktop-live` | 当前源码的完整开发 Desktop + daemon + 原生 Worker，访问真实 Example/IANA、Wikipedia 和 Rust Book，验证对话触发工具、光标滑行先于原生点击、输入/替换/搜索、右栏折叠恢复、移动中接管和交还；使用独立状态目录和本地模型调度，依赖公网和本机图形环境。先构建 Web 与 Desktop JavaScript，脚本通过 `scripts/dev-daemon.sh` 启动当前 daemon；截图与日志默认保留在临时目录，可用 `MAGI_CURSOR_LIVE_ARTIFACTS` 指定输出目录 |
 | `npm run test:electron-browser-network-policy` | 开发依赖 Electron 的网络边界验收；验证 iframe、fetch、重定向和 localhost 预览来源 |
 | `npm run test:browser-core-live -- --session-id <id>` | 已运行 daemon 的真实会话/Tab；`--app-renderer` 使用已启动 Desktop 的可信 Renderer，`--lifecycle-regression` 覆盖生命周期。环境变量和可写操作开关见 scripts/verify-browser-core-live.mjs |
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、首轮接纳期间草稿保留、排队与会话归属、停止和继续、终态、重启恢复及时序。应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部 |

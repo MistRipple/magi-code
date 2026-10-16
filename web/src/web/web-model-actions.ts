@@ -23,6 +23,8 @@ export type WebModelActionKind =
   | 'releaseSession'
   /** 查看工具通道状态与具体缺哪一项。 */
   | 'openTunnelSettings'
+  /** 打开插件管理页，安装并激活 GPT Web 第一方插件。 */
+  | 'openPluginSettings'
   /** 打开可用性 / Desktop 说明所在的浏览器设置页。 */
   | 'openSettings'
   /** 发送前失败且没有副作用时，使用已恢复的 composer 草稿重试。 */
@@ -102,6 +104,8 @@ export function webModelFailureAction(code: string): WebModelFailureAction | nul
       return { kind: 'probe', labelKey: 'webModel.action.runDiagnostics' };
     case 'web_tunnel_unavailable':
       return { kind: 'openTunnelSettings', labelKey: 'webModel.action.configureTunnel' };
+    case 'web_plugin_inactive':
+      return { kind: 'openPluginSettings', labelKey: 'webModel.action.installPlugin' };
     case 'web_desktop_unavailable':
       return { kind: 'openSettings', labelKey: 'webModel.action.openSettings' };
     default:

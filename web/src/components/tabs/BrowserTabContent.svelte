@@ -27,7 +27,7 @@
   } from '../../web/agent-api';
   import { synchronizeBrowserSessionSnapshot } from '../../stores/right-pane.svelte';
   import type { MessageBrowserNodeSelection } from '../../types/message';
-  import { normalizeOptionalDomNodeId } from '@magi/desktop-browser-contracts';
+  import { normalizeOptionalDomNodeId, type BrowserAgentCursorPresentation, type BrowserAgentCursorPresentationResult } from '@magi/desktop-browser-contracts';
   import { browserPartitionForSession } from '../../shared/web-model';
 
   interface Props {
@@ -96,6 +96,7 @@
     displayX?: number | null;
     displayY?: number | null;
     action?: string | null;
+    presentation?: BrowserAgentCursorPresentation;
     receivedBytes?: number;
     totalBytes?: number | null;
     error?: string;
@@ -1513,6 +1514,10 @@
     };
   }
 
+  function completeAgentCursorPresentation(result: BrowserAgentCursorPresentationResult): void {
+    void window.magiDesktop?.completeBrowserAgentCursor(result).catch(() => undefined);
+  }
+
   function clearAgentControl(): void {
     agentCursorSignal = { sequence: ++agentCursorSequence, visible: false, point: null, action: null };
   }
@@ -1578,6 +1583,7 @@
         visible: event.visible === true,
         point: agentCursorPoint(event.displayX, event.displayY),
         action: normalizeAgentCursorAction(event.action),
+        ...(event.presentation ? { presentation: event.presentation } : {}),
       };
       return;
     }
@@ -2096,7 +2102,7 @@
           aria-label={i18n.t('browser.viewport.label')}
         ></webview>
       </div>
-      <AgentCursorOverlay anchorName={surfaceAnchorName} signal={agentCursorSignal} hostVisible={surfaceSlotVisible && browserReady} />
+      <AgentCursorOverlay anchorName={surfaceAnchorName} signal={agentCursorSignal} hostVisible={surfaceSlotVisible && browserReady} onpresented={completeAgentCursorPresentation} />
       <div bind:this={viewportResizeElement} class="viewport-resize-frame" style:position-anchor={surfaceAnchorName} popover="manual">
         {#each viewportResizeEdges as edge (edge)}
           <button

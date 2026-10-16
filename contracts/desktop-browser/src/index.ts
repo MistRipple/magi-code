@@ -9,7 +9,7 @@ export {
   BROWSER_LAN_CIDRS,
 } from "./browser-network-policy.generated.js";
 
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 7 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 8 } as const;
 
 /**
  * Browser Surface 允许自动化附着的页面内部 Target 类型。
@@ -77,6 +77,15 @@ export interface BrowserSurfaceIdentity {
   tab_id: BrowserTabId;
   surface_id: SurfaceId;
   navigation_revision: number;
+}
+
+/** 宿主光标的一次展示请求；只确认呈现，不授予页面控制权。 */
+export interface BrowserAgentCursorPresentation extends BrowserSurfaceIdentity {
+  motionId: string;
+}
+
+export interface BrowserAgentCursorPresentationResult extends BrowserAgentCursorPresentation {
+  outcome: "arrived" | "hidden" | "interrupted";
 }
 
 export interface BrowserNodeSelection extends BrowserSurfaceIdentity {
@@ -412,8 +421,10 @@ export type BrowserHostCommand =
   /** 创建 / 启用 Magi 连接器并回读确认；只写连接器设置。 */
   | {
       type: "web_configure_connector";
-      payload: { tab_id: BrowserTabId; name: string; tunnel_id: string };
+      payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; name: string; tunnel_id: string };
     }
+  /** 创建 / 回读平台 Tunnel；禁止返回页面正文或密钥。 */
+  | { type: "web_platform_setup"; payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; action: "inspect_tunnel" | "create_tunnel" } }
   | { type: "shutdown" };
 
 export interface BrowserHostRequestEnvelope {

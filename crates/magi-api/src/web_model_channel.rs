@@ -137,6 +137,7 @@ struct ChannelInner {
 
 /// daemon 内的 GPT Web 工具通道运行时。
 pub struct WebModelChannelRuntime {
+    pub(crate) setup_lock: tokio::sync::Mutex<()>,
     channel: Arc<WebModelChannelState>,
     inner: Mutex<ChannelInner>,
     /// 串行化通道生命周期变更；状态锁不跨 await 持有。
@@ -159,6 +160,7 @@ pub struct WebModelChannelRuntime {
 impl WebModelChannelRuntime {
     pub fn new() -> Self {
         Self {
+            setup_lock: tokio::sync::Mutex::new(()),
             channel: Arc::new(WebModelChannelState::new()),
             inner: Mutex::new(ChannelInner {
                 tunnel: None,

@@ -243,6 +243,9 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
     if (expression.includes("globalThis.__magiWebModel.connectorStatus(")) {
       return { result: { value: responses.connectorStatus ?? null } };
     }
+    if (expression.includes("globalThis.__magiSetupInput") && expression.includes(".snapshot()")) {
+      return { result: { value: { done: true, failed: false, value: responses.configureConnector ?? null, request: null } } };
+    }
     if (expression.includes("globalThis.__magiWebModel.configureConnector(")) {
       return { result: { value: responses.configureConnector ?? null } };
     }

@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
+  BrowserWindow,
   session,
   webContents,
   type HandlerDetails,
@@ -22,10 +23,13 @@ import {
   isAllowedBrowserChildTarget,
   normalizeOptionalDomNodeId,
   type BrowserControlUpdate,
+  type BrowserControl,
   type BrowserLogicalViewport,
   type BrowserPageState,
   type BrowserNavigation,
   type BrowserSurfaceBinding,
+  type BrowserAgentCursorPresentation,
+  type BrowserAgentCursorPresentationResult,
 } from "@magi/desktop-browser-contracts";
 import { BrowserSurfaceRegistry } from "./browser-surface-registry.js";
 import { matchesNavigationRevision } from "./browser-navigation-revision.js";
@@ -46,8 +50,10 @@ import {
   type BrowserPopupBlockReason,
 } from "./browser-popup-policy.js";
 import { agentCursorActionForInput } from "./browser-agent-cursor.js";
+import { BrowserCursorPresentations } from "./browser-cursor-presentation.js";
 import {
   fitBrowserViewportScale,
+  browserInputDisplayParams,
   type BrowserDisplaySize,
 } from "./browser-viewport-scale.js";
 
@@ -145,6 +151,7 @@ export type BrowserSurfaceEvent =
       /** 内容槽 CSS 坐标，供 Renderer 绘制覆盖层光标。 */
       displayX: number | null;
       displayY: number | null;
+      presentation?: BrowserAgentCursorPresentation;
     }
   | {
       type: "cdp_event";
@@ -224,6 +231,9 @@ interface BrowserSurfaceRecord {
   closed: boolean;
   automationInputDepth: number;
   agentControlled: boolean;
+  agentControl: Extract<BrowserControl, { mode: "agent" }> | null;
+  /** 展示目标可能在取消后尚未到达；相同坐标的新动作仍需确认到位。 */
+  cursorPresentationReady: boolean;
   cursor: {
     visible: boolean;
     x: number | null;
@@ -702,6 +712,7 @@ function annotationCaptureOverlayExpression(input: {
 }
 
 export class BrowserSurfaceManager {
+  readonly #cursorPresentations = new BrowserCursorPresentations();
   readonly #desktopEpoch: string;
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
   // 代理需要在后台保持挂载的逻辑 Tab；代理控制释放、用户接管或页面关闭时移除。
@@ -753,6 +764,10 @@ export class BrowserSurfaceManager {
   attachWindow(windowId: string, appRenderer: WebContents): void {
     this.#appRenderers.set(windowId, appRenderer);
     this.#activationGenerations.set(windowId, 0);
+  }
+
+  completeAgentCursorPresentation(windowId: string, result: BrowserAgentCursorPresentationResult): void {
+    this.#cursorPresentations.complete(windowId, result);
   }
 
   setActivationGeneration(windowId: string, generation: number): void {
@@ -867,6 +882,8 @@ export class BrowserSurfaceManager {
       closed: false,
       automationInputDepth: 0,
       agentControlled: false,
+      agentControl: null,
+      cursorPresentationReady: false,
       cursor: { visible: false, x: null, y: null, action: null },
       cdpLane: Promise.resolve(),
       viewportLifecycle: {
@@ -1364,13 +1381,21 @@ export class BrowserSurfaceManager {
     method: string,
     params: Record<string, unknown> = {},
     sessionId?: string,
-    options: { allowNavigationAdvance?: boolean; signal?: AbortSignal } = {},
+    options: { allowNavigationAdvance?: boolean; signal?: AbortSignal; expectedAgentControl?: Extract<BrowserControl, { mode: "agent" }> | undefined } = {},
   ): Promise<unknown> {
     throwIfAborted(options.signal);
     if (!ALLOWED_WORKER_CDP_METHODS.has(method)) {
       throw new Error(`browser_cdp_method_denied:${method}`);
     }
     const record = this.requireRecord(binding.surface_id);
+    const assertControl = () => {
+      const expected = options.expectedAgentControl;
+      if (expected && (!record.agentControlled || !record.agentControl
+        || record.agentControl.lease_id !== expected.lease_id || record.agentControl.fence !== expected.fence)) {
+        throw new Error("browser_user_control_held");
+      }
+    };
+    assertControl();
     // JavaScript 对话框会阻塞触发它的 Input.dispatchMouseEvent。对话框处理
     // 命令必须能够穿过当前 Surface lane 直接送达 Chromium，否则会形成：
     // Input 等待对话框关闭、dialog 又排在 Input 后面，最终 Rust Host 请求超时
@@ -1439,13 +1464,14 @@ export class BrowserSurfaceManager {
       this.assertRenderableBinding(binding);
     }
     const injectsInput = method.startsWith("Input.");
-    if (injectsInput) record.automationInputDepth += 1;
+    let inputDepthAcquired = false;
     let inputCommand: Promise<unknown> | null = null;
     let inputCompletionTracked = false;
     let inputReleased = false;
     const releaseInput = () => {
       if (inputReleased) return;
       inputReleased = true;
+      if (!inputDepthAcquired) return;
       record.automationInputDepth = Math.max(
         0,
         record.automationInputDepth - 1,
@@ -1467,7 +1493,40 @@ export class BrowserSurfaceManager {
             // 与 lane 外的校验保持一致：排队期间文档已经换代时，旧命令必须
             // 失败并交给上层使用新的 binding 重试，不能把旧 DOM 操作投递到新页。
             this.recordForBinding(binding);
+            assertControl();
             const lease = debuggerLease(sessionId);
+            if (injectsInput && record.agentControlled) {
+              const input = params as { type?: string; x?: number; y?: number };
+              if (typeof input.x === "number" && typeof input.y === "number"
+                && input.type !== "mouseReleased"
+                && (!record.cursorPresentationReady || record.cursor.x !== input.x || record.cursor.y !== input.y)) {
+                record.cursorPresentationReady = false;
+                const control = record.agentControl;
+                const validate = () => {
+                  this.assertRenderableBinding(binding);
+                  assertControl();
+                  if (!record.agentControlled || record.agentControl?.lease_id !== control?.lease_id
+                    || record.agentControl?.fence !== control?.fence) throw new Error("browser_user_control_held");
+                };
+                const renderer = this.#appRenderers.get(record.windowId);
+                const window = renderer && !renderer.isDestroyed() ? BrowserWindow.fromWebContents(renderer) : null;
+                if (window?.isVisible() && !window.isMinimized()) {
+                  await this.#cursorPresentations.wait(record.windowId, {
+                    tab_id: binding.tab_id, surface_id: binding.surface_id, navigation_revision: binding.navigation_revision,
+                  }, presentation => this.setAgentCursor(record, true, input.x!, input.y!, "move", presentation), validate, options.signal);
+                  validate();
+                }
+                record.cursorPresentationReady = true;
+              }
+            }
+            // 等待动画时必须允许原生用户输入触发接管。只有真正投递 Input.* 才抑制自动输入回声。
+            throwIfAborted(options.signal);
+            this.recordForBinding(binding);
+            assertControl();
+            if (injectsInput) {
+              record.automationInputDepth += 1;
+              inputDepthAcquired = true;
+            }
             // DOM activeElement 不代表 Chromium 的键盘路由已从 App Renderer
             // 切至 guest。只在原生写入前聚焦当前 WebContents，不激活宿主窗口。
             if (method === "Input.insertText"
@@ -1655,7 +1714,7 @@ export class BrowserSurfaceManager {
     const result = await sendCdpCommandWithTimeout(
       contents,
       method,
-      constrainCdpCommandParams(method, params),
+      constrainCdpCommandParams(method, browserInputDisplayParams(method, params, record.viewportLifecycle.applied?.scale ?? 1)),
       timeoutMs,
       lease.sessionId,
       track,
@@ -1946,6 +2005,8 @@ export class BrowserSurfaceManager {
         commit.resolve();
         this.#onRuntimeStateChanged?.();
         if (record.agentControlled) {
+          // 同一页面坐标在新 scale 下也会移动；下一条输入仍需确认展示到位。
+          record.cursorPresentationReady = false;
           this.setAgentCursor(
             record,
             true,
@@ -2181,6 +2242,7 @@ export class BrowserSurfaceManager {
     const record = this.requireRecord(surfaceId);
     const acquiring = control.mode === "agent" && !record.agentControlled;
     record.agentControlled = control.mode === "agent";
+    record.agentControl = control.mode === "agent" ? { ...control } : null;
     if (acquiring && record.viewport.mode === "auto") {
       const state = await this.readViewport(binding);
       if (!record.agentControlled) throw new Error("browser_user_control_held");
@@ -5132,6 +5194,7 @@ export class BrowserSurfaceManager {
   private releaseAgentControlForUserInput(record: BrowserSurfaceRecord, followPanel = true): void {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
+    record.agentControl = null;
     this.setAgentCursor(record, false, null, null, null);
     // 只有介入 AI 控制才自动恢复响应式；用户显式选固定设备时保留其选择。
     if (followPanel && record.viewport.mode === "fixed") {
@@ -5899,9 +5962,11 @@ export class BrowserSurfaceManager {
     x: number | null,
     y: number | null,
     action: string | null,
+    presentation?: BrowserAgentCursorPresentation,
   ): void {
     const contents = record.contents;
     if (record.closed || !contents || contents.isDestroyed()) return;
+    if (!visible) record.cursorPresentationReady = false;
     const position =
       visible
         ? this.agentCursorPosition(record, x, y)
@@ -5919,6 +5984,7 @@ export class BrowserSurfaceManager {
       displayX: position.x === null ? null : position.x * scale,
       displayY: position.y === null ? null : position.y * scale,
       action,
+      ...(presentation ? { presentation } : {}),
     });
   }
 

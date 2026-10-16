@@ -19,7 +19,7 @@ pub enum BrowserWebQuestionAnswer {
 }
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 7;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 8;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 96;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 10 * 1024;
 
@@ -343,8 +343,15 @@ pub enum BrowserHostCommand {
     /// 在 ChatGPT 设置里为 Magi MCP 创建 / 启用连接器，并回读确认。只写连接器设置，不动其它设置。
     WebConfigureConnector {
         tab_id: BrowserTabId,
+        control: BrowserHostControl,
         name: String,
         tunnel_id: String,
+    },
+    /// 创建 / 回读 OpenAI 平台 Tunnel；只返回固定状态与 Tunnel id。
+    WebPlatformSetup {
+        tab_id: BrowserTabId,
+        control: BrowserHostControl,
+        action: String,
     },
     /// daemon 持有的浏览器网络策略开关，推送给 Electron Main 在 guest 网络层执行。
     /// Host 连接建立时先推送、设置变化时再推送；Main 重启后默认拒绝局域网，直到收到推送。
@@ -372,7 +379,8 @@ impl BrowserHostCommand {
             | Self::WebClearAttachments { .. }
             | Self::WebAnswerQuestion { .. }
             | Self::WebCancelGeneration { .. }
-            | Self::WebConfigureConnector { .. } => true,
+            | Self::WebConfigureConnector { .. }
+            | Self::WebPlatformSetup { .. } => true,
             Self::Ping
             | Self::Cancel { .. }
             | Self::CreatePage { .. }
@@ -907,7 +915,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 7 },
+                "protocol_version": { "major": 3, "minor": 8 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",

@@ -189,6 +189,8 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。
 
+Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置 Worker 的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；用户接管后拒绝后续输入，配置脚本不允许合成事件或直接改写文本字段绕过控制。每条配置命令结算后释放控制，登录、验证码和密钥输入阶段交由用户处理。
+
 ### 4.4 自动化不改布局与代理保留页面
 
 浏览器自动化**任何时候都不写布局**：Desktop Control 的驱动路径不写 `right_pane_visibility` / `active_panel`，也不切换用户当前会话或一级 Tab。用户在看什么完全由用户决定；代理只能驱动已在内容槽中注册的 guest。
@@ -200,6 +202,10 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | 驱动路径 | 内容槽绑定有效时直接复用；否则只做后台物化（`ensureBrowserSurfaceInBackground`），等待 Renderer 依据快照注册离屏宿主，不附带激活意图 |
 | 释放 | 页面移出保留集合后回到 §4.2 的普通生命周期：不在当前作用域即卸载当前窗口 guest，Authority 逻辑 Tab/URL 保留 |
 | 代理光标 | Main 是光标位置与动作的唯一来源：在输入投递前于同一 Surface lane 内更新，按实际生效的设备画布 `scale` 换算为内容槽坐标并随 `agent_cursor` 事件发布。窗口快照提供当前光标事实以恢复展示，事件提供连续动作。Renderer 区分保留挂载与前台可见状态，用锚定内容槽的 Top Layer 覆盖层（`pointer-events: none`）绘制 Magi 光标、动作名牌、点击波纹和受控描边；页面 DOM 不注入任何元素，截图不包含光标，导航不打断光标。用户接管、控制撤销、Primary 切换或页面崩溃时光标隐藏 |
+
+前台可见窗口中，改变位置的代理鼠标输入先由 Main 在同一 Surface lane 发布带 motion 身份的展示请求，Renderer 等待 transform 过渡完成和落点渲染后回传确认，Main 再校验当前 Surface、导航及 Agent lease/fence，随后投递原生输入；点击与输入框聚焦因此发生在光标到位之后。同位置且已确认的连续操作不重复等待。后台内容槽通过 hidden 确认跳过动画，隐藏或最小化窗口直接执行；减少动态效果时仍确认落点渲染。等待中接管、导航、取消、动画中断或 3 秒无确认均终止当前动作，旧窗口、旧导航和迟到 motion 的确认不能放行动作；取消后同坐标的新动作仍需新的确认。
+
+Worker 的定位、命中校验和工具参数始终使用页面 CSS 坐标。Main 在唯一物理 CDP 出口把 `Input.dispatchMouseEvent` 的 x/y 乘以当前已提交设备画布 scale，与展示光标共用同一比例；`auto` 比例为 1，不读取窗口位置或引入布局坐标协议。视口提交后重新要求光标到位确认，避免同页面坐标在缩放变化后绕过等待。文本选择使用 Chromium 原生编辑命令，不额外生成 End 的 keyup，以免触发站点动态搜索、在文本写入前使导航身份失效。
 
 ## 5. 导航、控制与恢复
 

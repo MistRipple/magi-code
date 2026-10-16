@@ -331,6 +331,7 @@ interface MagiDesktopBridge {
   onContext(
     listener: (context: MagiDesktopContextSnapshot) => void,
   ): () => void;
+  completeBrowserAgentCursor(request: import("@magi/desktop-browser-contracts").BrowserAgentCursorPresentationResult): Promise<void>;
   onBrowserEvent(listener: (event: unknown) => void): () => void;
   onBrowserComponent(
     listener: (snapshot: MagiDesktopBrowserComponentSnapshot) => void,

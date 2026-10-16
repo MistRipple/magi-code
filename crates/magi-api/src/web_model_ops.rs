@@ -18,8 +18,13 @@ use magi_web_model::{
     WebMessage, WebModelError, WebModelErrorCode, WebModelPageDriver,
 };
 
-use magi_browser_authority::{BrowserHostCommand, BrowserHostCommandOutcome, BrowserTabLifecycle};
-use magi_core::{BrowserTabId, UtcMillis, WorkspaceId};
+use magi_browser_authority::{
+    BrowserHostCommand, BrowserHostCommandOutcome, BrowserSession, BrowserSessionLifecycle,
+    BrowserSessionOwner, BrowserTab, BrowserTabLifecycle, CreateBrowserSession, CreateBrowserTab,
+};
+use magi_core::{BrowserProfileId, BrowserSessionId, BrowserTabId, UtcMillis, WorkspaceId};
+use std::sync::atomic::{AtomicU64, Ordering};
+static APP_BROWSER_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 use crate::ApiError;
 use crate::state::ApiState;
@@ -222,7 +227,7 @@ impl ApiState {
             Ok(())
         } else {
             Err(WebModelError::new(
-                WebModelErrorCode::WebDesktopUnavailable,
+                WebModelErrorCode::WebPluginInactive,
                 "GPT Web 插件未安装或未激活",
             ))
         }
@@ -426,6 +431,20 @@ impl ApiState {
         Ok(())
     }
 
+    fn require_no_setup_reservation(&self) -> Result<(), WebModelError> {
+        if self
+            .web_model
+            .bindings()
+            .is_some_and(|slots| slots.maintenance_owner().is_some())
+        {
+            return Err(WebModelError::new(
+                WebModelErrorCode::WebSessionBusy,
+                "正在配置 GPT Web，请回到配置对话继续或结束配置",
+            ));
+        }
+        Ok(())
+    }
+
     /// GPT Web 标签页顶部的快捷地址：把唯一的 WebView 切到对话页或 OpenAI 平台的固定页面。
     /// 目标是白名单枚举，不接受任意地址；槽位被会话占用时拒绝，不打断进行中的对话。
     pub async fn open_web_model_page(
@@ -482,8 +501,10 @@ impl ApiState {
     pub async fn web_connector_status(
         &self,
     ) -> Result<magi_web_model::ConnectorStatus, WebModelError> {
+        let _serial = self.web_model.setup_lock.lock().await;
         self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
+        self.require_no_setup_reservation()?;
         // 页面可能停在 OpenAI 平台页或设置页：连接器检查从 ChatGPT 主页开始。
         let driver = self.web_driver()?;
         self.open_home_with_recovery(&driver).await?;
@@ -497,8 +518,10 @@ impl ApiState {
     pub async fn configure_web_connector(
         &self,
     ) -> Result<magi_web_model::ConnectorConfigOutcome, WebModelError> {
+        let _serial = self.web_model.setup_lock.lock().await;
         self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
+        self.require_no_setup_reservation()?;
         let status = self.web_model.status();
         if status.tunnel_id.trim().is_empty() {
             return Err(WebModelError::new(
@@ -517,8 +540,10 @@ impl ApiState {
     pub async fn list_web_saved_conversations(
         &self,
     ) -> Result<Vec<SavedConversationEntry>, WebModelError> {
+        let _serial = self.web_model.setup_lock.lock().await;
         self.require_web_model_plugin()?;
         self.require_free_slot_for_connector()?;
+        self.require_no_setup_reservation()?;
         // 侧栏历史只在普通（非临时）主页上可读；槽位空闲时先回到主页再读。
         let driver = self.web_driver()?;
         self.open_home_with_recovery(&driver).await?;
@@ -702,6 +727,7 @@ impl ApiState {
     /// 释放某会话持有的 GPT Web 槽位（切到本地 / 会话删除 / 停止）：销毁页面、清运行态。
     /// 会话不是槽位拥有者时什么都不做。返回是否真的释放了槽位。
     pub async fn release_web_slot_for_session(&self, session_id: &SessionId) -> bool {
+        self.cancel_web_model_setup_for(Some(session_id)).await;
         let Some(slots) = self.web_model.bindings() else {
             return false;
         };
@@ -721,6 +747,7 @@ impl ApiState {
 
     /// 设置里的“停止”/ Tab 里的“退出”：取消进行中的推理、销毁页面、释放槽位。登录态保留。
     pub async fn stop_web_model(&self) {
+        self.cancel_web_model_setup_for(None).await;
         let owner = self.web_model.bindings().and_then(|slots| slots.owner());
         if let Some(owner) = owner {
             let session_id = SessionId::new(owner.session_id.clone());
@@ -896,4 +923,98 @@ mod tests {
             "指针消息不在远端：分支或删除，必须报告冲突而不是猜测"
         );
     }
+}
+
+/// 取得或创建应用级浏览器会话（幂等）。
+///
+/// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
+/// 创建时同时建立固定主页 Tab。
+pub(crate) fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.lifecycle != BrowserSessionLifecycle::Failed {
+            ensure_app_home_tab(state, &existing.browser_session_id)?;
+            return Ok(existing);
+        }
+        // 失败会话不能复用：它的 Tab 已经没有对应的 Browser Host 页面。
+        state.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &existing.browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })?;
+    }
+
+    let now = UtcMillis::now();
+    let browser_session_id = BrowserSessionId::new(format!(
+        "browser-session-app-{}-{}",
+        now.0,
+        APP_BROWSER_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let session = state.mutate_browser_authority(|authority| {
+        authority.create_session(CreateBrowserSession {
+            browser_session_id: browser_session_id.clone(),
+            owner: BrowserSessionOwner::App,
+            profile_id: BrowserProfileId::new("browser-profile-default"),
+            now,
+        })?;
+        authority.transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, now)
+    })?;
+    ensure_app_home_tab(state, &browser_session_id)?;
+    Ok(session)
+}
+
+/// 保证应用级会话的固定主页 Tab 存在且可用。
+///
+/// 主页固定在 GPT Web 入口；推理页面由推理通道按需创建，不在这里创建。
+pub(crate) fn ensure_app_home_tab(
+    state: &ApiState,
+    browser_session_id: &BrowserSessionId,
+) -> Result<BrowserTab, ApiError> {
+    let tab_id = BrowserTabId::new(WEB_MODEL_HOME_TAB_ID);
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .tab(&tab_id)
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.browser_session_id != *browser_session_id {
+            return Err(ApiError::Conflict(
+                "GPT Web 主页 Tab 归属了另一应用级浏览器会话".to_string(),
+            ));
+        }
+        if existing.lifecycle != BrowserTabLifecycle::Closed {
+            return Ok(existing);
+        }
+        // 应用级主页使用固定逻辑 id。孤儿清理或异常退出后的恢复可能留下 Closed 行，
+        // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
+        // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
+        // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。
+        let now = UtcMillis::now();
+        return state.mutate_browser_authority(|authority| {
+            authority.reopen_closed_tab(
+                browser_session_id,
+                &tab_id,
+                magi_web_model::chatgpt_web_home_url(),
+                now,
+            )
+        });
+    }
+    let now = UtcMillis::now();
+    state.mutate_browser_authority(|authority| {
+        authority.create_tab(CreateBrowserTab {
+            tab_id: tab_id.clone(),
+            browser_session_id: browser_session_id.clone(),
+            url: magi_web_model::chatgpt_web_home_url(),
+            now,
+        })?;
+        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, now)
+    })
 }

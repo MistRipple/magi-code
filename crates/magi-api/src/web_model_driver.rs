@@ -1,16 +1,20 @@
 //! GPT Web 的宿主驱动与单槽位 client 工厂。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use magi_bridge_client::llm_types::ImageSource;
 use magi_browser_authority::{
-    BrowserAuthority, BrowserHostClient, BrowserHostClientError, BrowserHostCommand,
-    BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
-    BrowserLogicalViewport, BrowserNavigation, BrowserTabLifecycle, BrowserWebWriteMode,
+    AcquireBrowserLease, BrowserAuthority, BrowserHostClient, BrowserHostClientError,
+    BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
+    BrowserHostControlUpdate, BrowserLogicalViewport, BrowserNavigation, BrowserTabLifecycle,
+    BrowserWebWriteMode,
 };
-use magi_core::{BrowserSessionId, BrowserTabId, UtcMillis};
+use magi_core::{BrowserLeaseId, BrowserSessionId, BrowserTabId, ExecutionOwnership, UtcMillis};
 use magi_web_model::{
     BrowserWebModelBridgeClient, ConnectorConfigOutcome, ConnectorStatus, DriverFuture, LoginState,
     SavedConversationEntry, SavedConversationSnapshot, SubmitOutcome, TurnState, WebMessage,
@@ -33,6 +37,19 @@ const SAVED_LIST_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// 连接器页面（设置里的「插件」页、`/plugins` 目录页）加载与脚本就绪的等待。
 const CONNECTOR_PAGE_ATTEMPTS: usize = 24;
 const CONNECTOR_PAGE_DELAY: Duration = Duration::from_millis(700);
+
+static WEB_SETUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+tokio::task_local! {
+    static WEB_SETUP_TURN: String;
+}
+
+pub(crate) async fn with_web_setup_turn<T>(
+    turn_id: String,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    WEB_SETUP_TURN.scope(turn_id, future).await
+}
 
 pub struct HostWebModelPageDriver {
     host_client: Arc<RwLock<Option<BrowserHostClient>>>,
@@ -312,6 +329,9 @@ impl HostWebModelPageDriver {
                 .authority
                 .lock()
                 .map_err(|_| unavailable("浏览器权威状态不可用"))?;
+            if authority.user_control_held(tab_id) {
+                return Err(unavailable("browser_user_control_held"));
+            }
             let (control, _revoked) = authority
                 .take_user_control(tab_id, &binding.surface_id, UtcMillis::now())
                 .map_err(|error| unavailable(&error.to_string()))?;
@@ -469,6 +489,102 @@ impl HostWebModelPageDriver {
             }
             BrowserHostCommandOutcome::Cancelled => Err(WebModelError::cancelled()),
         }
+    }
+
+    /// 应用级配置也沿 Authority lease → Main 控制投影 → Worker 原生输入链执行。
+    /// 每个窄命令结算后释放控制，等待登录、密钥或确认时不会残留 Agent 光标。
+    async fn native_setup_command(
+        &self,
+        build: impl FnOnce(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
+    ) -> Result<serde_json::Value, WebModelError> {
+        let tab_id = self.home_tab()?;
+        let binding = self.refresh_primary_binding(&tab_id).await?;
+        let client = self.client()?;
+        let now = UtcMillis::now();
+        let lease = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_| unavailable("浏览器权威状态不可用"))?;
+            authority
+                .acquire_lease(AcquireBrowserLease {
+                    lease_id: BrowserLeaseId::new(format!(
+                        "web-setup-{}-{}",
+                        now.0,
+                        WEB_SETUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                    )),
+                    tab_id: tab_id.clone(),
+                    surface_id: binding.surface_id.clone(),
+                    // App owner 不归属会话；配置 Turn 仅用于关联本次执行。
+                    owner: ExecutionOwnership::default(),
+                    turn_id: WEB_SETUP_TURN.try_with(Clone::clone).unwrap_or_else(|_| {
+                        format!(
+                            "web-model-settings-{}-{}",
+                            now.0,
+                            WEB_SETUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                        )
+                    }),
+                    goal_binding: None,
+                    acquired_at: now,
+                    expires_at: UtcMillis(now.0.saturating_add(120_000)),
+                })
+                .map_err(|error| unavailable(&error.to_string()))?
+        };
+        let result = async {
+            let reply = client
+                .request(BrowserHostCommand::UpdateControl {
+                    tab_id: tab_id.clone(),
+                    surface_id: binding.surface_id.clone(),
+                    control: BrowserHostControlUpdate::Agent {
+                        lease_id: lease.lease_id.clone(),
+                        fence: lease.fence,
+                    },
+                })
+                .await
+                .map_err(host_error)?;
+            if !matches!(
+                reply.response.outcome,
+                BrowserHostCommandOutcome::Succeeded(_)
+            ) {
+                return Err(unavailable("配置页面控制权未取得"));
+            }
+            self.json_command(
+                build(
+                    tab_id.clone(),
+                    BrowserHostControl::Agent {
+                        lease_id: lease.lease_id.clone(),
+                        fence: lease.fence,
+                    },
+                ),
+                WebModelErrorCode::WebTunnelUnavailable,
+            )
+            .await
+        }
+        .await;
+        let release = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_| unavailable("浏览器权威状态不可用"))?;
+            let _ = authority.release_lease(&lease.lease_id, UtcMillis::now());
+            // 只清理本次物理 Surface；不能撤销另一控制者或新 Surface 的控制。
+            authority
+                .surface_control_snapshot(&tab_id, &binding.surface_id)
+                .ok()
+                .filter(|snapshot| snapshot.lease_id.is_none())
+        };
+        if let Some(snapshot) = release {
+            let _ = client
+                .request(BrowserHostCommand::UpdateControl {
+                    tab_id,
+                    surface_id: binding.surface_id,
+                    control: BrowserHostControlUpdate::Released {
+                        fence: snapshot.fence,
+                    },
+                })
+                .await;
+        }
+        result
     }
 
     /// 只读页面命令（已保存对话、连接器状态）：页面刚导航 / 交接时 Surface 绑定会短暂过期，
@@ -1009,6 +1125,17 @@ impl WebModelPageDriver for HostWebModelPageDriver {
         })
     }
 
+    fn platform_setup<'a>(&'a self, action: &'a str) -> DriverFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            self.native_setup_command(|tab_id, control| BrowserHostCommand::WebPlatformSetup {
+                tab_id,
+                control,
+                action: action.to_string(),
+            })
+            .await
+        })
+    }
+
     fn connector_status<'a>(
         &'a self,
         _page_id: &'a str,
@@ -1029,7 +1156,9 @@ impl WebModelPageDriver for HostWebModelPageDriver {
     ) -> DriverFuture<'a, ConnectorConfigOutcome> {
         Box::pin(async move {
             let outcome = self.create_connector(name, tunnel_id).await;
-            self.leave_connector_pages().await;
+            if outcome.is_ok() {
+                self.leave_connector_pages().await;
+            }
             outcome
         })
     }
@@ -1109,13 +1238,13 @@ impl HostWebModelPageDriver {
                 tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
             }
             let value = self
-                .json_command(
-                    BrowserHostCommand::WebConfigureConnector {
-                        tab_id: self.home_tab()?,
+                .native_setup_command(
+                    |tab_id, control| BrowserHostCommand::WebConfigureConnector {
+                        tab_id,
+                        control,
                         name: name.to_string(),
                         tunnel_id: tunnel_id.to_string(),
                     },
-                    WebModelErrorCode::WebTunnelUnavailable,
                 )
                 .await;
             match value {
@@ -1162,13 +1291,13 @@ impl HostWebModelPageDriver {
                 tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
             }
             let value = self
-                .json_command(
-                    BrowserHostCommand::WebConfigureConnector {
-                        tab_id: self.home_tab()?,
+                .native_setup_command(
+                    |tab_id, control| BrowserHostCommand::WebConfigureConnector {
+                        tab_id,
+                        control,
                         name: name.to_string(),
                         tunnel_id: tunnel_id.to_string(),
                     },
-                    WebModelErrorCode::WebTunnelUnavailable,
                 )
                 .await;
             let value = match value {

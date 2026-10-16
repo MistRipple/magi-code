@@ -112,6 +112,8 @@ contextBridge.exposeInMainWorld("magiDesktop", {
     ipcRenderer.invoke("magi-desktop:register-browser-webview", request),
   updateBrowserDisplaySize: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:update-browser-display-size", request),
+  completeBrowserAgentCursor: (request: unknown) =>
+    ipcRenderer.invoke("magi-desktop:complete-browser-agent-cursor", request),
   releaseBrowserWebview: (request: unknown) =>
     ipcRenderer.invoke("magi-desktop:release-browser-webview", request),
   waitForBrowserSurface: (request: unknown) =>

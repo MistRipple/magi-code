@@ -38,7 +38,7 @@ use crate::{
     scope_binding::{self as session_scope, SessionScope},
     session_activity::session_running_task_count,
     state::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot},
-    web_model_ops::WEB_MODEL_HOME_TAB_ID,
+    web_model_ops::{ensure_app_browser_session, ensure_app_home_tab},
 };
 
 static BROWSER_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -85,6 +85,11 @@ pub fn routes() -> Router<ApiState> {
             get(get_app_session).post(create_app_session),
         )
         .route("/browser/web-models/probe", post(probe_web_model))
+        .route("/browser/web-models/setup", get(get_web_model_setup))
+        .route(
+            "/browser/web-models/setup/credentials",
+            post(save_web_model_setup_credentials),
+        )
         .route(
             "/browser/web-models/ensure-home",
             post(ensure_web_model_home_surface),
@@ -1253,100 +1258,6 @@ async fn create_app_session(
     ))
 }
 
-/// 取得或创建应用级浏览器会话（幂等）。
-///
-/// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
-/// 创建时同时建立固定主页 Tab。
-fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
-    let existing = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .app_session()
-        .cloned();
-    if let Some(existing) = existing {
-        if existing.lifecycle != BrowserSessionLifecycle::Failed {
-            ensure_app_home_tab(state, &existing.browser_session_id)?;
-            return Ok(existing);
-        }
-        // 失败会话不能复用：它的 Tab 已经没有对应的 Browser Host 页面。
-        state.mutate_browser_authority(|authority| {
-            authority.transition_session(
-                &existing.browser_session_id,
-                BrowserSessionLifecycle::Closed,
-                UtcMillis::now(),
-            )
-        })?;
-    }
-
-    let now = UtcMillis::now();
-    let browser_session_id = BrowserSessionId::new(format!(
-        "browser-session-app-{}-{}",
-        now.0,
-        BROWSER_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let session = state.mutate_browser_authority(|authority| {
-        authority.create_session(CreateBrowserSession {
-            browser_session_id: browser_session_id.clone(),
-            owner: BrowserSessionOwner::App,
-            profile_id: BrowserProfileId::new("browser-profile-default"),
-            now,
-        })?;
-        authority.transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, now)
-    })?;
-    ensure_app_home_tab(state, &browser_session_id)?;
-    Ok(session)
-}
-
-/// 保证应用级会话的固定主页 Tab 存在且可用。
-///
-/// 主页固定在 GPT Web 入口；推理页面由推理通道按需创建，不在这里创建。
-fn ensure_app_home_tab(
-    state: &ApiState,
-    browser_session_id: &BrowserSessionId,
-) -> Result<BrowserTab, ApiError> {
-    let tab_id = BrowserTabId::new(WEB_MODEL_HOME_TAB_ID);
-    let existing = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .tab(&tab_id)
-        .cloned();
-    if let Some(existing) = existing {
-        if existing.browser_session_id != *browser_session_id {
-            return Err(ApiError::Conflict(
-                "GPT Web 主页 Tab 归属了另一应用级浏览器会话".to_string(),
-            ));
-        }
-        if existing.lifecycle != BrowserTabLifecycle::Closed {
-            return Ok(existing);
-        }
-        // 应用级主页使用固定逻辑 id。孤儿清理或异常退出后的恢复可能留下 Closed 行，
-        // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
-        // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
-        // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。
-        let now = UtcMillis::now();
-        return state.mutate_browser_authority(|authority| {
-            authority.reopen_closed_tab(
-                browser_session_id,
-                &tab_id,
-                magi_web_model::chatgpt_web_home_url(),
-                now,
-            )
-        });
-    }
-    let now = UtcMillis::now();
-    state.mutate_browser_authority(|authority| {
-        authority.create_tab(CreateBrowserTab {
-            tab_id: tab_id.clone(),
-            browser_session_id: browser_session_id.clone(),
-            url: magi_web_model::chatgpt_web_home_url(),
-            now,
-        })?;
-        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, now)
-    })
-}
-
 /// `GET /browser/web-models/tunnel`：工具通道状态。
 ///
 /// 只暴露状态与「具体缺哪一项」，**不含任何凭据内容**。
@@ -1390,6 +1301,8 @@ async fn configure_web_model_tunnel(
 ) -> Result<Json<crate::web_model_channel::WebModelTunnelStatus>, ApiError> {
     require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
+    let _serial = state.web_model.setup_lock.lock().await;
+    require_web_model_plugin(&state)?;
     let config = if request.clear {
         None
     } else {
@@ -5271,4 +5184,48 @@ mod tests {
             "探测结论里不得出现网页的模型菜单"
         );
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebModelSetupQuery {
+    session_id: String,
+}
+
+async fn get_web_model_setup(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<WebModelSetupQuery>,
+) -> Result<Json<Option<magi_app_server_protocol::generated::WebModelSetupStatus>>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    let session = SessionId::new(query.session_id);
+    if state.session_store.session(&session).is_none() {
+        return Err(ApiError::NotFound("会话不存在".into()));
+    }
+    Ok(Json(state.web_model_setup_status(&session)))
+}
+
+// 不派生 Debug，避免密钥原文进入诊断；该请求不进入 Turn/canonical。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebModelSetupCredentials {
+    session_id: String,
+    tunnel_id: Option<String>,
+    api_key: String,
+}
+
+async fn save_web_model_setup_credentials(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WebModelSetupCredentials>,
+) -> Result<Json<Value>, ApiError> {
+    require_desktop_browser_capability(&state, &headers, None)?;
+    state
+        .save_setup_credentials(
+            &SessionId::new(request.session_id),
+            request.tunnel_id,
+            request.api_key,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({"saved": true})))
 }

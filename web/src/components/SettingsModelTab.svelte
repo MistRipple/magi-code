@@ -8,6 +8,7 @@
   import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import { WEB_MODEL_SETUP_REQUEST } from '../web/web-model-setup';
   import ModelConfigForm from './ModelConfigForm.svelte';
 
   let {
@@ -685,6 +686,10 @@
       </div>
     {/if}
 
+    <div class="settings-section" data-gpt-web-setup-entry><div class="settings-card"><div class="settings-row">
+      <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.setup.title')}</span><span class="settings-row-desc">{i18n.t('webModel.setup.entryHint')}</span></div>
+      <button class="btn btn--sm btn--secondary" onclick={() => window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST))}>{i18n.t('webModel.setup.start')}</button>
+    </div></div></div>
     {#if pluginEngines.some((engine: { id: string }) => engine.id === 'plugin/openai.chatgpt-web/default')}
     <div class="settings-section web-model-pointer">
       <div class="settings-section-header">

@@ -1,3 +1,5 @@
+import { INSTALL_WEB_SETUP_INPUT } from "./web-setup-input.js";
+import { PLATFORM_SETUP_SCRIPT, sanitizePlatformSetupResult } from "./web-platform-setup.js";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
@@ -348,6 +350,12 @@ export class BrowserAutomationRuntime {
         }
         return { result: { type: "json", payload: { value } } };
       }
+      case "web_platform_setup": {
+        const value = sanitizePlatformSetupResult(await this.runSetupInput(binding,
+          `${PLATFORM_SETUP_SCRIPT}(${JSON.stringify(command.payload.action)})`));
+        if (!value) throw protocolFailure("web_platform_setup_result_invalid", "平台配置结果无效");
+        return { result: { type: "json", payload: { value } } };
+      }
       case "web_connector_status": {
         await this.ensureWebModelAdapter(binding);
         const value = await this.evaluate<unknown>(
@@ -364,7 +372,7 @@ export class BrowserAutomationRuntime {
       }
       case "web_configure_connector": {
         await this.ensureWebModelAdapter(binding);
-        const value = await this.evaluate<unknown>(
+        const value = await this.runSetupInput(
           binding,
           `globalThis.__magiWebModel.configureConnector(${JSON.stringify({
             name: command.payload.name,
@@ -872,6 +880,46 @@ export class BrowserAutomationRuntime {
     );
   }
 
+  /** 配置页面只识别目标；写入共享通用工具的原生输入、命中检查和确认。 */
+  private async runSetupInput(binding: BrowserSurfaceBinding, expression: string): Promise<unknown> {
+    const id = randomUUID();
+    const state = "globalThis.__magiSetupInput";
+    await this.evaluate(binding, `${INSTALL_WEB_SETUP_INPUT}(${JSON.stringify(id)}, ${JSON.stringify(expression)})`);
+    try {
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        const next = await this.evaluate<{
+          done: boolean; failed: boolean; value: unknown;
+          request: { kind: string; ref: string; value: string | null } | null;
+        }>(binding, `${state}?.id === ${JSON.stringify(id)} ? ${state}.snapshot() : null`);
+        if (!next) throw protocolFailure("browser_setup_input_closed", "配置操作已失效", true);
+        if (next.done) {
+          if (next.failed) throw protocolFailure("browser_setup_input_failed", "配置页面操作未确认", true);
+          return next.value;
+        }
+        const request = next.request;
+        if (request) {
+          const target = { element_ref: request.ref };
+          if (request.kind === "click") await this.click(binding, target);
+          else if (request.kind === "type" && typeof request.value === "string") {
+            await this.typeText(binding, target, request.value, true, null);
+          } else if (request.kind === "select" && typeof request.value === "string") {
+            // 原生 select 的系统菜单无法稳定接受跨进程按键；先把光标移动到真实控件，
+            // 再复用 Worker 已有的受控 select 语义写入和回读确认，不合成 click 事件。
+            await this.pointerAction(binding, "mousemove", request.ref, null);
+            await this.setSelectValue(binding, target, request.value, false);
+          } else throw protocolFailure("browser_setup_input_invalid", "配置输入类型无效");
+          await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.settle()`);
+        } else await waitWithSignal(50, this.#cdp.currentSignal());
+      }
+      throw protocolFailure("browser_setup_input_timeout", "配置操作超时，请检查页面", true);
+    } finally {
+      if (!this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted) {
+        await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.dispose()`).catch(() => undefined);
+      }
+    }
+  }
+
   private async target(binding: BrowserSurfaceBinding, target: BrowserSnapshotTarget): Promise<PageTarget> {
     if (target.element_ref === "root") throw protocolFailure("browser_element_ref_invalid", "root is not an interactive element");
     return this.evaluate(binding, `globalThis.__magiBrowserAutomation.target(${JSON.stringify(target.element_ref)})`);
@@ -941,10 +989,13 @@ export class BrowserAutomationRuntime {
         binding,
         `globalThis.__magiBrowserAutomation.prepareText(${JSON.stringify(ref.element_ref)}, ${JSON.stringify(text)}, ${replace})`);
       if (!prepared || typeof prepared.expected !== "string" || !prepared.target) throw protocolFailure("browser_input_unverifiable", "无法确认输入目标和选择范围");
-      // Chromium 统一管理选择范围，email/number 等不支持 DOM selection API 的输入框也走同一链路。
-      if (!await this.key(binding, "keyDown", "End", 0, "End", [replace ? "selectAll" : "moveToEndOfDocument"])
-        || this.navigationAdvanced(binding)
-        || !await this.key(binding, "keyUp", "End")) {
+      // 执行 Chromium 编辑命令，不伪装成 End 按键。站点常在 keyup 上搜索并改写
+      // URL；无关的 End keyup 会在文本尚未写入时推进导航，使后续输入失效。
+      // 没有具体物理按键的编辑命令不需要配对 keyUp；email/number 同样支持。
+      const selected = await this.#cdp.send(binding, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown", commands: [replace ? "selectAll" : "moveToEndOfDocument"],
+      });
+      if (isNativeDialogOpenedResult(selected) || this.navigationAdvanced(binding)) {
         throw protocolFailure("browser_type_unconfirmed", "选择文本时页面状态变化，输入未完成", true);
       }
       await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyTextFocus(${JSON.stringify(ref.element_ref)})`);

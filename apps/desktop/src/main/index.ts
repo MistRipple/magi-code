@@ -467,6 +467,13 @@ function registerIpc(): void {
       return manager.updateEmbeddedWebviewDisplaySize(windowId, request);
     },
   );
+  handleIpc("magi-desktop:complete-browser-agent-cursor", (event, value: unknown) => {
+    const { windowId } = trustedAppSender(event.sender.id);
+    surfaceManager?.completeAgentCursorPresentation(
+      windowId,
+      value as import("@magi/desktop-browser-contracts").BrowserAgentCursorPresentationResult,
+    );
+  });
   handleIpc(
     "magi-desktop:release-browser-webview",
     async (event, value: unknown) => {

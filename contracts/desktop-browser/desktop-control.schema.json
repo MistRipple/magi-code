@@ -132,6 +132,12 @@
         }
       ]
     },
+    "agentControl": {
+      "allOf": [
+        { "$ref": "#/$defs/control" },
+        { "properties": { "mode": { "const": "agent" } } }
+      ]
+    },
     "control": {
       "oneOf": [
         {
@@ -591,11 +597,22 @@
     "webConfigureConnectorPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tab_id", "name", "tunnel_id"],
+      "required": ["tab_id", "control", "name", "tunnel_id"],
       "properties": {
         "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/agentControl" },
         "name": { "type": "string", "minLength": 1 },
         "tunnel_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "webPlatformSetupPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab_id", "control", "action"],
+      "properties": {
+        "tab_id": { "$ref": "#/$defs/id" },
+        "control": { "$ref": "#/$defs/agentControl" },
+        "action": { "enum": ["inspect_tunnel", "create_tunnel"] }
       }
     },
     "updateControlPayload": {
@@ -1602,6 +1619,14 @@
           "properties": {
             "type": { "const": "web_configure_connector" },
             "payload": { "$ref": "#/$defs/webConfigureConnectorPayload" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "web_platform_setup" },
+            "payload": { "$ref": "#/$defs/webPlatformSetupPayload" }
           }
         },
         {

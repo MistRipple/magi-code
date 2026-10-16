@@ -112,6 +112,12 @@ app.whenReady().then(async () => {
   assert.equal(await guest.executeJavaScript('window.clicks'), 3);
   assert.equal(await win.webContents.executeJavaScript('host.value'), '');
   console.log('PASS native click exactly once; replace/append/clear in hidden, host-focused and offscreen guests');
+  await guest.executeJavaScript('window.selectionKeyups=0;text.onkeyup=()=>{window.selectionKeyups++;history.replaceState(null,"","?selection-keyup")};undefined');
+  success(await type('Text', 'native editing command'));
+  assert.equal(await guest.executeJavaScript('text.value'), 'native editing command');
+  assert.equal(await guest.executeJavaScript('window.selectionKeyups'), 0);
+  await guest.executeJavaScript('text.onkeyup=null;undefined');
+  console.log('PASS text selection uses native editing commands without unrelated keyup navigation');
   for (const name of ['Disabled', 'Blocked']) assert.equal((await click(name)).status, 'failed');
   assert.equal((await type('Readonly', 'x')).status, 'failed');
   assert.equal((await type('Limited', 'too long')).status, 'indeterminate');

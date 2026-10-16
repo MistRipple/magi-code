@@ -210,6 +210,17 @@ pub enum AppServerResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebModelSetupStatus {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub stage: String,
+    pub reason: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JsonRpcVersion {
     #[serde(rename = "2.0")]

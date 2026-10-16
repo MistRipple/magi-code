@@ -186,6 +186,17 @@ pub trait WebModelPageDriver: Send + Sync {
         })
     }
 
+    /// 平台窄配置命令，不返回正文或凭据。
+    fn platform_setup<'a>(&'a self, action: &'a str) -> DriverFuture<'a, serde_json::Value> {
+        let _ = action;
+        Box::pin(async {
+            Err(WebModelError::new(
+                WebModelErrorCode::WebTunnelUnavailable,
+                "平台配置驱动不可用",
+            ))
+        })
+    }
+
     /// `conversation_id=None` 表示创建新的已保存对话，返回的远端 id 由
     /// `read_saved_conversation` 提供；普通继续发送必须传稳定 id。
     fn open_saved_chat<'a>(

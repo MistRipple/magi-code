@@ -6,6 +6,12 @@ export interface UserMessageCommandMetadata {
   skillName?: unknown;
 }
 
+export const WEB_MODEL_SETUP_COMMAND_ID = 'plugin/openai.chatgpt-web/setup';
+
+export function isWebModelSetupCommand(metadata: UserMessageCommandMetadata | undefined): boolean {
+  return (metadata?.pluginCommandId ?? metadata?.['magi.pluginCommandId']) === WEB_MODEL_SETUP_COMMAND_ID;
+}
+
 /** 命令展示只读取本条消息的结构化身份，不依赖当前技能设置。 */
 export function resolveUserMessageCommandLabel(
   metadata: UserMessageCommandMetadata | undefined,

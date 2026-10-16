@@ -1,8 +1,24 @@
 import assert from 'node:assert/strict';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
+globalThis.$state = (value) => value;
+globalThis.$derived = (value) => value;
+
 await withGoldenViteServer(async (server) => {
   const actions = await server.ssrLoadModule('/src/web/web-model-actions.ts');
+  const setup = await server.ssrLoadModule('/src/web/web-model-setup.ts');
+  for (const stage of ['complete', 'cancelled', 'busy']) assert.equal(setup.setupIsActive({ stage }), false);
+  for (const stage of ['login', 'tunnel', 'credentials', 'connecting', 'connector', 'failed']) assert.equal(setup.setupIsActive({ stage }), true);
+  assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason: 'confirmation_required' }), true);
+  for (const reason of ['connector_write_started', 'connector_unconfirmed']) {
+    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), false, '未确认的写入只能回读');
+    assert.equal(setup.setupReasonKey(reason), 'webModel.setup.reason.connectorUnconfirmed');
+  }
+  assert.equal(setup.setupReasonKey('untrusted page text'), null);
+  const commands = await server.ssrLoadModule('/src/lib/user-message-command.ts');
+  assert.equal(commands.isWebModelSetupCommand({ pluginCommandId: setup.WEB_MODEL_SETUP_COMMAND }), true);
+  assert.equal(commands.isWebModelSetupCommand({ 'magi.pluginCommandId': setup.WEB_MODEL_SETUP_COMMAND }), true);
+  assert.equal(commands.isWebModelSetupCommand({ pluginCommandId: 'plugin/other/setup' }), false);
 
   // 设计基线 §12：每个错误码只映射到一个主行动；没有用户动作的码不出按钮。
   const expected = {
@@ -20,6 +36,7 @@ await withGoldenViteServer(async (server) => {
     web_turn_timeout: 'retry',
     web_quota_exhausted: 'switchModel',
     web_tunnel_unavailable: 'openTunnelSettings',
+    web_plugin_inactive: 'openPluginSettings',
   };
   for (const [code, kind] of Object.entries(expected)) {
     assert.equal(actions.webModelFailureAction(code)?.kind, kind, code);

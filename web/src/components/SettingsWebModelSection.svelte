@@ -8,6 +8,7 @@
    */
   import { onMount, tick } from 'svelte';
   import Icon from './Icon.svelte';
+  import { WEB_MODEL_SETUP_REQUEST } from '../web/web-model-setup';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
@@ -447,6 +448,13 @@
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
 <div class="settings-section web-model-section">
+  <div class="settings-card" data-web-model-setup-entry>
+    <div class="settings-row">
+      <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.setup.title')}</span><span class="settings-row-desc">{i18n.t('webModel.setup.entryHint')}</span></div>
+      <button class="btn btn--sm btn--primary" disabled={!isDesktop} onclick={() => window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST))}>{i18n.t('webModel.setup.start')}</button>
+    </div>
+  </div>
+
   <div class="settings-section-header">
     <div class="settings-section-title" id="web-model-title">{i18n.t('settings.browser.webModel.title')}</div>
     <div class="settings-section-actions">

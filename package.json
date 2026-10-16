@@ -21,6 +21,8 @@
     "test:electron-browser-permission-matrix": "node scripts/verify-electron-browser-permission-matrix.mjs",
     "test:electron-browser-network-policy": "node scripts/verify-electron-browser-network-policy.mjs",
     "test:electron-browser-actions": "node scripts/verify-electron-browser-actions.mjs",
+    "test:electron-cursor-presentation": "node scripts/verify-electron-cursor-presentation.mjs",
+    "test:electron-cursor-desktop-live": "node scripts/verify-electron-cursor-desktop-live.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
     "plugin:center": "node scripts/plugin-center.mjs",
     "plugin-center:build": "node scripts/build-plugin-center.mjs",

@@ -79,6 +79,31 @@
   },
   "$ref": "#/$defs/JsonRpcMessage",
   "$defs": {
+    "WebModelSetupStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "stage",
+        "reason",
+        "updatedAt"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
     "JsonRpcVersion": {
       "type": "string",
       "enum": [

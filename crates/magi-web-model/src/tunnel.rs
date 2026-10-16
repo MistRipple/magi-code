@@ -879,7 +879,8 @@ fn run_inventory_probe(client_binary: &Path) -> std::io::Result<std::process::Ou
     }
 }
 
-fn valid_tunnel_id(value: &str) -> bool {
+/// 平台 Tunnel id 的唯一格式校验；配置入口与运行时预检共用。
+pub fn valid_tunnel_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("tunnel_") else {
         return false;
     };

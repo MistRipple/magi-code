@@ -28,7 +28,7 @@
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import { resolveBrowserAnnotationArtifactUrl } from '../web/agent-api';
   import { inferConversationPresentationRole } from '../lib/conversation-presentation';
-  import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
+  import { isWebModelSetupCommand, resolveUserMessageCommandLabel } from '../lib/user-message-command';
   import { resolveConversationMessageText } from '../lib/conversation-disclosure';
 
   // Props
@@ -202,7 +202,10 @@
     return nonEmptyLines >= 3 || normalized.length >= 140;
   });
 
-  const userCommandLabel = $derived(resolveUserMessageCommandLabel(message.metadata));
+  const hideUserCommandContent = $derived(isUser && isWebModelSetupCommand(message.metadata));
+  const userCommandLabel = $derived(hideUserCommandContent
+    ? i18n.t(`webModel.setup.userAction.${['start', 'continue', 'confirm_connector', 'cancel'].includes(message.content?.trim()) ? message.content.trim() : 'start'}`)
+    : resolveUserMessageCommandLabel(message.metadata));
 
   function resolveBlockRenderKey(
     block: import('../types/message').ContentBlock,
@@ -215,9 +218,9 @@
   }
 
   const copyableText = $derived.by(() => {
-    const content = typeof message.content === 'string' ? message.content.trim() : '';
+    const content = hideUserCommandContent ? '' : (typeof message.content === 'string' ? message.content.trim() : '');
     if (isUser) {
-      const visibleUserText = [userCommandLabel, message.content]
+      const visibleUserText = [userCommandLabel, hideUserCommandContent ? '' : message.content]
         .filter((part) => part.trim().length > 0)
         .join(' ');
       if (visibleUserText) return visibleUserText;
@@ -558,7 +561,7 @@
             {#if userCommandLabel}
               <span class="user-command-text">{userCommandLabel}</span>
             {/if}
-            {#if message.content?.trim()}
+            {#if message.content?.trim() && !hideUserCommandContent}
               <MarkdownContent content={message.content} isStreaming={false} {filePreviewScope} />
             {/if}
           </div>

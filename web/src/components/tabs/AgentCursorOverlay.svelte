@@ -6,7 +6,8 @@
    * 使用 Popover Top Layer 并锚定到内容槽，尺寸与内容槽一致、整体不接收指针事件：
    * 用户在页面上的任何操作都直接落到网页，并照常触发接管。
    */
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
+  import type { BrowserAgentCursorPresentation, BrowserAgentCursorPresentationResult } from '@magi/desktop-browser-contracts';
   import { i18n } from '../../stores/i18n.svelte';
   import {
     AGENT_CURSOR_ACTION_HOLD_MILLIS,
@@ -25,6 +26,7 @@
     visible: boolean;
     point: AgentCursorPoint | null;
     action: AgentCursorAction | null;
+    presentation?: BrowserAgentCursorPresentation;
   }
 
   interface Props {
@@ -32,14 +34,18 @@
     signal: AgentCursorSignal | null;
     /** 宿主不可见（折叠、隐藏或后台离屏挂载）时不显示覆盖层。 */
     hostVisible: boolean;
+    onpresented?: (result: BrowserAgentCursorPresentationResult) => void;
   }
 
-  let { anchorName, signal, hostVisible }: Props = $props();
+  let { anchorName, signal, hostVisible, onpresented }: Props = $props();
 
   const PRESS_MILLIS = 140;
   const RIPPLE_MILLIS = 560;
 
   let layer = $state<HTMLDivElement | undefined>();
+  let cursorElement = $state<HTMLDivElement | undefined>();
+  let documentVisible = $state(true);
+  let pendingPresentation: BrowserAgentCursorPresentation | null = null;
   let layerWidth = $state(0);
   let layerHeight = $state(0);
   let point = $state<AgentCursorPoint | null>(null);
@@ -109,6 +115,7 @@
   }
 
   function hide(): void {
+    finishPresentation('interrupted');
     shown = false;
     point = null;
     labelAction = null;
@@ -122,6 +129,32 @@
     idleTimer = null;
   }
 
+  function finishPresentation(outcome: BrowserAgentCursorPresentationResult['outcome']): void {
+    const request = pendingPresentation;
+    pendingPresentation = null;
+    if (request) onpresented?.({ ...request, outcome });
+  }
+
+  async function present(request: BrowserAgentCursorPresentation): Promise<void> {
+    await tick();
+    if (pendingPresentation !== request) return;
+    if (!hostVisible || !documentVisible) { finishPresentation('hidden'); return; }
+    const element = cursorElement;
+    if (!element) { finishPresentation('interrupted'); return; }
+    // 强制结算本帧样式后等待真实 transform transition；减少动态效果时没有 transition。
+    getComputedStyle(element).transform;
+    try {
+      await Promise.all(element.getAnimations().filter(animation =>
+        animation instanceof CSSTransition && animation.transitionProperty === 'transform',
+      ).map(animation => animation.finished));
+      // 下一帧呈现落点后才向 Main 确认；Main 收到确认才允许原生点击/焦点输入。
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      if (pendingPresentation === request) finishPresentation('arrived');
+    } catch {
+      if (pendingPresentation === request) finishPresentation('interrupted');
+    }
+  }
+
   function apply(next: AgentCursorSignal): void {
     if (!next.visible || next.point === null) {
       hide();
@@ -129,18 +162,20 @@
     }
     const appearing = !shown;
     const previous = appearing ? null : point;
-    glideMillis = agentCursorGlideMillis(previous, next.point);
+    const stationary = isStationaryMove(previous, next.point);
+    const nextGlideMillis = agentCursorGlideMillis(previous, next.point);
+    // 取消后的同坐标请求可能仍在滑行；保留正在进行的过渡，等待实际到位。
+    if (previous?.x !== next.point.x || previous?.y !== next.point.y) glideMillis = nextGlideMillis;
     if (appearing) {
       shown = true;
       entering = true;
       later(() => { entering = false; }, 220);
     }
-    const stationary = isStationaryMove(previous, next.point);
     point = next.point;
     restartIdleTimer();
     if (next.action === 'click') {
       showLabel('click');
-      playClick(glideMillis);
+      playClick(nextGlideMillis);
     } else if (next.action === 'type' || next.action === 'scroll' || next.action === 'drag') {
       showLabel(next.action);
     } else if (!stationary) {
@@ -154,7 +189,12 @@
     const next = signal;
     if (!next || next.sequence === lastSequence) return;
     lastSequence = next.sequence;
+    if (next.presentation && pendingPresentation !== next.presentation) {
+      finishPresentation('interrupted');
+      pendingPresentation = next.presentation;
+    }
     apply(next);
+    if (next.presentation && pendingPresentation === next.presentation) void present(next.presentation);
   });
 
   $effect(() => {
@@ -163,7 +203,19 @@
     else layer.hidePopover?.();
   });
 
+  $effect(() => {
+    if (!hostVisible || !documentVisible) finishPresentation('hidden');
+  });
+
+  onMount(() => {
+    const changed = () => { documentVisible = !document.hidden; };
+    changed();
+    document.addEventListener('visibilitychange', changed);
+    return () => document.removeEventListener('visibilitychange', changed);
+  });
+
   onDestroy(() => {
+    finishPresentation('interrupted');
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
   });
@@ -181,6 +233,7 @@
   <div class="agent-cursor-frame"></div>
   {#if point}
     <div
+      bind:this={cursorElement}
       class="agent-cursor"
       class:entering
       class:idle

@@ -62,6 +62,14 @@
   } from '../shared/session-navigation.svelte';
   import WebModelModeChooser from './WebModelModeChooser.svelte';
   import WebModelSessionBanner from './WebModelSessionBanner.svelte';
+  import WebModelSetupPanel from './WebModelSetupPanel.svelte';
+  import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
+  import { WEB_MODEL_SETUP_COMMAND, WEB_MODEL_SETUP_REQUEST, setupIsActive, type SetupAction } from '../web/web-model-setup';
+  import { loadedPluginProjection } from '../stores/plugin-registry.svelte';
+  import { openSettings, closeSettings } from '../stores/shell-ui.svelte';
+  import { createAppBrowserSession } from '../web/agent-api';
+  import { projectWebModelAppSession } from '../web/web-model-session-projection';
+  import { activateWebModelTab, setRightPaneCollapsed } from '../stores/right-pane.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
   import { bindWebSavedConversation, materializeSession } from '../web/agent-api';
   import { canFetchModelList } from '../shared/model-governance';
@@ -198,6 +206,47 @@
 
   // 输入内容
   let inputValue = $state('');
+  let setupStatus = $state<WebModelSetupStatus | null>(null);
+  let setupSubmitting = $state(false);
+  let setupRequestId = $state<string | null>(null);
+
+  async function submitWebSetup(action: SetupAction): Promise<void> {
+    if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return;
+    const origin = `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`;
+    setupSubmitting = true;
+    try {
+      if (!isDesktopRuntime()) { addToast('warning', i18n.t('settings.browser.webModel.needDesktop')); return; }
+      const projection = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
+      if (!projection.manifests.some(manifest => manifest.id === 'openai.chatgpt-web')
+        || !projection.commands.some(command => command.id === WEB_MODEL_SETUP_COMMAND)) {
+        addToast('warning', i18n.t('webModel.setup.pluginRequired'));
+        openSettings('plugins');
+        return;
+      }
+      if (origin !== `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`) return;
+      const target = resolveSubmissionWorkspace();
+      const sessionId = await materializeDraftSession();
+      closeSettings();
+      await createAppBrowserSession();
+      await projectWebModelAppSession();
+      if (currentSessionId?.trim() !== sessionId) return;
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+      activateWebModelTab();
+      setupRequestId = generateId();
+      vscode.postMessage({ type: 'executeTask', text: action, requestId: setupRequestId,
+        sessionId, workspaceId: target?.workspaceId || '', workspacePath: target ? workspaceNavigationPath(target) : '',
+        pluginCommandId: WEB_MODEL_SETUP_COMMAND, accessProfile: selectedAccessProfile,
+      });
+    } catch (error) {
+      setupRequestId = null;
+      addToast('error', error instanceof Error ? error.message : i18n.t('webModel.setup.failed'));
+    } finally { setupSubmitting = false; }
+  }
+  onMount(() => {
+    const start = () => { void submitWebSetup('start'); };
+    window.addEventListener(WEB_MODEL_SETUP_REQUEST, start);
+    return () => window.removeEventListener(WEB_MODEL_SETUP_REQUEST, start);
+  });
 
   // 斜杠快捷引用：Goal 决定持续推进生命周期，Skill 决定本轮执行方法，两者可同时引用。
   let selectedGoalMode = $state(false);
@@ -484,8 +533,8 @@
   let webSendBlocked = $state(false);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0 || !mainModelReady
-    || (isDraftSession && isSending) || webSendBlocked
+    sessionInputLocked || isInteractionBlocking || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!mainModelReady && selectedPluginCommand?.pluginCommandId !== WEB_MODEL_SETUP_COMMAND && !setupIsActive(setupStatus))
+    || (isDraftSession && isSending) || (webSendBlocked && !setupIsActive(setupStatus))
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -1705,6 +1754,7 @@
       const detail = (event as CustomEvent<{ requestId?: unknown; status?: unknown }>).detail;
       const requestId = typeof detail?.requestId === 'string' ? detail.requestId.trim() : '';
       if (!requestId) return;
+      if (setupRequestId === requestId) setupRequestId = null;
       const draft = submittedComposerDrafts.get(requestId);
       submittedComposerDrafts.delete(requestId);
       if (detail.status !== 'failed' || !draft || !composerIsPristineForSubmissionRecovery()) return;
@@ -1854,6 +1904,33 @@
       await waitForPendingImageReads();
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
+      // 配置正在等待用户时，短回复作为明确的配置控制输入；不交给 GPT Web 回发。
+      if (setupIsActive(setupStatus)) {
+        if (/\bsk[-_][A-Za-z0-9_-]{8,}/u.test(normalizedContent)) {
+          addToast('warning', i18n.t('webModel.setup.secretHint'));
+          return;
+        }
+        const action: SetupAction | null = /^(?:继续|好了|已完成|完成了|continue|done)$/iu.test(normalizedContent)
+          ? 'continue' : /^(?:取消配置|结束配置|cancel)$/iu.test(normalizedContent) ? 'cancel' : null;
+        if (action && attachmentTotal === 0) { await submitWebSetup(action); inputValue = ''; return; }
+        if (!mainModelReady) {
+          addToast('info', i18n.t('webModel.setup.commandHint'));
+          return;
+        }
+      }
+
+      if (selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND) {
+        if (attachmentTotal > 0) { addToast('warning', i18n.t('webModel.setup.noAttachments')); return; }
+        if (normalizedContent && !/^(?:开始|start|继续|continue|取消配置|cancel)$/iu.test(normalizedContent)) {
+          addToast('warning', i18n.t('webModel.setup.commandHint')); return;
+        }
+        selectedPluginCommand = null;
+        await submitWebSetup(/^(?:取消配置|cancel)$/iu.test(normalizedContent) ? 'cancel'
+          : /^(?:继续|continue)$/iu.test(normalizedContent) ? 'continue' : 'start');
+        inputValue = '';
+        return;
+      }
+
       if (
         (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
         || sessionInputLocked
@@ -2899,6 +2976,7 @@
     </div>
   {/if}
   <GoalRunDrawers bind:count={drawersCount} />
+  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={isSending || setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={submitWebSetup} />
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="ia-wrapper"

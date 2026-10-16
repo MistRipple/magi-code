@@ -15,6 +15,7 @@
         "magi-desktop:activate-browser",
         "magi-desktop:register-browser-webview",
         "magi-desktop:update-browser-display-size",
+        "magi-desktop:complete-browser-agent-cursor",
         "magi-desktop:release-browser-webview",
         "magi-desktop:wait-for-browser-surface",
         "magi-desktop:activate-panel",
@@ -52,6 +53,7 @@
     { "$ref": "#/$defs/activateBrowser" },
     { "$ref": "#/$defs/registerBrowserWebview" },
     { "$ref": "#/$defs/updateBrowserDisplaySize" },
+    { "$ref": "#/$defs/completeBrowserAgentCursor" },
     { "$ref": "#/$defs/releaseBrowserWebview" },
     { "$ref": "#/$defs/waitForBrowserSurface" },
     { "$ref": "#/$defs/activatePanel" },
@@ -203,6 +205,26 @@
             "navigationRevision": { "type": "integer", "minimum": 0 },
             "webContentsId": { "type": "integer", "minimum": 1 },
             "displaySize": { "$ref": "#/$defs/browserDisplaySize" }
+          }
+        }
+      }
+    },
+    "completeBrowserAgentCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "payload"],
+      "properties": {
+        "channel": { "const": "magi-desktop:complete-browser-agent-cursor" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tab_id", "surface_id", "navigation_revision", "motionId", "outcome"],
+          "properties": {
+            "tab_id": { "$ref": "#/$defs/id" },
+            "surface_id": { "$ref": "#/$defs/id" },
+            "navigation_revision": { "type": "integer", "minimum": 0 },
+            "motionId": { "$ref": "#/$defs/id" },
+            "outcome": { "enum": ["arrived", "hidden", "interrupted"] }
           }
         }
       }

@@ -385,6 +385,10 @@
         requestWebModelSettings({ focus: 'tunnel' });
         return;
       }
+      case 'openPluginSettings': {
+        openSettings('plugins');
+        return;
+      }
       case 'openSettings': {
         openSettings();
         requestWebModelSettings({ focus: 'status' });
@@ -432,6 +436,7 @@
         navigationRevision: home.navigationRevision,
       };
       openWebModelTab(session.browserSessionId, homeHost);
+      setRightPaneCollapsed(paneScopeKey, false);
     } catch (error) {
       console.warn('[RightPane] 打开 GPT Web 视图失败:', error);
       addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
