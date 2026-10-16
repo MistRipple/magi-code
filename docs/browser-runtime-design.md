@@ -74,7 +74,7 @@ Electron BrowserWindow
 
 Desktop App Renderer 的 `BrowserTabContent.svelte` 在浏览器内容槽直接渲染一个 Electron `<webview>`：
 
-- `<webview>` 使用 `width: 100%`、`height: 100%`、`min-width: 0`、`min-height: 0`，由父级 flex/grid 自然布局；
+- `<webview>` 使用 `width: 100%`、`height: 100%`、`min-width: 0`、`min-height: 0` 填充 Renderer 画布；`auto` 画布填满内容槽，fixed 画布按 Main 投影的显示尺寸水平居中、顶部对齐；
 - Main 不创建用于显示网页的 `WebContentsView`，不调用网页页面的 `setBounds()`，不接收 `getBoundingClientRect()` 坐标；Renderer 只上报经严格校验的内容槽宽高；
 - `<webview>` guest 是真实 Chromium 页面，用户输入和 Agent CDP 输入到达同一个 `WebContents`；
 - 右栏菜单、标记选择、备注、标记历史、Tooltip、视口菜单和截图操作全部属于 App Renderer DOM；
@@ -199,7 +199,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 | Renderer 挂载 | 右栏把当前作用域的浏览器 Tab 与保留页面合并为**同一个按 `tabId` 键控的宿主列表**；不在当前作用域或当前不可见的保留页面离屏挂载（`translate3d(-20000px, 0, 0)`，保持真实布局尺寸以维持 guest 注册），会话切换只改变可见性，不卸载重建 `<webview>`。存在保留页面时右栏列即使折叠也保持后台挂载 |
 | 驱动路径 | 内容槽绑定有效时直接复用；否则只做后台物化（`ensureBrowserSurfaceInBackground`），等待 Renderer 依据快照注册离屏宿主，不附带激活意图 |
 | 释放 | 页面移出保留集合后回到 §4.2 的普通生命周期：不在当前作用域即卸载当前窗口 guest，Authority 逻辑 Tab/URL 保留 |
-| 代理光标 | Main 是光标位置与动作的唯一来源：在输入投递前于同一 Surface lane 内更新，按实际生效的设备画布 `scale` 换算为内容槽坐标并随 `agent_cursor` 事件发布。Renderer 用锚定内容槽的 Top Layer 覆盖层（`pointer-events: none`）绘制 Magi 光标、动作名牌、点击波纹和受控描边；页面 DOM 不注入任何元素，截图不包含光标，导航不打断光标。用户接管、控制撤销、Primary 切换或页面崩溃时光标隐藏 |
+| 代理光标 | Main 是光标位置与动作的唯一来源：在输入投递前于同一 Surface lane 内更新，按实际生效的设备画布 `scale` 换算为内容槽坐标并随 `agent_cursor` 事件发布。窗口快照提供当前光标事实以恢复展示，事件提供连续动作。Renderer 区分保留挂载与前台可见状态，用锚定内容槽的 Top Layer 覆盖层（`pointer-events: none`）绘制 Magi 光标、动作名牌、点击波纹和受控描边；页面 DOM 不注入任何元素，截图不包含光标，导航不打断光标。用户接管、控制撤销、Primary 切换或页面崩溃时光标隐藏 |
 
 ## 5. 导航、控制与恢复
 
@@ -265,7 +265,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 标记选择层、备注编辑器和标记历史是当前 Browser Tab 内容槽内的 Renderer DOM 浮层；它们不得占用右栏外框空间。坐标只允许按以下单向关系转换：
 
-- 内容槽局部坐标属于 Renderer。`auto` 下内容画布等于整个槽；fixed 下内容画布从槽左上角开始，尺寸为 `逻辑 viewport × Main 返回的 Chromium scale`，剩余区域是不可选择留白。
+- 内容槽局部坐标属于 Renderer。`auto` 下内容画布等于整个槽；fixed 下内容画布水平居中、顶部对齐，尺寸为 `逻辑 viewport × Main 返回的 Chromium scale`；真实 `<webview>` 与光标锚点均限定在该画布内，剩余区域是不可选择留白；当 fixed 画布小于内容槽时，Renderer 用不参与布局的 Top Layer 淡色描边标出真实网页边界；有留白的边缘提供调整宽、高和角落的拖动区域，复用现有自定义视口提交入口并保持设备类型与 DPR，网页内部仍直接交给 guest。
 - 页面 viewport CSS 坐标属于当前 Chromium 文档。Renderer 只把内容画布内位置归一化到 `0..1`；Worker 使用同一页面的 `innerWidth/innerHeight` 反算 CSS 坐标。
 - 文档坐标等于 viewport CSS 坐标加捕获时的 `scrollX/scrollY`。导航代次变化后，旧坐标、节点和截图请求必须拒绝。
 - 图片像素坐标使用真实截图输出宽高换算，天然包含 `devicePixelRatio`；不得用内容槽像素、窗口 DPR 或固定 1000 替代页面报告的 DPR。
@@ -315,9 +315,13 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 ## 6. 视口策略
 
-`auto` 是默认模式：不调用 `Emulation.setDeviceMetricsOverride`，真实 `<webview>` DOM 尺寸就是页面 viewport，Chromium 自己触发 resize、media query 和响应式布局。
+用户新建页面默认使用 `auto`；AI 工具创建的新页面默认使用固定电脑视口 `1280 × 800`。AI 首次取得已有 `auto` 页面控制权时，Main 读取 Chromium 当时的实际 CSS 宽高和 DPR 并固定视口，避免用户拖动右栏导致操作中的页面重排。释放控制权保留最终视口；用户从手机仿真切回电脑时恢复自适应。
 
-固定模式只属于当前 Browser Tab，使用 Chromium CDP `Emulation.setDeviceMetricsOverride`。产品提供两种快捷设备模式：手机窄屏、平板/电脑宽屏；自定义宽高直接作用于当前 Tab。Renderer 用 `ResizeObserver` 读取当前内容槽 CSS 宽高，Main 计算 `scale = min(1, 槽宽 / 逻辑宽, 槽高 / 逻辑高)` 并作为同一次设备指标提交的一部分，使完整设备画布始终容纳在内容槽内。输入和拖动过程合并到每个动画帧的最新尺寸，不刷新页面、不改右栏 bounds、不使用 CSS transform、不在宿主层缩放截图。切回 `auto` 必须调用 `Emulation.clearDeviceMetricsOverride`，内容槽尺寸变化不触发任何设备指标写入。
+`auto` 不调用 `Emulation.setDeviceMetricsOverride`，真实 `<webview>` DOM 尺寸就是页面 viewport，Chromium 自己触发 resize、media query 和响应式布局。
+
+固定模式只属于当前 Browser Tab，使用 Chromium CDP `Emulation.setDeviceMetricsOverride`。用户默认电脑自适应，导航栏只有一个设备图标切换手机仿真 / 电脑自适应；电脑模式不提供固定分辨率预设。进入手机仿真时使用当前内容槽的宽高（按合同上下限约束），不替换成固定手机或电脑尺寸。手机仿真在网页上方展示紧凑尺寸工具条，提供精选手机 CSS 视口尺寸和 DPR（iPhone SE、iPhone 12 / 13、iPhone 16、iPhone 16 Pro Max、Pixel 7），不模拟设备操作系统、浏览器内核或完整硬件能力；选择设备从竖屏开始，旋转保留设备名称，自定义输入或边框拖动偏离尺寸后显示“自定义尺寸”，匹配名称从当前尺寸与 DPR 推导、不另存设备身份。工具条在所有宽度保持单行；窄面板收窄设备选择框并截断过长型号名称，保留宽高、旋转和适应比例可见，`320px` 面板也能容纳；宽高以 CSS px 编辑，支持 Enter 提交、方向键每次 1px、Shift + 方向键每次 10px、Escape 撤销尚未提交的输入；非法尺寸显示范围提示，失焦恢复该维度最后生效值。旋转交换宽高并保留设备类型和 DPR，交换后超出合同范围时禁用。工具条显隐直接投影当前 Tab 的设备类型，不另存开关状态；切回电脑清除手机仿真并跟随面板。AI 工具仍可按既有合同设置电脑或手机的任意合法固定视口，用户入口不再提供固定电脑分辨率。尺寸修改保留当前设备类型与 DPR，只有显式设备选择才改变手机/电脑语义。`mobile` 同步 Chromium 移动布局与触控仿真，`desktop` 与 `auto` 清除触控仿真。Renderer 用 `ResizeObserver` 读取当前内容槽 CSS 宽高，Main 计算 `scale = min(1, 槽宽 / 逻辑宽, 槽高 / 逻辑高)` 并作为同一次设备指标提交的一部分，使完整设备画布始终容纳在内容槽内。Main 在每个 Surface 快照投影视口和缩放后的显示宽高；Renderer 用这份投影约束真实 guest 的 DOM 宽高，水平居中、顶部对齐，滚动只发生在设备画布内。完整内容槽尺寸仍是缩放输入，不能用缩小后的 guest 尺寸回写，否则会形成重复缩放。输入和拖动过程合并到每个动画帧的最新尺寸，不刷新页面、不改右栏 bounds、不使用 CSS transform、不在宿主层缩放截图。切回 `auto` 必须调用 `Emulation.clearDeviceMetricsOverride`，内容槽尺寸变化不触发任何设备指标写入。
+
+`browser_viewport` 的 get/set 均从同一个真实 guest 回读 `actual_viewport`（CSS 宽高、DPR、设备类型）和 `display_scale`。`viewport` 保留原合同：固定模式返回配置，自适应模式为 null；不得拿配置值代替实际生效的页面尺寸。导航栏设备图标的按下状态表示手机仿真，手机工具条显示可编辑宽高，只读「适应 · 百分比」从本 Tab 的显示投影计算预览比例，不将其误标为页面缩放或设备像素比。用户拖动右栏宽度或向网页点击、滚动、键盘输入时，复用 `user_takeover` 路径撤销 AI 控制、立即隐藏光标并切回 `auto` 跟随面板；普通悬停不触发接管。显式选择固定设备视口时保留用户的选择。后续工具不得覆盖，必须由用户交还，下一次 Agent 获取控制时固定当时的实际视口。后台 BrowserAuthority 投影不展开右栏、不切换用户选中的一级 Tab，显式点击仍沿 `revealTabId` 入口处理。
 
 浏览器页面缩放不另设第二套状态；当前产品只使用设备指标中的 `scale` 完整容纳 fixed 画布，页面 CSS viewport 和 `devicePixelRatio` 仍由 Chromium 返回。任何标记、点击、DOM 命中或截图都必须从当前 Surface 的同一份 viewport/scale/scroll/DPR 事实换算。
 
@@ -327,7 +331,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 - 网页内容槽是普通 DOM 子节点；菜单和 Tooltip 使用同一 Renderer 的 Popover Top Layer，并以当前 Tab 唯一 CSS anchor 定位，不能被 guest 视图遮住或越过非活动 Tab 生命周期。
 - App Renderer 绘制左栏、中栏和右栏的主题材质及壁纸；浏览器只消费内容槽，不创建独立背景或模糊层。
 - Desktop 使用隐藏原生标题栏和原生窗口按钮；App Renderer 的可拖动标题区复用工作台主题材质，Main 同步 Windows/Linux 窗口按钮的底色与明暗对比度。macOS 不另叠加系统 vibrancy 背景。
-- Agent 虚拟鼠标是页面隔离世界中 `pointer-events: none` 的装饰层，document 创建后重注入；任务结束时隐藏，但保留任务占用状态历史。
+- Agent 虚拟鼠标由 Renderer Top Layer 绘制（`pointer-events: none`），持有控制权期间持续显示，包括等待模型和导航；用户接管或控制权释放时立即隐藏。工具栏不显示 Agent/用户接管状态徽标，只在用户接管时显示紧凑的交还图标。右栏宽度足够时，截图、标记、元素选择和外部打开直接显示为图标操作；宽度不足时才收进“更多操作”菜单，窄面板同时隐藏视口尺寸标签以保留地址输入空间。操作菜单右对齐工具栏内边缘，宽度随内容收缩并受右栏宽度约束；图标与文字分别左对齐，长文案换行，长列表在菜单内滚动。
 - Chromium 启动参数禁止默认同步、组件网络更新、首跑提示和无关用户数据采集。浏览器 partition 仅使用 Magi 自己的状态目录，不读取用户系统浏览器资料。
 
 ## 8. Rust/TypeScript 协议

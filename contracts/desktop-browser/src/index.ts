@@ -647,6 +647,7 @@ export interface BrowserBinaryPayload {
 }
 
 export interface BrowserHitTest {
+  device_type?: BrowserDeviceType;
   navigation_revision: number;
   viewport_width: number;
   viewport_height: number;

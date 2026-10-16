@@ -36,7 +36,6 @@
 
   let { anchorName, signal, hostVisible }: Props = $props();
 
-  const LEAVE_MILLIS = 180;
   const PRESS_MILLIS = 140;
   const RIPPLE_MILLIS = 560;
 
@@ -46,7 +45,6 @@
   let point = $state<AgentCursorPoint | null>(null);
   let glideMillis = $state(0);
   let shown = $state(false);
-  let leaving = $state(false);
   let entering = $state(false);
   let pressing = $state(false);
   let idle = $state(false);
@@ -58,7 +56,6 @@
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let labelTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  let leaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   const active = $derived(shown && hostVisible);
   const placement = $derived(
@@ -112,20 +109,17 @@
   }
 
   function hide(): void {
-    if (!shown || leaving) return;
-    leaving = true;
+    shown = false;
+    point = null;
     labelAction = null;
     idle = false;
-    labelTimer = cancel(labelTimer);
-    idleTimer = cancel(idleTimer);
-    leaveTimer = cancel(leaveTimer);
-    leaveTimer = later(() => {
-      leaveTimer = null;
-      leaving = false;
-      shown = false;
-      point = null;
-      ripples = [];
-    }, LEAVE_MILLIS);
+    pressing = false;
+    entering = false;
+    ripples = [];
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
+    labelTimer = null;
+    idleTimer = null;
   }
 
   function apply(next: AgentCursorSignal): void {
@@ -133,11 +127,9 @@
       hide();
       return;
     }
-    leaveTimer = cancel(leaveTimer);
-    const appearing = !shown || leaving;
+    const appearing = !shown;
     const previous = appearing ? null : point;
     glideMillis = agentCursorGlideMillis(previous, next.point);
-    leaving = false;
     if (appearing) {
       shown = true;
       entering = true;
@@ -182,7 +174,6 @@
   bind:clientWidth={layerWidth}
   bind:clientHeight={layerHeight}
   class="agent-cursor-layer"
-  class:leaving
   style:position-anchor={anchorName}
   popover="manual"
   aria-hidden="true"
@@ -237,9 +228,7 @@
     color: inherit;
     pointer-events: none;
     opacity: 1;
-    transition: opacity 180ms ease-out;
   }
-  .agent-cursor-layer.leaving { opacity: 0; }
 
   /* 受控期间沿内容槽内侧的一圈描边，提示整页正由 Magi 操作。 */
   .agent-cursor-frame {

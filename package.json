@@ -36,6 +36,7 @@
     "browser-network-policy:check": "node scripts/generate-browser-network-policy.mjs --check",
     "docs:architecture": "node scripts/render-crate-architecture.mjs",
     "docs:architecture:check": "node scripts/render-crate-architecture.mjs --check",
+    "test:electron-browser-viewport": "node scripts/verify-electron-browser-viewport.mjs",
     "test:electron-right-pane-links": "node scripts/verify-electron-right-pane-links.mjs"
   },
   "engines": {

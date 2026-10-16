@@ -2637,7 +2637,7 @@ async fn create_annotation(
         width: hit.viewport_width,
         height: hit.viewport_height,
         device_scale_factor_millis: hit.device_scale_factor_millis,
-        device_type: magi_browser_authority::BrowserDeviceType::for_dimensions(hit.viewport_width),
+        device_type: hit.device_type,
     };
     let anchor = match region {
         Some(rect) => BrowserAnnotationAnchor::Region(BrowserRegionAnnotationAnchor {

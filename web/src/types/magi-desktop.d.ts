@@ -37,6 +37,9 @@ interface MagiDesktopBrowserSurfaceSnapshot {
   navigationRevision: number;
   /** 代理正在使用该页面：不可见时也必须保持挂载（离屏），不得卸载 guest。 */
   retainedForAgent: boolean;
+  viewport: MagiDesktopLogicalViewport;
+  displayViewport: MagiDesktopBrowserDisplaySize | null;
+  agentCursor: { visible: boolean; displayX: number | null; displayY: number | null; action: string | null };
 }
 
 interface MagiDesktopWindowSnapshot {

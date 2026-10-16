@@ -1092,7 +1092,6 @@ export function synchronizeBrowserTabs(
   const pane = ensureSession(scopeKey);
   pane.browserAuthoritySynchronized = true;
   const previousActiveTabId = pane.activeTabId;
-  const hadBrowserProjection = pane.openTabs.some((tab) => tab.kind === 'browser');
   const rawAuthorityTabs = (snapshot?.tabs ?? []).filter((tab) => tab.tabId.trim());
   const rawAuthorityTabsById = new Map(
     rawAuthorityTabs.map((tab) => [tab.tabId.trim(), tab.lifecycle]),
@@ -1172,18 +1171,8 @@ export function synchronizeBrowserTabs(
     ? pane.openTabs.find((tab) => tab.id === previousActiveTabId) ?? null
     : null;
   const previousActiveStillExists = previousActiveTab !== null;
-  const pendingIntent = pendingDesktopPanelIntent;
-  const pendingBrowserIntent = pendingIntent?.scopeKey === scopeKey
-    && pendingIntent.kind === 'browser'
-    && pane.openTabs.some((tab) => tab.id === `browser:${browserSessionId}:${pendingIntent.tabId}`);
-
-  // 浏览器快照的 activeTabId 是物理 Chromium Surface 正在展示的页面。
-  // 只有用户尚未发出新的 Browser 激活意图时，才允许它收敛当前 Browser
-  // Tab；Code/Terminal 等非浏览器一级 Tab 仍由 RightPane 自己保持。
-  if (
-    previousActiveStillExists
-      && (previousActiveTab.kind !== 'browser' || pendingBrowserIntent || !authorityActivePaneId)
-  ) {
+  // Authority 的活动页面用于工具路由，不代表用户切换右栏的意图。
+  if (previousActiveStillExists) {
     pane.activeTabId = previousActiveTabId;
     return;
   }
@@ -1193,12 +1182,6 @@ export function synchronizeBrowserTabs(
       && pane.openTabs.some((tab) => tab.id === authorityActivePaneId)
   ) {
     pane.activeTabId = authorityActivePaneId;
-    if (!hadBrowserProjection) pane.collapsed = false;
-    return;
-  }
-
-  if (previousActiveStillExists) {
-    pane.activeTabId = previousActiveTabId;
     return;
   }
 
@@ -1213,10 +1196,6 @@ export function synchronizeBrowserTabs(
     && pane.openTabs.some((tab) => tab.id === firstAuthorityPaneId)
   ) {
     pane.activeTabId = firstAuthorityPaneId;
-    // Browser Tab 不写入前端存储。首次从 BrowserAuthority 恢复时，
-    // 右栏状态仍是空面板的 collapsed=true，必须把权威存在的 Browser
-    // Tab 投影为可见面板；已有本地 active Tab 或用户手动折叠时不抢占。
-    if (!hadBrowserProjection) pane.collapsed = false;
     return;
   }
 

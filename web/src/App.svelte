@@ -194,9 +194,6 @@
         return;
       }
       const eventType = detail?.eventType?.trim() || '';
-      const createdTabId = typeof detail?.payload?.tab_id === 'string'
-        ? detail.payload.tab_id.trim()
-        : '';
       if (
         eventType === 'browser.tab.activation_requested'
         || eventType === 'browser.tab.activated'
@@ -225,9 +222,7 @@
             : '');
         removeBrowserTabProjection(workspaceId, sessionId, browserSessionId, closedTabId);
       }
-      void synchronizeCurrentBrowserAuthority(
-        eventType === 'browser.tab.created' ? createdTabId : '',
-      );
+      void synchronizeCurrentBrowserAuthority();
     };
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     window.addEventListener(

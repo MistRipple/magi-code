@@ -198,7 +198,7 @@ if (singleInstance) {
         onDocumentReady: (binding) => {
           control?.handleSurfaceDocumentReady(binding);
         },
-        onAgentRetentionChanged: () => windowManager?.publishSnapshots(),
+        onRuntimeStateChanged: () => windowManager?.publishSnapshots(),
         partitionRegistryPath: join(
           app.getPath("userData"),
           "browser-partitions.json",

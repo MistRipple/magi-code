@@ -83,6 +83,11 @@ export interface BrowserSurfaceRuntimeSnapshot {
    * 不随会话切换、右栏折叠或当前 Tab 切换而卸载。
    */
   retainedForAgent: boolean;
+  viewport: BrowserLogicalViewport;
+  /** 当前 guest 对应的固定设备画布显示尺寸；auto 使用自然布局。 */
+  displayViewport: BrowserDisplaySize | null;
+  /** 当前物理控制光标，供重新显示/挂载的 Renderer 恢复；坐标为内容槽 CSS 像素（相对于 guest 画布）。 */
+  agentCursor: { visible: boolean; displayX: number | null; displayY: number | null; action: string | null };
 }
 
 export interface BrowserDownloadRuntimeSnapshot {
@@ -701,7 +706,7 @@ export class BrowserSurfaceManager {
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
   // 代理需要在后台保持挂载的逻辑 Tab；代理控制释放、用户接管或页面关闭时移除。
   readonly #agentRetainedTabs = new Set<string>();
-  readonly #onAgentRetentionChanged: (() => void) | undefined;
+  readonly #onRuntimeStateChanged: (() => void) | undefined;
   readonly #configuredPartitions = new Set<string>();
   readonly #knownPartitions = new Set<string>();
   readonly #partitionRegistryPath: string | null;
@@ -723,13 +728,13 @@ export class BrowserSurfaceManager {
     desktopEpoch: string;
     onEvent: (event: BrowserSurfaceEvent) => void;
     onDocumentReady?: (binding: BrowserSurfaceBinding) => void;
-    /** 代理保留集合变化：窗口快照需要重新发布，让 Renderer 及时挂载或释放后台宿主。 */
-    onAgentRetentionChanged?: () => void;
+    /** 视口或代理保留状态变化后重发窗口快照，不修改窗口布局。 */
+    onRuntimeStateChanged?: () => void;
     partitionRegistryPath?: string;
   }) {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
-    this.#onAgentRetentionChanged = input.onAgentRetentionChanged;
+    this.#onRuntimeStateChanged = input.onRuntimeStateChanged;
     this.#onDocumentReady = input.onDocumentReady;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
     this.#downloadUserDataPath = this.#partitionRegistryPath
@@ -1087,7 +1092,7 @@ export class BrowserSurfaceManager {
    * `<webview>` 注册必须先知道 `tabId → surfaceId + navigationRevision`，因此
    * 这里按窗口投影一份只读清单，让应用级内容槽能在不激活右栏的前提下完成注册。
    *
-   * 只包含逻辑身份字段：不返回 WebContents、partition 或任何页面内容。
+   * 包含身份与光标展示事实，不返回 WebContents、partition 或页面内容。
    */
   browserSurfaceSnapshotsForWindow(
     windowId: string,
@@ -1099,13 +1104,26 @@ export class BrowserSurfaceManager {
           !record.closed &&
           this.#surfaces.isPrimary(record),
       )
-      .map((record) => ({
-        tabId: record.tabId,
-        browserSessionId: record.browserSessionId,
-        surfaceId: record.surfaceId,
-        navigationRevision: record.navigationRevision,
-        retainedForAgent: this.#agentRetainedTabs.has(record.tabId),
-      }));
+      .map((record) => {
+        const scale = this.displayMetricsForSurface(record.surfaceId)?.scale;
+        return {
+          tabId: record.tabId,
+          browserSessionId: record.browserSessionId,
+          surfaceId: record.surfaceId,
+          navigationRevision: record.navigationRevision,
+          retainedForAgent: this.#agentRetainedTabs.has(record.tabId),
+          viewport: structuredClone(record.viewport),
+          displayViewport: record.viewport.mode === "fixed" && scale !== undefined
+            ? { width: record.viewport.width * scale, height: record.viewport.height * scale }
+            : null,
+          agentCursor: {
+            visible: record.agentControlled && record.cursor.visible,
+            displayX: record.cursor.x === null ? null : record.cursor.x * (record.viewportLifecycle.applied?.scale ?? 1),
+            displayY: record.cursor.y === null ? null : record.cursor.y * (record.viewportLifecycle.applied?.scale ?? 1),
+            action: record.cursor.action,
+          },
+        };
+      });
   }
 
   /** 代理正在使用该 Tab：要求 Renderer 在它不可见时也保持 guest 挂载。 */
@@ -1120,7 +1138,7 @@ export class BrowserSurfaceManager {
     if (!changed) return;
     if (retained) this.#agentRetainedTabs.add(tabId);
     else this.#agentRetainedTabs.delete(tabId);
-    this.#onAgentRetentionChanged?.();
+    this.#onRuntimeStateChanged?.();
   }
 
   browserDownloadSnapshotsForWindow(
@@ -1280,18 +1298,10 @@ export class BrowserSurfaceManager {
     );
   }
 
-  viewportStateForSurface(
-    surfaceId: string | null,
-  ): { viewport: BrowserLogicalViewport } | null {
+  viewportForSurface(surfaceId: string | null): BrowserLogicalViewport | null {
     if (!surfaceId) return null;
     const record = this.#surfaces.get(surfaceId);
-    return record && !record.closed
-      ? { viewport: structuredClone(record.viewport) }
-      : null;
-  }
-
-  viewportForSurface(surfaceId: string | null): BrowserLogicalViewport | null {
-    return this.viewportStateForSurface(surfaceId)?.viewport ?? null;
+    return record && !record.closed ? structuredClone(record.viewport) : null;
   }
 
   displayMetricsForSurface(surfaceId: string | null): {
@@ -1934,6 +1944,7 @@ export class BrowserSurfaceManager {
         commit.state = "ready";
         if (!this.isViewportCommitInputCurrent(record, commit)) continue;
         commit.resolve();
+        this.#onRuntimeStateChanged?.();
         if (record.agentControlled) {
           this.setAgentCursor(
             record,
@@ -2112,22 +2123,50 @@ export class BrowserSurfaceManager {
     return this.pageState(record);
   }
 
+  async readViewport(binding: BrowserSurfaceBinding) {
+    const record = this.requireRecord(binding.surface_id);
+    const result = await this.sendCdp(binding, "Runtime.evaluate", {
+      expression: "({ width: innerWidth, height: innerHeight, device_scale_factor_millis: Math.round(devicePixelRatio * 1000) })",
+      returnByValue: true,
+    }) as { result?: { value?: { width?: number; height?: number; device_scale_factor_millis?: number } } };
+    this.assertRenderableBinding(binding);
+    const actual = result.result?.value;
+    if (!actual || !Number.isSafeInteger(actual.width) || !Number.isSafeInteger(actual.height)
+      || actual.width! <= 0 || actual.height! <= 0
+      || !Number.isSafeInteger(actual.device_scale_factor_millis) || actual.device_scale_factor_millis! <= 0) {
+      throw new Error("browser_viewport_unavailable");
+    }
+    return {
+      viewport: structuredClone(record.viewport),
+      actual_viewport: {
+        width: actual.width!,
+        height: actual.height!,
+        device_scale_factor_millis: actual.device_scale_factor_millis!,
+        device_type: record.viewport.mode === "fixed" ? record.viewport.device_type : "desktop" as const,
+      },
+      display_scale: record.viewportLifecycle.applied?.scale ?? 1,
+    };
+  }
+
   async setViewport(
     binding: BrowserSurfaceBinding,
     viewport: BrowserLogicalViewport,
+    userInitiated = false,
   ): Promise<void> {
     const record = this.requireRecord(binding.surface_id);
+    this.assertRenderableBinding(binding);
+    if (userInitiated) this.releaseAgentControlForUserInput(record, false);
     await this.waitForDebugger(record);
     this.assertRenderableBinding(binding);
+    if (!userInitiated && !record.agentControlled) throw new Error("browser_user_control_held");
     record.viewport = viewport;
-    const contents = this.requireContents(record);
-    if (contents.isLoadingMainFrame()) return;
     // 显式提交即使与宿主记录相同，也必须重新写入当前 Chromium session。
     // 这使调用方可以校正外部调试动作造成的实际状态漂移，宿主缓存只用于
     // 合并内部重复生命周期事件，不能替代浏览器事实。
     this.scheduleViewportCommit(record, true);
     await this.waitForViewportCommit(record);
     this.assertRenderableBinding(binding);
+    if (!userInitiated && !record.agentControlled) throw new Error("browser_user_control_held");
   }
 
   async updateControl(
@@ -2140,7 +2179,13 @@ export class BrowserSurfaceManager {
       throw staleSurfaceError("browser_surface_stale");
     }
     const record = this.requireRecord(surfaceId);
+    const acquiring = control.mode === "agent" && !record.agentControlled;
     record.agentControlled = control.mode === "agent";
+    if (acquiring && record.viewport.mode === "auto") {
+      const state = await this.readViewport(binding);
+      if (!record.agentControlled) throw new Error("browser_user_control_held");
+      await this.setViewport(binding, { mode: "fixed", ...state.actual_viewport });
+    }
     if (!record.agentControlled) this.setAgentRetained(tabId, false);
     this.setAgentCursor(
       record,
@@ -2766,9 +2811,11 @@ export class BrowserSurfaceManager {
     })();
   }
 
-  private initialAgentCursorPosition(
+  private agentCursorPosition(
     record: BrowserSurfaceRecord,
-  ): { x: number; y: number } | null {
+    x: number | null,
+    y: number | null,
+  ): { x: number; y: number } {
     const width =
       record.viewport.mode === "fixed"
         ? record.viewport.width
@@ -2777,12 +2824,11 @@ export class BrowserSurfaceManager {
       record.viewport.mode === "fixed"
         ? record.viewport.height
         : (record.displaySize?.height ?? 240);
-    const inset = 18;
     const clamp = (value: number, limit: number): number =>
-      Math.max(0, Math.min(Math.max(0, limit - inset), value));
+      Math.max(0, Math.min(Math.max(0, limit - 1), value));
     return {
-      x: clamp(Math.round(width / 2), width),
-      y: clamp(Math.round(height / 2), height),
+      x: clamp(x ?? Math.round(width / 2), width),
+      y: clamp(y ?? Math.round(height / 2), height),
     };
   }
 
@@ -5053,7 +5099,7 @@ export class BrowserSurfaceManager {
       if (
         // 普通浏览模式下的真实输入才表示用户接管；节点选择已在上方
         // 单独消费，不得改变 Browser Tab 的控制权状态。
-        !["mouseMove", "mouseDown", "contextMenu", "mouseWheel"].includes(
+        !["mouseDown", "contextMenu", "mouseWheel"].includes(
           input.type,
         )
       )
@@ -5076,19 +5122,23 @@ export class BrowserSurfaceManager {
     });
   }
 
-  /**
-   * 用户输入只在 AI 当前持有控制权时产生接管事件。
-   *
-   * 普通浏览模式下 Chromium 会为一次移动连续派发大量 mouseMove；如果
-   * 每次都广播 user_takeover，daemon 会重复撤销同一租约并把无意义事件
-   * 写入 SSE，最终拖慢右栏状态同步。接管动作在第一次真实输入时立即
-   * 收敛本地控制状态，后续输入只保留 Chromium 的原生交互。
-   */
-  private releaseAgentControlForUserInput(record: BrowserSurfaceRecord): void {
+  /** 显式拖动右栏与网页输入共用接管入口；自动窗口布局变化不触发。 */
+  takeUserControlInWindow(windowId: string, tabId: string): void {
+    const record = this.#surfaces.forWindowTab(windowId, tabId);
+    if (record && this.#surfaces.isPrimary(record)) this.releaseAgentControlForUserInput(record);
+  }
+
+  // 接管只在首次介入 AI 控制时发布；后续原生交互不重复撤销租约。
+  private releaseAgentControlForUserInput(record: BrowserSurfaceRecord, followPanel = true): void {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
-    this.setAgentRetained(record.tabId, false);
     this.setAgentCursor(record, false, null, null, null);
+    // 只有介入 AI 控制才自动恢复响应式；用户显式选固定设备时保留其选择。
+    if (followPanel && record.viewport.mode === "fixed") {
+      record.viewport = { mode: "auto" };
+      this.scheduleViewportCommit(record, true);
+    }
+    this.setAgentRetained(record.tabId, false);
     this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
   }
 
@@ -5759,6 +5809,8 @@ export class BrowserSurfaceManager {
       if (record.viewportLifecycle.current !== commit) {
         throw staleSurfaceError("browser_viewport_commit_stale");
       }
+      await this.sendSurfaceCdpCommand(record, "Emulation.setTouchEmulationEnabled", { enabled: false },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS, lease, track, commit.abort.signal);
       lifecycle.deviceMetricsOverrideActive = false;
       lifecycle.applied = {
         viewport: structuredClone(commit.viewport),
@@ -5821,6 +5873,8 @@ export class BrowserSurfaceManager {
       track,
       commit.abort.signal,
     );
+    await this.sendSurfaceCdpCommand(record, "Emulation.setTouchEmulationEnabled", { enabled: mobile, maxTouchPoints: mobile ? 5 : 1 },
+      DEFAULT_CDP_COMMAND_TIMEOUT_MS, lease, track, commit.abort.signal);
     if (record.viewportLifecycle.current !== commit) {
       throw staleSurfaceError("browser_viewport_commit_stale");
     }
@@ -5836,7 +5890,7 @@ export class BrowserSurfaceManager {
 
   /**
    * 代理光标是宿主侧的展示状态：Main 记录页面 CSS 坐标，按当前实际生效的设备
-   * 画布缩放换算成内容槽坐标后发布，由 Renderer 在 `<webview>` 上方绘制。
+   * 画布缩放换算成 guest 画布坐标后发布，由 Renderer 在 `<webview>` 上方绘制。
    * 页面 DOM 不注入任何元素，截图也不包含光标；导航不会打断光标。
    */
   private setAgentCursor(
@@ -5849,12 +5903,12 @@ export class BrowserSurfaceManager {
     const contents = record.contents;
     if (record.closed || !contents || contents.isDestroyed()) return;
     const position =
-      visible && (x === null || y === null)
-        ? (this.initialAgentCursorPosition(record) ?? { x: null, y: null })
+      visible
+        ? this.agentCursorPosition(record, x, y)
         : { x, y };
     record.cursor = { visible, ...position, action };
-    // 固定设备视口由 Chromium 按 scale 缩放并贴齐内容槽左上角；响应式视口
-    // 的页面 CSS 像素与内容槽像素一致。以实际下发的 scale 为准，不重新推算。
+    // 坐标相对于 guest 画布；Renderer 将整个画布与光标锚点一起居中。
+    // 响应式视口的页面 CSS 像素与画布像素一致。以实际下发的 scale 为准。
     const scale = record.viewportLifecycle.applied?.scale ?? 1;
     this.#onEvent({
       type: "agent_cursor",

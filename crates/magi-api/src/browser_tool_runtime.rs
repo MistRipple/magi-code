@@ -282,61 +282,7 @@ impl BrowserToolRuntimeDependencies {
                         })
                         .await
                         .map_err(browser_host_client_error)?;
-                    let BrowserHostCommandResult::Json { value } =
-                        succeeded_result(reply.response.outcome, "读取浏览器页面视口失败")?
-                    else {
-                        return Err(BrowserToolError::new(
-                            "browser_result_invalid",
-                            "浏览器页面视口返回结果无效",
-                        ));
-                    };
-                    let logical_viewport = value
-                        .get("viewport")
-                        .cloned()
-                        .ok_or_else(|| {
-                            BrowserToolError::new(
-                                "browser_result_invalid",
-                                "浏览器页面视口缺少运行态视口信息",
-                            )
-                        })
-                        .and_then(|viewport| {
-                            serde_json::from_value::<
-                                magi_browser_authority::BrowserLogicalViewport,
-                            >(viewport)
-                            .map_err(|error| {
-                                BrowserToolError::new(
-                                    "browser_result_invalid",
-                                    format!("浏览器页面视口信息无效: {error}"),
-                                )
-                            })
-                        })?;
-                    let (mode, viewport) = match logical_viewport {
-                        magi_browser_authority::BrowserLogicalViewport::Auto => {
-                            (BrowserViewportMode::Auto, Value::Null)
-                        }
-                        magi_browser_authority::BrowserLogicalViewport::Fixed {
-                            width,
-                            height,
-                            device_scale_factor_millis,
-                            device_type,
-                        } => (
-                            BrowserViewportMode::Fixed,
-                            json!(BrowserViewport {
-                                width,
-                                height,
-                                device_scale_factor_millis,
-                                device_type,
-                            }),
-                        ),
-                    };
-                    return Ok(json!({
-                        "tool": tool_name,
-                        "status": "succeeded",
-                        "tab_id": tab.tab_id,
-                        "mode": mode,
-                        "viewport": viewport,
-                    })
-                    .to_string());
+                    return viewport_tool_result(tool_name, &tab.tab_id, reply.response.outcome);
                 }
                 if action != "set" {
                     return Err(BrowserToolError::new(
@@ -351,6 +297,8 @@ impl BrowserToolRuntimeDependencies {
                     ));
                 };
                 if mode == "auto" {
+                    self.prepare_agent_write(&client, &browser_session, &tab, scope)
+                        .await?;
                     let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
                     let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
                     let reply = client
@@ -360,15 +308,7 @@ impl BrowserToolRuntimeDependencies {
                         })
                         .await
                         .map_err(browser_host_client_error)?;
-                    succeeded_result(reply.response.outcome, "恢复浏览器页面自适应视口失败")?;
-                    return Ok(json!({
-                        "tool": tool_name,
-                        "status": "succeeded",
-                        "tab_id": tab.tab_id,
-                        "mode": BrowserViewportMode::Auto,
-                        "viewport": Value::Null,
-                    })
-                    .to_string());
+                    return viewport_tool_result(tool_name, &tab.tab_id, reply.response.outcome);
                 }
                 if mode != "fixed" {
                     return Err(BrowserToolError::new(
@@ -385,25 +325,19 @@ impl BrowserToolRuntimeDependencies {
                     .transpose()?
                     .unwrap_or(1_000);
                 validate_device_scale_factor(device_scale_factor_millis)?;
-                let requested_device_type =
-                    match optional_string(arguments, "device_type").as_deref() {
-                        Some("desktop") => Some(BrowserDeviceType::Desktop),
-                        Some("mobile") => Some(BrowserDeviceType::Mobile),
-                        Some(_) => {
-                            return Err(BrowserToolError::new(
-                                "browser_device_type_invalid",
-                                "device_type 必须是 desktop 或 mobile",
-                            ));
-                        }
-                        None => None,
-                    };
-                let device_type = BrowserDeviceType::for_dimensions(width);
-                if requested_device_type.is_some_and(|requested| requested != device_type) {
-                    return Err(BrowserToolError::new(
-                        "browser_device_type_mismatch",
-                        "device_type 与 width 不一致：320-600 必须为 mobile，601 以上必须为 desktop",
-                    ));
-                }
+                let device_type = match optional_string(arguments, "device_type").as_deref() {
+                    Some("desktop") => BrowserDeviceType::Desktop,
+                    Some("mobile") => BrowserDeviceType::Mobile,
+                    Some(_) => {
+                        return Err(BrowserToolError::new(
+                            "browser_device_type_invalid",
+                            "device_type 必须是 desktop 或 mobile",
+                        ));
+                    }
+                    None => BrowserDeviceType::Desktop,
+                };
+                self.prepare_agent_write(&client, &browser_session, &tab, scope)
+                    .await?;
                 let _control_guard = self.control_locks.lock_tab(&tab.tab_id).await;
                 let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
                 let viewport = BrowserViewport {
@@ -424,15 +358,7 @@ impl BrowserToolRuntimeDependencies {
                     })
                     .await
                     .map_err(browser_host_client_error)?;
-                succeeded_result(reply.response.outcome, "调整浏览器页面视口失败")?;
-                Ok(json!({
-                    "tool": tool_name,
-                    "status": "succeeded",
-                    "tab_id": tab.tab_id,
-                    "mode": BrowserViewportMode::Fixed,
-                    "viewport": viewport,
-                })
-                .to_string())
+                viewport_tool_result(tool_name, &tab.tab_id, reply.response.outcome)
             }
             "browser_navigate" => {
                 let navigation = navigation
@@ -930,7 +856,12 @@ impl BrowserToolRuntimeDependencies {
                 tab_id: tab_id.clone(),
                 browser_session_id: session.browser_session_id.clone(),
                 initial_url,
-                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Fixed {
+                    width: 1280,
+                    height: 800,
+                    device_scale_factor_millis: 1000,
+                    device_type: BrowserDeviceType::Desktop,
+                },
                 navigation_revision: 0,
                 snapshot_revision: 0,
                 allow_page_eviction: false,
@@ -2334,6 +2265,61 @@ fn u32_arg(arguments: &Map<String, Value>, name: &str) -> Result<u32, BrowserToo
     Ok(value)
 }
 
+fn viewport_tool_result(
+    tool_name: &str,
+    tab_id: &BrowserTabId,
+    outcome: BrowserHostCommandOutcome,
+) -> Result<String, BrowserToolError> {
+    let BrowserHostCommandResult::Json { value } =
+        succeeded_result(outcome, "读取实际浏览器视口失败")?
+    else {
+        return Err(BrowserToolError::new(
+            "browser_result_invalid",
+            "浏览器视口结果无效",
+        ));
+    };
+    let logical: magi_browser_authority::BrowserLogicalViewport =
+        serde_json::from_value(value["viewport"].clone())
+            .map_err(|e| BrowserToolError::new("browser_result_invalid", e.to_string()))?;
+    let actual: BrowserViewport = serde_json::from_value(value["actual_viewport"].clone())
+        .map_err(|e| BrowserToolError::new("browser_result_invalid", e.to_string()))?;
+    let display_scale = value["display_scale"]
+        .as_f64()
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .ok_or_else(|| BrowserToolError::new("browser_result_invalid", "缺少实际视口显示比例"))?;
+    if actual.width == 0 || actual.height == 0 || actual.device_scale_factor_millis == 0 {
+        return Err(BrowserToolError::new(
+            "browser_result_invalid",
+            "实际视口尺寸无效",
+        ));
+    }
+    let (mode, viewport) = match logical {
+        magi_browser_authority::BrowserLogicalViewport::Auto => {
+            (BrowserViewportMode::Auto, Value::Null)
+        }
+        magi_browser_authority::BrowserLogicalViewport::Fixed {
+            width,
+            height,
+            device_scale_factor_millis,
+            device_type,
+        } => (
+            BrowserViewportMode::Fixed,
+            json!(BrowserViewport {
+                width,
+                height,
+                device_scale_factor_millis,
+                device_type
+            }),
+        ),
+    };
+    Ok(json!({
+        "tool": tool_name, "status": "succeeded", "tab_id": tab_id,
+        "mode": mode, "viewport": viewport, "actual_viewport": actual,
+        "display_scale": display_scale,
+    })
+    .to_string())
+}
+
 fn validate_viewport_dimensions(width: u32, height: u32) -> Result<(), BrowserToolError> {
     if !(320..=7_680).contains(&width) || !(240..=4_320).contains(&height) {
         return Err(BrowserToolError::new(
@@ -3117,6 +3103,35 @@ impl ApiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_viewport_auto_returns_actual_metrics_without_fabricating_fixed_config() {
+        let result = viewport_tool_result("browser_viewport", &BrowserTabId::new("tab"),
+            BrowserHostCommandOutcome::Succeeded(Box::new(BrowserHostCommandResult::Json { value: json!({
+                "viewport": {"mode": "auto"},
+                "actual_viewport": {"width": 500, "height": 700, "device_scale_factor_millis": 2000, "device_type": "desktop"},
+                "display_scale": 1.0,
+            }) }))).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["mode"], "auto");
+        assert_eq!(result["viewport"], Value::Null);
+        assert_eq!(result["actual_viewport"]["width"], 500);
+        assert_eq!(result["actual_viewport"]["device_type"], "desktop");
+    }
+
+    #[test]
+    fn browser_viewport_rejects_missing_actual_metrics() {
+        let result = viewport_tool_result(
+            "browser_viewport",
+            &BrowserTabId::new("tab"),
+            BrowserHostCommandOutcome::Succeeded(Box::new(BrowserHostCommandResult::Json {
+                value: json!({
+                    "viewport": {"mode": "auto"}, "display_scale": 1.0,
+                }),
+            })),
+        );
+        assert_eq!(result.unwrap_err().code, "browser_result_invalid");
+    }
+
     #[tokio::test]
     async fn download_is_copied_without_overwriting_unless_asked() {
         let root = tempfile::tempdir().expect("tempdir");

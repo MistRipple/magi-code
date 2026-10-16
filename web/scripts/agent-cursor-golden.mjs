@@ -11,7 +11,7 @@ const overlaySource = await readFile(
 assert.match(overlaySource, /popover="manual"/, '光标覆盖层必须使用 Top Layer 才能盖住 webview guest');
 assert.match(overlaySource, /\.agent-cursor-layer \{[\s\S]*?pointer-events: none;/, '光标覆盖层不得拦截用户对网页的操作');
 assert.match(overlaySource, /\.agent-cursor-layer \{[\s\S]*?width: anchor-size\(width\);[\s\S]*?height: anchor-size\(height\);/, '覆盖层尺寸必须贴合内容槽');
-assert.match(overlaySource, /aria-hidden="true"/, '光标是装饰性反馈，状态由工具栏徽标播报');
+assert.match(overlaySource, /aria-hidden="true"/, '光标是装饰性反馈，不重复播报每次光标动作');
 assert.match(overlaySource, /@media \(prefers-reduced-motion: reduce\)/, '必须尊重减少动态效果设置');
 
 await withGoldenViteServer(async (server) => {

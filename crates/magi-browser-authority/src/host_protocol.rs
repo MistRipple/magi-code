@@ -687,6 +687,8 @@ pub struct BrowserHostBinaryPayload {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserHostHitTest {
+    #[serde(default)]
+    pub device_type: BrowserDeviceType,
     pub navigation_revision: u64,
     pub viewport_width: u32,
     pub viewport_height: u32,

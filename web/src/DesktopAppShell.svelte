@@ -51,6 +51,7 @@
   }
 
   .desktop-titlebar {
+    position: relative;
     flex: 0 0 max(32px, env(titlebar-area-height, 32px));
     background: var(--magi-surface-main);
     color: var(--foreground-muted);
@@ -59,6 +60,18 @@
     display: flex;
     align-items: center;
     font-size: 12px;
+  }
+
+  .desktop-titlebar::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--border), transparent);
+    opacity: 0.72;
+    pointer-events: none;
   }
 
   .desktop-titlebar span {

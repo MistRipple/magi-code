@@ -82,7 +82,7 @@ assert.match(
 assert.match(sources.schema, /magi-desktop:register-browser-webview/u);
 assert.match(sources.schema, /magi-desktop:update-browser-display-size/u);
 
-assert.match(sources.browserTab, /VIEWPORT_DEVICE_MODES[\s\S]*id: 'wide'[\s\S]*id: 'narrow'/u);
+assert.doesNotMatch(sources.browserTab, /VIEWPORT_DEVICE_MODES|selectedViewportPreset|viewport-device-type/u);
 assert.match(sources.browserTab, /useAutomaticViewport\(\)/u);
 assert.match(sources.browserTab, /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS/u);
 assert.match(sources.browserTab, /new ResizeObserver\(scheduleBrowserDisplaySizeSync\)/u);

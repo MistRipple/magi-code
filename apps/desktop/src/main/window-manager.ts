@@ -346,6 +346,11 @@ export class WindowManager {
     intent: WindowLayoutIntent,
   ): DesktopWindowSnapshot {
     const record = this.requireWindow(windowId);
+    if ((intent.type === "right_pane_width" || intent.type === "right_pane_reset_width")
+      && record.layout.rightPaneVisible && record.layout.activePanelKind === "browser"
+      && record.layout.activeTabId) {
+      this.#surfaceManager.takeUserControlInWindow(windowId, record.layout.activeTabId);
+    }
     record.layout = reduceWindowLayout(record.layout, intent);
     return this.applyLayout(record);
   }
@@ -638,7 +643,7 @@ export class WindowManager {
     if (!binding) {
       throw new Error(`browser_surface_not_found:${tabId}`);
     }
-    await this.#surfaceManager.setViewport(binding, viewport);
+    await this.#surfaceManager.setViewport(binding, viewport, true);
     return this.snapshot(record.windowId);
   }
 

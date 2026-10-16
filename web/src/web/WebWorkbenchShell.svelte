@@ -298,6 +298,7 @@ import {
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
+    visible?: boolean;
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   };
   type WebFolderPickerProps = {
@@ -3806,6 +3807,7 @@ import {
           <RightPaneComponent
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             desktopSurface={true}
+            visible={desktopRightPaneVisible && !shellUi.settingsOpen}
             agentRetainedSurfaces={agentRetainedSurfaces}
           />
         </div>
@@ -3926,18 +3928,18 @@ import {
     min-height: 0;
     cursor: col-resize;
     touch-action: none;
-    /* 桌面端三栏直接相连：这条拖动轨道（宽度属于布局契约，不能改）不能透出壁纸，
-       必须用和相邻面板相同的主题材质填满，只留中间一条 1px 分隔线。 */
+    /* 保留 8px 拖动热区；分隔线贴住右栏，避免网页左侧露出半条热区的空隙。 */
     background: var(--magi-surface-main);
   }
 
   .desktop-right-pane-resize-handle::before {
     content: '';
     position: absolute;
-    inset: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
     width: 1px;
-    margin: 0 auto;
-    background: var(--border);
+    background: var(--pane-divider-gradient);
     opacity: 0.72;
   }
 
@@ -4965,6 +4967,7 @@ import {
   /* 桌面端：侧栏 / 中栏 / 右栏（或设置页）直接相连并贴住窗口边缘，
      面板之间不留缝隙，只靠 1px 分隔线。 */
   .web-workbench-shell--desktop {
+    --pane-divider-gradient: linear-gradient(to bottom, transparent, var(--border), transparent);
     gap: 0;
     padding: 0;
     background: transparent;
@@ -4973,6 +4976,7 @@ import {
   .web-workbench-shell--desktop .sidebar {
     border: 0;
     border-right: 1px solid var(--border);
+    border-image: var(--pane-divider-gradient) 1;
     border-radius: 0;
     background: var(--magi-surface-sidebar);
   }

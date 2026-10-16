@@ -80,6 +80,7 @@
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
+    visible?: boolean;
     /** Main 声明的代理正在使用的页面；不可见时在离屏内容槽中保持挂载。 */
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   }
@@ -88,6 +89,7 @@
     workspaceRoot,
     overlay = false,
     desktopSurface = false,
+    visible = true,
     agentRetainedSurfaces = [],
   }: Props = $props();
 
@@ -1410,7 +1412,8 @@
           workspacePath={host.payload.workspacePath}
           sessionId={host.payload.sessionId || undefined}
           desktopSurface={desktopSurface}
-          backgroundHost={retainedInBackground}
+          retainedForAgent={retainedTabIds.has(host.tabId)}
+          hostVisible={visible && host.visible}
           onTitleChange={(label) => {
             if (host.paneTabId) updateRightPaneTabLabel(paneScopeKey, host.paneTabId, label);
           }}

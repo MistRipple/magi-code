@@ -50,11 +50,11 @@
      */
     surfaceScope?: 'session' | 'app';
     /**
-     * 会话级 Tab 的后台承载：代理正在使用该页面但它当前不可见（其他会话、其他 Tab
-     * 或右栏已折叠）。与应用级宿主一样只从窗口快照取得承载身份，读取与导航仍走
-     * 会话级接口。
+     * 代理保留页面从窗口快照取得承载身份，读取与导航仍走会话级接口。
+     * 是否在前台展示由 hostVisible 单独投影，保留状态不代表不可见。
      */
-    backgroundHost?: boolean;
+    retainedForAgent?: boolean;
+    hostVisible?: boolean;
   }
 
   // 消息链路的节点上下文是唯一契约；Renderer 只补充 Chromium 返回的
@@ -122,15 +122,19 @@
     page_title?: string;
   }
 
-  const VIEWPORT_DEVICE_MODES = [
-    { id: 'wide', width: 1280, height: 800, deviceType: 'desktop' },
-    { id: 'narrow', width: 390, height: 844, deviceType: 'mobile' },
-  ] as const;
   const VIEWPORT_DIMENSION_LIMITS = {
     width: { min: 320, max: 7680 },
     height: { min: 240, max: 4320 },
   } as const;
   const CUSTOM_VIEWPORT_DEBOUNCE_MILLIS = 180;
+  // CSS 视口尺寸和 DPR；只用于现有仿真入口，不另存设备选择状态。
+  const MOBILE_VIEWPORT_PRESETS = [
+    { name: 'iPhone SE', width: 375, height: 667, dpr: 2000 },
+    { name: 'iPhone 12 / 13', width: 390, height: 844, dpr: 3000 },
+    { name: 'iPhone 16', width: 393, height: 852, dpr: 3000 },
+    { name: 'iPhone 16 Pro Max', width: 440, height: 956, dpr: 3000 },
+    { name: 'Pixel 7', width: 412, height: 915, dpr: 2625 },
+  ] as const;
 
   let {
     browserSessionId,
@@ -142,11 +146,12 @@
     onTitleChange,
     desktopSurface = false,
     surfaceScope = 'session',
-    backgroundHost = false,
+    retainedForAgent = false,
+    hostVisible = true,
   }: Props = $props();
   const appLevelSurface = $derived(surfaceScope === 'app');
   // 承载身份是否只来自窗口快照（不依赖活动面板）：应用级宿主与会话级后台承载。
-  const snapshotIdentity = $derived(appLevelSurface || backgroundHost);
+  const snapshotIdentity = $derived(appLevelSurface || retainedForAgent);
   // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用主 Renderer
   // 直接承载 Electron <webview>；Main 只负责控制 guest 的生命周期和 CDP，
   // 不参与右栏几何计算。
@@ -155,6 +160,17 @@
   let browserWebview = $state<EmbeddedBrowserWebviewElement | undefined>();
   let browserSurfaceSlot = $state<HTMLDivElement | undefined>();
   let browserToolbar = $state<HTMLDivElement | undefined>();
+  let toolbarWidth = $state(0);
+  const compactToolbar = $derived(toolbarWidth < 480);
+
+  $effect(() => {
+    // 仅跨越操作区断点时关闭旧菜单，不打断视口输入或网页交互。
+    void compactToolbar;
+    untrack(() => {
+      actionsMenuOpen = false;
+      clearToolbarTooltip();
+    });
+  });
   let registeredWebviewKey = '';
   let registeredWebviewRelease: MagiDesktopReleasedBrowserWebviewRequest | null = null;
   let webviewRegistered = $state(false);
@@ -169,24 +185,20 @@
   let addressEditing = $state(false);
   let loading = $state(true);
   let browserLoading = $state(false);
-  // Agent 是否正在控制当前页面。这不是独立的状态源：它直接投影 Desktop 的 agent_cursor 事件
-  // （可见 = Agent 持有该 Surface 的控制权）。用户接管、控制权撤销、Surface 失去 Primary 时，
-  // Desktop 会发出对应事件，在下面清除它。
-  let agentControlling = $state(false);
   // 光标覆盖层逐条消费 agent_cursor 事件；序号让同一位置的连续点击也能重新触发反馈。
   let agentCursorSignal = $state<AgentCursorSignal | null>(null);
   let agentCursorSequence = 0;
   let surfaceSlotWidth = $state(0);
   let surfaceSlotHeight = $state(0);
-  const surfaceSlotVisible = $derived(!backgroundHost && surfaceSlotWidth > 0 && surfaceSlotHeight > 0);
+  const surfaceSlotVisible = $derived(hostVisible && surfaceSlotWidth > 0 && surfaceSlotHeight > 0);
   let sessionError = $state('');
   let actionError = $state('');
   let busy = $state(false);
-  let viewportMenuElement = $state<TopLayerPopoverElement | undefined>();
-  let annotationMenuElement = $state<TopLayerPopoverElement | undefined>();
-  let viewportMenuButton = $state<HTMLButtonElement | undefined>();
-  let annotationHistoryButton = $state<HTMLButtonElement | undefined>();
-  let annotationCreateButton = $state<HTMLButtonElement | undefined>();
+  let viewportResizeElement = $state<TopLayerPopoverElement | undefined>();
+  type ViewportResizeEdge = 'left' | 'right' | 'bottom' | 'corner';
+  let viewportResize = $state<{ pointerId: number; edge: ViewportResizeEdge; x: number; y: number; width: number; height: number; scale: number } | null>(null);
+  let actionsMenuElement = $state<TopLayerPopoverElement | undefined>();
+  let actionsMenuButton = $state<HTMLButtonElement | undefined>();
   let annotationEditorElement = $state<TopLayerPopoverElement | undefined>();
   let pageErrorElement = $state<TopLayerPopoverElement | undefined>();
   let actionErrorElement = $state<TopLayerPopoverElement | undefined>();
@@ -195,14 +207,14 @@
   let tooltipAnchorPreviousValue = '';
   let tooltipAnchorPreviousPriority = '';
   let tooltipText = $state('');
-  let viewportMenuOpen = $state(false);
-  let annotationMenuOpen = $state(false);
+  let actionsMenuOpen = $state(false);
   let localViewportMode = $state<BrowserViewportMode>('auto');
   let localViewport = $state({ width: 1280, height: 800, deviceType: 'desktop' as BrowserDeviceType });
   // 保留输入框的原始字符串，避免无效的空值被 Number('') 转成 0，
   // 进而在用户逐字符输入时被受控渲染抢回焦点内容。
-  let customViewportWidthInput = $state('390');
-  let customViewportHeightInput = $state('844');
+  let customViewportWidthInput = $state('1280');
+  let customViewportHeightInput = $state('800');
+  let localDeviceScaleFactorMillis = $state(1000);
   let customViewportWidthEditing = $state(false);
   let customViewportHeightEditing = $state(false);
   let customViewportInputDirty = $state(false);
@@ -230,8 +242,36 @@
   const anchorToken = $derived(tabId.replace(/[^A-Za-z0-9_-]/gu, '_'));
   const toolbarAnchorName = $derived(`--magi-browser-toolbar-${anchorToken}`);
   const surfaceAnchorName = $derived(`--magi-browser-surface-${anchorToken}`);
-  const viewportAnchorName = $derived(`--magi-browser-viewport-${anchorToken}`);
-  const annotationHistoryAnchorName = $derived(`--magi-browser-annotations-${anchorToken}`);
+  const displayViewport = $derived(desktopSnapshot?.browserSurfaces.find((surface) => surface.tabId === tabId)?.displayViewport ?? null);
+  const viewportInputInvalid = $derived(localViewportMode === 'fixed' && customViewportInputDirty && (
+    parseViewportDimension(customViewportWidthInput, VIEWPORT_DIMENSION_LIMITS.width) === null
+    || parseViewportDimension(customViewportHeightInput, VIEWPORT_DIMENSION_LIMITS.height) === null
+  ));
+  const canRotateViewport = $derived(
+    parseViewportDimension(customViewportHeightInput, VIEWPORT_DIMENSION_LIMITS.width) !== null
+    && parseViewportDimension(customViewportWidthInput, VIEWPORT_DIMENSION_LIMITS.height) !== null
+  );
+  const mobileEmulation = $derived(localViewportMode === 'fixed' && localViewport.deviceType === 'mobile');
+  const mobileViewportPreset = $derived(MOBILE_VIEWPORT_PRESETS.find((preset) => (
+    mobileEmulation && localDeviceScaleFactorMillis === preset.dpr && (
+      customViewportWidthInput === String(preset.width) && customViewportHeightInput === String(preset.height)
+      || customViewportWidthInput === String(preset.height) && customViewportHeightInput === String(preset.width)
+    )
+  ))?.name ?? '');
+  const fixedViewportFramed = $derived(Boolean(
+    displayViewport
+      && (surfaceSlotWidth > displayViewport.width + 1 || surfaceSlotHeight > displayViewport.height + 1),
+  ));
+  const viewportResizeEdges = $derived.by<ViewportResizeEdge[]>(() => {
+    const horizontal = Boolean(displayViewport && surfaceSlotWidth > displayViewport.width + 12);
+    const vertical = Boolean(displayViewport && surfaceSlotHeight > displayViewport.height + 12);
+    const edges: ViewportResizeEdge[] = [];
+    if (horizontal) edges.push('left', 'right');
+    if (vertical) edges.push('bottom');
+    if (horizontal && vertical) edges.push('corner');
+    if (viewportResize && !edges.includes(viewportResize.edge)) edges.push(viewportResize.edge);
+    return edges;
+  });
   const tooltipAnchorName = $derived(`--magi-browser-tooltip-${anchorToken}`);
 
   $effect(() => {
@@ -244,8 +284,8 @@
   $effect(() => {
     if (browserSurfaceAvailable) return;
     untrack(() => {
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
+      actionsMenuOpen = false;
+      viewportResize = null;
       annotationPhase = null;
       annotationSelection = null;
       annotationComment = '';
@@ -259,8 +299,8 @@
   // 放到 guest 之上，因此菜单、标记选择层和工具提示不会再被网页盖住。
   $effect(() => {
     const popovers: Array<[TopLayerPopoverElement | undefined, boolean]> = [
-      [viewportMenuElement, viewportMenuOpen],
-      [annotationMenuElement, annotationMenuOpen],
+      [viewportResizeElement, hostVisible && browserReady && (fixedViewportFramed || Boolean(viewportResize)) && !annotationPhase && !nodeInspectActive],
+      [actionsMenuElement, actionsMenuOpen],
       [annotationEditorElement, annotationPhase === 'comment' && Boolean(annotationSelection)],
       [pageErrorElement, Boolean(pageError && browserReady && !browserLoading)],
       [actionErrorElement, Boolean(actionError && browserReady)],
@@ -792,12 +832,6 @@
     };
   }
 
-  function fixedPresetSelected(mode: (typeof VIEWPORT_DEVICE_MODES)[number]): boolean {
-    return localViewportMode === 'fixed'
-      && localViewport.width === mode.width
-      && localViewport.height === mode.height;
-  }
-
   function parseViewportDimension(
     raw: string,
     limits: { min: number; max: number },
@@ -816,7 +850,7 @@
     return {
       width,
       height,
-      deviceType: width <= 600 ? 'mobile' : 'desktop',
+      deviceType: localViewport.deviceType,
     };
   }
 
@@ -826,23 +860,10 @@
     pendingViewport = null;
   }
 
-  function normalizeCustomViewportInputs(): { width: number; height: number; deviceType: BrowserDeviceType } {
-    const width = parseViewportDimension(customViewportWidthInput, VIEWPORT_DIMENSION_LIMITS.width)
-      ?? localViewport.width;
-    const height = parseViewportDimension(customViewportHeightInput, VIEWPORT_DIMENSION_LIMITS.height)
-      ?? localViewport.height;
-    customViewportWidthInput = String(width);
-    customViewportHeightInput = String(height);
-    return {
-      width,
-      height,
-      deviceType: width <= 600 ? 'mobile' : 'desktop',
-    };
-  }
-
   async function updateLogicalViewport(
     mode: BrowserViewportMode,
     viewport?: { width: number; height: number; deviceType: BrowserDeviceType },
+    deviceScaleFactorMillis = localDeviceScaleFactorMillis,
   ): Promise<void> {
     const tab = activeTab;
     const desktop = window.magiDesktop;
@@ -856,7 +877,7 @@
             mode: 'fixed',
             width: viewport!.width,
             height: viewport!.height,
-            deviceScaleFactorMillis: 1_000,
+            deviceScaleFactorMillis,
             deviceType: viewport!.deviceType,
           },
     });
@@ -870,6 +891,16 @@
     if (next.snapshotRevision < latestDesktopSnapshotRevision) return;
     latestDesktopSnapshotRevision = next.snapshotRevision;
     desktopSnapshot = next;
+    const surface = next.browserSurfaces.find((entry) => entry.tabId === tabId);
+    if (surface) {
+      const cursor = surface.agentCursor;
+      const point = agentCursorPoint(cursor.displayX, cursor.displayY);
+      const previous = agentCursorSignal;
+      if (!previous || previous.visible !== cursor.visible || previous.point?.x !== point?.x
+        || previous.point?.y !== point?.y || previous.action !== cursor.action) {
+        agentCursorSignal = { sequence: ++agentCursorSequence, visible: cursor.visible, point, action: normalizeAgentCursorAction(cursor.action) };
+      }
+    } else clearAgentControl();
     const activeDownloadIds = new Set(
       next.activeBrowserDownloads.map((download) => download.downloadId),
     );
@@ -895,10 +926,11 @@
       }
       scheduleWebviewRegistration();
     }
-    if (next.layout.activeTabId !== tabId || !next.activeBrowserViewport) return;
-    const viewport = next.activeBrowserViewport;
+    if (!surface) return;
+    const viewport = surface.viewport;
     localViewportMode = viewport.mode;
     if (viewport.mode !== 'auto') {
+      localDeviceScaleFactorMillis = viewport.device_scale_factor_millis;
       localViewport = {
         width: viewport.width,
         height: viewport.height,
@@ -930,19 +962,33 @@
     customViewportWidthEditing = false;
     customViewportHeightEditing = false;
     customViewportInputDirty = false;
-    normalizeCustomViewportInputs();
+    customViewportWidthInput = String(localViewport.width);
+    customViewportHeightInput = String(localViewport.height);
     void run(async () => updateLogicalViewport('auto'));
   }
 
-  function useFixedViewport(width: number, height: number): void {
-    const viewport = { width, height, deviceType: width <= 600 ? 'mobile' as const : 'desktop' as const };
+  function useFixedViewport(width: number, height: number, deviceType: BrowserDeviceType, deviceScaleFactorMillis = localDeviceScaleFactorMillis): void {
+    const viewport = { width, height, deviceType };
     cancelPendingCustomViewport();
     customViewportWidthEditing = false;
     customViewportHeightEditing = false;
     customViewportInputDirty = false;
     customViewportWidthInput = String(width);
     customViewportHeightInput = String(height);
-    void run(async () => updateLogicalViewport('fixed', viewport));
+    void run(async () => updateLogicalViewport('fixed', viewport, deviceScaleFactorMillis));
+  }
+
+  function selectMobileViewportPreset(event: Event): void {
+    const preset = MOBILE_VIEWPORT_PRESETS.find((entry) => entry.name === (event.currentTarget as HTMLSelectElement).value);
+    if (!preset || busy || !browserReady) return;
+    useFixedViewport(preset.width, preset.height, 'mobile', preset.dpr);
+  }
+
+  function rotateViewport(): void {
+    if (localViewportMode !== 'fixed' || busy) return;
+    const viewport = parsedCustomViewport();
+    if (!viewport || !canRotateViewport) return;
+    useFixedViewport(viewport.height, viewport.width, viewport.deviceType);
   }
 
   function flushPendingCustomViewport(): void {
@@ -952,7 +998,7 @@
     if (!next) return;
     if (busy) {
       pendingViewport = next;
-      customViewportTimer = window.setTimeout(flushPendingCustomViewport, CUSTOM_VIEWPORT_DEBOUNCE_MILLIS);
+      customViewportTimer = window.setTimeout(flushPendingCustomViewport, viewportResize ? 16 : CUSTOM_VIEWPORT_DEBOUNCE_MILLIS);
       return;
     }
     void run(async () => updateLogicalViewport('fixed', next));
@@ -992,27 +1038,128 @@
     scheduleCustomViewportUpdate();
   }
 
-  function handleCustomViewportBlur(event: FocusEvent): void {
-    const relatedTarget = event.relatedTarget;
-    if (relatedTarget instanceof Node && viewportMenuElement?.contains(relatedTarget)) return;
-    const wasEditing = customViewportWidthEditing || customViewportHeightEditing;
-    const wasDirty = customViewportInputDirty;
-    customViewportWidthEditing = false;
-    customViewportHeightEditing = false;
-    if (!wasEditing) return;
-    // 失焦提交前先淘汰旧请求，避免旧响应在归一化后短暂回写旧尺寸。
+  function handleCustomViewportBlur(dimension: 'width' | 'height'): void {
+    if (dimension === 'width') {
+      customViewportWidthEditing = false;
+      if (parseViewportDimension(customViewportWidthInput, VIEWPORT_DIMENSION_LIMITS.width) === null) {
+        customViewportWidthInput = String(localViewport.width);
+      }
+    } else {
+      customViewportHeightEditing = false;
+      if (parseViewportDimension(customViewportHeightInput, VIEWPORT_DIMENSION_LIMITS.height) === null) {
+        customViewportHeightInput = String(localViewport.height);
+      }
+    }
+    if (!customViewportInputDirty) return;
     ++viewportMutationGeneration;
-    const viewport = normalizeCustomViewportInputs();
-    if (!wasDirty) return;
-    customViewportInputDirty = false;
+    const viewport = parsedCustomViewport();
+    if (viewport) scheduleCustomViewportCommit(viewport, 0);
+  }
+
+  function handleViewportDimensionKey(dimension: 'width' | 'height', event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      cancelPendingCustomViewport();
+      ++viewportMutationGeneration;
+      customViewportWidthInput = String(localViewport.width);
+      customViewportHeightInput = String(localViewport.height);
+      customViewportInputDirty = false;
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const viewport = parsedCustomViewport();
+      if (viewport) {
+        ++viewportMutationGeneration;
+        scheduleCustomViewportCommit(viewport, 0);
+      }
+      return;
+    }
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    const input = event.currentTarget as HTMLInputElement;
+    const limits = VIEWPORT_DIMENSION_LIMITS[dimension];
+    const current = parseViewportDimension(input.value, limits) ?? localViewport[dimension];
+    const step = (event.shiftKey ? 10 : 1) * (event.key === 'ArrowUp' ? 1 : -1);
+    input.value = String(Math.max(limits.min, Math.min(limits.max, current + step)));
+    handleCustomViewportInput(dimension, event);
+  }
+
+  function queueResizedViewport(width: number, height: number): void {
+    const clamp = (value: number, limits: { min: number; max: number }) => Math.max(limits.min, Math.min(limits.max, Math.round(value)));
+    const viewport = {
+      width: clamp(width, VIEWPORT_DIMENSION_LIMITS.width),
+      height: clamp(height, VIEWPORT_DIMENSION_LIMITS.height),
+      deviceType: localViewport.deviceType,
+    };
+    customViewportWidthInput = String(viewport.width);
+    customViewportHeightInput = String(viewport.height);
+    ++viewportMutationGeneration;
     scheduleCustomViewportCommit(viewport, 0);
   }
 
-  function toggleViewportMenu(): void {
+  function startViewportResize(event: PointerEvent, edge: ViewportResizeEdge): void {
+    if (event.button !== 0 || !displayViewport || !browserReady || annotationPhase || nodeInspectActive) return;
+    event.preventDefault();
+    event.stopPropagation();
+    clearToolbarTooltip();
+    actionsMenuOpen = false;
+    customViewportWidthEditing = true;
+    customViewportHeightEditing = true;
+    viewportResize = { pointerId: event.pointerId, edge, x: event.clientX, y: event.clientY, width: localViewport.width, height: localViewport.height, scale: displayViewport.width / localViewport.width };
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+
+  function moveViewportResize(event: PointerEvent): void {
+    const drag = viewportResize;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    // 居中的画布左右同时变化，横向移动一像素对应两像素显示宽度。
+    const dx = (event.clientX - drag.x) * 2 / drag.scale;
+    const dy = (event.clientY - drag.y) / drag.scale;
+    queueResizedViewport(
+      drag.width + (drag.edge === 'bottom' ? 0 : drag.edge === 'left' ? -dx : dx),
+      drag.height + (drag.edge === 'bottom' || drag.edge === 'corner' ? dy : 0),
+    );
+  }
+
+  function finishViewportResize(event: PointerEvent): void {
+    if (!viewportResize || event.pointerId !== viewportResize.pointerId) return;
+    const target = event.currentTarget;
+    if (target instanceof HTMLElement && target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    viewportResize = null;
+    customViewportWidthEditing = false;
+    customViewportHeightEditing = false;
+  }
+
+  function resizeViewportWithKeyboard(event: KeyboardEvent, edge: ViewportResizeEdge): void {
+    const horizontal = edge !== 'bottom' && ['ArrowLeft', 'ArrowRight'].includes(event.key);
+    const vertical = (edge === 'bottom' || edge === 'corner') && ['ArrowUp', 'ArrowDown'].includes(event.key);
+    if (!horizontal && !vertical) return;
+    event.preventDefault();
+    const step = event.shiftKey ? 50 : 10;
+    queueResizedViewport(
+      localViewport.width + (horizontal ? (event.key === 'ArrowRight' ? 1 : -1) * (edge === 'left' ? -1 : 1) * step : 0),
+      localViewport.height + (vertical ? (event.key === 'ArrowDown' ? 1 : -1) * step : 0),
+    );
+  }
+
+  function toggleDeviceEmulation(): void {
     if (!activeTab || busy || !browserReady) return;
     clearToolbarTooltip();
-    annotationMenuOpen = false;
-    viewportMenuOpen = !viewportMenuOpen;
+    actionsMenuOpen = false;
+    if (mobileEmulation) {
+      useAutomaticViewport();
+      return;
+    }
+    // 从当前面板开始仿真，不用固定分辨率替换用户正在查看的尺寸。
+    const clamp = (value: number, limits: { min: number; max: number }) => Math.max(limits.min, Math.min(limits.max, Math.round(value)));
+    useFixedViewport(
+      clamp(browserSurfaceSlot?.clientWidth ?? surfaceSlotWidth, VIEWPORT_DIMENSION_LIMITS.width),
+      clamp(browserSurfaceSlot?.clientHeight ?? surfaceSlotHeight, VIEWPORT_DIMENSION_LIMITS.height),
+      'mobile',
+    );
   }
 
   function tooltipTarget(event: Event): HTMLElement | null {
@@ -1090,8 +1237,7 @@
     annotationSelection = null;
     annotationComment = '';
     annotationPhase = 'select';
-    viewportMenuOpen = false;
-    annotationMenuOpen = false;
+    actionsMenuOpen = false;
     const generation = ++annotationCaptureGeneration;
     annotationCaptureIdentity = identity;
     actionError = '';
@@ -1142,11 +1288,10 @@
     });
   }
 
-  function toggleAnnotationMenu(): void {
-    if (!activeTab || busy || !browserReady || annotationPhase) return;
+  function toggleActionsMenu(): void {
+    if (!activeTab || busy) return;
     clearToolbarTooltip();
-    viewportMenuOpen = false;
-    annotationMenuOpen = !annotationMenuOpen;
+    actionsMenuOpen = !actionsMenuOpen;
   }
 
   async function run(action: () => Promise<void>): Promise<void> {
@@ -1297,8 +1442,8 @@
   }
 
   function selectSavedAnnotation(annotation: BrowserAnnotationSnapshot): void {
-    annotationMenuOpen = false;
-    restoreOverlayTriggerFocus(annotationHistoryButton);
+    actionsMenuOpen = false;
+    restoreOverlayTriggerFocus(actionsMenuButton);
     window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: annotation }));
   }
 
@@ -1369,7 +1514,6 @@
   }
 
   function clearAgentControl(): void {
-    agentControlling = false;
     agentCursorSignal = { sequence: ++agentCursorSequence, visible: false, point: null, action: null };
   }
 
@@ -1404,7 +1548,7 @@
       return;
     }
 
-    if (!currentIdentity || !tab || binding.surfaceId !== currentIdentity.surfaceId) return;
+    if (!currentIdentity || binding.surfaceId !== currentIdentity.surfaceId) return;
 
     if (event.type === 'annotation_selection') {
       if (
@@ -1429,10 +1573,9 @@
     }
 
     if (event.type === 'agent_cursor') {
-      agentControlling = event.visible === true;
       agentCursorSignal = {
         sequence: ++agentCursorSequence,
-        visible: agentControlling,
+        visible: event.visible === true,
         point: agentCursorPoint(event.displayX, event.displayY),
         action: normalizeAgentCursorAction(event.action),
       };
@@ -1474,7 +1617,7 @@
       return;
     }
 
-    if (binding.navigationRevision < tab.navigationRevision) return;
+    if (!tab || binding.navigationRevision < tab.navigationRevision) return;
     const pageEventIsNewerThanSnapshot = binding.navigationRevision > tab.navigationRevision;
     if (pageEventIsNewerThanSnapshot) {
       // Desktop Surface 事件与 Authority 快照是两条异步链。页面已经由
@@ -1501,8 +1644,7 @@
         // 页面导航会使未提交选择失去语义；已保存的标记仍由 Authority
         // 持久化并在新文档就绪后重放。
         cancelAnnotationCreation();
-        viewportMenuOpen = false;
-        annotationMenuOpen = false;
+        actionsMenuOpen = false;
       }
       if (pageEventIsNewerThanSnapshot) void refreshSession();
       return;
@@ -1651,8 +1793,7 @@
       pageError = '';
       browserLoading = false;
       cancelAnnotationCreation();
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
+      actionsMenuOpen = false;
       activeDownloads = [];
       loading = Boolean(expectedSessionId && expectedTabId);
       if (!expectedSessionId || !expectedTabId) return;
@@ -1678,22 +1819,26 @@
     const pointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (viewportMenuElement && !viewportMenuElement.contains(target) && !viewportMenuButton?.contains(target)) viewportMenuOpen = false;
-      if (annotationMenuElement && !annotationMenuElement.contains(target) && !annotationHistoryButton?.contains(target)) annotationMenuOpen = false;
+      if (actionsMenuElement && !actionsMenuElement.contains(target) && !actionsMenuButton?.contains(target)) actionsMenuOpen = false;
     };
     const keyboard = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      const hasOpenOverlay = Boolean(annotationPhase || viewportMenuOpen || annotationMenuOpen);
+      if (viewportResize) {
+        event.preventDefault();
+        queueResizedViewport(viewportResize.width, viewportResize.height);
+        viewportResize = null;
+        customViewportWidthEditing = false;
+        customViewportHeightEditing = false;
+        return;
+      }
+      const hasOpenOverlay = Boolean(annotationPhase || actionsMenuOpen);
       if (!hasOpenOverlay) return;
       const focusTarget = annotationPhase
-        ? annotationCreateButton
-        : annotationMenuOpen
-          ? annotationHistoryButton
-          : viewportMenuButton;
+        ? actionsMenuButton ?? browserToolbar?.querySelector<HTMLButtonElement>('.browser-annotate-button') ?? undefined
+        : actionsMenuButton;
       event.preventDefault();
       event.stopPropagation();
-      viewportMenuOpen = false;
-      annotationMenuOpen = false;
+      actionsMenuOpen = false;
       if (annotationPhase) cancelAnnotationCreation();
       restoreOverlayTriggerFocus(focusTarget);
     };
@@ -1711,6 +1856,9 @@
     });
     const unsubscribeBrowserEvent = window.magiDesktop?.onBrowserEvent(handleDesktopBrowserEvent);
     window.addEventListener('pointerdown', pointerDown);
+    window.addEventListener('pointermove', moveViewportResize);
+    window.addEventListener('pointerup', finishViewportResize);
+    window.addEventListener('pointercancel', finishViewportResize);
     window.addEventListener('keydown', keyboard, true);
     window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, browserAuthorityChanged);
     return () => {
@@ -1724,6 +1872,9 @@
       unsubscribeBrowserEvent?.();
       unsubscribeDesktopSnapshot?.();
       window.removeEventListener('pointerdown', pointerDown);
+      window.removeEventListener('pointermove', moveViewportResize);
+      window.removeEventListener('pointerup', finishViewportResize);
+      window.removeEventListener('pointercancel', finishViewportResize);
       window.removeEventListener('keydown', keyboard, true);
       clearToolbarTooltip();
       clearNodeInspection();
@@ -1749,6 +1900,15 @@
 
 </script>
 
+{#snippet browserActions(inMenu: boolean)}
+  {#if desktopRuntime}
+    <button type="button" role={inMenu ? 'menuitem' : undefined} class="icon-button" class:active={nodeInspectActive || Boolean(nodeSelection)} onclick={() => { actionsMenuOpen = false; void toggleNodeInspection(); }} disabled={!browserReady || busy || (!nodeInspectActive && !nodeInspectBusy && !activeBrowserIdentity)} data-tooltip={inMenu ? undefined : i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')} aria-label={i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}><Icon name="code" size={14} />{#if inMenu}<span>{i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}</span>{/if}</button>
+    <button type="button" role={inMenu ? 'menuitem' : undefined} class="icon-button" onclick={() => { actionsMenuOpen = false; captureScreenshotForMessage(); }} disabled={!browserReady || busy} data-tooltip={inMenu ? undefined : i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}><Icon name="file-plus" size={14} />{#if inMenu}<span>{i18n.t('browser.action.screenshot')}</span>{/if}</button>
+    <button type="button" role={inMenu ? 'menuitem' : undefined} class="icon-button browser-annotate-button" onclick={() => { actionsMenuOpen = false; void openDesktopAnnotationCreation(); }} disabled={!browserReady || busy || Boolean(annotationPhase)} data-tooltip={inMenu ? undefined : i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={14} />{#if inMenu}<span>{i18n.t('browser.action.annotate')}</span>{/if}</button>
+  {/if}
+  <button type="button" role={inMenu ? 'menuitem' : undefined} class="icon-button" onclick={() => { actionsMenuOpen = false; openCurrentPageExternally(); }} disabled={!externalUrl || busy} data-tooltip={inMenu ? undefined : i18n.t('browser.action.openExternal')} aria-label={i18n.t('browser.action.openExternal')}><Icon name="external-link" size={14} />{#if inMenu}<span>{i18n.t('browser.action.openExternal')}</span>{/if}</button>
+{/snippet}
+
 <section
   class="browser-pane"
   aria-label={i18n.t('browser.pane.label')}
@@ -1759,6 +1919,7 @@
   {#if !appLevelSurface}
   <div
     bind:this={browserToolbar}
+    bind:clientWidth={toolbarWidth}
     class="browser-toolbar"
     style:anchor-name={toolbarAnchorName}
     role="toolbar"
@@ -1788,54 +1949,67 @@
         />
         <button type="submit" class="address-submit" disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
       </form>
-      <div class="menu-wrap">
-      <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} style:anchor-name={viewportAnchorName} onclick={toggleViewportMenu} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')} aria-expanded={viewportMenuOpen}><Icon name="monitor" size={13} /></button>
-      </div>
-      <button
-        type="button"
-        class="icon-button"
-        class:active={nodeInspectActive || Boolean(nodeSelection)}
-        onclick={toggleNodeInspection}
-        disabled={!browserReady || busy || (!nodeInspectActive && !nodeInspectBusy && !activeBrowserIdentity)}
-        data-tooltip={i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}
-        aria-label={i18n.t(nodeInspectActive ? 'browser.action.stopInspectNode' : 'browser.action.inspectNode')}
-        aria-pressed={nodeInspectActive}
-      ><Icon name="code" size={13} /></button>
+      <button type="button" class="icon-button viewport-button" class:active={mobileEmulation} onclick={toggleDeviceEmulation} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')} aria-pressed={mobileEmulation}><Icon name="devices" size={16} /></button>
     {:else}
       <div class="record-address" title={activeTab?.url || i18n.t('browser.status.noTab')}>
         <Icon name="globe" size={13} />
         <span>{activeTab?.title || activeTab?.url || i18n.t('browser.status.noTab')}</span>
       </div>
     {/if}
-    <button type="button" class="icon-button toolbar-edge-button" onclick={openCurrentPageExternally} disabled={!externalUrl || busy} data-tooltip={i18n.t('browser.action.openExternal')} aria-label={i18n.t('browser.action.openExternal')}><Icon name="external-link" size={13} /></button>
-    {#if desktopRuntime}
-      <button type="button" class="icon-button toolbar-edge-button" onclick={captureScreenshotForMessage} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}><Icon name="file-plus" size={13} /></button>
+    {#if !compactToolbar}
+      <div class="browser-toolbar-actions">
+        {@render browserActions(false)}
+      </div>
     {/if}
-    <div class="menu-wrap">
-      {#if desktopRuntime}
-        <button bind:this={annotationCreateButton} type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(annotationPhase)} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
-      {/if}
-      {#if savedAnnotations.length > 0}
-        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} style:anchor-name={annotationHistoryAnchorName} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')} aria-expanded={annotationMenuOpen}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
-      {/if}
-    </div>
-    {#if desktopRuntime && agentControlling}
-      <span class="agent-badge" role="status" aria-live="polite" title={i18n.t('browser.agent.takeoverHint')}>
-        <span class="agent-badge-dot" aria-hidden="true"></span>
-        <span class="agent-badge-label">{i18n.t('browser.agent.active')}</span>
-      </span>
-    {:else if desktopRuntime && userControlHeld}
-      <span class="agent-badge user-held-badge" role="status" aria-live="polite" title={i18n.t('browser.agent.userHeldHint')}>
-        <span class="agent-badge-label">{i18n.t('browser.agent.userHeld')}</span>
-        <button type="button" class="hand-back-button" onclick={() => void handBackControl()} disabled={handingBackControl}>{i18n.t('browser.agent.handBack')}</button>
-      </span>
+    {#if compactToolbar || savedAnnotations.length > 0}
+      <button bind:this={actionsMenuButton} type="button" class="icon-button browser-actions-button" class:active={actionsMenuOpen} onclick={toggleActionsMenu} data-tooltip={i18n.t('browser.action.more')} aria-label={i18n.t(compactToolbar ? 'browser.action.more' : 'browser.annotation.history')} aria-haspopup="menu" aria-expanded={actionsMenuOpen}><Icon name="more-horizontal" size={14} /></button>
     {/if}
-    {#if desktopRuntime}
-      <span class="status-light" class:ready={connectionState === 'ready' && !browserLoading} class:loading={connectionState === 'ready' && browserLoading} class:error={connectionState === 'error'} title={connectionStatusText} role="status"></span>
-    {:else}
+    {#if desktopRuntime && userControlHeld}
+      <button type="button" class="icon-button hand-back-button" onclick={() => void handBackControl()} disabled={handingBackControl} data-tooltip={i18n.t('browser.agent.handBack')} aria-label={i18n.t('browser.agent.handBack')}><Icon name="play" size={13} /></button>
+    {/if}
+    {#if !desktopRuntime}
       <span class="record-status" role="status">{activeTab ? i18n.t('browser.status.recordOnly') : i18n.t('browser.status.noTab')}</span>
     {/if}
   </div>
+  {/if}
+
+  {#if mobileEmulation && !appLevelSurface}
+    <div class="viewport-toolbar" role="toolbar" aria-label={i18n.t('browser.viewport.control')}>
+      <select class="viewport-preset" aria-label={i18n.t('browser.viewport.deviceSize')} title={i18n.t('browser.viewport.deviceSizeHint')} value={mobileViewportPreset} onchange={selectMobileViewportPreset} disabled={busy || !browserReady}>
+        <option value="" disabled>{i18n.t('browser.viewport.custom')}</option>
+        {#each MOBILE_VIEWPORT_PRESETS as preset (preset.name)}
+          <option value={preset.name}>{preset.name}</option>
+        {/each}
+      </select>
+      <div class="viewport-edit-row">
+        <div class="viewport-custom">
+          {#each (['width', 'height'] as const) as dimension}
+            {#if dimension === 'height'}<span class="viewport-dimension-separator" aria-hidden="true">×</span>{/if}
+            <input
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label={i18n.t(`browser.viewport.${dimension}`)}
+              title={i18n.t(`browser.viewport.${dimension}`)}
+              aria-invalid={localViewportMode === 'fixed' && parseViewportDimension(dimension === 'width' ? customViewportWidthInput : customViewportHeightInput, VIEWPORT_DIMENSION_LIMITS[dimension]) === null}
+              aria-describedby={viewportInputInvalid ? `viewport-error-${anchorToken}` : undefined}
+              value={dimension === 'width' ? customViewportWidthInput : customViewportHeightInput}
+              onfocus={() => { if (dimension === 'width') customViewportWidthEditing = true; else customViewportHeightEditing = true; }}
+              oninput={(event) => handleCustomViewportInput(dimension, event)}
+              onblur={() => handleCustomViewportBlur(dimension)}
+              onkeydown={(event) => handleViewportDimensionKey(dimension, event)}
+            />
+          {/each}
+          <span class="viewport-unit">px</span>
+        </div>
+        <button type="button" class="icon-button viewport-rotate" onclick={rotateViewport} disabled={busy || !canRotateViewport} title={i18n.t('browser.viewport.rotate')} aria-label={i18n.t('browser.viewport.rotate')}><Icon name="rotate" size={16} /></button>
+      </div>
+      <span class="viewport-preview-scale" title={i18n.t('browser.viewport.scaleHint')}>{i18n.t('browser.viewport.previewScale', { percent: localViewportMode === 'fixed' && displayViewport ? Math.round(displayViewport.width / localViewport.width * 100) : 100 })}</span>
+      {#if viewportInputInvalid}
+        <div class="viewport-input-error" id={`viewport-error-${anchorToken}`} role="status">{i18n.t('browser.viewport.invalidSize', { minWidth: VIEWPORT_DIMENSION_LIMITS.width.min, maxWidth: VIEWPORT_DIMENSION_LIMITS.width.max, minHeight: VIEWPORT_DIMENSION_LIMITS.height.min, maxHeight: VIEWPORT_DIMENSION_LIMITS.height.max })}</div>
+      {/if}
+    </div>
   {/if}
 
   {#if tooltipText}
@@ -1880,64 +2054,19 @@
     </div>
   {/if}
 
-  {#if viewportMenuOpen}
-    <div bind:this={viewportMenuElement} class="viewport-popover" style:position-anchor={viewportAnchorName} data-menu="viewport" popover="manual">
-      <div class="viewport-menu" role="menu" aria-label={i18n.t('browser.viewport.control')}>
-        <button type="button" class:selected={localViewportMode === 'auto'} role="menuitem" onclick={() => { viewportMenuOpen = false; useAutomaticViewport(); }}>
-          <Icon name="monitor" size={14} />
-          <span>{i18n.t('browser.viewport.auto')}</span>
-        </button>
-        <div class="menu-divider" aria-hidden="true"></div>
-        <div class="viewport-device-modes" role="group" aria-label={i18n.t('browser.viewport.deviceMode')}>
-          {#each VIEWPORT_DEVICE_MODES as mode (mode.id)}
-            <button
-              type="button"
-              class:selected={fixedPresetSelected(mode)}
-              onclick={() => { viewportMenuOpen = false; useFixedViewport(mode.width, mode.height); }}
-              title={`${mode.width} x ${mode.height}`}
-            >{i18n.t(`browser.viewport.mode.${mode.id}`)}</button>
+  {#if actionsMenuOpen}
+    <div bind:this={actionsMenuElement} class="browser-actions-popover" style:position-anchor={toolbarAnchorName} popover="manual">
+      <div class="browser-actions-menu" role="menu" aria-label={i18n.t('browser.action.more')}>
+        {#if compactToolbar}
+          {@render browserActions(true)}
+        {/if}
+        {#if savedAnnotations.length > 0}
+          {#if compactToolbar}<div class="menu-divider" aria-hidden="true"></div>{/if}
+          <div class="browser-actions-heading">{i18n.t('browser.annotation.history')}</div>
+          {#each savedAnnotations as annotation (annotation.annotationId)}
+            <button type="button" role="menuitem" onclick={() => selectSavedAnnotation(annotation)} title={annotation.comment}><span class="annotation-menu-number">{annotation.sequence}</span><span class="annotation-comment">{annotation.comment}</span></button>
           {/each}
-        </div>
-        <div class="viewport-custom">
-          <label>
-            <span>{i18n.t('browser.viewport.width')}</span>
-            <input
-              type="text"
-              inputmode="numeric"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label={i18n.t('browser.viewport.width')}
-              value={customViewportWidthInput}
-              onfocus={() => { customViewportWidthEditing = true; }}
-              oninput={(event) => handleCustomViewportInput('width', event)}
-              onblur={handleCustomViewportBlur}
-            />
-          </label>
-          <label>
-            <span>{i18n.t('browser.viewport.height')}</span>
-            <input
-              type="text"
-              inputmode="numeric"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label={i18n.t('browser.viewport.height')}
-              value={customViewportHeightInput}
-              onfocus={() => { customViewportHeightEditing = true; }}
-              oninput={(event) => handleCustomViewportInput('height', event)}
-              onblur={handleCustomViewportBlur}
-            />
-          </label>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  {#if annotationMenuOpen}
-    <div bind:this={annotationMenuElement} class="annotation-history-popover" style:position-anchor={annotationHistoryAnchorName} data-menu="annotations" popover="manual">
-      <div class="annotation-menu" role="menu" aria-label={i18n.t('browser.annotation.history')}>
-        {#each savedAnnotations as annotation (annotation.annotationId)}
-          <button type="button" onclick={() => selectSavedAnnotation(annotation)} title={annotation.comment}><span class="annotation-menu-number">{annotation.sequence}</span><span>{annotation.comment}</span></button>
-        {/each}
+        {/if}
       </div>
     </div>
   {/if}
@@ -1947,21 +2076,40 @@
     bind:clientWidth={surfaceSlotWidth}
     bind:clientHeight={surfaceSlotHeight}
     class="browser-surface-slot"
-    style:anchor-name={surfaceAnchorName}
     data-browser-tab-id={tabId}
     aria-label={i18n.t('browser.viewport.label')}
   >
     {#if desktopRuntime}
-      <webview
-        bind:this={browserWebview}
-        class="browser-webview"
-        src="about:blank"
-        partition={browserPartitionForSession(browserSessionId)}
-        allowpopups={false}
-        webpreferences="focusOnNavigation=no"
-        aria-label={i18n.t('browser.viewport.label')}
-      ></webview>
+      <div
+        class="browser-viewport"
+        style:anchor-name={surfaceAnchorName}
+        style:width={displayViewport ? `${displayViewport.width}px` : '100%'}
+        style:height={displayViewport ? `${displayViewport.height}px` : '100%'}
+      >
+        <webview
+          bind:this={browserWebview}
+          class="browser-webview"
+          src="about:blank"
+          partition={browserPartitionForSession(browserSessionId)}
+          allowpopups={false}
+          webpreferences="focusOnNavigation=no"
+          aria-label={i18n.t('browser.viewport.label')}
+        ></webview>
+      </div>
       <AgentCursorOverlay anchorName={surfaceAnchorName} signal={agentCursorSignal} hostVisible={surfaceSlotVisible && browserReady} />
+      <div bind:this={viewportResizeElement} class="viewport-resize-frame" style:position-anchor={surfaceAnchorName} popover="manual">
+        {#each viewportResizeEdges as edge (edge)}
+          <button
+            type="button"
+            class={`viewport-resize-handle viewport-resize-handle--${edge}`}
+            aria-label={i18n.t('browser.viewport.resize') + ' · ' + i18n.t(edge === 'bottom' ? 'browser.viewport.height' : edge === 'corner' ? 'browser.viewport.custom' : 'browser.viewport.width')}
+            title={i18n.t('browser.viewport.resize')}
+            onpointerdown={(event) => startViewportResize(event, edge)}
+            onlostpointercapture={finishViewportResize}
+            onkeydown={(event) => resizeViewportWithKeyboard(event, edge)}
+          ></button>
+        {/each}
+      </div>
       {#if !browserReady}
         <div class="browser-placeholder browser-placeholder-overlay" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
       {/if}
@@ -2033,9 +2181,10 @@
 </section>
 
 <style>
-  .browser-pane { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
+  .browser-pane { container-type: inline-size; position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
   /* 工具栏固定在右栏内容区内，边框不改变内容槽的有效尺寸。 */
   .browser-toolbar { position: relative; z-index: 10; isolation: isolate; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
+  .browser-toolbar-actions { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; }
   .icon-button, .address-submit { position: relative; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
@@ -2050,53 +2199,66 @@
   .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: 1px solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
   .record-address { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); }
   .record-address span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .menu-wrap { position: relative; display: flex; flex: 0 0 auto; }
   /* 顶部工具菜单是浏览器框架上的 Renderer 浮层，不属于页面内容的排版轨道。
      CSS Anchor Positioning 让它跟随真实工具栏位置，Popover Top Layer 解决
      Electron webview 原生合成层的遮挡，不需要任何浏览器内容坐标映射。 */
-  .viewport-popover,
-  .annotation-history-popover { position: fixed; top: calc(anchor(bottom) + 4px); left: anchor(right); z-index: 20; box-sizing: border-box; width: min(300px, calc(100vw - 12px)); pointer-events: auto; transform: translateX(-100%); }
-  .viewport-menu, .annotation-menu { box-sizing: border-box; width: min(300px, 100%); overflow: hidden; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
-  .annotation-history-popover .annotation-menu { width: 100%; max-height: min(420px, calc(100vh - 48px)); overflow-y: auto; scrollbar-width: none; }
-  .annotation-history-popover .annotation-menu::-webkit-scrollbar { display: none; }
-  .viewport-menu > button, .annotation-menu > button { box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; text-align: left; }
-  .viewport-menu > button:hover, .viewport-menu > button.selected, .annotation-menu > button:hover { background: var(--surface-hover); }
-  .viewport-menu > button.selected { color: var(--primary); }
-  .menu-divider { height: 1px; margin: 4px 3px; background: var(--border); }
-  .viewport-device-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; padding: 3px; }
-  .viewport-device-modes button { height: 28px; min-width: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground-muted); font: inherit; font-size: var(--text-xs); cursor: pointer; }
-  .viewport-device-modes button.selected { border-color: var(--primary); color: var(--primary); }
-  .viewport-custom { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; padding: 3px; }
-  .viewport-custom label { display: grid; gap: 3px; min-width: 0; color: var(--foreground-muted); font-size: 10px; }
-  .viewport-custom input { box-sizing: border-box; min-width: 0; width: 100%; height: 27px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; }
-  .annotation-history-button { position: relative; }
-  .annotation-count { position: absolute; top: 1px; right: 1px; min-width: 12px; height: 12px; padding: 0 2px; border-radius: 6px; background: var(--info); color: white; font-size: 8px; font-weight: 700; line-height: 12px; text-align: center; }
+  .browser-actions-popover { position: fixed; top: calc(anchor(bottom) + 4px); left: calc(anchor(right) - 6px); z-index: 20; box-sizing: border-box; width: min(300px, calc(anchor-size(width) - 12px)); pointer-events: auto; transform: translateX(-100%); }
+  .browser-actions-popover { width: max-content; min-width: min(200px, calc(anchor-size(width) - 12px)); max-width: min(280px, calc(anchor-size(width) - 12px)); }
+  .browser-actions-menu { box-sizing: border-box; width: 100%; overflow: hidden; padding: 7px; border: 1px solid var(--border); border-radius: 8px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .browser-actions-popover .browser-actions-menu { width: 100%; max-height: min(420px, 60dvh); overflow-y: auto; scrollbar-width: thin; }
+  .browser-actions-menu > button { box-sizing: border-box; display: flex; align-items: center; justify-content: flex-start; gap: 8px; width: 100%; height: auto; min-height: 32px; padding: 6px 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); line-height: 1.4; cursor: pointer; text-align: left; }
+  .browser-actions-menu > button > :global(svg) { flex: 0 0 14px; }
+  .browser-actions-menu > button > span { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+  .browser-actions-menu > button:hover { background: var(--surface-hover); }
+  .menu-divider { height: 1px; margin: 6px 3px; background: var(--border); }
+  .viewport-toolbar { box-sizing: border-box; display: grid; grid-template-columns: auto auto auto; justify-content: center; align-items: center; gap: 4px 8px; flex: 0 0 auto; padding: 5px 8px; border-bottom: 1px solid var(--border); background: var(--surface-1); font-size: 12px; }
+  .viewport-preset { box-sizing: border-box; width: 190px; max-width: 100%; min-width: 0; height: 28px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-overflow: ellipsis; }
+  .viewport-edit-row, .viewport-custom { display: flex; align-items: center; gap: 6px; }
+  .viewport-custom input { box-sizing: border-box; min-width: 0; width: 64px; height: 28px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-align: center; font-variant-numeric: tabular-nums; }
+  .viewport-toolbar :is(select, input, button):focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+  .viewport-custom input[aria-invalid="true"] { border-color: var(--error); }
+  .viewport-dimension-separator, .viewport-unit { color: var(--foreground-muted); }
+  .viewport-unit { font-size: 11px; }
+  .viewport-preview-scale { color: var(--foreground-muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .viewport-input-error { grid-column: 1 / -1; color: var(--error); font-size: 11px; overflow-wrap: anywhere; }
   .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: 700; }
-  /* 胶囊放在工具栏内而不是单独占一行：额外的一行会改变网页视口高度，让页面在每次 Agent 动作时重排。 */
-  .agent-badge { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; max-width: 104px; height: 20px; padding: 0 8px; border-radius: 9999px; background: var(--primary-muted); color: var(--primary); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1; white-space: nowrap; }
-  .agent-badge-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  .agent-badge-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--primary); animation: agent-badge-pulse 1.4s ease-in-out infinite; }
-  @keyframes agent-badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
-  @media (prefers-reduced-motion: reduce) { .agent-badge-dot { animation: none; } }
-  .user-held-badge { max-width: 240px; padding-right: 2px; background: var(--warning-muted); color: var(--foreground); }
-  .hand-back-button { flex: 0 0 auto; height: 16px; padding: 0 7px; border: none; border-radius: 9999px; background: var(--primary); color: var(--primary-foreground, #fff); font: inherit; font-size: 10px; cursor: pointer; }
-  .hand-back-button:disabled { opacity: .6; cursor: default; }
-  .status-light { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--foreground-muted); }
-  .status-light.ready { background: var(--success); }
-  .status-light.loading { background: var(--warning); }
-  .status-light.error { background: var(--error); }
   .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .hand-back-button { color: var(--primary); background: var(--primary-muted); }
+  .browser-actions-menu button:disabled { opacity: .45; cursor: default; }
+  .browser-actions-heading { padding: 5px 8px; color: var(--foreground-muted); font-size: 10px; }
+  .annotation-comment { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  @container (max-width: 520px) {
+    /* 窄右栏仍保持单行：型号名称可截断，尺寸输入和适应比例始终可见。 */
+    .viewport-toolbar { grid-template-columns: minmax(64px, 96px) auto auto; gap: 3px; padding-inline: 4px; }
+    .viewport-preset { width: 100%; }
+    .viewport-custom { gap: 3px; }
+    .viewport-custom input { width: 46px; padding-inline: 2px; }
+    .viewport-preview-scale { font-size: 10px; }
+  }
+  @container (max-width: 360px) {
+    .address-submit { display: none; }
+    .address-form input { border-right: 1px solid var(--border); border-radius: var(--radius-sm); }
+  }
   .browser-download-panel { position: fixed; top: calc(anchor(bottom) - 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; transform: translateY(-100%); }
   .browser-download-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
   .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; white-space: nowrap; }
   .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
   .browser-download-panel button:hover { background: var(--surface-hover); }
-  .browser-surface-slot { position: relative; z-index: 0; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
+  .browser-surface-slot { position: relative; z-index: 0; display: flex; justify-content: center; align-items: flex-start; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
+  .browser-viewport { display: flex; flex: 0 0 auto; min-width: 0; min-height: 0; overflow: hidden; }
+  .viewport-resize-frame { position: fixed; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); overflow: visible; pointer-events: none; outline: 1px solid color-mix(in srgb, var(--primary) 38%, var(--border)); outline-offset: -1px; box-shadow: 0 3px 14px color-mix(in srgb, var(--foreground) 14%, transparent); border-radius: 3px; }
+  .viewport-resize-handle { position: absolute; border: 0; padding: 0; background: transparent; pointer-events: auto; touch-action: none; }
+  .viewport-resize-handle--left, .viewport-resize-handle--right { top: 0; width: 8px; height: 100%; cursor: ew-resize; }
+  .viewport-resize-handle--left { left: -5px; }
+  .viewport-resize-handle--right { right: -5px; }
+  .viewport-resize-handle--bottom { left: 0; bottom: -5px; width: 100%; height: 8px; cursor: ns-resize; }
+  .viewport-resize-handle--corner { right: -5px; bottom: -5px; width: 12px; height: 12px; cursor: nwse-resize; border-right: 2px solid var(--foreground-muted); border-bottom: 2px solid var(--foreground-muted); border-radius: 0 0 3px 0; }
+  .viewport-resize-handle:hover, .viewport-resize-handle:focus-visible { background: color-mix(in srgb, var(--primary) 20%, transparent); outline: none; }
   /* Electron 的 webview 自定义元素依赖自身的 flex 内部布局把 guest
      视口同步到内容槽。覆盖为 block 会让 guest 退回默认 150px 高度，
      从而出现页面被截断、滚动条异常和截图范围错误。 */
-  .browser-webview { display: flex; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #fff; }
+  .browser-webview { display: flex; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: var(--magi-surface-right-pane); }
   .browser-placeholder-overlay { position: absolute; inset: 0; pointer-events: none; background: var(--surface-1); }
   .browser-action-error { position: fixed; top: calc(anchor(top) + 10px); left: calc(anchor(left) + 10px); z-index: 6; box-sizing: border-box; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 34px; margin: 0; padding: 5px 6px 5px 8px; border: 1px solid color-mix(in srgb, var(--error) 45%, var(--border)); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); color: var(--foreground); pointer-events: auto; }
   .browser-action-error > :global(svg) { color: var(--error); }

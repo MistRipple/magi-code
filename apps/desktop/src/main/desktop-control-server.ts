@@ -908,24 +908,15 @@ export class DesktopControlServer {
           binding,
           command.payload.viewport,
         );
-        return succeeded({ type: "empty" });
+        return succeeded({ type: "json", payload: { value: await this.#surfaceManager.readViewport(binding) } });
       }
       case "get_logical_viewport": {
         const binding = await this.requireRenderablePrimaryBinding(
           command.payload.tab_id,
         );
-        const state = this.#surfaceManager.viewportStateForSurface(
-          binding.surface_id,
-        );
-        if (!state) throw new Error("browser_surface_not_found");
         return succeeded({
           type: "json",
-          payload: {
-            value: {
-              tab_id: binding.tab_id,
-              viewport: state.viewport,
-            },
-          },
+          payload: { value: await this.#surfaceManager.readViewport(binding) },
         });
       }
       case "configure_network_policy": {
@@ -989,6 +980,11 @@ export class DesktopControlServer {
     command: BrowserHostCommand,
     executed: { outcome: BrowserCommandOutcome; binary?: Buffer },
   ): Promise<{ outcome: BrowserCommandOutcome; binary?: Buffer }> {
+    if (executed.outcome.status === "succeeded" && executed.outcome.payload.type === "hit_test") {
+      const binding = await this.requireRenderablePrimaryBinding(tabId);
+      const viewport = this.#surfaceManager.viewportForSurface(binding.surface_id);
+      executed.outcome.payload.payload.device_type = viewport?.mode === "fixed" ? viewport.device_type : "desktop";
+    }
     // 交互命令在 Worker 内可能由多个 CDP 输入事件组成。动作中的
     // keyDown/click 可能已经触发导航，因此不能把 Worker 发送前的
     // binding 当作动作结果的页面状态。由 Main 在动作完成后读取同一

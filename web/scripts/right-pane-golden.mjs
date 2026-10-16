@@ -36,6 +36,7 @@ await withGoldenViteServer(async (server) => {
   );
   const pane = rightPane.getRightPaneState('workspace-golden\u0000session-golden');
   assert.equal(pane.openTabs.length, 2);
+  assert.equal(pane.collapsed, true, '后台页面同步不能展开右栏');
   assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-golden');
   assert.equal((pane.openTabs[0].payload).url, 'https://example.com/');
 
@@ -63,7 +64,7 @@ await withGoldenViteServer(async (server) => {
       }],
     },
   );
-  assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-second');
+  assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-golden', 'Authority 工具路由不能切换用户正在看的 Tab');
 
   rightPane.synchronizeBrowserTabs(
     'workspace-golden',
@@ -84,7 +85,10 @@ await withGoldenViteServer(async (server) => {
     },
   );
   assert.equal((pane.openTabs[0].payload).url, 'https://example.com/');
-  assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-second');
+  assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-golden', 'Authority 工具路由不能切换用户正在看的 Tab');
+
+  rightPane.setActiveRightPaneTab('workspace-golden\u0000session-golden', 'browser:browser-session-golden:browser-tab-second');
+  assert.equal(pane.activeTabId, 'browser:browser-session-golden:browser-tab-second', '显式点击仍可切换 Tab');
 
   const [
     storeSource,
@@ -162,7 +166,7 @@ await withGoldenViteServer(async (server) => {
   assert.match(browserSource, /\.browser-toolbar \{[\s\S]*z-index: 10[\s\S]*isolation: isolate/u);
   assert.match(
     browserSource,
-    /class="browser-toolbar-tooltip"[\s\S]*style:position-anchor=\{tooltipAnchorName\}[\s\S]*\.browser-toolbar-tooltip \{[\s\S]*top: calc\(anchor\(bottom\) \+ 5px\);[\s\S]*left: anchor\(right\);[\s\S]*transform: translateX\(-100%\)/u,
+    /class="browser-toolbar-tooltip"[\s\S]*style:position-anchor=\{tooltipAnchorName\}[\s\S]*\.browser-toolbar-tooltip \{[\s\S]*top: calc\(anchor\(bottom\) \+ 5px\);[\s\S]*left: calc\(anchor\(right\) - 6px\);[\s\S]*transform: translateX\(-100%\)/u,
     '浏览器工具提示必须由 Renderer Top Layer 锚定在工具栏下方',
   );
   assert.match(browserSource, /const tooltipAnchorName = \$derived\(`/u);
@@ -176,21 +180,19 @@ await withGoldenViteServer(async (server) => {
     /if \(tooltipAnchorPreviousValue\) \{[\s\S]*?tooltipAnchorElement\.style\.setProperty\([\s\S]*?'anchor-name',[\s\S]*?tooltipAnchorPreviousValue,[\s\S]*?tooltipAnchorPreviousPriority,[\s\S]*?\)[\s\S]*?\} else \{[\s\S]*?removeProperty\('anchor-name'\)/u,
     'tooltip 关闭时必须恢复触发控件原有锚点',
   );
-  assert.match(browserSource, /style:position-anchor=\{viewportAnchorName\}/u);
-  assert.match(browserSource, /style:position-anchor=\{annotationHistoryAnchorName\}/u);
+  assert.match(browserSource, /style:position-anchor=\{toolbarAnchorName\}/u);
+  assert.match(browserSource, /style:position-anchor=\{toolbarAnchorName\}/u);
   assert.match(
     browserSource,
-    /\.viewport-popover,[\s\S]*?\.annotation-history-popover \{[\s\S]*?left: anchor\(right\);[\s\S]*?transform: translateX\(-100%\)/u,
-    '浏览器菜单必须以触发按钮右边缘为锚点向左展开',
+    /\.browser-actions-popover \{[\s\S]*?left: calc\(anchor\(right\) - 6px\);[\s\S]*?transform: translateX\(-100%\)/u,
+    '浏览器菜单必须以工具栏右边缘为锚点向左展开，窄面板不越界',
   );
   assert.doesNotMatch(browserSource, /right:\s*calc\(100vw\s*-\s*anchor\(right\)\)/u);
-  assert.match(browserSource, /function toggleViewportMenu\(\): void \{[\s\S]*?clearToolbarTooltip\(\);/u);
-  assert.match(browserSource, /function toggleAnnotationMenu\(\): void \{[\s\S]*?clearToolbarTooltip\(\);/u);
+  assert.match(browserSource, /function toggleDeviceEmulation\(\): void \{[\s\S]*?clearToolbarTooltip\(\);/u);
+  assert.match(browserSource, /function toggleActionsMenu\(\): void \{[\s\S]*?clearToolbarTooltip\(\);/u);
   for (const action of [
     'browser\.viewport\.control',
-    'browser\.action\.screenshot',
-    'browser\.action\.annotate',
-    'browser\.annotation\.history',
+    'browser\.action\.more',
   ]) {
     assert.match(
       browserSource,
@@ -201,12 +203,13 @@ await withGoldenViteServer(async (server) => {
   assert.doesNotMatch(browserSource, /\.toolbar-edge-button\[data-tooltip\]::after/u);
   assert.match(browserSource, /\.browser-surface-slot \{[\s\S]*display: flex;[\s\S]*flex: 1;[\s\S]*overflow: hidden;/u);
   assert.match(browserSource, /\.browser-webview \{[\s\S]*width: 100%;[\s\S]*height: 100%;/u);
-  assert.match(browserSource, /\{#if viewportMenuOpen\}[\s\S]*class="viewport-popover"/u);
-  assert.match(browserSource, /\{#if annotationMenuOpen\}[\s\S]*class="annotation-history-popover"/u);
+  assert.match(browserSource, /\{#if mobileEmulation && !appLevelSurface\}[\s\S]*class="viewport-toolbar"/u);
+  assert.match(browserSource, /\{#if actionsMenuOpen\}[\s\S]*class="browser-actions-popover"/u);
   assert.match(browserSource, /\.annotation-editor \{[\s\S]*top: calc\(anchor\(bottom\) - 12px\);[\s\S]*transform: translateY\(-100%\)/u);
   assert.match(browserSource, /\.browser-download-panel \{[\s\S]*top: calc\(anchor\(bottom\) - 10px\);[\s\S]*transform: translateY\(-100%\)/u);
   assert.doesNotMatch(browserSource, /100v[hw]\s*-\s*anchor\(/u);
-  assert.match(browserSource, /VIEWPORT_DEVICE_MODES[\s\S]*id: 'wide'[\s\S]*id: 'narrow'/u);
+  assert.doesNotMatch(browserSource, /VIEWPORT_DEVICE_MODES|selectedViewportPreset|viewport-device-type/u);
+  assert.match(browserSource, /class="viewport-preset"[\s\S]*value=\{mobileViewportPreset\}[\s\S]*onchange=\{selectMobileViewportPreset\}/u);
   assert.match(browserSource, /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS/u);
   assert.match(browserSource, /magi:browserScreenshotCaptured/u);
   assert.match(browserSource, /magi:browserNodeSelected/u);

@@ -1091,7 +1091,7 @@ test("P1-12 代理保留集合由 Main 持有，所有控制释放路径都清�
   assert.ok(setStart >= 0 && setEnd > setStart);
   assert.match(
     source.slice(setStart, setEnd),
-    /if \(!changed\) return;[\s\S]*this\.#onAgentRetentionChanged\?\.\(\)/u,
+    /if \(!changed\) return;[\s\S]*this\.#onRuntimeStateChanged\?\.\(\)/u,
   );
   assert.match(
     normalizedSource,
@@ -1113,7 +1113,7 @@ test("P1-12 代理保留集合由 Main 持有，所有控制释放路径都清�
   );
   assert.match(
     normalizeSourceWhitespace(indexSource),
-    /onAgentRetentionChanged: \(\) => windowManager\?\.publishSnapshots\(\)/u,
+    /onRuntimeStateChanged: \(\) => windowManager\?\.publishSnapshots\(\)/u,
   );
 });
 
@@ -1141,7 +1141,7 @@ test("P1-12 右栏浏览器宿主是唯一的 tabId 键控列表，保留页面�
     normalizedRightPane,
     /class:right-pane-browser-tab-host--background=\{retainedInBackground\}/u,
   );
-  assert.match(normalizedRightPane, /backgroundHost=\{retainedInBackground\}/u);
+  assert.match(normalizedRightPane, /retainedForAgent=\{retainedTabIds\.has\(host\.tabId\)\}/u);
   assert.match(
     normalizedRightPane,
     /\.right-pane-browser-tab-host--background \{ transform: translate3d\(-20000px, 0, 0\)/u,
@@ -1180,6 +1180,6 @@ test("浏览器内容槽上方挂载 Magi 光标覆盖层，并随接管或控�
   assert.match(normalizedBrowserTab, /point: agentCursorPoint\(event\.displayX, event\.displayY\)/u);
   assert.match(
     normalizedBrowserTab,
-    /function clearAgentControl\(\): void \{ agentControlling = false; agentCursorSignal = \{ sequence: \+\+agentCursorSequence, visible: false/u,
+    /function clearAgentControl\(\): void \{ agentCursorSignal = \{ sequence: \+\+agentCursorSequence, visible: false/u,
   );
 });

@@ -201,16 +201,6 @@ pub enum BrowserDeviceType {
     Mobile,
 }
 
-impl BrowserDeviceType {
-    pub fn for_dimensions(width: u32) -> Self {
-        if width <= 600 {
-            Self::Mobile
-        } else {
-            Self::Desktop
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserViewportMode {

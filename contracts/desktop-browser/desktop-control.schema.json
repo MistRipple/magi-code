@@ -781,6 +781,7 @@
         "bounds"
       ],
       "properties": {
+        "device_type": { "enum": ["desktop", "mobile"] },
         "navigation_revision": { "type": "integer", "minimum": 0 },
         "viewport_width": { "type": "integer", "minimum": 0 },
         "viewport_height": { "type": "integer", "minimum": 0 },

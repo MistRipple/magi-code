@@ -348,6 +348,7 @@
         sessionId={sessionId}
         desktopSurface={desktopSurface}
         surfaceScope="app"
+        hostVisible={hostVisible(host.tabId)}
         onTitleChange={onTitleChange}
       />
     </div>
