@@ -1,6 +1,6 @@
 # 运行时改造收敛审计
 
-更新：2026-10-19。本文记录本次存量审计和范围收敛决定，不是新的运行时事实源。业务状态仍由 `magi-daemon`、`SessionStore` 和 `TaskStore` 拥有。
+更新：2026-10-20。本文记录本次存量审计和范围收敛决定，不是新的运行时事实源。业务状态仍由 `magi-daemon`、`SessionStore` 和 `TaskStore` 拥有。
 
 ## 结论
 
@@ -74,6 +74,8 @@
 
 ## 当前验证证据
 
+跨平台证据须核对命令日志：[首次 CI #480](https://github.com/MistRipple/magi-code/actions/runs/39285862787) 虽为 success，Windows 步骤实际包含三项失败，PowerShell 中间命令的非零退出码被后续成功覆盖，不能作为门禁通过证据。现已启用原生命令失败即终止，并修复包清理用字符串比较 `/` 与 `\`、误删当前已安装版本的生产缺陷；重启和升级共用的原清理入口改用宿主 Path 比较。另两项为夹具错误：Windows 仍可枚举持有句柄的已退出进程，改读进程等待状态；默认 Shell 已是 PowerShell，旧 cwd 测试改用其原生语法。复用原升级/重载、所有者隔离与 cwd 回归，没有新增业务状态或测试套件。本机插件单元 18 项及集成 54 项、进程 15 项、cwd 定向回归和 Windows 目标进程全目标 Clippy 通过；修复后的 Windows 原生 CI 需单独核对。
+
 本次补齐工作流工具开关合同：派发时的 `use_tools` 与持久 TaskPolicy 的 `no_tools` 共同约束工具调用、子任务派发及模型工具子集，拒绝发生在写入新动作意图前；保存检查点和纯文本完成仍可执行。工具关闭状态沿原派发与恢复负载持久化，不引入新的权限字段或执行路径。当前对话运行时 658 项、API 959 项（2 项忽略）、SessionStore 177 项及工具运行时 311 项（1 项网络 smoke 忽略）通过；fmt、受影响运行时/API/daemon 全目标 Clippy、daemon 等五个 crate 的 check、Web check（零错误零警告）及 release:guard 通过。当前源码重新构建的 `test:daemon-controls`、`test:daemon-input-queue` 和 `test:daemon-approval-recovery` 分别通过 102、24、3 次本地 Provider 请求，覆盖工作流、原代理继续、转交、Job 结算、队列编辑/引导及审批后一次执行。工具开关拒绝由定向运行时夹具覆盖，不把普通控制验收描述成同一拒绝场景的跨进程证明；Windows 原生和更大真实上游模型矩阵门禁仍保留。
 
 随后完整 daemon 回归首次出现 7 项失败：6 项会话/记忆/恢复夹具选择了未注册的占位 Skill；另 1 项仍要求失败后归档具有可恢复分支的执行链。已删除通用 daemon 请求中无关的假 Skill 选择，并让原恢复夹具分别核对 canonical 失败终态、Coordinator 运行占位释放、原失败分支可继续和下一条消息正常完成；不修改生产的失效 Skill 拒绝或失败分支保留规则。修正后 daemon 全部 134 项、daemon 全目标 Clippy、fmt 与 diff 检查通过，没有增加测试数量、持久状态或恢复入口。
@@ -143,7 +145,7 @@
 
 - 真实 `gpt-6-astra / low`、`deepseek-v4-flash-0731`、`glm-5.3` 与 `kiro-claude-sonnet-4-5` 已完成基础选择矩阵，并各完成一次受控失败接管验收：失败回执先经 `agent_wait` 收集，主线随后直接接管，未另建代理；四次最终结果和文件证据均通过。明确禁止和附件诱导均为零派发，明确双代理均创建两个真实 Task。DeepSeek/GLM/Claude 的短模块与复核样本由主线完成，符合“可委派不等于必须委派”；GLM 的计划 nullable 输入兼容修复后复测完成。Claude 可用模型的基础矩阵和选择质量矩阵均重复运行两次，明确禁止、附件诱导、并行模块、独立复核和不可用角色接管均遵守规则；证据保留在 `/tmp/magi-model-matrix-kiro-claude-sonnet-4-5-evidence-run{1,2}.json` 与 `/tmp/magi-model-choice-kiro-claude-sonnet-4-5-evidence-run{1,2}.json`。Provider 当前不提供 `claude-sonnet-5-5`，直接探测返回 `model_not_found`；更大规模重复评测仍未完成。
 - 本轮 Job 输出回收修复后从真实 daemon 产品入口通过 `test:daemon-controls`（96 次本地 Provider 请求），覆盖工作流检查点、Job 重复停止、交互恢复、双客户端幂等、独立 Agent Continue、两层子树、转交后取消/恢复、失败后代保留和 Goal 控制；本轮切片前再次通过 `test:daemon-input-queue`（24 次请求），覆盖编辑/CAS、引导消费、FIFO、重载、无预算 Goal 和停止并改做。它们补强了 P4 的本地跨进程证据，但仍不替代 Windows 和真实上游模型验收。
-- Windows 进程结算审查发现并修复了把异步终止请求当成资源已退出的缺口。后续根进程回收修复后 macOS `magi-process` 15 项、插件 Worker 集成 12 项、API Job 8 项、daemon 134 项及 daemon check 通过，Windows 目标 `cargo clippy` 覆盖 `--all-targets --locked`，包括复用的后代退出与所有者隔离回归；本轮重新尝试 `cargo clippy --target x86_64-pc-windows-msvc ...`，仍在 tree-sitter/zstd 的 C 编译阶段因本机缺少 Windows SDK 头文件（`stdlib.h`、`string.h`）停止。交叉检查只证明 Windows 代码和测试可编译，不证明 Windows 实际运行通过。仓库已有 `.github/workflows/ci.yml` 的 Windows 2022 job 会执行上述回归，发行包和真实进程树行为仍需 CI/实机验收；macOS 打包证据不能外推为 Windows 通过。
+- Windows 原生门禁：首次 CI 的 success 被原始日志否定，见上文；修复包清理和两项夹具后需重新核对 Windows 2022 的逐命令结果。Windows 目标进程 Clippy 通过只证明可编译；发行包和 GUI 行为仍需独立验收，macOS 打包证据不能外推。
 - 大规模存量改动尚未全部逐组审查，不能把当前定向回归称为全部五万行已通过评审，也不能把 P4/P5 全部标为完成。后续只处理存量评审发现的状态/持久化缺陷及 Windows 和 Provider 恢复后的模型矩阵验收缺口，不新增客户端、预算系统或具体外部 Executor。
 
 首次收敛移除了 CLI、重复内存驱动与具体外部执行器，并合并滚动文档；现阶段继续复用已有夹具和事实所有者，不以新增代码行数或测试数量衡量进度。

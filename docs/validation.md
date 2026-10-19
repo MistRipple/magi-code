@@ -53,6 +53,8 @@ DOM 的 recovery、Git preflight、approval expiry、compaction 场景可单独�
 
 发布预检仍执行一次 Rust workspace 全量测试；不再紧接着重复执行已覆盖的本机平台测试。CI 的 Windows/macOS 专项任务继续验证对应操作系统差异。
 
+Windows CI 的多命令 PowerShell 步骤启用 `$PSNativeCommandUseErrorActionPreference = $true`，中间的 npm/cargo/Worker 失败必须立即失败该步骤。验收还须核对原始命令输出；仅有 Job 的绿色状态不能证明所有命令通过。插件清理回归应重载并读取当前包，避免只检查管理器打开成功却漏掉启动清理误删当前包。
+
 ## 性能测量
 
 只在处理性能问题或明确比较收益时采样，先验证终态、幂等、权限、取消和恢复。后端与 Renderer 使用各自时钟，不拼接为总延迟；辅助模型调用、失败、取消、阻塞和恢复单列。
