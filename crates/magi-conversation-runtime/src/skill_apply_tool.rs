@@ -132,9 +132,15 @@ pub fn execute_skill_apply_from_runtime(
             );
         }
     };
-    let skill = registry
-        .get(&canonical_skill_id)
-        .expect("resolved skill id must exist in registry");
+    // 名称解析与实际读取之间可能发生移除；撤销是正常失败，不能 panic。
+    let Some(skill) = registry.get(&canonical_skill_id) else {
+        return skill_apply_failed(
+            "skill_apply_not_found",
+            SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR,
+            Some(skill_name),
+            Vec::new(),
+        );
+    };
     let skill_id = skill.skill_id.clone();
     let title = skill.title.clone();
     let custom_tools = skill
@@ -245,6 +251,35 @@ mod tests {
                 .unwrap()
                 .contains("产品稳定性")
         );
+    }
+
+    #[test]
+    fn concurrent_skill_removal_returns_a_receipt_without_panicking() {
+        let runtime = make_skill_runtime();
+        let registry = runtime.registry();
+        let skill = registry.get("code-review").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let start = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            start.wait();
+            for _ in 0..10_000 {
+                registry.replace([]);
+                std::thread::yield_now();
+                registry.replace([skill.clone()]);
+            }
+        });
+        barrier.wait();
+        for _ in 0..10_000 {
+            let (payload, status) =
+                execute_skill_apply_from_runtime(r#"{"skill_name":"code-review"}"#, Some(&runtime));
+            let receipt: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            if status == ExecutionResultStatus::Succeeded {
+                assert_eq!(receipt["skill_name"], "code-review");
+            } else {
+                assert_eq!(receipt["error_code"], "skill_apply_not_found");
+            }
+        }
+        writer.join().unwrap();
     }
 
     #[test]

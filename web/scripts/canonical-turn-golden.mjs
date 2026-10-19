@@ -22,8 +22,61 @@ await withGoldenViteServer(async (server) => {
   assertUserCommandSurvivesAcceptanceAndReload(reducer, projection, userMessageCommand);
   assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore);
   assertSnapshotMergeKeepsLiveTurnIdentity(turnStore);
+  assertSteeringConsumptionReceipts(reducer, projection, canonicalProtocol);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
+
+function assertSteeringConsumptionReceipts(reducer, projection, protocol) {
+  const c = baseCase('input-receipt', 'session-input-receipt', 'turn-input-receipt', 100);
+  const guidance = user(c, 1, '补充要求');
+  guidance.metadata = { route: 'steer', requestId: 'input-guidance' };
+  const initial = turn(c, 'running', [guidance]);
+  let state = reducer.replaceCanonicalTurns(c.sessionId, [initial]);
+  const receipt = () => projection.buildCanonicalTimelineProjection(state).artifacts[0].message.metadata.inputDelivery;
+  assert.equal(receipt(), 'waiting');
+  const started = { stepId: 'step-guidance', status: 'started', purpose: 'execution',
+    inputRequestIds: ['input-guidance'], startedAt: 110, settledAt: null };
+  const stepEvent = (sequence, step) => protocol.parseCanonicalTurnEventPayload({
+    canonical_schema_version: 'canonical-turn.v1', canonical_event_kind: 'model_step_updated',
+    canonical_event_id: `input-step-${sequence}`, canonical_event_seq: sequence,
+    canonical_occurred_at: sequence + 110, session_id: c.sessionId,
+    turn_id: c.turnId, turn_seq: c.turnSeq, canonical_model_step: step,
+  });
+  const apply = (step) => {
+    const result = reducer.reduceCanonicalTurnEvent(state, step);
+    assert.equal(result.error, undefined);
+    state = result.state;
+  };
+  const compact = { ...started, stepId: 'compact', purpose: 'context_compaction' };
+  apply(stepEvent(1, compact));
+  assert.equal(receipt(), 'waiting', '压缩请求不消费当前任务补充');
+  apply(stepEvent(2, started));
+  assert.equal(receipt(), 'in_request');
+  state = reducer.replaceCanonicalTurns(c.sessionId,
+    [protocol.normalizeCanonicalTurnStrict(JSON.parse(JSON.stringify(state.turns[0])))]);
+  assert.equal(receipt(), 'in_request', '历史重载保留冻结请求事实');
+  apply(stepEvent(3, { ...started, status: 'response_received', settledAt: 120 }));
+  assert.equal(receipt(), 'used');
+  apply(event(c, 4, 'turn_item_upsert', { turn: { ...initial, modelSteps: [started] } }));
+  assert.equal(receipt(), 'used', '迟到的 item 快照不能撤回消费回执');
+  apply(stepEvent(2, started));
+  assert.equal(receipt(), 'used', '旧事件不能覆盖新回执');
+  state = reducer.replaceCanonicalTurns(c.sessionId,
+    [turn(c, 'interrupted', [guidance], { modelSteps: [started] })]);
+  assert.equal(receipt(), 'outcome_unknown', '重启后在途请求不能展示为已使用');
+  state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'cancelled', [guidance])]);
+  assert.equal(receipt(), 'not_recorded', '接纳后取消、没有冻结请求的补充不能冒充已使用');
+  const missing = reducer.reduceCanonicalTurnEvent(reducer.createCanonicalTurnReducerState(c.sessionId), stepEvent(5, started));
+  assert.equal(missing.recoveryRequired, true, '没有 Turn 基线时请求恢复，不能发明任务状态');
+  const resumed = reducer.reduceCanonicalTurnEvent(reducer.createCanonicalTurnReducerState(c.sessionId),
+    { ...stepEvent(5, started), turn: turn(c, 'running', []) });
+  assert.equal(resumed.error, undefined, '独立代理的 Step 携带服务端 Turn 基线时可直接接纳');
+  assert.equal(resumed.state.turns[0].status, 'running');
+  const conflict = reducer.reduceCanonicalTurnEvent(resumed.state,
+    stepEvent(6, { ...started, inputRequestIds: ['another-input'] }));
+  assert.match(conflict.error, /immutable request/);
+  assert.throws(() => stepEvent(6, { ...started, status: 'response_received' }), /invalid model Step/);
+}
 
 function installGoldenMemoryBridge(bridgeRuntime) {
   let bridgeState;

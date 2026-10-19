@@ -15,11 +15,27 @@
     "session/list",
     "session/read",
     "turn/start",
+    "turn/interrupt",
+    "session/interactions",
+    "session/approval/resolve",
+    "session/question/resolve",
+    "goal/read",
+    "goal/pause",
+    "goal/resume",
+    "goal/clear",
+    "goal/update",
     "events/subscribe",
     "browser/tools/list",
     "browser/tool",
     "approval/request",
-    "$/cancelRequest"
+    "$/cancelRequest",
+    "session/queue/read",
+    "session/queue/remove",
+    "session/queue/update",
+    "session/queue/retry",
+    "session/queue/guide",
+    "agent/transfer",
+    "agent/continue"
   ],
   "x-method-signatures": {
     "initialize": {
@@ -75,6 +91,86 @@
     "$/cancelRequest": {
       "kind": "notification",
       "params": "CancelRequestParams"
+    },
+    "turn/interrupt": {
+      "kind": "request",
+      "params": "TurnInterruptParams",
+      "result": "TurnInterruptResult"
+    },
+    "session/interactions": {
+      "kind": "request",
+      "params": "SessionInteractionScope",
+      "result": "SessionInteractionsResult"
+    },
+    "session/approval/resolve": {
+      "kind": "request",
+      "params": "ResolveToolApprovalParams",
+      "result": "ResolveToolApprovalResult"
+    },
+    "session/question/resolve": {
+      "kind": "request",
+      "params": "ResolveUserQuestionParams",
+      "result": "ResolveUserQuestionResult"
+    },
+    "goal/read": {
+      "kind": "request",
+      "params": "GoalReadParams",
+      "result": "GoalSnapshot"
+    },
+    "goal/pause": {
+      "kind": "request",
+      "params": "GoalActionParams",
+      "result": "GoalSnapshot"
+    },
+    "goal/resume": {
+      "kind": "request",
+      "params": "GoalActionParams",
+      "result": "GoalSnapshot"
+    },
+    "goal/clear": {
+      "kind": "request",
+      "params": "GoalActionParams",
+      "result": "GoalSnapshot"
+    },
+    "goal/update": {
+      "kind": "request",
+      "params": "GoalUpdateParams",
+      "result": "GoalSnapshot"
+    },
+    "session/queue/read": {
+      "kind": "request",
+      "params": "SessionInteractionScope",
+      "result": "SessionQueueSnapshot"
+    },
+    "session/queue/remove": {
+      "kind": "request",
+      "params": "SessionQueueItemParams",
+      "result": "SessionQueueSnapshot"
+    },
+    "session/queue/update": {
+      "kind": "request",
+      "params": "SessionQueueUpdateParams",
+      "result": "SessionQueueSnapshot"
+    },
+    "session/queue/retry": {
+      "kind": "request",
+      "params": "SessionQueueItemParams",
+      "result": "SessionQueueSnapshot"
+    },
+    "session/queue/guide": {
+      "kind": "request",
+      "params": "SessionQueueGuideParams",
+      "result": "SessionQueueSnapshot"
+    },
+    "agent/transfer": {
+      "kind": "request",
+      "params": "AgentTransferParams",
+      "result": "AgentTransferResult"
+    },
+    "agent/continue": {
+      "kind": "request",
+      "params": "AgentContinueParams",
+      "result": "AgentContinueResult"
     }
   },
   "$ref": "#/$defs/JsonRpcMessage",
@@ -251,6 +347,31 @@
         },
         "browserTools": {
           "type": "boolean"
+        },
+        "turnInterrupt": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "sessionInteractions": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "goalControl": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "sessionQueue": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
+        },
+        "agentTransfer": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true
         }
       }
     },
@@ -810,6 +931,14 @@
           "maxItems": 8,
           "default": [],
           "x-rust-default": true
+        },
+        "interruptTurnId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "先持久化本输入，再停止指定当前 Turn；旧执行资源结算后开始新轮。不同于编辑重发的 replaceTurnId。",
+          "x-rust-default": true
         }
       }
     },
@@ -1244,6 +1373,14 @@
           "x-rust-default": true,
           "x-rust-type": "std::collections::HashMap<String, Value>",
           "x-ts-type": "Record<string, JsonValue>"
+        },
+        "modelSteps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelStep"
+          },
+          "default": [],
+          "x-rust-default": true
         }
       }
     },
@@ -2991,6 +3128,2022 @@
           "x-rust-type": "u64"
         },
         "value": {}
+      }
+    },
+    "SessionTurnGuideStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "no_active_turn",
+        "input_closed",
+        "unsupported_input",
+        "unsupported_executor"
+      ]
+    },
+    "SessionTurnGuideEffectiveAt": {
+      "type": "string",
+      "enum": [
+        "next_model_step",
+        "unavailable"
+      ]
+    },
+    "SessionTurnGuideInputSupport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "images",
+        "contextReferences",
+        "browserAnnotationRefs",
+        "pluginSelections"
+      ],
+      "properties": {
+        "text": {
+          "type": "boolean"
+        },
+        "images": {
+          "type": "boolean"
+        },
+        "contextReferences": {
+          "type": "boolean"
+        },
+        "browserAnnotationRefs": {
+          "type": "boolean"
+        },
+        "pluginSelections": {
+          "type": "boolean"
+        }
+      }
+    },
+    "SessionTurnGuideCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SessionTurnGuideStatus"
+        },
+        "targetTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectiveAt": {
+          "$ref": "#/$defs/SessionTurnGuideEffectiveAt"
+        },
+        "inputSupport": {
+          "$ref": "#/$defs/SessionTurnGuideInputSupport"
+        }
+      }
+    },
+    "SessionInboxCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epoch",
+        "throughSequence"
+      ],
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "throughSequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "ModelStepStatus": {
+      "type": "string",
+      "enum": [
+        "started",
+        "response_received",
+        "outcome_unknown"
+      ]
+    },
+    "ModelStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stepId",
+        "taskId",
+        "threadId",
+        "checkpointGeneration",
+        "requestFingerprint",
+        "provider",
+        "messageCount",
+        "toolCount",
+        "inputRequestIds",
+        "startedAt",
+        "settledAt",
+        "status",
+        "responseFingerprint",
+        "attempts"
+      ],
+      "properties": {
+        "stepId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-rust-type": "Option<String>"
+        },
+        "threadId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkpointGeneration": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "toolCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "inputRequestIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "startedAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "settledAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-rust-type": "Option<i64>"
+        },
+        "status": {
+          "$ref": "#/$defs/ModelStepStatus"
+        },
+        "responseFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ModelAttempt"
+          }
+        },
+        "binding": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ModelStepBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "maxOutputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "x-rust-type": "Option<u32>"
+        },
+        "goalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usageTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "goalTokensAfter": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "executorCapabilities": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ExecutorCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "purpose": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ModelStepPurpose"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ModelAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attemptId",
+        "startedAt",
+        "settledAt",
+        "status"
+      ],
+      "properties": {
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "startedAt": {
+          "type": "integer",
+          "x-rust-type": "i64"
+        },
+        "settledAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-rust-type": "Option<i64>"
+        },
+        "status": {
+          "$ref": "#/$defs/ModelStepStatus"
+        }
+      }
+    },
+    "ModelStepBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "provider",
+        "bindingRevision",
+        "settingsRevision"
+      ],
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bindingRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u32"
+        },
+        "settingsRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "SessionGoalUsageChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "goal_id",
+        "step_id"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ExecutorInputModality": {
+      "type": "string",
+      "enum": [
+        "text",
+        "image"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorSteerMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "between_steps",
+        "interruptible"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorResumeMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "checkpoint",
+        "native_session"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorToolMode": {
+      "type": "string",
+      "enum": [
+        "native_calls",
+        "magi_gateway",
+        "executor_owned",
+        "none"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorApprovalMode": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "delegated",
+        "unavailable"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorCancellationMode": {
+      "type": "string",
+      "enum": [
+        "signal",
+        "settled"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorContextOwnership": {
+      "type": "string",
+      "enum": [
+        "magi_owned",
+        "executor_owned"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ExecutorCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputModalities",
+        "steer",
+        "resume",
+        "tools",
+        "approvals",
+        "cancellation",
+        "context",
+        "structuredOutput",
+        "background",
+        "inspection",
+        "outputLimit"
+      ],
+      "properties": {
+        "inputModalities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ExecutorInputModality"
+          }
+        },
+        "steer": {
+          "$ref": "#/$defs/ExecutorSteerMode"
+        },
+        "resume": {
+          "$ref": "#/$defs/ExecutorResumeMode"
+        },
+        "tools": {
+          "$ref": "#/$defs/ExecutorToolMode"
+        },
+        "approvals": {
+          "$ref": "#/$defs/ExecutorApprovalMode"
+        },
+        "cancellation": {
+          "$ref": "#/$defs/ExecutorCancellationMode"
+        },
+        "context": {
+          "$ref": "#/$defs/ExecutorContextOwnership"
+        },
+        "structuredOutput": {
+          "type": "boolean"
+        },
+        "background": {
+          "type": "boolean"
+        },
+        "inspection": {
+          "type": "boolean"
+        },
+        "outputLimit": {
+          "type": "boolean"
+        }
+      },
+      "x-rust-derive-eq": true
+    },
+    "ModelStepPurpose": {
+      "type": "string",
+      "enum": [
+        "execution",
+        "context_compaction"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "TurnInterruptParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "expectedTurnId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnInterruptResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interrupted",
+        "sessionId",
+        "workspaceId",
+        "turnId",
+        "eventId",
+        "requestedAt",
+        "cancelledToolProcessCount",
+        "remainingQueuedTurnCount",
+        "nextQueuedTurnStarted",
+        "removedTimelineEntryIds"
+      ],
+      "properties": {
+        "interrupted": {
+          "type": "boolean"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventId": {
+          "type": "string"
+        },
+        "requestedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "cancelledToolProcessCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "remainingQueuedTurnCount": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "usize"
+        },
+        "nextQueuedTurnStarted": {
+          "type": "boolean"
+        },
+        "removedTimelineEntryIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "SessionInteractionScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ToolApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "allow_once",
+        "allow_for_turn",
+        "deny"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "ApprovalRequestAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "title"
+      ],
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "PendingToolApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "sessionId",
+        "taskId",
+        "turnId",
+        "toolCallId",
+        "toolName",
+        "reason",
+        "requestedAt"
+      ],
+      "properties": {
+        "approvalId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requestedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "agent": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ApprovalRequestAgent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "UserQuestionOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "default": "",
+          "x-rust-default": true
+        }
+      }
+    },
+    "UserQuestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "header",
+        "multiSelect",
+        "allowOther",
+        "options"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "header": {
+          "type": "string"
+        },
+        "multiSelect": {
+          "type": "boolean"
+        },
+        "allowOther": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestionOption"
+          }
+        }
+      }
+    },
+    "PendingUserQuestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "questionId",
+        "sessionId",
+        "turnId",
+        "toolCallId",
+        "questions",
+        "requestedAt",
+        "canSkip"
+      ],
+      "properties": {
+        "questionId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestion"
+          }
+        },
+        "requestedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "canSkip": {
+          "type": "boolean"
+        }
+      }
+    },
+    "UserQuestionAnswer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "selected": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "x-rust-default": true
+        },
+        "other": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "AnsweredQuestionKind": {
+      "type": "string",
+      "enum": [
+        "answered"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "SkippedQuestionKind": {
+      "type": "string",
+      "enum": [
+        "skipped"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "AnsweredQuestionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "answers"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/AnsweredQuestionKind"
+        },
+        "answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestionAnswer"
+          }
+        }
+      }
+    },
+    "SkippedQuestionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SkippedQuestionKind"
+        }
+      }
+    },
+    "UserQuestionResponse": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AnsweredQuestionResponse"
+        },
+        {
+          "$ref": "#/$defs/SkippedQuestionResponse"
+        }
+      ]
+    },
+    "SessionInteractionsResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "pendingApprovals",
+        "pendingQuestions"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "pendingApprovals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PendingToolApproval"
+          }
+        },
+        "pendingQuestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PendingUserQuestion"
+          }
+        }
+      }
+    },
+    "ResolveToolApprovalParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "approvalId",
+        "decision"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approvalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision": {
+          "$ref": "#/$defs/ToolApprovalDecision"
+        }
+      }
+    },
+    "ResolveToolApprovalResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "approvalId",
+        "decision",
+        "status"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "approvalId": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/ToolApprovalDecision"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "ResolveUserQuestionParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "questionId",
+        "response"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "questionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "response": {
+          "$ref": "#/$defs/UserQuestionResponse"
+        }
+      }
+    },
+    "ResolveUserQuestionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "questionId",
+        "status"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "questionId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "GoalStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused",
+        "blocked",
+        "complete"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "GoalContinuationPhase": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "running",
+        "waiting"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "GoalBlocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blockerKey",
+        "reason",
+        "consecutiveTurns",
+        "lastObservedTurnId"
+      ],
+      "properties": {
+        "blockerKey": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "consecutiveTurns": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u32"
+        },
+        "lastObservedTurnId": {
+          "type": "string"
+        }
+      }
+    },
+    "GoalContinuation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/GoalContinuationPhase"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "GoalCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turnId",
+        "summary",
+        "evidenceRefs",
+        "completedAt"
+      ],
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "planRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "completedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "SessionGoal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "goalId",
+        "sessionId",
+        "threadId",
+        "objective",
+        "status",
+        "controlRevision",
+        "accessProfile",
+        "tokensUsed",
+        "modelAttemptsUsed",
+        "timeUsedSeconds",
+        "timeUsedMillis",
+        "continuation",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "goalId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "createdByTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/GoalStatus"
+        },
+        "controlRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "accessProfile": {
+          "$ref": "#/$defs/AccessProfile"
+        },
+        "tokensUsed": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "modelAttemptsUsed": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "timeUsedSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "timeUsedMillis": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "timingStartedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "timingTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blocker": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GoalBlocker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "continuation": {
+          "$ref": "#/$defs/GoalContinuation"
+        },
+        "completion": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/GoalCompletion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "PlanItemStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "blocked",
+        "canceled"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "PlanState": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused",
+        "completed",
+        "canceled"
+      ],
+      "x-rust-derive-eq": true
+    },
+    "PlanItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itemId",
+        "title",
+        "status"
+      ],
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanItemStatus"
+        }
+      }
+    },
+    "SessionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planId",
+        "sessionId",
+        "revision",
+        "language",
+        "state",
+        "items",
+        "taskBindings",
+        "updatedAt"
+      ],
+      "properties": {
+        "planId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "goalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "language": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/PlanState"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanItem"
+          }
+        },
+        "taskBindings": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "x-rust-type": "std::collections::BTreeMap<String, String>",
+          "x-ts-type": "Record<string, string>"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      }
+    },
+    "GoalAllowedActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canEdit",
+        "canPause",
+        "canResume",
+        "canClear"
+      ],
+      "properties": {
+        "canEdit": {
+          "type": "boolean"
+        },
+        "canPause": {
+          "type": "boolean"
+        },
+        "canResume": {
+          "type": "boolean"
+        },
+        "canClear": {
+          "type": "boolean"
+        }
+      },
+      "x-rust-derive-default": true
+    },
+    "GoalSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "workspaceId",
+        "workspacePath",
+        "observedAt",
+        "goal",
+        "plan",
+        "allowedActions"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "goal": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SessionGoal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SessionPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allowedActions": {
+          "$ref": "#/$defs/GoalAllowedActions"
+        }
+      }
+    },
+    "GoalReadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "scope"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        }
+      }
+    },
+    "GoalActionParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "scope",
+        "goalId",
+        "expectedRevision"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        },
+        "goalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "expectedPlanRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "accessProfile": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AccessProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GoalUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "scope",
+        "goalId",
+        "expectedRevision",
+        "objective"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        },
+        "goalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "expectedPlanRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "x-rust-type": "Option<u64>"
+        },
+        "objective": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "SessionQueueItemParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "queueId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queueId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "x-rust-type": "Option<u64>",
+          "description": "兼容已有 HTTP 客户端；App Server 队列变更必须提供当前输入 revision。"
+        }
+      }
+    },
+    "SessionQueueUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "queueId", "expectedRevision", "request"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": ["string", "null"] },
+        "workspacePath": { "type": ["string", "null"] },
+        "queueId": { "type": "string", "minLength": 1 },
+        "expectedRevision": { "type": "integer", "minimum": 1, "x-rust-type": "u64" },
+        "request": { "$ref": "#/$defs/TurnStartParams" }
+      }
+    },
+    "SessionQueueGuideParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "queueId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queueId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "x-rust-type": "Option<u64>",
+          "description": "兼容已有 HTTP 客户端；App Server 队列变更必须提供当前输入 revision。"
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1,
+          "default": "",
+          "x-rust-default": true
+        }
+      }
+    },
+    "QueuedSessionTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "queueId",
+        "queuePosition",
+        "requestId",
+        "sessionId",
+        "workspaceId",
+        "workspacePath",
+        "acceptedAt",
+        "content",
+        "text",
+        "command",
+        "workflowId",
+        "pluginCommandId",
+        "skillName",
+        "goalMode",
+        "accessProfile",
+        "images",
+        "contextReferences",
+        "browserAnnotationRefs",
+        "browserNodeSelections",
+        "pluginSelections",
+        "guide",
+        "retryCount",
+        "interruptTurnId",
+        "interruptionError"
+      ],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "queueId": {
+          "type": "string"
+        },
+        "queuePosition": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "requestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acceptedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "content": {
+          "type": "string"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SessionTurnCommand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflowId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pluginCommandId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skillName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goalMode": {
+          "type": "boolean"
+        },
+        "accessProfile": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AccessProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionTurnImage"
+          }
+        },
+        "contextReferences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionContextReference"
+          }
+        },
+        "browserAnnotationRefs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "browserNodeSelections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BrowserNodeSelection"
+          }
+        },
+        "pluginSelections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginSelection"
+          }
+        },
+        "guide": {
+          "$ref": "#/$defs/SessionTurnGuideCapability"
+        },
+        "retryCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "x-rust-type": "u8"
+        },
+        "interruptTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interruptionError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionQueueSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cursor",
+        "sessionId",
+        "queuedTurns"
+      ],
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/SessionInboxCursor"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "queuedTurns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QueuedSessionTurn"
+          }
+        }
+      }
+    },
+    "AgentTransferTarget": {
+      "type": "string",
+      "enum": [
+        "session",
+        "goal"
+      ]
+    },
+    "AgentTransferParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "scope",
+        "operationId",
+        "taskId",
+        "expectedParentTurnId",
+        "expectedGeneration",
+        "owner"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedParentTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "owner": {
+          "$ref": "#/$defs/AgentTransferTarget"
+        },
+        "goalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedGoalControlRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "x-rust-type": "Option<u64>"
+        }
+      }
+    },
+    "AgentTransferResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "operationId",
+        "taskId",
+        "sourceTurnId",
+        "activationGeneration",
+        "owner",
+        "transferredAt",
+        "runnerStarted"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        },
+        "activationGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "owner": {
+          "$ref": "#/$defs/AgentTransferTarget"
+        },
+        "goalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goalControlRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-rust-type": "Option<u64>"
+        },
+        "transferredAt": {
+          "type": "integer",
+          "x-rust-type": "u64"
+        },
+        "runnerStarted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "AgentContinueParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "scope",
+        "operationId",
+        "taskId",
+        "expectedTurnId",
+        "expectedGeneration"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "$ref": "#/$defs/SessionScope"
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspacePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "AgentContinueResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "taskId",
+        "operationId",
+        "sourceTurnId",
+        "turnId",
+        "replayed"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replayed": {
+          "type": "boolean"
+        }
       }
     }
   }

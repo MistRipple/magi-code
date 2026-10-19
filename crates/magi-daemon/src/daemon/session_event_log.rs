@@ -4,6 +4,7 @@ use magi_core::{SessionId, UtcMillis};
 use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnEvent, CanonicalTurnEventKind,
     CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnMutation, CanonicalTurnStatus,
+    SessionInput, SessionInputMutation, SessionInputState,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +30,8 @@ struct CanonicalEventCheckpoint {
     session_id: SessionId,
     last_event_seq: u64,
     canonical_turns: Vec<CanonicalTurn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inputs: Vec<SessionInput>,
     accepted_submissions: Vec<AcceptedSubmissionRecord>,
 }
 
@@ -65,6 +68,7 @@ pub(crate) struct SessionConversationProjection {
     session_id: Option<SessionId>,
     last_event_seq: u64,
     canonical_turns: Vec<CanonicalTurn>,
+    inputs: Vec<SessionInput>,
     accepted_submissions: Vec<AcceptedSubmissionRecord>,
     /// 已释放回合：只保留事件游标与 accepted 记录。回合事实在 SessionStore 里另有一份，
     /// 不活跃的会话没必要在这里再常驻一份完整副本；再次写入该会话前必须从事件目录重放。
@@ -141,6 +145,21 @@ impl SessionConversationProjection {
             projection.last_event_seq = checkpoint.last_event_seq;
             projection.canonical_turns = checkpoint.canonical_turns;
             projection.accepted_submissions = checkpoint.accepted_submissions;
+            for input in checkpoint.inputs {
+                input
+                    .validate_snapshot()
+                    .map_err(|error| DaemonError::internal(error.to_string()))?;
+                if input.session_id != *session_id
+                    || projection.inputs.iter().any(|existing| {
+                        existing.input_id == input.input_id
+                            || existing.request_id == input.request_id
+                    })
+                {
+                    return Err(DaemonError::internal("checkpoint 输入归属或身份冲突"));
+                }
+                validate_input_binding(&input, &projection.canonical_turns)?;
+                projection.inputs.push(input);
+            }
         }
 
         let mut seen_event_ids = HashSet::new();
@@ -182,28 +201,14 @@ impl SessionConversationProjection {
     }
 
     /// 在一个原子 segment 内提交一次真实 SessionStore mutation。
-    pub(crate) fn append_transaction(
+    #[cfg(test)]
+    fn append_transaction(
         &self,
         event_root: &Path,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
     ) -> Result<Self, DaemonError> {
-        self.append_transaction_inner(event_root, session_id, mutations, None)
-    }
-
-    /// 将 accepted 事实与 canonical 事件写入同一个 event segment。
-    ///
-    /// event segment 是本次提交唯一的 durable 边界：accepted session、sidecar 和 task
-    /// 恢复信息不再先写一个 accepted journal、再写 canonical event，从而避免一次发送
-    /// 产生两次同步磁盘写入和两个可能分裂的提交点。
-    pub(crate) fn append_transaction_with_acceptance(
-        &self,
-        event_root: &Path,
-        session_id: &SessionId,
-        mutations: &[CanonicalTurnMutation],
-        acceptance: AcceptedSubmissionRecord,
-    ) -> Result<Self, DaemonError> {
-        self.append_transaction_inner(event_root, session_id, mutations, Some(acceptance))
+        self.append_transaction_inner(event_root, session_id, mutations, &[], None)
     }
 
     fn append_transaction_inner(
@@ -211,10 +216,11 @@ impl SessionConversationProjection {
         event_root: &Path,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> Result<Self, DaemonError> {
-        let (mut next, transaction) =
-            self.plan_transaction_inner(event_root, session_id, mutations, acceptance)?;
+        let (mut next, transaction) = self
+            .plan_transaction_inner(event_root, session_id, mutations, inputs, acceptance, false)?;
         let Some(transaction) = transaction else {
             return Ok(next);
         };
@@ -272,6 +278,7 @@ impl SessionConversationProjection {
             session_id: session_id.clone(),
             last_event_seq: self.last_event_seq,
             canonical_turns: self.canonical_turns.clone(),
+            inputs: self.inputs.clone(),
             accepted_submissions: self.accepted_submissions.clone(),
         };
         magi_core::fs_atomic::write_atomic(
@@ -308,9 +315,10 @@ impl SessionConversationProjection {
         event_root: &Path,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
     ) -> Result<PreparedCanonicalEventWrite, DaemonError> {
         let (projection, transaction) =
-            self.plan_transaction_inner(event_root, session_id, mutations, None)?;
+            self.plan_transaction_inner(event_root, session_id, mutations, inputs, None, true)?;
         let transaction = transaction.ok_or_else(|| {
             DaemonError::internal("canonical event 导入没有产生可提交事件".to_string())
         })?;
@@ -339,14 +347,16 @@ impl SessionConversationProjection {
         event_root: &Path,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
+        importing: bool,
     ) -> Result<(Self, Option<CanonicalEventTransaction>), DaemonError> {
         if self.released {
             return Err(DaemonError::internal(format!(
                 "canonical projection 的回合已释放，写入前必须先从事件目录重放: {session_id}"
             )));
         }
-        if mutations.is_empty() {
+        if mutations.is_empty() && inputs.is_empty() {
             return Err(DaemonError::internal(
                 "canonical event transaction 不能为空".to_string(),
             ));
@@ -371,6 +381,37 @@ impl SessionConversationProjection {
         let mut events = Vec::new();
         for mutation in mutations {
             next.plan_mutation(session_id, mutation, &mut events)?;
+        }
+        for mutation in inputs {
+            let previous = next
+                .inputs
+                .iter()
+                .find(|input| input.input_id == mutation.next.input_id)
+                .cloned();
+            if previous != mutation.previous {
+                return Err(DaemonError::internal("Input 事务前置状态冲突"));
+            }
+            let seq = next.last_event_seq.saturating_add(1);
+            let event = CanonicalTurnEvent {
+                schema_version: CANONICAL_TURN_SCHEMA_VERSION.into(),
+                event_id: event_id(session_id, seq),
+                event_seq: seq,
+                kind: if importing {
+                    CanonicalTurnEventKind::InputImported
+                } else {
+                    CanonicalTurnEventKind::InputUpdated
+                },
+                session_id: session_id.clone(),
+                turn_id: String::new(),
+                turn_seq: 0,
+                occurred_at: mutation.next.accepted_at,
+                turn: None,
+                item: None,
+                input: Some(mutation.next.clone()),
+                model_step: None,
+            };
+            next.apply_event(event.clone())?;
+            events.push(event);
         }
         if events.is_empty() {
             if acceptance.is_some() {
@@ -404,6 +445,21 @@ impl SessionConversationProjection {
             acceptance,
         };
         Ok((next, Some(transaction)))
+    }
+
+    pub(crate) fn append_session_transaction(
+        &self,
+        event_root: &Path,
+        session_id: &SessionId,
+        mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
+        acceptance: Option<AcceptedSubmissionRecord>,
+    ) -> Result<Self, DaemonError> {
+        self.append_transaction_inner(event_root, session_id, mutations, inputs, acceptance)
+    }
+
+    pub(crate) fn inputs(&self) -> &[SessionInput] {
+        &self.inputs
     }
 
     pub(crate) fn last_event_seq(&self) -> u64 {
@@ -473,6 +529,7 @@ impl SessionConversationProjection {
         match current {
             None => {
                 let mut started = turn_shell(&next_turn);
+                started.model_steps.clear();
                 started.status = CanonicalTurnStatus::Pending;
                 started.completed_at = None;
                 started.response_duration_ms = None;
@@ -494,6 +551,9 @@ impl SessionConversationProjection {
                         item.updated_at,
                         events,
                     )?;
+                }
+                for step in &next_turn.model_steps {
+                    self.push_planned_step_event(session_id, &next_turn, step, events)?;
                 }
                 let current_shell = self
                     .canonical_turns
@@ -548,7 +608,17 @@ impl SessionConversationProjection {
                         )?;
                     }
                 }
-                if turn_shell(&previous) != turn_shell(&next_turn) {
+                for step in &next_turn.model_steps {
+                    if previous
+                        .model_steps
+                        .iter()
+                        .find(|old| old.step_id == step.step_id)
+                        != Some(step)
+                    {
+                        self.push_planned_step_event(session_id, &next_turn, step, events)?;
+                    }
+                }
+                if turn_header(&previous) != turn_header(&next_turn) {
                     self.push_planned_event(
                         session_id,
                         turn_event_kind(next_turn.status),
@@ -577,6 +647,33 @@ impl SessionConversationProjection {
                 next_turn.turn_id
             )));
         }
+        Ok(())
+    }
+
+    fn push_planned_step_event(
+        &mut self,
+        session_id: &SessionId,
+        turn: &CanonicalTurn,
+        step: &magi_session_store::ModelStep,
+        events: &mut Vec<CanonicalTurnEvent>,
+    ) -> Result<(), DaemonError> {
+        let seq = self.last_event_seq.saturating_add(1);
+        let event = CanonicalTurnEvent {
+            schema_version: CANONICAL_TURN_SCHEMA_VERSION.into(),
+            event_id: event_id(session_id, seq),
+            event_seq: seq,
+            kind: CanonicalTurnEventKind::ModelStepUpdated,
+            session_id: session_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            turn_seq: turn.turn_seq,
+            occurred_at: step.settled_at.unwrap_or(step.started_at),
+            turn: None,
+            item: None,
+            input: None,
+            model_step: Some(step.clone()),
+        };
+        self.apply_event(event.clone())?;
+        events.push(event);
         Ok(())
     }
 
@@ -610,6 +707,8 @@ impl SessionConversationProjection {
             occurred_at,
             turn,
             item,
+            input: None,
+            model_step: None,
         };
         self.apply_event(event.clone())?;
         events.push(event);
@@ -715,7 +814,100 @@ impl SessionConversationProjection {
     }
 
     fn apply_event(&mut self, event: CanonicalTurnEvent) -> Result<(), DaemonError> {
+        if !matches!(
+            event.kind,
+            CanonicalTurnEventKind::InputUpdated | CanonicalTurnEventKind::InputImported
+        ) && event.input.is_some()
+        {
+            return Err(DaemonError::internal("Turn 事件不能携带 Input"));
+        }
+        if event.kind != CanonicalTurnEventKind::ModelStepUpdated && event.model_step.is_some() {
+            return Err(DaemonError::internal("非 Step 事件不能携带 modelStep"));
+        }
         match event.kind {
+            CanonicalTurnEventKind::ModelStepUpdated => {
+                let step = event
+                    .model_step
+                    .ok_or_else(|| DaemonError::internal("Step 事件缺少 modelStep"))?;
+                step.validate_snapshot()
+                    .map_err(|error| DaemonError::internal(error.to_string()))?;
+                if event.turn.is_some() || event.item.is_some() || event.input.is_some() {
+                    return Err(DaemonError::internal("Step 事件不能携带其他事实"));
+                }
+                let turn = self
+                    .canonical_turns
+                    .iter_mut()
+                    .find(|turn| turn.turn_id == event.turn_id)
+                    .ok_or_else(|| DaemonError::internal("Step 事件引用未知 Turn"))?;
+                if turn.turn_seq != event.turn_seq {
+                    return Err(DaemonError::internal("Step 事件引用身份不同的 Turn"));
+                }
+                let terminal = turn.status.is_terminal() || turn.completed_at.is_some();
+                match turn
+                    .model_steps
+                    .iter_mut()
+                    .find(|old| old.step_id == step.step_id)
+                {
+                    Some(old) => {
+                        if terminal {
+                            step.validate_terminal_settlement_from(old)
+                                .map_err(|error| DaemonError::internal(error.to_string()))?;
+                        }
+                        step.validate_update_from(old)
+                            .map_err(|error| DaemonError::internal(error.to_string()))?;
+                        *old = step;
+                    }
+                    None if terminal => {
+                        return Err(DaemonError::internal("终态 Turn 不能接纳新 Step"));
+                    }
+                    None => turn.model_steps.push(step),
+                }
+            }
+
+            CanonicalTurnEventKind::InputUpdated | CanonicalTurnEventKind::InputImported => {
+                let input = event
+                    .input
+                    .clone()
+                    .ok_or_else(|| DaemonError::internal("Input 事件缺少输入"))?;
+                if event.turn.is_some()
+                    || event.item.is_some()
+                    || !event.turn_id.is_empty()
+                    || event.turn_seq != 0
+                    || input.session_id != event.session_id
+                {
+                    return Err(DaemonError::internal("Input 事件身份无效"));
+                }
+                let previous = self
+                    .inputs
+                    .iter()
+                    .find(|existing| existing.input_id == input.input_id);
+                if event.kind == CanonicalTurnEventKind::InputImported {
+                    if previous.is_some() {
+                        return Err(DaemonError::internal("不能导入已存在的输入"));
+                    }
+                    input
+                        .validate_snapshot()
+                        .map_err(|error| DaemonError::internal(error.to_string()))?;
+                } else {
+                    input
+                        .validate_update_from(previous)
+                        .map_err(|error| DaemonError::internal(error.to_string()))?;
+                }
+                if self.inputs.iter().any(|existing| {
+                    existing.input_id != input.input_id && existing.request_id == input.request_id
+                }) {
+                    return Err(DaemonError::internal("Input requestId 重复"));
+                }
+                validate_input_binding(&input, &self.canonical_turns)?;
+                match self
+                    .inputs
+                    .iter_mut()
+                    .find(|existing| existing.input_id == input.input_id)
+                {
+                    Some(existing) => *existing = input,
+                    None => self.inputs.push(input),
+                }
+            }
             CanonicalTurnEventKind::TurnStarted => {
                 let turn = event_turn_shell(&event)?;
                 if turn.status != CanonicalTurnStatus::Pending
@@ -827,6 +1019,34 @@ impl SessionConversationProjection {
     }
 }
 
+fn validate_input_binding(
+    input: &SessionInput,
+    turns: &[CanonicalTurn],
+) -> Result<(), DaemonError> {
+    if matches!(
+        input.state,
+        SessionInputState::Attached | SessionInputState::Consumed
+    ) && !turns.iter().any(|turn| {
+        Some(&turn.turn_id) == input.attached_turn_id.as_ref()
+            && turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::UserMessage
+                    && item
+                        .metadata
+                        .get("requestId")
+                        .and_then(|value| value.as_str())
+                        == Some(input.request_id.as_str())
+                    && item
+                        .metadata
+                        .get("userMessageId")
+                        .and_then(|value| value.as_str())
+                        == Some(input.user_message_id.as_str())
+            })
+    }) {
+        return Err(DaemonError::internal("Input 绑定缺少用户 item"));
+    }
+    Ok(())
+}
+
 fn event_turn_shell(event: &CanonicalTurnEvent) -> Result<CanonicalTurn, DaemonError> {
     let turn = event
         .turn
@@ -843,6 +1063,8 @@ fn event_turn_shell(event: &CanonicalTurnEvent) -> Result<CanonicalTurn, DaemonE
             event.event_id
         )));
     }
+    turn.validate_model_steps()
+        .map_err(|error| DaemonError::internal(error.to_string()))?;
     Ok(turn)
 }
 
@@ -852,6 +1074,8 @@ fn validate_turn(turn: &CanonicalTurn, session_id: &SessionId) -> Result<(), Dae
             "canonical turn session 或 turnId 不合法".to_string(),
         ));
     }
+    turn.validate_model_steps()
+        .map_err(|error| DaemonError::internal(error.to_string()))?;
     let mut ids = HashSet::new();
     let mut seqs = HashSet::new();
     for item in &turn.items {
@@ -872,6 +1096,8 @@ fn validate_turn(turn: &CanonicalTurn, session_id: &SessionId) -> Result<(), Dae
 }
 
 fn validate_item(item: &CanonicalTurnItem) -> Result<(), DaemonError> {
+    item.background_job()
+        .map_err(|error| DaemonError::internal(error.to_string()))?;
     if item.item_id.trim().is_empty() || item.updated_at.0 < item.created_at.0 {
         return Err(DaemonError::internal(format!(
             "canonical item {} 的时间或身份不合法",
@@ -885,6 +1111,12 @@ fn validate_item(item: &CanonicalTurnItem) -> Result<(), DaemonError> {
         )));
     }
     Ok(())
+}
+
+fn turn_header(turn: &CanonicalTurn) -> CanonicalTurn {
+    let mut header = turn_shell(turn);
+    header.model_steps.clear();
+    header
 }
 
 fn turn_shell(turn: &CanonicalTurn) -> CanonicalTurn {
@@ -981,6 +1213,102 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn input_binding_replays_atomically_and_survives_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionId::new("session-input-atomic");
+        let pending = SessionInput {
+            input_id: "input-atomic".into(),
+            session_id: session.clone(),
+            request_id: "request-atomic".into(),
+            user_message_id: "user-1".into(),
+            request_fingerprint: "fingerprint-atomic".into(),
+            accepted_at: UtcMillis(10),
+            revision: 1,
+            state: SessionInputState::Pending,
+            attached_turn_id: None,
+            consumption: None,
+            interruption: None,
+            payload: serde_json::json!({"text":"hello"}),
+        };
+        let empty = SessionConversationProjection::load(root.path(), &session).unwrap();
+        let queued = empty
+            .append_session_transaction(
+                root.path(),
+                &session,
+                &[],
+                &[SessionInputMutation {
+                    previous: None,
+                    next: pending.clone(),
+                }],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            SessionConversationProjection::load(root.path(), &session)
+                .unwrap()
+                .inputs(),
+            std::slice::from_ref(&pending)
+        );
+        let mut accepted = turn(&session, CanonicalTurnStatus::Pending);
+        accepted.items[0]
+            .metadata
+            .insert("requestId".into(), serde_json::json!(pending.request_id));
+        accepted.items[0].metadata.insert(
+            "userMessageId".into(),
+            serde_json::json!(pending.user_message_id),
+        );
+        let mut bound = pending.clone();
+        bound.revision = 2;
+        bound.state = SessionInputState::Attached;
+        bound.attached_turn_id = Some(accepted.turn_id.clone());
+        let turn_mutation = CanonicalTurnMutation {
+            previous: None,
+            next: accepted.clone(),
+        };
+        let input_mutation = SessionInputMutation {
+            previous: Some(pending),
+            next: bound.clone(),
+        };
+        // Turn 与 Input 的任意前置条件失败都不能留下半个事务。
+        let mut invalid = input_mutation.clone();
+        invalid.next.revision = 99;
+        assert!(
+            queued
+                .append_session_transaction(
+                    root.path(),
+                    &session,
+                    std::slice::from_ref(&turn_mutation),
+                    &[invalid],
+                    None
+                )
+                .is_err()
+        );
+        let before = SessionConversationProjection::load(root.path(), &session).unwrap();
+        assert!(before.canonical_turns().is_empty());
+        assert_eq!(before.inputs()[0].state, SessionInputState::Pending);
+        let committed = queued
+            .append_session_transaction(
+                root.path(),
+                &session,
+                &[turn_mutation],
+                &[input_mutation],
+                None,
+            )
+            .unwrap();
+        // 模拟 event 已落盘，内存/其他 projection 尚未更新便重启。
+        let replayed = SessionConversationProjection::load(root.path(), &session).unwrap();
+        assert_eq!(replayed.canonical_turns(), &[accepted]);
+        assert_eq!(replayed.inputs(), &[bound.clone()]);
+        committed.write_checkpoint(root.path(), &session).unwrap();
+        assert_eq!(
+            SessionConversationProjection::load(root.path(), &session)
+                .unwrap()
+                .inputs(),
+            &[bound]
+        );
+    }
+
     fn item(
         session_id: &SessionId,
         item_id: &str,
@@ -1012,6 +1340,7 @@ mod tests {
 
     fn turn(session_id: &SessionId, status: CanonicalTurnStatus) -> CanonicalTurn {
         CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session_id.clone(),
             turn_id: "turn-1".to_string(),
             turn_seq: 1,
@@ -1038,6 +1367,106 @@ mod tests {
             ],
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn background_job_facts_replay_after_the_origin_turn_is_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionId::new("job-events");
+        let mut running = turn(&session, CanonicalTurnStatus::Running);
+        let mut tool_item = item(&session, "job-tool", 3, CanonicalTurnItemKind::ToolCall, "");
+        tool_item.tool = Some(magi_session_store::CanonicalToolCall {
+            call_id: "job-call".into(),
+            name: "shell_exec".into(),
+            arguments: Some(serde_json::json!({"command":"publish","background":true})),
+            result: Some(
+                serde_json::json!({"status":"succeeded","running":true,"job_id":"job-events-1"}),
+            ),
+            error: None,
+        });
+        tool_item.worker = Some(CanonicalWorkerRef {
+            task_id: Some(magi_core::TaskId::new("job-task")),
+            worker_id: None,
+            role_id: None,
+            title: None,
+        });
+        let mut job = magi_tool_runtime::BackgroundJob {
+            job_id: "job-events-1".into(),
+            session_id: session.clone(),
+            workspace_id: None,
+            task_id: magi_core::TaskId::new("job-task"),
+            turn_id: running.turn_id.clone(),
+            item_id: tool_item.item_id.clone(),
+            tool_call_id: "job-call".into(),
+            revision: 1,
+            command: "publish".into(),
+            cwd: root.path().display().to_string(),
+            status: magi_tool_runtime::BackgroundJobStatus::Starting,
+            started_at: UtcMillis(10),
+            settled_at: None,
+            exit_code: None,
+            stdout_path: root.path().join("stdout.log"),
+            stderr_path: root.path().join("stderr.log"),
+        };
+        tool_item.metadata.insert(
+            magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY.into(),
+            serde_json::to_value(&job).unwrap(),
+        );
+        running.items.push(tool_item);
+        let mut projection = SessionConversationProjection::default()
+            .append_transaction(
+                root.path(),
+                &session,
+                &[CanonicalTurnMutation {
+                    previous: None,
+                    next: running.clone(),
+                }],
+            )
+            .unwrap();
+        let mut terminal = running.clone();
+        terminal.status = CanonicalTurnStatus::Completed;
+        terminal.completed_at = Some(UtcMillis(30));
+        projection = projection
+            .append_transaction(
+                root.path(),
+                &session,
+                &[CanonicalTurnMutation {
+                    previous: Some(running),
+                    next: terminal.clone(),
+                }],
+            )
+            .unwrap();
+        let mut settled = terminal.clone();
+        job.revision += 1;
+        job.status = magi_tool_runtime::BackgroundJobStatus::OutcomeUnknown;
+        job.settled_at = Some(UtcMillis(31));
+        settled.items.last_mut().unwrap().metadata.insert(
+            magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY.into(),
+            serde_json::to_value(&job).unwrap(),
+        );
+        projection = projection
+            .append_transaction(
+                root.path(),
+                &session,
+                &[CanonicalTurnMutation {
+                    previous: Some(terminal),
+                    next: settled.clone(),
+                }],
+            )
+            .unwrap();
+        let restored = SessionConversationProjection::load(root.path(), &session).unwrap();
+        assert_eq!(restored.canonical_turns(), &[settled]);
+        assert_eq!(restored.canonical_turns(), projection.canonical_turns());
+        assert_eq!(
+            restored.canonical_turns()[0]
+                .items
+                .last()
+                .unwrap()
+                .background_job()
+                .unwrap()
+                .unwrap(),
+            job
+        );
     }
 
     #[test]
@@ -1191,6 +1620,7 @@ mod tests {
             session_id: session_id.clone(),
             last_event_seq: 1,
             canonical_turns: Vec::new(),
+            inputs: Vec::new(),
             accepted_submissions: Vec::new(),
         };
         fs::write(

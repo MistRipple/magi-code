@@ -46,8 +46,21 @@ impl ToolExecutionInput {
     }
 }
 
+/// 由可信执行入口建立，模型参数不能改变调用者范围。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallerScope {
+    #[default]
+    SessionMainline,
+    DelegatedTask,
+    /// 可继续委派的子任务；进程等资源仍按当前 Task 隔离。
+    DelegatingTask,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolExecutionContext {
+    #[serde(default)]
+    pub caller_scope: ToolCallerScope,
     pub worker_id: Option<WorkerId>,
     pub task_id: Option<TaskId>,
     pub session_id: Option<SessionId>,
@@ -76,6 +89,19 @@ pub struct ToolExecutionContextQuery {
     pub task_id: Option<TaskId>,
     pub session_id: Option<SessionId>,
     pub workspace_id: Option<WorkspaceId>,
+    /// 普通 Conversation 没有 Task；只匹配无 Task 归属的资源，不能把 None 当作全会话通配。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub taskless_only: bool,
+}
+
+impl ToolExecutionContextQuery {
+    pub fn for_taskless_session(session_id: &SessionId) -> Self {
+        Self {
+            session_id: Some(session_id.clone()),
+            taskless_only: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +132,9 @@ pub struct ToolExecutionProgress {
 pub struct ToolExecutionPolicy {
     pub access_profile: magi_core::AccessProfile,
     pub source_skill_ids: Vec<String>,
-    pub allowed_tool_names: Vec<String>,
+    /// None 继承全部工具；Some([]) 明确禁止全部。来源只用于审计，不参与权限语义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tool_names: Option<Vec<String>>,
     pub denied_tool_names: Vec<String>,
     #[serde(default)]
     pub allowed_paths: Vec<String>,
@@ -118,11 +146,39 @@ pub struct ToolExecutionPolicy {
     pub command_mode: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolNameRejection {
+    ExplicitlyDenied,
+    NotAllowed,
+}
+impl ToolNameRejection {
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::ExplicitlyDenied => "tool_explicitly_denied",
+            Self::NotAllowed => "tool_not_in_allowed_scope",
+        }
+    }
+}
+
 impl ToolExecutionPolicy {
-    pub fn from_task_policy(policy: &magi_core::TaskPolicy) -> Self {
-        let mut tool_policy = Self::default();
-        tool_policy.apply_task_policy(policy);
-        tool_policy
+    /// 目录与执行预检共用；只有显式封闭范围的空集合表示全部拒绝。
+    pub fn tool_name_rejection(&self, name: &str) -> Option<ToolNameRejection> {
+        let canonical = canonical_tool_policy_name(name);
+        if self
+            .denied_tool_names
+            .iter()
+            .any(|tool| canonical_tool_policy_name(tool) == canonical)
+        {
+            return Some(ToolNameRejection::ExplicitlyDenied);
+        }
+        if self.allowed_tool_names.as_ref().is_some_and(|allowed| {
+            !allowed
+                .iter()
+                .any(|tool| canonical_tool_policy_name(tool) == canonical)
+        }) {
+            return Some(ToolNameRejection::NotAllowed);
+        }
+        None
     }
 
     pub fn apply_task_policy(&mut self, policy: &magi_core::TaskPolicy) {
@@ -132,7 +188,16 @@ impl ToolExecutionPolicy {
         self.read_only_paths = policy.read_only_paths.clone();
         self.command_mode = policy.command_mode.clone();
         extend_unique(&mut self.denied_tool_names, &policy.denied_tools);
-        merge_allowed_tools(&mut self.allowed_tool_names, &policy.allowed_tools);
+        if !policy.allowed_tools.is_empty() {
+            match &mut self.allowed_tool_names {
+                None => self.allowed_tool_names = Some(policy.allowed_tools.clone()),
+                Some(allowed) => allowed.retain(|tool| {
+                    policy.allowed_tools.iter().any(|value| {
+                        canonical_tool_policy_name(value) == canonical_tool_policy_name(tool)
+                    })
+                }),
+            }
+        }
     }
 
     pub fn effective_access_profile(&self) -> magi_core::AccessProfile {
@@ -151,22 +216,6 @@ fn extend_unique(target: &mut Vec<String>, values: &[String]) {
             target.push(value.clone());
         }
     }
-}
-
-fn merge_allowed_tools(target: &mut Vec<String>, values: &[String]) {
-    if values.is_empty() {
-        return;
-    }
-    if target.is_empty() {
-        target.extend(values.iter().cloned());
-        return;
-    }
-    target.retain(|tool_name| {
-        let canonical_tool_name = canonical_tool_policy_name(tool_name);
-        values
-            .iter()
-            .any(|value| canonical_tool_policy_name(value) == canonical_tool_name)
-    });
 }
 
 fn canonical_tool_policy_name(value: &str) -> String {
@@ -422,8 +471,11 @@ pub struct RuntimeCapabilityDependencyEntry {
 /// daemon 进程内的共享服务引用，由 ToolRegistry 持有并在 dispatch 时传入。
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
+    pub background_job_journal: Option<Arc<dyn crate::BackgroundJobJournal>>,
     /// 单次执行的取消信号；注册表默认资源不持有该信号。
     pub cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 当前调用的有效策略，只由 Registry 注入，供目录解释同一调用范围。
+    pub(crate) execution_policy: Option<ToolExecutionPolicy>,
     /// 由受控工具入口派生，供递归读取逐项复核权限。
     pub(crate) file_read_policy: magi_permissions::PermissionPolicy,
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,

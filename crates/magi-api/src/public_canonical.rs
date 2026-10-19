@@ -173,11 +173,26 @@ fn public_payload_field<T>(
     }
 }
 
-/// 只服务于模型 provider 重放的内部 metadata，不是对外事实，前端也不消费。
-/// 历史页与实时事件统一在这里剔除，保证同一 item 版本在两条通道上的内容一致。
-const INTERNAL_ITEM_METADATA_KEYS: [&str; 2] = ["providerContext", "toolCalls"];
+/// 内部重放与执行授权快照；UI 的审批请求沿用已脱敏的工具结果/审批 DTO。
+/// 历史页与实时事件统一剔除，不能把原始参数和权限快照旁路泄露到 metadata。
+const INTERNAL_ITEM_METADATA_KEYS: [&str; 3] = ["providerContext", "toolCalls", "toolApproval"];
 
 fn public_canonical_turn_item_in_place(item: &mut CanonicalTurnItem) {
+    if let Some(evidence) = item.metadata.remove("executorFailure")
+        && let Some(public) = public_canonical_tool_value(evidence, false, None)
+    {
+        item.metadata.insert("executorFailure".into(), public);
+    }
+    if let Some(job) = item
+        .metadata
+        .remove(magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY)
+        && let Some(public) = public_canonical_tool_value(job, false, None)
+    {
+        item.metadata.insert(
+            magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY.into(),
+            public,
+        );
+    }
     for key in INTERNAL_ITEM_METADATA_KEYS {
         item.metadata.remove(key);
     }
@@ -485,6 +500,7 @@ mod tests {
 
     fn canonical_turn(item: CanonicalTurnItem) -> CanonicalTurn {
         CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: item.session_id.clone(),
             turn_id: item.turn_id.clone(),
             turn_seq: item.turn_seq,
@@ -558,12 +574,20 @@ mod tests {
         let mut item = canonical_tool_item();
         item.metadata
             .insert("providerContext".to_string(), json!([{ "data": "x" }]));
+        item.metadata.insert(
+            "toolApproval".into(),
+            json!({
+                "normalizedArguments":"secret-command", "executionRoot":"/Users/private/workspace",
+                "policySnapshot":{"allowedPaths":["/Users/private"]}
+            }),
+        );
         item.metadata
             .insert("toolCalls".to_string(), json!([{ "id": "call" }]));
         item.metadata
             .insert("requestId".to_string(), json!("req-1"));
         let public = public_canonical_turn_item(item);
         assert!(!public.metadata.contains_key("providerContext"));
+        assert!(!public.metadata.contains_key("toolApproval"));
         assert!(!public.metadata.contains_key("toolCalls"));
         assert_eq!(public.metadata["requestId"], "req-1");
     }
@@ -617,6 +641,23 @@ mod tests {
             Some(json!({ "stdout": "ok" }))
         );
         assert!(!turn.items[0].metadata.contains_key("historyCompaction"));
+    }
+
+    #[test]
+    fn background_job_metadata_uses_the_same_public_redaction_as_tool_results() {
+        let mut item = canonical_tool_item();
+        item.metadata.insert(magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY.into(), json!({
+            "jobId":"job-public-1", "command":"curl -H 'Authorization: Bearer live-secret' https://example.com",
+            "stdoutPath":"/Users/private/project/stdout.log", "status":"running"
+        }));
+        let public = public_canonical_turn_item(item);
+        let metadata = public
+            .metadata
+            .get(magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY)
+            .unwrap();
+        assert_eq!(metadata["jobId"], "job-public-1");
+        assert!(!metadata.to_string().contains("live-secret"));
+        assert!(!metadata.to_string().contains("/Users/private"));
     }
 
     #[test]

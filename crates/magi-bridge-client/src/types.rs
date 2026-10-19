@@ -39,6 +39,15 @@ pub struct ModelInvocationRequest {
     pub tool_choice: Option<ChatToolChoice>,
 }
 
+/// 可信调度器在实际 Task 执行边界提供的作用域，不能从模型参数或引擎配置反序列化。
+#[derive(Clone, Debug)]
+pub struct ModelExecutionScope {
+    pub working_dir: Option<std::path::PathBuf>,
+    pub policy: magi_core::TaskPolicy,
+    pub requires_native_tools: bool,
+    pub closed_skill_scope: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatToolChoice {
     #[serde(rename = "type")]
@@ -62,6 +71,9 @@ pub struct ChatToolChoiceFunction {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// 可信输入装配端提供的原始 request 身份；只用于冻结消费集合，不发送给 Provider。
+    #[serde(skip)]
+    pub input_request_id: Option<String>,
     /// 由消息装配端指定的统计来源；仅供本地上下文估算，不发送给模型。
     #[serde(skip)]
     pub context_origin: ChatMessageOrigin,
@@ -559,6 +571,12 @@ impl BridgeTransportError {
 
 #[derive(Debug, Error)]
 pub enum BridgeClientError {
+    #[error("executor_outcome_unknown: {source}；已有执行证据已保留，未自动重发")]
+    ExecutorFailed {
+        #[source]
+        source: Box<BridgeClientError>,
+        evidence: Box<crate::ExecutorFailureEvidence>,
+    },
     #[error("桥接调用失败[{layer:?}]: {message}")]
     CallFailed {
         layer: BridgeErrorLayer,
@@ -605,7 +623,18 @@ pub struct ContextOverflowInfo {
 }
 
 impl BridgeClientError {
+    pub fn executor_failure_evidence(&self) -> Option<&crate::ExecutorFailureEvidence> {
+        match self {
+            Self::ExecutorFailed { evidence, .. } => Some(evidence),
+            _ => None,
+        }
+    }
+
     pub fn context_overflow(&self) -> Option<ContextOverflowInfo> {
+        if let Self::ExecutorFailed { .. } = self {
+            // 外部工具可能已经执行，不能因错误正文提到上下文超限而自动重发。
+            return None;
+        }
         let message = match self {
             Self::CallFailed { message, .. } => message.as_str(),
             Self::HttpStatusFailed { message, .. } => message.as_str(),
@@ -641,6 +670,7 @@ impl BridgeClientError {
 
     pub fn layer(&self) -> Option<BridgeErrorLayer> {
         match self {
+            Self::ExecutorFailed { source, .. } => source.layer(),
             Self::CallFailed { layer, .. } => Some(*layer),
             Self::HttpStatusFailed { layer, .. } => Some(*layer),
             Self::InvalidBindingTarget { .. }
@@ -653,6 +683,7 @@ impl BridgeClientError {
 
     pub fn code(&self) -> Option<i64> {
         match self {
+            Self::ExecutorFailed { source, .. } => source.code(),
             Self::CallFailed { code, .. } => *code,
             Self::HttpStatusFailed { code, .. } => *code,
             Self::InvalidBindingTarget { .. }
@@ -665,6 +696,7 @@ impl BridgeClientError {
 
     pub fn http_status(&self) -> Option<u16> {
         match self {
+            Self::ExecutorFailed { source, .. } => source.http_status(),
             Self::HttpStatusFailed { http_status, .. } => Some(*http_status),
             Self::CallFailed { .. }
             | Self::InvalidBindingTarget { .. }
@@ -684,6 +716,17 @@ pub trait BridgeTransport: Send + Sync {
 }
 
 pub trait ModelBridgeClient: Send + Sync {
+    /// 每个可信适配器必须显式声明实现的合同，包装器必须转发，不默认赋予原生能力。
+    fn executor_capabilities(&self) -> crate::ExecutorCapabilities;
+    /// 预留的外部执行器接口；当前没有具体外部 Agent 适配器。
+    /// 将来接入时须在缓存 client 之外绑定本次 Task 的可信权限/目录。
+    /// 普通模型没有本地执行面，保持原 client。返回的新 client 只用于本次执行。
+    fn bind_execution_scope(
+        &self,
+        _scope: ModelExecutionScope,
+    ) -> Result<Option<Arc<dyn ModelBridgeClient>>, BridgeClientError> {
+        Ok(None)
+    }
     fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError>;
 
     fn invoke_with_cancellation(
@@ -697,21 +740,44 @@ pub trait ModelBridgeClient: Send + Sync {
         self.invoke(request)
     }
 
-    /// 执行带有输出预算的可取消调用。
-    ///
-    /// 输出预算是压缩等需要严格控制结果尺寸的内部语义。非 HTTP bridge
-    /// 可以沿用旧调用路径，但必须由调用方在安装结果前再次校验实际输出。
-    fn invoke_with_cancellation_and_output_limit(
+    /// 非流式调用也公开 transport 重试边界，供运行时在再次发送前持久化 attempt。
+    fn invoke_with_retry_events_and_cancellation(
         &self,
         request: ModelInvocationRequest,
-        max_output_tokens: u32,
+        _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        let _ = max_output_tokens;
         self.invoke_with_cancellation(request, is_cancelled)
     }
 
-    /// 流式调用 LLM,每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
+    /// 执行带有供应商输出上限的可取消调用。
+    ///
+    /// 不支持该合同的适配器必须在发送前拒绝，不能静默忽略输出上限。
+    fn invoke_with_cancellation_and_output_limit(
+        &self,
+        _request: ModelInvocationRequest,
+        _max_output_tokens: u32,
+        _is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        // 能力声明不能替代实现；只有覆盖此方法的适配器才能把上限传给供应商。
+        Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32097),
+            message: "executor_output_limit_unsupported: 当前执行器不支持供应商输出上限".into(),
+        })
+    }
+
+    fn invoke_with_retry_events_cancellation_and_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: u32,
+        _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        self.invoke_with_cancellation_and_output_limit(request, max_output_tokens, is_cancelled)
+    }
+
+    /// 流式调用 LLM，`on_delta` 传入新增内容；上游重绘时使用 replace 全文帧。
     /// 实现方必须显式声明流式行为:真流式实现接收 SSE 增量,非流式实现必须返回错误而非静默降级。
     fn invoke_streaming(
         &self,
@@ -740,6 +806,21 @@ pub trait ModelBridgeClient: Send + Sync {
         }
         self.invoke_streaming_with_retry_events(request, on_delta, on_retry)
     }
+
+    fn invoke_streaming_with_output_limit(
+        &self,
+        _request: ModelInvocationRequest,
+        _max_output_tokens: u32,
+        _on_delta: &dyn Fn(&ModelStreamingDelta),
+        _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        _is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32097),
+            message: "executor_output_limit_unsupported: 当前模型执行器不支持供应商输出上限".into(),
+        })
+    }
 }
 
 pub fn model_invocation_cancelled_error() -> BridgeClientError {
@@ -751,13 +832,7 @@ pub fn model_invocation_cancelled_error() -> BridgeClientError {
 }
 
 pub fn model_invocation_error_is_cancelled(error: &BridgeClientError) -> bool {
-    matches!(
-        error,
-        BridgeClientError::CallFailed {
-            code: Some(-32800),
-            ..
-        }
-    )
+    error.code() == Some(-32800)
 }
 
 #[cfg(test)]

@@ -88,11 +88,9 @@ fn wait_for_answer(
         .ok_or_else(WebModelError::cancelled)?;
     let active = || {
         !cancelled.load(Ordering::Acquire)
-            && magi_conversation_runtime::tool_approval::session_turn_is_active(
-                &state.session_store,
-                &session_id,
-                &turn_id,
-            )
+            && state
+                .session_store
+                .turn_execution_is_active(&session_id, &turn_id)
     };
     if !active() {
         return Err(WebModelError::cancelled());
@@ -143,7 +141,9 @@ fn wait_for_answer(
         can_skip: question.can_skip,
     };
     let registry = state.conversation_registry.user_questions();
-    let waiter = registry.request(request);
+    let waiter = registry
+        .request_persisted(&state.session_store, request)
+        .map_err(|error| invalid(&error))?;
     let publish = |name: &str, outcome: Option<&str>| {
         let _ = state.event_bus.publish(
             EventEnvelope::domain(

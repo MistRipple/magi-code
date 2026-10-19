@@ -4,7 +4,7 @@
 >
 > 状态：核心链路已实现，后续仅允许在本架构内迭代
 >
-> 更新日期：2026-10-08
+> 更新日期：2026-10-19
 >
 > 适用范围：Magi 主对话、识图模型单轮接管、辅助模型、worker、上下文统计、上下文压缩、超限恢复、检查点、事件投影和前端上下文用量展示
 
@@ -42,6 +42,18 @@
 ### 3.1 单一权威
 
 所有上下文压力都由 `magi-usage-authority` 计算，运行时只提供输入和执行压缩，event bus 只投影，API 只转换 DTO，前端只展示。
+
+### 3.1.1 输入消费边界
+
+模型 Step 的 `inputRequestIds` 必须从本次冻结请求中的可信消息身份派生。消息正文、摘要内容和
+“已经接纳”状态都不能单独证明输入已经被模型请求使用。`ChatMessage.inputRequestId` 只存在于
+Magi 内部装配层，序列化到 Provider 前会被跳过；`ThreadChatMessage` 在持久投影中保留该身份，
+以便压缩、重启和恢复沿同一 request 身份核对消费。
+
+压缩边界不能把 `Attached` 输入放入摘要前缀。检查点若覆盖了仍未消费的输入，必须失效并从原始
+transcript 重建；图片输入从 canonical 用户 item 的受控 metadata 恢复。摘要辅助 Step 永远不
+领取用户输入。只有请求已经冻结且消息实际带有对应 request 身份时，SessionStore 才能把 Input
+从 `Attached` 变为 `Consumed`。
 
 ### 3.2 当前窗口与累计用量分离
 

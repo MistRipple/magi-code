@@ -809,6 +809,100 @@ impl ApiState {
     }
 }
 
+/// 取得或创建应用级浏览器会话（幂等）。
+///
+/// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
+/// 创建时同时建立固定主页 Tab。
+pub(crate) fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .app_session()
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.lifecycle != BrowserSessionLifecycle::Failed {
+            ensure_app_home_tab(state, &existing.browser_session_id)?;
+            return Ok(existing);
+        }
+        // 失败会话不能复用：它的 Tab 已经没有对应的 Browser Host 页面。
+        state.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &existing.browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })?;
+    }
+
+    let now = UtcMillis::now();
+    let browser_session_id = BrowserSessionId::new(format!(
+        "browser-session-app-{}-{}",
+        now.0,
+        APP_BROWSER_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let session = state.mutate_browser_authority(|authority| {
+        authority.create_session(CreateBrowserSession {
+            browser_session_id: browser_session_id.clone(),
+            owner: BrowserSessionOwner::App,
+            profile_id: BrowserProfileId::new("browser-profile-default"),
+            now,
+        })?;
+        authority.transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, now)
+    })?;
+    ensure_app_home_tab(state, &browser_session_id)?;
+    Ok(session)
+}
+
+/// 保证应用级会话的固定主页 Tab 存在且可用。
+///
+/// 主页固定在 GPT Web 入口；推理页面由推理通道按需创建，不在这里创建。
+pub(crate) fn ensure_app_home_tab(
+    state: &ApiState,
+    browser_session_id: &BrowserSessionId,
+) -> Result<BrowserTab, ApiError> {
+    let tab_id = BrowserTabId::new(WEB_MODEL_HOME_TAB_ID);
+    let existing = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .tab(&tab_id)
+        .cloned();
+    if let Some(existing) = existing {
+        if existing.browser_session_id != *browser_session_id {
+            return Err(ApiError::Conflict(
+                "GPT Web 主页 Tab 归属了另一应用级浏览器会话".to_string(),
+            ));
+        }
+        if existing.lifecycle != BrowserTabLifecycle::Closed {
+            return Ok(existing);
+        }
+        // 应用级主页使用固定逻辑 id。孤儿清理或异常退出后的恢复可能留下 Closed 行，
+        // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
+        // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
+        // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。
+        let now = UtcMillis::now();
+        return state.mutate_browser_authority(|authority| {
+            authority.reopen_closed_tab(
+                browser_session_id,
+                &tab_id,
+                magi_web_model::chatgpt_web_home_url(),
+                now,
+            )
+        });
+    }
+    let now = UtcMillis::now();
+    state.mutate_browser_authority(|authority| {
+        authority.create_tab(CreateBrowserTab {
+            tab_id: tab_id.clone(),
+            browser_session_id: browser_session_id.clone(),
+            url: magi_web_model::chatgpt_web_home_url(),
+            now,
+        })?;
+        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, now)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,98 +1017,4 @@ mod tests {
             "指针消息不在远端：分支或删除，必须报告冲突而不是猜测"
         );
     }
-}
-
-/// 取得或创建应用级浏览器会话（幂等）。
-///
-/// 全局唯一、id 持久稳定；已存在且未失败时直接复用，绝不反复新建。
-/// 创建时同时建立固定主页 Tab。
-pub(crate) fn ensure_app_browser_session(state: &ApiState) -> Result<BrowserSession, ApiError> {
-    let existing = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .app_session()
-        .cloned();
-    if let Some(existing) = existing {
-        if existing.lifecycle != BrowserSessionLifecycle::Failed {
-            ensure_app_home_tab(state, &existing.browser_session_id)?;
-            return Ok(existing);
-        }
-        // 失败会话不能复用：它的 Tab 已经没有对应的 Browser Host 页面。
-        state.mutate_browser_authority(|authority| {
-            authority.transition_session(
-                &existing.browser_session_id,
-                BrowserSessionLifecycle::Closed,
-                UtcMillis::now(),
-            )
-        })?;
-    }
-
-    let now = UtcMillis::now();
-    let browser_session_id = BrowserSessionId::new(format!(
-        "browser-session-app-{}-{}",
-        now.0,
-        APP_BROWSER_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let session = state.mutate_browser_authority(|authority| {
-        authority.create_session(CreateBrowserSession {
-            browser_session_id: browser_session_id.clone(),
-            owner: BrowserSessionOwner::App,
-            profile_id: BrowserProfileId::new("browser-profile-default"),
-            now,
-        })?;
-        authority.transition_session(&browser_session_id, BrowserSessionLifecycle::Ready, now)
-    })?;
-    ensure_app_home_tab(state, &browser_session_id)?;
-    Ok(session)
-}
-
-/// 保证应用级会话的固定主页 Tab 存在且可用。
-///
-/// 主页固定在 GPT Web 入口；推理页面由推理通道按需创建，不在这里创建。
-pub(crate) fn ensure_app_home_tab(
-    state: &ApiState,
-    browser_session_id: &BrowserSessionId,
-) -> Result<BrowserTab, ApiError> {
-    let tab_id = BrowserTabId::new(WEB_MODEL_HOME_TAB_ID);
-    let existing = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .tab(&tab_id)
-        .cloned();
-    if let Some(existing) = existing {
-        if existing.browser_session_id != *browser_session_id {
-            return Err(ApiError::Conflict(
-                "GPT Web 主页 Tab 归属了另一应用级浏览器会话".to_string(),
-            ));
-        }
-        if existing.lifecycle != BrowserTabLifecycle::Closed {
-            return Ok(existing);
-        }
-        // 应用级主页使用固定逻辑 id。孤儿清理或异常退出后的恢复可能留下 Closed 行，
-        // 不能把它当作仍可驱动的主页返回，否则 GET/POST 会得到空 tabs，
-        // Renderer 也无法重新挂载 guest。Authority 只允许在这里按新导航代次
-        // 重开该固定主页，迟到的旧 Surface 会因 revision 被拒绝。
-        let now = UtcMillis::now();
-        return state.mutate_browser_authority(|authority| {
-            authority.reopen_closed_tab(
-                browser_session_id,
-                &tab_id,
-                magi_web_model::chatgpt_web_home_url(),
-                now,
-            )
-        });
-    }
-    let now = UtcMillis::now();
-    state.mutate_browser_authority(|authority| {
-        authority.create_tab(CreateBrowserTab {
-            tab_id: tab_id.clone(),
-            browser_session_id: browser_session_id.clone(),
-            url: magi_web_model::chatgpt_web_home_url(),
-            now,
-        })?;
-        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, now)
-    })
 }

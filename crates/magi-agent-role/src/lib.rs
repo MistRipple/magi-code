@@ -1307,29 +1307,31 @@ mod tests {
     }
 
     #[test]
-    fn architect_returns_decision_requests_to_mainline() {
+    fn architect_distinguishes_parent_context_from_user_decisions() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         let role = reg.get("architect").expect("architect role exists");
         assert!(
-            role.system_prompt.contains("返回主线"),
-            "architect 不能绕过主线直接面向用户，实际: {}",
+            role.system_prompt.contains("context_request")
+                && role.system_prompt.contains("ask_user_question"),
+            "architect 应向父任务获取已有信息，确需用户裁决时使用带来源的提问，实际: {}",
             role.system_prompt
         );
         assert!(!role.system_prompt.contains("唯一代言人"));
     }
 
     #[test]
-    fn builtin_agent_prompts_define_non_recursive_worker_boundary() {
+    fn builtin_agent_prompts_defer_delegation_to_current_runtime_authority() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         for id in ["architect", "executor", "reviewer", "explorer", "tester"] {
             let role = reg.get(id).expect("builtin role exists");
             assert!(
-                role.system_prompt.contains("不能创建更多子代理"),
-                "{id} 必须明确禁止递归派发代理"
+                role.system_prompt.contains("未获授权时不能创建更多子代理")
+                    && role.system_prompt.contains("角色本身不授予委派权"),
+                "{id} 应遵守当前运行时委派授权，不能用角色提示覆盖授权或无条件禁止嵌套"
             );
             assert!(
-                role.system_prompt.contains("返回主线"),
-                "{id} 必须明确结果回传给主线"
+                role.system_prompt.contains("返回父任务"),
+                "{id} 必须把结果返回直接父任务"
             );
         }
     }

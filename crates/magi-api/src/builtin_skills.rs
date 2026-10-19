@@ -28,7 +28,7 @@ struct BuiltinSkill {
 
 const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
     id: "magi-cloudflare-tunnel",
-    version: 3,
+    version: 4,
     body: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/SKILL.md"),
     config: include_str!("../assets/builtin-skills/magi-cloudflare-tunnel/config.json"),
 }];

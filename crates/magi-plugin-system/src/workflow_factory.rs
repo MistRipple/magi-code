@@ -12,6 +12,7 @@ pub struct WorkflowCoreInvocationSpec {
     pub project_id: String,
     pub run_id: String,
     pub workflow_id: String,
+    pub package_digest: String,
     pub checkpoint_version: u32,
     pub config: Value,
 }
@@ -94,33 +95,22 @@ impl WorkflowCoreFactory for PluginWorkflowCoreFactory {
         &self,
         spec: WorkflowCoreInvocationSpec,
     ) -> Result<Arc<dyn WorkflowCore>, String> {
-        let ContributionRef {
-            plugin_id,
-            contribution_id,
-        } = ContributionRef::parse("工作流", &spec.workflow_id)?;
+        let selected = ContributionRef::parse("工作流", &spec.workflow_id)?;
         let scope = APPLICATION_SCOPE;
         let manager = self
             .manager
             .lock()
             .map_err(|_| "插件管理器不可用".to_string())?;
-        if !manager
-            .is_active_for_scope(&plugin_id, scope)
-            .map_err(|error| error.to_string())?
-        {
-            return Err("插件工作流未在当前作用域激活".into());
-        }
         let package = manager
-            .package(&plugin_id)
+            .prepare_workflow(&selected)
             .map_err(|error| error.to_string())?;
-        if !package
-            .manifest()
-            .contributions
-            .workflows
-            .iter()
-            .any(|workflow| workflow.id == contribution_id)
-        {
-            return Err("插件工作流贡献不存在".into());
+        if spec.package_digest != package.digest() {
+            return Err("插件工作流包已变化；原检查点不能交给新版本执行".into());
         }
+        let ContributionRef {
+            plugin_id,
+            contribution_id,
+        } = selected;
         let identity = InvocationIdentity {
             plugin_id,
             package_digest: package.digest().to_string(),
@@ -151,6 +141,109 @@ impl WorkflowCoreFactory for PluginWorkflowCoreFactory {
 mod tests {
     use super::*;
 
+    struct NoCapabilities;
+    impl CapabilityHandler for NoCapabilities {
+        fn call(
+            &self,
+            _: magi_plugin_runtime::CapabilityRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Value, magi_plugin_runtime::ExecutionError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { panic!("版本校验必须先于 Worker 和能力执行") })
+        }
+    }
+
+    #[test]
+    fn workflow_checkpoint_cannot_switch_to_an_upgraded_package() {
+        let root = tempfile::tempdir().unwrap();
+        let package = |version| {
+            crate::PluginPackage::from_manifest_and_source(
+            serde_json::from_value(serde_json::json!({
+                "sdkVersion":1,"id":"test.flow","version":version,"name":"Flow","description":"",
+                "backend":"plugin.mjs","permissions":[],"dataSchemaVersion":1,
+                "settingsSchema":{"type":"object","additionalProperties":false},
+                "contributions":{"workflows":[{"id":"main","title":"Flow","description":""}]}
+            })).unwrap(), "export default () => null;"
+        ).unwrap()
+        };
+        let original = package("1.0.0");
+        let upgraded = package("1.1.0");
+        let mut manager = PluginManager::open(root.path()).unwrap();
+        manager
+            .install(
+                &original,
+                crate::PluginSource::Local {
+                    name: "flow.zip".into(),
+                },
+            )
+            .unwrap();
+        manager.enable("test.flow", APPLICATION_SCOPE).unwrap();
+        manager.activate("test.flow", APPLICATION_SCOPE).unwrap();
+        let manager = Arc::new(std::sync::Mutex::new(manager));
+        let factory = PluginWorkflowCoreFactory::new(
+            manager.clone(),
+            PluginHost::new(
+                root.path().join("missing-worker"),
+                magi_process::ManagedProcessGroup::new(),
+            ),
+            Arc::new(NoCapabilities),
+            RuntimeLimits::default(),
+        );
+        let spec = WorkflowCoreInvocationSpec {
+            session_id: "session".into(),
+            project_id: String::new(),
+            run_id: "run".into(),
+            workflow_id: "plugin/test.flow/main".into(),
+            package_digest: original.digest().into(),
+            checkpoint_version: 1,
+            config: serde_json::json!({"saved":"original checkpoint"}),
+        };
+        assert!(factory.build_workflow_core(spec.clone()).is_ok());
+        let drain = PluginManager::begin_upgrade_drain(manager.clone(), "test.flow").unwrap();
+        assert!(
+            factory
+                .build_workflow_core(spec.clone())
+                .err()
+                .unwrap()
+                .contains("排空")
+        );
+        {
+            let mut manager = manager.lock().unwrap();
+            manager
+                .upgrade(
+                    &upgraded,
+                    crate::PluginSource::Local {
+                        name: "flow.zip".into(),
+                    },
+                    &drain,
+                    None,
+                )
+                .unwrap();
+            drain.commit(&mut manager);
+            manager.activate("test.flow", APPLICATION_SCOPE).unwrap();
+        }
+        assert!(
+            factory
+                .build_workflow_core(spec.clone())
+                .err()
+                .unwrap()
+                .contains("包已变化")
+        );
+        assert!(
+            factory
+                .build_workflow_core(WorkflowCoreInvocationSpec {
+                    package_digest: upgraded.digest().into(),
+                    ..spec
+                })
+                .is_ok(),
+            "新的显式运行可以选择新包"
+        );
+    }
+
     struct NamespaceFactory(&'static str);
 
     impl WorkflowCoreFactory for NamespaceFactory {
@@ -177,6 +270,7 @@ mod tests {
             project_id: String::new(),
             run_id: String::new(),
             workflow_id: "builtin/default".into(),
+            package_digest: String::new(),
             checkpoint_version: 1,
             config: Value::Null,
         };
@@ -196,6 +290,7 @@ mod tests {
             project_id: String::new(),
             run_id: String::new(),
             workflow_id: "plugin/example/workflow".into(),
+            package_digest: String::new(),
             checkpoint_version: 1,
             config: Value::Null,
         }) {

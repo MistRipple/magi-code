@@ -2,6 +2,7 @@
 // Uses the unified transport layer so it works in both browser-direct and VS Code proxy modes.
 
 import { getTransport } from './transport';
+import type { AgentContinueParams, AgentContinueResult, AgentTransferParams, AgentTransferResult } from './app-server-protocol.generated';
 import type {
   AddedResponseDto,
   AgentsResponseDto,
@@ -706,6 +707,14 @@ export class RustDaemonClient {
     request: AgentRunActionRequestDto,
   ): Promise<AgentRunActionResponseDto> {
     return this.postJson<AgentRunActionResponseDto>('/api/agent-runs/action', request);
+  }
+
+  public async transferAgentRun(request: AgentTransferParams): Promise<AgentTransferResult> {
+    return this.postJson<AgentTransferResult>('/api/agent-runs/transfer', request);
+  }
+
+  public async continueAgentRun(request: AgentContinueParams): Promise<AgentContinueResult> {
+    return this.postJson<AgentContinueResult>('/api/agent-runs/continue', request);
   }
 
   private async getJson<T>(path: string, signal?: AbortSignal): Promise<T> {

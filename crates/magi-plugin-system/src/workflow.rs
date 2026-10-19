@@ -1,6 +1,6 @@
 //! 工作流核心的唯一类型化边界。
 //!
-//! 核心只能返回动作意图；daemon 负责预算、授权、持久化、执行和终态提交。插件不
+//! 核心只能返回动作意图；daemon 负责授权、持久化、执行和终态提交。插件不
 //! 能通过这个合同直接写 TaskStore、审批记录或 canonical Turn。
 
 use magi_plugin_runtime::RunCancellation;
@@ -27,6 +27,8 @@ pub enum WorkflowAction {
         action_id: String,
         role: String,
         instruction: String,
+        /// 必须由工作流提供，宿主复用 agent_spawn 合同校验。
+        delegation: Value,
     },
     WaitUser {
         action_id: String,

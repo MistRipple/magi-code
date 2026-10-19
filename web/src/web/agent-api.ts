@@ -2531,6 +2531,7 @@ export async function submitSessionTurn(
     steerCurrentTurn?: boolean;
     expectedTurnId?: string | null;
     replaceTurnId?: string | null;
+    interruptTurnId?: string | null;
   },
   bindingOverride?: AgentBindingOverride,
 ): Promise<AgentSessionTurnResult> {
@@ -2559,6 +2560,7 @@ export async function submitSessionTurn(
         steerCurrentTurn: payload.steerCurrentTurn === true,
         expectedTurnId: payload.expectedTurnId ?? null,
         replaceTurnId: payload.replaceTurnId ?? null,
+        interruptTurnId: payload.interruptTurnId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,
@@ -2708,6 +2710,7 @@ export async function getAgentSessionTurnQueue(
 export async function removeAgentSessionTurnQueueItem(
   sessionId: string,
   queueId: string,
+  expectedRevision: number,
   bindingOverride?: AgentBindingOverride,
 ): Promise<SessionTurnQueueResponseDto> {
   const normalizedSessionId = sessionId.trim();
@@ -2717,8 +2720,37 @@ export async function removeAgentSessionTurnQueueItem(
   }
   return await postBoundJson<SessionTurnQueueResponseDto>(
     '/api/session/queue/remove',
-    { sessionId: normalizedSessionId, queueId: normalizedQueueId },
+    { sessionId: normalizedSessionId, queueId: normalizedQueueId, expectedRevision },
     'remove session turn queue item',
+    bindingOverride,
+  );
+}
+
+export async function updateAgentSessionTurnQueueItem(
+  sessionId: string,
+  queueId: string,
+  expectedRevision: number,
+  request: import('../shared/app-server-protocol.generated').TurnStartParams,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionTurnQueueResponseDto> {
+  return postBoundJson<SessionTurnQueueResponseDto>(
+    '/api/session/queue/update',
+    { sessionId: sessionId.trim(), queueId: queueId.trim(), expectedRevision, request },
+    'update session turn queue item',
+    bindingOverride,
+  );
+}
+
+export async function retryAgentSessionTurnQueueItem(
+  sessionId: string,
+  queueId: string,
+  expectedRevision: number,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionTurnQueueResponseDto> {
+  return postBoundJson<SessionTurnQueueResponseDto>(
+    '/api/session/queue/retry',
+    { sessionId, queueId, expectedRevision },
+    'retry session turn queue item',
     bindingOverride,
   );
 }
@@ -2726,16 +2758,19 @@ export async function removeAgentSessionTurnQueueItem(
 export async function guideAgentSessionTurnQueueItem(
   sessionId: string,
   queueId: string,
+  expectedTurnId: string,
+  expectedRevision: number,
   bindingOverride?: AgentBindingOverride,
 ): Promise<SessionTurnQueueResponseDto> {
   const normalizedSessionId = sessionId.trim();
   const normalizedQueueId = queueId.trim();
-  if (!normalizedSessionId || !normalizedQueueId) {
-    throw new AgentApiError(400, 'sessionId 和 queueId 不能为空', 'guide session turn queue item');
+  const normalizedTurnId = expectedTurnId.trim();
+  if (!normalizedSessionId || !normalizedQueueId || !normalizedTurnId) {
+    throw new AgentApiError(400, 'sessionId、queueId 和 expectedTurnId 不能为空', 'guide session turn queue item');
   }
   return await postBoundJson<SessionTurnQueueResponseDto>(
     '/api/session/queue/guide',
-    { sessionId: normalizedSessionId, queueId: normalizedQueueId },
+    { sessionId: normalizedSessionId, queueId: normalizedQueueId, expectedTurnId: normalizedTurnId, expectedRevision },
     'guide session turn queue item',
     bindingOverride,
   );

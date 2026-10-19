@@ -1,5 +1,7 @@
+pub mod agent;
 pub mod errors;
 pub mod execution;
+pub mod executor_receipt;
 pub mod fs_atomic;
 pub mod host_path;
 pub mod ids;
@@ -14,8 +16,15 @@ pub mod value_objects;
 #[cfg(test)]
 mod tests;
 
+pub use agent::{
+    AGENT_OPERATION_ID_MAX_CHARS, AgentActivation, AgentLifetime, AgentRunOwner, AgentRunTransfer,
+    agent_operation_id_is_valid,
+};
 pub use errors::{DomainError, DomainResult, GoalRejection};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
+pub use executor_receipt::{
+    ExecutorCommandEvidence, ExecutorCommandStatus, ExecutorFailureEvidence, ExecutorReceipt,
+};
 pub use host_path::{HostPath, HostPathError, HostPathRef};
 pub use ids::{
     AssignmentId, BrowserAnnotationId, BrowserCommandId, BrowserLeaseId, BrowserProfileId,

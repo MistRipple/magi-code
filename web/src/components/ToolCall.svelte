@@ -54,7 +54,7 @@
   import { untrack } from 'svelte';
 
   interface ErrorDiagnosis {
-    category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
+    category: 'model_input' | 'context_stale' | 'permission' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
     categoryLabel: string;
     ownerLabel: string;
     message: string;
@@ -806,21 +806,6 @@
       };
     }
 
-    // 主模型角色约束（agent_spawn 引导）— 与用户权限无关，是系统架构层面的职责划分
-    if (matches(
-      'orchestrator',
-      'agent_spawn delegation',
-      '请通过 agent_spawn 委派给代理',
-    )) {
-      return {
-        category: 'role_constraint',
-        categoryLabel: i18n.t('toolCall.errorDiagnosis.roleConstraint.categoryLabel'),
-        ownerLabel: i18n.t('toolCall.errorDiagnosis.roleConstraint.ownerLabel'),
-        message: i18n.t('toolCall.errorDiagnosis.roleConstraint.message'),
-        hint: i18n.t('toolCall.errorDiagnosis.roleConstraint.hint'),
-      };
-    }
-
     // 用户权限拦截（Ask 模式弹窗拒绝 / 权限开关关闭）
     // 仅匹配 errorCode，不对 message 做子串匹配 — 'authorization' 在代码中过于常见，易误判
     if (
@@ -1132,7 +1117,7 @@
           {#if userQuestionSummary}
             <div class="tool-section">
               {#if userQuestionSummary.status === 'awaiting'}
-                <!-- 轮次被停止或会话重启后问题已不在待回答列表里：不能一直显示“等待你的回答”。 -->
+                <!-- 已答复或取消的问题不再显示等待；重启后可恢复的问题继续由 daemon 待答投影决定。 -->
                 <div class="uq-summary-note">
                   {userQuestionSummary.questionId
                     && !isUserQuestionPending(filePreviewScope?.sessionId || getCurrentSessionId() || '', userQuestionSummary.questionId)
@@ -1371,12 +1356,6 @@
     color: var(--warning);
     border-color: rgba(234, 179, 8, 0.45);
     background: rgba(234, 179, 8, 0.12);
-  }
-
-  .error-role_constraint {
-    color: var(--info);
-    border-color: rgba(139, 92, 246, 0.45);
-    background: rgba(139, 92, 246, 0.12);
   }
 
   .error-policy {

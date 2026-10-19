@@ -100,6 +100,8 @@ export async function resolvePendingToolApproval(
     : { scope: 'personal', sessionId: sessionId.trim() };
   await resolveAgentToolApproval(sessionId, approvalId, decision, bindingOverride);
   if (toolApprovalState.sessionId === sessionId.trim()) {
+    ++syncRevision;
+    toolApprovalState.syncing = false;
     toolApprovalState.pending = toolApprovalState.pending.filter(
       (approval) => approval.approvalId !== approvalId.trim(),
     );

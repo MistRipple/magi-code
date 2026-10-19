@@ -251,6 +251,7 @@ mod tests {
 
     fn canonical(status: magi_session_store::CanonicalTurnStatus) -> CanonicalTurn {
         CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: SessionId::new("turn-contract-session"),
             turn_id: "turn-contract".to_string(),
             turn_seq: 7,

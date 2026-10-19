@@ -10,8 +10,8 @@ use std::sync::Arc;
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanItemId,
-    SessionId, TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
+    AccessProfile, DomainError, DomainResult, GoalId, MissionId, PlanItemId, SessionId,
+    TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
     TaskRecoveryCheckpoint, TaskStatus, TaskTier, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
@@ -621,6 +621,7 @@ struct DispatchTaskInput<'a> {
     now: UtcMillis,
     target_role: &'a str,
     workflow_id: Option<String>,
+    workflow_package_digest: Option<String>,
     active_skill_id: Option<&'a str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
@@ -645,6 +646,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         now,
         target_role,
         workflow_id,
+        workflow_package_digest,
         active_skill_id,
         task_tier,
         access_profile,
@@ -706,6 +708,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         runtime_payload: if let Some(workflow_id) = workflow_id {
             magi_core::TaskRuntimePayload::Workflow {
                 workflow_id,
+                package_digest: workflow_package_digest,
                 checkpoint_version: 1,
                 stage: "start".into(),
                 checkpoint: serde_json::Value::Null,
@@ -820,12 +823,17 @@ fn validate_dispatch_request(
             "目标模式只能绑定主线 coordinator，不能下发到 worker 或 sidechain".to_string(),
         ));
     }
+    let task_kind = if request.workflow_id.is_some() {
+        TaskKind::LocalWorkflow
+    } else {
+        TaskKind::LocalAgent
+    };
     if !runtime
         .agent_role_registry
-        .role_supports_task_kind(target_role, TaskKind::LocalAgent)
+        .role_supports_task_kind(target_role, task_kind)
     {
         return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "role {target_role} 不支持 local_agent 任务"
+            "role {target_role} 不支持 {task_kind:?} 任务"
         )));
     }
 
@@ -846,6 +854,11 @@ fn validate_dispatch_request(
         now,
         target_role,
         workflow_id: request.workflow_id.clone(),
+        workflow_package_digest: request
+            .user_message_metadata
+            .get("magi.workflowPackageDigest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         active_skill_id: request.skill_name.as_deref(),
         task_tier: request.task_tier,
         access_profile: request.access_profile,
@@ -901,7 +914,7 @@ fn build_active_execution_chain(
         checkpoint_at: Some(prepared.now),
         resume_mode: Some("stage-restart".to_string()),
         resume_token: None,
-        use_tools: true,
+        use_tools: request.use_tools,
         skill_name: request.skill_name.clone(),
         is_primary: true,
         thread_id: prepared.worker_thread_id.clone(),
@@ -1209,14 +1222,6 @@ fn materialize_execution(
             .rollback
             .record_plan_materialization(materialization);
     }
-    let ownership = ExecutionOwnership {
-        session_id: Some(request.session_id.clone()),
-        workspace_id: request.workspace_id.clone(),
-        mission_id: Some(prepared.mission_id.clone()),
-        task_id: Some(prepared.action_task_id.clone()),
-        worker_id: Some(prepared.worker_id.clone()),
-        execution_chain_ref: Some(prepared.execution_chain_ref.clone()),
-    };
     let execution_plan = TaskExecutionPlan::Dispatch {
         target: TaskExecutionTarget {
             mission_id: prepared.mission_id.clone(),
@@ -1233,7 +1238,6 @@ fn materialize_execution(
         turn_id: prepared.turn_id.clone(),
         workspace_id: request.workspace_id.clone(),
         execution_root: request.execution_root.clone(),
-        ownership,
         writebacks: ExecutionWritebackPlans::from_session_action_input(
             DispatchMemoryExtractionInput {
                 accepted_at: request.accepted_at,
@@ -1398,6 +1402,14 @@ pub fn materialize_dispatch_submission(
     {
         return Err(DispatchSubmissionRunError::InvalidInput(
             "accepted root task 已被修改或不再可执行".to_string(),
+        ));
+    }
+    // accepted journal 与 TaskStore 是同一接纳事实的两份持久投影。恢复时不能只
+    // 比对 goal：篡改 pendingDispatch 的工作流身份或包摘要会让旧任务被错误地
+    // 当作新实现装配。工作流摘要尤其决定恢复时允许加载哪个不可变插件包。
+    if task.runtime_payload != prepared.task.runtime_payload {
+        return Err(DispatchSubmissionRunError::InvalidInput(
+            "accepted root task 的运行负载与持久化请求不一致，拒绝恢复".to_string(),
         ));
     }
     if let Some(existing_plan) = runtime.execution_registry.get(&prepared.action_task_id) {
@@ -1761,33 +1773,23 @@ pub fn accept_dispatch_submission(
 mod tests {
     use super::*;
     use magi_session_store::{
-        CanonicalTurnEventWriter, CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus,
-        GoalContinuationPhase, GoalStatus, SessionAcceptanceRecord, ThreadChatMessage,
+        CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase,
+        GoalStatus, SessionAcceptanceRecord, SessionEventWriter, ThreadChatMessage,
         ThreadChatToolCall, ThreadChatToolFunction,
     };
 
     struct RejectingCanonicalWriter;
 
-    impl CanonicalTurnEventWriter for RejectingCanonicalWriter {
-        fn append_canonical_turn_transaction(
+    impl SessionEventWriter for RejectingCanonicalWriter {
+        fn append_session_transaction(
             &self,
-            _session_id: &SessionId,
-            _mutations: &[CanonicalTurnMutation],
+            _: &SessionId,
+            _: &[CanonicalTurnMutation],
+            _: &[magi_session_store::SessionInputMutation],
+            _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
         ) -> DomainResult<()> {
             Err(DomainError::Persistence {
-                message: "test canonical write rejection".to_string(),
-            })
-        }
-
-        fn append_canonical_turn_transaction_with_acceptance(
-            &self,
-            _session_id: &SessionId,
-            _mutations: &[CanonicalTurnMutation],
-            _acceptance: &SessionAcceptanceRecord,
-            _task: Option<&magi_core::Task>,
-        ) -> DomainResult<()> {
-            Err(DomainError::Persistence {
-                message: "test acceptance write rejection".to_string(),
+                message: "test acceptance write rejection".into(),
             })
         }
     }
@@ -1835,6 +1837,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disabled_tools_survive_acceptance_and_store_reload() {
+        let sessions = SessionStore::new();
+        let tasks = TaskStore::new();
+        let registry = TaskExecutionRegistry::default();
+        let events = InMemoryEventBus::new(16);
+        let roles = AgentRoleRegistry::load_default();
+        let session = SessionId::new("disabled-tools-dispatch");
+        sessions
+            .create_session(session.clone(), "disabled tools")
+            .unwrap();
+        let mut request = rollback_test_request(session.clone(), UtcMillis(3500), "coordinator");
+        request.use_tools = false;
+        let graph = run_dispatch_submission_for_test(
+            &DispatchSubmissionRuntime {
+                session_store: &sessions,
+                task_store: &tasks,
+                execution_registry: &registry,
+                event_bus: &events,
+                agent_role_registry: &roles,
+                model_bridge_client: None,
+                settings_store: None,
+                workspace_root_path: None,
+            },
+            &request,
+        )
+        .unwrap();
+        let TaskExecutionPlan::Dispatch { use_tools, .. } =
+            registry.get(&graph.action_task_id).unwrap();
+        assert!(!use_tools);
+        accept_dispatch_submission(&sessions, &tasks, &registry, request, graph).unwrap();
+        let restored = SessionStore::from_persisted_parts(
+            sessions.durable_state(),
+            sessions.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        let chain = restored.active_execution_chain(&session).unwrap();
+        assert!(
+            !chain.branches[0].use_tools,
+            "恢复不能把原先关闭的工具重新打开"
+        );
+    }
+
     fn rollback_test_execution_plan(
         session_id: &SessionId,
         mission_id: &MissionId,
@@ -1859,14 +1904,6 @@ mod tests {
             turn_id: turn_id.to_string(),
             workspace_id: None,
             execution_root: None,
-            ownership: ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                mission_id: Some(mission_id.clone()),
-                task_id: Some(task_id.clone()),
-                worker_id: Some(worker_id.clone()),
-                execution_chain_ref: Some("chain-materialize-rollback".to_string()),
-                ..ExecutionOwnership::default()
-            },
             writebacks: ExecutionWritebackPlans::default(),
             use_tools: true,
             skill_name: None,
@@ -1955,6 +1992,7 @@ mod tests {
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![TaskId::new("task-old")],
                 message_history: vec![ThreadChatMessage {
+                    input_request_id: None,
                     role: "user".to_string(),
                     content: Some(
                         "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"
@@ -2281,6 +2319,7 @@ mod tests {
         let source_worker_id = WorkerId::new("worker-dispatch-resume-source");
         let source_history = vec![
             ThreadChatMessage {
+                input_request_id: None,
                 role: "user".to_string(),
                 content: Some("画当前项目流程图".to_string()),
                 images: Vec::new(),
@@ -2289,6 +2328,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -2304,6 +2344,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "tool".to_string(),
                 content: Some(r#"{"status":"succeeded","content":"workspace"}"#.to_string()),
                 images: Vec::new(),
@@ -2385,6 +2426,7 @@ mod tests {
             now,
             target_role: "coordinator",
             workflow_id: None,
+            workflow_package_digest: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
@@ -2609,6 +2651,7 @@ mod tests {
             now,
             target_role: "coordinator",
             workflow_id: None,
+            workflow_package_digest: None,
             active_skill_id: None,
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
@@ -3276,7 +3319,6 @@ mod tests {
                 "task-goal-creator",
                 "完成验收",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("goal should be creatable");
         let request = DispatchSubmissionRequest {
@@ -3404,7 +3446,6 @@ mod tests {
                 "task-goal-creator",
                 "验证暂停竞态",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("goal should be creatable");
         let request = DispatchSubmissionRequest {
@@ -3625,6 +3666,7 @@ mod tests {
             observed_context_window_tokens: None,
             handled_task_ids: vec![task_id.clone()],
             message_history: vec![ThreadChatMessage {
+                input_request_id: None,
                 role: "user".to_string(),
                 content: Some("恢复上下文".to_string()),
                 images: Vec::new(),
@@ -3644,6 +3686,7 @@ mod tests {
                     checkpoint_id: "checkpoint-materialize-rollback".to_string(),
                     source_message_count: 1,
                     summary_message: ThreadChatMessage {
+                        input_request_id: None,
                         role: "system".to_string(),
                         content: Some("恢复摘要".to_string()),
                         images: Vec::new(),
@@ -4001,7 +4044,7 @@ mod tests {
             .expect("accepted user item should exist")
             .metadata
             .insert("forceWriteback".to_string(), serde_json::json!(true));
-        session_store.install_canonical_event_writer(Arc::new(RejectingCanonicalWriter));
+        session_store.install_session_event_writer(Arc::new(RejectingCanonicalWriter));
 
         let error = match materialize_execution(&runtime, &request, &prepared, Some(changed_chain))
         {

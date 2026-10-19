@@ -12,6 +12,9 @@ use super::{
         terminate_shell_child,
     },
 };
+use crate::background_job::{
+    BackgroundJob, BackgroundJobJournal, BackgroundJobStatus, DurableProcessJob,
+};
 use crate::{BuiltinToolAccessMode, ToolExecutionContext, ToolExecutionContextQuery};
 use magi_core::ToolFailure;
 use magi_core::UtcMillis;
@@ -43,23 +46,123 @@ pub(super) struct ProcessExecutionScope {
     workspace_id: Option<String>,
 }
 
+enum ProcessOutputReaders {
+    Reading([JoinHandle<std::io::Result<()>>; 2]),
+    Settled(bool),
+}
+
+impl ProcessOutputReaders {
+    fn settle(&mut self) -> bool {
+        let readers = match self {
+            Self::Settled(success) => return *success,
+            Self::Reading(readers) => readers,
+        };
+        let deadline =
+            Instant::now() + Duration::from_millis(super::shell::SHELL_PIPE_DRAIN_GRACE_MS);
+        while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if readers.iter().any(|reader| !reader.is_finished()) {
+            return false;
+        }
+        let Self::Reading(readers) = std::mem::replace(self, Self::Settled(false)) else {
+            unreachable!()
+        };
+        let mut success = true;
+        for reader in readers {
+            success &= matches!(reader.join(), Ok(Ok(())));
+        }
+        *self = Self::Settled(success);
+        success
+    }
+}
+
 pub(super) struct ManagedProcess {
     terminal_id: u64,
     command: String,
     cwd: String,
     scope: ProcessExecutionScope,
-    child: ManagedChild,
+    child: Option<ManagedChild>,
     /// 子进程 stdin 单独加锁：写入可能因子进程不读而阻塞，绝不能在持有全局进程表锁时进行。
     stdin: Option<Arc<Mutex<std::process::ChildStdin>>>,
     stdout: SharedOutput,
     stderr: SharedOutput,
     started_at_ms: u64,
+    job: Option<Arc<DurableProcessJob>>,
+    observed_exit: Arc<Mutex<Option<ExitStatus>>>,
+    /// 与进程一起移交结算；取消不能丢下仍在写产物的读取线程。
+    output_readers: Option<ProcessOutputReaders>,
+}
+
+impl ManagedProcess {
+    fn job_settlement_pending(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| {
+            job.is_unsettled()
+                || self.child.is_some()
+                || matches!(self.output_readers, Some(ProcessOutputReaders::Reading(_)))
+        })
+    }
+
+    fn poll_exit(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let exit = match self.child.as_mut() {
+            Some(child) => child.try_wait()?,
+            None => *self.observed_exit.lock().expect("process exit lock"),
+        };
+        if let Some(status) = &exit {
+            *self.observed_exit.lock().expect("process exit lock") = Some(*status);
+        }
+        Ok(exit)
+    }
+
+    fn terminate(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            let status = child.terminate()?;
+            *self.observed_exit.lock().expect("process exit lock") = Some(status);
+            // 只保留退出和 Job 结算记录。写盘重试不能再按已回收的 PID 发送信号。
+            self.child = None;
+        }
+        Ok(())
+    }
 }
 
 pub(super) static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) static PROCESS_TABLE: LazyLock<Mutex<HashMap<u64, ManagedProcess>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 启动与停止都先登记在途操作，再做进程/journal IO；查询不能将暂时离开进程表的操作当作已结算。
+struct ProcessOperationGuard {
+    id: u64,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+type PendingProcessOperation = (ProcessExecutionScope, Arc<std::sync::atomic::AtomicBool>);
+static PROCESS_OPERATIONS: LazyLock<Mutex<HashMap<u64, PendingProcessOperation>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+impl ProcessOperationGuard {
+    fn begin(context: &ToolExecutionContext) -> Self {
+        Self::from_scope(ProcessExecutionScope::from_context(context))
+    }
+    fn from_scope(scope: ProcessExecutionScope) -> Self {
+        let id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        PROCESS_OPERATIONS
+            .lock()
+            .expect("process operation lock")
+            .insert(id, (scope, cancelled.clone()));
+        Self { id, cancelled }
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+impl Drop for ProcessOperationGuard {
+    fn drop(&mut self) {
+        PROCESS_OPERATIONS
+            .lock()
+            .expect("process operation lock")
+            .remove(&self.id);
+    }
+}
 
 impl ProcessExecutionScope {
     pub(super) fn from_context(context: &ToolExecutionContext) -> Self {
@@ -77,6 +180,9 @@ impl ProcessExecutionScope {
             || query.session_id.is_some()
             || query.workspace_id.is_some();
         if !has_scope {
+            return false;
+        }
+        if query.taskless_only && self.task_id.is_some() {
             return false;
         }
         if let Some(worker_id) = query.worker_id.as_ref()
@@ -104,69 +210,82 @@ impl ProcessExecutionScope {
 }
 
 pub(crate) fn cancel_active_processes(query: &ToolExecutionContextQuery) -> usize {
+    cancel_matching_processes(|scope| scope.matches_query(query))
+}
+
+fn cancel_matching_processes(matches_scope: impl Fn(&ProcessExecutionScope) -> bool) -> usize {
+    for (scope, cancelled) in PROCESS_OPERATIONS
+        .lock()
+        .expect("process operation lock")
+        .values()
+    {
+        if matches_scope(scope) {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }
     let shell_processes = {
         let mut table = ACTIVE_SHELL_EXECUTIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let execution_ids = table
             .values()
-            .filter(|process| process.scope.matches_query(query))
+            .filter(|process| matches_scope(&process.scope))
             .map(|process| process.execution_id)
             .collect::<Vec<_>>();
         execution_ids
             .into_iter()
             .filter_map(|execution_id| {
+                let operation =
+                    ProcessOperationGuard::from_scope(table.get(&execution_id)?.scope.clone());
                 let process = table.remove(&execution_id)?;
                 process.cancelled.store(true, Ordering::SeqCst);
-                Some(process)
+                Some((process, operation))
             })
             .collect::<Vec<_>>()
     };
-    let managed_processes = take_managed_processes(|process| process.scope.matches_query(query));
+    let managed_processes = take_managed_processes(|process| matches_scope(&process.scope));
     let cancelled_count = shell_processes.len() + managed_processes.len();
-    for process in &shell_processes {
+    for (process, _settlement_guard) in &shell_processes {
         let _ = terminate_shell_child(&process.child);
     }
-    for mut process in managed_processes {
-        if let Err(error) = process.child.terminate() {
-            tracing::warn!(
-                terminal_id = process.terminal_id,
-                %error,
-                "取消工具执行时终止后台进程树失败"
-            );
+    for (process, _settlement_guard) in managed_processes {
+        if let Err(failure) = stop_process(process, BackgroundJobStatus::Cancelled, "shell_exec") {
+            tracing::error!(failure = %failure.into_payload(), "后台进程取消尚未结算，保留句柄等待重试");
         }
     }
     cancelled_count
 }
 
+/// 取消回执不是结算证据；终止或 Job 终态提交失败都继续阻止新工作抢占资源。
+pub(crate) fn has_active_processes(query: &ToolExecutionContextQuery) -> bool {
+    if ACTIVE_SHELL_EXECUTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|process| process.scope.matches_query(query))
+    {
+        return true;
+    }
+    // 同时持有进程表与在途操作的读取边界；停止操作在移走句柄前登记，失败重入表后
+    // 才释放 guard，不能在两份瞬时集合的交接窗口返回“已结算”。
+    let mut table = PROCESS_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if table.values_mut().any(|process| {
+        process.scope.matches_query(query)
+            && (process.job_settlement_pending() || !matches!(process.poll_exit(), Ok(Some(_))))
+    }) {
+        return true;
+    }
+    PROCESS_OPERATIONS
+        .lock()
+        .expect("process operation lock")
+        .values()
+        .any(|(scope, _)| scope.matches_query(query))
+}
+
 pub(crate) fn cancel_all_active_processes() -> usize {
-    let shell_processes = {
-        let mut table = ACTIVE_SHELL_EXECUTIONS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        table
-            .drain()
-            .map(|(_, process)| {
-                process.cancelled.store(true, Ordering::SeqCst);
-                process
-            })
-            .collect::<Vec<_>>()
-    };
-    let managed_processes = take_managed_processes(|_| true);
-    let cancelled_count = shell_processes.len() + managed_processes.len();
-    for process in &shell_processes {
-        let _ = terminate_shell_child(&process.child);
-    }
-    for mut process in managed_processes {
-        if let Err(error) = process.child.terminate() {
-            tracing::warn!(
-                terminal_id = process.terminal_id,
-                %error,
-                "服务关闭时终止后台进程树失败"
-            );
-        }
-    }
-    cancelled_count
+    cancel_matching_processes(|_| true)
 }
 
 /// 已退出的后台进程只为查看输出保留最近一批，避免进程表随长期使用无限增长。
@@ -174,7 +293,7 @@ pub(super) fn prune_exited_processes(table: &mut HashMap<u64, ManagedProcess>) {
     let mut exited = table
         .values_mut()
         .filter_map(|process| {
-            matches!(process.child.try_wait(), Ok(Some(_)))
+            (!process.job_settlement_pending() && matches!(process.poll_exit(), Ok(Some(_))))
                 .then_some((process.started_at_ms, process.terminal_id))
         })
         .collect::<Vec<_>>();
@@ -188,9 +307,9 @@ pub(super) fn prune_exited_processes(table: &mut HashMap<u64, ManagedProcess>) {
     }
 }
 
-pub(super) fn take_managed_processes(
+fn take_managed_processes(
     predicate: impl Fn(&ManagedProcess) -> bool,
-) -> Vec<ManagedProcess> {
+) -> Vec<(ManagedProcess, ProcessOperationGuard)> {
     let mut table = PROCESS_TABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -201,7 +320,15 @@ pub(super) fn take_managed_processes(
         .collect::<Vec<_>>();
     terminal_ids
         .into_iter()
-        .filter_map(|terminal_id| table.remove(&terminal_id))
+        .filter_map(|terminal_id| {
+            let operation =
+                ProcessOperationGuard::from_scope(table.get(&terminal_id)?.scope.clone());
+            let process = table.remove(&terminal_id)?;
+            if let Some(job) = &process.job {
+                job.request_cancel();
+            }
+            Some((process, operation))
+        })
         .collect()
 }
 
@@ -209,6 +336,14 @@ pub(super) fn process_belongs_to_context(
     process: &ManagedProcess,
     context: &ToolExecutionContext,
 ) -> bool {
+    // 委派权只允许管理子任务，不授予同会话其他任务的进程控制权。
+    if context.caller_scope != crate::ToolCallerScope::SessionMainline
+        && (context.task_id.is_none()
+            || process.scope.task_id.as_deref()
+                != context.task_id.as_ref().map(|task| task.as_str()))
+    {
+        return false;
+    }
     if let Some(session_id) = process.scope.session_id.as_deref()
         && context.session_id.as_ref().map(|id| id.as_str()) != Some(session_id)
     {
@@ -465,14 +600,14 @@ fn process_not_owned(surface_tool: &str, terminal_id: usize) -> String {
     process_failure(
         surface_tool,
         "not_owned",
-        format!("进程 #{terminal_id} 不属于当前会话或工作区"),
+        format!("进程 #{terminal_id} 不属于当前任务、会话或工作区的授权范围"),
     )
     .instruction("用 action=list 查看当前上下文可管理的进程；不要重试同一个 terminal_id。")
     .into_payload()
 }
 
 pub(super) fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String {
-    execute_process_launch_with_surface(input, context, "process_launch", None)
+    execute_process_launch_with_surface(input, context, "process_launch", None, None, None)
 }
 
 pub(super) fn execute_process_launch_with_surface(
@@ -480,6 +615,8 @@ pub(super) fn execute_process_launch_with_surface(
     context: &ToolExecutionContext,
     surface_tool: &str,
     mode: Option<&str>,
+    journal: Option<(&str, &Arc<dyn BackgroundJobJournal>)>,
+    cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> String {
     let request = parse_json_object(input);
     let command =
@@ -502,6 +639,63 @@ pub(super) fn execute_process_launch_with_surface(
         return failure;
     }
     let ShellInvocation { cwd, shell } = invocation;
+    let launch_guard = ProcessOperationGuard::begin(context);
+
+    let job = match journal {
+        Some((call, journal)) => {
+            match journal.begin(context, call, &command, &cwd.to_string_lossy()) {
+                Ok(record) => Some(Arc::new(DurableProcessJob::new(record, journal.clone()))),
+                Err(error) => {
+                    return process_failure(surface_tool, "job_persist_failed", error)
+                        .with("execution_started", false)
+                        .into_payload();
+                }
+            }
+        }
+        None => None,
+    };
+    let terminal_id = launch_guard.id;
+    let stdout_buffer = SharedOutput::default();
+    let stderr_buffer = SharedOutput::default();
+    let observed_exit = Arc::new(Mutex::new(None));
+    // Starting 提交后即保留结算所需的记录；失败时可以只补交终态，不再启动命令。
+    let mut process = ManagedProcess {
+        terminal_id,
+        command: command.clone(),
+        cwd: cwd.display().to_string(),
+        scope: ProcessExecutionScope::from_context(context),
+        child: None,
+        stdin: None,
+        stdout: Arc::clone(&stdout_buffer),
+        stderr: Arc::clone(&stderr_buffer),
+        started_at_ms: UtcMillis::now().0,
+        job: job.clone(),
+        observed_exit: observed_exit.clone(),
+        output_readers: None,
+    };
+    let output_files = match job
+        .as_ref()
+        .map(|job| {
+            let record = job.snapshot();
+            std::fs::create_dir_all(record.stdout_path.parent().expect("job output directory"))?;
+            Ok::<_, std::io::Error>((
+                std::fs::File::create(&record.stdout_path)?,
+                std::fs::File::create(&record.stderr_path)?,
+            ))
+        })
+        .transpose()
+    {
+        Ok(files) => files,
+        Err(error) => {
+            return fail_process_start(
+                process,
+                BackgroundJobStatus::Failed,
+                surface_tool,
+                process_failure(surface_tool, "job_output_failed", error.to_string()),
+                false,
+            );
+        }
+    };
 
     let mut command_builder = std_command(&shell.program);
     command_builder
@@ -511,40 +705,62 @@ pub(super) fn execute_process_launch_with_surface(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match spawn_managed(&mut command_builder) {
+    if launch_guard.is_cancelled()
+        || cancellation.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+    {
+        if let Err(failure) = stop_process(process, BackgroundJobStatus::Cancelled, surface_tool) {
+            return failure.with("execution_started", false).into_payload();
+        }
+        return serde_json::json!({"tool":surface_tool,"status":"cancelled","execution_started":false,"error_code":"job_cancelled_before_start"}).to_string();
+    }
+    process.child = Some(match spawn_managed(&mut command_builder) {
         Ok(child) => child,
         Err(error) => {
             tracing::warn!(tool = surface_tool, %error, "后台进程启动失败");
-            return process_failure(surface_tool, "spawn_failed", "进程启动失败")
-                .instruction(
+            return fail_process_start(
+                process,
+                BackgroundJobStatus::Failed,
+                surface_tool,
+                process_failure(surface_tool, "spawn_failed", "进程启动失败").instruction(
                     "原因已记录到日志；检查 shell 与 cwd 是否可用，不要用相同参数重复调用。",
-                )
-                .into_payload();
+                ),
+                false,
+            );
         }
-    };
+    });
 
-    let stdout_buffer = SharedOutput::default();
-    let stderr_buffer = SharedOutput::default();
-    spawn_managed_process_reader(child.take_stdout(), Arc::clone(&stdout_buffer));
-    spawn_managed_process_reader(child.take_stderr(), Arc::clone(&stderr_buffer));
-    let stdin = child.take_stdin().map(|stdin| Arc::new(Mutex::new(stdin)));
-    let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
-    let mut process = ManagedProcess {
-        terminal_id,
-        command: command.clone(),
-        cwd: cwd.display().to_string(),
-        scope: ProcessExecutionScope::from_context(context),
-        child,
-        stdin,
-        stdout: Arc::clone(&stdout_buffer),
-        stderr: Arc::clone(&stderr_buffer),
-        started_at_ms: UtcMillis::now().0,
-    };
+    if let Some(job) = &job
+        && let Err(error) = job.transition(BackgroundJobStatus::Running, None)
+    {
+        return fail_process_start(
+            process,
+            BackgroundJobStatus::OutcomeUnknown,
+            surface_tool,
+            process_failure(surface_tool, "job_persist_failed", error),
+            true,
+        );
+    }
+
+    let (stdout_file, stderr_file) = output_files.map_or((None, None), |(stdout, stderr)| {
+        (Some(stdout), Some(stderr))
+    });
+    let child = process.child.as_mut().expect("spawned process");
+    let stdout_reader =
+        spawn_process_reader(child.take_stdout(), Arc::clone(&stdout_buffer), stdout_file);
+    let stderr_reader =
+        spawn_process_reader(child.take_stderr(), Arc::clone(&stderr_buffer), stderr_file);
+    process.stdin = child.take_stdin().map(|stdin| Arc::new(Mutex::new(stdin)));
+    if job.is_some() {
+        process.output_readers = Some(ProcessOutputReaders::Reading([
+            stdout_reader,
+            stderr_reader,
+        ]));
+    }
 
     // 观察一小段时间：命令不存在、端口被占用这类立刻退出的启动失败，不能报告成“已启动”。
     let deadline = Instant::now() + STARTUP_OBSERVATION;
     let early_exit = loop {
-        if let Ok(Some(status)) = process.child.try_wait() {
+        if let Ok(Some(status)) = process.poll_exit() {
             break Some(status);
         }
         if Instant::now() >= deadline {
@@ -564,6 +780,32 @@ pub(super) fn execute_process_launch_with_surface(
         table.insert(terminal_id, process);
     }
 
+    if let Some(job) = job.as_ref() {
+        if let Some(status) = &early_exit {
+            let output_settled = settle_exited_process(terminal_id);
+            let state = if !output_settled {
+                BackgroundJobStatus::OutcomeUnknown
+            } else if status.success() {
+                BackgroundJobStatus::Completed
+            } else {
+                BackgroundJobStatus::Failed
+            };
+            if let Err(error) = job.transition(state, status.code()) {
+                return process_failure(surface_tool, "job_persist_failed", error)
+                    .with("job_id", job.snapshot().job_id)
+                    .with("terminal_id", terminal_id)
+                    .with("execution_started", true)
+                    .with("resources_settled", false)
+                    .instruction(
+                        "原进程的结算尚未提交；用相同 job_id 核对或重试 kill，不要重新启动命令。",
+                    )
+                    .into_payload();
+            }
+        } else {
+            watch_job(terminal_id, job.clone(), observed_exit);
+        }
+    }
+
     let exit_code = early_exit.as_ref().and_then(ExitStatus::code);
     let exited_with_failure = early_exit.as_ref().is_some_and(|status| !status.success());
     let mut payload = serde_json::json!({
@@ -577,6 +819,54 @@ pub(super) fn execute_process_launch_with_surface(
         "running": early_exit.is_none(),
         "startup_status": if exited_with_failure { "failed" } else { "confirmed" },
     });
+    if let Some(job) = job.as_ref() {
+        let record = job.snapshot();
+        payload["job_id"] = record.job_id.into();
+        payload["job_status"] = serde_json::to_value(record.status).expect("job status serializes");
+        if record.status == BackgroundJobStatus::OutcomeUnknown {
+            payload["status"] = "indeterminate".into();
+            payload["error_code"] = "job_output_unconfirmed".into();
+            payload["error"] =
+                "后台进程或输出结果尚未确认；保留 Job 引用核对，不要自动重放命令".into();
+        }
+    }
+    if launch_guard.is_cancelled()
+        || cancellation.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+    {
+        let stopped = execute_process_kill_with_surface(
+            &serde_json::json!({"terminal_id":terminal_id}).to_string(),
+            context,
+            surface_tool,
+            mode,
+        );
+        let stopped: Value = serde_json::from_str(&stopped).expect("process kill JSON");
+        if stopped["status"] != "succeeded" {
+            if stopped["error_code"] == format!("{surface_tool}_not_found") {
+                return process_failure(
+                    surface_tool,
+                    "job_settlement_unconfirmed",
+                    "原进程正在由另一个取消操作结算",
+                )
+                .with("job_id", payload["job_id"].clone())
+                .with("terminal_id", terminal_id)
+                .with("resources_settled", false)
+                .instruction(
+                    "先核对原 Job 与取消回执；此结果不证明资源已释放，不能重新启动原命令。",
+                )
+                .into_payload();
+            }
+            return stopped.to_string();
+        }
+        if let Some(job) = job.as_ref() {
+            payload["job_status"] =
+                serde_json::to_value(job.snapshot().status).expect("job status serializes");
+        }
+        payload["status"] = "cancelled".into();
+        payload["running"] = false.into();
+        payload["resources_settled"] = true.into();
+        payload["error_code"] = "job_cancelled_during_start".into();
+        return payload.to_string();
+    }
     if early_exit.is_some() {
         payload["exit_code"] = exit_code.into();
         output_fields(
@@ -611,6 +901,10 @@ pub(super) fn execute_process_launch_with_surface(
     }
     if let Some(mode) = mode {
         payload["mode"] = Value::String(mode.to_string());
+    }
+    if payload["status"] == "indeterminate" {
+        payload["summary"] =
+            "后台 Job 的输出或执行结果未确认，请按 job_id 核对，不能视为已完成".into();
     }
     payload.to_string()
 }
@@ -649,7 +943,7 @@ pub(super) fn execute_process_read_with_surface(
     if !process_belongs_to_context(process, context) {
         return process_not_owned(surface_tool, terminal_id);
     }
-    let exit_status = process.child.try_wait().ok().flatten();
+    let exit_status = process.poll_exit().ok().flatten();
     let running = exit_status.is_none();
     let exit_code = exit_status.as_ref().and_then(ExitStatus::code);
 
@@ -791,7 +1085,7 @@ pub(super) fn execute_process_kill_with_surface(
     if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
-    let mut process = {
+    let (process, _settlement_guard) = {
         let mut table = PROCESS_TABLE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -801,25 +1095,25 @@ pub(super) fn execute_process_kill_with_surface(
         if !process_belongs_to_context(process, context) {
             return process_not_owned(surface_tool, terminal_id);
         }
-        table
-            .remove(&(terminal_id as u64))
-            .expect("checked process should remain in table")
+        if let Some(job) = &process.job {
+            job.request_cancel();
+        }
+        let operation = ProcessOperationGuard::from_scope(process.scope.clone());
+        (
+            table
+                .remove(&(terminal_id as u64))
+                .expect("checked process should remain in table"),
+            operation,
+        )
     };
-    if let Err(error) = process.child.terminate() {
-        tracing::warn!(tool = surface_tool, terminal_id, %error, "停止后台进程树失败");
-        // 没停掉就必须仍然可以管理，否则它会变成再也找不到的孤儿进程。
-        PROCESS_TABLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(terminal_id as u64, process);
-        return process_failure(surface_tool, "terminate_failed", "没能停止后台进程")
-            .instruction("进程仍在进程表中；用 action=read 确认状态，必要时告知用户手动结束它。")
-            .into_payload();
+    if let Err(failure) = stop_process(process, BackgroundJobStatus::Cancelled, surface_tool) {
+        return failure.into_payload();
     }
     let mut payload = serde_json::json!({
         "tool": surface_tool,
         "status": "succeeded",
         "terminal_id": terminal_id,
+        "resources_settled": true,
         "summary": format!("已停止进程 #{terminal_id}")
     });
     if let Some(mode) = mode {
@@ -849,8 +1143,7 @@ pub(super) fn execute_process_list_with_surface(
             continue;
         }
         let running = process
-            .child
-            .try_wait()
+            .poll_exit()
             .ok()
             .flatten()
             .map(|_| false)
@@ -879,22 +1172,434 @@ pub(super) fn execute_process_list_with_surface(
     payload.to_string()
 }
 
-pub(super) fn spawn_managed_process_reader<T: Read + Send + 'static>(
+fn spawn_process_reader<T: Read + Send + 'static>(
     pipe: Option<T>,
     target: SharedOutput,
-) -> JoinHandle<()> {
+    mut file: Option<std::fs::File>,
+) -> JoinHandle<std::io::Result<()>> {
     thread::spawn(move || {
         let Some(mut pipe) = pipe else {
-            return;
+            return Ok(());
         };
         let mut chunk = [0_u8; 4096];
         loop {
             match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(size) => lock_output(&target).push(&chunk[..size]),
+                Ok(0) => break,
+                Err(error) => return Err(error),
+                Ok(size) => {
+                    lock_output(&target).push(&chunk[..size]);
+                    if let Some(file) = file.as_mut()
+                        && let Err(error) = file.write_all(&chunk[..size])
+                    {
+                        return Err(error);
+                    }
+                }
             }
         }
+        if let Some(file) = file {
+            file.sync_data()?;
+        }
+        Ok(())
     })
+}
+
+/// 调用方持有原操作 guard；启动失败、显式 kill 和作用域取消共用此结算入口。
+#[allow(clippy::result_large_err)]
+fn stop_process(
+    mut process: ManagedProcess,
+    status: BackgroundJobStatus,
+    surface_tool: &str,
+) -> Result<(), ToolFailure> {
+    if let Some(job) = &process.job {
+        job.request_cancel();
+    }
+    let result = match process.terminate() {
+        Err(error) => {
+            tracing::warn!(terminal_id = process.terminal_id, %error, "停止后台进程树失败");
+            Err(
+                process_failure(surface_tool, "terminate_failed", "没能停止后台进程")
+                    .with("process_stopped", false),
+            )
+        }
+        Ok(()) => {
+            let output_settled = process
+                .output_readers
+                .as_mut()
+                .is_none_or(ProcessOutputReaders::settle);
+            let status = if output_settled {
+                status
+            } else {
+                BackgroundJobStatus::OutcomeUnknown
+            };
+            process
+                .job
+                .as_ref()
+                .map_or(Ok(()), |job| {
+                    job.transition(status, None).map_err(|error| {
+                        process_failure(surface_tool, "job_persist_failed", error)
+                            .with("process_stopped", true)
+                    })
+                })
+                .and_then(|()| {
+                    if output_settled {
+                        Ok(())
+                    } else {
+                        Err(process_failure(
+                            surface_tool,
+                            "job_output_unsettled",
+                            "进程已停止但输出读取尚未结算",
+                        )
+                        .with("process_stopped", true))
+                    }
+                })
+        }
+    };
+    result.map_err(|failure| {
+        let mut failure = failure
+            .with("terminal_id", process.terminal_id)
+            .with("resources_settled", false)
+            .instruction("结算尚未完成；稍后重试相同的 kill 核对原 Job，不能重新启动原命令。");
+        if let Some(job) = &process.job {
+            failure = failure.with("job_id", job.snapshot().job_id);
+        }
+        PROCESS_TABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(process.terminal_id, process);
+        failure
+    })
+}
+
+fn fail_process_start(
+    process: ManagedProcess,
+    status: BackgroundJobStatus,
+    surface_tool: &str,
+    mut failure: ToolFailure,
+    execution_started: bool,
+) -> String {
+    if let Some(job) = &process.job {
+        failure = failure.with("job_id", job.snapshot().job_id);
+    }
+    match stop_process(process, status, surface_tool) {
+        Ok(()) => failure.with("resources_settled", true),
+        Err(settlement) => settlement,
+    }
+    .with("execution_started", execution_started)
+    .into_payload()
+}
+
+/// 根进程退出不代表其后代已经释放。先移交在途 guard，再于表锁外回收整棵树。
+fn settle_exited_process(terminal_id: u64) -> bool {
+    let (mut process, _settlement_guard) = {
+        let mut table = PROCESS_TABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(process) = table.get(&terminal_id) else {
+            return false; // 已被另一个停止操作领取，不能据此声称结算完成。
+        };
+        let guard = ProcessOperationGuard::from_scope(process.scope.clone());
+        (table.remove(&terminal_id).expect("checked process"), guard)
+    };
+    let result = process.terminate();
+    if let Err(error) = &result {
+        tracing::error!(terminal_id, %error, "后台 Job 派生进程尚未结算");
+    }
+    let output_settled = result.is_ok()
+        && process
+            .output_readers
+            .as_mut()
+            .is_none_or(ProcessOutputReaders::settle);
+    PROCESS_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(terminal_id, process);
+    output_settled
+}
+
+fn watch_job(
+    terminal_id: u64,
+    job: Arc<DurableProcessJob>,
+    observed_exit: Arc<Mutex<Option<ExitStatus>>>,
+) {
+    thread::spawn(move || {
+        let exit = loop {
+            let observed = {
+                let mut table = PROCESS_TABLE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match table.get_mut(&terminal_id) {
+                    Some(process) => process.poll_exit(),
+                    None => break *observed_exit.lock().expect("process exit lock"),
+                }
+            };
+            match observed {
+                Ok(Some(status)) => break Some(status),
+                Err(error) => {
+                    tracing::error!(%error, "后台 Job 退出状态查询失败");
+                    break None;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+            }
+        };
+        let output_settled = settle_exited_process(terminal_id);
+        let (status, code) = match exit {
+            Some(exit) if output_settled && exit.success() => {
+                (BackgroundJobStatus::Completed, exit.code())
+            }
+            Some(exit) if output_settled => (BackgroundJobStatus::Failed, exit.code()),
+            _ => (BackgroundJobStatus::OutcomeUnknown, None),
+        };
+        if job.is_cancelling() {
+            return;
+        }
+        if let Err(error) = job.transition(status, code) {
+            tracing::error!(%error, "后台 Job 终态未提交，保留原句柄供结算重试；重启后结果未知");
+        }
+    });
+}
+
+pub(super) fn execute_durable_job_action(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &crate::ToolRuntimeResources,
+) -> Option<String> {
+    let request = parse_json_object(input)?;
+    let action = field_string(&request, "action")?;
+    // 先按动作分派；run 的可选 job_id 不能把新命令变成历史 Job 查询，
+    // 未知动作继续由 shell 的统一参数检查拒绝。
+    if !matches!(action.as_str(), "read" | "wait" | "write" | "kill" | "list") {
+        return None;
+    }
+    let job_id = (action != "list")
+        .then(|| field_string(&request, "job_id"))
+        .flatten();
+    if job_id.is_none() && action != "list" {
+        return None;
+    }
+    let journal = match resources.background_job_journal.as_ref() {
+        Some(journal) => journal,
+        None if job_id.is_none() => return None,
+        None => {
+            return Some(
+                process_failure(
+                    "shell_exec",
+                    "job_unavailable",
+                    "当前运行时未提供持久 Job 查询",
+                )
+                .into_payload(),
+            );
+        }
+    };
+    let jobs = match journal.list(context) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            return Some(process_failure("shell_exec", "job_query_failed", error).into_payload());
+        }
+    };
+    if action == "list" && job_id.is_none() {
+        let mut payload: Value = serde_json::from_str(&execute_process_list_with_surface(
+            context,
+            "shell_exec",
+            Some("background_list"),
+        ))
+        .expect("process list json");
+        payload["jobs"] = serde_json::json!(jobs);
+        return Some(payload.to_string());
+    }
+    let job_id = job_id?;
+    let Some(mut job) = jobs.into_iter().find(|job| job.job_id == job_id) else {
+        return Some(
+            process_failure(
+                "shell_exec",
+                "job_not_found",
+                "Job 不存在或不在当前授权范围",
+            )
+            .into_payload(),
+        );
+    };
+    if action == "wait" {
+        let cancellation = super::cancellation::OperationCancellation::new(context, resources);
+        let timeout = field_usize(&request, "timeout_ms").unwrap_or(60_000);
+        if !(1_000..=60_000).contains(&timeout) {
+            return Some(invalid_input(
+                "shell_exec",
+                "action=wait 的 timeout_ms 必须在 1000–60000 之间",
+            ));
+        }
+        job = match journal.wait_for_terminal(context, &job_id, Duration::from_millis(timeout as u64), Some(cancellation.flag())) {
+            Ok(Some(job)) => job,
+            Ok(None) => return Some(serde_json::json!({
+                "tool":"shell_exec", "status":"cancelled", "job_id":job_id,
+                "error_code":"shell_exec_wait_cancelled", "execution_started":false,
+                "instruction":"等待已取消；此回执不证明进程已经停止，进程结算由原 Task 取消入口负责。",
+            }).to_string()),
+            Err(error) => return Some(process_failure("shell_exec", "job_wait_failed", error).into_payload()),
+        };
+    }
+    if action == "read" || action == "wait" {
+        use std::io::{Seek, SeekFrom};
+        let mut payload = serde_json::json!({"tool":"shell_exec","status":"succeeded","mode":"background_read","job":job,"job_id":job.job_id,"running":!job.status.is_terminal(),"exit_code":job.exit_code});
+        if action == "wait" {
+            payload["mode"] = "background_wait".into();
+            payload["wait_timed_out"] = (!job.status.is_terminal()).into();
+            match job.status {
+                BackgroundJobStatus::Failed => {
+                    payload["status"] = "failed".into();
+                    payload["error_code"] = "shell_exec_job_failed".into();
+                    payload["error"] = "后台命令以非零退出码结束".into();
+                    payload["instruction"] =
+                        "根据退出码和输出处理失败，不能把等待结束当成命令成功。".into();
+                }
+                BackgroundJobStatus::Cancelled => {
+                    payload["status"] = "cancelled".into();
+                    payload["error_code"] = "shell_exec_job_cancelled".into();
+                    payload["instruction"] = "后台命令已取消，保留输出不代表命令已完成。".into();
+                }
+                BackgroundJobStatus::OutcomeUnknown => {
+                    payload["status"] = "indeterminate".into();
+                    payload["error_code"] = "shell_exec_job_outcome_unknown".into();
+                }
+                BackgroundJobStatus::Starting | BackgroundJobStatus::Running => {
+                    payload["instruction"] = "等待超时，命令仍未结算；可处理其他工作，依赖结果前须继续等待，不要重新启动命令。".into();
+                }
+                BackgroundJobStatus::Completed => {}
+            }
+        }
+        let max = field_usize(&request, "max_bytes")
+            .unwrap_or(12_000)
+            .clamp(512, 200_000);
+        for (stream, path) in [("stdout", &job.stdout_path), ("stderr", &job.stderr_path)] {
+            let offset = field_usize(&request, &format!("{stream}_offset")).unwrap_or(0) as u64;
+            let data = (|| {
+                let mut file = std::fs::File::open(path)?;
+                let length = file.metadata()?.len();
+                let offset = offset.min(length);
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(max as u64).read_to_end(&mut bytes)?;
+                let next = offset + bytes.len() as u64;
+                Ok::<_, std::io::Error>((bytes, offset, next, length))
+            })();
+            match data {
+                Ok((bytes, offset, next, length)) => {
+                    payload[stream] = String::from_utf8_lossy(&bytes).into_owned().into();
+                    payload[format!("{stream}_start_offset")] = offset.into();
+                    payload[format!("{stream}_next_offset")] = next.into();
+                    payload[format!("{stream}_has_more")] = (next < length).into();
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && job.status == BackgroundJobStatus::Starting =>
+                {
+                    payload[stream] = "".into();
+                    payload["output_pending"] = true.into();
+                }
+                Err(error) => {
+                    return Some(
+                        process_failure("shell_exec", "job_output_failed", error.to_string())
+                            .into_payload(),
+                    );
+                }
+            }
+        }
+        if job.status == BackgroundJobStatus::OutcomeUnknown {
+            payload["instruction"] =
+                "进程连接已丢失，保留的输出不能证明任务完成；先核对副作用，不要自动重放原命令。"
+                    .into();
+        }
+        return Some(payload.to_string());
+    }
+    if action == "kill"
+        && let Some(receipt) = settled_job_stop_receipt(&job)
+    {
+        return Some(receipt);
+    }
+    let candidates = {
+        let table = PROCESS_TABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table
+            .values()
+            .filter(|process| process_belongs_to_context(process, context))
+            .filter_map(|process| {
+                process
+                    .job
+                    .as_ref()
+                    .map(|job| (process.terminal_id, job.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    // snapshot 可能等待正在写盘的 journal，不能在持有全局进程表锁时读取。
+    let terminal = candidates.into_iter().find_map(|(terminal, candidate)| {
+        (candidate.snapshot().job_id == job_id).then_some(terminal)
+    });
+    let result = if let Some(terminal) = terminal {
+        let mut arguments = request;
+        arguments.insert("terminal_id".into(), terminal.into());
+        let arguments = Value::Object(arguments).to_string();
+        if action == "kill" {
+            execute_process_kill_with_surface(
+                &arguments,
+                context,
+                "shell_exec",
+                Some("background_kill"),
+            )
+        } else {
+            execute_process_write_with_surface(
+                &arguments,
+                context,
+                "shell_exec",
+                Some("background_write"),
+            )
+        }
+    } else {
+        process_failure(
+            "shell_exec",
+            "job_not_attached",
+            "Job 没有活动进程连接；可读取历史输出，不能按旧 PID 操作或重放",
+        )
+        .into_payload()
+    };
+    // Running 快照之后或找到句柄之后都可能被另一个停止操作抢先结算。
+    // 句柄缺失时重读原持久事实；尚未提交或 OutcomeUnknown 仍保留失败回执。
+    if action == "kill" {
+        let payload: Value = serde_json::from_str(&result).expect("process kill JSON");
+        if matches!(
+            payload["error_code"].as_str(),
+            Some("shell_exec_not_found" | "shell_exec_job_not_attached")
+        ) {
+            let current_jobs = match journal.list(context) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    return Some(
+                        process_failure("shell_exec", "job_query_failed", error).into_payload(),
+                    );
+                }
+            };
+            if let Some(receipt) = current_jobs
+                .iter()
+                .find(|current| current.job_id == job_id)
+                .and_then(settled_job_stop_receipt)
+            {
+                return Some(receipt);
+            }
+        }
+    }
+    Some(result)
+}
+
+fn settled_job_stop_receipt(job: &BackgroundJob) -> Option<String> {
+    // 已确认终态只在资源回收后提交；未知结果不能用旧 PID 或短期句柄推断已释放。
+    matches!(
+        job.status,
+        BackgroundJobStatus::Completed | BackgroundJobStatus::Failed | BackgroundJobStatus::Cancelled
+    )
+    .then(|| serde_json::json!({
+        "tool":"shell_exec", "status":"succeeded", "mode":"background_kill",
+        "job_id":job.job_id, "job":job, "running":false, "resources_settled":true,
+        "summary":"后台 Job 已结算，读取原结算回执",
+        "instruction":"停止操作已经完成；命令是否成功仍以原 job.status 和 exitCode 为准，不要重新启动原命令。",
+    }).to_string())
 }
 
 fn require_process_context(tool: &str, context: &ToolExecutionContext) -> Option<String> {
@@ -915,6 +1620,90 @@ fn require_process_context(tool: &str, context: &ToolExecutionContext) -> Option
 #[cfg(test)]
 mod output_buffer_tests {
     use super::*;
+
+    fn process_with_output(stdout: JoinHandle<std::io::Result<()>>) -> ManagedProcess {
+        let stderr = thread::spawn(|| Ok(()));
+        ManagedProcess {
+            terminal_id: NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed),
+            command: "settlement fixture".into(),
+            cwd: String::new(),
+            scope: ProcessExecutionScope::default(),
+            child: None,
+            stdin: None,
+            stdout: Arc::new(Mutex::new(OutputBuffer::default())),
+            stderr: Arc::new(Mutex::new(OutputBuffer::default())),
+            started_at_ms: UtcMillis::now().0,
+            job: None,
+            observed_exit: Arc::new(Mutex::new(None)),
+            output_readers: Some(ProcessOutputReaders::Reading([stdout, stderr])),
+        }
+    }
+
+    #[test]
+    fn stopping_process_waits_for_output_before_reporting_settled() {
+        let (release, pending) = std::sync::mpsc::channel();
+        let process = process_with_output(thread::spawn(move || {
+            pending.recv().unwrap();
+            Ok(())
+        }));
+        let (stopped, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            stopped
+                .send(stop_process(
+                    process,
+                    BackgroundJobStatus::Cancelled,
+                    "shell_exec",
+                ))
+                .unwrap();
+        });
+        let premature = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "输出尚未回收时不能返回资源已结算"
+        );
+        assert!(result.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+    }
+
+    #[test]
+    fn stop_retains_unfinished_output_and_does_not_hide_read_failures_on_retry() {
+        for read_error in [false, true] {
+            let (release, pending) = std::sync::mpsc::channel();
+            let process = process_with_output(thread::spawn(move || {
+                pending.recv().unwrap();
+                if read_error {
+                    Err(std::io::Error::other("output write failed"))
+                } else {
+                    Ok(())
+                }
+            }));
+            let id = process.terminal_id;
+            let error =
+                stop_process(process, BackgroundJobStatus::Cancelled, "shell_exec").unwrap_err();
+            let receipt: Value = serde_json::from_str(&error.into_payload()).unwrap();
+            assert_eq!(receipt["resources_settled"], false);
+            release.send(()).unwrap();
+            let retained = PROCESS_TABLE
+                .lock()
+                .unwrap()
+                .remove(&id)
+                .expect("未完成输出保留原句柄供重试");
+            let retry = stop_process(retained, BackgroundJobStatus::Cancelled, "shell_exec");
+            assert_eq!(
+                retry.is_err(),
+                read_error,
+                "输出失败不能在读取线程已被 join 后变成成功"
+            );
+            if read_error {
+                let retained = PROCESS_TABLE.lock().unwrap().remove(&id).unwrap();
+                assert!(
+                    stop_process(retained, BackgroundJobStatus::Cancelled, "shell_exec").is_err()
+                );
+                PROCESS_TABLE.lock().unwrap().remove(&id);
+            }
+        }
+    }
 
     fn filled(text: &str) -> OutputBuffer {
         let mut buffer = OutputBuffer::default();

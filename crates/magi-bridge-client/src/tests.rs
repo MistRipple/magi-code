@@ -195,6 +195,66 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
 }
 
 #[test]
+fn json_rpc_model_client_publishes_probe_only_capabilities() {
+    let transport = Arc::new(RecordingTransport::new(
+        serde_json::to_value(crate::ModelResponse::completed("probe"))
+            .expect("model response should serialize"),
+        json!({"ok": true, "payload": "probe"}),
+    ));
+    let client = JsonRpcModelBridgeClient::new(transport.clone());
+    let capabilities = client.executor_capabilities();
+
+    assert_eq!(capabilities, crate::text_executor_capabilities());
+    let mut request = ModelInvocationRequest {
+        provider: "loopback".to_string(),
+        prompt: "probe".to_string(),
+        messages: None,
+        tools: None,
+        tool_choice: None,
+    };
+    request.tool_choice = Some(crate::ChatToolChoice::force_function("shell_exec"));
+    assert!(
+        client
+            .invoke(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("executor_native_tools_unsupported")
+    );
+    request.tool_choice = None;
+    request.messages = Some(vec![
+        serde_json::from_value(json!({
+            "role": "user", "content": "inspect image",
+            "images": [{"type":"base64", "media_type":"image/png", "data":"image"}]
+        }))
+        .unwrap(),
+    ]);
+    assert!(
+        client
+            .invoke(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("executor_image_unsupported")
+    );
+    request.messages.as_mut().unwrap()[0].images.clear();
+    assert!(
+        client
+            .invoke(request.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("executor_message_history_unsupported")
+    );
+    assert!(
+        transport.calls().is_empty(),
+        "unsupported calls must not reach the transport"
+    );
+    for messages in [None, Some(Vec::new())] {
+        request.messages = messages;
+        client.invoke(request.clone()).unwrap();
+    }
+    assert_eq!(transport.calls().len(), 2);
+}
+
+#[test]
 fn json_rpc_model_client_rejects_legacy_bridge_response_shape() {
     let legacy_response = json!({
         "ok": true,
@@ -282,6 +342,54 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
         )
         .expect("mcp dispatch should succeed");
     assert_eq!(mcp.response.payload(), "dispatch");
+}
+
+#[test]
+fn dispatch_runtime_enforces_declared_executor_response_contract() {
+    let plan = BridgeBindingDispatchPlan {
+        source_skill_ids: vec![],
+        bindings: vec![BridgeBindingReference {
+            binding_id: "model-binding".into(),
+            tool_name: "model.prompt".into(),
+            bridge_kind: BridgeBindingKind::Model,
+            dispatch_action: BridgeDispatchAction::ModelPrompt,
+            bridge_target: "loopback".into(),
+        }],
+    };
+    for (response, code) in [
+        (
+            json!({"status":"requires_tool_execution", "content":"probe"}),
+            "executor_native_tools_unsupported",
+        ),
+        (
+            json!({"status":"incomplete", "content":"partial"}),
+            "executor_incomplete_response",
+        ),
+        (
+            serde_json::to_value(crate::ModelResponse::completed("")).unwrap(),
+            "executor_incomplete_response",
+        ),
+    ] {
+        let transport = Arc::new(RecordingTransport::new(response, Value::Null));
+        let runtime = BridgeDispatchRuntime::new()
+            .with_model_client(Arc::new(JsonRpcModelBridgeClient::new(transport.clone())));
+        let error = runtime
+            .dispatch(
+                &plan,
+                BridgeDispatchInput {
+                    binding_id: "model-binding".into(),
+                    payload: "hello".into(),
+                    working_directory: None,
+                },
+            )
+            .expect_err("dispatch must reject responses outside the executor contract");
+        assert!(error.to_string().contains(code), "{error}");
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "invalid responses must not be retried"
+        );
+    }
 }
 
 // ============================================================================

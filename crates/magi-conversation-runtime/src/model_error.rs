@@ -207,6 +207,9 @@ impl ModelFailureDiagnostic {
 }
 
 fn model_failure_is_user_retryable(code: &str) -> bool {
+    if code.starts_with("executor_") {
+        return false;
+    }
     if code.starts_with("web_") || code.starts_with("magi_tool_") {
         return magi_web_model::WebModelErrorCode::ALL
             .into_iter()
@@ -215,7 +218,11 @@ fn model_failure_is_user_retryable(code: &str) -> bool {
     }
     !matches!(
         code,
-        "model_auth_failed"
+        "run_safety_limit"
+            | "executor_output_limit_unsupported"
+            | "executor_output_limit_incompatible"
+            | "run_paused"
+            | "model_auth_failed"
             | "model_context_limit"
             | "model_invalid_request"
             | "model_not_found"
@@ -233,6 +240,80 @@ pub(crate) struct ModelInvocationErrorClassification {
 pub(crate) fn classify_model_invocation_error(
     raw_error: &str,
 ) -> ModelInvocationErrorClassification {
+    if raw_error.contains("run_safety_limit:") {
+        return ModelInvocationErrorClassification {
+            code: "run_safety_limit",
+            public_message: "本次执行已达到安全上限，请核对已保存的进展和重复操作后再继续。",
+        };
+    }
+    if raw_error.contains("executor_output_limit_incompatible:") {
+        return ModelInvocationErrorClassification {
+            code: "executor_output_limit_incompatible",
+            public_message: "单次输出上限与当前推理配置不兼容，请调整输出上限或推理强度。",
+        };
+    }
+    if raw_error.contains("executor_output_limit_unsupported:") {
+        return ModelInvocationErrorClassification {
+            code: "executor_output_limit_unsupported",
+            public_message: "当前执行器不支持单次输出上限，请切换执行器或调整输出上限。",
+        };
+    }
+    for (code, public_message) in [
+        (
+            "executor_outcome_unknown",
+            "执行器调用结果未知，请核对已保存的进展和远端状态后再继续。",
+        ),
+        (
+            "executor_incomplete_response",
+            "执行器未交付完整结果，请核对远端状态；本次未自动重发。",
+        ),
+        (
+            "executor_resume_unsupported",
+            "当前执行器不支持检查点恢复，请核对进展后发送新的明确指令。",
+        ),
+        (
+            "executor_invalid_capabilities",
+            "当前执行器的能力声明无效，请检查引擎配置。",
+        ),
+        (
+            "executor_invalid_receipt",
+            "执行器返回的执行证据无效，请核对原执行；本次未自动重发。",
+        ),
+        (
+            "executor_text_unsupported",
+            "当前执行器不支持文字输入，请切换执行器。",
+        ),
+        (
+            "executor_image_unsupported",
+            "当前执行器不支持图片输入，请切换执行器。",
+        ),
+        (
+            "executor_native_tools_unsupported",
+            "当前执行器不支持 Magi 原生工具，请切换执行器或关闭工具。",
+        ),
+        (
+            "executor_scope_required",
+            "外部执行器尚未绑定本次任务的目录和权限，调用未发送。",
+        ),
+        (
+            "executor_policy_unsupported",
+            "当前执行器无法落实本次任务权限，调用未发送。",
+        ),
+    ] {
+        if raw_error.contains(&format!("{code}:")) {
+            return ModelInvocationErrorClassification {
+                code,
+                public_message,
+            };
+        }
+    }
+    if raw_error.contains("run_paused:") {
+        return ModelInvocationErrorClassification {
+            code: "run_paused",
+            public_message: "目标已暂停，恢复目标后可继续执行。",
+        };
+    }
+
     // GPT Web 的错误码由桥接层放在消息前缀：保留原码让前端映射主行动，
     // 且**绝不**自动重试（重试会重复向账号发消息）。
     if let Some(web_code) = magi_web_model::WebModelErrorCode::find_in(raw_error) {
@@ -619,5 +700,25 @@ mod tests {
         assert!(model_failure_is_user_retryable("web_send_rejected"));
         assert!(!model_failure_is_user_retryable("web_turn_timeout"));
         assert!(!model_failure_is_user_retryable("web_context_lost"));
+    }
+    #[test]
+    fn safety_stop_and_output_configuration_errors_have_distinct_actions() {
+        for code in [
+            "run_safety_limit",
+            "executor_output_limit_incompatible",
+            "executor_output_limit_unsupported",
+            "executor_invalid_capabilities",
+            "executor_invalid_receipt",
+            "executor_text_unsupported",
+            "executor_image_unsupported",
+            "executor_native_tools_unsupported",
+            "executor_incomplete_response",
+            "executor_outcome_unknown",
+            "executor_resume_unsupported",
+        ] {
+            let classification = classify_model_invocation_error(&format!("{code}: detail"));
+            assert_eq!(classification.code, code);
+            assert!(!model_failure_is_user_retryable(code));
+        }
     }
 }

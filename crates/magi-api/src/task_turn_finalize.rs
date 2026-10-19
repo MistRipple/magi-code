@@ -135,7 +135,7 @@ impl SessionStatePersistenceScheduler {
         Ok(())
     }
 
-    fn persist_terminal(&self, checkpoint: &'static str) -> Result<(), String> {
+    fn persist_immediately(&self, checkpoint: &'static str) -> Result<(), String> {
         {
             let mut state = self
                 .state
@@ -166,23 +166,27 @@ impl SessionStatePersistenceScheduler {
             .expect("session persistence idle wait lock poisoned");
         !state.worker_active
     }
-}
-
-pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersistCallback> {
-    let scheduler = SessionStatePersistenceScheduler::new(state);
-    Arc::new(move |checkpoint: &str| {
+    fn checkpoint(self: &Arc<Self>, checkpoint: &str) -> Result<(), String> {
         let checkpoint: &'static str = match checkpoint {
             "session_turn_completed"
             | "session_turn_failed"
             | "session_task_chain_archived"
             | "session_turn_final_item"
+            | "task_skill_activated"
+            | "agent_worktree_allocated"
+            | "agent_worktree_reattached"
+            | "agent_worktree_result_saved"
             | "session_task_turn_goal_updated" => {
-                // 这些 checkpoint 是终态或用户可见最终结果，必须在回调返回前落盘。
+                // 终态、最终结果和执行限制必须在回调返回前落盘。
                 match checkpoint {
                     "session_turn_completed" => "session_turn_completed",
                     "session_turn_failed" => "session_turn_failed",
                     "session_task_chain_archived" => "session_task_chain_archived",
                     "session_turn_final_item" => "session_turn_final_item",
+                    "task_skill_activated" => "task_skill_activated",
+                    "agent_worktree_allocated" => "agent_worktree_allocated",
+                    "agent_worktree_reattached" => "agent_worktree_reattached",
+                    "agent_worktree_result_saved" => "agent_worktree_result_saved",
                     "session_task_turn_goal_updated" => "session_task_turn_goal_updated",
                     _ => unreachable!(),
                 }
@@ -208,11 +212,16 @@ pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersi
                     }
                     _ => "session_turn_progress",
                 };
-                return scheduler.request(checkpoint);
+                return self.request(checkpoint);
             }
         };
-        scheduler.persist_terminal(checkpoint)
-    })
+        self.persist_immediately(checkpoint)
+    }
+}
+
+pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersistCallback> {
+    let scheduler = SessionStatePersistenceScheduler::new(state);
+    Arc::new(move |checkpoint| scheduler.checkpoint(checkpoint))
 }
 
 pub fn finalize_background_session_task_turn_if_root_completed(
@@ -298,6 +307,45 @@ pub fn finalize_background_session_task_turn_if_root_terminal_for_turn(
     runner_status: &str,
     expected_turn_id: Option<&str>,
 ) -> Result<bool, String> {
+    if let Some(turn_id) = expected_turn_id
+        && let Some(turn) = state
+            .session_store
+            .canonical_turn_for_session_turn_id(session_id, turn_id)
+        && let Some(binding) = turn
+            .agent_turn_binding()
+            .map_err(|error| error.to_string())?
+    {
+        let task = state
+            .task_store()
+            .and_then(|store| store.get_task(&binding.task_id))
+            .ok_or_else(|| "Agent Turn 结算缺少 Task".to_string())?;
+        let status = match task.status {
+            magi_core::TaskStatus::Completed => magi_session_store::CanonicalTurnStatus::Completed,
+            magi_core::TaskStatus::Failed => magi_session_store::CanonicalTurnStatus::Failed,
+            magi_core::TaskStatus::Killed => magi_session_store::CanonicalTurnStatus::Cancelled,
+            _ => return Ok(false),
+        };
+        let Some((next, changed)) = state
+            .session_store
+            .finish_agent_turn(session_id, &binding.task_id, turn_id, status)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        if changed {
+            let workspace_id = state
+                .session_store
+                .session(session_id)
+                .and_then(|session| session.workspace_id);
+            for item in &next.items {
+                magi_conversation_runtime::session_writeback::publish_committed_canonical_item_event(
+                    &state.event_bus, magi_session_store::CanonicalItemCommitNotice {
+                        turn:next.clone(), item:item.clone(), workspace_id:workspace_id.clone(),
+                    });
+            }
+        }
+        return Ok(changed);
+    }
     let finalize_started_at = Instant::now();
     let trace_id = state
         .session_store
@@ -565,6 +613,42 @@ mod tests {
     use magi_workspace::WorkspaceStore;
 
     #[test]
+    fn skill_activation_checkpoint_is_synchronous_and_reports_write_failure() {
+        for (checkpoint, fail) in [
+            ("task_skill_activated", false),
+            ("task_skill_activated", true),
+            ("agent_worktree_allocated", false),
+            ("agent_worktree_allocated", true),
+            ("agent_worktree_reattached", false),
+            ("agent_worktree_reattached", true),
+            ("agent_worktree_result_saved", false),
+            ("agent_worktree_result_saved", true),
+        ] {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let observed = writes.clone();
+            let scheduler =
+                SessionStatePersistenceScheduler::with_persist(Arc::new(move |checkpoint| {
+                    observed.lock().unwrap().push(checkpoint.to_string());
+                    if fail {
+                        Err("injected Skill flush failure".into())
+                    } else {
+                        Ok(())
+                    }
+                }));
+            scheduler.checkpoint("task_turn_tool_started").unwrap();
+            let result = scheduler.checkpoint(checkpoint);
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(writes.lock().unwrap().as_slice(), [checkpoint]);
+            assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
+            assert_eq!(
+                writes.lock().unwrap().as_slice(),
+                [checkpoint],
+                "执行限制及恢复资源保存不能退回普通进度合并或由迟到的旧 checkpoint 覆盖"
+            );
+        }
+    }
+
+    #[test]
     fn persistence_scheduler_coalesces_burst_into_one_write() {
         let writes = Arc::new(Mutex::new(Vec::<String>::new()));
         let writes_for_persist = Arc::clone(&writes);
@@ -609,7 +693,7 @@ mod tests {
                 .expect("中间 checkpoint 应成功排队");
         }
         scheduler
-            .persist_terminal("session_turn_completed")
+            .checkpoint("session_turn_completed")
             .expect("终态 checkpoint 应成功落盘");
 
         assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
@@ -667,7 +751,6 @@ mod tests {
                 "turn-restored-waiting-goal",
                 "验证启动时恢复 waiting Goal",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("goal should create");
         session_store
@@ -832,7 +915,6 @@ mod tests {
                 "task-goal-creator",
                 "验证快速完成续跑",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("goal should create");
         session_store

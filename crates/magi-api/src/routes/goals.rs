@@ -1,17 +1,12 @@
+use crate::{
+    errors::ApiError,
+    goal_service::{GoalActionRequest, GoalQuery, GoalUpdateRequest},
+    state::ApiState,
+};
 use axum::{
     Json, Router,
     extract::{Query, State},
     routing::{get, post},
-};
-use magi_conversation_runtime::TurnCommand;
-use magi_core::{AccessProfile, DomainError, GoalId, SessionId, UtcMillis};
-use magi_session_store::{GoalStatus, SessionGoal, SessionPlan};
-use serde::{Deserialize, Serialize};
-
-use crate::scope_binding::{SessionRequestScope, require_session_request_scope};
-use crate::{
-    dto::SessionScopeKindDto, errors::ApiError, session_activity::current_turn_status_is_active,
-    state::ApiState,
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -24,499 +19,70 @@ pub fn routes() -> Router<ApiState> {
         .route("/goals/current/plan/clear", post(clear_current_plan))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GoalQuery {
-    session_id: Option<String>,
-    scope: SessionScopeKindDto,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CurrentGoalResponseDto {
-    session_id: String,
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
-    observed_at: UtcMillis,
-    goal: Option<SessionGoal>,
-    plan: Option<SessionPlan>,
-    allowed_actions: GoalAllowedActionsDto,
-}
-
-#[derive(Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GoalAllowedActionsDto {
-    can_edit: bool,
-    can_pause: bool,
-    can_resume: bool,
-    can_clear: bool,
-    requires_budget_increase: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GoalActionRequest {
-    session_id: Option<String>,
-    scope: SessionScopeKindDto,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-    goal_id: String,
-    expected_revision: u64,
-    #[serde(default)]
-    expected_plan_revision: Option<u64>,
-    #[serde(default)]
-    new_token_budget: Option<u64>,
-    #[serde(default)]
-    access_profile: Option<AccessProfile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GoalUpdateRequest {
-    session_id: Option<String>,
-    scope: SessionScopeKindDto,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-    goal_id: String,
-    expected_revision: u64,
-    #[serde(default, rename = "expectedPlanRevision")]
-    _expected_plan_revision: Option<u64>,
-    objective: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GoalMutationResponseDto {
-    session_id: String,
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
-    observed_at: UtcMillis,
-    goal: Option<SessionGoal>,
-    plan: Option<SessionPlan>,
-    allowed_actions: GoalAllowedActionsDto,
-}
-
 async fn get_current_goal(
     State(state): State<ApiState>,
     Query(query): Query<GoalQuery>,
-) -> Result<Json<CurrentGoalResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        query.session_id.as_deref(),
-        query.scope,
-        query.workspace_id.as_deref(),
-        query.workspace_path.as_deref(),
-    )?;
-    Ok(Json(current_goal_response(&state, scope)))
-}
-
-fn current_goal_response(state: &ApiState, scope: SessionRequestScope) -> CurrentGoalResponseDto {
-    let goal = state.session_store.current_visible_goal(&scope.session_id);
-    let plan = goal.as_ref().and_then(|goal| {
-        state
-            .session_store
-            .plan(&scope.session_id)
-            .filter(|plan| plan.goal_id.as_ref() == Some(&goal.goal_id))
-    });
-    let allowed_actions = allowed_actions(state, &scope.session_id, goal.as_ref(), plan.as_ref());
-    CurrentGoalResponseDto {
-        session_id: scope.session_id.to_string(),
-        workspace_id: scope.workspace_id().map(|id| id.to_string()),
-        workspace_path: scope.workspace_path(),
-        observed_at: UtcMillis::now(),
-        goal,
-        plan,
-        allowed_actions,
-    }
-}
-
-fn allowed_actions(
-    state: &ApiState,
-    _session_id: &SessionId,
-    goal: Option<&SessionGoal>,
-    _plan: Option<&SessionPlan>,
-) -> GoalAllowedActionsDto {
-    let Some(goal) = goal else {
-        return GoalAllowedActionsDto::default();
-    };
-    let resume_state_allowed = matches!(
-        goal.status,
-        GoalStatus::Paused
-            | GoalStatus::Blocked
-            | GoalStatus::UsageLimited
-            | GoalStatus::BudgetLimited
-    );
-    GoalAllowedActionsDto {
-        can_edit: goal.status.is_unfinished(),
-        can_pause: goal.status == GoalStatus::Active,
-        can_resume: resume_state_allowed && state.session_turn_dispatcher().is_some(),
-        can_clear: true,
-        requires_budget_increase: goal.status == GoalStatus::BudgetLimited,
-    }
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::get_current_goal(&state, query)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 async fn update_current_goal(
     State(state): State<ApiState>,
     Json(request): Json<GoalUpdateRequest>,
-) -> Result<Json<GoalMutationResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
-    let goal = state
-        .session_store
-        .update_goal_objective_if_revision(
-            &scope.session_id,
-            &GoalId::new(request.goal_id),
-            request.objective,
-            Some(request.expected_revision),
-        )
-        .map_err(map_goal_domain_error)?;
-    state.persist_session_state_checkpoint("goal_updated")?;
-    let plan = state
-        .session_store
-        .plan(&scope.session_id)
-        .filter(|plan| plan.goal_id.as_ref() == Some(&goal.goal_id));
-    Ok(Json(goal_mutation_response(
-        &state,
-        scope,
-        Some(goal),
-        plan,
-    )))
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::update_current_goal(&state, request)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 async fn pause_current_goal(
     State(state): State<ApiState>,
     Json(request): Json<GoalActionRequest>,
-) -> Result<Json<GoalMutationResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
-    let execution_to_interrupt = goal_execution_to_interrupt(
-        &state,
-        &scope.session_id,
-        &GoalId::new(request.goal_id.clone()),
-    );
-    let (goal, plan) = state
-        .session_store
-        .pause_goal_with_plan(
-            &scope.session_id,
-            &GoalId::new(request.goal_id),
-            request.expected_revision,
-            request.expected_plan_revision,
-        )
-        .map_err(map_goal_domain_error)?;
-    state.cancel_execution_resources(
-        Some(&scope.session_id),
-        None,
-        None,
-        magi_browser_authority::BrowserLeaseEndReason::GoalPaused,
-    );
-    if let Some((root_task_id, turn_id)) = execution_to_interrupt {
-        if let Some(root_task_id) = root_task_id
-            && let Some(manager) = state.runner_manager()
-            && let Err(error) = manager.kill_tree(root_task_id.as_str())
-        {
-            tracing::warn!(
-                session_id = %scope.session_id,
-                task_id = %root_task_id,
-                ?error,
-                "暂停 Goal 时终止执行树失败，继续通过 Turn 取消信号收口"
-            );
-        }
-        state
-            .turn_event_sink()
-            .interrupt_turn_by_user(&scope.session_id)
-            .map_err(|error| {
-                ApiError::internal_assembly("暂停 Goal 时中断当前 Turn 失败", error)
-            })?;
-        state
-            .turn_coordinator()
-            .close_session_turn_input(&scope.session_id, &turn_id);
-        if let Ok(attempt) = state
-            .turn_coordinator()
-            .current_attempt(&scope.session_id, &turn_id)
-            && let Err(error) = state.turn_coordinator().execute_command(
-                &scope.session_id,
-                TurnCommand::Cancel {
-                    attempt: attempt.clone(),
-                },
-            )
-        {
-            tracing::error!(
-                session_id = %scope.session_id,
-                turn_id = %turn_id,
-                %error,
-                "暂停 Goal 时 Coordinator 取消收口失败"
-            );
-        }
-    }
-    publish_goal_plan_if_present(&state, &scope, plan.as_ref());
-    state.persist_session_state_checkpoint("goal_paused")?;
-    Ok(Json(goal_mutation_response(
-        &state,
-        scope,
-        Some(goal),
-        plan,
-    )))
-}
-
-fn goal_execution_to_interrupt(
-    state: &ApiState,
-    session_id: &SessionId,
-    goal_id: &GoalId,
-) -> Option<(Option<magi_core::TaskId>, String)> {
-    let sidecar = state.session_store.runtime_sidecar(session_id)?;
-    let current_turn = sidecar.current_turn.as_ref()?;
-    if !current_turn_status_is_active(&current_turn.status) {
-        return None;
-    }
-    let root_task_id = sidecar
-        .active_execution_chain
-        .as_ref()
-        .map(|chain| chain.root_task_id.clone());
-    let owner_matches = std::iter::once(current_turn.turn_id.as_str())
-        .chain(root_task_id.as_ref().map(|task_id| task_id.as_str()))
-        .any(|owner_id| {
-            state
-                .session_store
-                .active_goal_for_execution_owner(session_id, owner_id)
-                .is_some_and(|goal| &goal.goal_id == goal_id)
-        });
-    owner_matches.then(|| (root_task_id, current_turn.turn_id.clone()))
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::pause_current_goal(&state, request)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 async fn resume_current_goal(
     State(state): State<ApiState>,
     Json(request): Json<GoalActionRequest>,
-) -> Result<Json<GoalMutationResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
-    let current = state
-        .session_store
-        .current_goal(&scope.session_id)
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可操作目标".to_string()))?;
-    if current.goal_id.as_str() != request.goal_id
-        || current.control_revision != request.expected_revision
-    {
-        return Err(ApiError::InvalidInput(
-            "目标状态已变化，请刷新后重试".to_string(),
-        ));
-    }
-    if !matches!(
-        current.status,
-        GoalStatus::Paused
-            | GoalStatus::Blocked
-            | GoalStatus::UsageLimited
-            | GoalStatus::BudgetLimited
-    ) {
-        return Err(ApiError::InvalidInput(
-            "只有暂停、阻塞、用量受限或预算受限目标可以继续执行".to_string(),
-        ));
-    }
-    if current.status == GoalStatus::BudgetLimited
-        && request
-            .new_token_budget
-            .is_none_or(|budget| budget <= current.tokens_used)
-    {
-        return Err(ApiError::InvalidInput(
-            "预算受限目标必须设置高于已用 Token 的新预算".to_string(),
-        ));
-    }
-    crate::turn_service::ensure_goal_continuation_runtime_available(&state, &scope.session_id)?;
-    let (_goal, _, resume_checkpoint) = state
-        .session_store
-        .resume_goal_with_plan(
-            &scope.session_id,
-            &GoalId::new(request.goal_id),
-            request.expected_revision,
-            request.expected_plan_revision,
-            request.new_token_budget,
-            request.access_profile,
-        )
-        .map_err(map_goal_domain_error)?;
-    state.persist_session_state_checkpoint("goal_resume_requested")?;
-    let can_start_now = state.queued_regular_session_turn_count(&scope.session_id) == 0
-        && state
-            .session_store
-            .ensure_current_turn_acceptance_available(&scope.session_id)
-            .is_ok();
-    if can_start_now
-        && let Err(error) =
-            crate::turn_service::resume_active_goal_continuation_turn_after_turn_commit(
-                state.clone(),
-                scope.session_id.clone(),
-                scope.workspace_id(),
-            )
-            .await
-    {
-        state
-            .session_store
-            .rollback_goal_resume(resume_checkpoint)
-            .map_err(|rollback_error| {
-                ApiError::internal_assembly("恢复目标失败后的状态回滚失败", rollback_error)
-            })?;
-        state.persist_session_state_checkpoint("goal_resume_rolled_back")?;
-        return Err(error);
-    }
-    let goal = state
-        .session_store
-        .current_goal(&scope.session_id)
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可操作目标".to_string()))?;
-    let plan = state
-        .session_store
-        .plan(&scope.session_id)
-        .filter(|plan| plan.goal_id.as_ref() == Some(&goal.goal_id));
-    publish_goal_plan_if_present(&state, &scope, plan.as_ref());
-    state.persist_session_state_checkpoint("goal_resumed")?;
-    Ok(Json(goal_mutation_response(
-        &state,
-        scope,
-        Some(goal),
-        plan,
-    )))
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::resume_current_goal(&state, request)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 async fn clear_current_goal(
     State(state): State<ApiState>,
     Json(request): Json<GoalActionRequest>,
-) -> Result<Json<GoalMutationResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
-    let (_cleared_goal, cleared_plan) = state
-        .session_store
-        .clear_goal_with_plan(
-            &scope.session_id,
-            &GoalId::new(request.goal_id),
-            request.expected_revision,
-            request.expected_plan_revision,
-        )
-        .map_err(map_goal_domain_error)?;
-    if let Some(plan) = cleared_plan.as_ref() {
-        let workspace_id = scope.workspace_id();
-        magi_plan::publish_plan_cleared_event(&state.event_bus, plan, workspace_id.as_ref());
-    }
-    state.persist_session_state_checkpoint("goal_cleared")?;
-    Ok(Json(goal_mutation_response(&state, scope, None, None)))
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::clear_current_goal(&state, request)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 async fn clear_current_plan(
     State(state): State<ApiState>,
     Json(request): Json<GoalActionRequest>,
-) -> Result<Json<CurrentGoalResponseDto>, ApiError> {
-    let scope = require_session_request_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.scope,
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-    )?;
-    let _session_turn_guard = state.lock_session_turn_commit(&scope.session_id).await;
-    let plan_store =
-        magi_plan::PlanStore::new(state.session_store.clone(), scope.session_id.clone());
-    let cleared_plan = plan_store.snapshot();
-    if cleared_plan.as_ref().is_some_and(|plan| {
-        plan.goal_id.as_ref().is_some_and(|goal_id| {
-            state
-                .session_store
-                .current_unfinished_goal(&scope.session_id)
-                .is_some_and(|goal| &goal.goal_id == goal_id)
-        })
-    }) {
-        return Err(ApiError::InvalidInput(
-            "未完成目标的绑定计划不能单独清除；请清除目标或先完成目标".to_string(),
-        ));
-    }
-    plan_store
-        .clear(request.expected_plan_revision)
-        .map_err(map_plan_error)?;
-    if let Some(plan) = cleared_plan.as_ref() {
-        let workspace_id = scope.workspace_id();
-        magi_plan::publish_plan_cleared_event(&state.event_bus, plan, workspace_id.as_ref());
-    }
-    state.persist_session_state_checkpoint("session_plan_cleared")?;
-    Ok(Json(current_goal_response(&state, scope)))
-}
-
-fn goal_mutation_response(
-    state: &ApiState,
-    scope: SessionRequestScope,
-    goal: Option<SessionGoal>,
-    plan: Option<SessionPlan>,
-) -> GoalMutationResponseDto {
-    let allowed_actions = allowed_actions(state, &scope.session_id, goal.as_ref(), plan.as_ref());
-    GoalMutationResponseDto {
-        session_id: scope.session_id.to_string(),
-        workspace_id: scope.workspace_id().map(|id| id.to_string()),
-        workspace_path: scope.workspace_path(),
-        observed_at: UtcMillis::now(),
-        goal,
-        plan,
-        allowed_actions,
-    }
-}
-
-fn publish_goal_plan_if_present(
-    state: &ApiState,
-    scope: &SessionRequestScope,
-    plan: Option<&SessionPlan>,
-) {
-    if let Some(plan) = plan {
-        let workspace_id = scope.workspace_id();
-        magi_plan::publish_plan_event(
-            &state.event_bus,
-            magi_plan::plan_event_type(plan),
-            plan,
-            workspace_id.as_ref(),
-            None,
-            None,
-        );
-    }
-}
-
-fn map_goal_domain_error(error: DomainError) -> ApiError {
-    match error {
-        DomainError::NotFound { .. } => ApiError::not_found("目标不存在", "current"),
-        DomainError::Validation { message } | DomainError::InvalidState { message } => {
-            ApiError::InvalidInput(message)
-        }
-        other => ApiError::internal_assembly("目标状态更新失败", other),
-    }
-}
-
-fn map_plan_error(error: magi_plan::PlanUpdateError) -> ApiError {
-    ApiError::InvalidInput(error.to_string())
+) -> Result<Json<magi_app_server_protocol::GoalSnapshot>, ApiError> {
+    crate::goal_service::clear_current_plan(&state, request)
+        .await
+        .and_then(crate::goal_service::snapshot_to_wire)
+        .map(Json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goal_service::allowed_actions;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
     use magi_bridge_client::ModelResponse;
@@ -528,14 +94,14 @@ mod tests {
         task_execution_dispatcher::{
             ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
         },
-        task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher},
+        task_runner_bridge::TaskDispatcher,
     };
-    use magi_core::PlanItemStatus;
     use magi_core::{AbsolutePath, MissionId, SessionId, UtcMillis, WorkspaceId};
+    use magi_core::{AccessProfile, PlanItemStatus};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
-    use magi_session_store::{GoalRevisionExpectation, SessionStore};
+    use magi_session_store::{GoalRevisionExpectation, GoalStatus, SessionGoal, SessionStore};
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
@@ -550,7 +116,6 @@ mod tests {
         session_id: &SessionId,
         turn_id: &str,
         objective: &str,
-        token_budget: Option<u64>,
     ) -> SessionGoal {
         let (_, thread_id) =
             state
@@ -565,8 +130,7 @@ mod tests {
                 thread_id,
                 turn_id,
                 objective,
-                magi_core::AccessProfile::Restricted,
-                token_budget,
+                AccessProfile::Restricted,
             )
             .expect("test goal should be creatable")
     }
@@ -576,6 +140,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for RecordingFailingModelClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -615,7 +183,6 @@ mod tests {
         tool_registry.register_default_builtins();
         let execution_runtime = OrchestratedExecutionRuntime::new(WorkerRuntime::new())
             .with_task_store(Arc::clone(&task_store));
-        let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let dispatcher = Arc::new(
             LlmTaskDispatcher::new(
                 event_bus,
@@ -626,7 +193,9 @@ mod tests {
                 LlmTaskDispatcherDependencies {
                     session_store: Arc::clone(&session_store),
                     execution_registry: state.task_execution_registry().clone(),
-                    result_receiver: Arc::clone(&result_receiver),
+                    completion_sink: Arc::new(
+                        magi_conversation_runtime::TaskCompletionNotifier::new(task_store.clone()),
+                    ),
                     conversation_registry: Arc::clone(&state.conversation_registry),
                     agent_role_registry: Arc::clone(&state.agent_role_registry),
                 },
@@ -634,7 +203,7 @@ mod tests {
             )
             .with_model_bridge_client(Arc::new(RecordingFailingModelClient { calls }))
             .with_workspace_registry(workspace_store)
-            .with_tool_registry(tool_registry),
+            .with_tool_registry(tool_registry.clone()),
         );
         let state_for_workers = state.clone();
         let runner_dispatcher: Arc<dyn TaskDispatcher> = dispatcher.clone();
@@ -646,8 +215,100 @@ mod tests {
         )
         .with_agent_role_registry(Arc::clone(&state.agent_role_registry));
         state
+            .with_tool_registry(tool_registry)
             .with_runner_manager(runner_manager)
             .with_session_turn_dispatcher(dispatcher)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pausing_goal_does_not_cancel_unrelated_current_turn_or_shell() {
+        use magi_core::{ExecutionResultStatus, ToolCallId};
+        use magi_tool_runtime::{
+            BuiltinToolName, ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput,
+            ToolExecutionPolicy,
+        };
+        let state = state_with_recording_goal_dispatcher(Arc::new(AtomicUsize::new(0)));
+        let session = SessionId::new("goal-pause-unrelated-shell");
+        state
+            .session_store
+            .create_session(session.clone(), "unrelated work")
+            .unwrap();
+        let goal = create_test_goal(
+            &state,
+            &session,
+            "goal-original-owner",
+            "preserve unrelated task",
+        );
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &state.session_store,
+            state.turn_coordinator(),
+            &session,
+            "unrelated-current-turn",
+            1,
+            UtcMillis::now(),
+            "running",
+            "unrelated task",
+        );
+        let registry = state.tool_registry().unwrap().clone();
+        let runner_registry = registry.clone();
+        let context_session = session.clone();
+        let workspace = tempfile::tempdir().unwrap();
+        let workdir = workspace.path().to_path_buf();
+        let runner = std::thread::spawn(move || {
+            runner_registry.execute_with_policy(
+                ToolExecutionInput::for_builtin_invocation(
+                    ToolCallId::new("goal-unrelated-shell"),
+                    BuiltinToolName::ShellExec.as_str(),
+                    serde_json::json!({"command":"sleep 1; printf survives", "timeout_ms":5000})
+                        .to_string(),
+                ),
+                ToolExecutionContext {
+                    session_id: Some(context_session),
+                    workspace_id: Some(WorkspaceId::new("unrelated-workspace")),
+                    working_directory: Some(workdir),
+                    access_profile: AccessProfile::FullAccess,
+                    ..Default::default()
+                },
+                &ToolExecutionPolicy {
+                    access_profile: AccessProfile::FullAccess,
+                    ..Default::default()
+                },
+            )
+        });
+        let query = ToolExecutionContextQuery {
+            session_id: Some(session.clone()),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !registry.has_active_executions(&query) {
+            if runner.is_finished() {
+                panic!("真实 Shell 提前退出: {:?}", runner.join().unwrap());
+            }
+            assert!(std::time::Instant::now() < deadline, "真实 Shell 必须在途");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let request = serde_json::from_value(serde_json::json!({"sessionId":session,"scope":"personal","goalId":goal.goal_id,"expectedRevision":goal.control_revision})).unwrap();
+        crate::goal_service::pause_current_goal(&state, request)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .session_store
+                .runtime_sidecar(&session)
+                .unwrap()
+                .current_turn
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert!(registry.has_active_executions(&query));
+        let result = runner.join().unwrap();
+        assert_eq!(
+            result.status,
+            ExecutionResultStatus::Succeeded,
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -663,7 +324,6 @@ mod tests {
             &session_id,
             "turn-goal-resume-action-owner",
             "验证运行中不展示 Goal 恢复操作",
-            None,
         );
         let paused_goal = state
             .session_store
@@ -719,7 +379,6 @@ mod tests {
             &session_id,
             "turn-goal-resume-waiting-owner",
             "验证忙碌会话恢复等待",
-            None,
         );
         let paused = state
             .session_store
@@ -798,13 +457,7 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should be creatable");
-        let goal = create_test_goal(
-            &state,
-            &session_id,
-            "turn-goal-route",
-            "完成 Goal API",
-            Some(2048),
-        );
+        let goal = create_test_goal(&state, &session_id, "turn-goal-route", "完成 Goal API");
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let response = app
@@ -852,7 +505,6 @@ mod tests {
             &session_id,
             "turn-personal-goal-routes",
             "完成个人会话目标",
-            Some(4096),
         );
         let app = Router::new().merge(routes()).with_state(state.clone());
 
@@ -975,7 +627,6 @@ mod tests {
             &session_id,
             "turn-goal-plan-route",
             "完成稳定计划展示",
-            None,
         );
         let plan_store = magi_plan::PlanStore::new(Arc::clone(&session_store), session_id.clone());
         let created = plan_store
@@ -1080,13 +731,7 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should be creatable");
-        let goal = create_test_goal(
-            &state,
-            &session_id,
-            "turn-goal-actions",
-            "原目标",
-            Some(4096),
-        );
+        let goal = create_test_goal(&state, &session_id, "turn-goal-actions", "原目标");
         let goal_id = goal.goal_id.to_string();
         let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
         plan_store
@@ -1256,7 +901,6 @@ mod tests {
                 paused_goal.control_revision,
                 Some(paused_plan.revision),
                 None,
-                None,
             )
             .expect("matching Goal and Plan revisions should permit activation");
         let resumed_plan = resumed_plan.expect("bound plan should resume");
@@ -1309,7 +953,7 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("INPUT_INVALID"));
         assert_eq!(
             payload["message"].as_str(),
-            Some("只有暂停、阻塞、用量受限或预算受限目标可以继续执行")
+            Some("只有暂停或阻塞目标可以继续执行")
         );
         assert!(
             state
@@ -1413,7 +1057,6 @@ mod tests {
             &session_id,
             "turn-goal-real-resume",
             "验证目标恢复会启动续跑任务",
-            Some(4096),
         );
         let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
         plan_store
@@ -1515,7 +1158,6 @@ mod tests {
             &session_id,
             "turn-personal-goal-resume",
             "验证个人目标恢复",
-            Some(4096),
         );
         let paused = state
             .session_store
@@ -1596,7 +1238,6 @@ mod tests {
             &session_id,
             "turn-goal-plan-clear",
             "保留目标，仅清除计划",
-            None,
         );
         let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
         let created = plan_store

@@ -93,7 +93,7 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
     )
 }
 
-fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
+pub(super) fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
     match status.trim().to_ascii_lowercase().as_str() {
         "completed" | "complete" | "succeeded" | "success" => Some("completed"),
         "blocked" => Some("blocked"),
@@ -128,7 +128,10 @@ fn normalize_terminal_current_turn_item_metadata(
     );
 }
 
-fn settle_active_current_turn_items(items: &mut [ActiveExecutionTurnItem], terminal_status: &str) {
+pub(super) fn settle_active_current_turn_items(
+    items: &mut [ActiveExecutionTurnItem],
+    terminal_status: &str,
+) {
     for item in items {
         if current_turn_item_status_is_active(&item.status) {
             item.status = terminal_status.to_string();
@@ -184,7 +187,7 @@ fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTur
     })
 }
 
-fn canonical_turn_status_name(status: CanonicalTurnStatus) -> &'static str {
+pub(super) fn canonical_turn_status_name(status: CanonicalTurnStatus) -> &'static str {
     match status {
         CanonicalTurnStatus::Pending => "pending",
         CanonicalTurnStatus::Running => "running",
@@ -233,6 +236,18 @@ fn terminal_item_status_for_canonical_turn_status(
 fn same_thread_message_slot(left: &ThreadChatMessage, right: &ThreadChatMessage) -> bool {
     if left.role != right.role {
         return false;
+    }
+    if let (Some(left), Some(right)) = (&left.input_request_id, &right.input_request_id) {
+        return left == right;
+    }
+    // 旧用户投影没有 requestId 时仅允许精确升级；图片消息的空正文不能
+    // 与任意历史文本按前缀对齐，否则会把新输入移动到历史开头。
+    if left.role == "user" {
+        return left
+            .content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty() && right.content.as_deref() == Some(text))
+            || !left.images.is_empty() && left.images == right.images;
     }
     if left.role == "tool" {
         return left.tool_call_id == right.tool_call_id;
@@ -554,6 +569,7 @@ fn current_turn_to_canonical_turn(
         }
     }
     let mut canonical_turn = CanonicalTurn {
+        model_steps: Vec::new(),
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
@@ -571,7 +587,7 @@ fn current_turn_to_canonical_turn(
     Ok(canonical_turn)
 }
 
-fn prepare_canonical_turn_in_state(
+pub(super) fn prepare_canonical_turn_in_state(
     state: &SessionStoreState,
     session_id: &SessionId,
     turn: &ActiveExecutionTurn,
@@ -596,6 +612,28 @@ fn prepare_canonical_turn_in_state(
         .iter()
         .find(|existing| existing.session_id == *session_id && existing.turn_id == incoming.turn_id)
     {
+        incoming.model_steps = existing.model_steps.clone();
+        if let Some(binding) = existing
+            .metadata
+            .get(crate::agent_turn::AGENT_EXECUTION_METADATA_KEY)
+        {
+            incoming.metadata.insert(
+                crate::agent_turn::AGENT_EXECUTION_METADATA_KEY.into(),
+                binding.clone(),
+            );
+            if let Some(skill) = existing
+                .metadata
+                .get(crate::agent_turn::AGENT_ACTIVE_SKILL_METADATA_KEY)
+            {
+                incoming.metadata.insert(
+                    crate::agent_turn::AGENT_ACTIVE_SKILL_METADATA_KEY.into(),
+                    skill.clone(),
+                );
+            }
+            if let Some(goal) = existing.metadata.get("goalId") {
+                incoming.metadata.insert("goalId".into(), goal.clone());
+            }
+        }
         incoming.validate_update_from(existing)?;
         if let Some(removed) = existing.items.iter().find(|existing_item| {
             !incoming
@@ -616,6 +654,43 @@ fn prepare_canonical_turn_in_state(
                 .iter()
                 .find(|existing_item| existing_item.item_id == incoming_item.item_id)
             {
+                for key in [
+                    magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY,
+                    crate::user_question::USER_QUESTION_METADATA_KEY,
+                    crate::tool_approval::TOOL_APPROVAL_METADATA_KEY,
+                    "approvalSource",
+                ] {
+                    if let Some(value) = existing_item.metadata.get(key) {
+                        incoming_item.metadata.insert(key.into(), value.clone());
+                    }
+                }
+                if let Some(result) = incoming_item
+                    .tool_approval()?
+                    .and_then(|approval| approval.denied_result())
+                {
+                    incoming_item.tool.as_mut().expect("approval tool").result = Some(result);
+                }
+                if let Some(approval) = incoming_item.tool_approval()?
+                    && approval.execution.is_some()
+                    && incoming_item
+                        .tool
+                        .as_ref()
+                        .and_then(|tool| tool.result.as_ref())
+                        .and_then(|result| result.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("awaiting_approval")
+                {
+                    incoming_item.tool.as_mut().expect("approval tool").result = existing_item
+                        .tool
+                        .as_ref()
+                        .and_then(|tool| tool.result.clone());
+                }
+                if let Some(result) = incoming_item
+                    .user_question()?
+                    .and_then(|question| question.result_payload())
+                {
+                    incoming_item.tool.as_mut().expect("question tool").result = Some(result);
+                }
                 incoming_item.validate_update_from(existing_item)?;
                 let generated_updated_at = incoming_item.updated_at;
                 incoming_item.updated_at = existing_item.updated_at;
@@ -635,7 +710,25 @@ fn prepare_canonical_turn_in_state(
     Ok(incoming)
 }
 
-fn apply_canonical_turn_in_state(state: &mut SessionStoreState, incoming: CanonicalTurn) {
+pub(super) fn apply_canonical_turn_in_state(
+    state: &mut SessionStoreState,
+    incoming: CanonicalTurn,
+) {
+    // 流式 item 写回不触碰用量投影；只有 Step 变化才应用该 Turn 的水位。
+    let previous = state
+        .canonical_turns
+        .iter()
+        .find(|old| old.session_id == incoming.session_id && old.turn_id == incoming.turn_id);
+    let usage_changed = previous.is_none_or(|old| old.model_steps != incoming.model_steps);
+    if usage_changed {
+        let previous = previous.cloned();
+        super::goals::apply_goal_attempt_change(&mut state.goals, previous.as_ref(), &incoming);
+        super::goals::apply_goal_token_watermarks(
+            &mut state.goals,
+            &incoming.session_id,
+            &incoming.model_steps,
+        );
+    }
     if let Some(existing) = state.canonical_turns.iter_mut().find(|existing| {
         existing.session_id == incoming.session_id && existing.turn_id == incoming.turn_id
     }) {
@@ -651,10 +744,10 @@ fn apply_canonical_turn_in_state(state: &mut SessionStoreState, incoming: Canoni
     reconcile_goal_time_used(state);
 }
 
-struct CanonicalCommitPlan<T> {
-    mutations: Vec<super::CanonicalTurnMutation>,
-    value: T,
-    acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
+pub(super) struct CanonicalCommitPlan<T> {
+    pub(super) mutations: Vec<super::CanonicalTurnMutation>,
+    pub(super) value: T,
+    pub(super) acceptance: Option<(SessionAcceptanceRecord, Option<Task>)>,
 }
 
 impl SessionStore {
@@ -664,7 +757,7 @@ impl SessionStore {
     /// canonical projection。canonical session commit lock 保证 prepare 到 apply 期间不会有
     /// 另一笔 canonical 事务改变同一份事件 projection；普通 session 读取可以在 fsync
     /// 期间继续进行。
-    fn commit_canonical_transaction<T, R>(
+    pub(super) fn commit_canonical_transaction<T, R>(
         &self,
         session_id: &SessionId,
         prepare: impl FnOnce(&SessionStoreState) -> DomainResult<CanonicalCommitPlan<T>>,
@@ -688,15 +781,19 @@ impl SessionStore {
                 message: "accepted canonical transaction 不能没有 canonical mutation".to_string(),
             });
         }
-        if let Some((acceptance, task)) = plan.acceptance.as_ref() {
-            self.persist_canonical_mutations_with_acceptance(
+        let inputs = {
+            let state = self.state.read().expect("session state read lock poisoned");
+            super::inputs::attached_inputs(&state.inputs, &plan.mutations)?
+        };
+        if !plan.mutations.is_empty() || !inputs.is_empty() {
+            self.persist_session_transaction(
                 session_id,
                 &plan.mutations,
-                acceptance,
-                task.as_ref(),
+                &inputs,
+                plan.acceptance
+                    .as_ref()
+                    .map(|(acceptance, task)| (acceptance, task.as_ref())),
             )?;
-        } else if !plan.mutations.is_empty() {
-            self.persist_canonical_mutations(session_id, &plan.mutations)?;
         }
 
         let mut state = self
@@ -724,7 +821,16 @@ impl SessionStore {
         for mutation in &plan.mutations {
             apply_canonical_turn_in_state(&mut state, mutation.next.clone());
         }
-        Ok(apply(&mut state, plan.value))
+        let inputs_changed = !inputs.is_empty();
+        for mutation in inputs {
+            super::inputs::apply_input(&mut state.inputs, mutation.next);
+        }
+        let result = apply(&mut state, plan.value);
+        drop(state);
+        if inputs_changed {
+            self.notify_input_commit(session_id);
+        }
+        Ok(result)
     }
 
     fn canonical_turn_commit_plan(
@@ -824,7 +930,7 @@ fn turn_matches_owner_id(turn: &CanonicalTurn, owner_id: &str) -> bool {
         })
 }
 
-fn goal_owns_turn(
+pub(super) fn goal_owns_turn(
     state: &SessionStoreState,
     goal: &crate::models::SessionGoal,
     turn: &CanonicalTurn,
@@ -991,10 +1097,7 @@ fn is_goal_response_boundary(goal: &crate::models::SessionGoal, turn: &Canonical
             .blocker
             .as_ref()
             .is_some_and(|blocker| turn_matches_owner_id(turn, &blocker.last_observed_turn_id)),
-        GoalStatus::Active
-        | GoalStatus::Paused
-        | GoalStatus::UsageLimited
-        | GoalStatus::BudgetLimited => false,
+        GoalStatus::Active | GoalStatus::Paused => false,
     }
 }
 
@@ -1057,10 +1160,7 @@ pub(super) fn reconcile_goal_time_used(state: &mut SessionStoreState) {
                             && goal_owns_turn(state, goal, turn)
                     })
                 }),
-                (GoalStatus::Paused, _)
-                | (GoalStatus::Blocked, _)
-                | (GoalStatus::UsageLimited, _)
-                | (GoalStatus::BudgetLimited, _) => None,
+                (GoalStatus::Paused, _) | (GoalStatus::Blocked, _) => None,
             };
             (
                 goal.goal_id.clone(),
@@ -1552,6 +1652,62 @@ fn canonical_turn_progress_rank(status: CanonicalTurnStatus) -> u8 {
     }
 }
 
+pub(super) fn upsert_item_in_turn(
+    turn: &mut ActiveExecutionTurn,
+    mut item: ActiveExecutionTurnItem,
+) -> DomainResult<()> {
+    if let Some(existing) = turn
+        .items
+        .iter_mut()
+        .find(|existing| existing.item_id == item.item_id)
+    {
+        validate_current_turn_item_update(existing, &item)?;
+        if item.item_seq == 0 {
+            item.item_seq = existing.item_seq;
+        }
+        if item.request_id.is_none() {
+            item.request_id = existing.request_id.clone();
+        }
+        if item.user_message_id.is_none() {
+            item.user_message_id = existing.user_message_id.clone();
+        }
+        if item.placeholder_message_id.is_none() {
+            item.placeholder_message_id = existing.placeholder_message_id.clone();
+        }
+        *existing = item;
+    } else {
+        let next_item_seq = turn
+            .items
+            .iter()
+            .map(|existing| existing.item_seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if item.item_seq == 0 {
+            item.item_seq = next_item_seq;
+        }
+        inherit_current_turn_aliases(turn, &mut item);
+        turn.items.push(item);
+    }
+
+    turn.normalize();
+    Ok(())
+}
+
+pub(super) fn active_turn_projection(canonical: &CanonicalTurn) -> ActiveExecutionTurn {
+    let mut turn = ActiveExecutionTurn {
+        turn_id: canonical.turn_id.clone(),
+        turn_seq: canonical.turn_seq,
+        accepted_at: canonical.accepted_at,
+        completed_at: canonical.completed_at,
+        status: String::new(),
+        user_message: None,
+        items: vec![],
+    };
+    replace_active_turn_from_canonical(canonical, &mut turn);
+    turn
+}
+
 fn replace_active_turn_from_canonical(
     canonical: &CanonicalTurn,
     sidecar_turn: &mut ActiveExecutionTurn,
@@ -1959,7 +2115,7 @@ impl SessionStore {
             .expect("session state write lock poisoned");
         upsert_runtime_sidecar_in_state(&mut state, sidecar);
         drop(state);
-        self.mark_sidecar_dirty_for_session(Some(&session_id), reason);
+        self.mark_sidecar_dirty_for_session(&session_id, reason);
     }
 
     fn derive_sidecar_status(
@@ -2091,10 +2247,7 @@ impl SessionStore {
             }
             state.thread_registry.push(thread);
         }
-        self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
-            SessionSidecarFlushReason::RegisterThread,
-        );
+        self.mark_sidecar_dirty_for_session(&session_id, SessionSidecarFlushReason::RegisterThread);
         Ok(())
     }
 
@@ -2138,10 +2291,7 @@ impl SessionStore {
             }
             state.thread_registry.remove(index)
         };
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::RemoveThread,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::RemoveThread);
         Ok(Some(removed))
     }
 
@@ -2181,10 +2331,7 @@ impl SessionStore {
                 .retain(|checkpoint| &checkpoint.thread_id != thread_id);
             state.thread_registry.remove(index)
         };
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::RemoveThread,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::RemoveThread);
         Ok(Some(removed))
     }
 
@@ -2221,10 +2368,7 @@ impl SessionStore {
             }
             *thread = original;
         }
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::RestoreThread,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::RestoreThread);
         Ok(())
     }
 
@@ -2253,7 +2397,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -2284,7 +2428,7 @@ impl SessionStore {
             thread.clone()
         };
         self.mark_sidecar_dirty_for_session(
-            Some(&updated.session_id),
+            &updated.session_id,
             SessionSidecarFlushReason::RegisterThread,
         );
         Ok(updated)
@@ -2318,7 +2462,7 @@ impl SessionStore {
         if settled > 0 {
             for session_id in session_ids {
                 self.mark_sidecar_dirty_for_session(
-                    Some(&session_id),
+                    &session_id,
                     SessionSidecarFlushReason::SettleThread,
                 );
             }
@@ -2339,10 +2483,7 @@ impl SessionStore {
             }
         }
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::SettleThread,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::SettleThread);
     }
 
     /// 只读快照：用于测试与调试。
@@ -2433,10 +2574,7 @@ impl SessionStore {
             message_history: Vec::new(),
         });
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::RegisterThread,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::RegisterThread);
         (mission_id, thread_id, true)
     }
 
@@ -2512,8 +2650,18 @@ impl SessionStore {
                             .content
                             .as_deref()
                             .is_some_and(|content| !content.trim().is_empty())
+                            || item
+                                .metadata
+                                .get("images")
+                                .and_then(Value::as_array)
+                                .is_some_and(|images| !images.is_empty())
                         {
                             projected.push(ThreadChatMessage {
+                                input_request_id: item
+                                    .metadata
+                                    .get("requestId")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
                                 role: "user".to_string(),
                                 content: item.content.clone(),
                                 images: Vec::new(),
@@ -2548,6 +2696,7 @@ impl SessionStore {
                                 })
                                 .unwrap_or_default();
                             projected.push(ThreadChatMessage {
+                                input_request_id: None,
                                 role: "assistant".to_string(),
                                 content: item.content.clone(),
                                 images: Vec::new(),
@@ -2562,6 +2711,7 @@ impl SessionStore {
                             continue;
                         };
                         projected.push(ThreadChatMessage {
+                            input_request_id: None,
                             role: "assistant".to_string(),
                             content: None,
                             images: Vec::new(),
@@ -2582,14 +2732,17 @@ impl SessionStore {
                         });
                         // 等待授权的调用尚未执行（批准后会先改写为 running）；它记录的进度
                         // 不是工具结果，投影为“中断、未执行”，恢复后可以重新申请授权。
+                        let question_result = item
+                            .user_question()?
+                            .and_then(|question| question.result_payload());
                         let awaiting_approval = tool.result.as_ref().is_some_and(|result| {
-                            result.get("status").and_then(Value::as_str)
-                                == Some("awaiting_approval")
+                            matches!(
+                                result.get("status").and_then(Value::as_str),
+                                Some("awaiting_approval" | "awaiting_user_input")
+                            )
                         });
-                        let result = tool
-                            .result
-                            .as_ref()
-                            .filter(|_| !awaiting_approval)
+                        let result = question_result.as_ref().or(tool.result.as_ref())
+                            .filter(|_| question_result.is_some() || !awaiting_approval)
                             .map(value_text)
                             .or_else(|| {
                                 tool.error.as_ref().map(|error| {
@@ -2635,6 +2788,7 @@ impl SessionStore {
                                 .to_string()
                             });
                         projected.push(ThreadChatMessage {
+                            input_request_id: None,
                             role: "tool".to_string(),
                             content: Some(result),
                             images: Vec::new(),
@@ -2669,7 +2823,7 @@ impl SessionStore {
         drop(state);
         if changed {
             self.mark_sidecar_dirty_for_session(
-                Some(&thread.session_id),
+                &thread.session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -2713,10 +2867,7 @@ impl SessionStore {
         thread.message_history.extend(initial_messages);
         thread.last_used_at = now;
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
-            SessionSidecarFlushReason::RegisterThread,
-        );
+        self.mark_sidecar_dirty_for_session(&session_id, SessionSidecarFlushReason::RegisterThread);
         Ok(1)
     }
 
@@ -2820,7 +2971,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -2873,7 +3024,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -2925,7 +3076,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -2992,10 +3143,7 @@ impl SessionStore {
             thread.last_used_at = now;
         }
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
-            SessionSidecarFlushReason::RegisterThread,
-        );
+        self.mark_sidecar_dirty_for_session(&session_id, SessionSidecarFlushReason::RegisterThread);
         true
     }
 
@@ -3017,7 +3165,7 @@ impl SessionStore {
         drop(state);
         if changed && let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -3053,7 +3201,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -3091,7 +3239,7 @@ impl SessionStore {
         drop(state);
         if let Some(session_id) = session_id {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::RegisterThread,
             );
         }
@@ -3120,10 +3268,7 @@ impl SessionStore {
             .thread_context_checkpoints
             .retain(|checkpoint| &checkpoint.thread_id != thread_id);
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
-            SessionSidecarFlushReason::RegisterThread,
-        );
+        self.mark_sidecar_dirty_for_session(&session_id, SessionSidecarFlushReason::RegisterThread);
         Ok(())
     }
 
@@ -3189,7 +3334,7 @@ impl SessionStore {
         );
         drop(state);
         self.mark_sidecar_dirty_for_session(
-            Some(&dirty_session_id),
+            &dirty_session_id,
             SessionSidecarFlushReason::BindExecutionOwnership,
         );
     }
@@ -3299,7 +3444,7 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated))
@@ -3422,7 +3567,7 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated, canonical_turn))
@@ -3512,7 +3657,7 @@ impl SessionStore {
             .is_some_and(|turn| turn.status == "failed")
         {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -3657,7 +3802,7 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok(updated)
@@ -3749,7 +3894,7 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::AcceptCurrentTurn,
         );
         Ok((entry_id, updated, superseded_turn))
@@ -3962,7 +4107,7 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::UpsertActiveExecutionChain,
         );
         Ok((entry_id, updated, canonical_turn))
@@ -4124,7 +4269,7 @@ impl SessionStore {
                 },
             )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::UpsertActiveExecutionChain,
         );
         Ok((entry_id, updated, superseded_turn, accepted_canonical_turn))
@@ -4203,10 +4348,89 @@ impl SessionStore {
             },
         )?;
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::UpsertActiveExecutionChain,
         );
         Ok(updated)
+    }
+
+    /// 仅更新原 Turn 的分支 Skill，不从调用方的整条链快照覆盖当前状态。
+    pub fn update_execution_branch_active_skill(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        expected_turn_id: &str,
+        skill_id: &str,
+    ) -> DomainResult<()> {
+        if skill_id.trim().is_empty() {
+            return Err(DomainError::InvalidState {
+                message: "Skill ID 不能为空".into(),
+            });
+        }
+        self.commit_canonical_transaction(
+            session_id,
+            |state| {
+                let previous = state
+                    .canonical_turns
+                    .iter()
+                    .find(|turn| &turn.session_id == session_id && turn.turn_id == expected_turn_id)
+                    .filter(|turn| {
+                        !turn.status.is_terminal()
+                            && turn.completed_at.is_none()
+                            && turn
+                                .agent_turn_binding()
+                                .is_ok_and(|binding| binding.is_none())
+                    })
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "分支 Skill 激活的主线 Turn 不存在或已关闭".into(),
+                    })?;
+                let mut candidate = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                    .cloned()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "分支 Skill 激活缺少当前执行链".into(),
+                    })?;
+                let chain = candidate
+                    .active_execution_chain
+                    .as_mut()
+                    .filter(|chain| {
+                        chain
+                            .current_turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.turn_id == previous.turn_id)
+                    })
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "分支 Skill 激活的执行链 Turn 已变化".into(),
+                    })?;
+                let branch = chain
+                    .branches
+                    .iter_mut()
+                    .find(|branch| &branch.task_id == task_id)
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "Skill 激活 Task 不在当前执行链".into(),
+                    })?;
+                branch.skill_name = Some(skill_id.into());
+                if &chain.root_task_id == task_id {
+                    chain.dispatch_context.skill_name = Some(skill_id.into());
+                }
+                chain.normalize();
+                candidate.updated_at = UtcMillis::now();
+                Ok(CanonicalCommitPlan {
+                    mutations: vec![],
+                    value: candidate,
+                    acceptance: None,
+                })
+            },
+            upsert_runtime_sidecar_in_state,
+        )?;
+        self.mark_sidecar_dirty_for_session(
+            session_id,
+            SessionSidecarFlushReason::UpsertActiveExecutionChain,
+        );
+        Ok(())
     }
 
     pub fn apply_recovery_resume_input(
@@ -4286,7 +4510,7 @@ impl SessionStore {
         );
         drop(state);
         self.mark_sidecar_dirty_for_session(
-            Some(&session_id),
+            &session_id,
             SessionSidecarFlushReason::ApplyRecoveryResumeInput,
         );
         Ok(())
@@ -4375,7 +4599,7 @@ impl SessionStore {
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
         drop(state);
         self.mark_sidecar_dirty_for_session(
-            Some(session_id),
+            session_id,
             SessionSidecarFlushReason::ApplyResumeExecutionTarget,
         );
         Ok(updated)
@@ -4550,7 +4774,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(&session_id),
+                &session_id,
                 SessionSidecarFlushReason::UpdateActiveExecutionBranchSnapshot,
             );
         }
@@ -4612,7 +4836,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::AppendCurrentTurnItem,
             );
         }
@@ -4702,7 +4926,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::AppendCurrentTurnItem,
             );
         }
@@ -4713,7 +4937,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         expected_turn_id: Option<&str>,
-        mut item: ActiveExecutionTurnItem,
+        item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = self.commit_canonical_transaction(
             session_id,
@@ -4737,39 +4961,7 @@ impl SessionStore {
                 };
                 validate_expected_current_turn(session_id, turn, expected_turn_id)?;
 
-                if let Some(existing) = turn
-                    .items
-                    .iter_mut()
-                    .find(|existing| existing.item_id == item.item_id)
-                {
-                    validate_current_turn_item_update(existing, &item)?;
-                    if item.item_seq == 0 {
-                        item.item_seq = existing.item_seq;
-                    }
-                    if item.request_id.is_none() {
-                        item.request_id = existing.request_id.clone();
-                    }
-                    if item.user_message_id.is_none() {
-                        item.user_message_id = existing.user_message_id.clone();
-                    }
-                    if item.placeholder_message_id.is_none() {
-                        item.placeholder_message_id = existing.placeholder_message_id.clone();
-                    }
-                    *existing = item;
-                } else {
-                    let next_item_seq = turn
-                        .items
-                        .iter()
-                        .map(|existing| existing.item_seq)
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    if item.item_seq == 0 {
-                        item.item_seq = next_item_seq;
-                    }
-                    inherit_current_turn_aliases(turn, &mut item);
-                    turn.items.push(item);
-                }
+                upsert_item_in_turn(turn, item.clone())?;
 
                 turn.normalize();
                 if let Some(chain) = candidate.active_execution_chain.as_mut() {
@@ -4800,7 +4992,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::AppendCurrentTurnItem,
             );
         }
@@ -4912,7 +5104,7 @@ impl SessionStore {
         )?;
         if updated.as_ref().is_some_and(|(_, changed)| *changed) {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -5049,7 +5241,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -5187,7 +5379,7 @@ impl SessionStore {
                     .as_ref()
                     .map(|chain| chain.root_task_id.to_string())
                     .unwrap_or(current_turn_id);
-                let canonical_plan = Self::canonical_turn_commit_plan(
+                let mut canonical_plan = Self::canonical_turn_commit_plan(
                     state,
                     session_id,
                     candidate
@@ -5196,6 +5388,18 @@ impl SessionStore {
                         .expect("current turn was set"),
                     None,
                 )?;
+                canonical_plan
+                    .mutations
+                    .extend(super::agent_turns::interrupted_descendant_turns(
+                        self,
+                        state,
+                        session_id,
+                        &candidate
+                            .current_turn
+                            .as_ref()
+                            .expect("current turn")
+                            .turn_id,
+                    )?);
                 Ok(CanonicalCommitPlan {
                     mutations: canonical_plan.mutations,
                     value: Some((
@@ -5222,7 +5426,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -5485,6 +5689,18 @@ impl SessionStore {
                         acceptance: None,
                     });
                 }
+                if next_state == RECOVERY_STATE_CLAIMED
+                    && (!super::user_questions::pending_user_questions_in_state(
+                        self, state, session_id,
+                    )?
+                    .is_empty()
+                        || !super::tool_approvals::pending_in_state(self, state, session_id)?
+                            .is_empty())
+                {
+                    return Err(DomainError::InvalidState {
+                        message: "请先处理待回答问题和工具审批，再继续执行".into(),
+                    });
+                }
                 let Some(notice) = turn.items.iter_mut().find(|item| {
                     item.metadata.get("noticeKind").and_then(Value::as_str)
                         == Some(INTERRUPTION_NOTICE_KIND)
@@ -5534,7 +5750,7 @@ impl SessionStore {
         )?;
         if updated_turn_id.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -5648,7 +5864,7 @@ impl SessionStore {
         )?;
         if updated.is_some() {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::UpdateCurrentTurnStatus,
             );
         }
@@ -5733,100 +5949,30 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn flush_execution_sidecars_with<E, F>(&self, persist: F) -> Result<bool, E>
-    where
-        F: FnMut(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), E>,
-    {
-        let _flush_guard = self
-            .sidecar_flush_lock
-            .lock()
-            .expect("session sidecar flush lock poisoned");
-        {
-            let flush_state = self
-                .sidecar_flush_state
-                .read()
-                .expect("session sidecar flush state read lock poisoned");
-            if flush_state.current_version == flush_state.flushed_version {
-                return Ok(false);
-            }
-        }
-        let _persistence_guard = self
-            .durable_persistence_lock
-            .lock()
-            .expect("session durable persistence lock poisoned");
-        // sidecar checkpoint 同样会携带完整 durable canonical projection。必须与
-        // persist_projection_with 遵守同一锁顺序，禁止在 event writer 已提交、
-        // 内存 canonical 尚未 apply 的窗口捕获跨代快照。
-        let _canonical_guard = self
-            .canonical_commit_barrier
-            .write()
-            .expect("session canonical commit barrier poisoned");
-        let mut persist = persist;
-        let (persisted_version, persisted_session_ids) = {
-            let state = self.state.read().expect("session state read lock poisoned");
-            let durable_snapshot = state.durable_state();
-            let sidecar_snapshot = state.execution_sidecar_store.clone();
-            let flush_state = self
-                .sidecar_flush_state
-                .read()
-                .expect("session sidecar flush state read lock poisoned");
-            let persisted_version = flush_state.current_version;
-            let persisted_session_ids = flush_state
-                .dirty_session_versions
-                .iter()
-                .filter_map(|(session_id, version)| {
-                    (*version <= persisted_version).then_some(session_id.clone())
-                })
-                .collect::<Vec<_>>();
-            persist(&durable_snapshot, &sidecar_snapshot)?;
-            (persisted_version, persisted_session_ids)
-        };
-        let mut flush_state = self
-            .sidecar_flush_state
-            .write()
-            .expect("session sidecar flush state write lock poisoned");
-        for session_id in persisted_session_ids {
-            if flush_state
-                .dirty_session_versions
-                .get(&session_id)
-                .is_some_and(|version| *version <= persisted_version)
-            {
-                flush_state.dirty_session_versions.remove(&session_id);
-            }
-        }
-        flush_state.flushed_version = flush_state.flushed_version.max(persisted_version);
-        let now = UtcMillis::now();
-        flush_state.last_flush_at = Some(now);
-        if flush_state.current_version == flush_state.flushed_version {
-            flush_state.next_flush_hint = None;
-        } else if flush_state.next_flush_hint.is_none() {
-            flush_state.next_flush_hint = flush_state.last_dirty_at.or(Some(now));
-        }
-        Ok(true)
-    }
-
     /// 捕获脏 session 的最小持久化快照后再执行写盘。
     ///
-    /// canonical/persistence 锁只覆盖快照构造，不覆盖文件 fsync；因此后台中间态
-    /// 持久化不会阻塞模型流式写回。canonical event 是追加日志，快照写盘期间若有
+    /// canonical/state 锁只覆盖快照构造，不覆盖文件 fsync；因此后台中间态
+    /// 持久化不会阻塞模型流式写回。持久化锁覆盖整个投影提交，避免旧快照在
+    /// 重命名、删除或其他投影事务之后落盘。canonical event 是追加日志，写盘期间若有
     /// 新事件提交，projection builder 会以日志最新事实重新对齐，下一轮继续收敛。
+    /// 回调返回实际提交的 session；暂不可写的工作区保留脏版本，不阻断其他会话。
     pub fn flush_execution_sidecar_snapshot_with<E, F>(&self, persist: F) -> Result<bool, E>
     where
         F: FnMut(
             &SessionDurableState,
             &SessionExecutionSidecarStoreState,
             &[SessionId],
-        ) -> Result<(), E>,
+        ) -> Result<Vec<SessionId>, E>,
     {
         let _flush_guard = self
             .sidecar_flush_lock
             .lock()
             .expect("session sidecar flush lock poisoned");
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
         let (persisted_version, dirty_session_ids, durable, sidecars) = {
-            let _persistence_guard = self
-                .durable_persistence_lock
-                .lock()
-                .expect("session durable persistence lock poisoned");
             let _canonical_guard = self
                 .canonical_commit_barrier
                 .write()
@@ -5848,10 +5994,7 @@ impl SessionStore {
                 })
                 .collect::<Vec<_>>();
             dirty_session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            let mut durable = SessionDurableState {
-                current_session_id: state.current_session_id.clone(),
-                ..SessionDurableState::default()
-            };
+            let mut durable = SessionDurableState::default();
             for session_id in &dirty_session_ids {
                 durable.append_state_without_current(state.durable_state_for_session(session_id));
             }
@@ -5869,13 +6012,23 @@ impl SessionStore {
         };
 
         let mut persist = persist;
-        persist(&durable, &sidecars, &dirty_session_ids)?;
+        let committed = persist(&durable, &sidecars, &dirty_session_ids)?;
+        let committed = committed
+            .into_iter()
+            .filter(|id| dirty_session_ids.contains(id))
+            .collect::<HashSet<_>>();
+        if !dirty_session_ids.is_empty() && committed.is_empty() {
+            return Ok(false);
+        }
 
         let mut flush_state = self
             .sidecar_flush_state
             .write()
             .expect("session sidecar flush state write lock poisoned");
-        for session_id in dirty_session_ids {
+        for session_id in dirty_session_ids
+            .into_iter()
+            .filter(|id| committed.contains(id))
+        {
             if flush_state
                 .dirty_session_versions
                 .get(&session_id)
@@ -5884,7 +6037,14 @@ impl SessionStore {
                 flush_state.dirty_session_versions.remove(&session_id);
             }
         }
-        flush_state.flushed_version = flush_state.flushed_version.max(persisted_version);
+        let committed_through = flush_state
+            .dirty_session_versions
+            .values()
+            .min()
+            .map_or(persisted_version, |pending| {
+                persisted_version.min(pending.saturating_sub(1))
+            });
+        flush_state.flushed_version = flush_state.flushed_version.max(committed_through);
         let now = UtcMillis::now();
         flush_state.last_flush_at = Some(now);
         if flush_state.current_version == flush_state.flushed_version {

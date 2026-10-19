@@ -60,6 +60,7 @@ let summaryUpdatedAt = ACCEPTED_AT;
 let workspaceListPayload = null;
 const capturedTurnBodies = [];
 const capturedGuideQueueBodies = [];
+const capturedRemoveQueueBodies = [];
 const bootstrapInterceptors = [];
 const sessionNavigationInterceptors = [];
 const workspaceSessionsInterceptors = [];
@@ -472,6 +473,7 @@ function installFetchStub() {
     }
     if (parsed.pathname === '/api/session/queue/remove') {
       const body = JSON.parse(String(init.body || '{}'));
+      capturedRemoveQueueBodies.push(body);
       queuedTurnPayloads = queuedTurnPayloads.filter((turn) => turn.queueId !== body.queueId);
       return jsonResponse({
         sessionId: body.sessionId || SESSION_ID,
@@ -560,7 +562,6 @@ function installFetchStub() {
           canPause: false,
           canResume: false,
           canClear: false,
-          requiresBudgetIncrease: false,
         },
       });
     }
@@ -1899,7 +1900,6 @@ await withGoldenViteServer(async (server) => {
     workspacePath: WORKSPACE_PATH,
     sessionId: SESSION_ID,
     goalMode: true,
-    followUpMode: 'queue',
     contextReferences: [{
       kind: 'file',
       path: '/tmp/reference-queued.md',
@@ -1943,6 +1943,7 @@ await withGoldenViteServer(async (server) => {
   queuedTurnPayloads = [
     {
       queueId: 'queued-session-turn-golden',
+      revision: 6,
       queuePosition: 1,
       requestId: 'request-queued-immediate-feedback',
       sessionId: SESSION_ID,
@@ -1963,11 +1964,12 @@ await withGoldenViteServer(async (server) => {
         name: 'reference-queued.md',
       }],
       browserAnnotationRefs: [],
-      canGuide: false,
+      guide: { status: 'unsupported_executor', targetTurnId: 'turn-guide-snapshot' },
       retryCount: 0,
     },
     {
       queueId: 'queued-session-turn-guide-golden',
+      revision: 7,
       queuePosition: 2,
       requestId: 'request-queued-guide-feedback',
       sessionId: SESSION_ID,
@@ -1983,7 +1985,7 @@ await withGoldenViteServer(async (server) => {
       images: [],
       contextReferences: [],
       browserAnnotationRefs: [],
-      canGuide: true,
+      guide: { status: 'ready', targetTurnId: 'turn-guide-snapshot' },
       retryCount: 0,
     },
   ];
@@ -2015,9 +2017,23 @@ await withGoldenViteServer(async (server) => {
   assert.equal(
     messagesStore.messagesState.queuedMessages.find((message) => (
       message.id === 'queued-session-turn-guide-golden'
-    ))?.canGuide,
-    true,
+    ))?.guide?.status,
+    'ready',
     'queue normalization must preserve the server-authoritative guidance capability',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.queuedMessages.find((message) => (
+      message.id === 'queued-session-turn-golden'
+    ))?.guide,
+    { status: 'unsupported_executor', targetTurnId: 'turn-guide-snapshot' },
+    'queue normalization must preserve the executor refusal so the UI can explain why guidance is disabled',
+  );
+  assert.equal(
+    messagesStore.messagesState.queuedMessages.find((message) => (
+      message.id === 'queued-session-turn-guide-golden'
+    ))?.revision,
+    7,
+    'the queue revision must reach the composer so guidance and editing can use CAS',
   );
   assert.equal(
     findArtifactByRequestId(
@@ -2051,6 +2067,16 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'guideQueuedMessage',
     queuedMessageId: 'queued-session-turn-guide-golden',
+    expectedTurnId: 'turn-guide-snapshot',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(capturedGuideQueueBodies.length, 0,
+    '补充缺少点击时版本时不能用最新快照代填，防止补充另一客户端刚编辑的输入');
+  bridge.postMessage({
+    type: 'guideQueuedMessage',
+    queuedMessageId: 'queued-session-turn-guide-golden',
+    expectedTurnId: 'turn-guide-snapshot',
+    expectedRevision: 7,
   });
   await waitFor(
     () => messagesStore.messagesState.queuedMessages.length === 1,
@@ -2063,6 +2089,8 @@ await withGoldenViteServer(async (server) => {
       workspacePath: WORKSPACE_PATH,
       sessionId: SESSION_ID,
       queueId: 'queued-session-turn-guide-golden',
+      expectedTurnId: 'turn-guide-snapshot',
+      expectedRevision: 7,
     },
     'queued guidance must use the dedicated server-authoritative endpoint',
   );
@@ -2073,6 +2101,17 @@ await withGoldenViteServer(async (server) => {
     type: 'removeQueuedMessage',
     queuedMessageId: 'queued-session-turn-golden',
   });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(capturedRemoveQueueBodies.length, 0,
+    '缺少点击时的版本不能用最新快照补齐后删除，以免撤销另一客户端刚编辑的输入');
+  bridge.postMessage({
+    type: 'removeQueuedMessage',
+    queuedMessageId: 'queued-session-turn-golden',
+    expectedRevision: messagesStore.messagesState.queuedMessages[0].revision,
+  });
+  await waitFor(() => capturedRemoveQueueBodies.length === 1,
+    '删除队列消息必须提交点击时的 Input 版本');
+  assert.equal(capturedRemoveQueueBodies[0].expectedRevision, 6);
   await waitFor(
     () => messagesStore.messagesState.queuedMessages.length === 0,
     'removing a queued turn must update the daemon queue and then refresh the UI snapshot',
@@ -2114,7 +2153,6 @@ await withGoldenViteServer(async (server) => {
     images: [],
     contextReferences: [],
     browserAnnotationRefs: [],
-    canGuide: false,
     retryCount: 0,
   }];
   messagesStore.setQueuedMessages(queuedTurnPayloads.map((turn) => ({
@@ -2133,7 +2171,7 @@ await withGoldenViteServer(async (server) => {
     images: turn.images,
     contextReferences: turn.contextReferences,
     browserAnnotationRefs: turn.browserAnnotationRefs,
-    canGuide: turn.canGuide,
+    guide: turn.guide,
   })));
   assert.equal(
     messagesStore.messagesState.queuedMessages[0]?.command,
@@ -3237,6 +3275,27 @@ await withGoldenViteServer(async (server) => {
   );
   messagesStore.clearRequestBinding('request-gpt-setup-command');
 
+  sessionTurnInterceptors.push(() => electronTurnResponse(3));
+  bridge.postMessage({
+    type: 'executeTask',
+    text: null,
+    requestId: 'request-workflow-command',
+    workflowId: 'plugin/queue/workflow',
+    workspaceId: RACE_WORKSPACE_ID,
+    workspacePath: RACE_WORKSPACE_PATH,
+    sessionId: RACE_SESSION_ID,
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-workflow-command'),
+    '没有正文的工作流选择也必须进入 canonical Turn 入口',
+  );
+  assert.equal(
+    capturedTurnBodies.find((body) => body.requestId === 'request-workflow-command').workflowId,
+    'plugin/queue/workflow',
+    'Renderer Bridge 不得丢弃 workflowId，否则选择工作流会退化成普通对话',
+  );
+  messagesStore.clearRequestBinding('request-workflow-command');
+
   const externalApprovalEvents = [];
   const onExternalApproval = () => externalApprovalEvents.push(true);
   window.addEventListener('magi:mcp-approvals-changed', onExternalApproval);
@@ -3258,6 +3317,68 @@ await withGoldenViteServer(async (server) => {
   }
   await waitFor(() => externalApprovalEvents.length === 2, '外部审批必须在工作区和会话过滤前通知全局托盘');
   window.removeEventListener('magi:mcp-approvals-changed', onExternalApproval);
+
+  // 即使更晚发起的读取返回了旧持久版本，也不能覆盖已观察到的 Inbox。
+  const versionedInput = { ...queueSnapshotBeforeGuide[1], queueId: 'versioned-input',
+    requestId: 'versioned-request', sessionId: RACE_SESSION_ID, workspaceId: RACE_WORKSPACE_ID, revision: 1 };
+  let newestInboxRead = false;
+  sessionQueueInterceptors.push(() => {
+    newestInboxRead = true;
+    return jsonResponse({ sessionId: RACE_SESSION_ID, cursor: { epoch: 'persistent-inbox', throughSequence: 100 }, queuedTurns: [] });
+  });
+  const inboxEvent = (sequence) => electronSocket.message({ jsonrpc: '2.0', method: 'event/session.inbox.changed', params: {
+    sequence, event: { ...acceptedEnvelope(), event_id: `versioned-inbox-${sequence}`, event_type: 'session.inbox.changed',
+      workspace_id: RACE_WORKSPACE_ID, session_id: RACE_SESSION_ID, payload: {} },
+  } });
+  inboxEvent(20000);
+  await waitFor(() => newestInboxRead, 'Inbox 提交事件必须刷新权威投影');
+  await new Promise((resolve) => setImmediate(resolve));
+  let staleInboxRead = false;
+  sessionQueueInterceptors.push(() => {
+    staleInboxRead = true;
+    return jsonResponse({ sessionId: RACE_SESSION_ID, cursor: { epoch: 'persistent-inbox', throughSequence: 99 }, queuedTurns: [versionedInput] });
+  });
+  inboxEvent(20001);
+  await waitFor(() => staleInboxRead, '更晚发起的旧版本快照必须被测试读取');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messagesStore.messagesState.queuedMessages.length, 0, '旧服务端版本不能复活已消费输入');
+
+  const pluginSelection = {
+    pluginId: 'plugin-queue', resourceId: 'resource-queue', version: 3,
+    label: '选中资源', summary: '原始上下文摘要', selection: { ids: ['selected-1'] },
+  };
+  const queueMetadata = [
+    { workflowId: 'plugin/queue/workflow', pluginSelections: [pluginSelection] },
+    { pluginCommandId: 'plugin/queue/command' },
+    { interruptTurnId: 'turn-interrupted-queue', interruptionError: '资源尚未结算' },
+  ];
+  let metadataInboxRead = false;
+  sessionQueueInterceptors.push(() => {
+    metadataInboxRead = true;
+    return jsonResponse({ sessionId: RACE_SESSION_ID,
+      cursor: { epoch: 'persistent-inbox', throughSequence: 101 },
+      queuedTurns: queueMetadata.map((metadata, index) => ({
+        ...versionedInput, ...metadata, queueId: `metadata-input-${index}`, revision: index + 2,
+        guide: { status: 'unsupported_input', targetTurnId: null },
+      })) });
+  });
+  inboxEvent(20002);
+  await waitFor(() => metadataInboxRead && messagesStore.messagesState.queuedMessages.length === 3,
+    'Inbox metadata must pass through the real bridge projection');
+  for (const [index, metadata] of queueMetadata.entries()) {
+    const projected = messagesStore.messagesState.queuedMessages[index];
+    assert.equal(projected.revision, index + 2, 'retry/edit must keep the original CAS revision');
+    for (const [field, value] of Object.entries(metadata)) {
+      assert.deepEqual(projected[field], value, `queue projection must preserve ${field}`);
+    }
+  }
+
+  const goalReadsBeforeUsage = goalRefreshQueries.length;
+  electronSocket.message({ jsonrpc: '2.0', method: 'event/session.goal.usage.changed', params: {
+    sequence: 20003, event: { ...acceptedEnvelope(), event_id: 'late-goal-usage', event_type: 'session.goal.usage.changed',
+      workspace_id: RACE_WORKSPACE_ID, session_id: RACE_SESSION_ID, payload: { goal_id: 'goal-late', step_id: 'late-response' } },
+  } });
+  await waitFor(() => goalRefreshQueries.length > goalReadsBeforeUsage, 'Turn 结束后的迟到用量提交也必须刷新服务端 Goal 快照');
 
   console.log('web client bridge golden replay passed');
 }, {

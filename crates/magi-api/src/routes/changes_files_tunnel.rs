@@ -2927,7 +2927,18 @@ mod tests {
             .expect("pending changes array");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["filePath"], "pending.txt");
-        assert_eq!(pending[0]["sourceKind"], "external");
+        // watcher 与显式 reconcile 竞速，二者都表示没有工具归属的外部覆盖。
+        // 关键是不能沿用先前工具写入的身份或提供撤销外部修改的权限。
+        assert!(
+            matches!(
+                pending[0]["sourceKind"].as_str(),
+                Some("external" | "watcher")
+            ),
+            "{payload}"
+        );
+        assert_eq!(pending[0]["revertible"], false);
+        assert!(pending[0]["toolCallId"].is_null());
+        assert!(pending[0]["workerId"].is_null());
 
         let response = app
             .oneshot(

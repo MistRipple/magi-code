@@ -1528,6 +1528,7 @@ fn shell_exec_records_non_git_filesystem_changed_paths() {
 fn shell_exec_cancel_active_session_kills_running_command() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-cancel")),
         session_id: Some(SessionId::new("session-shell-cancel")),
@@ -1565,6 +1566,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
         workspace_id: context.workspace_id.clone(),
         task_id: None,
         worker_id: None,
+        taskless_only: false,
     });
 
     assert_eq!(cancelled, 1);
@@ -1583,6 +1585,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
 fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-cancel-workspace-scope")),
         session_id: Some(SessionId::new("session-shell-cancel-workspace-scope")),
@@ -1619,6 +1622,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-other")),
         task_id: context.task_id.clone(),
         worker_id: None,
+        taskless_only: false,
     });
     assert_eq!(wrong_workspace_cancelled, 0);
 
@@ -1627,6 +1631,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
         workspace_id: context.workspace_id.clone(),
         task_id: context.task_id.clone(),
         worker_id: None,
+        taskless_only: false,
     });
     assert_eq!(cancelled, 1);
 
@@ -1638,6 +1643,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
 fn session_cancellation_stops_background_processes_in_the_same_scope() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("worker-background-cancel")),
         task_id: Some(TaskId::new("task-background-cancel")),
         session_id: Some(SessionId::new("session-background-cancel")),
@@ -1670,6 +1676,7 @@ fn session_cancellation_stops_background_processes_in_the_same_scope() {
         task_id: context.task_id.clone(),
         session_id: context.session_id.clone(),
         workspace_id: context.workspace_id.clone(),
+        taskless_only: false,
     });
 
     assert_eq!(cancelled, 1);
@@ -1861,6 +1868,7 @@ fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
     tool_registry.register_default_builtins();
 
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-write")),
         session_id: Some(SessionId::new("session-write")),
@@ -1944,6 +1952,7 @@ fn write_guard_tracks_file_copy_destination_path() {
     tool_registry.register_default_builtins();
 
     let guarded_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("copy-task")),
         session_id: Some(SessionId::new("session-copy-guard")),
@@ -2021,6 +2030,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
     tool_registry.register_default_builtins();
 
     let guarded_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-a")),
         session_id: Some(SessionId::new("session-a")),
@@ -2031,6 +2041,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         browser_execution_id: None,
     };
     let other_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-b")),
         session_id: Some(SessionId::new("session-b")),
@@ -2148,6 +2159,7 @@ fn process_launch_does_not_block_followup_shell_in_same_session() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-launch")),
         session_id: Some(SessionId::new("session-process-launch")),
@@ -2231,6 +2243,7 @@ fn blocked_process_write_does_not_hold_the_process_table() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-write-blocked")),
         session_id: Some(SessionId::new("session-process-write-blocked")),
@@ -2331,6 +2344,7 @@ fn exited_background_processes_are_pruned_from_the_process_table() {
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-prune")),
         session_id: Some(SessionId::new("session-process-prune")),
@@ -2419,6 +2433,7 @@ fn process_launch_spawn_failure_uses_public_error_message() {
     let registry = make_registry();
     let missing_shell = "magi-missing-process-shell-for-public-error-test";
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-spawn-error")),
         session_id: Some(SessionId::new("session-process-spawn-error")),
@@ -2469,6 +2484,7 @@ fn process_write_failure_uses_public_error_message() {
     let root = unique_temp_dir("magi-tool-process-write-error");
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-write-error")),
         session_id: Some(SessionId::new("session-process-write-error")),
@@ -2569,6 +2585,7 @@ fn process_tools_reject_missing_workspace_context_before_execution() {
     assert_eq!(payload["error_code"], "workspace_required");
 
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-context")),
         session_id: Some(SessionId::new("session-process-context")),
@@ -2630,6 +2647,94 @@ fn process_tools_reject_missing_workspace_context_before_execution() {
     assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
 }
 
+#[cfg(unix)]
+#[test]
+fn delegated_background_process_access_is_limited_to_the_current_activation() {
+    let registry = make_registry();
+    let root = unique_temp_dir("magi-process-activation-scope");
+    let owner = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::DelegatedTask,
+        task_id: Some(TaskId::new("process-activation-owner")),
+        session_id: Some(SessionId::new("process-activation-session")),
+        workspace_id: Some(WorkspaceId::new("process-activation-workspace")),
+        working_directory: Some(root.clone()),
+        ..Default::default()
+    };
+    let run = |context: ToolExecutionContext, input: Value| {
+        registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(format!("process-scope-{}", UtcMillis::now().0)),
+                tool_name: "shell_exec".into(),
+                tool_kind: ToolKind::Builtin,
+                input: input.to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &full_access_policy(),
+        )
+    };
+    let launch = run(
+        owner.clone(),
+        serde_json::json!({"command":"sleep 30", "background":true}),
+    );
+    assert_eq!(
+        launch.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        launch.payload
+    );
+    let id = serde_json::from_str::<Value>(&launch.payload).unwrap()["terminal_id"].clone();
+    for (caller_scope, task_id) in [
+        crate::ToolCallerScope::DelegatedTask,
+        crate::ToolCallerScope::DelegatingTask,
+    ]
+    .into_iter()
+    .flat_map(|scope| {
+        [None, Some(TaskId::new("sibling-or-later-activation"))]
+            .into_iter()
+            .map(move |id| (scope, id))
+    }) {
+        let other = ToolExecutionContext {
+            caller_scope,
+            task_id,
+            ..owner.clone()
+        };
+        for action in ["read", "write", "kill"] {
+            let output = run(
+                other.clone(),
+                serde_json::json!({"action":action,"terminal_id":id,"input":"exit\n"}),
+            );
+            assert!(
+                output.payload.contains("not_owned"),
+                "{caller_scope:?} {action}: {}",
+                output.payload
+            );
+        }
+        let list = run(other, serde_json::json!({"action":"list"}));
+        assert_eq!(
+            serde_json::from_str::<Value>(&list.payload).unwrap()["processes"],
+            serde_json::json!([])
+        );
+    }
+    for caller_scope in [
+        crate::ToolCallerScope::DelegatedTask,
+        crate::ToolCallerScope::DelegatingTask,
+    ] {
+        let read = run(
+            ToolExecutionContext {
+                caller_scope,
+                ..owner.clone()
+            },
+            serde_json::json!({"action":"read","terminal_id":id}),
+        );
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+    }
+    let killed = run(owner, serde_json::json!({"action":"kill","terminal_id":id}));
+    assert_eq!(killed.status, ExecutionResultStatus::Succeeded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
     let root = unique_temp_dir("magi-tool-process-session-scope");
@@ -2639,6 +2744,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
     tool_registry.register_default_builtins();
 
     let owner_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-owner")),
         session_id: Some(SessionId::new("session-process-owner")),
@@ -2649,6 +2755,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         browser_execution_id: None,
     };
     let workspace_only_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-workspace-only")),
         session_id: None,
@@ -2659,6 +2766,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         browser_execution_id: None,
     };
     let other_session_context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-process-other")),
         session_id: Some(SessionId::new("session-process-other")),
@@ -3021,6 +3129,7 @@ fn governance_blocked_invocations_appear_in_summary_and_events() {
     fs::write(&file_path, "content").expect("write file");
 
     let ctx = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("worker-gov")),
         task_id: Some(TaskId::new("todo-gov")),
         session_id: Some(SessionId::new("session-gov")),
@@ -3134,6 +3243,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
 
     // Context A holds a write guard on shared_file via paths
     let ctx_a = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-path-a")),
         session_id: Some(SessionId::new("session-path-a")),
@@ -3164,6 +3274,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
 
     // Context B tries to write to the same path — should conflict
     let ctx_b = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("todo-path-b")),
         session_id: Some(SessionId::new("session-path-a")),
@@ -3226,6 +3337,7 @@ fn summary_for_query_filters_by_context_fields() {
     fs::write(&file, "query").expect("write");
 
     let ctx_w1 = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("w1")),
         task_id: Some(TaskId::new("t1")),
         session_id: Some(SessionId::new("s1")),
@@ -3236,6 +3348,7 @@ fn summary_for_query_filters_by_context_fields() {
         browser_execution_id: None,
     };
     let ctx_w2 = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("w2")),
         task_id: Some(TaskId::new("t2")),
         session_id: Some(SessionId::new("s1")),
@@ -3333,10 +3446,10 @@ fn policy_rejection_reflected_in_summary_and_events() {
     let deny_policy = ToolExecutionPolicy {
         access_profile: magi_core::AccessProfile::Restricted,
         source_skill_ids: vec!["skill-x".to_string()],
-        allowed_tool_names: vec![
+        allowed_tool_names: Some(vec![
             BuiltinToolName::FileRead.as_str().to_string(),
             BuiltinToolName::SearchText.as_str().to_string(),
-        ],
+        ]),
         denied_tool_names: vec![BuiltinToolName::FileRead.as_str().to_string()],
         ..ToolExecutionPolicy::default()
     };
@@ -3372,7 +3485,7 @@ fn policy_rejection_reflected_in_summary_and_events() {
     let not_allowed_policy = ToolExecutionPolicy {
         access_profile: magi_core::AccessProfile::Restricted,
         source_skill_ids: vec!["skill-y".to_string()],
-        allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
+        allowed_tool_names: Some(vec![BuiltinToolName::SearchText.as_str().to_string()]),
         denied_tool_names: vec![],
         ..ToolExecutionPolicy::default()
     };
@@ -3450,6 +3563,7 @@ fn full_chain_invocations_events_summary_consistent() {
     fs::write(&file, "chain data").expect("write");
 
     let ctx = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: Some(WorkerId::new("wk-chain")),
         task_id: Some(TaskId::new("td-chain")),
         session_id: Some(SessionId::new("ss-chain")),
@@ -3531,7 +3645,7 @@ fn full_chain_invocations_events_summary_consistent() {
         &ToolExecutionPolicy {
             access_profile: magi_core::AccessProfile::Restricted,
             source_skill_ids: vec!["sk-locked".to_string()],
-            allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
+            allowed_tool_names: Some(vec![BuiltinToolName::SearchText.as_str().to_string()]),
             denied_tool_names: vec![],
             ..ToolExecutionPolicy::default()
         },
@@ -3784,10 +3898,10 @@ fn tool_execution_policy_applies_task_policy_without_losing_skill_scope() {
     let mut policy = ToolExecutionPolicy {
         access_profile: magi_core::AccessProfile::Restricted,
         source_skill_ids: vec!["skill-a".to_string()],
-        allowed_tool_names: vec![
+        allowed_tool_names: Some(vec![
             BuiltinToolName::FileRead.as_str().to_string(),
             BuiltinToolName::SearchText.as_str().to_string(),
-        ],
+        ]),
         denied_tool_names: vec![BuiltinToolName::FileRemove.as_str().to_string()],
         ..ToolExecutionPolicy::default()
     };
@@ -3802,7 +3916,7 @@ fn tool_execution_policy_applies_task_policy_without_losing_skill_scope() {
     assert_eq!(policy.access_profile, magi_core::AccessProfile::FullAccess);
     assert_eq!(
         policy.allowed_tool_names,
-        vec![BuiltinToolName::FileRead.as_str().to_string()]
+        Some(vec![BuiltinToolName::FileRead.as_str().to_string()])
     );
     assert_eq!(
         policy.denied_tool_names,
@@ -7314,22 +7428,6 @@ fn builtin_catalog_contracts_are_complete_and_self_consistent() {
 }
 
 #[test]
-fn create_goal_schema_uses_explicit_nullable_budget_contract() {
-    let schema = BuiltinToolName::CreateGoal.parameters_schema();
-    assert_eq!(
-        schema["required"],
-        serde_json::json!(["objective", "token_budget"])
-    );
-    assert_eq!(
-        schema["properties"]["token_budget"]["anyOf"],
-        serde_json::json!([
-            { "type": "integer", "minimum": 16000 },
-            { "type": "null" }
-        ])
-    );
-}
-
-#[test]
 fn public_tool_schemas_do_not_expose_legacy_argument_aliases() {
     let cases = [
         (
@@ -7759,6 +7857,7 @@ fn builtin_execution_input_keeps_canonical_name_and_applies_invocation_policy() 
 fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-internal-process")),
         session_id: Some(SessionId::new("session-internal-process")),
@@ -7818,6 +7917,7 @@ fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
 fn shell_exec_background_keeps_shell_public_payload() {
     let registry = make_registry();
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-shell-background")),
         session_id: Some(SessionId::new("session-shell-background")),
@@ -7858,6 +7958,7 @@ fn file_write_execution_respects_active_write_guard() {
     let root = unique_temp_dir("magi-tool-file-write-guard");
     let file = root.join("guarded.txt");
     let context = ToolExecutionContext {
+        caller_scope: crate::ToolCallerScope::SessionMainline,
         worker_id: None,
         task_id: Some(TaskId::new("task-file-write-guard")),
         session_id: Some(SessionId::new("session-file-write-guard")),
@@ -8144,8 +8245,8 @@ fn search_semantic_returns_empty_success_for_empty_workspace() {
 fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
-    let registry = ToolRegistry::new(governance, event_bus)
-        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+    let registry = ToolRegistry::new(governance, event_bus).with_external_tool_catalog_provider(
+        Arc::new(|| ExternalToolCatalogSnapshot {
             instruction_skill_count: 0,
             mcp_tools: vec![ExternalMcpToolCatalogEntry {
                 server_id: "repo-tools".to_string(),
@@ -8160,8 +8261,17 @@ fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
                 }),
             }],
             ..ExternalToolCatalogSnapshot::default()
-        }))
-        .with_external_mcp_tool_executor(Arc::new(|server_id, tool_name, arguments| {
+        }),
+    );
+    let unavailable = registry.tool_catalog_value("{}", &ToolExecutionContext::default());
+    assert_eq!(unavailable["mcp_tools"][0]["model_available"], false);
+    assert_eq!(unavailable["mcp_tools"][0]["availability"], "unavailable");
+    assert_eq!(
+        unavailable["mcp_tools"][0]["reason_code"],
+        "runtime_unavailable"
+    );
+    let registry =
+        registry.with_external_mcp_tool_executor(Arc::new(|server_id, tool_name, arguments| {
             assert_eq!(server_id, "repo-tools");
             assert_eq!(tool_name, "inspect");
             assert_eq!(arguments, r#"{"path":"src"}"#);
@@ -8434,6 +8544,32 @@ fn external_mcp_access_profile_matrix_records_executor_side_effects() {
             let result = registry
                 .execute_external_mcp_tool(tool_name, r#"{"value":"matrix"}"#, access_profile)
                 .expect("matrix MCP tool must be present in the same catalog snapshot");
+            let catalog = registry.tool_catalog_value(
+                "{}",
+                &ToolExecutionContext {
+                    access_profile,
+                    ..Default::default()
+                },
+            );
+            let entry = catalog["mcp_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["model_tool_name"] == tool_name)
+                .unwrap();
+            assert_eq!(
+                entry["availability"],
+                match result.1 {
+                    ExecutionResultStatus::Succeeded => "available",
+                    ExecutionResultStatus::NeedsApproval => "needs_approval",
+                    ExecutionResultStatus::Rejected => "denied",
+                    _ => panic!("unexpected access decision"),
+                }
+            );
+            assert_eq!(
+                entry["model_available"],
+                result.1 != ExecutionResultStatus::Rejected
+            );
             let executed = result.1 == ExecutionResultStatus::Succeeded;
             rows.push(serde_json::json!({
                 "tool": tool_name,
@@ -9854,6 +9990,36 @@ fn shell_exec_does_not_infer_a_read_action_from_a_bare_terminal_id() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn shell_exec_run_does_not_treat_a_job_id_as_a_historical_lookup() {
+    let root = unique_temp_dir("magi-tool-shell-run-job-id");
+    let registry = make_registry();
+    let context = session_context(&root, "run-job-id");
+
+    let output = run_shell(
+        &registry,
+        &context,
+        serde_json::json!({
+            "action": "run",
+            "job_id": "model-placeholder-job",
+            "command": "printf action-run-ok",
+            "access_mode": "read_only",
+        }),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(payload_of(&output)["stdout"], "action-run-ok");
+
+    let listed = run_shell(
+        &registry,
+        &context,
+        serde_json::json!({ "action": "list", "job_id": "model-placeholder-job" }),
+    );
+    assert_eq!(listed.status, ExecutionResultStatus::Succeeded);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn shell_exec_rejects_unknown_background_actions_with_invalid_input() {
     let registry = make_registry();
@@ -9861,7 +10027,7 @@ fn shell_exec_rejects_unknown_background_actions_with_invalid_input() {
     let output = exec_tool(
         &registry,
         BuiltinToolName::ShellExec,
-        &serde_json::json!({ "action": "READ", "terminal_id": 1 }).to_string(),
+        &serde_json::json!({ "action": "READ", "terminal_id": 1, "job_id": "unused" }).to_string(),
     );
 
     assert_eq!(output.status, ExecutionResultStatus::Failed);
@@ -10176,8 +10342,20 @@ fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
         input_schema: serde_json::json!({"type": "object"}),
         read_only,
     };
-    let provider: PluginToolCatalogProvider =
-        Arc::new(move |_| vec![entry("read", true), entry("write", false)]);
+    let catalog_calls = Arc::new(AtomicUsize::new(0));
+    let catalog_counter = catalog_calls.clone();
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let active = enabled.clone();
+    let provider: PluginToolCatalogProvider = Arc::new(move |workspace| {
+        catalog_counter.fetch_add(1, Ordering::SeqCst);
+        if active.load(Ordering::SeqCst)
+            && workspace == test_workspace_context().workspace_id.as_ref()
+        {
+            vec![entry("read", true), entry("write", false)]
+        } else {
+            Vec::new()
+        }
+    });
     let executor: PluginToolExecutor = Arc::new(|_, _, _| {
         (
             "{\"ran\":true}".to_string(),
@@ -10199,6 +10377,31 @@ fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
 
     let (_, status) = call("read", magi_core::AccessProfile::ReadOnly);
     assert_eq!(status, ExecutionResultStatus::Succeeded);
+
+    for (access_profile, availability) in [
+        (magi_core::AccessProfile::ReadOnly, "denied"),
+        (magi_core::AccessProfile::Restricted, "needs_approval"),
+        (magi_core::AccessProfile::FullAccess, "available"),
+    ] {
+        let before = catalog_calls.load(Ordering::SeqCst);
+        let catalog = registry.tool_catalog_value(
+            "{}",
+            &ToolExecutionContext {
+                access_profile,
+                ..context.clone()
+            },
+        );
+        let plugins = catalog["plugin_tools"].as_array().unwrap();
+        assert_eq!(catalog["external_catalog_status"], "available");
+        assert_eq!(plugins[0]["availability"], "available");
+        assert_eq!(plugins[1]["availability"], availability);
+        assert_eq!(plugins[1]["model_available"], availability != "denied");
+        assert_eq!(
+            catalog_calls.load(Ordering::SeqCst) - before,
+            1,
+            "每次目录读取只取得一个插件快照"
+        );
+    }
 
     let (payload, status) = call("write", magi_core::AccessProfile::Restricted);
     assert_eq!(status, ExecutionResultStatus::NeedsApproval);
@@ -10225,4 +10428,99 @@ fn plugin_side_effect_tools_share_the_mcp_approval_resume_contract() {
             .is_none(),
         "不在目录内的名称不属于插件工具"
     );
+    let hidden = registry.tool_catalog_value("{}", &ToolExecutionContext::default());
+    assert_eq!(
+        hidden["plugin_tools"],
+        serde_json::json!([]),
+        "其他范围不能读取插件工具"
+    );
+    let before = catalog_calls.load(Ordering::SeqCst);
+    let disabled = registry.tool_catalog_value(r#"{"include_external":false}"#, &context);
+    assert_eq!(disabled["plugin_tools"], serde_json::json!([]));
+    assert_eq!(
+        catalog_calls.load(Ordering::SeqCst),
+        before,
+        "关闭外部目录不能加载插件"
+    );
+    enabled.store(false, Ordering::SeqCst);
+    assert_eq!(
+        registry.tool_catalog_value("{}", &context)["plugin_tools"],
+        serde_json::json!([])
+    );
+    assert!(
+        registry
+            .execute_plugin_tool(
+                "plugin__acme.tools__read",
+                "{}",
+                &context,
+                magi_core::AccessProfile::FullAccess
+            )
+            .is_none(),
+        "停用后旧目录不授权新调用"
+    );
+}
+
+#[test]
+fn tool_name_scope_keeps_deny_only_inheritance_and_closed_empty_distinct() {
+    let policy = crate::ToolExecutionPolicy {
+        denied_tool_names: vec!["file_remove".into()],
+        ..Default::default()
+    };
+    assert!(policy.tool_name_rejection("file_read").is_none());
+    assert_eq!(
+        policy.tool_name_rejection("file_remove"),
+        Some(crate::ToolNameRejection::ExplicitlyDenied)
+    );
+    let closed = crate::ToolExecutionPolicy {
+        source_skill_ids: vec!["closed".into()],
+        allowed_tool_names: Some(Vec::new()),
+        ..Default::default()
+    };
+    assert_eq!(
+        closed.tool_name_rejection("file_read"),
+        Some(crate::ToolNameRejection::NotAllowed)
+    );
+}
+
+#[test]
+fn task_tool_scope_intersection_never_reopens_a_closed_allowlist() {
+    let task = test_task_policy(
+        magi_core::AccessProfile::FullAccess,
+        vec!["search_text".into()],
+        vec!["file_remove".into()],
+    );
+    for mut policy in [
+        ToolExecutionPolicy {
+            allowed_tool_names: Some(Vec::new()),
+            ..Default::default()
+        },
+        ToolExecutionPolicy {
+            allowed_tool_names: Some(vec!["file_read".into()]),
+            ..Default::default()
+        },
+    ] {
+        for _ in 0..2 {
+            policy.apply_task_policy(&task);
+            assert_eq!(policy.allowed_tool_names, Some(Vec::new()));
+            assert_eq!(
+                policy.tool_name_rejection("search_text"),
+                Some(crate::ToolNameRejection::NotAllowed)
+            );
+            assert_eq!(
+                policy.tool_name_rejection("file_remove"),
+                Some(crate::ToolNameRejection::ExplicitlyDenied)
+            );
+        }
+    }
+    let mut inherited = ToolExecutionPolicy::default();
+    inherited.apply_task_policy(&task);
+    assert!(inherited.tool_name_rejection("search_text").is_none());
+    assert!(inherited.tool_name_rejection("file_read").is_some());
+}
+
+#[test]
+fn create_goal_requires_only_objective_and_exposes_no_task_budget() {
+    let schema = BuiltinToolName::CreateGoal.parameters_schema();
+    assert_eq!(schema["required"], serde_json::json!(["objective"]));
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
 }

@@ -314,11 +314,14 @@ pub struct BrowserLeaseSelector {
     pub worker_id: Option<magi_core::WorkerId>,
     pub execution_chain_ref: Option<String>,
     pub goal_id: Option<GoalId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub taskless_only: bool,
 }
 
 impl BrowserLeaseSelector {
     pub fn matches(&self, lease: &BrowserControlLease) -> bool {
-        option_matches(&self.tab_id, Some(&lease.tab_id))
+        (!self.taskless_only || lease.owner.task_id.is_none())
+            && option_matches(&self.tab_id, Some(&lease.tab_id))
             && option_matches(&self.surface_id, Some(&lease.surface_id))
             && option_matches(&self.session_id, lease.owner.session_id.as_ref())
             && option_matches(&self.workspace_id, lease.owner.workspace_id.as_ref())

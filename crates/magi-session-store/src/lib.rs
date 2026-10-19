@@ -1,6 +1,13 @@
+#[macro_use]
+mod persistence_compat;
+mod agent_turn;
 mod lifecycle;
+pub use agent_turn::{AgentRunTransferResolver, AgentTurnBinding};
+mod model_step;
 mod models;
 mod store;
+pub mod tool_approval;
+pub mod user_question;
 
 pub use lifecycle::SessionLifecycleObserver;
 pub use models::{
@@ -11,19 +18,26 @@ pub use models::{
     CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread,
     ExecutionThreadStatus, GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase,
     GoalContinuationState, GoalResumeCheckpoint, GoalRevisionExpectation,
-    GoalRuntimeFailureDisposition, GoalStatus, InterruptedGoalResumeCheckpoint,
-    NotificationContext, NotificationRecord, NotificationScope, SESSION_COMMAND_METADATA_KEY,
-    SessionAcceptanceRecord, SessionDurableState, SessionExecutionSidecarStatus,
-    SessionExecutionSidecarStoreState, SessionGoal, SessionKind, SessionPlan,
-    SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
-    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState,
-    ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
-    ThreadContextCheckpoint, ThreadFileFactVersion, ThreadModelProviderContext, ThreadVisibility,
-    TimelineEntry, TimelineEntryKind, active_execution_turn_request_id,
-    timeline_entry_visible_text,
+    GoalRuntimeFailureDisposition, GoalStatus, InputConsumption, InputInterruption,
+    InterruptedGoalResumeCheckpoint, NotificationContext, NotificationRecord, NotificationScope,
+    SESSION_COMMAND_METADATA_KEY, SessionAcceptanceRecord, SessionDurableState,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionGoal, SessionInput,
+    SessionInputState, SessionKind, SessionPlan, SessionProjectionInput, SessionRecord,
+    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,
+    SessionSidecarFlushReason, SessionStoreState, ThreadChatImageSource, ThreadChatMessage,
+    ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
+    ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    active_execution_turn_request_id, timeline_entry_visible_text,
 };
-pub use store::{CanonicalTurnEventWriter, CanonicalTurnMutation};
+pub use store::{
+    CanonicalItemCommitNotice, CanonicalTurnMutation, ModelStepCommitNotice, SessionEventWriter,
+    SessionInputCommitNotice, SessionInputMutation,
+};
 pub use store::{
     ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionMutationTransactionError, SessionStore,
     TimelineEntryInput, UnavailableSession,
+};
+
+pub use model_step::{
+    ModelAttempt, ModelStep, ModelStepBinding, ModelStepPurpose, ModelStepStatus,
 };

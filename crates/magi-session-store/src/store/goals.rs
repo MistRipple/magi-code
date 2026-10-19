@@ -51,7 +51,6 @@ pub(super) fn activate_paused_plan(plan: &mut SessionPlan, now: UtcMillis) {
     plan.revision = plan.revision.saturating_add(1);
     plan.updated_at = now;
 }
-
 pub(super) fn pause_goal_and_bound_plan_in_state(
     state: &mut crate::models::SessionStoreState,
     goal_index: usize,
@@ -123,7 +122,6 @@ impl SessionStore {
         turn_id: impl Into<String>,
         objective: impl Into<String>,
         access_profile: AccessProfile,
-        token_budget: Option<u64>,
     ) -> DomainResult<SessionGoal> {
         let turn_id = normalize_non_empty(turn_id, "goal turn_id")?;
         let objective = normalize_objective(objective)?;
@@ -174,8 +172,8 @@ impl SessionStore {
             status: GoalStatus::Active,
             control_revision: 1,
             access_profile,
-            token_budget,
             tokens_used: 0,
+            model_attempts_used: 0,
             time_used_seconds: 0,
             time_used_millis: 0,
             timing_started_at: None,
@@ -290,6 +288,12 @@ impl SessionStore {
         expected_revision: Option<u64>,
     ) -> DomainResult<SessionGoal> {
         let objective = normalize_objective(objective)?;
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let _guard = lock.lock().expect("canonical session lock poisoned");
         let now = UtcMillis::now();
         let mut state = self
             .state
@@ -546,54 +550,6 @@ impl SessionStore {
         Ok(state.goals[goal_index].clone())
     }
 
-    pub fn account_goal_token_usage(
-        &self,
-        session_id: &SessionId,
-        goal_id: &GoalId,
-        token_delta: u64,
-    ) -> DomainResult<SessionGoal> {
-        let now = UtcMillis::now();
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        let goal_index = state
-            .goals
-            .iter()
-            .position(|goal| &goal.session_id == session_id && &goal.goal_id == goal_id)
-            .ok_or(DomainError::NotFound { entity: "goal" })?;
-        if !state.goals[goal_index].status.is_unfinished() {
-            return Ok(state.goals[goal_index].clone());
-        }
-        let goal = &mut state.goals[goal_index];
-        goal.tokens_used = goal.tokens_used.saturating_add(token_delta);
-        let budget_exhausted = goal
-            .token_budget
-            .is_some_and(|token_budget| goal.tokens_used >= token_budget)
-            && goal.status == GoalStatus::Active;
-        if budget_exhausted {
-            goal.status = GoalStatus::BudgetLimited;
-            goal.control_revision = goal.control_revision.saturating_add(1);
-            goal.continuation = GoalContinuationState {
-                phase: GoalContinuationPhase::Waiting,
-                turn_id: None,
-                reason: Some("token_budget_exhausted".to_string()),
-            };
-        }
-        goal.updated_at = now;
-        if budget_exhausted
-            && let Some(plan) = state.plans.iter_mut().find(|plan| {
-                &plan.session_id == session_id && plan.goal_id.as_ref() == Some(goal_id)
-            })
-        {
-            plan.state = PlanState::Paused;
-            plan.revision = plan.revision.saturating_add(1);
-            plan.updated_at = now;
-        }
-        super::sidecar::reconcile_goal_time_used(&mut state);
-        Ok(state.goals[goal_index].clone())
-    }
-
     pub fn complete_goal(
         &self,
         session_id: &SessionId,
@@ -697,7 +653,6 @@ impl SessionStore {
             GoalRevisionExpectation::new(expected_revision, expected_plan_revision),
             GoalStatus::Paused,
             None,
-            None,
         )?;
         Ok((goal, plan))
     }
@@ -729,7 +684,6 @@ impl SessionStore {
         goal_id: &GoalId,
         expected_revision: u64,
         expected_plan_revision: Option<u64>,
-        new_token_budget: Option<u64>,
         new_access_profile: Option<AccessProfile>,
     ) -> DomainResult<(SessionGoal, Option<SessionPlan>, GoalResumeCheckpoint)> {
         let (goal, plan, checkpoint) = self.transition_goal_with_plan(
@@ -737,7 +691,6 @@ impl SessionStore {
             goal_id,
             GoalRevisionExpectation::new(expected_revision, expected_plan_revision),
             GoalStatus::Active,
-            new_token_budget,
             new_access_profile,
         )?;
         Ok((
@@ -753,13 +706,18 @@ impl SessionStore {
         goal_id: &GoalId,
         expected_revisions: GoalRevisionExpectation,
         next_status: GoalStatus,
-        new_token_budget: Option<u64>,
         new_access_profile: Option<AccessProfile>,
     ) -> DomainResult<(
         SessionGoal,
         Option<SessionPlan>,
         Option<GoalResumeCheckpoint>,
     )> {
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let _guard = lock.lock().expect("canonical session lock poisoned");
         let now = UtcMillis::now();
         let mut state = self
             .state
@@ -783,12 +741,7 @@ impl SessionStore {
         let allowed = match next_status {
             GoalStatus::Paused => current_status == GoalStatus::Active,
             GoalStatus::Active => {
-                matches!(
-                    current_status,
-                    GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited
-                ) || (current_status == GoalStatus::BudgetLimited
-                    && new_token_budget
-                        .is_some_and(|budget| budget > state.goals[goal_index].tokens_used))
+                matches!(current_status, GoalStatus::Paused | GoalStatus::Blocked)
             }
             _ => false,
         };
@@ -829,9 +782,7 @@ impl SessionStore {
         {
             let goal = &mut state.goals[goal_index];
             goal.status = next_status;
-            if let Some(new_token_budget) = new_token_budget {
-                goal.token_budget = Some(new_token_budget);
-            }
+
             if let Some(new_access_profile) = new_access_profile {
                 goal.access_profile = new_access_profile;
             }
@@ -906,6 +857,7 @@ impl SessionStore {
             }
         }
         state.goals[goal_index] = checkpoint.goal_before;
+        reconcile_goal_token_usage(&mut state);
         super::sidecar::reconcile_goal_time_used(&mut state);
         Ok(())
     }
@@ -1080,6 +1032,68 @@ fn normalize_evidence_refs(evidence_refs: Vec<String>) -> Vec<String> {
     normalized
 }
 
+/// Step 的累计水位是 token 记账事实；Goal 只是读取投影。保留旧快照已有的基数，
+/// 事件重放或重复重建只能前进到最大水位，不能再次累加同一响应。
+pub(super) fn reconcile_goal_token_usage(state: &mut SessionStoreState) {
+    for turn in &state.canonical_turns {
+        apply_goal_token_watermarks(&mut state.goals, &turn.session_id, &turn.model_steps);
+    }
+    reconcile_goal_attempt_usage(state);
+}
+
+pub(super) fn apply_goal_token_watermarks(
+    goals: &mut [SessionGoal],
+    session_id: &SessionId,
+    steps: &[crate::ModelStep],
+) {
+    for step in steps {
+        if let Some((id, after)) = step.goal_id.as_ref().zip(step.goal_tokens_after)
+            && let Some(goal) = goals
+                .iter_mut()
+                .find(|goal| &goal.session_id == session_id && &goal.goal_id == id)
+            && after > goal.tokens_used
+        {
+            goal.tokens_used = after;
+            goal.updated_at = goal
+                .updated_at
+                .max(step.settled_at.unwrap_or(step.started_at));
+        }
+    }
+}
+
+/// 只在恢复时全量重建；热路径按变化 Turn 维护请求次数统计。
+pub(super) fn reconcile_goal_attempt_usage(state: &mut SessionStoreState) {
+    for goal in &mut state.goals {
+        goal.model_attempts_used = 0;
+    }
+    for turn in &state.canonical_turns {
+        apply_goal_attempt_change(&mut state.goals, None, turn);
+    }
+}
+
+pub(super) fn apply_goal_attempt_change(
+    goals: &mut [SessionGoal],
+    previous: Option<&crate::CanonicalTurn>,
+    next: &crate::CanonicalTurn,
+) {
+    for goal in goals
+        .iter_mut()
+        .filter(|goal| goal.session_id == next.session_id)
+    {
+        let attempts = |turn: &crate::CanonicalTurn| {
+            turn.model_steps
+                .iter()
+                .filter(|step| step.goal_id.as_ref() == Some(&goal.goal_id))
+                .map(|step| step.attempts.len() as u64)
+                .fold(0_u64, u64::saturating_add)
+        };
+        goal.model_attempts_used = goal
+            .model_attempts_used
+            .saturating_sub(previous.map_or(0, attempts))
+            .saturating_add(attempts(next));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,7 +1108,6 @@ mod tests {
         turn_id: &str,
         objective: &str,
         access_profile: AccessProfile,
-        token_budget: Option<u64>,
     ) -> SessionGoal {
         let (_, thread_id) = store.ensure_session_mission(session_id, UtcMillis::now(), || {
             MissionId::new(format!("mission-{session_id}"))
@@ -1106,7 +1119,6 @@ mod tests {
                 turn_id,
                 objective,
                 access_profile,
-                token_budget,
             )
             .expect("goal should be created")
     }
@@ -1146,7 +1158,6 @@ mod tests {
             "turn-goal-access-profile",
             "验证访问模式持久化",
             AccessProfile::ReadOnly,
-            None,
         );
 
         let updated = store
@@ -1183,7 +1194,6 @@ mod tests {
                 "turn-goal-thread-owner",
                 "验证 thread 归属",
                 AccessProfile::Restricted,
-                None,
             )
             .expect_err("goal must not exist before orchestrator thread registration");
         assert!(matches!(
@@ -1204,7 +1214,6 @@ mod tests {
                 "turn-goal-thread-owner",
                 "验证 thread 归属",
                 AccessProfile::Restricted,
-                None,
             )
             .expect_err("goal must belong to the registered orchestrator thread");
         assert!(matches!(wrong_thread_error, DomainError::Validation { .. }));
@@ -1230,7 +1239,6 @@ mod tests {
                     "turn-goal-objective-length",
                     &oversized,
                     AccessProfile::Restricted,
-                    None,
                 )
                 .is_err()
         );
@@ -1241,7 +1249,6 @@ mod tests {
                 "turn-goal-objective-length",
                 "有效目标",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("bounded goal should create");
         assert!(
@@ -1276,7 +1283,6 @@ mod tests {
             "turn-goal-history-1",
             "第一个目标",
             AccessProfile::Restricted,
-            None,
         );
         store
             .complete_goal(
@@ -1294,7 +1300,6 @@ mod tests {
             "turn-goal-history-2",
             "第二个目标",
             AccessProfile::Restricted,
-            None,
         );
         store
             .clear_goal_with_plan(&session_id, &second.goal_id, second.control_revision, None)
@@ -1317,7 +1322,6 @@ mod tests {
             "turn-goal-terminal",
             "终态目标",
             AccessProfile::Restricted,
-            None,
         );
         let completed = store
             .complete_goal(
@@ -1335,7 +1339,6 @@ mod tests {
                 &session_id,
                 &goal.goal_id,
                 completed.control_revision,
-                None,
                 None,
                 None,
             )
@@ -1362,7 +1365,6 @@ mod tests {
             "turn-goal-failure-streak",
             "完成目标",
             AccessProfile::Restricted,
-            None,
         );
 
         let mut current = goal;
@@ -1426,7 +1428,6 @@ mod tests {
             "turn-goal-owner",
             "只允许归属 Turn 更新终态",
             AccessProfile::Restricted,
-            None,
         );
 
         assert!(
@@ -1491,7 +1492,6 @@ mod tests {
             "turn-runtime-error",
             "完成目标",
             AccessProfile::Restricted,
-            None,
         );
         let blocked = store
             .stop_goal_for_runtime_failure(
@@ -1525,7 +1525,6 @@ mod tests {
             "turn-1",
             "完成目标",
             AccessProfile::Restricted,
-            None,
         );
 
         for (turn, expected_attempt) in [("turn-1", 1), ("turn-2", 2)] {
@@ -1565,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_turn_cannot_charge_replacement_goal() {
+    fn stale_turn_cannot_block_replacement_goal() {
         let store = SessionStore::new();
         let session_id = SessionId::new("session-goal-stale-accounting");
         store
@@ -1577,7 +1576,6 @@ mod tests {
             "turn-stale-accounting-1",
             "第一个目标",
             AccessProfile::Restricted,
-            None,
         );
         store
             .complete_goal(
@@ -1595,14 +1593,10 @@ mod tests {
             "turn-stale-accounting-2",
             "第二个目标",
             AccessProfile::Restricted,
-            None,
         );
 
-        assert!(
-            store
-                .account_goal_token_usage(&session_id, &first.goal_id, 100)
-                .is_err()
-        );
+        // 旧 Goal 的结算水位不能改写已经替换的新 Goal。
+        super::reconcile_goal_token_usage(&mut store.state.write().unwrap());
         let current = store
             .current_goal(&session_id)
             .expect("current goal should exist");
@@ -1636,7 +1630,6 @@ mod tests {
             "turn-goal-completion-gate",
             "完成计划",
             AccessProfile::Restricted,
-            None,
         );
         let plan = SessionPlan {
             plan_id: magi_core::PlanId::new("plan-goal-completion-gate"),
@@ -1709,7 +1702,6 @@ mod tests {
             owning_turn_id,
             "完成当前 Goal Turn",
             AccessProfile::Restricted,
-            None,
         );
         let own_task_id = magi_core::TaskId::new(owning_turn_id);
         let other_task_id = magi_core::TaskId::new("task-other-active-binding");
@@ -1806,7 +1798,6 @@ mod tests {
             "turn-goal-completion-plan-cas",
             "验证完成状态的计划版本",
             AccessProfile::Restricted,
-            None,
         );
         let completion_plan = SessionPlan {
             plan_id: magi_core::PlanId::new("plan-goal-completion-plan-cas"),
@@ -1873,7 +1864,6 @@ mod tests {
             "turn-goal-blocker-plan-cas",
             "验证阻塞状态的计划版本",
             AccessProfile::Restricted,
-            None,
         );
         let blocker_plan = SessionPlan {
             plan_id: magi_core::PlanId::new("plan-goal-blocker-plan-cas"),
@@ -1952,123 +1942,6 @@ mod tests {
     }
 
     #[test]
-    fn budget_limited_goal_requires_increased_budget_to_resume() {
-        let store = SessionStore::new();
-        let session_id = SessionId::new("session-goal-budget-resume");
-        store
-            .create_session(session_id.clone(), "budget resume")
-            .expect("session should be created");
-        let goal = create_test_goal(
-            &store,
-            &session_id,
-            "turn-goal-budget-resume",
-            "完成预算恢复",
-            AccessProfile::Restricted,
-            Some(10),
-        );
-        store
-            .upsert_plan(
-                &session_id,
-                SessionPlan {
-                    plan_id: magi_core::PlanId::new("plan-goal-budget-resume"),
-                    session_id: session_id.clone(),
-                    goal_id: Some(goal.goal_id.clone()),
-                    revision: 1,
-                    language: "zh-CN".to_string(),
-                    state: PlanState::Active,
-                    items: vec![magi_core::PlanItem::new(
-                        magi_core::PlanItemId::new("budget-step"),
-                        "继续执行",
-                        PlanItemStatus::InProgress,
-                    )],
-                    task_bindings: std::collections::HashMap::new(),
-                    updated_at: UtcMillis::now(),
-                },
-                Some(0),
-            )
-            .expect("bound plan should create");
-        let limited = store
-            .account_goal_token_usage(&session_id, &goal.goal_id, 10)
-            .expect("usage should be accounted");
-        assert_eq!(limited.status, GoalStatus::BudgetLimited);
-        let limited_plan = store.plan(&session_id).expect("bound plan should remain");
-        assert_eq!(limited_plan.state, PlanState::Paused);
-        assert_eq!(limited_plan.revision, 2);
-        assert!(
-            store
-                .resume_goal_with_plan(
-                    &session_id,
-                    &goal.goal_id,
-                    limited.control_revision,
-                    Some(limited_plan.revision),
-                    Some(10),
-                    None,
-                )
-                .is_err()
-        );
-        let (resumed, _, _) = store
-            .resume_goal_with_plan(
-                &session_id,
-                &goal.goal_id,
-                limited.control_revision,
-                Some(limited_plan.revision),
-                Some(11),
-                None,
-            )
-            .expect("larger budget should resume");
-        assert_eq!(resumed.status, GoalStatus::Active);
-        assert_eq!(resumed.token_budget, Some(11));
-    }
-
-    #[test]
-    fn usage_limited_goal_can_resume_after_system_limit_clears() {
-        let store = SessionStore::new();
-        let session_id = SessionId::new("session-goal-usage-resume");
-        store
-            .create_session(session_id.clone(), "usage resume")
-            .expect("session should be created");
-        let goal = create_test_goal(
-            &store,
-            &session_id,
-            "turn-goal-usage-resume",
-            "完成用量恢复",
-            AccessProfile::Restricted,
-            None,
-        );
-        {
-            let mut state = store
-                .state
-                .write()
-                .expect("session state write lock should hold");
-            let stored = state
-                .goals
-                .iter_mut()
-                .find(|stored| stored.goal_id == goal.goal_id)
-                .expect("goal should exist");
-            stored.status = GoalStatus::UsageLimited;
-            stored.continuation = GoalContinuationState {
-                phase: GoalContinuationPhase::Waiting,
-                turn_id: None,
-                reason: Some("system_usage_limit".to_string()),
-            };
-        }
-
-        let limited = store.current_goal(&session_id).expect("goal should remain");
-        let (resumed, _, _) = store
-            .resume_goal_with_plan(
-                &session_id,
-                &limited.goal_id,
-                limited.control_revision,
-                None,
-                None,
-                None,
-            )
-            .expect("usage limited goal should resume");
-        assert_eq!(resumed.status, GoalStatus::Active);
-        assert_eq!(resumed.continuation.phase, GoalContinuationPhase::Waiting);
-    }
-
-    #[test]
     fn goal_plan_controls_reject_stale_plan_revision_atomically() {
         let store = SessionStore::new();
         let session_id = SessionId::new("session-goal-plan-control-revision");
@@ -2081,7 +1954,6 @@ mod tests {
             "turn-goal-plan-control-revision",
             "验证 Goal 与 Plan 控制版本",
             AccessProfile::Restricted,
-            None,
         );
         store
             .upsert_plan(
@@ -2137,7 +2009,6 @@ mod tests {
                     paused.control_revision,
                     Some(1),
                     None,
-                    None,
                 )
                 .is_err()
         );
@@ -2162,7 +2033,6 @@ mod tests {
                 paused.control_revision,
                 Some(paused_plan.revision),
                 None,
-                None,
             )
             .expect("matching revisions should resume goal and plan");
         assert_eq!(resumed.status, GoalStatus::Active);
@@ -2185,7 +2055,6 @@ mod tests {
             "turn-paused-goal-late-plan-progress",
             "验证暂停后的迟到计划更新",
             AccessProfile::Restricted,
-            None,
         );
         let active_plan = SessionPlan {
             plan_id: magi_core::PlanId::new("plan-paused-goal-late-plan-progress"),
@@ -2290,7 +2159,6 @@ mod tests {
             "turn-replacement-goal",
             "替换后的新目标",
             AccessProfile::Restricted,
-            None,
         );
         assert_eq!(replacement_goal.control_revision, goal.control_revision);
         let late_initial_plan = SessionPlan {
@@ -2342,7 +2210,6 @@ mod tests {
             "task-goal-diversion-owner",
             "验证任务切换原子暂停",
             AccessProfile::Restricted,
-            None,
         );
         let plan = SessionPlan {
             plan_id: magi_core::PlanId::new("plan-goal-diversion"),
@@ -2401,7 +2268,6 @@ mod tests {
             "task-goal-owner",
             "验证执行归属和恢复回滚",
             AccessProfile::Restricted,
-            None,
         );
         store
             .upsert_plan_for_goal_progress(
@@ -2457,7 +2323,6 @@ mod tests {
                 &goal.goal_id,
                 paused.control_revision,
                 Some(2),
-                None,
                 Some(AccessProfile::FullAccess),
             )
             .expect("resume request should succeed");
@@ -2505,7 +2370,6 @@ mod tests {
             "turn-goal-interrupt-owner",
             "验证直接 Goal Turn 中断",
             AccessProfile::Restricted,
-            None,
         );
         store
             .accept_current_turn_with_timeline_entry(

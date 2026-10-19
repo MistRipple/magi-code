@@ -22,6 +22,9 @@ const ARCHIVE_SESSION_ID = 'session-agent-run-archive';
 const ARCHIVE_ROOT_TASK_ID = 'task-root-agent-run-archive';
 let releaseSlowProjection = null;
 let hasDelayedSlowProjection = false;
+const transferRequests = [];
+let releaseTransfer;
+let rejectTransfer = false;
 
 class MemoryStorage {
   constructor() {
@@ -118,6 +121,14 @@ function installBrowserGlobals() {
 function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
   globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(String(url));
+    if (parsed.pathname === '/api/agent-runs/transfer') {
+      const payload = JSON.parse(String(init.body));
+      transferRequests.push(payload);
+      await new Promise(resolve => { releaseTransfer = resolve; });
+      if (rejectTransfer) throw new Error('transfer response lost');
+      return jsonResponse({ sessionId: payload.sessionId, taskId: payload.taskId,
+        operationId: payload.operationId, owner: payload.owner, runnerStarted: true });
+    }
     if (parsed.pathname.startsWith('/api/agent-runs/projection/')) {
       fetches.push(parsed);
       const rootTaskId = decodeURIComponent(parsed.pathname.split('/').pop() || '');
@@ -429,6 +440,43 @@ await withGoldenViteServer(async (server) => {
     true,
     '统一动作请求必须携带幂等 operationId',
   );
+
+  const transferRequest = {
+    sessionId: ACTION_SESSION_ID, taskId: `${ACTION_ROOT_TASK_ID}-child-4`,
+    scope: 'workspace', workspaceId: WORKSPACE_ID, workspacePath: WORKSPACE_PATH,
+    operationId: 'server-projected-operation', expectedParentTurnId: 'original-parent-turn',
+    expectedGeneration: 1, owner: 'session',
+  };
+  const transferring = agentRunStore.transferAgentRun(transferRequest);
+  await delay(0);
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).transferInFlight, transferRequest.taskId);
+  assert.equal(agentRunStore.getAgentRunState(SESSION_ID_B, WORKSPACE_ID).transferInFlight, null);
+  assert.equal(await agentRunStore.transferAgentRun(transferRequest), null, '重复点击不能创建并发转交');
+  const actionCount = actionRequests.length;
+  assert.equal(await agentRunStore.performAgentRunAction(ACTION_SESSION_ID, RESTARTED_ROOT_TASK_ID, 'archive', WORKSPACE_ID), null);
+  assert.equal(actionRequests.length, actionCount, '转交与主线控制不得并发提交');
+  releaseTransfer();
+  assert.equal((await transferring).taskId, transferRequest.taskId);
+  assert.deepEqual(transferRequests[0], transferRequest, 'UI 必须原样提交服务端命令，不能推断代际或拥有方');
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).rootTaskId, RESTARTED_ROOT_TASK_ID,
+    '旧代理转交不能把当前主线切回原 root 或改为子 Task');
+
+  rejectTransfer = true;
+  const failedTransfer = agentRunStore.transferAgentRun(transferRequest);
+  const rejected = assert.rejects(failedTransfer, /transfer response lost/u);
+  await delay(0);
+  releaseTransfer();
+  await rejected;
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).transferInFlight, null);
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).transferError.taskId, transferRequest.taskId);
+  assert.equal(agentRunStore.getAgentRunState(SESSION_ID_B, WORKSPACE_ID).transferError, null, '错误不能污染其他会话');
+  rejectTransfer = false;
+  const retry = agentRunStore.transferAgentRun(transferRequest);
+  await delay(0);
+  releaseTransfer();
+  await retry;
+  assert.deepEqual(transferRequests.at(-1), transferRequest, '响应丢失后重试必须保留原 operation 与全部控制字段');
+  assert.equal(agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).transferError, null);
 
   agentRunStore.activateAgentRunSession(ARCHIVE_SESSION_ID, WORKSPACE_ID, WORKSPACE_PATH);
   await agentRunStore.fetchAgentRunProjection(

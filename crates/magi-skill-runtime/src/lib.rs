@@ -54,6 +54,39 @@ pub struct SkillDefinition {
     pub prompt_priority: u32,
 }
 
+/// 导入格式保留原字段，运行时只通过显式语义解释空列表。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardToolAccess<'a> {
+    Inherit,
+    AllowOnly(&'a [String]),
+    DenyAll,
+}
+
+impl StandardToolAccess<'_> {
+    pub fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::Inherit => true,
+            Self::AllowOnly(tools) => tools.iter().any(|allowed| allowed == tool),
+            Self::DenyAll => false,
+        }
+    }
+    pub fn is_restricted(self) -> bool {
+        !matches!(self, Self::Inherit)
+    }
+}
+
+impl SkillDefinition {
+    pub fn standard_tool_access(&self) -> StandardToolAccess<'_> {
+        if !self.restrict_standard_tools {
+            StandardToolAccess::Inherit
+        } else if self.allowed_tools.is_empty() {
+            StandardToolAccess::DenyAll
+        } else {
+            StandardToolAccess::AllowOnly(&self.allowed_tools)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillSelection {
     pub skill_ids: Vec<String>,
@@ -207,11 +240,17 @@ impl SkillRegistry {
         Self::default()
     }
 
-    pub fn clear(&self) {
-        self.skills
+    /// 原子替换注册快照，避免热重载期间短暂发布空 Skill 目录。
+    pub fn replace(&self, skills: impl IntoIterator<Item = SkillDefinition>) {
+        let replacement = skills
+            .into_iter()
+            .map(validation::normalize_skill)
+            .map(|skill| (skill.skill_id.clone(), skill))
+            .collect();
+        *self
+            .skills
             .write()
-            .expect("skill registry write lock poisoned")
-            .clear();
+            .expect("skill registry write lock poisoned") = replacement;
     }
 
     pub fn register(&self, skill: SkillDefinition) {
@@ -246,14 +285,17 @@ impl SkillRegistry {
         if requested.is_empty() {
             return SkillIdResolution::NotFound;
         }
-        if self.get(requested).is_some() {
+        let skills = self
+            .skills
+            .read()
+            .expect("skill registry read lock poisoned");
+        if skills.contains_key(requested) {
             return SkillIdResolution::Found(requested.to_string());
         }
 
         let requested_normalized = requested.to_ascii_lowercase();
-        let mut matches = self
-            .list()
-            .into_iter()
+        let mut matches = skills
+            .values()
             .filter(|skill| {
                 let skill_id = skill.skill_id.trim();
                 let short_name = skill_id.rsplit('/').next().unwrap_or(skill_id);
@@ -263,7 +305,7 @@ impl SkillRegistry {
                         .trim()
                         .eq_ignore_ascii_case(&requested_normalized)
             })
-            .map(|skill| skill.skill_id)
+            .map(|skill| skill.skill_id.clone())
             .collect::<Vec<_>>();
         matches.sort();
         matches.dedup();
@@ -276,8 +318,7 @@ impl SkillRegistry {
 
     pub fn is_tool_allowed(&self, skill_id: &str, tool_name: &str) -> bool {
         self.get(skill_id).is_some_and(|skill| {
-            !skill.restrict_standard_tools
-                || skill.allowed_tools.iter().any(|tool| tool == tool_name)
+            skill.standard_tool_access().allows(tool_name)
                 || skill
                     .custom_tool_bindings
                     .iter()
@@ -286,11 +327,25 @@ impl SkillRegistry {
     }
 
     pub fn resolve_context(&self, selection: &SkillSelection) -> ResolvedSkillContext {
-        let mut selected_skills = selection
+        Self::resolve_selected_context(selection, self.selected_skills(selection))
+    }
+
+    fn selected_skills(&self, selection: &SkillSelection) -> Vec<SkillDefinition> {
+        let skills = self
+            .skills
+            .read()
+            .expect("skill registry read lock poisoned");
+        selection
             .skill_ids
             .iter()
-            .filter_map(|skill_id| self.get(skill_id))
-            .collect::<Vec<_>>();
+            .filter_map(|skill_id| skills.get(skill_id).cloned())
+            .collect()
+    }
+
+    fn resolve_selected_context(
+        selection: &SkillSelection,
+        mut selected_skills: Vec<SkillDefinition>,
+    ) -> ResolvedSkillContext {
         selected_skills.sort_by(|left, right| {
             left.prompt_priority
                 .cmp(&right.prompt_priority)
@@ -332,12 +387,21 @@ impl SkillRegistry {
     }
 
     pub fn build_tool_runtime_plan(&self, selection: &SkillSelection) -> SkillToolRuntimePlan {
-        let restrict_standard_tools = selection
-            .skill_ids
-            .iter()
-            .filter_map(|skill_id| self.get(skill_id))
-            .any(|skill| skill.restrict_standard_tools);
-        let resolved = self.resolve_context(selection);
+        // 一次读锁取得配置快照；热更新不能在缺失检查与权限解析之间放大范围。
+        let selected_skills = self.selected_skills(selection);
+        let missing_skill = selected_skills.len() != selection.skill_ids.len();
+        let restrict_standard_tools = missing_skill
+            || selected_skills
+                .iter()
+                .any(|skill| skill.standard_tool_access().is_restricted());
+        let mut resolved = Self::resolve_selected_context(selection, selected_skills);
+        if missing_skill {
+            resolved.allowed_tools.clear();
+            resolved.custom_tool_bindings.clear();
+            resolved
+                .denied_tools
+                .extend(selection.requested_tools.clone());
+        }
         let mut routing = routing::classify_requested_tools(
             &selection.requested_tools,
             &resolved.custom_tool_bindings,
@@ -383,7 +447,7 @@ impl SkillRegistry {
                     Default::default()
                 },
                 allowed_tool_names: if restrict_standard_tools {
-                    allowed_builtin_tools
+                    Some(allowed_builtin_tools)
                 } else {
                     Default::default()
                 },
@@ -428,12 +492,7 @@ impl SkillRuntime {
             skill_ids: skill_ids.to_vec(),
             requested_tools: vec![tool_name.to_string()],
         });
-        plan.tool_policy.source_skill_ids.is_empty()
-            || plan
-                .tool_policy
-                .allowed_tool_names
-                .iter()
-                .any(|tool| tool == tool_name)
+        plan.tool_policy.tool_name_rejection(tool_name).is_none()
     }
 }
 
@@ -609,6 +668,10 @@ mod tests {
     struct TestModelClient;
 
     impl magi_bridge_client::ModelBridgeClient for TestModelClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
@@ -642,6 +705,10 @@ mod tests {
     }
 
     impl magi_bridge_client::ModelBridgeClient for FailingModelClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,
@@ -665,6 +732,10 @@ mod tests {
     }
 
     impl magi_bridge_client::ModelBridgeClient for BusinessFailureModelClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,
@@ -1684,6 +1755,7 @@ mod tests {
         });
 
         let ctx = ToolExecutionContext {
+            caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
             worker_id: Some(magi_core::WorkerId::new("wk-skill")),
             task_id: Some(magi_core::TaskId::new("td-skill")),
             session_id: Some(magi_core::SessionId::new("ss-skill")),
@@ -1965,5 +2037,27 @@ mod tests {
         assert_eq!(obs.dispatch_action, Some(BridgeDispatchAction::ModelPrompt));
         assert!(obs.error_kind.is_none());
         assert!(!obs.detail.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod missing_skill_policy_tests {
+    use super::*;
+    #[test]
+    fn removed_skill_has_no_standard_or_custom_execution_scope() {
+        let registry = SkillRegistry::new();
+        let plan = registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["removed".into()],
+            requested_tools: vec!["file_read".into(), "mcp__repo__inspect".into()],
+        });
+        assert_eq!(plan.tool_policy.source_skill_ids, ["removed"]);
+        assert_eq!(plan.tool_policy.allowed_tool_names, Some(Vec::new()));
+        assert!(plan.custom_tool_bindings.is_empty());
+        assert!(plan.tool_policy.tool_name_rejection("file_read").is_some());
+        assert!(
+            plan.tool_policy
+                .tool_name_rejection("mcp__repo__inspect")
+                .is_some()
+        );
     }
 }

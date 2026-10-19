@@ -196,6 +196,7 @@ fn task_runtime_payload_none_serialization_roundtrip() {
 fn task_runtime_payload_workflow_serialization_roundtrip() {
     let payload = TaskRuntimePayload::Workflow {
         workflow_id: "plugin/example/workflow".into(),
+        package_digest: Some("workflow-package-digest".into()),
         checkpoint_version: 1,
         stage: "start".into(),
         checkpoint: serde_json::json!({"stage":"start"}),
@@ -205,6 +206,18 @@ fn task_runtime_payload_workflow_serialization_roundtrip() {
     let encoded = serde_json::to_string(&payload).expect("工作流负载应可序列化");
     let decoded: TaskRuntimePayload = serde_json::from_str(&encoded).expect("工作流负载应可恢复");
     assert_eq!(decoded, payload);
+    let mut legacy = serde_json::to_value(&payload).unwrap();
+    legacy.as_object_mut().unwrap().remove("package_digest");
+    assert!(
+        matches!(
+            serde_json::from_value::<TaskRuntimePayload>(legacy).unwrap(),
+            TaskRuntimePayload::Workflow {
+                package_digest: None,
+                ..
+            }
+        ),
+        "旧证据可读取，不能为它猜测当前包身份"
+    );
 }
 
 #[test]

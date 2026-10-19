@@ -1,57 +1,11 @@
 use magi_core::{ExecutionResultStatus, SessionId, TaskId, UtcMillis};
 use magi_session_store::SessionStore;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 
-/// 用户审批的最长等待时间。过期后不会执行原始工具调用，也不会写入拒绝记忆；
-/// 后续新的模型调用可以重新请求同一组参数的审批。
-pub const TOOL_APPROVAL_TTL_MILLIS: u64 = 5 * 60 * 1_000;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolApprovalDecision {
-    AllowOnce,
-    AllowForTurn,
-    Deny,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingToolApproval {
-    pub approval_id: String,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub turn_id: String,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub reason: String,
-    pub requested_at: UtcMillis,
-    /// 由子代理发起时的代理身份，供审批界面说明是谁在请求；主线请求为空。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<ApprovalRequestAgent>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovalRequestAgent {
-    pub role: String,
-    pub title: String,
-}
-
-impl ApprovalRequestAgent {
-    /// 子代理任务的身份；主线任务返回 `None`。
-    pub fn for_task(task: &magi_core::Task) -> Option<Self> {
-        task.parent_task_id.as_ref()?;
-        Some(Self {
-            role: task
-                .executor_binding_target_role()
-                .unwrap_or("agent")
-                .to_string(),
-            title: task.title.clone(),
-        })
-    }
-}
+pub use magi_session_store::tool_approval::{
+    ApprovalRequestAgent, PendingToolApproval, TOOL_APPROVAL_TTL_MILLIS, ToolApprovalDecision,
+};
 
 /// “本轮允许/拒绝”的作用域：同一会话、同一轮、同一执行者（task）、同一工具与参数。
 ///
@@ -64,6 +18,8 @@ struct SessionToolCallFingerprint {
     task_id: TaskId,
     tool_name: String,
     normalized_arguments: String,
+    execution_root: Option<std::path::PathBuf>,
+    policy_snapshot: Option<String>,
 }
 
 fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToolCallFingerprint {
@@ -74,14 +30,24 @@ fn fingerprint_for(request: &PendingToolApproval, arguments: &str) -> SessionToo
         tool_name: magi_tool_runtime::canonical_builtin_tool_name(&request.tool_name)
             .unwrap_or_else(|| request.tool_name.trim().to_ascii_lowercase()),
         normalized_arguments: crate::tool_result_utils::normalized_tool_arguments(arguments),
+        execution_root: None,
+        policy_snapshot: None,
     }
 }
 
-#[derive(Debug)]
 struct PendingApprovalEntry {
+    store: Option<SessionStore>,
     request: PendingToolApproval,
     fingerprint: SessionToolCallFingerprint,
     decision_tx: mpsc::Sender<ToolApprovalDecision>,
+}
+
+impl std::fmt::Debug for PendingApprovalEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingApprovalEntry")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -113,32 +79,6 @@ pub enum ToolApprovalRequestOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct ToolApprovalRegistry {
     state: Arc<Mutex<ToolApprovalState>>,
-}
-
-pub fn session_turn_is_active(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    turn_id: &str,
-) -> bool {
-    session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| {
-            turn.turn_id == turn_id
-                && matches!(
-                    turn.status.trim().to_ascii_lowercase().as_str(),
-                    "pending"
-                        | "queued"
-                        | "accepted"
-                        | "running"
-                        | "started"
-                        | "streaming"
-                        | "awaiting_approval"
-                        | "review_required"
-                        | "repairing"
-                        | "verifying"
-                )
-        })
 }
 
 impl ToolApprovalRegistry {
@@ -198,12 +138,51 @@ impl ToolApprovalRegistry {
         self.request_with_arguments(request, "")
     }
 
+    #[cfg(test)]
     pub fn request_with_arguments(
         &self,
         request: PendingToolApproval,
         arguments: &str,
     ) -> Result<ToolApprovalRequestOutcome, String> {
-        let fingerprint = fingerprint_for(&request, arguments);
+        self.request_internal(request, arguments, None)
+    }
+
+    /// 外部 MCP 调用由活跃令牌/连接拥有，不可恢复为原生 Task 授权。
+    pub fn request_external_with_arguments(
+        &self,
+        request: PendingToolApproval,
+        arguments: &str,
+    ) -> Result<ToolApprovalRequestOutcome, String> {
+        if !request.task_id.as_str().starts_with("external:")
+            || !request.turn_id.starts_with("external:")
+        {
+            return Err("外部审批需要令牌与调用方的合成身份；原生 Task 必须使用持久入口".into());
+        }
+        self.request_internal(request, arguments, None)
+    }
+
+    pub fn request_persisted(
+        &self,
+        store: &SessionStore,
+        request: PendingToolApproval,
+        arguments: &str,
+        execution_root: Option<std::path::PathBuf>,
+        policy: serde_json::Value,
+    ) -> Result<ToolApprovalRequestOutcome, String> {
+        self.request_internal(request, arguments, Some((store, execution_root, policy)))
+    }
+
+    fn request_internal(
+        &self,
+        request: PendingToolApproval,
+        arguments: &str,
+        journal: Option<(&SessionStore, Option<std::path::PathBuf>, serde_json::Value)>,
+    ) -> Result<ToolApprovalRequestOutcome, String> {
+        let mut fingerprint = fingerprint_for(&request, arguments);
+        if let Some((_, root, policy)) = &journal {
+            fingerprint.execution_root = root.clone();
+            fingerprint.policy_snapshot = Some(policy.to_string());
+        }
         let mut state = self
             .state
             .lock()
@@ -216,6 +195,16 @@ impl ToolApprovalRegistry {
             existing.session_id != fingerprint.session_id || existing.turn_id == fingerprint.turn_id
         });
         if state.turn_tool_grants.contains(&fingerprint) {
+            if let Some((store, root, policy)) = journal {
+                store
+                    .register_tool_approval(
+                        request,
+                        root,
+                        policy,
+                        Some(ToolApprovalDecision::AllowForTurn),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             return Ok(ToolApprovalRequestOutcome::AlreadyAllowed);
         }
         if state.denied_session_tool_calls.contains(&fingerprint) {
@@ -224,10 +213,19 @@ impl ToolApprovalRegistry {
         if state.pending.contains_key(&request.approval_id) {
             return Err(format!("工具授权请求已存在: {}", request.approval_id));
         }
+        let store = if let Some((store, root, policy)) = journal {
+            store
+                .register_tool_approval(request.clone(), root, policy, None)
+                .map_err(|error| error.to_string())?;
+            Some(store.clone())
+        } else {
+            None
+        };
         let (decision_tx, decision_rx) = mpsc::channel();
         state.pending.insert(
             request.approval_id.clone(),
             PendingApprovalEntry {
+                store,
                 request: request.clone(),
                 fingerprint,
                 decision_tx,
@@ -252,7 +250,7 @@ impl ToolApprovalRegistry {
             .lock()
             .map_err(|_| "工具授权状态锁已损坏".to_string())?;
         Self::expire_stale_locked(&mut state, UtcMillis::now());
-        let Some(entry) = state.pending.remove(approval_id) else {
+        let Some(entry) = state.pending.get(approval_id) else {
             if state
                 .expired
                 .contains_key(&(session_id.clone(), approval_id.to_string()))
@@ -262,13 +260,45 @@ impl ToolApprovalRegistry {
             return Err("工具授权请求不存在或已经处理".to_string());
         };
         if entry.request.session_id != *session_id {
-            state.pending.insert(approval_id.to_string(), entry);
             return Err("工具授权请求不属于当前会话".to_string());
         }
-        entry
-            .decision_tx
-            .send(decision)
-            .map_err(|_| "工具授权等待任务已经结束".to_string())?;
+        let matching = state
+            .pending
+            .iter()
+            .filter(|(id, candidate)| {
+                id.as_str() == approval_id
+                    || decision == ToolApprovalDecision::AllowForTurn
+                        && candidate.fingerprint == entry.fingerprint
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if let Some(store) = &entry.store {
+            let durable_ids = matching
+                .iter()
+                .filter(|id| {
+                    state
+                        .pending
+                        .get(*id)
+                        .is_some_and(|entry| entry.store.is_some())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            store
+                .resolve_tool_approvals(session_id, &durable_ids, decision)
+                .map_err(|error| match error {
+                    magi_core::DomainError::Persistence { .. } => {
+                        format!("工具审批持久化失败：{error}")
+                    }
+                    error => error.to_string(),
+                })?;
+        }
+        let entry = state
+            .pending
+            .remove(approval_id)
+            .expect("approval checked above");
+        if entry.decision_tx.send(decision).is_err() && entry.store.is_none() {
+            return Err("工具授权等待任务已经结束".into());
+        }
         if decision == ToolApprovalDecision::Deny {
             state.denied_session_tool_calls.insert(entry.fingerprint);
         } else if decision == ToolApprovalDecision::AllowForTurn {
@@ -292,8 +322,19 @@ impl ToolApprovalRegistry {
     }
 
     pub fn cancel(&self, approval_id: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            state.pending.remove(approval_id);
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.pending.remove(approval_id)
+        {
+            Self::persist_cancel(&entry);
+        }
+    }
+
+    fn persist_cancel(entry: &PendingApprovalEntry) {
+        if let Some(store) = &entry.store
+            && let Err(error) =
+                store.cancel_tool_approval(&entry.request.session_id, &entry.request.approval_id)
+        {
+            tracing::error!(%error,"审批取消事实提交失败");
         }
     }
 
@@ -328,7 +369,12 @@ impl ToolApprovalRegistry {
     pub fn remove_turn(&self, session_id: &SessionId, turn_id: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.pending.retain(|_, entry| {
-                entry.request.session_id != *session_id || entry.request.turn_id != turn_id
+                let keep =
+                    entry.request.session_id != *session_id || entry.request.turn_id != turn_id;
+                if !keep {
+                    Self::persist_cancel(entry);
+                }
+                keep
             });
             state
                 .turn_tool_grants
@@ -348,9 +394,13 @@ impl ToolApprovalRegistry {
     /// 只有新的用户请求开始时，才允许相同调用再次进入授权流程。
     pub fn begin_turn(&self, session_id: &SessionId) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .pending
-                .retain(|_, entry| entry.request.session_id != *session_id);
+            state.pending.retain(|_, entry| {
+                let keep = entry.request.session_id != *session_id;
+                if !keep {
+                    Self::persist_cancel(entry);
+                }
+                keep
+            });
             state
                 .turn_tool_grants
                 .retain(|grant| grant.session_id != *session_id);
@@ -366,7 +416,12 @@ impl ToolApprovalRegistry {
     pub fn remove_task(&self, session_id: &SessionId, task_id: &TaskId) {
         if let Ok(mut state) = self.state.lock() {
             state.pending.retain(|_, entry| {
-                entry.request.session_id != *session_id || entry.request.task_id != *task_id
+                let keep =
+                    entry.request.session_id != *session_id || entry.request.task_id != *task_id;
+                if !keep {
+                    Self::persist_cancel(entry);
+                }
+                keep
             });
             state.expired.retain(|(expired_session, _), entry| {
                 expired_session != session_id || entry.task_id != *task_id
@@ -376,9 +431,13 @@ impl ToolApprovalRegistry {
 
     pub fn remove_session(&self, session_id: &SessionId) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .pending
-                .retain(|_, entry| entry.request.session_id != *session_id);
+            state.pending.retain(|_, entry| {
+                let keep = entry.request.session_id != *session_id;
+                if !keep {
+                    Self::persist_cancel(entry);
+                }
+                keep
+            });
             state
                 .turn_tool_grants
                 .retain(|grant| grant.session_id != *session_id);

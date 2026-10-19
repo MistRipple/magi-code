@@ -83,3 +83,61 @@ await withGoldenViteServer(async (server) => {
 
   console.log('user question golden passed');
 });
+
+globalThis.$state = (value) => value;
+globalThis.$derived = (value) => (typeof value === 'function' ? value() : value);
+globalThis.$derived.by = (fn) => fn();
+
+await withGoldenViteServer(async (server) => {
+  const questions = await server.ssrLoadModule('/src/stores/user-question-store.svelte.ts');
+  const originalFetch = globalThis.fetch;
+  let releaseRead;
+  globalThis.fetch = async (url, init) => {
+    const path = new URL(String(url)).pathname;
+    if (path === '/api/session/user-questions') {
+      return await new Promise((resolve) => {
+        releaseRead = () => resolve(new Response(JSON.stringify({
+          sessionId: 'question-sync-session', pendingQuestions: [{ questionId: 'answered-question' }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      });
+    }
+    if (path === '/api/session/user-question' && init?.method === 'POST') {
+      return new Response(JSON.stringify({ sessionId: 'question-sync-session', questionId: 'answered-question', status: 'resolved' }),
+        { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected user question request: ${url}`);
+  };
+  try {
+    const read = questions.syncUserQuestions('question-sync-session');
+    await questions.resolvePendingUserQuestion('question-sync-session', 'answered-question', { kind: 'skipped' });
+    releaseRead();
+    await read;
+    assert.deepEqual(questions.userQuestionState.pending, [], '答复成功前读取的旧快照不得复活待答问题');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await withGoldenViteServer(async (server) => {
+  const approvals=await server.ssrLoadModule('/src/stores/tool-approval-store.svelte.ts');
+  const originalFetch=globalThis.fetch;
+  let releaseRead;
+  globalThis.fetch=async(url,init)=>{
+    const path=new URL(String(url)).pathname;
+    if(path==='/api/session/tool-approvals')return await new Promise((resolve)=>{
+      releaseRead=()=>resolve(new Response(JSON.stringify({sessionId:'approval-sync-session',pendingApprovals:[{approvalId:'confirmed-approval'}]}),
+        {status:200,headers:{'content-type':'application/json'}}));
+    });
+    if(path==='/api/session/tool-approval' && init?.method==='POST')return new Response(JSON.stringify({sessionId:'approval-sync-session',approvalId:'confirmed-approval',status:'resolved'}),
+      {status:200,headers:{'content-type':'application/json'}});
+    throw new Error(`Unexpected approval request: ${url}`);
+  };
+  try{
+    const read=approvals.syncToolApprovals('approval-sync-session');
+    await approvals.resolvePendingToolApproval('approval-sync-session','confirmed-approval','allow_once');
+    releaseRead();await read;
+    assert.deepEqual(approvals.toolApprovalState.pending,[],'确认审批后旧读取不得复活审批');
+    assert.equal(approvals.toolApprovalState.syncing,false);
+    assert.equal(approvals.toolApprovalState.hydrated,true);
+  }finally{globalThis.fetch=originalFetch;}
+});

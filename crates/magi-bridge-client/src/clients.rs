@@ -192,7 +192,26 @@ impl JsonRpcBridgeServerProbeClient {
 }
 
 impl ModelBridgeClient for JsonRpcModelBridgeClient {
+    fn executor_capabilities(&self) -> crate::ExecutorCapabilities {
+        // 本地 JSON-RPC shim 只用于探测和冒烟：仅接受文本 prompt，不流式输出，
+        // 也不执行 Magi 工具调用。这里误报 native profile 会让能力预检错误地
+        // 宣称支持工具和 checkpoint 恢复。
+        crate::text_executor_capabilities()
+    }
+
     fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
+        crate::validate_executor_request(&self.executor_capabilities(), &request)?;
+        if request
+            .messages
+            .as_ref()
+            .is_some_and(|messages| !messages.is_empty())
+        {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32096),
+                message: "executor_message_history_unsupported: JSON-RPC 探测桥只转发 prompt，不支持对话历史；调用尚未发送".into(),
+            });
+        }
         let params = serde_json::to_value(request).map_err(|error| {
             protocol_call_failed(format!("serialize model request failed: {error}"))
         })?;
@@ -203,6 +222,8 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
                 params,
             })
             .map_err(transport_call_failed)?;
+        // 探测端保留可解码的异常响应供诊断；业务使用方由
+        // BridgeDispatchRuntime / StepModelClient 在交付结果前校验响应合同。
         serde_json::from_value(response.payload)
             .map_err(|error| protocol_call_failed(format!("decode model response failed: {error}")))
     }

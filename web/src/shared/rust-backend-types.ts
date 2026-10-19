@@ -2,7 +2,7 @@
 // Source of truth for all DTO types returned by the Rust daemon HTTP API.
 // Formerly maintained in support/frontend-contract/src/contracts.ts.
 
-import type { PluginSelection } from './app-server-protocol.generated';
+import type { AgentContinueParams, AgentTransferParams, AgentTransferTarget, PluginSelection, QueuedSessionTurn, SessionQueueSnapshot } from './app-server-protocol.generated';
 import type { ModelApiProtocol } from './types/agent-types';
 
 export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'System';
@@ -134,75 +134,8 @@ export interface SessionTurnResponseDto {
   steeredTurnId?: string | null;
 }
 
-export interface QueuedSessionTurnDto {
-  queueId: string;
-  queuePosition: number;
-  requestId?: string | null;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath?: string | null;
-  acceptedAt: number;
-  content: string;
-  text?: string | null;
-  command: 'compact' | null;
-  workflowId?: string | null;
-  pluginCommandId?: string | null;
-  skillName?: string | null;
-  goalMode: boolean;
-  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
-  images: SessionTurnImageDto[];
-  contextReferences: Array<{
-    kind: 'file' | 'directory';
-    path: string;
-    pathRef?: string;
-    name: string;
-  }>;
-  browserAnnotationRefs: string[];
-  browserNodeSelections: SessionBrowserNodeSelectionDto[];
-  pluginSelections: PluginSelection[];
-  canGuide: boolean;
-  retryCount: number;
-}
-
-export interface SessionTurnQueueResponseDto {
-  sessionId: string;
-  queuedTurns: QueuedSessionTurnDto[];
-}
-
-export interface TaskInterruptResponseDto {
-  interrupted: boolean;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  rootTaskId: string;
-  eventId: string;
-  requestedAt: number;
-}
-
-export interface TaskRestartResponseDto {
-  restarted: boolean;
-  sessionId: string;
-  entryId: string;
-  eventId: string;
-  acceptedAt: number;
-  createdSession: boolean;
-  rootTaskId: string;
-  actionTaskId: string;
-  executionChainRef?: string | null;
-  requestedAt: number;
-  workspaceId: string;
-  workspacePath: string;
-}
-
-export interface TaskArchiveResponseDto {
-  archived: boolean;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  rootTaskId: string;
-  eventId: string;
-  requestedAt: number;
-}
+export type QueuedSessionTurnDto = QueuedSessionTurn;
+export type SessionTurnQueueResponseDto = SessionQueueSnapshot;
 
 export interface SessionInterruptRequestDto {
   workspaceId: string;
@@ -210,47 +143,15 @@ export interface SessionInterruptRequestDto {
   sessionId: string;
 }
 
-export interface SessionInterruptResponseDto {
-  interrupted: boolean;
-  sessionId: string;
-  workspaceId?: string | null;
-  turnId?: string | null;
-  eventId: string;
-  requestedAt: number;
-  remainingQueuedTurnCount: number;
-  nextQueuedTurnStarted: boolean;
-  removedTimelineEntryIds: string[];
-}
+export type SessionInterruptResponseDto = import('./app-server-protocol.generated').TurnInterruptResult;
 
-export type ToolApprovalDecision = 'allow_once' | 'allow_for_turn' | 'deny';
+export type ToolApprovalDecision = import('./app-server-protocol.generated').ToolApprovalDecision;
 
-export interface PendingToolApprovalDto {
-  approvalId: string;
-  sessionId: string;
-  taskId: string;
-  turnId: string;
-  toolCallId: string;
-  toolName: string;
-  reason: string;
-  requestedAt: number;
-  /** 由子代理发起时的代理身份；主线请求不返回该字段。 */
-  agent?: { role: string; title: string } | null;
-}
+export type PendingToolApprovalDto = import('./app-server-protocol.generated').PendingToolApproval;
 
-export interface SessionToolApprovalRequestDto {
-  sessionId: string;
-  workspaceId?: string | null;
-  workspacePath?: string | null;
-  approvalId: string;
-  decision: ToolApprovalDecision;
-}
+export type SessionToolApprovalRequestDto = import('./app-server-protocol.generated').ResolveToolApprovalParams;
 
-export interface SessionToolApprovalResponseDto {
-  sessionId: string;
-  approvalId: string;
-  decision: ToolApprovalDecision;
-  status: 'resolved';
-}
+export type SessionToolApprovalResponseDto = import('./app-server-protocol.generated').ResolveToolApprovalResult;
 
 export interface SessionToolApprovalsResponseDto {
   sessionId: string;
@@ -268,45 +169,20 @@ export interface SkillDetailDto {
 }
 
 /** 模型通过 `ask_user_question` 向用户提出的一道选择题。“其他”由界面固定追加，不在 options 里。 */
-export interface UserQuestionDto {
-  question: string;
-  header: string;
-  multiSelect: boolean;
-  /** 页面卡片只展示它实际支持的输入；模型提问默认允许。 */
-  allowOther?: boolean;
-  options: Array<{ label: string; description?: string }>;
-}
+export type UserQuestionDto = import('./app-server-protocol.generated').UserQuestion;
 
-export interface PendingUserQuestionDto {
-  questionId: string;
-  sessionId: string;
-  taskId: string | null;
-  turnId: string;
-  toolCallId: string;
-  questions: UserQuestionDto[];
-  requestedAt: number;
-  canSkip?: boolean;
-}
+export type PendingUserQuestionDto = import('./app-server-protocol.generated').PendingUserQuestion;
 
-export interface UserQuestionAnswerDto {
-  selected: string[];
-  other?: string;
-}
+export type UserQuestionAnswerDto = import('./app-server-protocol.generated').UserQuestionAnswer;
 
-export type UserQuestionResponseDto =
-  | { kind: 'answered'; answers: UserQuestionAnswerDto[] }
-  | { kind: 'skipped' };
+export type UserQuestionResponseDto = import('./app-server-protocol.generated').UserQuestionResponse;
 
 export interface SessionUserQuestionsResponseDto {
   sessionId: string;
   pendingQuestions: PendingUserQuestionDto[];
 }
 
-export interface SessionUserQuestionResponseDto {
-  sessionId: string;
-  questionId: string;
-  status: string;
-}
+export type SessionUserQuestionResponseDto = import('./app-server-protocol.generated').ResolveUserQuestionResult;
 
 /** 会话为什么运行在隔离副本里：用户主动选择，或提交时主工作区正被另一个会话使用而自动隔离。 */
 export type SessionIsolationOriginDto =
@@ -1753,96 +1629,26 @@ export interface AgentProjectionResultDto {
   truncated: boolean;
 }
 
-export type GoalStatus =
-  | 'active'
-  | 'paused'
-  | 'blocked'
-  | 'usage_limited'
-  | 'budget_limited'
-  | 'complete';
+export type GoalStatus = import('./app-server-protocol.generated').GoalStatus;
 
-export interface GoalBlockerDto {
-  blockerKey: string;
-  reason: string;
-  consecutiveTurns: number;
-  lastObservedTurnId: string;
-}
+export type GoalBlockerDto = import('./app-server-protocol.generated').GoalBlocker;
 
-export interface GoalContinuationDto {
-  phase: 'idle' | 'running' | 'waiting';
-  turnId?: string | null;
-  reason?: string | null;
-}
+export type GoalContinuationDto = import('./app-server-protocol.generated').GoalContinuation;
 
-export interface GoalCompletionDto {
-  turnId: string;
-  summary: string;
-  planRevision?: number | null;
-  evidenceRefs: string[];
-  completedAt: number;
-}
+export type GoalCompletionDto = import('./app-server-protocol.generated').GoalCompletion;
 
-export interface SessionGoalDto {
-  goalId: string;
-  sessionId: string;
-  threadId: string;
-  createdByTurnId?: string | null;
-  objective: string;
-  status: GoalStatus;
-  controlRevision: number;
-  accessProfile: 'read_only' | 'restricted' | 'full_access';
-  tokenBudget?: number | null;
-  tokensUsed: number;
-  timeUsedSeconds: number;
-  timeUsedMillis?: number;
-  timingStartedAt?: number | null;
-  timingTurnId?: string | null;
-  blocker?: GoalBlockerDto | null;
-  continuation: GoalContinuationDto;
-  completion?: GoalCompletionDto | null;
-  createdAt: number;
-  updatedAt: number;
-}
+export type SessionGoalDto = import('./app-server-protocol.generated').SessionGoal;
 
-export type PlanItemStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'canceled';
-export type PlanState = 'active' | 'paused' | 'completed' | 'canceled';
+export type PlanItemStatus = import('./app-server-protocol.generated').PlanItemStatus;
+export type PlanState = import('./app-server-protocol.generated').PlanState;
 
-export interface PlanItemDto {
-  itemId: string;
-  title: string;
-  status: PlanItemStatus;
-}
+export type PlanItemDto = import('./app-server-protocol.generated').PlanItem;
 
-export interface SessionPlanDto {
-  planId: string;
-  sessionId: string;
-  goalId?: string | null;
-  revision: number;
-  language: string;
-  state: PlanState;
-  items: PlanItemDto[];
-  /** 当前正在执行各计划项的任务；任务结束后绑定移除。 */
-  taskBindings: Record<string, string>;
-  updatedAt: number;
-}
+export type SessionPlanDto = import('./app-server-protocol.generated').SessionPlan;
 
-export interface CurrentGoalResponseDto {
-  sessionId: string;
-  workspaceId: string | null;
-  workspacePath: string | null;
-  observedAt: number;
-  goal?: SessionGoalDto | null;
-  plan?: SessionPlanDto | null;
-  allowedActions: GoalAllowedActionsDto;
-}
+export type CurrentGoalResponseDto = import('./app-server-protocol.generated').GoalSnapshot;
 
-export interface GoalAllowedActionsDto {
-  canEdit: boolean;
-  canPause: boolean;
-  canResume: boolean;
-  canClear: boolean;
-  requiresBudgetIncrease: boolean;
-}
+export type GoalAllowedActionsDto = import('./app-server-protocol.generated').GoalAllowedActions;
 
 export interface GoalActionRequestDto {
   sessionId: string;
@@ -1852,23 +1658,14 @@ export interface GoalActionRequestDto {
   goalId: string;
   expectedRevision: number;
   expectedPlanRevision?: number;
-  newTokenBudget?: number;
   accessProfile?: 'read_only' | 'restricted' | 'full_access';
 }
 
-export interface GoalUpdateRequestDto extends GoalActionRequestDto {
+export interface GoalUpdateRequestDto extends Omit<GoalActionRequestDto, 'accessProfile'> {
   objective: string;
 }
 
-export interface GoalMutationResponseDto {
-  sessionId: string;
-  workspaceId: string | null;
-  workspacePath: string | null;
-  observedAt: number;
-  goal?: SessionGoalDto | null;
-  plan?: SessionPlanDto | null;
-  allowedActions: GoalAllowedActionsDto;
-}
+export type GoalMutationResponseDto = import('./app-server-protocol.generated').GoalSnapshot;
 
 export interface AgentProjectionDto {
   agentRunId: string;
@@ -1902,6 +1699,12 @@ export interface AgentProjectionDto {
   responseDurationMs?: number | null;
   updatedAt: number;
   result?: AgentProjectionResultDto | null;
+  /** daemon 核对后的完整命令；客户端只提交，不从 lifetime 或状态生成权限。 */
+  transferRequest?: AgentTransferParams | null;
+  continueRequest?: AgentContinueParams | null;
+  continueUnavailableReason?: string | null;
+  executionOwner?: AgentTransferTarget | null;
+  transferUnavailableReason?: string | null;
 }
 
 export type AgentRunOutcome =

@@ -15,8 +15,8 @@ use crate::{
     },
     prompt_utils::{
         CURRENT_TASK_PRIORITY_NOTE, PromptFragmentKind, REFERENCE_CONTEXT_PRIORITY_NOTE,
-        compose_developer_instructions, render_safeguard_prompt, root_multi_agent_mode_prompt,
-        runtime_context_message, subagent_multi_agent_mode_prompt, user_rules_from_settings,
+        compose_developer_instructions, render_safeguard_prompt, runtime_context_message,
+        user_rules_from_settings,
     },
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
@@ -30,10 +30,14 @@ use crate::{
     skill_apply_tool_definition,
     task_completion_notifier::TaskCompletionNotifier,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
-    task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
+    task_helpers::{
+        enforce_agent_coordination_surface, task_can_see_builtin_tool, task_is_coordinator,
+        task_role_id,
+    },
+    task_runner_bridge::{TaskCompletionSink, TaskDispatcher, TaskOutcome, TaskResult},
     tool_surface_state::{
-        RefreshLiveMcpToolDefinitionsInput, refresh_live_mcp_tool_definitions_with_mode,
+        RefreshLiveMcpToolDefinitionsInput, constrain_task_tool_definitions,
+        refresh_live_mcp_tool_definitions_with_mode,
     },
     usage_recording::{
         AuxiliaryModelUsageContext, ModelUsageBinding, invoke_auxiliary_model_with_usage,
@@ -50,8 +54,8 @@ use magi_context_runtime::{
     KnowledgeContextSelection, RecentTurnSource,
 };
 use magi_core::{
-    AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
-    WorkerId, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
+    AccessProfile, EventId, LeaseId, SessionId, TaskId, TaskKind, UtcMillis, WorkerId, WorkspaceId,
+    estimate_text_tokens, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -70,7 +74,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 #[cfg(test)]
@@ -85,11 +89,117 @@ pub struct ExecutionPipeline {
     pub memory_store: MemoryStore,
 }
 
+/// 在首次本地工具调用前准备会话资源。实现由 daemon 的应用层注入；运行时不复制
+/// Git 基线、执行租约或变更账本的所有权。
+pub type WorkspaceExecutionPreparer = dyn Fn(
+        &SessionId,
+        &Option<WorkspaceId>,
+        &str,
+    ) -> Result<Option<Arc<magi_snapshot::SnapshotSession>>, String>
+    + Send
+    + Sync;
+
+fn tool_requires_workspace_execution_preparation(name: &str, arguments: &str) -> bool {
+    BuiltinToolName::from_name(name)
+        .map(|tool| tool.requires_workspace_execution_preparation(arguments))
+        // MCP 持有自己的执行环境；Skill 发现只加载说明，不执行 handler。
+        // 其余 Skill handler / 插件可能访问文件或进程，按本地执行准备。
+        .unwrap_or_else(|| name != SKILL_APPLY_TOOL_NAME && !name.starts_with("mcp__"))
+}
+
+/// 主线读取共享目录无需扫描；子代理首次访问本地事实前必须分配隔离目录。
+pub(crate) fn tool_requires_execution_resources(
+    name: &str,
+    arguments: &str,
+    is_sidechain: bool,
+) -> bool {
+    if BuiltinToolName::from_name(name)
+        .is_some_and(|tool| tool.is_background_process_observation(arguments))
+    {
+        return false;
+    }
+    tool_requires_workspace_execution_preparation(name, arguments)
+        || (is_sidechain
+            && BuiltinToolName::from_name(name)
+                .is_some_and(|tool| tool.requires_workspace_context()))
+}
+
+/// 模型请求在目录分配前生成，绝对路径不能静默继续指向旧工作区。
+/// 检查解码后的参数，兼容 Windows 反斜杠；新目录位于旧目录内时允许引用新目录。
+pub(crate) fn arguments_reference_retired_root(
+    tool_name: &str,
+    arguments: &str,
+    retired: &std::path::Path,
+    current: Option<&std::path::Path>,
+) -> bool {
+    let retired_path = magi_tool_runtime::canonicalize_tool_permission_path(retired);
+    let current_path = current.map(magi_tool_runtime::canonicalize_tool_permission_path);
+    if current_path.as_ref() == Some(&retired_path) {
+        return false;
+    }
+    if magi_tool_runtime::tool_path_access_requests(
+        tool_name,
+        arguments,
+        current,
+        AccessProfile::FullAccess,
+    )
+    .iter()
+    .any(|request| {
+        let path = magi_tool_runtime::canonicalize_tool_permission_path(&request.absolute_path);
+        path.starts_with(&retired_path)
+            && !current_path
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+    }) {
+        return true;
+    }
+    fn references(value: &serde_json::Value, retired: &str, current: Option<&str>) -> bool {
+        match value {
+            serde_json::Value::String(value) => {
+                let text_reference = current
+                    .map(|current| value.replace(current, ""))
+                    .unwrap_or_else(|| value.clone())
+                    .contains(retired);
+                let path_reference = std::path::Path::new(value).is_absolute() && {
+                    let path = magi_tool_runtime::canonicalize_tool_permission_path(
+                        std::path::Path::new(value),
+                    );
+                    let retired = magi_tool_runtime::canonicalize_tool_permission_path(
+                        std::path::Path::new(retired),
+                    );
+                    path.starts_with(retired)
+                        && !current.is_some_and(|current| {
+                            path.starts_with(magi_tool_runtime::canonicalize_tool_permission_path(
+                                std::path::Path::new(current),
+                            ))
+                        })
+                };
+                text_reference || path_reference
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| references(value, retired, current)),
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(|value| references(value, retired, current)),
+            _ => false,
+        }
+    }
+    let retired = retired.to_string_lossy();
+    let current = current.map(|root| root.to_string_lossy());
+    serde_json::from_str(arguments)
+        .is_ok_and(|value| references(&value, &retired, current.as_deref()))
+}
+
 /// 插件命令不依赖模型配置，但 conversation 执行合同仍要求携带一个 client。
 /// 这个占位 client 只会在插件命令已经在执行入口短路时传入，任何模型调用都会显式失败。
 struct PluginCommandPlaceholderClient;
 
 impl ModelBridgeClient for PluginCommandPlaceholderClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::text_executor_capabilities()
+    }
+
     fn invoke(&self, _request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
         Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Protocol,
@@ -128,7 +238,6 @@ struct DispatchPlanExecutionInput<'a> {
     turn_id: String,
     workspace_id: Option<WorkspaceId>,
     execution_root: Option<PathBuf>,
-    ownership: ExecutionOwnership,
     writebacks: ExecutionWritebackPlans,
     use_tools: bool,
     skill_name: Option<String>,
@@ -167,7 +276,7 @@ pub struct LlmTaskDispatcher {
     pipeline: ExecutionPipeline,
     session_store: Arc<SessionStore>,
     execution_registry: TaskExecutionRegistry,
-    result_receiver: Arc<EventBasedResultReceiver>,
+    completion_sink: Arc<dyn TaskCompletionSink>,
     completion_notifier: Option<Arc<TaskCompletionNotifier>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     /// Web 引擎（GPT Web）的 client 工厂，由 daemon 装配宿主实现。
@@ -179,12 +288,10 @@ pub struct LlmTaskDispatcher {
     /// 按设置事实源代际复用角色模型客户端。HTTP 连接池由 bridge-client 继续统一持有，
     /// 这里只避免每个 Turn 重复解析配置和构造同一角色包装器。
     model_client_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelBridgeClient>>>>,
-    /// 内置工具和 skill schema 在 daemon 生命周期内稳定；MCP 与浏览器能力仍在
-    /// 每轮通过 live refresh 更新，不进入该缓存。
-    tool_definition_cache: Arc<Mutex<HashMap<String, Vec<ChatToolDefinition>>>>,
     /// 按 root task 统计尚未退出的异步 dispatch。Runner 重启必须等待这里的计数
     /// 归零，不能只等待 Runner 自身循环结束。
     dispatch_quiesce: Arc<DispatchQuiesceState>,
+    conversation_quiesce: Arc<DispatchQuiesceState>,
     knowledge_store: Option<Arc<KnowledgeStore>>,
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     session_state_persist_callback: Option<Arc<SessionStatePersistCallback>>,
@@ -203,7 +310,8 @@ pub struct LlmTaskDispatcher {
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
-    /// 任务系统：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
+    workspace_execution_preparer: Option<Arc<WorkspaceExecutionPreparer>>,
+    /// 主线和子代理共用的运行时输入与交互投递入口，不持有独立 Turn 状态。
     conversation_registry: Arc<ConversationRegistry>,
     /// 任务系统：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
     agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
@@ -218,27 +326,39 @@ pub struct LlmTaskDispatcher {
 pub struct LlmTaskDispatcherDependencies {
     pub session_store: Arc<SessionStore>,
     pub execution_registry: TaskExecutionRegistry,
-    pub result_receiver: Arc<EventBasedResultReceiver>,
+    pub completion_sink: Arc<dyn TaskCompletionSink>,
     pub conversation_registry: Arc<ConversationRegistry>,
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
 }
 
 #[derive(Default)]
 struct DispatchQuiesceState {
-    in_flight: Mutex<HashMap<TaskId, usize>>,
+    in_flight: Mutex<HashMap<(TaskId, TaskId), usize>>,
     notify: tokio::sync::Notify,
+    idle: Condvar,
 }
 
 impl DispatchQuiesceState {
     fn begin(self: &Arc<Self>, root_task_id: TaskId) -> InFlightDispatchGuard {
+        self.begin_task(root_task_id.clone(), root_task_id)
+    }
+
+    fn begin_task(
+        self: &Arc<Self>,
+        root_task_id: TaskId,
+        task_id: TaskId,
+    ) -> InFlightDispatchGuard {
         let mut in_flight = self
             .in_flight
             .lock()
             .expect("dispatch quiesce lock poisoned");
-        *in_flight.entry(root_task_id.clone()).or_default() += 1;
+        *in_flight
+            .entry((root_task_id.clone(), task_id.clone()))
+            .or_default() += 1;
         InFlightDispatchGuard {
             state: Arc::clone(self),
             root_task_id,
+            task_id,
         }
     }
 
@@ -250,29 +370,78 @@ impl DispatchQuiesceState {
                 .in_flight
                 .lock()
                 .expect("dispatch quiesce lock poisoned")
-                .get(root_task_id)
-                .copied()
-                .unwrap_or(0);
-            if active == 0 {
+                .keys()
+                .any(|(root, _)| root == root_task_id);
+            if !active {
                 return;
             }
             notified.await;
         }
     }
 
-    fn finish(&self, root_task_id: &TaskId) {
+    async fn wait_for_execution_scope(
+        &self,
+        store: &magi_orchestrator::task_store::TaskStore,
+        scope: &TaskId,
+    ) {
+        let audit_root = store
+            .get_task(scope)
+            .map_or_else(|| scope.clone(), |task| task.root_task_id);
+        loop {
+            let notified = self.notify.notified();
+            let ownership_changed = store.runtime_change_notification();
+            let active = self
+                .in_flight
+                .lock()
+                .expect("dispatch quiesce lock poisoned")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            // 不持有登记锁查询 TaskStore。来源缺失或损坏时保守等待原审计树，
+            // 不能把查询失败误当作已转交或资源已经退出。
+            if !active.iter().any(|(root, task)| {
+                store
+                    .execution_scope_root(task)
+                    .map_or(root == &audit_root, |owner| owner == *scope)
+            }) {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = ownership_changed => {},
+            }
+        }
+    }
+
+    fn wait_for_tasks_blocking(&self, task_ids: &[TaskId], timeout: std::time::Duration) -> bool {
+        let in_flight = self
+            .in_flight
+            .lock()
+            .expect("dispatch quiesce lock poisoned");
+        let (in_flight, _) = self
+            .idle
+            .wait_timeout_while(in_flight, timeout, |active| {
+                active.keys().any(|(_, task)| task_ids.contains(task))
+            })
+            .expect("dispatch quiesce wait poisoned");
+        !in_flight.keys().any(|(_, task)| task_ids.contains(task))
+    }
+
+    fn finish(&self, root_task_id: &TaskId, task_id: &TaskId) {
         let mut in_flight = self
             .in_flight
             .lock()
             .expect("dispatch quiesce lock poisoned");
-        if let Some(count) = in_flight.get_mut(root_task_id) {
+        let key = (root_task_id.clone(), task_id.clone());
+        if let Some(count) = in_flight.get_mut(&key) {
             if *count <= 1 {
-                in_flight.remove(root_task_id);
+                in_flight.remove(&key);
             } else {
                 *count -= 1;
             }
         }
         drop(in_flight);
+        self.idle.notify_all();
         self.notify.notify_waiters();
     }
 }
@@ -280,11 +449,17 @@ impl DispatchQuiesceState {
 struct InFlightDispatchGuard {
     state: Arc<DispatchQuiesceState>,
     root_task_id: TaskId,
+    task_id: TaskId,
+}
+
+/// 纯 Conversation 的租期不包含等待会话锁的终态回调。
+pub struct ConversationTurnActivityGuard {
+    _inner: InFlightDispatchGuard,
 }
 
 impl Drop for InFlightDispatchGuard {
     fn drop(&mut self) {
-        self.state.finish(&self.root_task_id);
+        self.state.finish(&self.root_task_id, &self.task_id);
     }
 }
 
@@ -602,6 +777,149 @@ fn refresh_file_summary_projection(
 }
 
 impl LlmTaskDispatcher {
+    /// 显式转交是资源交接边界：在原父 Turn 仍有效时，为转交根冻结其独立
+    /// worktree。仍复用首次本地执行的唯一准备入口，不创建新 Task/lease。
+    /// 转交后首次工具或孙代理沿该副本准备，不再获取主线执行租约。
+    pub fn prepare_agent_run_transfer_resources(
+        &self,
+        task_id: &TaskId,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Result<(), String> {
+        let store = self.pipeline.execution_runtime.task_store();
+        let task = store.get_task(task_id).ok_or("转交代理不存在")?;
+        let lease = store
+            .get_active_lease(task_id)
+            .ok_or("转交代理没有活动执行租约")?;
+        if task
+            .policy_snapshot
+            .as_ref()
+            .is_some_and(|policy| policy.command_mode == "no_tools")
+        {
+            return Ok(());
+        }
+        let root = self.resolve_workspace_root_path(session_id, workspace_id);
+        self.prepare_task_workspace_execution(
+            &task,
+            &lease.lease_id,
+            session_id,
+            workspace_id,
+            root.as_ref(),
+            true,
+            Some(&lease.worker_id),
+        )?;
+        Ok(())
+    }
+
+    fn prepare_workspace_execution(
+        &self,
+        task_id: &TaskId,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Result<Option<Arc<magi_snapshot::SnapshotSession>>, String> {
+        let Some(prepare) = self.workspace_execution_preparer.as_ref() else {
+            return Ok(None);
+        };
+        let turn_id = self
+            .execution_registry
+            .turn_id(task_id)
+            .ok_or_else(|| "准备执行资源时缺少 Turn 身份".to_string())?;
+        let mut source = turn_id;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(binding) = self
+            .session_store
+            .canonical_turn_for_session_turn_id(session_id, &source)
+            .and_then(|turn| turn.agent_turn_binding().ok().flatten())
+        {
+            if !seen.insert(source.clone()) {
+                return Err("Agent Turn 来源链循环".into());
+            }
+            source = binding.parent_turn_id;
+        }
+        prepare(session_id, workspace_id, &source)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_task_workspace_execution(
+        &self,
+        task: &magi_core::Task,
+        lease_id: &LeaseId,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        execution_root: Option<&PathBuf>,
+        is_sidechain: bool,
+        worker_id: Option<&WorkerId>,
+    ) -> Result<conversation_loop::PreparedWorkspaceExecution, String> {
+        let execution_guard = crate::task_execution_guard::TaskExecutionGuard::new(
+            self.pipeline.execution_runtime.task_store(),
+            &self.session_store,
+            &self.execution_registry,
+            session_id,
+            &task.task_id,
+            lease_id,
+        );
+        let execution_is_active = || execution_guard.is_active();
+        if !execution_is_active() {
+            return Err("准备执行资源前任务租约已失效".into());
+        }
+        // 仓库准备可能等另一个任务释放资源，不能同时占住它继续执行所需的模型名额。
+        let waiting = self
+            .execution_registry
+            .execution_admission()
+            .suspend_while_waiting(&task.task_id);
+        let prepared = (|| -> Result<conversation_loop::PreparedWorkspaceExecution, String> {
+            let identity_root = workspace_id
+                .as_ref()
+                .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
+            let transferred = self
+                .pipeline
+                .execution_runtime
+                .task_store()
+                .agent_run_transfer_for_task(&task.task_id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let snapshot = if transferred {
+                // 转交根的独立副本已在交接前准备；嵌套任务从直接父副本出发。
+                // 主线可能已结束或换到下一轮，不能再准备/改动它的工作区状态。
+                None
+            } else {
+                self.prepare_workspace_execution(&task.task_id, session_id, workspace_id)?
+            };
+            let main_root = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.workspace_root().to_path_buf());
+            if !execution_is_active() {
+                return Err("准备执行资源期间任务或父 Turn 已停止".into());
+            }
+            let root = self.resolve_task_execution_root(
+                task,
+                lease_id,
+                session_id,
+                workspace_id,
+                main_root.as_ref().or(execution_root),
+                is_sidechain,
+                worker_id,
+            )?;
+            if !execution_is_active() {
+                return Err("准备执行资源期间任务租约已失效".into());
+            }
+            Ok(conversation_loop::PreparedWorkspaceExecution {
+                task: Self::task_for_execution_root(task, identity_root.as_ref(), root.as_ref()),
+                // Git 子代理的变更属于代理分支；不能让其相对路径写入主会话账本。
+                snapshot: snapshot
+                    .filter(|snapshot| root.as_deref() == Some(snapshot.workspace_root())),
+                root,
+            })
+        })();
+        if waiting
+            .as_ref()
+            .is_some_and(|guard| !guard.resume(execution_is_active))
+        {
+            return Err("准备执行资源后任务已停止，未取得执行名额".into());
+        }
+        prepared
+    }
+
     pub fn new(
         event_bus: Arc<InMemoryEventBus>,
         pipeline: ExecutionPipeline,
@@ -611,7 +929,7 @@ impl LlmTaskDispatcher {
         let LlmTaskDispatcherDependencies {
             session_store,
             execution_registry,
-            result_receiver,
+            completion_sink,
             conversation_registry,
             agent_role_registry,
         } = dependencies;
@@ -620,15 +938,15 @@ impl LlmTaskDispatcher {
             pipeline,
             session_store,
             execution_registry,
-            result_receiver,
+            completion_sink,
             completion_notifier: None,
             model_bridge_client: None,
             session_engine_factory: None,
             workflow_core_factory: None,
             plugin_command_executor: None,
             model_client_cache: Arc::new(Mutex::new(HashMap::new())),
-            tool_definition_cache: Arc::new(Mutex::new(HashMap::new())),
             dispatch_quiesce: Arc::new(DispatchQuiesceState::default()),
+            conversation_quiesce: Arc::new(DispatchQuiesceState::default()),
             knowledge_store: None,
             knowledge_persist_callback: None,
             session_state_persist_callback: None,
@@ -644,6 +962,7 @@ impl LlmTaskDispatcher {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             snapshot_manager: None,
+            workspace_execution_preparer: None,
             conversation_registry,
             agent_role_registry,
             project_memory_registry: Arc::new(
@@ -693,9 +1012,10 @@ impl LlmTaskDispatcher {
         factory.build_workflow_core(spec)
     }
 
-    /// 配置主动 Task 完成通知。生产 daemon 在 Worker 结果到达时先提交 TaskStore，
-    /// 再由该通知器唤醒 Turn 侧；未配置时仅保留测试用的结果接收器。
+    /// 绑定 Task/Turn 来源与完成交付到同一通知器；结果直接提交 TaskStore，
+    /// 再唤醒 Turn 侧，不经内存结果队列或 Runner 轮询。
     pub fn with_completion_notifier(mut self, notifier: Arc<TaskCompletionNotifier>) -> Self {
+        self.completion_sink = notifier.clone();
         self.completion_notifier = Some(notifier);
         self
     }
@@ -771,16 +1091,26 @@ impl LlmTaskDispatcher {
         self
     }
 
-    fn resolve_registered_skill_id(&self, requested: Option<&str>) -> Option<String> {
-        let requested = requested?.trim();
-        if requested.is_empty() {
-            return None;
-        }
-        let runtime = self.skill_runtime.as_ref()?;
+    fn resolve_registered_skill_id(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let unavailable = || {
+            format!(
+                "skill_unavailable: 已选择的 Skill {requested} 当前不可用，请重新选择有效 Skill"
+            )
+        };
+        let runtime = self.skill_runtime.as_ref().ok_or_else(unavailable)?;
         match runtime.registry().resolve_skill_id(requested) {
-            magi_skill_runtime::SkillIdResolution::Found(skill_id) => Some(skill_id),
-            magi_skill_runtime::SkillIdResolution::NotFound
-            | magi_skill_runtime::SkillIdResolution::Ambiguous(_) => None,
+            magi_skill_runtime::SkillIdResolution::Found(skill_id) => Ok(Some(skill_id)),
+            // 配置撤销不能降级成无 Skill 的全工具执行。
+            magi_skill_runtime::SkillIdResolution::NotFound => Err(unavailable()),
+            magi_skill_runtime::SkillIdResolution::Ambiguous(_) => Err(format!(
+                "skill_ambiguous: 已选择的 Skill {requested} 名称不唯一，请选择完整 Skill ID"
+            )),
         }
     }
 
@@ -794,6 +1124,14 @@ impl LlmTaskDispatcher {
 
     pub fn with_snapshot_manager(mut self, manager: Arc<magi_snapshot::SnapshotManager>) -> Self {
         self.snapshot_manager = Some(manager);
+        self
+    }
+
+    pub fn with_workspace_execution_preparer(
+        mut self,
+        prepare: Arc<WorkspaceExecutionPreparer>,
+    ) -> Self {
+        self.workspace_execution_preparer = Some(prepare);
         self
     }
 
@@ -843,8 +1181,8 @@ impl LlmTaskDispatcher {
         let _ = self.event_bus.publish(event);
     }
 
-    fn push_result(&self, task_id: &TaskId, lease_id: &LeaseId, outcome: TaskOutcome) {
-        self.result_receiver.push_result(TaskResult {
+    fn notify_task_result(&self, task_id: &TaskId, lease_id: &LeaseId, outcome: TaskOutcome) {
+        self.completion_sink.notify(TaskResult {
             task_id: task_id.clone(),
             lease_id: lease_id.clone(),
             outcome,
@@ -859,7 +1197,6 @@ impl LlmTaskDispatcher {
             turn_id,
             workspace_id,
             execution_root,
-            ownership,
             writebacks,
             use_tools,
             skill_name,
@@ -899,9 +1236,17 @@ impl LlmTaskDispatcher {
             system_prompt,
             execution_settings_snapshot: execution_settings_snapshot.clone(),
         });
+        // canonical 取消先于 TaskStore 的级联清理提交。Guard 会立即让执行退出，
+        // 这份回执必须保留取消语义，不能抢先把仍持有旧租约的 Task 写成 Failed。
+        if self
+            .session_store
+            .turn_execution_was_cancelled(&session_id, &turn_id)
+        {
+            outcome = TaskOutcome::Cancelled;
+        }
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
-            self.session_store
-                .bind_execution_ownership(session_id.clone(), ownership);
+            // Session ownership 已随主线接纳/恢复提交。完成只写回原 Task/Turn，
+            // 不用旧执行计划覆盖当前主线或已归档的 Session 归属。
             let should_enrich_session = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
@@ -1346,43 +1691,31 @@ impl LlmTaskDispatcher {
         access_profile: AccessProfile,
         workspace_id: Option<&WorkspaceId>,
     ) -> Vec<ChatToolDefinition> {
-        let cache_key = tool_definition_cache_key(task, skill_name, access_profile, workspace_id);
-        let cached_definitions = self
-            .tool_definition_cache
-            .lock()
-            .expect("tool definition cache lock poisoned")
-            .get(&cache_key)
-            .cloned();
-        let definitions = if let Some(definitions) = cached_definitions {
-            definitions
-        } else {
-            let definitions =
-                self.build_base_tool_definitions(task, skill_name, access_profile, workspace_id);
-            self.tool_definition_cache
-                .lock()
-                .expect("tool definition cache lock poisoned")
-                .insert(cache_key, definitions.clone());
-            definitions
-        };
+        // Skill 内容、可选清单与宿主能力均可热更新，名称与 Task 策略不足以
+        // 标识目录版本；每次从权威注册状态生成，避免发布旧权限或失效选项。
+        let definitions =
+            self.build_base_tool_definitions(task, skill_name, access_profile, workspace_id);
         let task_policy = task.policy_snapshot.as_ref();
         let Some(registry) = self.tool_registry.as_ref() else {
             return definitions;
         };
-        refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
-            definitions,
-            tool_registry: registry,
-            skill_runtime: self.skill_runtime.as_deref(),
-            active_skill_id: skill_name,
-            access_profile: tool_surface_access_profile(task, access_profile),
-            allowed_tools: task_policy
-                .filter(|policy| !policy.allowed_tools.is_empty())
-                .map(|policy| policy.allowed_tools.as_slice()),
-            denied_tools: task_policy
-                .map(|policy| policy.denied_tools.as_slice())
-                .unwrap_or_default(),
-            include_external: false,
-            workspace_id,
-        })
+        let definitions =
+            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                definitions,
+                tool_registry: registry,
+                skill_runtime: self.skill_runtime.as_deref(),
+                active_skill_id: skill_name,
+                access_profile: tool_surface_access_profile(task, access_profile),
+                allowed_tools: task_policy
+                    .filter(|policy| !policy.allowed_tools.is_empty())
+                    .map(|policy| policy.allowed_tools.as_slice()),
+                denied_tools: task_policy
+                    .map(|policy| policy.denied_tools.as_slice())
+                    .unwrap_or_default(),
+                include_external: false,
+                workspace_id,
+            });
+        constrain_task_tool_definitions(definitions, task_policy)
     }
 
     fn build_base_tool_definitions(
@@ -1403,46 +1736,39 @@ impl LlmTaskDispatcher {
             return Vec::new();
         }
         let tool_surface_access_profile = tool_surface_access_profile(task, access_profile);
-        let registry = if let Some(policy) = task.policy_snapshot.as_ref() {
-            registry.filtered_clone(&policy.allowed_tools, &policy.denied_tools)
-        } else {
-            registry.clone()
-        };
         let active_skill_policy = active_skill_tool_execution_policy(
             tool_surface_access_profile,
             self.skill_runtime.as_deref(),
             skill_name,
         );
-        let active_skill_allowed_tools = (!active_skill_policy.source_skill_ids.is_empty())
-            .then_some(active_skill_policy.allowed_tool_names.as_slice());
-        let mut definitions =
-            public_builtin_tool_definitions(&registry, self.agent_role_registry.as_ref())
-                .into_iter()
-                .filter(|definition| {
-                    BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
-                        |tool| {
-                            task_can_see_builtin_tool(
-                                Some(task),
-                                Some(self.agent_role_registry.as_ref()),
-                                tool,
-                            ) && (workspace_id.is_some() || !tool.requires_workspace_context())
-                                && builtin_tool_visible_in_access_profile(
-                                    tool,
-                                    tool_surface_access_profile,
-                                )
-                                && registry.browser_tool_available(tool)
-                        },
-                    )
+        let active_skill_allowed_tools = active_skill_policy.allowed_tool_names.as_deref();
+        let mut definitions = public_builtin_tool_definitions(registry)
+            .into_iter()
+            .filter(|definition| {
+                BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(|tool| {
+                    task_can_see_builtin_tool(
+                        Some(task),
+                        Some(self.agent_role_registry.as_ref()),
+                        tool,
+                    ) && (workspace_id.is_some() || !tool.requires_workspace_context())
+                        && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
+                        && registry.browser_tool_available(tool)
                 })
-                .filter(|definition| {
-                    active_skill_allowed_tools.is_none_or(|allowed_tools| {
+            })
+            .filter(|definition| {
+                (task.is_goal_mode()
+                    && matches!(
+                        definition.function.name.as_str(),
+                        "get_goal" | "create_goal" | "update_goal" | "update_plan"
+                    ))
+                    || active_skill_allowed_tools.is_none_or(|allowed_tools| {
                         allowed_tools
                             .iter()
                             .any(|tool_name| tool_name == &definition.function.name)
                     })
-                })
-                .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
-                .collect::<Vec<_>>();
+            })
+            .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
+            .collect::<Vec<_>>();
         if self.skill_runtime.is_some() && skill_name.is_none() {
             definitions.push(skill_apply_tool_definition(
                 self.skill_runtime
@@ -1461,39 +1787,8 @@ impl LlmTaskDispatcher {
                 tool_surface_access_profile,
             ));
         }
-        definitions
+        enforce_agent_coordination_surface(definitions)
     }
-}
-
-fn tool_definition_cache_key(
-    task: &magi_core::Task,
-    skill_name: Option<&str>,
-    access_profile: AccessProfile,
-    workspace_id: Option<&WorkspaceId>,
-) -> String {
-    let policy = task.policy_snapshot.as_ref();
-    let task_kind = format!("{:?}", task.kind);
-    let role_id = task_role_id(Some(task)).map(ToString::to_string);
-    let allowed_tools = policy
-        .map(|policy| policy.allowed_tools.clone())
-        .unwrap_or_default();
-    let denied_tools = policy
-        .map(|policy| policy.denied_tools.clone())
-        .unwrap_or_default();
-    let command_mode = policy
-        .map(|policy| policy.command_mode.clone())
-        .unwrap_or_default();
-    serde_json::json!({
-        "task_kind": task_kind,
-        "role_id": role_id,
-        "allowed_tools": allowed_tools,
-        "denied_tools": denied_tools,
-        "command_mode": command_mode,
-        "skill": skill_name,
-        "access_profile": format!("{:?}", access_profile),
-        "workspace_bound": workspace_id.is_some(),
-    })
-    .to_string()
 }
 
 fn task_streaming_entry_id(task: &magi_core::Task) -> String {
@@ -1524,11 +1819,13 @@ fn project_policy_paths_to_execution_root(
     workspace_identity_root: &Path,
     execution_root: &Path,
 ) -> Vec<String> {
+    let identity_root =
+        magi_tool_runtime::canonicalize_tool_permission_path(workspace_identity_root);
     paths
         .iter()
         .map(|path| {
-            let source = PathBuf::from(path);
-            let Ok(relative) = source.strip_prefix(workspace_identity_root) else {
+            let source = magi_tool_runtime::canonicalize_tool_permission_path(Path::new(path));
+            let Ok(relative) = source.strip_prefix(&identity_root) else {
                 return path.clone();
             };
             if relative.as_os_str().is_empty() {
@@ -1599,7 +1896,7 @@ impl LlmTaskDispatcher {
     }
 
     /// 子代理永不直接复用主会话 live worktree：只读任务拿 detached worktree，
-    /// 可写任务拿唯一临时 branch + 独立 worktree。两者都从主线工作树当前内容的快照出发。
+    /// 可写任务拿唯一临时 branch + 独立 worktree。两者都从直接父任务当前工作树快照出发。
     #[allow(clippy::too_many_arguments)]
     fn resolve_task_execution_root(
         &self,
@@ -1614,6 +1911,9 @@ impl LlmTaskDispatcher {
         let main_root = execution_root
             .cloned()
             .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id));
+        if !is_sidechain {
+            return Ok(main_root);
+        }
         let context = self
             .session_code_contexts
             .as_ref()
@@ -1625,16 +1925,23 @@ impl LlmTaskDispatcher {
                 .begin_execution(session_id.as_str(), &context.git.git_common_dir)
                 .map_err(|error| error.to_string())?;
         }
-        if !is_sidechain {
-            return Ok(main_root);
-        }
         let Some(registry) = self.session_code_contexts.as_ref() else {
+            if task.agent_run_transfer().is_some() {
+                return Err("转交代理缺少原执行目录注册表，不能恢复本地执行".into());
+            }
             return Ok(main_root);
         };
         let Some(context) = context else {
+            if task.agent_run_transfer().is_some() {
+                return Err("转交代理缺少原执行目录上下文，不能回退到主线目录".into());
+            }
             // 非 Git workspace 没有 SessionGitContext，只能沿用普通 workspace 语义。
             return Ok(main_root);
         };
+        let git_service = self
+            .git_service
+            .as_ref()
+            .ok_or_else(|| "Git service 未注入，无法隔离子代理".to_string())?;
         if let Some(existing) = context.agent_worktrees.iter().find(|worktree| {
             worktree.task_id == task.task_id.as_str()
                 && worktree.active
@@ -1648,6 +1955,117 @@ impl LlmTaskDispatcher {
                 lease_id
             ));
         }
+        if task.agent_activation().is_some() {
+            // daemon 重启会撤销旧 lease，但保留 Agent 的 worktree 目录。恢复时
+            // 必须复用这份原目录，并验证它仍属于同一 repository；不能从主线 HEAD
+            // 重新创建一份看似干净的副本，悄悄丢掉代理留下的文件和分支。
+            let previous_allocations = context
+                .agent_worktrees
+                .iter()
+                .filter(|worktree| worktree.task_id == task.task_id.as_str())
+                .collect::<Vec<_>>();
+            if previous_allocations.len() > 1 {
+                return Err("代理存在多份历史 worktree，不能猜测恢复来源".into());
+            }
+            if let Some(previous) = previous_allocations.first().copied() {
+                let worker = worker_id.ok_or("恢复代理 worktree 缺少当前 Worker")?;
+                let store = self.pipeline.execution_runtime.task_store();
+                let current = store
+                    .get_active_lease(&task.task_id)
+                    .filter(|lease| &lease.lease_id == lease_id)
+                    .ok_or("恢复代理 worktree 当前租约已失效")?;
+                if previous.active
+                    || current.root_task_id != task.root_task_id
+                    || previous.worker_id != worker.as_str()
+                {
+                    return Err("代理原 worktree 仍占用或当前租约归属变化".into());
+                }
+                previous
+                    .lease_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.pipeline
+                            .execution_runtime
+                            .task_store()
+                            .get_lease(&LeaseId::new(id))
+                    })
+                    .filter(|lease| {
+                        lease.task_id == task.task_id
+                            && lease.root_task_id == task.root_task_id
+                            && lease.role == current.role
+                            && lease.lease_status
+                                != magi_orchestrator::task_store::TaskLeaseState::Active
+                    })
+                    .ok_or("原代理 worktree 缺少已结算的来源租约，拒绝恢复")?;
+                let mode = if task
+                    .policy_snapshot
+                    .as_ref()
+                    .map(magi_core::TaskPolicy::effective_access_profile)
+                    .unwrap_or_default()
+                    == AccessProfile::ReadOnly
+                {
+                    magi_git::AgentWorktreeMode::ReadOnly
+                } else {
+                    magi_git::AgentWorktreeMode::Writable
+                };
+                if mode != previous.mode {
+                    return Err("代理恢复工具范围与原 worktree 模式不一致".into());
+                }
+                block_on_git(git_service.recover_agent_worktree(
+                    &context.git.worktree_path,
+                    &context.git.git_common_dir,
+                    previous,
+                ))
+                .map_err(|error| format!("恢复代理 worktree 失败: {error}"))?;
+                registry
+                    .reattach_agent_worktree(
+                        session_id.as_str(),
+                        previous,
+                        lease_id.as_str(),
+                        worker.as_str(),
+                    )
+                    .map_err(|error| format!("恢复代理 worktree 记录失败: {error}"))?;
+                if let Some(persist) = self.session_state_persist_callback.as_deref()
+                    && let Err(error) = persist("agent_worktree_reattached")
+                {
+                    let _ = registry.release_agent_worktree_for_lease(
+                        session_id.as_str(),
+                        task.task_id.as_str(),
+                        lease_id.as_str(),
+                    );
+                    return Err(format!("恢复代理 worktree 保存失败: {error}"));
+                }
+                return Ok(Some(previous.path.clone()));
+            }
+            let current_turn = self.execution_registry.turn_id(&task.task_id);
+            let used_local_tools = self
+                .session_store
+                .canonical_turns_for_session(session_id)
+                .iter()
+                .filter(|turn| Some(turn.turn_id.as_str()) != current_turn.as_deref())
+                .flat_map(|turn| &turn.items)
+                .filter(|item| {
+                    item.worker
+                        .as_ref()
+                        .and_then(|worker| worker.task_id.as_ref())
+                        == Some(&task.task_id)
+                })
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| {
+                    tool_requires_execution_resources(
+                        &tool.name,
+                        &tool
+                            .arguments
+                            .as_ref()
+                            .map(serde_json::Value::to_string)
+                            .unwrap_or_else(|| "{}".into()),
+                        true,
+                    )
+                });
+            if task.agent_run_transfer().is_some() || used_local_tools {
+                return Err("代理缺少原本地执行 worktree 记录，拒绝从当前主线重建基线".into());
+            }
+        }
         if context.has_external_drift() {
             return Err(format!(
                 "session Git context 已漂移，拒绝为子代理 {} 分配 worktree",
@@ -1657,10 +2075,6 @@ impl LlmTaskDispatcher {
         let Some(base_head) = context.git.base_head.clone() else {
             return Err("当前 Git session 没有 base HEAD，无法隔离子代理".to_string());
         };
-        let git_service = self
-            .git_service
-            .as_ref()
-            .ok_or_else(|| "Git service 未注入，无法隔离子代理".to_string())?;
         let workspace_key = workspace_id
             .as_ref()
             .map(|value| sanitize_git_path_component(value.as_str()))
@@ -1689,11 +2103,45 @@ impl LlmTaskDispatcher {
         };
         let branch = (mode == magi_git::AgentWorktreeMode::Writable)
             .then(|| format!("magi/agent/{task_key}-{allocation_nonce}"));
-        // 子代理从主线工作树的当前内容出发（含未提交改动），而不是会话开始时的 HEAD；
-        // 快照只写对象库，不改动主线的 index、工作树和 ref。
-        let base_head =
-            block_on_git(git_service.snapshot_worktree(&context.git.worktree_path, &base_head))
-                .map_err(|error| format!("生成子代理基线快照失败: {error}"))?;
+        // 首次执行时读取直接父代理当前 worktree，含其尚未提交改动；主线不共享子代理 index。
+        let source = task.parent_task_id.as_ref().and_then(|id| {
+            context
+                .agent_worktrees
+                .iter()
+                .find(|worktree| worktree.task_id == id.as_str())
+        });
+        if (task
+            .parent_task_id
+            .as_ref()
+            .is_some_and(|id| id != &task.root_task_id)
+            && source.is_none())
+            || source.is_some_and(|source| !source.active || !source.path.is_dir())
+        {
+            return Err("父代理执行资源已释放，拒绝建立嵌套 worktree".into());
+        }
+        if let Some(source) = source {
+            let store = self.pipeline.execution_runtime.task_store();
+            let current_parent = task
+                .parent_task_id
+                .as_ref()
+                .and_then(|id| store.get_task(id));
+            if current_parent.as_ref().is_none_or(|parent| {
+                parent.status != magi_core::TaskStatus::Running
+                    || parent.root_task_id != task.root_task_id
+                    || parent.mission_id != task.mission_id
+                    || store.get_active_lease(&parent.task_id).is_none_or(|lease| {
+                        source.lease_id.as_deref() != Some(lease.lease_id.as_str())
+                    })
+            }) {
+                return Err("父代理执行租约已失效，拒绝使用旧 worktree 建立快照".into());
+            }
+        }
+        let source_path = source.map_or(context.git.worktree_path.as_path(), |source| {
+            source.path.as_path()
+        });
+        let source_head = source.map_or(base_head.as_str(), |source| source.base_head.as_str());
+        let base_head = block_on_git(git_service.snapshot_worktree(source_path, source_head))
+            .map_err(|error| format!("生成子代理基线快照失败: {error}"))?;
         let created = block_on_git(git_service.worktree_create(
             &context.git.worktree_path,
             magi_git::WorktreeCreateOptions {
@@ -1797,7 +2245,7 @@ impl LlmTaskDispatcher {
     /// 子代理模型调用结束后立即结束 worktree 的 active 生命周期。
     ///
     /// 可写 worktree 中的改动由运行时提交到代理分支并记录产出（分支、提交、改动路径），
-    /// 随后安全移除目录；分支保留，供主线通过 agent_apply 应用。只读 worktree 干净时
+    /// 随后安全移除目录；分支保留，供直接父任务通过 agent_apply 应用。只读 worktree 干净时
     /// 移除；存在未提交改动或安全移除失败时保留目录与分配记录，但标记为 inactive，
     /// 避免后续任务误认为仍由 worker 占用。绝不使用 force。
     ///
@@ -1855,17 +2303,37 @@ impl LlmTaskDispatcher {
                         observation.dirty.conflicted_paths.len()
                     )),
                 ),
-                Ok(_) => match block_on_git(git_service.worktree_remove(
-                    &context.git.worktree_path,
-                    magi_git::WorktreeRemoveOptions {
-                        path: allocation.path.clone(),
-                        force: false,
-                        confirm_force: false,
-                        precondition: context.precondition(),
-                    },
-                )) {
+                Ok(observation) => match (|| -> Result<(), String> {
+                    if allocation.mode == magi_git::AgentWorktreeMode::ReadOnly {
+                        registry
+                            .record_agent_worktree_result(
+                                session_id.as_str(),
+                                task.task_id.as_str(),
+                                lease_id.as_str(),
+                                observation.head.ok_or("只读代理目录缺少 HEAD，不能清理")?,
+                                vec![],
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    // 删除目录前先保存可恢复 commit；不能只在删除后的异步进度
+                    // checkpoint 里保存，否则崩溃会同时丢失目录和恢复证据。
+                    if let Some(persist) = self.session_state_persist_callback.as_deref() {
+                        persist("agent_worktree_result_saved")?;
+                    }
+                    block_on_git(git_service.worktree_remove(
+                        &context.git.worktree_path,
+                        magi_git::WorktreeRemoveOptions {
+                            path: allocation.path.clone(),
+                            force: false,
+                            confirm_force: false,
+                            precondition: context.precondition(),
+                        },
+                    ))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+                })() {
                     Ok(_) => ("removed", false, None),
-                    Err(error) => ("retained_cleanup_failed", true, Some(error.to_string())),
+                    Err(error) => ("retained_cleanup_failed", true, Some(error)),
                 },
                 Err(error) => ("retained_observation_failed", true, Some(error.to_string())),
             }
@@ -1960,9 +2428,6 @@ impl LlmTaskDispatcher {
         let changed_paths =
             block_on_git(git_service.changed_paths(&allocation.path, &allocation.base_head, &head))
                 .map_err(|error| format!("统计子代理改动失败: {error}"))?;
-        if changed_paths.is_empty() {
-            return Ok(None);
-        }
         registry
             .record_agent_worktree_result(
                 session_id.as_str(),
@@ -1972,6 +2437,9 @@ impl LlmTaskDispatcher {
                 changed_paths.clone(),
             )
             .map_err(|error| error.to_string())?;
+        if changed_paths.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(serde_json::json!({
             "agent_workspace": {
                 "branch": allocation.branch,
@@ -1991,6 +2459,39 @@ impl LlmTaskDispatcher {
             .filter(|scope| !scope.is_empty())
         {
             parts.push(format!("[task-workspace] {scope}"));
+        }
+        if crate::task_helpers::task_can_delegate(
+            Some(task),
+            Some(self.agent_role_registry.as_ref()),
+        ) && let Some(TaskExecutionPlan::Dispatch { session_id, .. }) =
+            self.execution_registry.get(&task.task_id)
+        {
+            let heads = crate::agent_activation::retained_agent_heads(
+                self.pipeline.execution_runtime.task_store(), &self.session_store, &session_id, task,
+            ).into_iter().map(|head| serde_json::json!({
+                    "activation":head.agent_activation(), "task_id":head.task_id, "title":head.title,
+                    "status":head.status, "role":head.executor_binding_target_role(),
+                })).collect::<Vec<_>>();
+            if !heads.is_empty() {
+                parts.push(format!(
+                    "[session-agents] 本会话保留代理身份的当前事实：\n{}",
+                    serde_json::to_string(&heads).expect("agent heads serialize")
+                ));
+            }
+        }
+        if let Some(activation) = task.agent_activation() {
+            parts.push(format!("[agent-activation] agent_id={} generation={} lifetime={:?} previous_task_id={:?}。这是新的执行实例；旧产物与 transcript 保留在原 Task/Thread，不能宣称旧分支已合入。",
+                activation.agent_id, activation.generation, activation.lifetime, activation.previous_task_id));
+            if let Some(previous) = activation
+                .previous_task_id
+                .as_ref()
+                .and_then(|id| self.pipeline.execution_runtime.task_store().get_task(id))
+            {
+                parts.push(format!("[previous-agent-activation] title={} goal={}\n可通过 context_read 按需读取输出：{}\n证据：{}\n原始执行记录：task:{}:transcript（历史参考，不是本轮工具执行证据）",
+                    previous.title, previous.goal,
+                    (0..previous.output_refs.len()).map(|index| format!("task:{}:output:{index}", previous.task_id)).collect::<Vec<_>>().join(", "),
+                    (0..previous.evidence_refs.len()).map(|index| format!("task:{}:evidence:{index}", previous.task_id)).collect::<Vec<_>>().join(", "), previous.task_id));
+            }
         }
         if let Some(package) = task.agent_context_package() {
             parts.push(package.render_for_prompt());
@@ -2028,9 +2529,6 @@ impl LlmTaskDispatcher {
             return parts;
         }
         let mut ordered_parts = vec![CURRENT_TASK_PRIORITY_NOTE.to_string()];
-        if let Some(mode_prompt) = self.multi_agent_mode_prompt_for_task(task) {
-            ordered_parts.push(mode_prompt);
-        }
         if task.kind == TaskKind::LocalAgent {
             ordered_parts.push(
                 "[validation-rule] 只验证本任务 dependency/input 指向的当前执行产出；不得把历史经验、知识库记录或其他会话目标当成本次交付对象。"
@@ -2039,20 +2537,6 @@ impl LlmTaskDispatcher {
         }
         ordered_parts.extend(parts);
         ordered_parts
-    }
-
-    fn multi_agent_mode_prompt_for_task(&self, task: &magi_core::Task) -> Option<String> {
-        if task.kind != TaskKind::LocalAgent {
-            return None;
-        }
-        let registry = Some(self.agent_role_registry.as_ref());
-        if task_is_coordinator(Some(task), registry) {
-            return Some(root_multi_agent_mode_prompt(
-                self.execution_registry.execution_admission().limits(),
-                self.agent_role_registry.as_ref(),
-            ));
-        }
-        Some(subagent_multi_agent_mode_prompt())
     }
 
     fn assemble_prompt(
@@ -2353,6 +2837,43 @@ impl LlmTaskDispatcher {
         self.execute_session_turn_with_policy(request, TurnTerminalCommitPolicy::Coordinator)
     }
 
+    pub fn track_conversation_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> ConversationTurnActivityGuard {
+        ConversationTurnActivityGuard {
+            _inner: self.conversation_quiesce.begin(TaskId::new(
+                serde_json::to_string(&(session_id, turn_id)).expect("conversation identity"),
+            )),
+        }
+    }
+
+    pub async fn wait_for_conversation_turn_quiesce(&self, session_id: &SessionId, turn_id: &str) {
+        self.conversation_quiesce
+            .wait_for_root(&TaskId::new(
+                serde_json::to_string(&(session_id, turn_id)).expect("conversation identity"),
+            ))
+            .await;
+    }
+
+    /// 仅等待指定任务的执行线程；由阻塞工具执行器调用，不能等待包含调用者的 root。
+    /// 超时仅报告结算未完成，不取消等待中的线程或假造资源退出。
+    pub fn wait_for_task_dispatches_blocking(
+        &self,
+        task_ids: &[TaskId],
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        if self
+            .dispatch_quiesce
+            .wait_for_tasks_blocking(task_ids, timeout)
+        {
+            Ok(())
+        } else {
+            Err("代理执行线程尚未退出，不能确认资源已结算".into())
+        }
+    }
+
     fn execute_session_turn_with_policy(
         &self,
         request: SessionTurnExecutionRequest,
@@ -2531,7 +3052,19 @@ impl LlmTaskDispatcher {
             }
         };
 
-        let skill_name = self.resolve_registered_skill_id(skill_name.as_deref());
+        if task.recovery_checkpoint().is_some()
+            && client.executor_capabilities().resume
+                != magi_bridge_client::ExecutorResumeMode::Checkpoint
+        {
+            return (TaskOutcome::Failed {
+                error: "executor_resume_unsupported: 当前执行器不支持 Magi 检查点恢复，请核对远端进展后提交新的明确指令".into(),
+            }, None);
+        }
+
+        let skill_name = match self.resolve_registered_skill_id(skill_name.as_deref()) {
+            Ok(skill_name) => skill_name,
+            Err(error) => return (TaskOutcome::Failed { error }, None),
+        };
         let (prompt, task_context_messages, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let developer_prompt = compose_developer_instructions(
@@ -2543,33 +3076,59 @@ impl LlmTaskDispatcher {
         let workspace_identity_root_path = workspace_id
             .as_ref()
             .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
-        let workspace_root_path = match self.resolve_task_execution_root(
-            task,
-            lease_id,
-            session_id,
-            workspace_id,
-            execution_root,
-            is_sidechain,
-            worker_id,
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::error!(
-                    task_id = %task.task_id,
-                    session_id = %session_id,
-                    %error,
-                    "拒绝在未隔离的 Git workspace 中启动子代理"
-                );
-                return (TaskOutcome::Failed { error }, None);
-            }
+        let prepare_workspace = || {
+            self.prepare_task_workspace_execution(
+                task,
+                lease_id,
+                session_id,
+                workspace_id,
+                execution_root,
+                is_sidechain,
+                worker_id,
+            )
         };
-        let execution_task = Self::task_for_execution_root(
-            task,
-            workspace_identity_root_path.as_ref(),
-            workspace_root_path.as_ref(),
-        );
+        // ExecutorOwned 的首个请求内部就可能执行本地工具，必须在交付请求前走
+        // 同一准备入口；原生模型仍到首次本地工具边界才准备资源。
+        let executor_owns_tools = client.executor_capabilities().tools
+            == magi_bridge_client::ExecutorToolMode::ExecutorOwned;
+        let prepared = if executor_owns_tools {
+            if !use_tools {
+                return (TaskOutcome::Failed {
+                    error: "executor_policy_unsupported: 当前任务禁止使用工具，不能启动拥有独立工具循环的执行器".into(),
+                }, None);
+            }
+            match prepare_workspace() {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    return (
+                        TaskOutcome::Failed {
+                            error: format!("外部执行器工作区准备失败，调用尚未发送：{error}"),
+                        },
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let workspace_root_path = match prepared.as_ref() {
+            Some(prepared) => prepared.root.clone(),
+            None => execution_root
+                .cloned()
+                .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id)),
+        };
+        let execution_task = prepared
+            .as_ref()
+            .map(|prepared| prepared.task.clone())
+            .unwrap_or_else(|| {
+                Self::task_for_execution_root(
+                    task,
+                    workspace_identity_root_path.as_ref(),
+                    workspace_root_path.as_ref(),
+                )
+            });
 
-        let tools = if use_tools {
+        let tools = if use_tools && !executor_owns_tools {
             let access_profile = execution_task
                 .policy_snapshot
                 .as_ref()
@@ -2602,11 +3161,26 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        let snapshot_session = self.snapshot_manager.as_ref().and_then(|manager| {
-            workspace_identity_root_path
-                .as_ref()
-                .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
-        });
+        let snapshot_session = match prepared {
+            Some(prepared) => prepared.snapshot,
+            None => self.snapshot_manager.as_ref().and_then(|manager| {
+                workspace_root_path
+                    .as_ref()
+                    .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
+            }),
+        };
+        let refresh_tools = |skill_id: Option<&str>| {
+            self.build_tool_definitions(
+                &execution_task,
+                skill_id,
+                execution_task
+                    .policy_snapshot
+                    .as_ref()
+                    .map(magi_core::TaskPolicy::effective_access_profile)
+                    .unwrap_or_default(),
+                workspace_id.as_ref(),
+            )
+        };
         conversation_loop::run_conversation_loop(ConversationLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -2633,6 +3207,8 @@ impl LlmTaskDispatcher {
             task_context_messages,
             images,
             tools,
+            refresh_tool_definitions: (use_tools && !executor_owns_tools)
+                .then_some(&refresh_tools as &conversation_loop::RefreshToolDefinitions<'_>),
             usage_binding,
             streaming_entry_id,
             is_sidechain,
@@ -2642,6 +3218,8 @@ impl LlmTaskDispatcher {
             system_prompt: developer_prompt,
             workspace_root_path,
             snapshot_session,
+            prepare_workspace: (use_tools && !executor_owns_tools)
+                .then_some(&prepare_workspace as &crate::conversation_loop::PrepareWorkspace),
             execution_group_id: Some(task.mission_id.to_string()),
             persist_session_state: self.session_state_persist_callback.as_deref(),
         })
@@ -2667,13 +3245,96 @@ impl LlmTaskDispatcher {
                 worker_id = %worker.worker_id,
                 "task dispatch missing execution plan"
             );
-            self.push_result(
+            self.notify_task_result(
                 &task.task_id,
                 &lease.lease_id,
                 TaskOutcome::Failed { error },
             );
             return Ok(());
         };
+        let mut plan = plan;
+        {
+            let TaskExecutionPlan::Dispatch {
+                session_id,
+                turn_id,
+                thread_id,
+                is_primary,
+                skill_name,
+                ..
+            } = &mut plan;
+            let parent_owned = self
+                .session_store
+                .canonical_turn_for_session_turn_id(session_id, turn_id)
+                .and_then(|turn| turn.agent_turn_binding().ok().flatten())
+                .is_some();
+            let retained = task.agent_activation().is_some_and(|activation| {
+                !matches!(activation.lifetime, magi_core::AgentLifetime::Turn)
+            });
+            let own_existing = if !*is_primary {
+                self.session_store
+                    .agent_turn_for_task(session_id, &task.task_id)
+                    .map_err(|error| error.to_string())?
+            } else {
+                None
+            };
+            if !*is_primary && (retained || parent_owned || own_existing.is_some()) {
+                let source_turn_id = turn_id.clone();
+                let parent_turn_id = if task.parent_task_id.as_ref() != Some(&task.root_task_id) {
+                    let parent = task
+                        .parent_task_id
+                        .as_ref()
+                        .ok_or("嵌套 Agent 缺少父任务")?;
+                    let parent = self
+                        .session_store
+                        .agent_turn_for_task(session_id, parent)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("嵌套 Agent 缺少父任务的独立 Turn")?;
+                    if !self
+                        .session_store
+                        .turn_execution_is_active(session_id, &parent.turn_id)
+                    {
+                        return Err("嵌套 Agent 的父 Turn 不可执行".into());
+                    }
+                    parent.turn_id
+                } else {
+                    source_turn_id.clone()
+                };
+                let result = if let Some(existing) = own_existing {
+                    if existing.turn_id == source_turn_id {
+                        Ok(existing)
+                    } else {
+                        self.session_store
+                            .create_agent_turn(task, &parent_turn_id, thread_id)
+                    }
+                } else {
+                    self.session_store
+                        .create_agent_turn(task, &parent_turn_id, thread_id)
+                };
+                let owned = match result {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        self.notify_task_result(
+                            &task.task_id,
+                            &lease.lease_id,
+                            TaskOutcome::Failed {
+                                error: format!("接纳 Agent 独立执行 Turn 失败: {error}"),
+                            },
+                        );
+                        return Ok(());
+                    }
+                };
+                *turn_id = owned.turn_id.clone();
+                if let Some(skill) = owned
+                    .agent_active_skill_id()
+                    .map_err(|error| error.to_string())?
+                {
+                    *skill_name = Some(skill);
+                }
+                // 只修改同一 Task 的进程内计划投影。持久来源已由 canonical 事务提交。
+                self.execution_registry
+                    .bind_agent_turn(&task.task_id, &source_turn_id, &owned)?;
+            }
+        }
         let plan_turn_id = match &plan {
             TaskExecutionPlan::Dispatch { turn_id, .. } => turn_id.clone(),
         };
@@ -2694,7 +3355,6 @@ impl LlmTaskDispatcher {
                 turn_id,
                 workspace_id,
                 execution_root,
-                ownership,
                 writebacks,
                 use_tools,
                 skill_name,
@@ -2726,7 +3386,6 @@ impl LlmTaskDispatcher {
                     turn_id,
                     workspace_id,
                     execution_root,
-                    ownership,
                     writebacks,
                     use_tools,
                     skill_name,
@@ -2767,7 +3426,7 @@ impl LlmTaskDispatcher {
                 // execution plan，再提交 TaskStore 终态，避免下一轮观察到旧计划。
                 plan_cleanup.retained = matches!(&outcome, TaskOutcome::Yielded);
                 drop(plan_cleanup);
-                self.push_result(&task.task_id, &lease.lease_id, outcome);
+                self.notify_task_result(&task.task_id, &lease.lease_id, outcome);
             }
         }
 
@@ -3131,13 +3790,15 @@ impl TaskDispatcher for LlmTaskDispatcher {
             let task_id = task.task_id.clone();
             let lease_id = lease.lease_id.clone();
             let join_observer = self.clone();
-            let _dispatch_quiesce = self.dispatch_quiesce.begin(task.root_task_id.clone());
+            let _dispatch_quiesce = self
+                .dispatch_quiesce
+                .begin_task(task.root_task_id.clone(), task.task_id.clone());
             let join = handle.spawn_blocking(move || {
                 let _dispatch_quiesce = _dispatch_quiesce;
                 let _admission_permit = admission_permit;
                 if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
                     tracing::error!("dispatch_inner failed: {}", err);
-                    dispatcher.push_result(
+                    dispatcher.notify_task_result(
                         &task.task_id,
                         &lease.lease_id,
                         TaskOutcome::Failed {
@@ -3152,7 +3813,9 @@ impl TaskDispatcher for LlmTaskDispatcher {
             Ok(())
         } else {
             // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
-            let _dispatch_quiesce = self.dispatch_quiesce.begin(task.root_task_id.clone());
+            let _dispatch_quiesce = self
+                .dispatch_quiesce
+                .begin_task(task.root_task_id.clone(), task.task_id.clone());
             let _admission_permit = admission_permit;
             self.dispatch_inner(&task, &worker, &lease)
         }
@@ -3164,8 +3827,25 @@ impl TaskDispatcher for LlmTaskDispatcher {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let state = Arc::clone(&self.dispatch_quiesce);
         let root_task_id = root_task_id.clone();
+        let store = self.pipeline.execution_runtime.task_store();
         Box::pin(async move {
-            state.wait_for_root(&root_task_id).await;
+            state.wait_for_execution_scope(store, &root_task_id).await;
+        })
+    }
+
+    fn wait_for_audit_tree_quiesce<'a>(
+        &'a self,
+        root_task_id: &'a TaskId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let state = Arc::clone(&self.dispatch_quiesce);
+        let root = self
+            .pipeline
+            .execution_runtime
+            .task_store()
+            .get_task(root_task_id)
+            .map_or_else(|| root_task_id.clone(), |task| task.root_task_id);
+        Box::pin(async move {
+            state.wait_for_root(&root).await;
         })
     }
 }
@@ -3179,7 +3859,7 @@ async fn record_dispatch_join_outcome(
     if let Err(error) = join.await {
         tracing::error!(task_id = %task_id, lease_id = %lease_id, ?error, "dispatch spawn_blocking panicked");
         let direct_error = public_runtime_excerpt(&format!("模型执行线程异常退出: {error}"), 4096);
-        dispatcher.push_result(
+        dispatcher.notify_task_result(
             &task_id,
             &lease_id,
             TaskOutcome::Failed {
@@ -3223,6 +3903,86 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn retired_root_detection_decodes_windows_paths_and_allows_the_allocated_subdirectory() {
+        let old = std::path::Path::new(r"C:\project");
+        let new = std::path::Path::new(r"C:\project\.magi\isolated");
+        assert!(arguments_reference_retired_root(
+            "file_read",
+            &serde_json::json!({"paths": [r"C:\project\src\main.rs"]}).to_string(),
+            old,
+            Some(new),
+        ));
+        assert!(!arguments_reference_retired_root(
+            "shell_exec",
+            &serde_json::json!({"command": r"cat C:\project\.magi\isolated\README.md"}).to_string(),
+            old,
+            Some(new),
+        ));
+        assert!(arguments_reference_retired_root(
+            "shell_exec",
+            &serde_json::json!({"command": r"cp C:\project\a.txt C:\project\.magi\isolated\a.txt"})
+                .to_string(),
+            old,
+            Some(new),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_root_detection_covers_path_aliases_in_file_and_shell_tools() {
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("original");
+        let alias = fixture.path().join("alias");
+        let current = original.join("isolated");
+        std::fs::create_dir_all(&current).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        assert!(
+            !arguments_reference_retired_root(
+                "file_write",
+                &serde_json::json!({"path": alias.join("new.txt"), "content":"a"}).to_string(),
+                &original,
+                Some(&alias),
+            ),
+            "相同目录的别名不属于执行根切换"
+        );
+        assert_eq!(
+            project_policy_paths_to_execution_root(
+                &[alias.join("private").to_string_lossy().into_owned()],
+                &original,
+                &current,
+            ),
+            vec![current.join("private").to_string_lossy().into_owned()],
+            "通过别名声明的禁止/只读子目录也必须投影到隔离目录"
+        );
+        for (tool, arguments) in [
+            (
+                "file_write",
+                serde_json::json!({"path": alias.join("new.txt"), "content":"a"}),
+            ),
+            (
+                "shell_exec",
+                serde_json::json!({"command": format!("cat '{}'", alias.join("old.txt").display())}),
+            ),
+        ] {
+            assert!(arguments_reference_retired_root(
+                tool,
+                &arguments.to_string(),
+                &original,
+                Some(&current)
+            ));
+        }
+        assert!(!arguments_reference_retired_root(
+            "file_write",
+            &serde_json::json!({
+                "path": alias.join("isolated/new.txt"), "content":"a"
+            })
+            .to_string(),
+            &original,
+            Some(&current)
+        ));
+    }
 
     /// 只记录输入并返回固定 client 的测试工厂（不断言真实浏览器行为）。
     struct RecordingEngineFactory {
@@ -3491,6 +4251,10 @@ mod tests {
     struct FailingAuxiliaryClient;
 
     impl ModelBridgeClient for FailingAuxiliaryClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3612,7 +4376,7 @@ mod tests {
             LlmTaskDispatcherDependencies {
                 session_store: Arc::new(SessionStore::new()),
                 execution_registry: TaskExecutionRegistry::default(),
-                result_receiver: Arc::new(EventBasedResultReceiver::new()),
+                completion_sink: Arc::new(|_| panic!("此夹具不应派发 Task 终态")),
                 conversation_registry: Arc::new(ConversationRegistry::new()),
                 agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             },
@@ -3786,6 +4550,398 @@ mod tests {
             decision.is_none(),
             "子代理相对执行根目录读取工作区文件不应被继承的逻辑路径策略拒绝"
         );
+    }
+
+    struct ScopeProbeExecutor {
+        scopes: Arc<Mutex<Vec<magi_bridge_client::ModelExecutionScope>>>,
+    }
+
+    impl ModelBridgeClient for ScopeProbeExecutor {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            let mut caps = magi_bridge_client::text_executor_capabilities();
+            caps.tools = magi_bridge_client::ExecutorToolMode::ExecutorOwned;
+            caps
+        }
+
+        fn bind_execution_scope(
+            &self,
+            scope: magi_bridge_client::ModelExecutionScope,
+        ) -> Result<Option<Arc<dyn ModelBridgeClient>>, BridgeClientError> {
+            self.scopes.lock().unwrap().push(scope);
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: "executor_policy_unsupported: probe stops before external execution"
+                    .into(),
+            })
+        }
+
+        fn invoke(&self, _: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
+            panic!("scope probe must stop before executing")
+        }
+
+        fn invoke_streaming(
+            &self,
+            _: ModelInvocationRequest,
+            _: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            panic!("scope probe must stop before executing")
+        }
+    }
+
+    #[test]
+    fn executor_owned_child_prepares_isolated_directory_before_scope_binding() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        git_fixture(&repository, &["init", "-b", "main"]);
+        git_fixture(&repository, &["config", "user.name", "Magi Test"]);
+        git_fixture(&repository, &["config", "user.email", "magi@example.test"]);
+        std::fs::write(repository.join("README.md"), "base\n").unwrap();
+        git_fixture(&repository, &["add", "README.md"]);
+        git_fixture(&repository, &["commit", "-m", "base"]);
+        std::fs::write(repository.join("README.md"), "parent uncommitted\n").unwrap();
+        let service = Arc::new(magi_git::GitService::new());
+        let observation = block_on_git(service.observe(&repository)).unwrap();
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        let session = SessionId::new("session-external-scope");
+        let workspace = Some(WorkspaceId::new("workspace-external-scope"));
+        contexts.accept(
+            session.as_str(),
+            workspace.as_ref().unwrap().as_str(),
+            vec![repository.clone()],
+            &observation,
+        );
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = dispatcher_with_default_tool_surface()
+            .with_git_context_runtime(service, contexts.clone())
+            .with_model_bridge_client(Arc::new(ScopeProbeExecutor {
+                scopes: scopes.clone(),
+            }));
+        dispatcher.agent_worktree_root = fixture.path().join("agent-worktrees");
+        let mut parent = task_with_role("coordinator", TaskTier::ExecutionChain);
+        parent.status = magi_core::TaskStatus::Running;
+        let mut child = task_with_role("explorer", TaskTier::ExecutionChain);
+        child.status = magi_core::TaskStatus::Running;
+        child.root_task_id = parent.task_id.clone();
+        child.parent_task_id = Some(parent.task_id.clone());
+        let policy = child.policy_snapshot.as_mut().unwrap();
+        policy.access_profile = AccessProfile::ReadOnly;
+        policy.allowed_paths = vec![repository.to_string_lossy().into_owned()];
+        let store = dispatcher.pipeline.execution_runtime.task_store();
+        store.insert_task(parent).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let worker = WorkerId::new("worker-external-scope");
+        let lease = store
+            .grant_lease(
+                &child.task_id,
+                &child.root_task_id,
+                &worker,
+                "explorer",
+                60_000,
+            )
+            .unwrap();
+        dispatcher
+            .session_store
+            .create_session(session.clone(), "scope probe")
+            .unwrap();
+        dispatcher
+            .session_store
+            .ensure_session_mission(&session, UtcMillis::now(), || child.mission_id.clone());
+        let thread = crate::session_thread::ensure_thread_for_role(
+            &dispatcher.session_store,
+            &session,
+            &child.mission_id,
+            "explorer",
+            &worker,
+            &child.task_id,
+            UtcMillis::now(),
+        )
+        .unwrap();
+        let usage = crate::usage_recording::session_turn_model_usage_binding(true);
+        let invoke = |use_tools| {
+            dispatcher.invoke_llm_with_tools(TaskLlmInvocationInput {
+                task: &child,
+                lease_id: &lease.lease_id,
+                session_id: &session,
+                workspace_id: &workspace,
+                execution_root: Some(&repository),
+                use_tools,
+                skill_name: None,
+                images: vec![],
+                usage_binding: &usage,
+                streaming_entry_id: None,
+                is_sidechain: true,
+                worker_id: Some(&worker),
+                execution_role_id: Some("explorer"),
+                thread_id: &thread,
+                system_prompt: None,
+                execution_settings_snapshot: None,
+            })
+        };
+        let (outcome, _) = invoke(false);
+        assert!(matches!(outcome, TaskOutcome::Failed { .. }));
+        assert!(scopes.lock().unwrap().is_empty());
+        assert!(
+            contexts
+                .get(session.as_str())
+                .unwrap()
+                .agent_worktrees
+                .is_empty()
+        );
+        let (outcome, _) = invoke(true);
+        assert!(
+            matches!(outcome, TaskOutcome::Failed { .. }),
+            "probe rejects binding: {outcome:?}"
+        );
+        let observed = scopes.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "must reach scope binding after preparation: {outcome:?}"
+        );
+        let root = observed[0].working_dir.as_ref().unwrap();
+        assert_ne!(root, &repository);
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "parent uncommitted\n"
+        );
+        assert_eq!(
+            observed[0].policy.allowed_paths,
+            vec![root.to_string_lossy()]
+        );
+        let context = contexts.get(session.as_str()).unwrap();
+        assert_eq!(context.agent_worktrees.len(), 1);
+        assert_eq!(
+            context.agent_worktrees[0].mode,
+            magi_git::AgentWorktreeMode::ReadOnly
+        );
+        drop(observed);
+        dispatcher.finalize_agent_worktree(&child, &lease.lease_id, &session, &workspace, true);
+        assert!(!context.agent_worktrees[0].path.exists());
+    }
+
+    #[test]
+    fn recovered_agent_worktree_keeps_original_files_across_new_runtime_workers_and_cleanup() {
+        for failed_checkpoint in [
+            None,
+            Some("agent_worktree_reattached"),
+            Some("agent_worktree_result_saved"),
+        ] {
+            let fail_persist = failed_checkpoint == Some("agent_worktree_reattached");
+            let fixture = tempfile::tempdir().unwrap();
+            let repository = fixture.path().join("repo");
+            std::fs::create_dir(&repository).unwrap();
+            for args in [
+                vec!["init", "-b", "main"],
+                vec!["config", "user.name", "Magi Test"],
+                vec!["config", "user.email", "test@magi.invalid"],
+            ] {
+                git_fixture(&repository, &args);
+            }
+            std::fs::write(repository.join("README.md"), "original baseline").unwrap();
+            git_fixture(&repository, &["add", "."]);
+            git_fixture(&repository, &["commit", "-m", "base"]);
+            let git = Arc::new(magi_git::GitService::new());
+            let observation = block_on_git(git.observe(&repository)).unwrap();
+            let contexts = magi_git::SessionCodeContextRegistry::default();
+            let session = SessionId::new("resource-recovery");
+            let workspace = Some(WorkspaceId::new("resource-recovery"));
+            contexts.accept(
+                session.as_str(),
+                workspace.as_ref().unwrap().as_str(),
+                vec![],
+                &observation,
+            );
+            let mut dispatcher = dispatcher_with_default_tool_surface()
+                .with_git_context_runtime(git, contexts.clone());
+            dispatcher.agent_worktree_root = fixture.path().join("worktrees");
+            let mut parent = task_with_role("coordinator", TaskTier::ExecutionChain);
+            parent.status = magi_core::TaskStatus::Running;
+            let mut child = task_with_role("executor", TaskTier::ExecutionChain);
+            child.status = magi_core::TaskStatus::Running;
+            child.parent_task_id = Some(parent.task_id.clone());
+            child.root_task_id = parent.task_id.clone();
+            child.executor_binding.as_mut().unwrap().agent_activation =
+                Some(magi_core::AgentActivation {
+                    agent_id: child.task_id.clone(),
+                    session_id: session.clone(),
+                    lifetime: magi_core::AgentLifetime::Session,
+                    generation: 1,
+                    previous_task_id: None,
+                });
+            let store = dispatcher.pipeline.execution_runtime.task_store();
+            store.insert_task(parent).unwrap();
+            store.insert_task(child.clone()).unwrap();
+            let logical_worker = WorkerId::new("persistent-thread-worker");
+            let first = store
+                .grant_lease(
+                    &child.task_id,
+                    &child.root_task_id,
+                    &WorkerId::new("old-runtime-worker"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap();
+            let path = dispatcher
+                .resolve_task_execution_root(
+                    &child,
+                    &first.lease_id,
+                    &session,
+                    &workspace,
+                    None,
+                    true,
+                    Some(&logical_worker),
+                )
+                .unwrap()
+                .unwrap();
+            store
+                .transfer_agent_subtree(
+                    &child.root_task_id,
+                    &child.task_id,
+                    magi_core::AgentRunTransfer {
+                        operation_id: "resource-recovery-transfer".into(),
+                        session_id: session.clone(),
+                        source_turn_id: "original-parent-turn".into(),
+                        transferred_by: child.root_task_id.clone(),
+                        activation_generation: 1,
+                        owner: magi_core::AgentRunOwner::Session,
+                        transferred_at: UtcMillis::now(),
+                    },
+                )
+                .unwrap();
+            child = store.get_task(&child.task_id).unwrap();
+            std::fs::write(path.join("retained.txt"), "original agent output").unwrap();
+            assert!(store.revoke_lease(&child.task_id, &first.lease_id));
+            contexts.restore_after_restart(contexts.all());
+            std::fs::write(repository.join("README.md"), "new mainline baseline").unwrap();
+            let second = store
+                .grant_lease(
+                    &child.task_id,
+                    &child.root_task_id,
+                    &WorkerId::new("new-runtime-worker"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap();
+            dispatcher.session_state_persist_callback = Some(Arc::new(move |checkpoint| {
+                if Some(checkpoint) == failed_checkpoint {
+                    Err("injected resource flush failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+            let resumed = dispatcher.resolve_task_execution_root(
+                &child,
+                &second.lease_id,
+                &session,
+                &workspace,
+                None,
+                true,
+                Some(&logical_worker),
+            );
+            assert_eq!(resumed.is_err(), fail_persist, "{resumed:?}");
+            assert_eq!(
+                std::fs::read_to_string(path.join("README.md")).unwrap(),
+                "original baseline"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.join("retained.txt")).unwrap(),
+                "original agent output"
+            );
+            assert_eq!(
+                contexts
+                    .get(session.as_str())
+                    .unwrap()
+                    .agent_worktrees
+                    .len(),
+                1
+            );
+            if fail_persist {
+                assert!(!contexts.get(session.as_str()).unwrap().agent_worktrees[0].active);
+                assert!(
+                    path.exists(),
+                    "保存失败仍保留原文件供核对，不能执行清理或换新副本"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::canonicalize(resumed.unwrap().unwrap()).unwrap(),
+                    std::fs::canonicalize(&path).unwrap()
+                );
+                assert!(
+                    dispatcher
+                        .finalize_agent_worktree(
+                            &child,
+                            &first.lease_id,
+                            &session,
+                            &workspace,
+                            true
+                        )
+                        .is_none()
+                );
+                assert!(
+                    contexts.get(session.as_str()).unwrap().agent_worktrees[0].active,
+                    "旧 lease 的迟到清理不能释放新执行"
+                );
+                dispatcher
+                    .finalize_agent_worktree(&child, &second.lease_id, &session, &workspace, true)
+                    .unwrap();
+                assert_eq!(
+                    path.exists(),
+                    failed_checkpoint == Some("agent_worktree_result_saved"),
+                    "清理前保存失败须保留原目录；正常清理之后从持久结果恢复"
+                );
+                assert!(store.revoke_lease(&child.task_id, &second.lease_id));
+                let third = store
+                    .grant_lease(
+                        &child.task_id,
+                        &child.root_task_id,
+                        &WorkerId::new("third-runtime-worker"),
+                        "executor",
+                        60_000,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    std::fs::canonicalize(
+                        dispatcher
+                            .resolve_task_execution_root(
+                                &child,
+                                &third.lease_id,
+                                &session,
+                                &workspace,
+                                None,
+                                true,
+                                Some(&logical_worker)
+                            )
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    std::fs::canonicalize(&path).unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(path.join("retained.txt")).unwrap(),
+                    "original agent output",
+                    "已清理目录从原结果重建，不能从当前主线建立新基线"
+                );
+            }
+            contexts.remove(session.as_str());
+            assert!(
+                dispatcher
+                    .resolve_task_execution_root(
+                        &child,
+                        &second.lease_id,
+                        &session,
+                        &workspace,
+                        None,
+                        true,
+                        Some(&logical_worker)
+                    )
+                    .is_err(),
+                "丢失原目录上下文时，不能以当前主线作为转交代理的恢复目录"
+            );
+            assert!(!repository.join("retained.txt").exists());
+        }
     }
 
     #[test]
@@ -4118,15 +5274,16 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_thread_panic_is_reported_as_task_failure() {
-        let dispatcher = dispatcher_with_default_tool_surface();
-        let result_receiver = dispatcher.result_receiver.clone();
+        let mut dispatcher = dispatcher_with_default_tool_surface();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        dispatcher.completion_sink = Arc::new(move |result| sender.send(result).unwrap());
         let task_id = TaskId::new("task-dispatch-thread-panic");
         let lease_id = LeaseId::new("lease-dispatch-thread-panic");
         let join = tokio::task::spawn_blocking(|| panic!("模拟模型执行线程 panic"));
 
         record_dispatch_join_outcome(dispatcher, task_id.clone(), lease_id.clone(), join).await;
 
-        let results = result_receiver.poll_results_for_test();
+        let results = receiver.try_iter().collect::<Vec<_>>();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, task_id);
         assert_eq!(results[0].lease_id, lease_id);
@@ -4137,6 +5294,7 @@ mod tests {
             }
             TaskOutcome::Completed { .. } => panic!("panic 不得被记录为成功"),
             TaskOutcome::Yielded => panic!("panic 不得被记录为等待用户"),
+            TaskOutcome::Cancelled => panic!("panic 不得被记录为用户取消"),
         }
     }
 
@@ -4183,6 +5341,7 @@ mod tests {
             }],
             notifications: vec![],
             canonical_turns: vec![],
+            inputs: vec![],
             goals: vec![],
             plans: vec![],
             thread_context_checkpoints: vec![],
@@ -4228,6 +5387,7 @@ mod tests {
         dispatcher.session_store.append_thread_messages(
             &thread_id,
             vec![magi_session_store::ThreadChatMessage {
+                input_request_id: None,
                 role: "tool".to_string(),
                 content: Some(
                     serde_json::json!({
@@ -4575,6 +5735,14 @@ mod tests {
             Some(&registry),
             BuiltinToolName::GitBranchSwitch
         ));
+        assert!(
+            task_can_see_builtin_tool(
+                Some(&worker_task),
+                Some(&registry),
+                BuiltinToolName::AskUserQuestion,
+            ),
+            "子代理可以请求用户澄清，但不能因此取得协调权限"
+        );
     }
 
     #[tokio::test]
@@ -4619,25 +5787,143 @@ mod tests {
     }
 
     #[test]
-    fn assemble_prompt_injects_codex_style_multi_agent_mode_by_role() {
+    fn dispatch_quiesce_task_scope_does_not_wait_for_its_caller_or_siblings() {
+        let state = Arc::new(DispatchQuiesceState::default());
+        let root = TaskId::new("scope-root");
+        let child = TaskId::new("scope-child");
+        let leaf = TaskId::new("scope-leaf");
+        let _caller = state.begin_task(root.clone(), root.clone());
+        let _sibling = state.begin_task(root.clone(), TaskId::new("scope-sibling"));
+        let first = state.begin_task(root.clone(), child.clone());
+        let second = state.begin_task(root.clone(), child.clone());
+        let descendant = state.begin_task(root, leaf.clone());
+        let ids = vec![child, leaf];
+        assert!(!state.wait_for_tasks_blocking(&ids, std::time::Duration::ZERO));
+        drop(first);
+        assert!(!state.wait_for_tasks_blocking(&ids, std::time::Duration::ZERO));
+        drop(second);
+        assert!(!state.wait_for_tasks_blocking(&ids, std::time::Duration::ZERO));
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                ready.send(()).unwrap();
+                state.wait_for_tasks_blocking(&ids, std::time::Duration::from_secs(2))
+            }
+        });
+        waiting.recv().unwrap();
+        drop(descendant);
+        assert!(
+            waiter.join().unwrap(),
+            "子树退出后不能再等仍在运行的父任务或兄弟"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_quiesce_uses_current_transfer_owner_without_retagging_in_flight_calls() {
+        let store = magi_orchestrator::task_store::TaskStore::new();
+        let mut root = task_with_role("coordinator", TaskTier::ExecutionChain);
+        root.status = magi_core::TaskStatus::Running;
+        let mut child = task_with_role("executor", TaskTier::ExecutionChain);
+        child.root_task_id = root.task_id.clone();
+        child.parent_task_id = Some(root.task_id.clone());
+        child.executor_binding.as_mut().unwrap().agent_activation =
+            Some(magi_core::AgentActivation {
+                agent_id: child.task_id.clone(),
+                session_id: SessionId::new("quiesce-transfer"),
+                lifetime: magi_core::AgentLifetime::Session,
+                generation: 1,
+                previous_task_id: None,
+            });
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let state = Arc::new(DispatchQuiesceState::default());
+        let source = state.begin_task(root.task_id.clone(), root.task_id.clone());
+        let work = state.begin_task(root.task_id.clone(), child.task_id.clone());
+        drop(source);
+        let waiting = state.wait_for_execution_scope(&store, &root.task_id);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        store
+            .transfer_agent_subtree(
+                &root.task_id,
+                &child.task_id,
+                magi_core::AgentRunTransfer {
+                    operation_id: "quiesce-handoff".into(),
+                    session_id: SessionId::new("quiesce-transfer"),
+                    source_turn_id: "source-turn".into(),
+                    transferred_by: root.task_id.clone(),
+                    activation_generation: 1,
+                    owner: magi_core::AgentRunOwner::Session,
+                    transferred_at: UtcMillis::now(),
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("原拥有方不能等待已转交执行");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                state.wait_for_execution_scope(&store, &child.task_id)
+            )
+            .await
+            .is_err()
+        );
+        drop(work);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.wait_for_execution_scope(&store, &child.task_id),
+        )
+        .await
+        .expect("新拥有方须等待原线程真实退出");
+    }
+
+    #[test]
+    fn agent_mode_prompt_matches_role_and_current_tool_surface() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let session_id = SessionId::new("session-multi-agent-mode");
         let workspace_id = None;
 
         let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let prompt_for_task = |task: &Task, skill_name: Option<&str>| {
+            let tools = dispatcher.build_tool_definitions(
+                task,
+                skill_name,
+                AccessProfile::FullAccess,
+                workspace_id.as_ref(),
+            );
+            crate::prompt_utils::current_agent_mode_prompt(
+                task,
+                dispatcher.execution_registry.execution_admission().limits(),
+                &dispatcher.agent_role_registry,
+                &tools,
+            )
+            .unwrap()
+        };
         let (_, coordinator_context, _) =
             dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
-        let coordinator_prompt = coordinator_context
-            .iter()
-            .filter_map(|message| message.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
+        assert!(
+            coordinator_context.iter().all(|message| {
+                !message
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("多代理协作（root coordinator 必须遵守）")
+            }),
+            "运行时派发规则不能混入任务事实"
+        );
+        let coordinator_prompt = prompt_for_task(&coordinator_task, None);
         assert!(
             coordinator_prompt.contains("多代理协作（root coordinator 必须遵守）"),
             "root coordinator prompt 必须包含多代理协作规则: {coordinator_prompt}"
         );
         assert!(
-            coordinator_prompt.contains("用户明确要求使用子代理")
+            coordinator_prompt.contains("明确要求真实代理执行具体工作")
                 && coordinator_prompt.contains("必须通过 agent_spawn 创建真实代理"),
             "明确 subagent 请求必须被约束为真实 agent_spawn"
         );
@@ -4648,13 +5934,7 @@ mod tests {
         );
 
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
-        let (_, worker_context, _) =
-            dispatcher.assemble_prompt(None, &worker_task, &session_id, &workspace_id);
-        let worker_prompt = worker_context
-            .iter()
-            .filter_map(|message| message.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let worker_prompt = prompt_for_task(&worker_task, None);
         assert!(
             worker_prompt.contains("子代理模式（当前模式：worker；worker 必须遵守）")
                 && worker_prompt.contains("不要继续创建代理"),
@@ -4664,6 +5944,75 @@ mod tests {
             !worker_prompt.contains("多代理协作（root coordinator 必须遵守）"),
             "worker prompt 不能收到 root coordinator 派发策略"
         );
+
+        for tool_policy in ["no_tools", "deny_spawn", "allow_file_read"] {
+            let mut restricted = coordinator_task.clone();
+            let policy = restricted.policy_snapshot.as_mut().unwrap();
+            match tool_policy {
+                "no_tools" => policy.command_mode = "no_tools".into(),
+                "deny_spawn" => policy.denied_tools = vec!["agent_spawn".into()],
+                _ => policy.allowed_tools = vec!["file_read".into()],
+            }
+            let prompt = prompt_for_task(&restricted, None);
+            assert!(
+                prompt.contains("本轮 tools 未提供 agent_spawn"),
+                "{tool_policy}: {prompt}"
+            );
+            assert!(!prompt.contains("必须通过 agent_spawn 创建真实代理"));
+            assert!(!prompt.contains("可派发角色"));
+        }
+
+        // 使用真实内置角色，检查角色提示、运行时提示和工具面不会相互矛盾。
+        for role_id in ["architect", "executor", "reviewer", "explorer", "tester"] {
+            let mut delegated = task_with_role(role_id, TaskTier::ExecutionChain);
+            delegated.parent_task_id = Some(coordinator_task.task_id.clone());
+            delegated.root_task_id = coordinator_task.task_id.clone();
+            delegated
+                .executor_binding
+                .as_mut()
+                .unwrap()
+                .delegation_allowed = true;
+            let prompt = prompt_for_task(&delegated, None);
+            let role = dispatcher.agent_role_registry.get(role_id).unwrap();
+            assert!(prompt.contains("受委派代理模式"), "{role_id}: {prompt}");
+            assert!(prompt.contains("获授委派能力不要求创建子代理"));
+            assert!(!prompt.contains("不要继续创建代理"));
+            assert!(role.system_prompt.contains("未获授权时不能创建更多子代理"));
+            let names = dispatcher
+                .build_tool_definitions(
+                    &delegated,
+                    None,
+                    magi_core::AccessProfile::Restricted,
+                    Some(&WorkspaceId::new("delegation-prompt-workspace")),
+                )
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>();
+            for tool in [
+                "agent_spawn",
+                "agent_wait",
+                "agent_cancel",
+                "agent_send",
+                "agent_apply",
+                "ask_user_question",
+            ] {
+                assert!(
+                    names.iter().any(|name| name == tool),
+                    "{role_id} 缺少 {tool}"
+                );
+            }
+            for tool in [
+                "create_goal",
+                "update_plan",
+                "memory_write",
+                "git_branch_switch",
+            ] {
+                assert!(
+                    !names.iter().any(|name| name == tool),
+                    "{role_id} 不应拥有 {tool}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4741,6 +6090,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_surface_separates_coordinator_worker_and_delegation_grant() {
+        let root = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let mut worker = root.clone();
+        worker.parent_task_id = Some(root.task_id.clone());
+        worker.task_id = TaskId::new("worker-surface");
+        let mut delegator = worker.clone();
+        delegator
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .delegation_allowed = true;
+        let dispatcher = dispatcher_with_default_tool_surface();
+        for (task, can_spawn, can_plan) in [
+            (&root, true, true),
+            (&worker, false, false),
+            (&delegator, true, false),
+            (&worker, false, false),
+        ] {
+            let definitions =
+                dispatcher.build_tool_definitions(task, None, AccessProfile::FullAccess, None);
+            assert_eq!(
+                definitions
+                    .iter()
+                    .any(|tool| tool.function.name == "agent_spawn"),
+                can_spawn
+            );
+            assert_eq!(
+                definitions
+                    .iter()
+                    .any(|tool| tool.function.name == "update_plan"),
+                can_plan
+            );
+        }
+    }
+
+    #[test]
     fn coordinator_model_tool_surface_contains_agent_contracts() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let task = task_with_role("coordinator", TaskTier::ExecutionChain);
@@ -4758,7 +6143,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("coordinator model request must contain {name}"));
             assert_eq!(definition.kind, "function");
             assert!(
-                definition.function.description.contains("模型") || name != "agent_spawn",
+                !definition.function.description.trim().is_empty(),
                 "{name} definition must be model-facing"
             );
             assert_eq!(definition.function.parameters["type"], "object");
@@ -4813,6 +6198,10 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(worker_names.iter().any(|name| name == "file_read"));
             assert!(worker_names.iter().any(|name| name == "shell_exec"));
+            assert!(
+                worker_names.iter().any(|name| name == "ask_user_question"),
+                "子代理应在 {access_profile:?} 模式下看到自己的提问入口"
+            );
             assert!(
                 !worker_names.iter().any(|name| name == "agent_spawn"),
                 "子代理在 {access_profile:?} 模式下都不能递归创建代理"
@@ -4931,14 +6320,14 @@ mod tests {
             });
             magi_skill_runtime::SkillRuntime::new(registry)
         }));
-        let task = task_with_role("coordinator", TaskTier::ExecutionChain);
-
+        let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let workspace = WorkspaceId::new("test-workspace");
         let names = dispatcher
             .build_tool_definitions(
                 &task,
                 Some("code-review"),
                 magi_core::AccessProfile::Restricted,
-                Some(&WorkspaceId::new("test-workspace")),
+                Some(&workspace),
             )
             .into_iter()
             .map(|definition| definition.function.name)
@@ -4959,6 +6348,48 @@ mod tests {
             !names.iter().any(|name| name == "shell_exec"),
             "active skill 没有声明 allowed_tools 时不应暴露 shell_exec"
         );
+        let skills = dispatcher.skill_runtime.as_ref().unwrap().registry();
+        let original = skills.get("code-review").unwrap();
+        let mut tightened = original.clone();
+        tightened.custom_tool_bindings.clear();
+        skills.register(tightened);
+        assert!(
+            dispatcher
+                .build_tool_definitions(
+                    &task,
+                    Some("code-review"),
+                    AccessProfile::Restricted,
+                    Some(&workspace)
+                )
+                .is_empty(),
+            "同名 Skill 收紧为封闭空集合后不能继续发布缓存的自定义工具"
+        );
+        skills.register(original);
+        for denied in [false, true] {
+            let policy = task.policy_snapshot.as_mut().unwrap();
+            policy.allowed_tools = if denied {
+                vec![]
+            } else {
+                vec!["file_read".into()]
+            };
+            policy.denied_tools = if denied {
+                vec!["skill__code-review__review-mcp".into()]
+            } else {
+                vec![]
+            };
+            let tools = dispatcher.build_tool_definitions(
+                &task,
+                Some("code-review"),
+                AccessProfile::Restricted,
+                None,
+            );
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool.function.name == "skill__code-review__review-mcp"),
+                "Task 白名单和明确禁止必须约束 Skill 自定义工具，不能只在执行时拒绝"
+            );
+        }
     }
 
     #[test]
@@ -5120,8 +6551,35 @@ mod tests {
 
         assert_eq!(
             dispatcher.resolve_registered_skill_id(Some("code-review")),
-            Some("owner/repo/skills/code-review".to_string())
+            Ok(Some("owner/repo/skills/code-review".to_string()))
         );
+        let registry = dispatcher.skill_runtime.as_ref().unwrap().registry();
+        let mut duplicate = registry.get("owner/repo/skills/code-review").unwrap();
+        duplicate.skill_id = "another/repo/code-review".into();
+        registry.register(duplicate);
+        assert!(
+            dispatcher
+                .resolve_registered_skill_id(Some("code-review"))
+                .unwrap_err()
+                .contains("skill_ambiguous")
+        );
+        registry.replace([]);
+        assert!(
+            dispatcher
+                .resolve_registered_skill_id(Some("owner/repo/skills/code-review"))
+                .unwrap_err()
+                .contains("skill_unavailable")
+        );
+        let dispatcher = dispatcher_with_default_tool_surface();
+        assert!(
+            dispatcher
+                .resolve_registered_skill_id(Some("code-review"))
+                .unwrap_err()
+                .contains("skill_unavailable")
+        );
+        for absent in [None, Some(" ")] {
+            assert_eq!(dispatcher.resolve_registered_skill_id(absent), Ok(None));
+        }
     }
 
     #[test]
@@ -5192,6 +6650,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawn_requires_wait_and_cancel_in_the_effective_tool_surface() {
+        for missing in ["agent_wait", "agent_cancel"] {
+            let dispatcher = dispatcher_with_default_tool_surface();
+            let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
+            task.policy_snapshot.as_mut().unwrap().denied_tools = vec![missing.into()];
+            let tools =
+                dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
+            assert!(
+                !tools.iter().any(|tool| tool.function.name == "agent_spawn"),
+                "missing {missing} must prevent creation of an unmanageable child"
+            );
+            assert!(tools.iter().any(|tool| tool.function.name == "agent_send"));
+            let prompt = crate::prompt_utils::current_agent_mode_prompt(
+                &task,
+                dispatcher.execution_registry.execution_admission().limits(),
+                &dispatcher.agent_role_registry,
+                &tools,
+            )
+            .unwrap();
+            assert!(prompt.contains("本轮 tools 未提供 agent_spawn"));
+            assert!(!prompt.contains("可派发角色"));
+        }
+    }
+
+    #[test]
     fn active_skill_allowed_tools_filter_builtin_tool_surface() {
         let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
             let registry = magi_skill_runtime::SkillRegistry::new();
@@ -5228,6 +6711,88 @@ mod tests {
         assert!(!names.iter().any(|name| name == "search_text"));
         assert!(!names.iter().any(|name| name == "shell_exec"));
         assert!(!names.iter().any(|name| name == "agent_spawn"));
+        // Goal 生命周期工具继续由宿主拥有；重建目录不能被 Skill 隐藏，
+        // Task 的显式禁止仍须生效。
+        let mut goal_task = task.clone();
+        goal_task.executor_binding.as_mut().unwrap().goal_mode = true;
+        goal_task
+            .policy_snapshot
+            .as_mut()
+            .unwrap()
+            .denied_tools
+            .push("update_plan".into());
+        let goal_tools = dispatcher.build_tool_definitions(
+            &goal_task,
+            Some("read-only-skill"),
+            AccessProfile::Restricted,
+            Some(&WorkspaceId::new("test-workspace")),
+        );
+        for name in ["get_goal", "create_goal", "update_goal", "file_read"] {
+            assert!(goal_tools.iter().any(|tool| tool.function.name == name));
+        }
+        assert!(
+            !goal_tools
+                .iter()
+                .any(|tool| tool.function.name == "update_plan")
+        );
+        let prompt = crate::prompt_utils::current_agent_mode_prompt(
+            &task,
+            dispatcher.execution_registry.execution_admission().limits(),
+            &dispatcher.agent_role_registry,
+            &dispatcher.build_tool_definitions(
+                &task,
+                Some("read-only-skill"),
+                AccessProfile::Restricted,
+                Some(&WorkspaceId::new("test-workspace")),
+            ),
+        )
+        .unwrap();
+        assert!(prompt.contains("本轮 tools 未提供 agent_spawn"));
+        assert!(!prompt.contains("必须通过 agent_spawn 创建真实代理"));
+
+        // 同名配置重载及移除必须重新解析范围，不能因名称相同复用旧目录。
+        let runtime = dispatcher.skill_runtime.as_ref().unwrap();
+        let registry = runtime.registry();
+        let mut skill = registry.get("read-only-skill").unwrap();
+        skill.allowed_tools = vec!["search_text".into()];
+        registry.register(skill);
+        let tools = || {
+            dispatcher
+                .build_tool_definitions(
+                    &task,
+                    Some("read-only-skill"),
+                    AccessProfile::Restricted,
+                    Some(&WorkspaceId::new("test-workspace")),
+                )
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tools(), ["search_text"]);
+        let available =
+            dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
+        assert!(
+            available
+                .iter()
+                .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+                .unwrap()
+                .function
+                .description
+                .contains("read-only-skill")
+        );
+        registry.replace([]);
+        assert!(tools().is_empty());
+        let available =
+            dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
+        assert!(
+            !available
+                .iter()
+                .find(|tool| tool.function.name == SKILL_APPLY_TOOL_NAME)
+                .unwrap()
+                .function
+                .description
+                .contains("read-only-skill")
+        );
     }
 
     #[test]

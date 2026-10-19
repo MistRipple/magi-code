@@ -61,7 +61,7 @@ notify = "8"
 sha2 = "0.10"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 getrandom = "0.3"
 zstd = "0.13"
 ignore = "0.4"
@@ -73,8 +73,9 @@ netstat2 = "0.11.2"
 tiktoken-rs = { version = "0.12", default-features = false }
 
 [profile.dev]
-# 开发态只保留行号级调试信息，避免频繁 cargo run/check 后 target 目录快速膨胀。
+# 开发态只保留行号级调试信息并禁用增量编译缓存，避免频繁 cargo run/check/test 后 target 目录快速膨胀。
 debug = "line-tables-only"
+incremental = false
 
 [profile.test]
 # 测试产物数量多，关闭增量缓存并降低调试信息，优先控制本地磁盘占用。

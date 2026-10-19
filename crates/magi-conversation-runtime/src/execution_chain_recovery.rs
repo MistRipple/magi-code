@@ -4,10 +4,7 @@
 //! 校验 / 校对 / 应用 / writeback 落盘 / branch checkpoint 同步 / 子树解封等
 //! "继续会话"实现细节。错误类型统一为 `String`，函数签名走显式 stores。
 
-use magi_core::{
-    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskCompletionAttempt, TaskStatus,
-    UtcMillis,
-};
+use magi_core::{ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus, UtcMillis};
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
@@ -41,45 +38,11 @@ fn root_task_allows_continue(status: &TaskStatus) -> bool {
     !matches!(status, TaskStatus::Completed | TaskStatus::Killed)
 }
 
-fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Pending | TaskStatus::Running)
-}
-
-fn branch_stage_is_terminal(stage: &str) -> bool {
-    matches!(
-        stage.trim().to_ascii_lowercase().as_str(),
-        "finish" | "finished"
-    )
-}
-
-fn branch_runtime_snapshot_is_terminal(
-    worker_runtime: Option<&WorkerRuntime>,
-    branch: &ActiveExecutionBranch,
-) -> bool {
-    worker_runtime
-        .and_then(|runtime| runtime.branch_snapshot_for_task(&branch.task_id))
-        .is_some_and(|snapshot| {
-            snapshot.worker_id == branch.worker_id && matches!(snapshot.stage, WorkerStage::Finish)
-        })
-}
-
-fn branch_is_terminal_for_recovery(
-    worker_runtime: Option<&WorkerRuntime>,
-    branch: &ActiveExecutionBranch,
-) -> bool {
-    branch_stage_is_terminal(&branch.stage)
-        || branch_runtime_snapshot_is_terminal(worker_runtime, branch)
-}
-
 pub fn active_execution_branch_is_continue_recoverable(
-    worker_runtime: Option<&WorkerRuntime>,
     task_store: Option<&TaskStore>,
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> bool {
-    if branch_is_terminal_for_recovery(worker_runtime, branch) {
-        return false;
-    }
     let Some(task_store) = task_store else {
         return false;
     };
@@ -94,64 +57,10 @@ pub fn active_execution_branch_is_continue_recoverable(
     };
     task.mission_id == chain.mission_id
         && task.root_task_id == chain.root_task_id
+        && task_store
+            .execution_scope_root(&task.task_id)
+            .is_ok_and(|scope| scope == chain.root_task_id)
         && task_status_is_continue_recoverable(&task.status)
-}
-
-/// 收敛 chain 中所有"branch stage 或 worker runtime 分支快照已到 Finish 但 task_store
-/// 还停留在非终态"的 branch：凭其执行租约落盘成 `TaskStatus::Completed`。
-/// 用于会话中断与执行链续跑入口的统一护栏。
-///
-/// `Result::Err(String)`：上层 magi-api 用
-/// `.map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))` 桥回 ApiError。
-pub fn finalize_terminal_worker_branches(
-    session_store: &SessionStore,
-    task_store: Option<&TaskStore>,
-    worker_runtime: Option<&WorkerRuntime>,
-    session_id: &SessionId,
-) -> Result<usize, String> {
-    let Some(chain) = session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain)
-    else {
-        return Ok(0);
-    };
-    let task_store = task_store.ok_or_else(|| "task_store 未配置".to_string())?;
-    let mut finalized_count = 0usize;
-    for branch in chain
-        .branches
-        .iter()
-        .filter(|branch| branch_is_terminal_for_recovery(worker_runtime, branch))
-    {
-        let Some(task) = task_store.get_task(&branch.task_id) else {
-            continue;
-        };
-        if !task_status_needs_terminal_branch_finalization(&task.status) {
-            continue;
-        }
-        let lease_id = branch.lease_id.as_ref().ok_or_else(|| {
-            format!(
-                "恢复 branch {} 缺少执行租约，拒绝无 lease 完成提交",
-                branch.task_id
-            )
-        })?;
-        let final_response = task.output_refs.join("\n\n");
-        let attempt = TaskCompletionAttempt {
-            output_refs: task.output_refs.clone(),
-            final_response: Some(final_response),
-            evidence: Vec::new(),
-        };
-        if !task_store
-            .complete_lease_and_task(&branch.task_id, &chain.root_task_id, lease_id, attempt)
-            .map_err(|error| error.to_string())?
-        {
-            return Err(format!(
-                "恢复 branch {} 的执行租约已失效，未提交完成事实",
-                branch.task_id
-            ));
-        }
-        finalized_count += 1;
-    }
-    Ok(finalized_count)
 }
 
 /// 沿 TaskStore 的父任务链上溯，把恢复 branch 与其祖先链上的可恢复 Failed 任务恢复为 Pending。
@@ -160,6 +69,13 @@ pub fn release_resumed_branch_path(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> Result<(), String> {
+    if task_store
+        .execution_scope_root(&branch.task_id)
+        .map_err(|error| error.to_string())?
+        != chain.root_task_id
+    {
+        return Err("恢复 branch 已转交其他拥有方，原主线不能重新打开".into());
+    }
     let mut current_task_id = Some(branch.task_id.clone());
     while let Some(task_id) = current_task_id {
         if task_id == chain.root_task_id {
@@ -193,6 +109,15 @@ pub fn fail_resumed_execution_paths(
 ) -> Result<(), String> {
     let mut task_ids = Vec::new();
     for branch in branches {
+        if task_store
+            .execution_scope_root(&branch.task_id)
+            .map_err(|error| error.to_string())?
+            != chain.root_task_id
+        {
+            // 旧 Continue 在失败回滚前也可能失去子树；只回滚仍归原主线
+            // 的路径，不能重置、取消或重新激活已转交代理。
+            continue;
+        }
         let mut path_seen = Vec::new();
         let mut current_task_id = Some(branch.task_id.clone());
         while let Some(task_id) = current_task_id {
@@ -383,6 +308,7 @@ pub fn map_recovery_input_error(
         },
         magi_core::DomainError::InvalidState { message }
         | magi_core::DomainError::GoalRejected { message, .. }
+        | magi_core::DomainError::RunSafetyLimit { message }
         | magi_core::DomainError::Validation { message } => {
             RecoveryValidationError::Mismatch { message }
         }
@@ -634,63 +560,119 @@ mod tests {
     }
 
     #[test]
-    fn terminal_completion_requires_branch_lease() {
-        let session_store = SessionStore::new();
-        let task_store = TaskStore::new();
-        let session_id = SessionId::new("session-terminal-lease");
-        let mission_id = MissionId::new("mission-terminal-lease");
-        let root_task_id = TaskId::new("task-root-terminal-lease");
-        let branch_task_id = TaskId::new("task-branch-terminal-lease");
-        session_store
-            .create_session(session_id.clone(), "terminal lease")
-            .expect("session should exist");
-        task_store
-            .insert_task(task(
-                root_task_id.as_str(),
-                root_task_id.as_str(),
-                mission_id.as_str(),
-                None,
-                TaskStatus::Running,
-            ))
-            .expect("root should insert");
-        task_store
-            .insert_task(task(
-                branch_task_id.as_str(),
-                root_task_id.as_str(),
-                mission_id.as_str(),
-                Some(root_task_id.as_str()),
-                TaskStatus::Running,
-            ))
-            .expect("branch should insert");
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                chain(
-                    &session_id,
-                    &mission_id,
-                    &root_task_id,
-                    branch(
-                        branch_task_id.as_str(),
-                        "worker-terminal-lease",
-                        "finish",
-                        None,
-                    ),
-                    None,
-                ),
-            )
-            .expect("chain should persist");
-
-        let error =
-            finalize_terminal_worker_branches(&session_store, Some(&task_store), None, &session_id)
-                .expect_err("completion without lease must be rejected");
-        assert!(error.contains("拒绝无 lease 完成提交"));
-        assert_eq!(
-            task_store
-                .get_task(&branch_task_id)
-                .expect("branch should remain")
-                .status,
-            TaskStatus::Running
+    fn mainline_continue_does_not_reopen_finalize_or_rollback_transferred_branch() {
+        let store = TaskStore::new();
+        let session = SessionId::new("transferred-continue-session");
+        let mut root = task(
+            "continue-root",
+            "continue-root",
+            "continue-mission",
+            None,
+            TaskStatus::Running,
         );
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        store.insert_task(root.clone()).unwrap();
+        let mut child = task(
+            "continue-independent",
+            "continue-root",
+            "continue-mission",
+            Some("continue-root"),
+            TaskStatus::Pending,
+        );
+        let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+        binding.agent_activation = Some(magi_core::AgentActivation {
+            agent_id: child.task_id.clone(),
+            session_id: session.clone(),
+            lifetime: magi_core::AgentLifetime::Session,
+            generation: 1,
+            previous_task_id: None,
+        });
+        child.executor_binding = Some(binding);
+        store.insert_task(child.clone()).unwrap();
+        store
+            .transfer_agent_subtree(
+                &root.task_id,
+                &child.task_id,
+                magi_core::AgentRunTransfer {
+                    operation_id: "continue-transfer".into(),
+                    session_id: session.clone(),
+                    source_turn_id: "source-turn".into(),
+                    transferred_by: root.task_id.clone(),
+                    activation_generation: 1,
+                    owner: magi_core::AgentRunOwner::Session,
+                    transferred_at: UtcMillis::now(),
+                },
+            )
+            .unwrap();
+        let branch = branch(child.task_id.as_str(), "independent-worker", "finish", None);
+        let chain = chain(
+            &session,
+            &root.mission_id,
+            &root.task_id,
+            branch.clone(),
+            None,
+        );
+        let mut executable = branch.clone();
+        executable.stage = "execute".into();
+        assert!(!active_execution_branch_is_continue_recoverable(
+            Some(&store),
+            &chain,
+            &executable
+        ));
+        assert!(release_resumed_branch_path(&store, &chain, &executable).is_err());
+        fail_resumed_execution_paths(&store, &chain, &[executable]).unwrap();
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            store.execution_scope_root(&child.task_id).unwrap(),
+            child.task_id
+        );
+    }
+
+    #[test]
+    fn finish_projection_does_not_override_task_recovery_status() {
+        let store = TaskStore::new();
+        let session = SessionId::new("session-finish-recovery");
+        let root = task("root", "root", "mission", None, TaskStatus::Running);
+        store.insert_task(root.clone()).unwrap();
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Failed,
+            TaskStatus::Completed,
+            TaskStatus::Killed,
+        ] {
+            let child = task(
+                &format!("child-{status:?}"),
+                "root",
+                "mission",
+                Some("root"),
+                status,
+            );
+            store.insert_task(child.clone()).unwrap();
+            let branch = branch(child.task_id.as_str(), "worker", "finish", None);
+            let chain = chain(
+                &session,
+                &root.mission_id,
+                &root.task_id,
+                branch.clone(),
+                None,
+            );
+            assert_eq!(
+                active_execution_branch_is_continue_recoverable(Some(&store), &chain, &branch),
+                status == TaskStatus::Failed,
+                "finish 阶段不能替代 Task 的实际结果"
+            );
+            assert_eq!(
+                serde_json::to_value(store.get_task(&child.task_id).unwrap()).unwrap(),
+                serde_json::to_value(child).unwrap()
+            );
+        }
     }
 
     #[test]

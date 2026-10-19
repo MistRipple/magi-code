@@ -285,20 +285,46 @@ async fn remove_workspace(
     State(state): State<ApiState>,
     Json(request): Json<RemoveWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _navigation_guard = state.lock_session_navigation().await;
     let workspace_id = magi_core::WorkspaceId::new(&request.workspace_id);
+    if !state
+        .workspace_registry
+        .workspaces()
+        .iter()
+        .any(|workspace| workspace.workspace_id == workspace_id)
+    {
+        return Err(ApiError::InvalidInput(format!(
+            "workspace 不存在: {workspace_id}"
+        )));
+    }
+    // 先撤销外部调用准入，令牌写盘失败时保留工作区注册事实。
+    state
+        .mcp_service
+        .revoke_workspace(&state, workspace_id.as_str())
+        .await
+        .map_err(|error| ApiError::internal_assembly("吊销工作区 MCP 令牌失败", error))?;
+    // 令牌吊销可能更新外部会话的运行 sidecar。必须在工作区仍注册时完成一次
+    // checkpoint，再提交 deregister；否则后续维护 flush 无法解析原工作区路径，
+    // 会把历史会话的持久化失败当成周期性运行时错误。
+    state.persist_session_state_checkpoint("workspace_remove")?;
+    if let Some(current) = state
+        .session_store
+        .current_session()
+        .filter(|session| session.workspace_id.as_deref() == Some(workspace_id.as_str()))
+    {
+        state.session_store.clear_current_session();
+        if let Err(error) = state.persist_session_navigation_state_for_api(None) {
+            let _ = state
+                .session_store
+                .select_current_session(&current.session_id);
+            return Err(error);
+        }
+    }
     state
         .workspace_registry
         .deregister(&workspace_id)
         .map_err(|e| ApiError::internal_assembly("工作区移除失败", e))?;
     state.persist_workspace_durable_state_for_api()?;
-    // 工作区移除后，其下 MCP 令牌与待审批一并失效。
-    if let Err(error) = state
-        .mcp_service
-        .revoke_workspace(&state, workspace_id.as_str())
-        .await
-    {
-        tracing::warn!(%error, %workspace_id, "工作区移除后吊销 MCP 令牌失败");
-    }
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
@@ -416,6 +442,75 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_checkpoints_before_deregister_and_clears_only_its_selection() {
+        for fail in [false, true] {
+            for selected_here in [false, true] {
+                let mut state = test_state();
+                let workspace = WorkspaceId::new("remove-checkpoint");
+                state
+                    .workspace_registry
+                    .register(
+                        workspace.clone(),
+                        AbsolutePath::new("/tmp/magi-remove-checkpoint"),
+                    )
+                    .unwrap();
+                let session = SessionId::new("remove-session");
+                state
+                    .session_store
+                    .create_session_for_workspace(
+                        session.clone(),
+                        "history",
+                        Some(workspace.to_string()),
+                    )
+                    .unwrap();
+                if !selected_here {
+                    state
+                        .session_store
+                        .create_session(SessionId::new("other-current"), "other")
+                        .unwrap();
+                }
+                let previous = state.session_store.current_session_id();
+                let registry = state.workspace_registry.clone();
+                let expected = workspace.clone();
+                state = state.with_session_state_checkpoint_persist(Arc::new(move |_| {
+                    assert!(
+                        registry
+                            .workspaces()
+                            .iter()
+                            .any(|entry| entry.workspace_id == expected)
+                    );
+                    if fail {
+                        Err(ApiError::Conflict("checkpoint failed".into()))
+                    } else {
+                        Ok(true)
+                    }
+                }));
+                let result = remove_workspace(
+                    State(state.clone()),
+                    Json(RemoveWorkspaceRequest {
+                        workspace_id: workspace.to_string(),
+                    }),
+                )
+                .await;
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(state.workspace_registry.workspaces().is_empty(), !fail);
+                assert_eq!(
+                    state.session_store.current_session_id(),
+                    if !fail && selected_here {
+                        None
+                    } else {
+                        previous
+                    }
+                );
+                assert!(
+                    state.session_store.session(&session).is_some(),
+                    "移除工作区不能删除会话历史"
+                );
+            }
+        }
     }
 
     async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
@@ -1186,6 +1281,7 @@ mod tests {
             }],
             timeline: Vec::new(),
             canonical_turns: Vec::new(),
+            inputs: Vec::new(),
             notifications: Vec::new(),
             goals: Vec::new(),
             plans: Vec::new(),

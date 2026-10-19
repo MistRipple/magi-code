@@ -51,6 +51,9 @@ pub struct AsyncManagedChild {
     child: tokio::process::Child,
     process_group: Arc<ManagedProcessRegistry>,
     registration_id: u64,
+    // Tokio 在回收根进程后清除 PID；资源身份必须保留到整棵树完成结算。
+    #[cfg(unix)]
+    process_group_id: u32,
     #[cfg(windows)]
     job_handle: Arc<WindowsJobHandle>,
 }
@@ -307,17 +310,15 @@ impl ManagedProcessGroup {
             (child, job_handle)
         };
         #[cfg(unix)]
-        let registration_id = register_managed_process(
-            &self.inner,
-            ManagedProcessTerminator {
-                process_group_id: child.id().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "异步子进程在注册受管进程前已退出",
-                    )
-                })?,
-            },
-        );
+        let process_group_id = child.id().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "异步子进程在注册受管进程前已退出",
+            )
+        })?;
+        #[cfg(unix)]
+        let registration_id =
+            register_managed_process(&self.inner, ManagedProcessTerminator { process_group_id });
         #[cfg(windows)]
         let registration_id = register_managed_process(
             &self.inner,
@@ -329,6 +330,8 @@ impl ManagedProcessGroup {
             child,
             process_group: Arc::clone(&self.inner),
             registration_id,
+            #[cfg(unix)]
+            process_group_id,
             #[cfg(windows)]
             job_handle,
         })
@@ -395,23 +398,18 @@ impl ManagedChild {
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        if status.is_some() {
-            self.unregister();
-        }
-        Ok(status)
+        self.child.try_wait()
     }
 
+    /// 只观察根进程退出；后代仍由原 owner 持有，直到 terminate 或 Drop 结算。
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        self.unregister();
-        Ok(status)
+        self.child.wait()
     }
 
     pub fn terminate(&mut self) -> io::Result<ExitStatus> {
         let termination = terminate_std_process_tree(self);
         let wait = self.child.wait();
-        if wait.is_ok() {
+        if termination.is_ok() && wait.is_ok() {
             self.unregister();
         }
         termination.and(wait)
@@ -453,17 +451,12 @@ impl AsyncManagedChild {
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        if status.is_some() {
-            self.unregister();
-        }
-        Ok(status)
+        self.child.try_wait()
     }
 
+    /// Tokio 回收根进程不改变原进程组的拥有方，也不代表后代已退出。
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait().await?;
-        self.unregister();
-        Ok(status)
+        self.child.wait().await
     }
 
     pub fn start_terminate(&mut self) -> io::Result<()> {
@@ -473,7 +466,7 @@ impl AsyncManagedChild {
     pub async fn terminate(&mut self) -> io::Result<ExitStatus> {
         let termination = terminate_async_process_tree(self);
         let wait = self.child.wait().await;
-        if wait.is_ok() {
+        if termination.is_ok() && wait.is_ok() {
             self.unregister();
         }
         termination.and(wait)
@@ -537,6 +530,9 @@ fn prepare_managed_std_command(command: &mut Command) {
 
 #[cfg(unix)]
 fn terminate_std_process_tree(process: &mut ManagedChild) -> io::Result<()> {
+    if process.registration_id == 0 {
+        return Ok(());
+    }
     let tree_termination = terminate_unix_process_group(process.child.id());
     let parent_termination = match process.child.kill() {
         Ok(()) => Ok(()),
@@ -561,11 +557,10 @@ fn terminate_std_process_tree(process: &mut ManagedChild) -> io::Result<()> {
 
 #[cfg(unix)]
 fn terminate_async_process_tree(process: &mut AsyncManagedChild) -> io::Result<()> {
-    let tree_termination = process
-        .child
-        .id()
-        .map(terminate_unix_process_group)
-        .unwrap_or(Ok(()));
+    if process.registration_id == 0 {
+        return Ok(());
+    }
+    let tree_termination = terminate_unix_process_group(process.process_group_id);
     let parent_termination = match process.child.start_kill() {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
@@ -630,6 +625,18 @@ fn unix_process_tree(root_pid: u32) -> Vec<u32> {
     system.refresh_processes(ProcessesToUpdate::All, true);
     let root = Pid::from_u32(root_pid);
     let mut tree = vec![root];
+    // 根 Shell 可能已退出，后代已被 reparent；同一受管进程组仍属于原调用。
+    // 把它们纳入等待与强制终止集合，不能因根 PID 消失就跳过 SIGKILL。
+    if let Ok(group) = i32::try_from(root_pid) {
+        for pid in system.processes().keys().copied() {
+            if let Ok(raw_pid) = i32::try_from(pid.as_u32())
+                && unsafe { libc::getpgid(raw_pid) } == group
+                && !tree.contains(&pid)
+            {
+                tree.push(pid);
+            }
+        }
+    }
     let mut cursor = 0;
     while cursor < tree.len() {
         let parent = tree[cursor];
@@ -672,7 +679,7 @@ fn wait_for_unix_processes_to_exit(processes: &[u32], timeout: Duration) -> bool
 }
 
 #[cfg(all(unix, test))]
-fn unix_process_alive(pid: u32) -> bool {
+fn process_alive(pid: u32) -> bool {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
@@ -780,10 +787,43 @@ impl WindowsJobHandle {
 
         let terminated = unsafe { TerminateJobObject(self.0 as _, 1) };
         if terminated == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            return Err(io::Error::last_os_error());
         }
+        // TerminateJobObject 是异步终止请求；根进程退出不能证明 Job 的后代已退出。
+        // 沿原 Job 核对结算，调用方才能安全发布完成或启动下一次写入。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        while self.active_process_count()? != 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "受管 Windows Job 未在终止期限内退出",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Ok(())
+    }
+
+    fn active_process_count(&self) -> io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.0 as _,
+                JobObjectBasicAccountingInformation,
+                (&raw mut information).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(information.ActiveProcesses)
     }
 }
 
@@ -1091,25 +1131,34 @@ fn apply_platform_policy(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs, path::Path};
-
-    #[cfg(unix)]
     use std::{
-        collections::BTreeMap,
-        os::unix::ffi::OsStringExt,
+        ffi::OsString,
+        fs,
+        path::Path,
         time::{Duration, Instant},
     };
+
+    #[cfg(unix)]
+    use std::{collections::BTreeMap, os::unix::ffi::OsStringExt};
 
     use super::{
         ManagedProcessGroup, initialize_user_process_environment, spawn_managed,
         spawn_managed_tokio, std_command, tokio_command,
     };
     #[cfg(unix)]
-    use super::{environment_overrides, unix_process_alive};
+    use super::{environment_overrides, process_alive};
+
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).is_some()
+    }
 
     #[cfg(unix)]
     fn configure_long_running_std_command(command: &mut std::process::Command) {
-        command.args(["-c", "sleep 5"]);
+        command.args(["-c", "sleep 30"]);
     }
 
     #[cfg(windows)]
@@ -1119,30 +1168,44 @@ mod tests {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Start-Sleep -Seconds 5",
+            "Start-Sleep -Seconds 30",
         ]);
     }
 
     #[cfg(unix)]
     fn configure_long_running_tokio_command(command: &mut tokio::process::Command) {
-        command.args(["-c", "sleep 5"]);
+        command.args(["-c", "sleep 30"]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn managed_process_termination_cleans_descendant_that_changed_process_group() {
-        use std::{fs, os::unix::process::CommandExt, process::Command, thread};
+    fn managed_process_termination_waits_for_descendant_exit() {
+        #[cfg(unix)]
+        use std::os::unix::process::CommandExt;
+        use std::{fs, thread};
 
         if std::env::var_os("MAGI_PROCESS_TREE_HELPER").is_some() {
-            let mut descendant = Command::new("sleep");
-            descendant.arg("30").process_group(0);
-            let mut child = descendant.spawn().expect("descendant should start");
+            let mut descendant = std_command(super::user_shell());
+            configure_long_running_std_command(&mut descendant);
+            #[cfg(unix)]
+            descendant.process_group(0);
+            let child = descendant.spawn().expect("descendant should start");
             let pid_file = std::env::var_os("MAGI_PROCESS_TREE_PID_FILE")
                 .expect("helper pid file should be configured");
             fs::write(pid_file, child.id().to_string()).expect("descendant pid should persist");
-            thread::sleep(Duration::from_secs(30));
-            let _ = child.wait();
-            return;
+            #[cfg(windows)]
+            {
+                // Windows Job 在根进程退出后仍须拥有并结算后代；关闭 Child
+                // 句柄不会终止 Job 中的进程，外层测试负责结算它。
+                drop(child);
+                return;
+            }
+            #[cfg(unix)]
+            {
+                let mut child = child;
+                thread::sleep(Duration::from_secs(30));
+                let _ = child.wait();
+                return;
+            }
         }
 
         let pid_file = tempfile::NamedTempFile::new().expect("pid fixture should create");
@@ -1150,13 +1213,13 @@ mod tests {
         command
             .args([
                 "--exact",
-                "tests::managed_process_termination_cleans_descendant_that_changed_process_group",
+                "tests::managed_process_termination_waits_for_descendant_exit",
                 "--nocapture",
             ])
             .env("MAGI_PROCESS_TREE_HELPER", "1")
             .env("MAGI_PROCESS_TREE_PID_FILE", pid_file.path());
         let mut managed = spawn_managed(&mut command).expect("helper should start");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let descendant_pid = loop {
             if let Ok(value) = fs::read_to_string(pid_file.path())
                 && !value.trim().is_empty()
@@ -1173,11 +1236,17 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         };
 
+        #[cfg(windows)]
+        {
+            assert!(managed.wait().unwrap().success());
+            assert!(managed.job_handle.active_process_count().unwrap() >= 1);
+        }
         managed.terminate().expect("managed tree should terminate");
-        assert!(!unix_process_alive(descendant_pid));
+        #[cfg(windows)]
+        assert_eq!(managed.job_handle.active_process_count().unwrap(), 0);
+        assert!(!process_alive(descendant_pid));
     }
 
-    #[cfg(unix)]
     #[test]
     fn managed_process_groups_do_not_terminate_each_other() {
         let first_group = ManagedProcessGroup::new();
@@ -1196,16 +1265,16 @@ mod tests {
         let second_pid = second_child.id();
 
         assert_eq!(first_group.terminate_all(), 1);
-        assert!(!unix_process_alive(first_child.id()));
+        assert!(!process_alive(first_child.id()));
         assert!(
-            unix_process_alive(second_pid),
+            process_alive(second_pid),
             "terminating one owner group must not kill another owner's process"
         );
 
         second_child
             .terminate()
             .expect("second managed child should terminate");
-        assert!(!unix_process_alive(second_pid));
+        assert!(!process_alive(second_pid));
     }
 
     #[cfg(windows)]
@@ -1215,7 +1284,7 @@ mod tests {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Start-Sleep -Seconds 5",
+            "Start-Sleep -Seconds 30",
         ]);
     }
 
@@ -1286,6 +1355,8 @@ mod tests {
         let started = std::time::Instant::now();
 
         child.terminate().expect("managed child should terminate");
+        #[cfg(windows)]
+        assert_eq!(child.job_handle.active_process_count().unwrap(), 0);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
@@ -1305,6 +1376,8 @@ mod tests {
             .terminate()
             .await
             .expect("async managed child should terminate");
+        #[cfg(windows)]
+        assert_eq!(child.job_handle.active_process_count().unwrap(), 0);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
@@ -1315,16 +1388,83 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_termination_settles_a_child_that_already_exited() {
+        let owner = ManagedProcessGroup::new();
         let mut command = std_command("/bin/sh");
         command.args(["-c", "exit 0"]);
-        let mut child = spawn_managed(&mut command).expect("managed child should start");
+        let mut child = owner
+            .spawn(&mut command)
+            .expect("managed child should start");
         assert!(child.wait().expect("child should exit").success());
+        assert_eq!(
+            owner.terminate_all(),
+            1,
+            "root exit does not release tree ownership"
+        );
         assert!(
             child
                 .terminate()
                 .expect("already exited child should settle")
                 .success()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_managed_termination_settles_descendants_after_root_reaped() {
+        for settlement in ["terminate", "drop", "owner"] {
+            let owner = ManagedProcessGroup::new();
+            let directory = tempfile::tempdir().expect("process fixture should create");
+            let pid_file = directory.path().join("descendant.pid");
+            let mut command = tokio_command("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"$MAGI_DESCENDANT_PID_FILE\"",
+                ])
+                .env("MAGI_DESCENDANT_PID_FILE", &pid_file);
+            let mut child = owner.spawn_tokio(&mut command).expect("root should start");
+            let original_pid = child.id().expect("root has a PID before wait");
+            assert!(child.wait().await.expect("root should exit").success());
+            assert_eq!(child.id(), None, "Tokio retires the PID after wait");
+            let descendant_pid = fs::read_to_string(pid_file)
+                .expect("root should publish descendant PID")
+                .trim()
+                .parse::<u32>()
+                .expect("descendant PID should be numeric");
+            assert!(process_alive(descendant_pid));
+
+            let owner_count = match settlement {
+                "terminate" => {
+                    child
+                        .terminate()
+                        .await
+                        .expect("original tree should settle");
+                    assert_eq!(
+                        owner.terminate_all(),
+                        0,
+                        "settlement releases ownership once"
+                    );
+                    None
+                }
+                "drop" => {
+                    drop(child);
+                    None
+                }
+                _ => Some(owner.terminate_all()),
+            };
+            let descendant_survived = process_alive(descendant_pid);
+            // 回归失败也先回收自己的夹具，不能让复现本身留下孤儿进程。
+            if descendant_survived {
+                super::terminate_unix_process_group(original_pid).expect("fixture should settle");
+            }
+            assert!(
+                !descendant_survived,
+                "{settlement}: reaping the root must not detach its descendants"
+            );
+            if let Some(count) = owner_count {
+                assert_eq!(count, 1);
+            }
+        }
     }
 
     #[cfg(unix)]

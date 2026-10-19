@@ -7,9 +7,9 @@ use axum::{
 use magi_conversation_runtime::{
     PendingToolApproval, PendingUserQuestion, ToolApprovalDecision, UserQuestionResponse,
 };
-use magi_core::{
-    AccessProfile, DomainError, EventId, SessionId, UtcMillis, WorkspaceId, public_runtime_excerpt,
-};
+#[cfg(test)]
+use magi_core::AccessProfile;
+use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkspaceId, public_runtime_excerpt};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{NotificationContext, NotificationRecord, NotificationScope};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ use crate::scope_binding::{
     SessionScope, parse_session_id, require_session_record_in_scope,
     resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
 };
+#[cfg(test)]
+use crate::turn_service::canonical_turn_matches_queued_regular_turn;
 use crate::{
     dto::{
         BootstrapDto, ContinueSessionRequest, ContinueSessionResponseDto, NotificationsResponseDto,
@@ -28,10 +30,7 @@ use crate::{
     },
     errors::ApiError,
     state::ApiState,
-    turn_service::{
-        canonical_turn_matches_queued_regular_turn, session_turn_request_is_plain_text,
-        submit_steer_current_turn_after_turn_commit, trimmed_non_empty,
-    },
+    turn_service::trimmed_non_empty,
 };
 
 static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -43,10 +42,15 @@ pub fn routes() -> Router<ApiState> {
         .route("/session/turn", post(submit_session_turn))
         .route("/session/queue", get(get_session_turn_queue))
         .route(
+            "/session/queue/update",
+            post(update_session_turn_queue_item),
+        )
+        .route(
             "/session/queue/remove",
             post(remove_session_turn_queue_item),
         )
         .route("/session/queue/guide", post(guide_session_turn_queue_item))
+        .route("/session/queue/retry", post(retry_session_turn_queue_item))
         .route("/session/interrupt", post(interrupt_session_turn))
         .route("/session/tool-approvals", get(get_session_tool_approvals))
         .route(
@@ -111,14 +115,7 @@ struct SessionToolApprovalsResponse {
     pending_approvals: Vec<PendingToolApproval>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResolveSessionToolApprovalResponse {
-    session_id: SessionId,
-    approval_id: String,
-    decision: ToolApprovalDecision,
-    status: &'static str,
-}
+type ResolveSessionToolApprovalResponse = magi_app_server_protocol::ResolveToolApprovalResult;
 
 fn require_session_tool_approval_scope(
     state: &ApiState,
@@ -139,11 +136,9 @@ async fn get_session_tool_approvals(
     Query(scope): Query<SessionToolApprovalScope>,
 ) -> Result<Json<SessionToolApprovalsResponse>, ApiError> {
     let session_id = require_session_tool_approval_scope(&state, &scope)?;
+    let pending = crate::interaction_service::pending_approvals(&state, &session_id)?;
     Ok(Json(SessionToolApprovalsResponse {
-        pending_approvals: state
-            .conversation_registry
-            .tool_approvals()
-            .pending_for_session(&session_id),
+        pending_approvals: pending,
         session_id,
     }))
 }
@@ -154,40 +149,8 @@ async fn resolve_session_tool_approval(
 ) -> Result<Json<ResolveSessionToolApprovalResponse>, ApiError> {
     let session_id = require_session_tool_approval_scope(&state, &request.scope)?;
     let approval_id = request.approval_id.trim();
-    if approval_id.is_empty() {
-        return Err(ApiError::InvalidInput("approvalId 不能为空".to_string()));
-    }
-    let pending = state
-        .conversation_registry
-        .tool_approvals()
-        .resolve(&session_id, approval_id, request.decision)
-        .map_err(ApiError::Conflict)?;
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::unique("event-tool-approval-resolved"),
-            "tool.approval.resolved",
-            json!({
-                "session_id": session_id,
-                "task_id": pending.task_id,
-                "turn_id": pending.turn_id,
-                "tool_call_id": pending.tool_call_id,
-                "tool_name": pending.tool_name,
-                "approval_id": pending.approval_id,
-                "decision": request.decision,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            task_id: Some(pending.task_id),
-            ..EventContext::default()
-        }),
-    );
-    Ok(Json(ResolveSessionToolApprovalResponse {
-        session_id,
-        approval_id: approval_id.to_string(),
-        decision: request.decision,
-        status: "resolved",
-    }))
+    crate::interaction_service::resolve_approval(&state, &session_id, approval_id, request.decision)
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,13 +169,7 @@ struct SessionUserQuestionsResponse {
     pending_questions: Vec<PendingUserQuestion>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResolveSessionUserQuestionResponse {
-    session_id: SessionId,
-    question_id: String,
-    status: &'static str,
-}
+type ResolveSessionUserQuestionResponse = magi_app_server_protocol::ResolveUserQuestionResult;
 
 /// 模型向用户提出的待回答选择题（`ask_user_question`）。
 async fn get_session_user_questions(
@@ -222,9 +179,9 @@ async fn get_session_user_questions(
     let session_id = require_session_tool_approval_scope(&state, &scope)?;
     Ok(Json(SessionUserQuestionsResponse {
         pending_questions: state
-            .conversation_registry
-            .user_questions()
-            .pending_for_session(&session_id),
+            .session_store
+            .pending_user_questions(&session_id)
+            .map_err(|error| ApiError::internal_assembly("读取提问失败", error))?,
         session_id,
     }))
 }
@@ -235,49 +192,8 @@ async fn resolve_session_user_question(
 ) -> Result<Json<ResolveSessionUserQuestionResponse>, ApiError> {
     let session_id = require_session_tool_approval_scope(&state, &request.scope)?;
     let question_id = request.question_id.trim();
-    if question_id.is_empty() {
-        return Err(ApiError::InvalidInput("questionId 不能为空".to_string()));
-    }
-    let outcome = match &request.response {
-        UserQuestionResponse::Answered { .. } => "answered",
-        UserQuestionResponse::Skipped => "skipped",
-    };
-    // 回答与题目对不上是调用方的输入错误；问题已经收口（轮次结束、已回答）才是冲突。
-    let pending = state
-        .conversation_registry
-        .user_questions()
-        .resolve(&session_id, question_id, request.response)
-        .map_err(|message| {
-            if message.starts_with("这个问题已经处理过") {
-                ApiError::Conflict(message)
-            } else {
-                ApiError::InvalidInput(message)
-            }
-        })?;
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::unique("event-user-question-resolved"),
-            "user.question.resolved",
-            json!({
-                "session_id": session_id,
-                "task_id": pending.task_id,
-                "turn_id": pending.turn_id,
-                "tool_call_id": pending.tool_call_id,
-                "question_id": pending.question_id,
-                "outcome": outcome,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            task_id: pending.task_id,
-            ..EventContext::default()
-        }),
-    );
-    Ok(Json(ResolveSessionUserQuestionResponse {
-        session_id,
-        question_id: question_id.to_string(),
-        status: "resolved",
-    }))
+    crate::interaction_service::resolve_question(&state, &session_id, question_id, request.response)
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,67 +312,12 @@ struct MarkSessionViewedResponse {
     has_unread_completion: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionTurnQueueScope {
-    session_id: String,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-}
-
-impl SessionTurnQueueScope {
-    fn requested_workspace_id(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_id.as_deref())
-    }
-
-    fn requested_workspace_path(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_path.as_deref())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RemoveSessionTurnQueueItemRequest {
-    #[serde(flatten)]
-    scope: SessionTurnQueueScope,
-    queue_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct QueuedSessionTurnDto {
-    queue_id: String,
-    queue_position: usize,
-    request_id: Option<String>,
-    session_id: String,
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
-    accepted_at: UtcMillis,
-    content: String,
-    text: Option<String>,
-    command: Option<magi_app_server_protocol::SessionTurnCommand>,
-    workflow_id: Option<String>,
-    plugin_command_id: Option<String>,
-    skill_name: Option<String>,
-    goal_mode: bool,
-    access_profile: Option<AccessProfile>,
-    images: Vec<crate::dto::SessionTurnImageDto>,
-    context_references: Vec<crate::dto::SessionContextReferenceDto>,
-    browser_annotation_refs: Vec<String>,
-    browser_node_selections: Vec<crate::dto::BrowserNodeSelectionDto>,
-    plugin_selections: Vec<magi_app_server_protocol::generated::PluginSelection>,
-    can_guide: bool,
-    retry_count: u8,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionTurnQueueResponseDto {
-    session_id: String,
-    queued_turns: Vec<QueuedSessionTurnDto>,
-}
+#[cfg(test)]
+use crate::input_service::session_turn_queue_response;
+use crate::input_service::{
+    GuideSessionTurnQueueItemRequest, SessionTurnQueueItemRequest, SessionTurnQueueResponseDto,
+    SessionTurnQueueScope,
+};
 
 impl DeleteSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
@@ -468,156 +329,49 @@ impl DeleteSessionRequest {
     }
 }
 
-fn session_turn_queue_response(
-    state: &ApiState,
-    session_id: &SessionId,
-) -> SessionTurnQueueResponseDto {
-    // 引导能力由当前 Turn 的输入边界决定，UI 不自行推断执行状态。
-    let active_turn_accepts_steer = state
-        .turn_coordinator()
-        .active_turn_accepts_steer(session_id);
-    let queued_turns = state
-        .queued_regular_session_turns(session_id)
-        .into_iter()
-        .enumerate()
-        .map(|(index, queued)| {
-            let text = queued.request.trimmed_text();
-            let can_guide =
-                active_turn_accepts_steer && session_turn_request_is_plain_text(&queued.request);
-            QueuedSessionTurnDto {
-                queue_id: queued.queue_id,
-                queue_position: index + 1,
-                request_id: queued.request.request_id(),
-                session_id: queued.session_id.to_string(),
-                workspace_id: queued
-                    .requested_workspace_id
-                    .as_ref()
-                    .map(ToString::to_string),
-                workspace_path: queued.request.workspace_path.clone(),
-                accepted_at: queued.accepted_at,
-                content: queued.request.timeline_content(text.as_deref()),
-                text,
-                command: queued.request.command.clone(),
-                workflow_id: queued.request.workflow_id.clone(),
-                plugin_command_id: queued.request.plugin_command_id.clone(),
-                skill_name: queued.request.skill_name.clone(),
-                goal_mode: queued.request.goal_mode,
-                access_profile: queued.request.access_profile,
-                images: queued.request.images,
-                context_references: queued.request.context_references,
-                browser_annotation_refs: queued.request.browser_annotation_refs,
-                browser_node_selections: queued.request.browser_node_selections,
-                plugin_selections: queued.request.plugin_selections,
-                can_guide,
-                retry_count: queued.retry_count,
-            }
-        })
-        .collect();
-    SessionTurnQueueResponseDto {
-        session_id: session_id.to_string(),
-        queued_turns,
-    }
-}
-
-fn require_session_turn_queue_scope(
-    state: &ApiState,
-    scope: &SessionTurnQueueScope,
-) -> Result<(SessionId, SessionScope), ApiError> {
-    let session_id = parse_session_id(Some(&scope.session_id))?;
-    let session_scope = resolve_existing_session_scope(
-        state,
-        &session_id,
-        scope.requested_workspace_id(),
-        scope.requested_workspace_path(),
-    )?;
-    Ok((session_id, session_scope))
-}
-
 async fn get_session_turn_queue(
     State(state): State<ApiState>,
     Query(scope): Query<SessionTurnQueueScope>,
 ) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
-    let (session_id, _) = require_session_turn_queue_scope(&state, &scope)?;
-    // accepted 事件在出队确认前发布；读取必须等待同一提交临界区结束，
-    // 否则客户端会重新读到已经进入主线、但尚未从 durable queue 移除的消息。
-    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
-    Ok(Json(session_turn_queue_response(&state, &session_id)))
+    crate::input_service::get_session_turn_queue(state, scope)
+        .await
+        .map(Json)
 }
 
 async fn remove_session_turn_queue_item(
     State(state): State<ApiState>,
-    Json(request): Json<RemoveSessionTurnQueueItemRequest>,
+    Json(request): Json<SessionTurnQueueItemRequest>,
 ) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
-    let (session_id, _) = require_session_turn_queue_scope(&state, &request.scope)?;
-    let queue_id = request.queue_id.trim();
-    if queue_id.is_empty() {
-        return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
-    }
-    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
-    state.remove_regular_session_turn(&session_id, queue_id)?;
-    Ok(Json(session_turn_queue_response(&state, &session_id)))
+    crate::input_service::remove_session_turn_queue_item(state, request)
+        .await
+        .map(Json)
+}
+
+async fn update_session_turn_queue_item(
+    State(state): State<ApiState>,
+    Json(request): Json<magi_app_server_protocol::generated::SessionQueueUpdateParams>,
+) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
+    crate::input_service::update_session_turn_queue_item(state, request)
+        .await
+        .map(Json)
+}
+
+async fn retry_session_turn_queue_item(
+    State(state): State<ApiState>,
+    Json(request): Json<SessionTurnQueueItemRequest>,
+) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
+    crate::input_service::retry_session_turn_queue_item(state, request)
+        .await
+        .map(Json)
 }
 
 async fn guide_session_turn_queue_item(
     State(state): State<ApiState>,
-    Json(request): Json<RemoveSessionTurnQueueItemRequest>,
+    Json(request): Json<GuideSessionTurnQueueItemRequest>,
 ) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
-    let (session_id, scope) = require_session_turn_queue_scope(&state, &request.scope)?;
-    let queue_id = request.queue_id.trim();
-    if queue_id.is_empty() {
-        return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
-    }
-
-    // 队列消费、删除和转引导必须共用同一个 session 临界区，避免后台出队与用户操作
-    // 同时取得同一条消息。引导先写入 canonical Turn，再持久化移除队列项；若第二步
-    // 失败，重试会通过 requestId + userMessageId 识别已提交消息，不会重复引导。
-    let _session_turn_guard = state.lock_session_turn_commit(&session_id).await;
-    let queued = state
-        .queued_regular_session_turns(&session_id)
-        .into_iter()
-        .find(|turn| turn.queue_id == queue_id)
-        .ok_or_else(|| ApiError::not_found("排队消息不存在", queue_id))?;
-
-    let already_committed = state
-        .session_store
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .any(|turn| canonical_turn_matches_queued_regular_turn(&turn, &queued));
-    if !already_committed {
-        if !session_turn_request_is_plain_text(&queued.request) {
-            return Err(ApiError::InvalidInput(
-                "仅纯文字排队消息可以转为当前回复的引导".to_string(),
-            ));
-        }
-        let expected_turn_id = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
-            .ok_or_else(|| {
-                ApiError::turn_conflict(
-                    "no_active_turn",
-                    None,
-                    "当前回复已经结束，无法把排队消息转为引导",
-                )
-            })?;
-        let mut steer_request = queued.request.clone();
-        steer_request.session_id = Some(session_id.to_string());
-        steer_request.workspace_id = scope.workspace_id().as_ref().map(ToString::to_string);
-        steer_request.steer_current_turn = true;
-        steer_request.expected_turn_id = Some(expected_turn_id);
-        submit_steer_current_turn_after_turn_commit(
-            &state,
-            &steer_request,
-            &scope,
-            crate::turn_service::monotonic_accepted_at(),
-        )
-        .await?;
-    }
-
-    if !state.remove_regular_session_turn(&session_id, queue_id)? {
-        return Err(ApiError::not_found("排队消息不存在", queue_id));
-    }
-    Ok(Json(session_turn_queue_response(&state, &session_id)))
+    crate::input_service::guide_session_turn_queue_item(state, request)
+        .await
+        .map(Json)
 }
 
 async fn submit_session_turn(
@@ -956,7 +710,8 @@ async fn close_session(
     if let Some(manager) = manager {
         manager
             .unbind_session_after_lifecycle_lock(&session_id)
-            .await;
+            .await
+            .map_err(|error| ApiError::internal_assembly("关闭会话时停止执行失败", error))?;
     }
     state
         .close_browser_session_for_magi_session(&session_id)
@@ -1484,9 +1239,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn user_question_route_lists_and_resolves_pending_questions() {
-        let state = test_state();
+    fn question_route_fixture(
+        state: &ApiState,
+    ) -> (
+        SessionId,
+        magi_conversation_runtime::user_question::UserQuestionWaiter,
+    ) {
         let session_id = SessionId::new("session-user-question-route");
         state
             .session_store
@@ -1502,19 +1260,94 @@ mod tests {
             .to_string(),
         )
         .expect("questions should parse");
+        let now = UtcMillis::now();
+        state.session_store.accept_conversation_turn_with_timeline_entry(
+            session_id.clone(), None, TimelineEntryInput::new("question-route", TimelineEntryKind::UserMessage, "test", now),
+            ActiveExecutionTurn {
+                turn_id: "turn-user-question-route".into(), turn_seq: now.0, accepted_at: now,
+                completed_at: None, status: "running".into(), user_message: Some("test".into()),
+                items: vec![serde_json::from_value(json!({
+                    "itemId": "question-route-item", "itemSeq": 1, "kind": "tool_call_started", "status": "running",
+                    "source": "orchestrator", "sourceThreadId": "thread-main",
+                    "taskId": "task-user-question-route", "toolName": "ask_user_question", "toolCallId": "call-user-question-route"
+                })).unwrap()],
+            }
+        ).unwrap();
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                magi_session_store::ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: MissionId::new("question-route-mission"),
+                    root_task_id: TaskId::new("task-user-question-route"),
+                    execution_chain_ref: "question-route-chain".into(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "question-route".into(),
+                        trimmed_text: Some("test".into()),
+                        skill_name: None,
+                    },
+                    current_turn: state
+                        .session_store
+                        .runtime_sidecar(&session_id)
+                        .unwrap()
+                        .current_turn,
+                },
+            )
+            .unwrap();
         let waiter = state
             .conversation_registry
             .user_questions()
-            .request(PendingUserQuestion {
-                can_skip: true,
-                question_id: "question-route-1".to_string(),
-                session_id: session_id.clone(),
-                task_id: Some(TaskId::new("task-user-question-route")),
-                turn_id: "turn-user-question-route".to_string(),
-                tool_call_id: "call-user-question-route".to_string(),
-                questions,
-                requested_at: UtcMillis::now(),
-            });
+            .request_persisted(
+                &state.session_store,
+                PendingUserQuestion {
+                    can_skip: true,
+                    question_id: "question-route-1".to_string(),
+                    session_id: session_id.clone(),
+                    task_id: Some(TaskId::new("task-user-question-route")),
+                    turn_id: "turn-user-question-route".to_string(),
+                    tool_call_id: "call-user-question-route".to_string(),
+                    questions,
+                    requested_at: UtcMillis::now(),
+                },
+            )
+            .unwrap();
+        (session_id, waiter)
+    }
+
+    #[tokio::test]
+    async fn delete_session_disconnects_question_waiters_and_drops_registry_entries() {
+        let state = test_state();
+        let (session_id, waiter) = question_route_fixture(&state);
+        state
+            .delete_session_and_resources(&session_id)
+            .await
+            .unwrap();
+
+        assert!(state.session_store.session(&session_id).is_none());
+        assert!(
+            state
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(&session_id)
+                .is_empty()
+        );
+        assert_eq!(
+            waiter.response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_question_route_lists_and_resolves_pending_questions() {
+        let state = test_state();
+        let (session_id, waiter) = question_route_fixture(&state);
         let app = routes().with_state(state);
         let post = |body: serde_json::Value| {
             Request::builder()
@@ -1600,6 +1433,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_question_route_restores_without_waiter_and_accepts_only_one_client_response() {
+        let original = test_state();
+        let (session, waiter) = question_route_fixture(&original);
+        original
+            .session_store
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        let store = Arc::new(
+            SessionStore::from_persisted_parts(
+                original.session_store.durable_state(),
+                original.session_store.execution_sidecar_store_state(),
+            )
+            .unwrap(),
+        );
+        drop(waiter);
+        let restored = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            store.clone(),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        assert!(
+            restored
+                .conversation_registry
+                .user_questions()
+                .pending_for_session(&session)
+                .is_empty()
+        );
+        let app = routes().with_state(restored);
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/session/user-questions?sessionId={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            listed["pendingQuestions"][0]["questionId"],
+            "question-route-1"
+        );
+        let post = || {
+            Request::builder()
+                .method("POST")
+                .uri("/session/user-question")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "sessionId":session, "questionId":"question-route-1",
+                        "response":{"kind":"answered","answers":[{"selected":["B"]}]}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(app.clone().oneshot(post()), app.oneshot(post()));
+        let mut statuses = vec![
+            first.unwrap().status().as_u16(),
+            second.unwrap().status().as_u16(),
+        ];
+        statuses.sort();
+        assert_eq!(statuses, vec![200, 409]);
+        assert!(store.pending_user_questions(&session).unwrap().is_empty());
+        assert_eq!(
+            store
+                .user_question_state(&session, "question-route-1")
+                .unwrap()
+                .unwrap()
+                .result_payload()
+                .unwrap()["answers"][0]["answer"],
+            json!(["B"])
+        );
+    }
+
+    #[tokio::test]
+    async fn user_question_route_does_not_acknowledge_or_wake_on_failed_commit() {
+        struct FailAnswer(std::sync::atomic::AtomicBool);
+        impl magi_session_store::SessionEventWriter for FailAnswer {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                _: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(&magi_session_store::SessionAcceptanceRecord, Option<&Task>)>,
+            ) -> magi_core::DomainResult<()> {
+                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err(magi_core::DomainError::Persistence {
+                        message: "injected question commit failure".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let state = test_state();
+        let (session, waiter) = question_route_fixture(&state);
+        state
+            .session_store
+            .install_session_event_writer(Arc::new(FailAnswer(
+                std::sync::atomic::AtomicBool::new(true),
+            )));
+        let app = routes().with_state(state.clone());
+        let post = || {
+            Request::builder().method("POST").uri("/session/user-question")
+            .header("content-type","application/json").body(Body::from(json!({
+                "sessionId":session,"questionId":"question-route-1","response":{"kind":"skipped"}
+            }).to_string())).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(post()).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(matches!(
+            waiter.response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .all(|event| event.event_type != "user.question.resolved")
+        );
+        assert_eq!(app.oneshot(post()).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            waiter
+                .response_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            UserQuestionResponse::Skipped
+        );
+    }
+
+    fn durable_approval_route_fixture(
+        state: &ApiState,
+    ) -> (
+        SessionId,
+        magi_conversation_runtime::tool_approval::ToolApprovalWaiter,
+    ) {
+        let (session, question) = question_route_fixture(state);
+        state
+            .conversation_registry
+            .user_questions()
+            .cancel(&question.request.question_id);
+        let turn_id = "turn-user-question-route";
+        state.session_store.append_current_turn_item_for_turn(&session,Some(turn_id),serde_json::from_value(json!({
+            "itemId":"approval-route-durable-item","itemSeq":2,"kind":"tool_call_started","status":"running",
+            "source":"orchestrator","sourceThreadId":"thread-main","taskId":"task-user-question-route",
+            "toolName":"shell_exec","toolCallId":"durable-approval-call","toolArguments":"{\"command\":\"publish\"}"
+        })).unwrap()).unwrap();
+        let request = PendingToolApproval {
+            approval_id: "approval-route-durable".into(),
+            session_id: session.clone(),
+            task_id: TaskId::new("task-user-question-route"),
+            turn_id: turn_id.into(),
+            tool_call_id: "durable-approval-call".into(),
+            tool_name: "shell_exec".into(),
+            reason: "发布".into(),
+            requested_at: UtcMillis::now(),
+            agent: None,
+        };
+        let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = state
+            .conversation_registry
+            .tool_approvals()
+            .request_persisted(
+                &state.session_store,
+                request,
+                r#"{"command":"publish"}"#,
+                None,
+                Value::Null,
+            )
+            .unwrap()
+        else {
+            panic!("approval should wait");
+        };
+        (session, *waiter)
+    }
+
+    #[tokio::test]
+    async fn durable_approval_route_restores_and_competing_decisions_commit_only_once() {
+        let original = test_state();
+        let (session, waiter) = durable_approval_route_fixture(&original);
+        original
+            .session_store
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        let store = Arc::new(
+            SessionStore::from_persisted_parts(
+                original.session_store.durable_state(),
+                original.session_store.execution_sidecar_store_state(),
+            )
+            .unwrap(),
+        );
+        drop(waiter);
+        let state = ApiState::new(
+            "approval-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            store.clone(),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let app = routes().with_state(state);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/session/tool-approvals?sessionId={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            payload["pendingApprovals"][0]["approvalId"],
+            "approval-route-durable"
+        );
+        let post = || {
+            Request::builder().method("POST").uri("/session/tool-approval").header("content-type","application/json").body(Body::from(json!({
+            "sessionId":session,"approvalId":"approval-route-durable","decision":"allow_once"
+        }).to_string())).unwrap()
+        };
+        let (first, second) = tokio::join!(app.clone().oneshot(post()), app.oneshot(post()));
+        let mut statuses = vec![
+            first.unwrap().status().as_u16(),
+            second.unwrap().status().as_u16(),
+        ];
+        statuses.sort();
+        assert_eq!(statuses, vec![200, 409]);
+        assert!(store.pending_tool_approvals(&session).unwrap().is_empty());
+        let turn = store
+            .canonical_turn_for_session_turn_id(&session, "turn-user-question-route")
+            .unwrap();
+        let approval = turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "approval-route-durable-item")
+            .unwrap()
+            .tool_approval()
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.decision, Some(ToolApprovalDecision::AllowOnce));
+        assert!(approval.execution.is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_approval_route_failed_commit_keeps_waiter_pending() {
+        struct FailDecision;
+        impl magi_session_store::SessionEventWriter for FailDecision {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                _: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(&magi_session_store::SessionAcceptanceRecord, Option<&Task>)>,
+            ) -> magi_core::DomainResult<()> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "injected approval fsync failure".into(),
+                })
+            }
+        }
+        let state = test_state();
+        let (session, waiter) = durable_approval_route_fixture(&state);
+        state
+            .session_store
+            .install_session_event_writer(Arc::new(FailDecision));
+        let app = routes().with_state(state.clone());
+        let response=app.oneshot(Request::builder().method("POST").uri("/session/tool-approval").header("content-type","application/json")
+            .body(Body::from(json!({"sessionId":session,"approvalId":"approval-route-durable","decision":"allow_once"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            waiter.decision_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state
+                .session_store
+                .pending_tool_approvals(&session)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .all(|event| event.event_type != "tool.approval.resolved")
+        );
+    }
+
+    #[tokio::test]
     async fn tool_approval_route_resolves_pending_runtime_call() {
         let state = test_state();
         let session_id = SessionId::new("session-tool-approval-route");
@@ -1610,8 +1754,8 @@ mod tests {
         let pending = PendingToolApproval {
             approval_id: "approval-route-1".to_string(),
             session_id: session_id.clone(),
-            task_id: TaskId::new("task-tool-approval-route"),
-            turn_id: "turn-tool-approval-route".to_string(),
+            task_id: TaskId::new("external:tool-approval-route"),
+            turn_id: "external:tool-approval-route:call".to_string(),
             tool_call_id: "call-tool-approval-route".to_string(),
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
@@ -1621,7 +1765,7 @@ mod tests {
         let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = state
             .conversation_registry
             .tool_approvals()
-            .request_with_arguments(pending, "{}")
+            .request_external_with_arguments(pending, "{}")
             .expect("approval should become pending")
         else {
             panic!("first approval request must wait");
@@ -1714,8 +1858,8 @@ mod tests {
         let pending = PendingToolApproval {
             approval_id: "approval-route-expired-1".to_string(),
             session_id: session_id.clone(),
-            task_id: TaskId::new("task-tool-approval-expired-route"),
-            turn_id: "turn-tool-approval-expired-route".to_string(),
+            task_id: TaskId::new("external:tool-approval-expired-route"),
+            turn_id: "external:tool-approval-expired-route:call".to_string(),
             tool_call_id: "call-tool-approval-expired-route".to_string(),
             tool_name: "file_write".to_string(),
             reason: "需要写入文件".to_string(),
@@ -1725,7 +1869,7 @@ mod tests {
         let approval_id = pending.approval_id.clone();
         let registry = state.conversation_registry.tool_approvals();
         let magi_conversation_runtime::ToolApprovalRequestOutcome::Pending(waiter) = registry
-            .request_with_arguments(pending, "{}")
+            .request_external_with_arguments(pending, "{}")
             .expect("approval should become pending")
         else {
             panic!("first approval request must wait");
@@ -1963,8 +2107,8 @@ mod tests {
             status: GoalStatus::Active,
             control_revision: 1,
             access_profile: AccessProfile::FullAccess,
-            token_budget: Some(4096),
             tokens_used: 1024,
+            model_attempts_used: 0,
             time_used_seconds: 30,
             time_used_millis: 30_000,
             timing_started_at: None,
@@ -1980,8 +2124,7 @@ mod tests {
 
         assert!(prompt.contains("完成任务系统升级并验证"));
         assert!(prompt.contains("Tokens used: 1024"));
-        assert!(prompt.contains("Token budget: 4096"));
-        assert!(prompt.contains("Tokens remaining: 3072"));
+        assert!(!prompt.contains("预算"));
         assert!(prompt.contains("update_plan"));
         assert!(prompt.contains("主对话输入区上方"));
         assert!(prompt.contains("必须先调用 get_goal"));
@@ -2214,6 +2357,7 @@ mod tests {
             steer_current_turn: false,
             expected_turn_id: None,
             replace_turn_id: None,
+            interrupt_turn_id: None,
             command: None,
             workflow_id: None,
             plugin_command_id: None,
@@ -2248,7 +2392,7 @@ mod tests {
         );
         let bare = compact_command_request(None);
         assert_eq!(bare.timeline_content(bare.trimmed_text().as_deref()), "");
-        assert!(!session_turn_request_is_plain_text(&request));
+        assert!(!session_turn_request_is_steerable_input(&request));
         assert_ne!(
             request.request_fingerprint().expect("fingerprint"),
             {
@@ -2402,7 +2546,6 @@ mod tests {
             for (index, text) in ["", "保留接口约束"].into_iter().enumerate() {
                 assert_eq!(queue["queuedTurns"][index]["command"], "compact");
                 assert_eq!(queue["queuedTurns"][index]["content"], text);
-                assert_eq!(queue["queuedTurns"][index]["canGuide"], false);
             }
         }
     }
@@ -2459,6 +2602,271 @@ mod tests {
             queue_id: queue_id.to_string(),
             retry_count: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_edit_preserves_identity_fifo_and_original_submission_replay() {
+        let state = test_state();
+        let workspace = register_workspace(&state, "workspace-queue-edit", "queue-edit");
+        let session = SessionId::new("session-queue-edit");
+        state
+            .session_store
+            .create_session_for_workspace(session.clone(), "编辑队列", Some(workspace.to_string()))
+            .unwrap();
+        let original = queued_regular_turn(&session, &workspace, "edit-first", UtcMillis(100));
+        state
+            .enqueue_regular_session_turn(original.clone())
+            .unwrap();
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session,
+                &workspace,
+                "edit-second",
+                UtcMillis(101),
+            ))
+            .unwrap();
+        let before = state
+            .session_store
+            .input_for_id(&session, "edit-first")
+            .unwrap();
+        let request = json!({
+            "sessionId": session, "workspaceId": workspace,
+            "queueId": "edit-first", "expectedRevision": before.revision,
+            "request": {"scope": "workspace", "sessionId": session, "workspaceId": workspace,
+                "text": "保存后的输入", "goalMode": true, "accessProfile": "read_only",
+                "images": [{"name": "input.png", "dataUrl": "data:image/png;base64,AA=="}]},
+        });
+        // 两个客户端重试同一保存，只有一次实际写入。
+        let ((status, body), (retry_status, retry_body)) = tokio::join!(
+            post_json(state.clone(), "/session/queue/update", request.clone()),
+            post_json(state.clone(), "/session/queue/update", request.clone()),
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+        assert_eq!(body, retry_body);
+        assert_eq!(body["queuedTurns"][0]["queueId"], "edit-first");
+        assert_eq!(body["queuedTurns"][1]["queueId"], "edit-second");
+        assert_eq!(body["queuedTurns"][0]["text"], "保存后的输入");
+        assert_eq!(body["queuedTurns"][0]["images"][0]["name"], "input.png");
+        assert_eq!(body["queuedTurns"][0]["goalMode"], true);
+        assert_eq!(body["queuedTurns"][0]["accessProfile"], "read_only");
+        let after = state
+            .session_store
+            .input_for_id(&session, "edit-first")
+            .unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        let mut expected = before;
+        expected.revision = after.revision;
+        expected.payload = after.payload.clone();
+        assert_eq!(after, expected, "只有内容和 revision 可变，不能重建 Input");
+        let replay = crate::turn_service::TurnService::new(state.clone())
+            .submit(original.request)
+            .await
+            .unwrap();
+        assert!(replay.replayed && replay.queued);
+        assert_eq!(
+            state.session_store.input_for_id(&session, "edit-first"),
+            Some(after.clone())
+        );
+
+        let mut competing = request.clone();
+        competing["request"]["text"] = json!("另一客户端的过期修改");
+        let (status, body) = post_json(state.clone(), "/session/queue/update", competing).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/queue/remove",
+            json!({
+                "sessionId": session, "workspaceId": workspace,
+                "queueId": "edit-first", "expectedRevision": after.revision - 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            state.session_store.input_for_id(&session, "edit-first"),
+            Some(after.clone()),
+            "另一客户端编辑后，旧版本删除不能撤销新内容"
+        );
+        // 入口不能借编辑改变投递/会话/模型或执行身份；失败不改变队列。
+        for (key, value) in [
+            ("sessionId", json!("another-session")),
+            (
+                "orchestratorSessionConfig",
+                json!({"model": "another-model"}),
+            ),
+            ("requestId", json!("another-request")),
+            ("userMessageId", json!("another-user")),
+            ("placeholderMessageId", json!("another-placeholder")),
+            ("resume", json!(true)),
+            ("steerCurrentTurn", json!(true)),
+            ("expectedTurnId", json!("another-turn")),
+            ("replaceTurnId", json!("another-turn")),
+            ("interruptTurnId", json!("another-turn")),
+            ("images", json!([{"name": "bad.png", "dataUrl": "invalid"}])),
+        ] {
+            let mut invalid = request.clone();
+            invalid["expectedRevision"] = json!(after.revision);
+            invalid["request"][key] = value;
+            let (status, body) = post_json(state.clone(), "/session/queue/update", invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {body}");
+            assert_eq!(
+                state.session_store.input_for_id(&session, "edit-first"),
+                Some(after.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_edit_resolves_original_workspace_binding_before_comparing_scope() {
+        let state = test_state();
+        let workspace = register_workspace(&state, "workspace-queue-edit-path", "queue-edit-path");
+        let session = SessionId::new("session-queue-edit-path");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session.clone(),
+                "路径绑定队列",
+                Some(workspace.to_string()),
+            )
+            .unwrap();
+        let path = crate::scope_binding::registered_workspace_path(&state, &workspace).unwrap();
+        let mut original = queued_regular_turn(&session, &workspace, "edit-path", UtcMillis(100));
+        original.request.workspace_id = None;
+        original.request.workspace_path = Some(path.clone());
+        state.enqueue_regular_session_turn(original).unwrap();
+        let before = state
+            .session_store
+            .input_for_id(&session, "edit-path")
+            .unwrap();
+        let snapshot = session_turn_queue_response(&state, &session);
+        let queued = &snapshot.queued_turns[0];
+        // 前端消费服务端投影时会带回解析后的 workspaceId；它与原始 path-only
+        // 请求属于同一项目，不能按原 JSON 字段是否缺省判成更换工作区。
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/queue/update",
+            json!({
+                "sessionId":session, "workspaceId":workspace, "queueId":queued.queue_id,
+                "expectedRevision":queued.revision,
+                "request":{"scope":"workspace", "sessionId":session,
+                    "workspaceId":queued.workspace_id, "workspacePath":queued.workspace_path,
+                    "text":"保存路径绑定消息"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = state
+            .session_store
+            .input_for_id(&session, "edit-path")
+            .unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.request_fingerprint, before.request_fingerprint);
+        let saved: QueuedRegularSessionTurn = serde_json::from_value(after.payload).unwrap();
+        assert!(saved.request.workspace_id.is_none(), "编辑不重写原创建身份");
+        assert_eq!(saved.request.workspace_path.as_deref(), Some(path.as_str()));
+        assert_eq!(saved.request.text.as_deref(), Some("保存路径绑定消息"));
+        let other = register_workspace(&state, "workspace-queue-edit-other", "queue-edit-other");
+        let (status, _) = post_json(
+            state.clone(),
+            "/session/queue/update",
+            json!({
+                "sessionId":session, "workspaceId":workspace, "queueId":queued.queue_id,
+                "expectedRevision":after.revision,
+                "request":{"scope":"workspace", "sessionId":session,
+                    "workspaceId":other, "text":"不能换项目"},
+            }),
+        )
+        .await;
+        assert!(status.is_client_error());
+        assert_eq!(
+            state
+                .session_store
+                .input_for_id(&session, "edit-path")
+                .unwrap()
+                .revision,
+            after.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_edit_cannot_overwrite_claimed_or_cancelled_input() {
+        let state = test_state();
+        let workspace =
+            register_workspace(&state, "workspace-queue-edit-claim", "queue-edit-claim");
+        let session = SessionId::new("session-queue-edit-claim");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session.clone(),
+                "编辑与领取竞争",
+                Some(workspace.to_string()),
+            )
+            .unwrap();
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .ensure_session_mission(&session, now, || MissionId::new("edit-claim"));
+        seed_conversation_turn(
+            &state,
+            &session,
+            "edit-claim-turn",
+            now.0,
+            now,
+            "running",
+            "当前工作",
+        );
+        state
+            .turn_coordinator()
+            .begin_session_turn_input(session.clone(), "edit-claim-turn".into())
+            .unwrap();
+        for (queue_id, cancelled) in [("edit-claimed", false), ("edit-cancelled", true)] {
+            state
+                .enqueue_regular_session_turn(queued_regular_turn(
+                    &session, &workspace, queue_id, now,
+                ))
+                .unwrap();
+            let before = state
+                .session_store
+                .input_for_id(&session, queue_id)
+                .unwrap();
+            if cancelled {
+                state
+                    .remove_regular_session_turn(&session, queue_id)
+                    .unwrap();
+            } else {
+                let (status, body) = post_json(
+                    state.clone(),
+                    "/session/queue/guide",
+                    json!({
+                        "sessionId": session, "workspaceId": workspace, "queueId": queue_id,
+                        "expectedRevision": before.revision, "expectedTurnId": "edit-claim-turn",
+                    }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            let bound = state
+                .session_store
+                .input_for_id(&session, queue_id)
+                .unwrap();
+            let (status, body) = post_json(state.clone(), "/session/queue/update", json!({
+                "sessionId": session, "workspaceId": workspace, "queueId": queue_id,
+                "expectedRevision": before.revision,
+                "request": {"scope": "workspace", "sessionId": session, "workspaceId": workspace, "text": "迟到编辑"},
+            })).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                state.session_store.input_for_id(&session, queue_id),
+                Some(bound)
+            );
+        }
+        assert_eq!(state.queued_regular_session_turn_count(&session), 0);
+        let steers = state
+            .turn_coordinator()
+            .drain_session_turn_steers(&session, "edit-claim-turn");
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].text.as_deref(), Some("queued edit-claimed"));
     }
 
     #[test]
@@ -3505,6 +3913,139 @@ mod tests {
         assert_eq!(output.status, ExecutionResultStatus::Cancelled);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taskless_conversation_controls_preserve_independent_agent_processes() {
+        for action in ["stop", "targeted_stop", "pause_goal"] {
+            let state = test_state();
+            let mut registry = ToolRegistry::new(state.governance.clone(), state.event_bus.clone());
+            registry.register_default_builtins();
+            let state = state.with_tool_registry(registry);
+            let workspace = register_workspace(
+                &state,
+                &format!("taskless-{action}"),
+                &format!("taskless-{action}"),
+            );
+            let session = SessionId::new(format!("taskless-conversation-{action}"));
+            state
+                .session_store
+                .create_session_for_workspace(
+                    session.clone(),
+                    "普通对话停止范围",
+                    Some(workspace.to_string()),
+                )
+                .unwrap();
+            let turn = format!("taskless-turn-{action}");
+            seed_conversation_turn(
+                &state,
+                &session,
+                &turn,
+                1,
+                UtcMillis(1),
+                "running",
+                "普通聊天",
+            );
+            let registry = state.tool_registry().unwrap().clone();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut runs = Vec::new();
+            for (index, task_id) in [None, Some(TaskId::new("independent-task"))]
+                .into_iter()
+                .enumerate()
+            {
+                let cwd = fixture.path().join(index.to_string());
+                std::fs::create_dir(&cwd).unwrap();
+                let context = ToolExecutionContext {
+                    session_id: Some(session.clone()),
+                    workspace_id: Some(workspace.clone()),
+                    task_id,
+                    working_directory: Some(cwd),
+                    access_profile: AccessProfile::FullAccess,
+                    ..Default::default()
+                };
+                let executor = registry.clone();
+                runs.push(std::thread::spawn(move || executor.execute_with_policy(
+                    ToolExecutionInput::for_builtin_invocation(ToolCallId::new(format!("taskless-shell-{index}")), "shell_exec",
+                        serde_json::json!({"command":"while [ ! -f ../release ]; do sleep 0.02; done; printf survives", "timeout_ms":10000}).to_string()),
+                    context, &ToolExecutionPolicy { access_profile: AccessProfile::FullAccess, ..Default::default() },
+                )));
+            }
+            let main_query =
+                magi_tool_runtime::ToolExecutionContextQuery::for_taskless_session(&session);
+            let agent_query = magi_tool_runtime::ToolExecutionContextQuery {
+                session_id: Some(session.clone()),
+                task_id: Some(TaskId::new("independent-task")),
+                ..Default::default()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !registry.has_active_executions(&main_query)
+                || !registry.has_active_executions(&agent_query)
+            {
+                if std::time::Instant::now() >= deadline {
+                    std::fs::write(fixture.path().join("release"), "release").unwrap();
+                    let results = runs
+                        .into_iter()
+                        .map(|run| run.join().unwrap())
+                        .collect::<Vec<_>>();
+                    panic!("资源未启动: {results:?}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let result = if action == "pause_goal" {
+                let (_, thread) =
+                    state
+                        .session_store
+                        .ensure_session_mission(&session, UtcMillis::now(), || {
+                            MissionId::new("taskless-goal")
+                        });
+                let goal = state
+                    .session_store
+                    .create_goal(
+                        session.clone(),
+                        thread,
+                        &turn,
+                        "暂停当前对话目标",
+                        AccessProfile::FullAccess,
+                    )
+                    .unwrap();
+                crate::goal_service::pause_current_goal(&state, serde_json::from_value(serde_json::json!({
+                    "sessionId":session, "scope":"workspace", "workspaceId":workspace, "goalId":goal.goal_id, "expectedRevision":goal.control_revision
+                })).unwrap()).await.map(|_| ())
+            } else {
+                crate::turn_service::interrupt_session_turn_with_expected(
+                    &state,
+                    &session,
+                    Some(workspace.as_str()),
+                    None,
+                    (action == "targeted_stop").then_some(turn.as_str()),
+                )
+                .await
+                .map(|_| ())
+            };
+            let agent_running = registry.has_active_executions(&agent_query);
+            std::fs::write(fixture.path().join("release"), "release").unwrap();
+            let results = tokio::task::spawn_blocking(move || {
+                runs.into_iter()
+                    .map(|run| run.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+            assert!(agent_running, "{action} 不能取消独立代理或等待其退出");
+            assert_eq!(
+                results[0].status,
+                ExecutionResultStatus::Cancelled,
+                "{results:?}"
+            );
+            assert_eq!(
+                results[1].status,
+                ExecutionResultStatus::Succeeded,
+                "{results:?}"
+            );
+            assert_eq!(registry.query_invocations(&main_query).len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn session_interrupt_publishes_terminal_canonical_payload() {
         let state = test_state();
@@ -3852,7 +4393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_session_checks_git_context_before_restarting_runner() {
+    async fn continue_defers_git_drift_validation_until_workspace_execution() {
         let state = test_state_with_pending_runner();
         let (workspace_id, workspace_root) = register_git_workspace(
             &state,
@@ -3952,7 +4493,6 @@ mod tests {
             .expect("initial Git context");
         state.release_session_git_execution_lease(&session_id);
         git(&workspace_root, &["switch", "-c", "external/branch"]);
-
         let (status, body) = post_json(
             state.clone(),
             "/session/continue",
@@ -3963,32 +4503,36 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::CONFLICT, "unexpected body: {body}");
-        assert!(
-            body["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("Git context 发生高风险变化")),
-            "unexpected body: {body}"
-        );
-        assert_eq!(
-            task_store
-                .get_task(&root_task_id)
-                .expect("root task")
-                .status,
-            TaskStatus::Running,
-            "Git 校验失败时不能重启或改写原执行链"
-        );
-        let observation = state
-            .git_service
-            .observe(&workspace_root)
-            .await
-            .expect("Git observation");
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let observation = state.git_service.observe(&workspace_root).await.unwrap();
         assert!(
             !state
                 .workspace_git_coordinator
-                .session_holds_execution(&session_id.to_string(), &observation.git_common_dir),
-            "继续前 Git 校验失败必须释放执行租约"
+                .session_holds_execution(session_id.as_str(), &observation.git_common_dir,),
+            "Continue 接纳不提前取得 Git 租约"
         );
+        let prepare = crate::task_dispatch::workspace_execution_preparer(&state);
+        let prepare_session = session_id.clone();
+        let turn_id = body["turnId"].as_str().unwrap().to_owned();
+        let error = tokio::task::spawn_blocking(move || {
+            prepare(&prepare_session, &Some(workspace_id), &turn_id)
+        })
+        .await
+        .unwrap()
+        .err()
+        .expect("首次工作区执行必须拒绝分支漂移");
+        assert!(error.contains("Git context 发生高风险变化"), "{error}");
+        assert!(
+            !state
+                .workspace_git_coordinator
+                .session_holds_execution(session_id.as_str(), &observation.git_common_dir,),
+            "准备失败必须释放执行租约"
+        );
+        state
+            .runner_manager()
+            .unwrap()
+            .quiesce_for_restart(root_task_id.as_str())
+            .await;
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -4026,7 +4570,6 @@ mod tests {
                 root_task_id.to_string(),
                 "恢复异常中断执行链并同步目标状态",
                 AccessProfile::FullAccess,
-                None,
             )
             .expect("goal should create");
 
@@ -4273,26 +4816,35 @@ mod tests {
             .turn_coordinator()
             .begin_session_turn_input(session_id.clone(), "turn-session-steer".to_string());
 
-        let (status, body) = post_json(
-            state.clone(),
-            "/session/turn",
-            serde_json::json!({
-                "scope": "workspace",
-                "workspaceId": workspace_id.as_str(),
-                "sessionId": session_id.as_str(),
-                "text": "优先收口，不要扩展",
-                "requestId": "request-session-steer",
-                "userMessageId": "user-session-steer",
-                "steerCurrentTurn": true,
-                "expectedTurnId": "turn-session-steer"
-            }),
-        )
-        .await;
+        let steer_request = serde_json::json!({
+            "scope": "workspace", "workspaceId": workspace_id.as_str(),
+            "sessionId": session_id.as_str(), "text": "优先收口，不要扩展",
+            "requestId": "request-session-steer", "userMessageId": "user-session-steer",
+            "steerCurrentTurn": true, "expectedTurnId": "turn-session-steer",
+        });
+        let (status, body) = post_json(state.clone(), "/session/turn", steer_request.clone()).await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["route"], "steer");
         assert_eq!(body["steeredTurnId"], "turn-session-steer");
         assert_eq!(body["userMessageItemId"], "user-session-steer");
+        assert_eq!(
+            body["requestId"], "request-session-steer",
+            "回执不能被根输入身份覆盖"
+        );
+        let (replay_status, replay) =
+            post_json(state.clone(), "/session/turn", steer_request.clone()).await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["requestId"], body["requestId"]);
+        assert_eq!(replay["userMessageItemId"], body["userMessageItemId"]);
+        assert_eq!(replay["steeredTurnId"], body["steeredTurnId"]);
+        assert_eq!(replay["route"], "steer");
+        assert_eq!(replay["canonicalEventKind"], "turn_item_upsert");
+        let mut conflicting = steer_request;
+        conflicting["text"] = json!("同一个 request 不允许更换输入");
+        let (conflict_status, _) = post_json(state.clone(), "/session/turn", conflicting).await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
         let drained = state
             .turn_coordinator()
             .drain_session_turn_steers(&session_id, "turn-session-steer");
@@ -4704,7 +5256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_session_turn_adopts_same_branch_git_fast_forward() {
+    async fn regular_session_turn_defers_fast_forward_adoption_until_workspace_execution() {
         let state = test_state_with_pending_runner();
         let (workspace_id, workspace_root) = register_git_workspace(
             &state,
@@ -4762,18 +5314,30 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["canonicalEventKind"], "turn_started");
-        let context = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(context) = state.session_code_contexts.get(session_id.as_str())
-                    && context.git.base_head.as_deref() == Some(advanced_head.as_str())
-                {
-                    break context;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        assert_ne!(
+            state
+                .session_code_contexts
+                .get(session_id.as_str())
+                .unwrap()
+                .git
+                .base_head
+                .as_deref(),
+            Some(advanced_head.as_str()),
+            "只接纳 Turn 不提前改变 Git 基线"
+        );
+        let prepare = crate::task_dispatch::workspace_execution_preparer(&state);
+        let prepare_session = session_id.clone();
+        let turn_id = body["turnId"].as_str().unwrap().to_owned();
+        tokio::task::spawn_blocking(move || {
+            prepare(&prepare_session, &Some(workspace_id), &turn_id)
         })
         .await
-        .expect("accepted turn preparation should adopt Git context");
+        .unwrap()
+        .expect("首次工作区执行准备采用安全快进");
+        let context = state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .unwrap();
         assert_eq!(
             context.git.base_head.as_deref(),
             Some(advanced_head.as_str())
@@ -4978,7 +5542,10 @@ mod tests {
         assert_eq!(payload["queuedTurns"][0]["queuePosition"], 1);
         assert_eq!(payload["queuedTurns"][0]["text"], "queued queue-route-a");
         // 会话没有运行中的轮次，排队消息没有可引导的对象。
-        assert_eq!(payload["queuedTurns"][0]["canGuide"], false);
+        assert_eq!(
+            payload["queuedTurns"][0]["guide"]["status"],
+            "no_active_turn"
+        );
 
         let (status, payload) = post_json(
             state.clone(),
@@ -5033,13 +5600,217 @@ mod tests {
             "accepted 后的读取必须等待出队事务完成"
         );
         state
-            .acknowledge_regular_session_turn(&session_id, "queue-commit")
+            .remove_regular_session_turn(&session_id, "queue-commit")
             .unwrap();
         drop(commit_guard);
         let Json(snapshot) = snapshot.await.unwrap();
         assert!(
             snapshot.queued_turns.is_empty(),
             "不得把已进入主线的消息重新显示为排队"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_request_waiting_for_delete_rechecks_session_scope() {
+        for remove in [false, true] {
+            let state = test_state();
+            let session_id = SessionId::new("session-queue-delete-race");
+            state
+                .session_store
+                .create_session(session_id.clone(), "delete race")
+                .unwrap();
+            let lifecycle = state.lock_session_lifecycle(&session_id).await;
+            let scope = SessionTurnQueueScope {
+                session_id: session_id.to_string(),
+                workspace_id: None,
+                workspace_path: None,
+            };
+            let request = async {
+                if remove {
+                    crate::input_service::remove_session_turn_queue_item(
+                        state.clone(),
+                        SessionTurnQueueItemRequest {
+                            session_id: session_id.to_string(),
+                            workspace_id: None,
+                            workspace_path: None,
+                            queue_id: "already-deleted-input".into(),
+                            expected_revision: None,
+                        },
+                    )
+                    .await
+                } else {
+                    crate::input_service::get_session_turn_queue(state.clone(), scope).await
+                }
+            };
+            tokio::pin!(request);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut request)
+                    .await
+                    .is_err()
+            );
+            state
+                .delete_session_and_resources_after_lifecycle_lock(&session_id, None)
+                .await
+                .unwrap();
+            drop(lifecycle);
+            assert!(
+                matches!(request.await, Err(ApiError::SessionNotFound(_))),
+                "a request queued behind deletion must return the original missing-session error"
+            );
+            assert!(state.session_store.session(&session_id).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_executor_preserves_queued_input_and_reports_guide_reason() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-executor-guide", "executor-guide");
+        let session_id = SessionId::new("session-executor-guide");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "executor guide",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        state
+            .session_store
+            .ensure_session_mission(&session_id, now, || {
+                MissionId::new("mission-executor-guide")
+            });
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-executor-guide",
+            now.0,
+            now,
+            "running",
+            "work",
+        );
+        state
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), "turn-executor-guide".into())
+            .unwrap();
+        let queued = queued_regular_turn(&session_id, &workspace_id, "queue-executor-guide", now);
+        state.enqueue_regular_session_turn(queued.clone()).unwrap();
+        let step = serde_json::from_value(json!({
+            "purpose":"execution", "stepId":"executor-step", "attempts":[{"attemptId":"executor-step:attempt:1", "startedAt":now.0, "settledAt":null, "status":"started"}],
+            "taskId":null,"threadId":"main","checkpointGeneration":0,
+            "requestFingerprint":"a".repeat(64),"provider":"plugin", "executorCapabilities": magi_bridge_client::text_executor_capabilities(),
+            "messageCount":1,"toolCount":0,"inputRequestIds":[],"startedAt":now.0,"settledAt":null,"status":"started","responseFingerprint":null
+        })).unwrap();
+        state
+            .session_store
+            .begin_model_step(&session_id, "turn-executor-guide", step)
+            .unwrap();
+        // 辅助模型即使支持引导，也不能替代主执行器的合同。
+        let compaction = serde_json::from_value(json!({
+            "purpose":"context_compaction","stepId":"compaction-step", "attempts":[{"attemptId":"compaction-step:attempt:1", "startedAt":now.0, "settledAt":null, "status":"started"}],
+            "taskId":null,"threadId":"main","checkpointGeneration":0,
+            "requestFingerprint":"b".repeat(64),"provider":"auxiliary", "executorCapabilities": magi_bridge_client::native_executor_capabilities(),
+            "messageCount":1,"toolCount":0,"inputRequestIds":[],"startedAt":now.0,"settledAt":null,"status":"started","responseFingerprint":null
+        })).unwrap();
+        state
+            .session_store
+            .begin_model_step(&session_id, "turn-executor-guide", compaction)
+            .unwrap();
+        let capability = crate::turn_service::session_turn_guide_capability(
+            &state,
+            &session_id,
+            &queued.request,
+        );
+        assert_eq!(
+            capability.status,
+            magi_app_server_protocol::generated::SessionTurnGuideStatus::UnsupportedExecutor
+        );
+        let (status, body) = post_json(state.clone(), "/session/queue/guide", json!({
+            "workspaceId":workspace_id.as_str(), "sessionId":session_id.as_str(),"queueId":"queue-executor-guide", "expectedTurnId":"turn-executor-guide"
+        })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(state.queued_regular_session_turns(&session_id).len(), 1);
+        assert!(
+            state
+                .turn_coordinator()
+                .drain_session_turn_steers(&session_id, "turn-executor-guide")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_executor_rejects_image_steer_without_consuming_queued_input() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-image-guide", "image-guide");
+        let session_id = SessionId::new("session-image-guide");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "image guide",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        state
+            .session_store
+            .ensure_session_mission(&session_id, now, || MissionId::new("mission-image-guide"));
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-image-guide",
+            now.0,
+            now,
+            "running",
+            "work",
+        );
+        state
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), "turn-image-guide".into())
+            .unwrap();
+        let mut queued = queued_regular_turn(&session_id, &workspace_id, "queue-image-guide", now);
+        queued.request.text = None;
+        queued.request.images = vec![crate::dto::SessionTurnImageDto {
+            name: "image.png".into(),
+            data_url: "data:image/png;base64,AA==".into(),
+        }];
+        state.enqueue_regular_session_turn(queued.clone()).unwrap();
+        let mut caps = magi_bridge_client::native_executor_capabilities();
+        caps.input_modalities = vec![magi_bridge_client::ExecutorInputModality::Text];
+        let step = serde_json::from_value(json!({
+            "purpose":"execution", "stepId":"text-step", "attempts":[{"attemptId":"text-step:attempt:1", "startedAt":now.0, "settledAt":null, "status":"started"}],
+            "taskId":null,"threadId":"main","checkpointGeneration":0,
+            "requestFingerprint":"a".repeat(64),"provider":"text-only", "executorCapabilities":caps,
+            "messageCount":1,"toolCount":0,"inputRequestIds":[],"startedAt":now.0,"settledAt":null,"status":"started","responseFingerprint":null
+        })).unwrap();
+        state
+            .session_store
+            .begin_model_step(&session_id, "turn-image-guide", step)
+            .unwrap();
+        assert_eq!(
+            crate::turn_service::session_turn_guide_capability(
+                &state,
+                &session_id,
+                &queued.request
+            )
+            .status,
+            magi_app_server_protocol::generated::SessionTurnGuideStatus::UnsupportedExecutor
+        );
+        let (status, body) = post_json(state.clone(), "/session/queue/guide", json!({
+            "workspaceId":workspace_id.as_str(),"sessionId":session_id.as_str(),"queueId":"queue-image-guide","expectedTurnId":"turn-image-guide"
+        })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let retained = state.queued_regular_session_turns(&session_id);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].request.images[0].data_url,
+            queued.request.images[0].data_url
+        );
+        assert!(
+            state
+                .turn_coordinator()
+                .drain_session_turn_steers(&session_id, "turn-image-guide")
+                .is_empty()
         );
     }
 
@@ -5086,11 +5857,24 @@ mod tests {
             .enqueue_regular_session_turn(queued.clone())
             .expect("queued turn should persist");
 
+        let (edit_status, edit) = post_json(state.clone(), "/session/queue/update", json!({
+            "sessionId":session_id,"workspaceId":workspace_id,"queueId":"queue-guide-once","expectedRevision":1,
+            "request":{"scope":"workspace","sessionId":session_id,"workspaceId":workspace_id,
+                "text":"edited queue-guide-once"},
+        })).await;
+        assert_eq!(edit_status, StatusCode::OK, "{edit}");
+        let revision = edit["queuedTurns"][0]["revision"].as_u64().unwrap();
         let guide_request = json!({
             "workspaceId": workspace_id.as_str(),
             "sessionId": session_id.as_str(),
-            "queueId": "queue-guide-once",
+            "queueId": "queue-guide-once", "expectedRevision": revision,
+            "expectedTurnId": "turn-queued-turn-guide",
         });
+        let mut stale_guide = guide_request.clone();
+        stale_guide["expectedRevision"] = json!(revision - 1);
+        let (stale_status, stale_body) =
+            post_json(state.clone(), "/session/queue/guide", stale_guide.clone()).await;
+        assert_eq!(stale_status, StatusCode::CONFLICT, "{stale_body}");
         let (status, body) =
             post_json(state.clone(), "/session/queue/guide", guide_request.clone()).await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
@@ -5099,7 +5883,7 @@ mod tests {
             .turn_coordinator()
             .drain_session_turn_steers(&session_id, "turn-queued-turn-guide");
         assert_eq!(steers.len(), 1);
-        assert_eq!(steers[0].text.as_deref(), Some("queued queue-guide-once"));
+        assert_eq!(steers[0].text.as_deref(), Some("edited queue-guide-once"));
         assert_eq!(
             steers[0].request_id.as_deref(),
             Some("request-queue-guide-once")
@@ -5109,7 +5893,35 @@ mod tests {
             Some("user-queue-guide-once")
         );
 
-        // 模拟 canonical 引导已提交、队列持久化删除尚未完成后的恢复重试。
+        let replay = crate::turn_service::TurnService::new(state.clone())
+            .submit(queued.request.clone())
+            .await
+            .expect("原始排队请求在转补充后仍可重放");
+        assert!(replay.replayed);
+        assert!(!replay.queued);
+        assert_eq!(
+            replay.request_id.as_deref(),
+            Some("request-queue-guide-once")
+        );
+        assert_eq!(
+            replay.user_message_item_id.as_deref(),
+            Some("user-queue-guide-once")
+        );
+        assert_eq!(
+            replay.steered_turn_id.as_deref(),
+            Some("turn-queued-turn-guide")
+        );
+        assert!(
+            state
+                .turn_coordinator()
+                .drain_session_turn_steers(&session_id, "turn-queued-turn-guide")
+                .is_empty()
+        );
+
+        let (stale_status, stale_body) =
+            post_json(state.clone(), "/session/queue/guide", stale_guide).await;
+        assert_eq!(stale_status, StatusCode::CONFLICT, "{stale_body}");
+        // 同一输入重试直接返回持久绑定回执，不会再次进入 FIFO。
         state
             .enqueue_regular_session_turn(queued)
             .expect("recovery queue should persist");
@@ -5128,6 +5940,100 @@ mod tests {
                 .is_empty(),
             "恢复重试不得重复写入引导信号"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_guide_keeps_input_when_the_displayed_target_changed_or_closed() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-guide-target", "guide-target");
+        let session_id = SessionId::new("session-guide-target");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "补充目标竞争",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+        state
+            .session_store
+            .ensure_session_mission(&session_id, UtcMillis(100), || {
+                MissionId::new("mission-guide-target")
+            });
+        seed_conversation_turn(
+            &state,
+            &session_id,
+            "turn-new-target",
+            1,
+            UtcMillis(100),
+            "running",
+            "新任务",
+        );
+        state
+            .turn_coordinator()
+            .begin_session_turn_input(session_id.clone(), "turn-new-target".into())
+            .unwrap();
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                "queue-guide-target",
+                UtcMillis(101),
+            ))
+            .unwrap();
+        let snapshot = session_turn_queue_response(&state, &session_id);
+        let guide = serde_json::to_value(&snapshot.queued_turns[0].guide).unwrap();
+        assert_eq!(guide["status"], "ready");
+        assert_eq!(guide["targetTurnId"], "turn-new-target");
+        assert_eq!(guide["effectiveAt"], "next_model_step");
+        assert_eq!(guide["inputSupport"]["text"], true);
+        assert_eq!(guide["inputSupport"]["images"], false);
+        for (expected, conflict) in [
+            ("turn-old-target", "expected_turn_mismatch"),
+            ("turn-new-target", "steer_unsupported"),
+        ] {
+            if expected == "turn-new-target" {
+                state
+                    .turn_coordinator()
+                    .close_session_turn_input(&session_id, expected);
+                assert_eq!(
+                    session_turn_queue_response(&state, &session_id).queued_turns[0]
+                        .guide
+                        .status,
+                    magi_app_server_protocol::generated::SessionTurnGuideStatus::InputClosed
+                );
+            }
+            let (status, body) = post_json(
+                state.clone(),
+                "/session/queue/guide",
+                json!({
+                    "workspaceId": workspace_id, "sessionId": session_id,
+                    "queueId": "queue-guide-target", "expectedTurnId": expected,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["conflict_kind"], conflict);
+            assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
+            assert!(
+                state
+                    .session_store
+                    .canonical_turn_for_request_id("request-queue-guide-target")
+                    .is_none()
+            );
+            assert!(
+                state
+                    .turn_coordinator()
+                    .drain_session_turn_steers(&session_id, "turn-new-target")
+                    .is_empty()
+            );
+        }
+        // 不带目标的旧请求必须安全拒绝，不能由服务端猜一个新目标。
+        let (status, _) = post_json(state.clone(), "/session/queue/guide", json!({
+            "workspaceId": workspace_id, "sessionId": session_id, "queueId": "queue-guide-target",
+        })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
     }
 
     #[tokio::test]
@@ -5165,6 +6071,7 @@ mod tests {
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "queueId": "queue-guide-structured",
+                "expectedTurnId": "turn-finished",
             }),
         )
         .await;
@@ -5193,6 +6100,7 @@ mod tests {
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "queueId": "queue-guide-no-active-turn",
+                "expectedTurnId": "turn-finished",
             }),
         )
         .await;
@@ -5286,7 +6194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_queue_acknowledges_only_matching_canonical_user_identity() {
+    async fn legacy_input_matching_canonical_identity_is_migrated_as_attached() {
         let state = test_state();
         let workspace_id = register_workspace(
             &state,
@@ -5374,7 +6282,7 @@ mod tests {
                 Some(workspace_id),
             )
             .await,
-            QueuedRegularSessionTurnDrainOutcome::Started,
+            QueuedRegularSessionTurnDrainOutcome::Empty,
         );
         assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
         assert_eq!(
@@ -5664,7 +6572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_goal_keeps_queued_messages_waiting_until_the_goal_stops() {
+    async fn active_goal_yields_the_next_turn_to_queued_user_input() {
         let state = test_state();
         let workspace_id = register_workspace(
             &state,
@@ -5679,18 +6587,14 @@ mod tests {
                 "目标与排队",
                 Some(workspace_id.to_string()),
             )
-            .expect("session should create");
-        assert!(
-            !goal_continuation_takes_priority(&state, &session_id),
-            "没有目标时排队消息照常出队"
-        );
+            .unwrap();
         let (_, thread_id) =
             state
                 .session_store
                 .ensure_session_mission(&session_id, UtcMillis::now(), || {
                     MissionId::new("mission-goal-queue-priority")
                 });
-        let goal = state
+        state
             .session_store
             .create_goal(
                 session_id.clone(),
@@ -5698,26 +6602,47 @@ mod tests {
                 "turn-goal-queue-priority",
                 "分析当前项目",
                 magi_core::AccessProfile::Restricted,
-                None,
             )
-            .expect("goal should create");
-        assert!(
-            goal_continuation_takes_priority(&state, &session_id),
-            "目标正在推进时，下一轮属于目标续跑，排队消息不能插队"
-        );
+            .unwrap();
         state
-            .session_store
-            .stop_goal_for_runtime_failure(
+            .enqueue_regular_session_turn(queued_regular_turn(
                 &session_id,
-                &goal.goal_id,
-                None,
-                "turn-goal-queue-priority",
-                "目标停下来了",
+                &workspace_id,
+                "queue-before-auto-goal",
+                UtcMillis::now(),
+            ))
+            .unwrap();
+        schedule_next_queued_regular_session_turn(
+            state.clone(),
+            session_id.clone(),
+            Some(workspace_id),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.queued_regular_session_turn_count(&session_id) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("用户输入不应等 Goal 结束");
+        let turn = state
+            .session_store
+            .canonical_turn_for_request_id("request-queue-before-auto-goal")
+            .expect("下一轮必须绑定用户排队消息");
+        assert!(canonical_turn_matches_queued_regular_turn(
+            &turn,
+            &queued_regular_turn(
+                &session_id,
+                &WorkspaceId::new("workspace-goal-queue-priority"),
+                "queue-before-auto-goal",
+                UtcMillis(0),
             )
-            .expect("goal should stop");
+        ));
         assert!(
-            !goal_continuation_takes_priority(&state, &session_id),
-            "目标受阻 / 暂停后，排队消息按顺序继续发送"
+            state.session_store.active_goal(&session_id).is_some(),
+            "处理用户输入不应暗中终止目标"
         );
     }
 
@@ -5748,7 +6673,6 @@ mod tests {
                 "turn-goal-retry-1",
                 "分析当前项目",
                 magi_core::AccessProfile::Restricted,
-                None,
             )
             .expect("goal should create");
         assert_eq!(goal_runtime_retry_backoff(&state, &session_id), None);
@@ -6092,7 +7016,6 @@ mod tests {
                 "turn-existing-goal-required-chain",
                 "完成已有目标",
                 magi_core::AccessProfile::Restricted,
-                None,
             )
             .expect("unfinished goal should create");
 
@@ -6327,7 +7250,6 @@ mod tests {
                     turn_id: "turn-delete-runtime-resources".to_string(),
                     workspace_id: Some(workspace_id.clone()),
                     execution_root: None,
-                    ownership: ExecutionOwnership::default(),
                     writebacks: ExecutionWritebackPlans::default(),
                     use_tools: true,
                     skill_name: None,
@@ -6338,7 +7260,7 @@ mod tests {
             .expect("execution plan should register");
         state
             .conversation_registry
-            .conversation_for_task(&session_id, &child_task.task_id);
+            .open_task_signal_channel(&session_id, &child_task.task_id);
         state
             .settings_store
             .set_session_section(

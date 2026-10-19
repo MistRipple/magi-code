@@ -1,20 +1,19 @@
 //! 任务系统 - Conversation Runtime
 //!
-//! 提供 Task Conversation 的运行时 Mailbox、SessionTurnCoordinator 与 Turn 执行骨架。
-//! 普通 Session Turn 由 Coordinator/TurnService 接纳；Task worker 才绑定
-//! Conversation、Mailbox 与当前 Turn 槽位。
+//! SessionTurnCoordinator 接纳主线输入，TaskStore 管理任务与租约；
+//! 原生主任务和子代理共用模型/工具循环及任务信号通道。
 
 #![recursion_limit = "256"]
 
+mod agent_activation;
 mod agent_receipt;
 mod agent_spawn_preflight;
 mod builtin_tool_schema;
 mod context_authority;
 pub mod context_reference;
-mod conversation;
 pub mod conversation_loop;
+mod discovery_progress;
 pub mod dispatch_submission;
-mod driver;
 pub mod execution_admission;
 pub mod execution_chain_recovery;
 pub mod external_approval;
@@ -26,6 +25,7 @@ mod mailbox;
 pub mod model_config;
 pub mod model_context_window;
 pub mod model_error;
+mod model_step;
 pub mod prompt_utils;
 mod registry;
 pub mod session_images;
@@ -38,6 +38,7 @@ mod skill_apply_tool;
 mod skill_custom_tool_surface;
 pub mod task_completion_notifier;
 pub mod task_execution_dispatcher;
+mod task_execution_guard;
 pub mod task_execution_registry;
 pub mod task_helpers;
 pub mod task_runner;
@@ -49,7 +50,6 @@ mod tool_declared_paths;
 mod tool_execution_ledger;
 pub mod tool_result_utils;
 mod tool_surface_state;
-mod turn;
 pub mod turn_contract;
 pub mod turn_stream_buffer;
 pub mod usage_recording;
@@ -59,10 +59,8 @@ pub mod web_history_import;
 pub use builtin_tool_schema::{
     internal_builtin_tool_rejection_payload, public_builtin_tool_definitions,
 };
-pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
-pub use driver::{RoundOutcome, TurnDriver};
 pub use human_wait::{HumanWait, HumanWaitGate, HumanWaitHook};
-pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
+pub use mailbox::{MailboxAuthor, MailboxKind, RuntimeSignal, UserSignal};
 pub use registry::{ConversationRegistry, TaskSignalBoundary, TaskSignalCommitError};
 pub use session_turn_coordinator::{
     CoordinatorAdmission, CoordinatorCommandResult, CoordinatorError, CoordinatorTurnStatus,
@@ -85,12 +83,8 @@ pub use task_execution_dispatcher::safety_gate_from_settings;
 pub use task_helpers::{
     GoalModeLifecycleState, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
-    collect_dependency_output_validation_facts, compact_validation_failure,
-    deterministic_execution_tool_validation_content, deterministic_planning_content,
-    deterministic_planning_validation_content, deterministic_task_final_content, extract_task_goal,
-    forced_task_tool_choice_for_round, goal_mode_required_tool_chain,
+    compact_validation_failure, forced_task_tool_choice_for_round, goal_mode_required_tool_chain,
     goal_mode_requires_terminalization, goal_mode_tool_batch_violation,
-    is_execution_tool_validation, is_planning_no_tool_action, is_planning_text_validation,
     record_completed_required_tools, required_tool_chain_is_complete,
     required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
     strict_goal_mode_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
@@ -101,7 +95,6 @@ pub use tool_approval::{
     ToolApprovalRegistry, ToolApprovalRequestOutcome,
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;
-pub use turn::{Turn, TurnState, TurnTransitionError};
 pub use turn_contract::{TaskRunRecord, TurnCommand, TurnEventEnvelope, TurnRecord};
 pub use user_question::{
     PendingUserQuestion, UserQuestion, UserQuestionAnswer, UserQuestionOption,

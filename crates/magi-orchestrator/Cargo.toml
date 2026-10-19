@@ -12,6 +12,7 @@ magi-context-runtime = { path = "../magi-context-runtime" }
 magi-memory-store = { path = "../magi-memory-store" }
 serde_json.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,12 +1,38 @@
-use crate::{
-    SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions,
-    builtin_tool_schema::public_builtin_tool_definition, parse_skill_custom_tool_name,
-};
+use crate::{SKILL_APPLY_TOOL_NAME, builtin_tool_schema::public_builtin_tool_definition};
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_browser_authority::BrowserCapabilitySnapshot;
 use magi_core::{AccessProfile, ExecutionResultStatus};
-use magi_skill_runtime::{SkillRuntime, SkillSelection};
+use magi_skill_runtime::SkillRuntime;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
+
+/// 初始与按需刷新后的工具面共用 Task 的显式限制；Skill/宿主不能重新加入已禁止的工具。
+pub(crate) fn constrain_task_tool_definitions(
+    mut definitions: Vec<ChatToolDefinition>,
+    task_policy: Option<&magi_core::TaskPolicy>,
+) -> Vec<ChatToolDefinition> {
+    if let Some(policy) = task_policy {
+        if policy.command_mode.eq_ignore_ascii_case("no_tools") {
+            return Vec::new();
+        }
+        let mut scope = magi_tool_runtime::ToolExecutionPolicy::default();
+        scope.apply_task_policy(policy);
+        definitions.retain(|definition| {
+            scope
+                .tool_name_rejection(&definition.function.name)
+                .is_none()
+        });
+    }
+    crate::task_helpers::enforce_agent_coordination_surface(definitions)
+}
+
+fn active_skill_allowed_tools(
+    runtime: Option<&SkillRuntime>,
+    active_id: Option<&str>,
+) -> Option<Vec<String>> {
+    let policy =
+        crate::active_skill_tool_execution_policy(AccessProfile::ReadOnly, runtime, active_id);
+    policy.allowed_tool_names
+}
 
 pub(crate) struct BrowserToolSurfaceSnapshot {
     pub definitions: Vec<ChatToolDefinition>,
@@ -53,17 +79,8 @@ pub(crate) fn build_browser_tool_surface(
             capability: None,
         };
     };
-    let skill_allowed_tools = context.active_skill_id.and_then(|skill_id| {
-        context.skill_runtime.and_then(|runtime| {
-            let policy = runtime
-                .build_tool_runtime_plan(SkillSelection {
-                    skill_ids: vec![skill_id.to_string()],
-                    requested_tools: Vec::new(),
-                })
-                .tool_policy;
-            (!policy.source_skill_ids.is_empty()).then_some(policy.allowed_tool_names)
-        })
-    });
+    let skill_allowed_tools =
+        active_skill_allowed_tools(context.skill_runtime, context.active_skill_id);
     let registered_public_tools = tool_registry
         .public_builtin_specs()
         .into_iter()
@@ -118,42 +135,20 @@ pub(crate) fn activated_skill_id_from_tool_result(
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn activate_skill_tool_definitions(
-    mut definitions: Vec<ChatToolDefinition>,
-    skill_runtime: &SkillRuntime,
-    skill_id: &str,
-    access_profile: AccessProfile,
-    preserved_builtin_tools: &[&str],
-) -> Vec<ChatToolDefinition> {
-    let plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
-        skill_ids: vec![skill_id.to_string()],
-        requested_tools: Vec::new(),
-    });
-    let standard_tool_allowlist = (!plan.tool_policy.source_skill_ids.is_empty())
-        .then_some(plan.tool_policy.allowed_tool_names.as_slice());
-    definitions.retain(|definition| {
-        let name = definition.function.name.as_str();
-        if name == SKILL_APPLY_TOOL_NAME || parse_skill_custom_tool_name(name).is_some() {
-            return false;
-        }
-        if BuiltinToolName::from_name(name).is_some() {
-            return preserved_builtin_tools.contains(&name)
-                || standard_tool_allowlist.is_none_or(|allowed_tools| {
-                    allowed_tools.iter().any(|allowed| allowed == name)
-                });
-        }
-        if name.starts_with("mcp__") {
-            return standard_tool_allowlist
-                .is_none_or(|allowed_tools| allowed_tools.iter().any(|allowed| allowed == name));
-        }
-        true
-    });
-    definitions.extend(build_skill_custom_tool_definitions(
-        skill_id,
-        &plan,
-        access_profile,
-    ));
-    definitions
+/// 原生循环和工作流都先提交 Skill 限制，再发布工具成功或继续下一步。
+pub(crate) fn persist_task_skill_activation(
+    registry: &crate::task_execution_registry::TaskExecutionRegistry,
+    sessions: &magi_session_store::SessionStore,
+    task_id: &magi_core::TaskId,
+    session_id: &magi_core::SessionId,
+    turn_id: Option<&str>,
+    skill_id: String,
+    persist: Option<&crate::session_writeback::SessionStatePersistCallback>,
+) -> Result<(), String> {
+    let turn_id = turn_id.ok_or_else(|| "Skill 激活缺少执行 Turn".to_string())?;
+    registry.update_active_skill(task_id, sessions, session_id, turn_id, skill_id)?;
+    // 主线限制位于 sidecar，不能放进普通工具进度的异步合并窗口。
+    crate::session_writeback::persist_session_state_checkpoint(persist, "task_skill_activated")
 }
 
 pub(crate) struct RefreshLiveMcpToolDefinitionsInput<'a> {
@@ -186,20 +181,12 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         !definition.function.name.starts_with("mcp__")
             && !definition.function.name.starts_with("plugin__")
     });
-    let skill_allowed_tools = active_skill_id.and_then(|skill_id| {
-        skill_runtime.and_then(|runtime| {
-            let policy = runtime
-                .build_tool_runtime_plan(SkillSelection {
-                    skill_ids: vec![skill_id.to_string()],
-                    requested_tools: Vec::new(),
-                })
-                .tool_policy;
-            (!policy.source_skill_ids.is_empty()).then_some(policy.allowed_tool_names)
-        })
-    });
+    let skill_allowed_tools = active_skill_allowed_tools(skill_runtime, active_skill_id);
     if include_external {
         for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
-            if (access_profile == AccessProfile::ReadOnly && !tool.read_only)
+            if magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
+                == Some(ExecutionResultStatus::Rejected)
+                || !tool_registry.external_mcp_tool_executor_available()
                 || denied_tools
                     .iter()
                     .any(|denied| denied == &tool.model_tool_name)
@@ -245,7 +232,8 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
         }
     }
     for tool in tool_registry.plugin_tool_catalog(workspace_id) {
-        if (access_profile == AccessProfile::ReadOnly && !tool.read_only)
+        if magi_tool_runtime::external_tool_access_decision(tool.read_only, access_profile)
+            == Some(ExecutionResultStatus::Rejected)
             || denied_tools
                 .iter()
                 .any(|denied| denied == &tool.model_tool_name)
@@ -286,7 +274,6 @@ pub(crate) fn refresh_live_mcp_tool_definitions_with_mode(
 mod tests {
     use super::*;
     use magi_browser_authority::{BrowserCapabilitySnapshot, BrowserHostStatus};
-    use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -401,129 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn successful_skill_activation_replaces_apply_surface_with_skill_tools() {
-        let registry = SkillRegistry::new();
-        registry.register(SkillDefinition {
-            skill_id: "code-review".to_string(),
-            title: "代码审查".to_string(),
-            instruction: "检查关键缺陷。".to_string(),
-            metadata: SkillMetadata {
-                category: "quality".to_string(),
-                tags: vec![],
-            },
-            restrict_standard_tools: true,
-            allowed_tools: vec!["file_read".to_string()],
-            custom_tool_bindings: vec![],
-            prompt_priority: 50,
-        });
-        let runtime = SkillRuntime::new(registry);
-        let definitions = vec![
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: SKILL_APPLY_TOOL_NAME.to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::Builtin,
-            },
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: "file_read".to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::Builtin,
-            },
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: "file_write".to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::Builtin,
-            },
-        ];
-
-        let activated = activate_skill_tool_definitions(
-            definitions,
-            &runtime,
-            "code-review",
-            AccessProfile::Restricted,
-            &[],
-        );
-        let names = activated
-            .iter()
-            .map(|definition| definition.function.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["file_read"]);
-    }
-
-    #[test]
-    fn prompt_only_skill_activation_keeps_standard_tool_surface() {
-        let registry = SkillRegistry::new();
-        registry.register(SkillDefinition {
-            skill_id: "prompt-only".to_string(),
-            title: "Prompt Only".to_string(),
-            instruction: "先取证，再回答。".to_string(),
-            metadata: SkillMetadata {
-                category: "workflow".to_string(),
-                tags: vec![],
-            },
-            restrict_standard_tools: false,
-            allowed_tools: vec![],
-            custom_tool_bindings: vec![],
-            prompt_priority: 50,
-        });
-        let runtime = SkillRuntime::new(registry);
-        let definitions = vec![
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: SKILL_APPLY_TOOL_NAME.to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::Builtin,
-            },
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: "file_read".to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::Builtin,
-            },
-            ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: "mcp__repo__inspect".to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({ "type": "object" }),
-                },
-                origin: ChatToolOrigin::ExternalMcp,
-            },
-        ];
-
-        let activated = activate_skill_tool_definitions(
-            definitions,
-            &runtime,
-            "prompt-only",
-            AccessProfile::Restricted,
-            &[],
-        );
-        let names = activated
-            .iter()
-            .map(|definition| definition.function.name.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["file_read", "mcp__repo__inspect"]);
-    }
-
-    #[test]
     fn read_only_surface_exposes_only_mcp_tools_with_read_only_annotation() {
         let registry = ToolRegistry::new(
             std::sync::Arc::new(magi_governance::GovernanceService::default()),
@@ -553,6 +417,9 @@ mod tests {
                 ],
                 ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
             }
+        }))
+        .with_external_mcp_tool_executor(std::sync::Arc::new(|_, _, _| {
+            ("{}".into(), ExecutionResultStatus::Succeeded)
         }));
 
         let definitions =
@@ -594,6 +461,31 @@ mod tests {
                 }],
                 ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
             }
+        }));
+
+        let unavailable =
+            refresh_live_mcp_tool_definitions_with_mode(RefreshLiveMcpToolDefinitionsInput {
+                definitions: Vec::new(),
+                tool_registry: &registry,
+                skill_runtime: None,
+                active_skill_id: None,
+                access_profile: AccessProfile::FullAccess,
+                allowed_tools: None,
+                denied_tools: &[],
+                include_external: true,
+                workspace_id: None,
+            });
+        assert!(
+            unavailable.is_empty(),
+            "目录没有执行器时不能发布模型 schema"
+        );
+        let catalog = registry.tool_catalog_value("{}", &Default::default());
+        assert_eq!(
+            catalog["mcp_tools"][0]["reason_code"],
+            "runtime_unavailable"
+        );
+        let registry = registry.with_external_mcp_tool_executor(std::sync::Arc::new(|_, _, _| {
+            ("{}".into(), ExecutionResultStatus::Succeeded)
         }));
 
         let first_round =

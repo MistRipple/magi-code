@@ -54,7 +54,6 @@ globalThis.fetch = async (url) => {
         threadId: 'thread-goal-store-golden',
         objective: '验证 Goal store 刷新',
         status: 'complete',
-        tokenBudget: 256000,
         tokensUsed: 1024,
         timeUsedSeconds: 3,
         createdAt: 1780000000000,

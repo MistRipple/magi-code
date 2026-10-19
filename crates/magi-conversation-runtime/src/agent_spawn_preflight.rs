@@ -21,7 +21,7 @@ use crate::{
     model_config::configured_role_engine_model_config,
     task_execution_dispatcher::{RoleTarget, resolve_target_for_role},
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::task_is_coordinator,
+    task_helpers::{AGENT_SPAWN_LIFECYCLE_TOOLS, task_can_delegate},
 };
 
 pub(crate) const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 4_000;
@@ -30,19 +30,7 @@ pub(crate) const AGENT_CONTEXT_CONSTRAINT_MAX_CHARS: usize = 600;
 pub(crate) const AGENT_CONTEXT_PREVIEW_MAX_CHARS: usize = 600;
 pub(crate) const AGENT_CONTEXT_REFERENCE_LIMIT: usize = 16;
 pub(crate) const AGENT_SPAWN_GOAL_MAX_CHARS: usize = 20_000;
-
-const AGENT_SPAWN_FIELDS: &[&str] = &[
-    "task_name",
-    "plan_item_id",
-    "role",
-    "capabilities",
-    "display_name",
-    "goal",
-    "context_package",
-    "working_dir",
-    "parallelism_group",
-    "inherit_skill",
-];
+pub(crate) const AGENT_SPAWN_DUPLICATE_INSTRUCTION: &str = "先用 agent_wait 核对 existing_task_id 的原始目标与状态；同一工作不得仅换名重派。运行中补充用 agent_send，确属不同的新工作包时才重新判断委派价值并使用新名字。";
 
 const GENERAL_ENGINEERING_CAPABILITY: &str = "general_engineering";
 
@@ -52,6 +40,7 @@ pub(crate) struct AgentSpawnPreflightError {
     pub(crate) failure_stage: String,
     pub(crate) message: String,
     pub(crate) instruction: String,
+    pub(crate) existing_task_id: Option<TaskId>,
 }
 
 impl AgentSpawnPreflightError {
@@ -65,6 +54,7 @@ impl AgentSpawnPreflightError {
             failure_stage: "input_validation".to_string(),
             message: message.into(),
             instruction: instruction.into(),
+            existing_task_id: None,
         }
     }
 
@@ -79,12 +69,18 @@ impl AgentSpawnPreflightError {
             failure_stage: stage.into(),
             message: message.into(),
             instruction: instruction.into(),
+            existing_task_id: None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentSpawnPreflight {
+    pub(crate) delegation: magi_tool_runtime::AgentDelegationDecision,
+    pub(crate) delegation_allowed: bool,
+    pub(crate) agent_lifetime: magi_core::AgentLifetime,
+    pub(crate) previous_activation: Option<magi_core::AgentActivation>,
+    pub(crate) previous_task_id: Option<TaskId>,
     pub(crate) task_name: String,
     pub(crate) canonical_task_name: String,
     pub(crate) role: String,
@@ -114,8 +110,56 @@ pub(crate) struct AgentSpawnPreflightInput<'a> {
     pub(crate) plan_store: &'a PlanStore,
     pub(crate) session_id: &'a magi_core::SessionId,
     pub(crate) workspace_id: &'a Option<WorkspaceId>,
+    pub(crate) execution_root: Option<&'a PathBuf>,
     pub(crate) now: UtcMillis,
     pub(crate) sequence: u64,
+}
+
+fn validate_lifecycle_tools(
+    parent_task: &Task,
+    execution_registry: &TaskExecutionRegistry,
+    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+) -> Result<(), AgentSpawnPreflightError> {
+    let active_skill = execution_registry
+        .get(&parent_task.task_id)
+        .map(|plan| match plan {
+            TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name,
+        })
+        .unwrap_or_else(|| {
+            parent_task
+                .executor_binding_active_skill_id()
+                .map(str::to_owned)
+        });
+    let skill_policy = crate::active_skill_tool_execution_policy(
+        parent_task
+            .policy_snapshot
+            .as_ref()
+            .map(TaskPolicy::effective_access_profile)
+            .unwrap_or_default(),
+        skill_runtime,
+        active_skill.as_deref(),
+    );
+    for required in AGENT_SPAWN_LIFECYCLE_TOOLS {
+        if skill_policy
+            .tool_name_rejection(required.as_str())
+            .is_some()
+            || parent_task.policy_snapshot.as_ref().is_some_and(|policy| {
+                crate::tool_batch::policy_tool_decision(policy, required.as_str(), "{}", None)
+                    .is_some()
+            })
+        {
+            return Err(AgentSpawnPreflightError::runtime(
+                "agent_lifecycle_tool_unavailable",
+                "authorization",
+                format!(
+                    "当前 Task/Skill 不允许 {}，无法可靠收集或取消新代理",
+                    required.as_str()
+                ),
+                "由当前任务直接完成；确需代理时调整授权或 Skill，使 agent_wait 和 agent_cancel 均可用。不要换名、换角色或通过嵌套绕过当前范围。",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn preflight_agent_spawn(
@@ -131,6 +175,7 @@ pub(crate) fn preflight_agent_spawn(
         plan_store,
         session_id,
         workspace_id,
+        execution_root,
         now,
         sequence,
     } = input;
@@ -142,17 +187,23 @@ pub(crate) fn preflight_agent_spawn(
             "请使用 agent_spawn 的完整 JSON Schema 重新提交对象参数。",
         ));
     };
-    if let Some(unknown) = object
-        .keys()
-        .find(|key| !AGENT_SPAWN_FIELDS.contains(&key.as_str()))
-    {
-        return Err(AgentSpawnPreflightError::input(
+    let delegation = magi_tool_runtime::AgentDelegationDecision::from_arguments(parsed)
+        .map_err(|message| AgentSpawnPreflightError::input(
+            "invalid_delegation_decision", message,
+            "先判断是否有独立委派价值；确需派发时按 delegation Schema 给出 purpose、reason，parallel_work 另给出 parent_work，否则由当前任务直接完成。"))?;
+    // 直接入口与模型响应使用同一目录 Schema；业务预检只补充动态事实检查，
+    // 不再维护另一份字段白名单或接受 Schema 已禁止的 null/二次编码形式。
+    crate::tool_call_validation::validate_json_schema_value(
+        parsed,
+        &magi_tool_runtime::BuiltinToolName::AgentSpawn.parameters_schema(),
+    )
+    .map_err(|message| {
+        AgentSpawnPreflightError::input(
             "invalid_arguments",
-            format!("agent_spawn 不支持字段 {unknown}"),
-            "请移除未知字段，并按当前 agent_spawn Schema 重新提交。",
-        ));
-    }
-
+            message,
+            "请按当前 agent_spawn Schema 提供结构化参数；不能说明委派收益时由当前任务直接完成。",
+        )
+    })?;
     let task_name = required_string(object, "task_name")?;
     if !valid_agent_task_name(&task_name) {
         return Err(AgentSpawnPreflightError::input(
@@ -163,16 +214,18 @@ pub(crate) fn preflight_agent_spawn(
     }
     let parent_canonical_name = parent_task.canonical_task_name().unwrap_or("/root");
     let canonical_task_name = child_canonical_task_name(parent_canonical_name, &task_name);
-    if task_store
+    if let Some(existing) = task_store
         .get_children(&parent_task.task_id)
         .iter()
-        .any(|child| child.canonical_task_name() == Some(canonical_task_name.as_str()))
+        .find(|child| child.canonical_task_name() == Some(canonical_task_name.as_str()))
     {
-        return Err(AgentSpawnPreflightError::input(
+        let mut error = AgentSpawnPreflightError::input(
             "duplicate_task_name",
             format!("同一父任务下 task_name 已存在: {task_name}"),
-            "请生成一个未使用的 task_name 后重新调用 agent_spawn。",
-        ));
+            AGENT_SPAWN_DUPLICATE_INSTRUCTION,
+        );
+        error.existing_task_id = Some(existing.task_id.clone());
+        return Err(error);
     }
 
     let role = required_string(object, "role")?;
@@ -256,7 +309,7 @@ pub(crate) fn preflight_agent_spawn(
     let parallelism_group = optional_nonempty_string(object, "parallelism_group")?;
     let working_dir = parse_working_dir(object)?;
     let inherit_skill = match object.get("inherit_skill") {
-        None | Some(serde_json::Value::Null) => false,
+        None => false,
         Some(serde_json::Value::Bool(value)) => *value,
         Some(_) => {
             return Err(AgentSpawnPreflightError::input(
@@ -266,6 +319,33 @@ pub(crate) fn preflight_agent_spawn(
             ));
         }
     };
+    let delegation_allowed = match object.get("allow_delegation") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(AgentSpawnPreflightError::input(
+                "invalid_arguments",
+                "allow_delegation 必须是布尔值",
+                "主线需要显式允许嵌套时传 true，否则省略。",
+            ));
+        }
+    };
+    if parent_task.parent_task_id.is_some() && delegation_allowed {
+        return Err(AgentSpawnPreflightError::runtime(
+            "delegation_depth_exceeded",
+            "execution_context",
+            "最多允许两层代理，孙代理不能继续委派",
+            "由当前代理直接完成或把拆分请求交给父任务。",
+        ));
+    }
+    if parent_task.parent_task_id.is_some() && plan_item_id.is_some() {
+        return Err(AgentSpawnPreflightError::runtime(
+            "shared_plan_binding_forbidden",
+            "execution_context",
+            "子代理不能把嵌套任务绑定到主线共享计划",
+            "省略 plan_item_id，由主线管理共享计划。",
+        ));
+    }
     let mut context_package = parse_agent_context_package(parsed, &parent_task.task_id, now, sequence)
         .map_err(|message| {
             AgentSpawnPreflightError::input(
@@ -275,6 +355,12 @@ pub(crate) fn preflight_agent_spawn(
             )
         })?;
 
+    let runtime = execution_registry.agent_spawn_preflight_runtime();
+    validate_lifecycle_tools(
+        parent_task,
+        execution_registry,
+        runtime.skill_runtime.as_deref(),
+    )?;
     validate_execution_chain(
         parent_task,
         task_store,
@@ -283,7 +369,16 @@ pub(crate) fn preflight_agent_spawn(
         workspace_id,
         agent_role_registry,
     )?;
-    let runtime = execution_registry.agent_spawn_preflight_runtime();
+    execution_registry
+        .validate_spawn_skill_inheritance(&parent_task.task_id, inherit_skill)
+        .map_err(|message| {
+            AgentSpawnPreflightError::runtime(
+                "parent_skill_scope_required",
+                "authorization",
+                message,
+                "保留原任务与工具范围，使用 inherit_skill=true 重新派发。",
+            )
+        })?;
     let model_source = preflight_model(
         execution_registry,
         parent_task,
@@ -297,6 +392,7 @@ pub(crate) fn preflight_agent_spawn(
         parent_task,
         session_id,
         workspace_id,
+        execution_root,
         working_dir.as_ref(),
         &runtime,
     )?;
@@ -316,8 +412,39 @@ pub(crate) fn preflight_agent_spawn(
         sequence,
     );
 
-    let child_policy_snapshot =
-        agent_spawn_child_policy_snapshot(parent_task.policy_snapshot.as_ref());
+    // TaskStore 保存逻辑路径授权；执行时才投影到各自 worktree，不能继承父 worktree 的物理白名单。
+    let persisted_parent = task_store.get_task(&parent_task.task_id);
+    let child_policy_snapshot = agent_spawn_child_policy_snapshot(
+        persisted_parent
+            .as_ref()
+            .and_then(|task| task.policy_snapshot.as_ref())
+            .or(parent_task.policy_snapshot.as_ref()),
+    );
+    let lifetime = optional_nonempty_string(object, "lifetime")?;
+    let previous_task_id = optional_nonempty_string(object, "resume_task_id")?;
+    let (agent_lifetime, previous_activation) = crate::agent_activation::preflight_activation(
+        crate::agent_activation::ActivationPreflight {
+            task_store, session_store, session_id, parent: parent_task, role: &role,
+            capabilities: &capability_ids, lifetime: lifetime.as_deref(),
+            previous_task_id: previous_task_id.as_deref(),
+        },
+    ).map_err(|message| AgentSpawnPreflightError::runtime(
+        "agent_activation_rejected", "activation", message,
+        "使用同会话 Agent 的最新已完成 task_id；活跃代理用 agent_send 补充，权限或目标归属变化时创建新代理。",
+    ))?;
+    if delegation_allowed
+        && previous_task_id
+            .as_ref()
+            .and_then(|id| task_store.get_task(&TaskId::new(id)))
+            .is_some_and(|source| !source.delegation_allowed())
+    {
+        return Err(AgentSpawnPreflightError::runtime(
+            "agent_activation_rejected",
+            "activation",
+            "不能在继续旧 Agent 时增加委派权限",
+            "需要新增委派权限时创建新 Agent，不使用 resume_task_id。",
+        ));
+    }
     let child_access_profile = child_policy_snapshot.effective_access_profile();
     let child_dependency_ids = agent_spawn_child_dependency_ids(parent_task);
     let child_input_refs = context_package
@@ -327,6 +454,11 @@ pub(crate) fn preflight_agent_spawn(
         .collect();
 
     Ok(AgentSpawnPreflight {
+        delegation,
+        delegation_allowed,
+        agent_lifetime,
+        previous_activation,
+        previous_task_id: previous_task_id.map(TaskId::new),
         task_name,
         canonical_task_name,
         role,
@@ -382,13 +514,10 @@ fn optional_nonempty_string(
     let Some(value) = object.get(field) else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
     let Some(value) = value.as_str() else {
         return Err(AgentSpawnPreflightError::input(
             "invalid_arguments",
-            format!("agent_spawn {field} 必须是字符串或 null"),
+            format!("agent_spawn {field} 必须是字符串"),
             format!("请将 {field} 改为 JSON string，或省略该字段。"),
         ));
     };
@@ -411,14 +540,11 @@ fn parse_capabilities(
     let Some(value) = object.get("capabilities") else {
         return default_capabilities(registry, role);
     };
-    if value.is_null() {
-        return default_capabilities(registry, role);
-    }
     let Some(values) = value.as_array() else {
         return Err(AgentSpawnPreflightError::input(
             "invalid_arguments",
-            "agent_spawn capabilities 必须是数组或 null",
-            "请省略 capabilities 使用角色默认能力，或传入字符串数组。",
+            "agent_spawn capabilities 必须是数组",
+            "请省略 capabilities 仅激活 general_engineering，或传入该角色支持的能力 id 字符串数组。",
         ));
     };
     if values.is_empty() {
@@ -499,9 +625,6 @@ fn parse_working_dir(
     let Some(value) = object.get("working_dir") else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
     let Some(value) = value.as_str() else {
         return Err(AgentSpawnPreflightError::input(
             "invalid_arguments",
@@ -528,17 +651,24 @@ fn validate_execution_chain(
     workspace_id: &Option<WorkspaceId>,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
 ) -> Result<(), AgentSpawnPreflightError> {
-    if parent_task.parent_task_id.is_some()
-        || parent_task.root_task_id != parent_task.task_id
-        || task_role_is_not_root_coordinator(parent_task, agent_role_registry)
-    {
+    if !task_can_delegate(Some(parent_task), Some(agent_role_registry)) {
         return Err(AgentSpawnPreflightError::runtime(
-            "parent_not_root_coordinator",
+            "delegation_not_granted",
             "execution_context",
-            "只有当前任务树根节点的 coordinator 可以创建子代理",
-            "请回到 root coordinator 主线派发代理，不要在 Worker 中继续创建子代理。",
+            "当前任务未获得派发子代理的委派权限",
+            "请由主线派发，或在创建当前代理时显式设置 allow_delegation=true。",
         ));
     }
+    task_store
+        .validate_agent_delegation(parent_task)
+        .map_err(|error| {
+            AgentSpawnPreflightError::runtime(
+                "delegation_depth_exceeded",
+                "execution_context",
+                error.to_string(),
+                "最多两层代理；请由当前代理直接完成或向父任务请求拆分。",
+            )
+        })?;
     let Some(chain) = session_store.active_execution_chain(session_id) else {
         return Err(AgentSpawnPreflightError::runtime(
             "active_execution_chain_missing",
@@ -595,14 +725,6 @@ fn validate_execution_chain(
         ));
     }
     Ok(())
-}
-
-fn task_role_is_not_root_coordinator(
-    task: &Task,
-    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
-) -> bool {
-    !task_is_coordinator(Some(task), Some(agent_role_registry))
-        || task.executor_binding_target_role() != Some("coordinator")
 }
 
 fn preflight_model(
@@ -692,6 +814,7 @@ fn preflight_workspace_and_git(
     parent_task: &Task,
     session_id: &magi_core::SessionId,
     workspace_id: &Option<WorkspaceId>,
+    execution_root: Option<&PathBuf>,
     working_dir: Option<&PathBuf>,
     runtime: &crate::task_execution_registry::AgentSpawnPreflightRuntime,
 ) -> Result<Option<PathBuf>, AgentSpawnPreflightError> {
@@ -704,9 +827,13 @@ fn preflight_workspace_and_git(
         .session_code_contexts
         .as_ref()
         .and_then(|registry| registry.get(session_id.as_str()));
-    let workspace_root = context
-        .as_ref()
-        .map(|context| context.execution_root.clone())
+    let workspace_root = execution_root
+        .cloned()
+        .or_else(|| {
+            context
+                .as_ref()
+                .map(|context| context.execution_root.clone())
+        })
         .or_else(|| {
             workspace_id.as_ref().and_then(|workspace_id| {
                 runtime.workspace_registry.as_ref().and_then(|registry| {
@@ -954,22 +1081,15 @@ pub(crate) fn parse_agent_context_package(
     now: UtcMillis,
     sequence: u64,
 ) -> Result<AgentContextPackage, String> {
-    let context_package = match parsed.get("context_package") {
-        Some(serde_json::Value::Object(_)) => parsed
-            .get("context_package")
-            .cloned()
-            .expect("context_package object should remain present"),
-        Some(serde_json::Value::String(encoded)) => {
-            serde_json::from_str(encoded).map_err(|_| {
-                "agent_spawn 的 context_package 必须是对象或可解析为对象的 JSON 字符串".to_string()
-            })?
-        }
-        Some(_) => return Err("agent_spawn 的 context_package 必须是结构化对象".to_string()),
-        None => return Err("agent_spawn 缺少结构化 context_package".to_string()),
-    };
-    let value = context_package
+    // Schema 只允许结构化对象。旧版本接受 JSON 字符串会让模型看到的合同与
+    // 直接执行预检分叉，也会把二次编码的上下文重新引入运行时；该兼容入口已移除。
+    let value = parsed
+        .get("context_package")
+        .ok_or_else(|| "agent_spawn 缺少结构化 context_package".to_string())?
         .as_object()
-        .ok_or_else(|| "agent_spawn 的 context_package 必须是结构化对象".to_string())?;
+        .ok_or_else(|| {
+            "agent_spawn 的 context_package 必须是结构化对象，不能二次编码为字符串".to_string()
+        })?;
     for key in value.keys() {
         if !matches!(
             key.as_str(),
@@ -1309,6 +1429,9 @@ mod tests {
             "task_name": "legacy_context",
             "role": "executor",
             "goal": "执行旧格式代理任务",
+            "display_name": "旧格式代理",
+            "delegation": {"purpose":"user_requested", "reason":"验收明确要求检查旧参数拒绝"},
+            "context_package": {"summary":"旧参数检查", "constraints":[], "expected_output":"拒绝未知字段", "references":[]},
             "context": "旧版字符串上下文",
         });
         let workspace_id = None;
@@ -1323,6 +1446,7 @@ mod tests {
             plan_store: &plan_store,
             session_id: &session_id,
             workspace_id: &workspace_id,
+            execution_root: None,
             now: UtcMillis(2),
             sequence: 1,
         })
@@ -1338,5 +1462,36 @@ mod tests {
                 ))
                 .is_none()
         );
+
+        // 缺失/伪造的决策在角色、模型、Git 预检和任何注册写入前拒绝。
+        for decision in [
+            None,
+            Some(serde_json::json!({"purpose":"long_task", "reason":"many files"})),
+            Some(serde_json::json!({"purpose":"parallel_work", "reason":"independent work"})),
+            Some(serde_json::json!({"purpose":"independent_review", "reason":" "})),
+        ] {
+            let mut parsed = serde_json::json!({"task_name":"invalid_decision", "role":"executor"});
+            if let Some(decision) = decision {
+                parsed["delegation"] = decision;
+            }
+            let error = preflight_agent_spawn(AgentSpawnPreflightInput {
+                parsed: &parsed,
+                parent_task: &parent_task,
+                task_store: &task_store,
+                session_store: &session_store,
+                execution_registry: &execution_registry,
+                agent_role_registry: &agent_role_registry,
+                plan_store: &plan_store,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                execution_root: None,
+                now: UtcMillis(3),
+                sequence: 2,
+            })
+            .unwrap_err();
+            assert_eq!(error.error_code, "invalid_delegation_decision");
+            assert!(task_store.all_tasks().is_empty());
+            assert!(session_store.runtime_sidecar(&session_id).is_none());
+        }
     }
 }

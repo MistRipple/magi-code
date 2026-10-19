@@ -85,11 +85,11 @@ pub enum BuiltinToolName {
     GitWorktreeCreate,
     GitWorktreeRemove,
     // ── Goal 目标模式（会话级一等产品实体）──
-    /// 读取当前会话的目标状态、预算与记账信息。
+    /// 读取当前会话的目标状态与累计用量。
     GetGoal,
     /// 创建当前会话的主动目标。一个会话同一时间只能存在一个未结束目标。
     CreateGoal,
-    /// 将当前会话目标标记为完成或阻塞；暂停、预算限制等由系统状态控制。
+    /// 将当前会话目标标记为完成或阻塞；暂停等由系统状态控制。
     UpdateGoal,
     // ── 协调器（任务系统 L10，仅 coordinator_mode 角色可见）──
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
@@ -124,12 +124,88 @@ pub enum BuiltinToolName {
     AskUserQuestion,
 }
 
+/// 工具的模型调用范围。目录、schema 过滤与执行入口共用；授权和资源预检另行执行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinToolModelScope {
+    SessionOrTask,
+    TaskOnly,
+    SessionMainlineOrCoordinatorTask,
+    CoordinatorTaskOnly,
+    DelegatorTaskOnly,
+    WorkerTaskOnly,
+    RuntimeOnly,
+}
+
+impl BuiltinToolModelScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionOrTask => "session_or_task",
+            Self::TaskOnly => "task_only",
+            Self::SessionMainlineOrCoordinatorTask => "session_mainline_or_coordinator_task",
+            Self::CoordinatorTaskOnly => "coordinator_task_only",
+            Self::DelegatorTaskOnly => "delegator_task_only",
+            Self::WorkerTaskOnly => "worker_task_only",
+            Self::RuntimeOnly => "runtime_only_use_shell_exec",
+        }
+    }
+
+    pub const fn allows(
+        self,
+        has_task: bool,
+        is_root_coordinator: bool,
+        can_delegate: bool,
+    ) -> bool {
+        match self {
+            Self::SessionOrTask => true,
+            Self::TaskOnly => has_task,
+            Self::SessionMainlineOrCoordinatorTask => !has_task || is_root_coordinator,
+            Self::CoordinatorTaskOnly => has_task && is_root_coordinator,
+            Self::DelegatorTaskOnly => has_task && can_delegate,
+            Self::WorkerTaskOnly => has_task && !is_root_coordinator,
+            Self::RuntimeOnly => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestrictedWriteProfilePolicy {
     AutoAllowed,
 }
 
 impl BuiltinToolName {
+    pub const fn model_call_scope(self) -> BuiltinToolModelScope {
+        use BuiltinToolModelScope as Scope;
+        match self {
+            Self::AgentSpawn
+            | Self::AgentSend
+            | Self::AgentCancel
+            | Self::AgentWait
+            | Self::AgentApply => Scope::DelegatorTaskOnly,
+            Self::MemoryWrite => Scope::CoordinatorTaskOnly,
+            Self::ContextSearch | Self::ContextRead | Self::ContextRequest => Scope::WorkerTaskOnly,
+            Self::GetGoal
+            | Self::CreateGoal
+            | Self::UpdateGoal
+            | Self::UpdatePlan
+            | Self::GitBranchCreate
+            | Self::GitBranchSwitch
+            | Self::GitPull
+            | Self::GitPush
+            | Self::GitMergePreview
+            | Self::GitMerge
+            | Self::GitBranchDelete
+            | Self::GitWorktreeCreate
+            | Self::GitWorktreeRemove => Scope::SessionMainlineOrCoordinatorTask,
+            Self::AskUserQuestion => Scope::TaskOnly,
+            Self::ProcessLaunch
+            | Self::ProcessRead
+            | Self::ProcessWrite
+            | Self::ProcessKill
+            | Self::ProcessList => Scope::RuntimeOnly,
+            _ => Scope::SessionOrTask,
+        }
+    }
+
     pub const ALL: [Self; 82] = [
         Self::FileRead,
         Self::ViewImage,
@@ -518,6 +594,47 @@ impl BuiltinToolName {
                 | Self::GitWorktreeCreate
                 | Self::GitWorktreeRemove
         )
+    }
+
+    /// 首次会话工作区执行需要建立变更账本、校验 Git 基线并取得执行租约。
+    /// 单纯文件读取/检索与网络、Browser 工具不应触发全仓扫描。
+    pub fn requires_workspace_execution_preparation(&self, arguments: &str) -> bool {
+        !self.is_background_process_observation(arguments)
+            && (self.captures_workspace_changes()
+                || matches!(
+                    self,
+                    Self::AgentSpawn
+                        | Self::AgentApply
+                        | Self::ImageGenerate
+                        | Self::ProcessLaunch
+                        | Self::ProcessWrite
+                        | Self::ProcessKill
+                        | Self::GitStatus
+                        | Self::GitBranchList
+                        | Self::GitBranchCreate
+                        | Self::GitBranchSwitch
+                        | Self::GitPull
+                        | Self::GitPush
+                        | Self::GitMergePreview
+                        | Self::GitMerge
+                        | Self::GitBranchDelete
+                        | Self::GitWorktreeList
+                        | Self::GitWorktreeCreate
+                        | Self::GitWorktreeRemove
+                ))
+    }
+
+    /// 观察已归属的进程/Job，不执行命令，不应扫描或创建工作副本。
+    pub fn is_background_process_observation(&self, arguments: &str) -> bool {
+        *self == Self::ShellExec
+            && serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.get("action").and_then(serde_json::Value::as_str),
+                        Some("read" | "wait" | "list")
+                    )
+                })
     }
 
     pub fn is_write_operation(&self) -> bool {
@@ -959,7 +1076,7 @@ impl BuiltinToolName {
                 # 何时用\n\
                 - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、查 PID\n\
                 - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
-                - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\
+                - 启动后台命令时设置 background=true；后续用同一个 shell_exec 和 job_id 管理；需要等完成时用 action=wait，按已提交事件唤醒并返回输出，避免反复 read 轮询\n\
                 - 后台启动会观察约 0.3 秒：命令立刻退出（命令不存在、端口被占用等）会以失败返回并附带输出；action=read 返回 stdout_next_offset / stderr_next_offset，下次传 stdout_offset / stderr_offset 只读新增输出\n\
                 - 前台命令超时返回 shell_exec_timeout，非零退出返回 shell_exec_nonzero_exit，按 instruction 处理，不要原样重复执行\n\
                 - 验证 Web 项目时，用 background=true 启动项目已有的开发服务，从输出确认真实监听 URL，再用 browser_navigate 和其他 browser_* 工具完成页面验收\n\n\
@@ -1015,18 +1132,19 @@ impl BuiltinToolName {
             Self::ToolCatalog => {
                 "列出 Magi 工具目录与健康状态。\n\n\
                 # 何时用\n\
-                - 需要确认当前运行时有哪些内置工具、skill 绑定工具、MCP server 状态、agent_spawn 可派发角色\n\
+                - 需要确认当前运行时有哪些内置工具、skill 绑定工具、MCP/插件工具、MCP server 状态、agent_spawn 可派发角色\n\
                 - 需要诊断工具 schema 是否完整，或区分模型可见工具、外接工具与运行时内部工具\n\n\
                 # 何时不用\n\
                 - 已知道具体工具且要完成任务 → 直接调用对应工具\n\n\
                 # 说明\n\
                 - 内置工具读取 BuiltinToolName::ALL 单一注册源\n\
                 - `runtime_internal=true` 只表示必须由对应运行时路由执行，不表示模型不可调用；请以每项 `model_call_scope` 和当前请求实际收到的 tools 定义为准\n\
-                - `model_call_scope=coordinator_task_only` 的 agent_spawn / agent_send / agent_wait 只能由任务执行链中的 root coordinator 调用，普通会话和 goal 主线不会收到这些工具\n\
-                - 外接工具只读取 daemon 注入的 skill/MCP 运行时快照，不扫描文件系统"
+                - `model_call_scope=delegator_task_only` 的 agent_spawn / agent_send / agent_wait / agent_cancel 由 root coordinator 或显式获授 allow_delegation 的代理调用；最多两层代理，管理范围仅限自己的直接子任务\n\
+                - MCP/插件条目的 availability、reason_code 和 model_available 来自当前任务/Skill 范围、访问模式与执行器可用性；needs_approval 表示仍需授权，schema_included 不表示已加载到本轮 tools\n\
+                - 外接工具只读取 daemon 注入的 skill/MCP/插件运行时快照，不扫描文件系统"
             }
             Self::GitStatus => {
-                "读取当前主对话绑定的 repository、worktree、branch、HEAD、upstream、ahead/behind、dirty 与 conflict 状态。该工具只观察，不接受外部 Git 漂移为新基线。"
+                "读取当前调用者获授工作目录的 repository、worktree、branch、HEAD、upstream、ahead/behind、dirty 与 conflict 状态。子代理只查询自己的执行目录，不更新主会话 Git context；主线查询不接受外部 Git 漂移为新基线。"
             }
             Self::GitBranchList => {
                 "列出当前 repository 的本地分支，可选包含远程跟踪分支，并返回当前分支、HEAD 和各分支被哪个 worktree 占用。"
@@ -1062,65 +1180,25 @@ impl BuiltinToolName {
                 "移除由 Magi 管理的 Git worktree。不能删除当前 worktree；dirty worktree 的强制移除必须由用户明确二次确认。"
             }
             Self::GetGoal => {
-                "读取当前会话的 Goal 状态、预算和累计用量。用于长目标推进前确认当前目标是否仍 active，或在继续执行前判断是否已 complete / blocked / budget_limited。"
+                "读取当前会话的 Goal 状态和累计用量。用于长目标推进前确认当前目标是否仍 active，或在继续执行前判断是否已 complete / blocked / paused。"
             }
             Self::CreateGoal => {
-                "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、预算记账和终止状态；同一会话同一时间只能存在一个未结束 Goal。token_budget 必须显式传值：用户没有指定预算时传 null，只有用户原文明示 token 预算时才传对应整数。"
+                "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、用量统计和终止状态；同一会话同一时间只能存在一个未结束 Goal。"
             }
             Self::UpdateGoal => {
                 "更新当前会话 Goal 的终态。调用前必须用 get_goal 取得 goal_id、control_revision 与绑定计划 revision；没有绑定计划时 expected_plan_revision 传 null。complete 必须提供完成摘要；blocked 必须提供稳定 blocker_key 与原因，服务端只在同一阻塞连续三个 Goal Turn 出现后进入 blocked。"
             }
             Self::AgentSpawn => {
-                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。capabilities 可省略，省略时由服务端按目标角色的能力集合自动补齐；显式提供时必须属于该角色。必须同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
-                # 何时用\n\
-                - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
-                - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
-                - 多个子工作可并行执行节省时间\n\n\
-                # 主线与代理分工\n\
-                - 先判断当前关键路径应由主线直接推进，还是适合拆出代理并行工作\n\
-                - 主线可以直接分析、读写文件、运行命令和验证；不要把 1-3 步即可完成的任务强行派发代理\n\
-                - 代理适合处理边界清晰、可并行、不阻塞主线下一步的专项任务\n\
-                - 代理运行中，主线应继续推进不重叠工作；不要空等，也不要重复做已经委派的同一件事\n\n\
-                # 专业能力\n\
-                - capabilities 只能从“可派发角色”清单中目标角色的能力里选择；省略时只激活 general_engineering\n\
-                - 任务明确属于某个领域时显式传入对应能力；跨领域任务可以同时激活多项\n\n\
-                # 执行容量\n\
-                - 容量上限以系统提示中的“执行容量”说明为准；超出时返回 queued，代理已创建并会在有名额后自动开始\n\n\
-                # 访问模式\n\
-                - 子代理继承当前主线由用户选择的访问模式，不能被提升\n\
-                - 声明只读的角色（见“可派发角色”清单）由运行时以只读模式执行，写入类工具会被拒绝；需要修改文件时派发可写角色\n\n\
-                # 何时不用\n\
-                - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
-                - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
-                - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
-                # display_name 写法\n\
-                - 长度 3-30 个字符，前端代理卡片直接展示\n\
-                - 如果用户明确给出了 display_name 或要求使用某个代理名称，必须原样使用该名称，不要自行改写、缩短或泛化\n\
-                - 如果用户同时指定 role / display_name，把这些值视为强制参数契约逐项转写；不要替换 role、不要重命名、不要把两个代理合并成一个\n\
-                - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
-                - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
-                - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
-                # 反例\n\
-                - ❌ 派 executor 去「改一行配置」→ 启动开销远超价值\n\
-                - ❌ 派 reviewer 去「看看代码好不好」（边界模糊、验收不清）\n\
-                - ✅ 派 reviewer 审查具体 PR：「审查 commits abc..def 的安全性，按通过 / 不通过给结论」\n\
-                - ✅ 派 executor 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」\n\n\
-                # 返回结果处理\n\
-                - 返回 `status=started` 时，记录 `child_task_id`，后续通过 `agent_wait` 等待和收集结果\n\
-                - 不要在依赖代理结果的情况下直接给最终答复；必须先调用 `agent_wait`\n\
-                - agent_wait 返回 `child_status=completed` 时，`result.final_text` 是该代理的最终答复，`assignment.goal` 是你派给它的原始目标，`activity` 是运行时记录的实际执行事实\n\
-                - 同一轮多个代理返回后，先按任务合并结论、证据、风险与缺口，再生成主线最终答复；不要把多个代理输出原样拼贴给用户\n\
-                - agent_wait 回执 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
-                - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
+                "【root coordinator 或显式获授委派权限的代理可调用】向已注册角色派发独立子任务。默认由主线直接完成；按运行时共享唤起规则判断用户明确要求、并行、上下文隔离或必要独立复核的价值。capabilities 可省略，省略时只激活 general_engineering；显式提供时必须属于该角色。必须提供 delegation 决策和结构化 context_package（直接 JSON 对象）；决策只说明收益，不授予权限。子代理不自动继承主对话历史。当前 Task/Skill 必须允许 agent_wait 和 agent_cancel，不能创建无法收集或取消的代理。立即返回 child_task_id；依赖结果时用 agent_wait，运行中补充用 agent_send。queued 表示已创建，不得重复派发；duplicate_task_name 应核对 existing_task_id 的原始目标和状态，不能仅换名重派。显式 lifetime=session/goal 可保留身份，新的委派确有价值时才用 resume_task_id 继续；普通后续步骤由当前代理完成。失败后按回执核对产物和副作用，再决定接管或重新委派。"
             }
             Self::AgentSend => {
                 "向当前任务直接派发、尚未结束的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增：运行中的代理在下一次模型轮次前收到；排队中的代理在开始执行时随上下文包一起收到。"
             }
             Self::AgentCancel => {
-                "取消当前任务直接派发、尚未结束的代理：终止该代理及其子树，释放其进程、浏览器租约和并发名额。用于代理方向错误、已不再需要或长时间无进展的情况；取消后该代理在 agent_wait 中返回 child_status=killed。"
+                "取消当前任务直接派发的代理及其子树。用于方向错误、已不再需要或长时间无进展的情况。results 返回与 agent_wait 相同的终态回执；already_terminal 保留原结果。任务终态与资源退出分别核对：仅 resources_settled=true 确认执行线程与资源已退出；cancel_unsettled 或 false 时不能执行冲突的替代工作，可再次调用本工具核对结算。取消不保证此前没有副作用，先核对原产物，再按共享恢复规则判断后续工作。"
             }
             Self::AgentApply => {
-                "把已完成代理分支上的改动应用到主线工作树。代理从派发时主线工作树的快照出发，运行时在代理结束时把它的改动提交到代理分支；本工具把“快照→代理分支”的差异应用到主线当前工作树，不产生提交、不改 index。任一文件无法干净应用时整体拒绝并返回 conflicted_paths，主线工作树保持原样；此时可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理改动后手动合并。"
+                "把直接子代理已完成分支上的改动应用到当前任务工作树。主线应用到主工作树，受委派代理只应用到自己的活动副本。代理从首次本地执行时直接父任务工作树的快照出发，运行时在代理结束时把它的改动提交到代理分支；本工具把“快照→代理分支”的差异应用到调用者当前工作树，不产生提交、不改 index。任一文件无法干净应用时整体拒绝并返回 conflicted_paths，调用者工作树保持原样；此时可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理改动后手动合并。"
             }
             Self::AgentWait => {
                 "等待一个或多个已派发代理结束，并返回每个已结束代理的结构化回执。用于收集 agent_spawn 创建的代理结果；只有下一步依赖代理结果时才调用，不要轮询式重复调用。\n\n\
@@ -1131,7 +1209,7 @@ impl BuiltinToolName {
                 # 返回结果处理\n\
                 - `results[]` 只包含已结束的代理，返回即视为已收集；`pending_task_ids` 是仍在运行的代理\n\
                 - `result.final_text` 是代理最终答复，对照 `assignment.goal` 判断是否达成；`activity` 是运行时记录的执行事实（实际运行的命令与退出码、改动文件、工具失败次数），用它核实代理的自述\n\
-                - `child_status=failed/killed`：判断是否改派或由主线接管，不要把单个代理失败当作整体失败\n\
+                - `child_status=failed/killed`：按共享恢复规则先核对产物与副作用，再判断接管或是否仍有独立委派价值\n\
                 - `status=timed_out`：可先处理已返回的结果和不依赖未结束代理的工作，需要时再等待，或用 agent_cancel 取消不再需要的代理\n\
                 - `status=attention_required`：先处理 runtime_signals（如代理的上下文请求）再继续等待"
             }
@@ -1139,7 +1217,7 @@ impl BuiltinToolName {
                 "按需检索当前 session 的用户/助手可见消息、同一执行链任务输出与证据，以及当前 AgentContextPackage 引用。只返回引用、预览与 token 估算；需要正文时继续调用 context_read。"
             }
             Self::ContextRead => {
-                "读取 context_search 或 AgentContextPackage 返回的引用正文。引用必须属于当前 session、workspace 与同一 root task；单次最多读取 8 条。"
+                "读取 context_search 或 AgentContextPackage 返回的引用正文。引用必须属于当前 session、workspace 与同一 root task，或当前 Agent 明确前序 activation 的输出、证据及 transcript；历史记录仅作参考。单次最多读取 8 条。"
             }
             Self::ContextRequest => {
                 "当 AgentContextPackage 和 context_search/context_read 都不足以完成任务时，向父任务发送明确的上下文请求。父任务可通过 agent_send 回复；不要用它替代已有引用读取。"
@@ -1179,7 +1257,7 @@ impl BuiltinToolName {
                 - 每题 2–4 个互斥的选项（multiSelect=true 时可并存），label 简短，description 说明选它的含义与代价\n\
                 - 有明确推荐时把推荐项放第一个，并在 label 末尾加“（推荐）”\n\n\
                 # 返回\n\
-                返回每道题用户的最终决定 `answer`（选中的 label，以及用户在“其他”里自己写的原文）。用户在“其他”里写的答案是合法决定，哪怕不在你给的选项里也要按字面采纳，不要拒绝、质疑或重复追问。status=skipped 表示用户没有回答，此时不要反复追问，按你的最佳判断继续并说明假设。子代理不能使用本工具。"
+                返回每道题用户的最终决定 `answer`（选中的 label，以及用户在“其他”里自己写的原文）。用户在“其他”里写的答案是合法决定，哪怕不在你给的选项里也要按字面采纳，不要拒绝、质疑或重复追问。status=skipped 表示用户没有回答，此时不要反复追问，按你的最佳判断继续并说明假设。子代理也可使用本工具；运行时标明来源 Task/Turn，答复只交付原调用。需要父任务已有信息时先用 context_request，避免重复向用户提问。"
             }
             _ => unreachable!("浏览器工具描述已由 browser-tool.schema.json 的唯一目录提供"),
         }
@@ -1347,10 +1425,11 @@ impl BuiltinToolName {
                     "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 1800000, "description": "执行超时（毫秒），默认 300000；正常长命令请保留较大的超时时间，命令被用户停止时会返回 cancelled，而不是 failed" },
                     "action": {
                         "type": "string",
-                        "description": "后台进程控制动作：run/read/write/kill/list。省略时默认 run；background=true 启动后台命令后，使用 read/write/kill/list 搭配 terminal_id 继续管理。",
-                        "enum": ["run", "read", "write", "kill", "list"]
+                        "description": "后台进程控制动作：run/read/wait/write/kill/list。省略时默认 run；后台启动后优先使用 job_id。wait 必须指定 job_id，等待已提交的终态并返回输出，默认等待 60 秒，timeout_ms 有效范围为 1000–60000；超时只返回当前状态，不停止或重启进程，无需反复调用 read 轮询。",
+                        "enum": ["run", "read", "wait", "write", "kill", "list"]
                     },
-                    "terminal_id": { "type": "integer", "description": "background=true 返回的受管终端 / 进程 ID；action=read/write/kill 时必填" },
+                    "terminal_id": { "type": "integer", "description": "当前进程内的受管终端 ID；action=read/write/kill 时可用 job_id 替代" },
+                    "job_id": { "type": "string", "minLength": 1, "description": "background=true 返回的持久 Job 身份；优先用它读取输出或管理进程。重启后仍可读取输出和结果未知状态；不会按旧 PID 重新连接或重放命令。action=list 返回当前授权范围内的历史 Job。" },
                     "input": { "type": "string", "description": "action=write 时写入后台进程 stdin 的文本" },
                     "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
                     "stdout_offset": { "type": "integer", "minimum": 0, "description": "action=read 时的增量读取位置：传上次结果里的 stdout_next_offset，只返回其后的新输出；省略时返回最近的输出" },
@@ -1594,7 +1673,7 @@ impl BuiltinToolName {
                 "properties": {
                     "include_internal": { "type": "boolean", "description": "是否包含运行时内部工具，默认 false" },
                     "include_schema": { "type": "boolean", "description": "是否在每个内置工具条目中包含完整 parameters_schema，默认 false" },
-                    "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具与 MCP server 快照，默认 true" },
+                    "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具、MCP 与当前工作区插件工具快照，默认 true" },
                     "include_mcp_servers": { "type": "boolean", "description": "包含外接工具时是否同时返回 MCP server 健康摘要，默认 true" },
                     "include_agent_roles": { "type": "boolean", "description": "是否包含可通过 agent_spawn 派发的代理角色健康摘要，默认 true" }
                 },
@@ -1747,16 +1826,9 @@ impl BuiltinToolName {
                         "type": "string",
                         "maxLength": 4000,
                         "description": "用户要持续推进的完整目标。应保留用户给出的核心交付要求、边界和完成标准。"
-                    },
-                    "token_budget": {
-                        "anyOf": [
-                            { "type": "integer", "minimum": 16000 },
-                            { "type": "null" }
-                        ],
-                        "description": "token 预算。用户原文没有明确预算时必须传 null；只有用户明确给出 token 预算数值时才传整数，禁止自行臆造 1000、4096、16000 等预算。"
                     }
                 },
-                "required": ["objective", "token_budget"]
+                "required": ["objective"]
             }),
             Self::UpdateGoal => serde_json::json!({
                 "type": "object",
@@ -1780,7 +1852,7 @@ impl BuiltinToolName {
                     "status": {
                         "type": "string",
                         "enum": ["complete", "blocked"],
-                        "description": "模型只能提交 complete 或 blocked。pause / budget_limited / usage_limited 由用户或系统控制。"
+                        "description": "模型只能提交 complete 或 blocked。暂停和恢复由用户控制。"
                     },
                     "completion_summary": {
                         "type": "string",
@@ -1804,6 +1876,7 @@ impl BuiltinToolName {
             }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
                     "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
@@ -1820,8 +1893,10 @@ impl BuiltinToolName {
                     },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
+                    "delegation": crate::agent_delegation::AgentDelegationDecision::parameters_schema(),
                     "context_package": {
                         "type": "object",
+                        "additionalProperties": false,
                         "description": "子代理启动时唯一的结构化上下文包；禁止传旧 context 字符串。所有文本字段必须直接传 JSON string，不能传对象、数组或 Markdown 键值对；references 可以传空数组。",
                         "properties": {
                             "summary": { "type": "string", "minLength": 1, "description": "当前子任务所需的最小背景摘要，不复制主对话全文。" },
@@ -1832,6 +1907,7 @@ impl BuiltinToolName {
                                 "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。引用必须指向真实事实：会话消息用 turn:<entry_id>，任务输出用 task:<task_id>:output:<n>，文件用工作区内存在的路径；不存在的引用会在派发前被拒绝。本轮用户原始请求由运行时自动附上。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"Cargo.toml\",\"title\":\"配置文件\"}。",
                                 "items": {
                                     "type": "object",
+                                    "additionalProperties": false,
                                     "properties": {
                                         "kind": { "type": "string", "enum": ["conversation_turn", "task_output", "task_evidence", "file", "knowledge", "other"] },
                                         "title": { "type": "string", "minLength": 1 },
@@ -1846,9 +1922,12 @@ impl BuiltinToolName {
                     },
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一父任务下相同组名的子 agent 互斥执行" },
-                    "inherit_skill": { "type": "boolean", "description": "可选。为 true 时子代理沿用主线当前激活的 Skill；默认不继承，避免 Skill 与角色职责冲突" }
+                    "lifetime": { "type": "string", "enum": ["turn", "session", "goal"], "description": "默认 turn。显式 session/goal 保留 Agent 身份供后续 Turn 再次激活；本次执行仍必须在所属 Turn 内结算。goal 绑定当前活跃 Goal。" },
+                    "resume_task_id": { "type": "string", "minLength": 1, "description": "可选：同一 Session/Goal 保留的 Agent 最新已完成 activation task_id。创建新的 child_task_id，继承 agent_id 与可按需检索的历史；不重放旧工具、不隐式合入旧分支，不改变角色/归属或扩大权限。" },
+                    "allow_delegation": { "type": "boolean", "description": "可选，默认 false。主线显式允许该直接子代理继续派发自己的子任务；最多两层代理，孙代理不能继续委派。不会授予共享计划/Goal/记忆或主分支权限。" },
+                    "inherit_skill": { "type": "boolean", "description": "可选。为 true 时子代理沿用父任务当前激活的 Skill；普通流程说明默认不继承。父 Skill 显式限制工具范围时必须传 true，不能通过子代理移除限制" }
                 },
-                "required": ["task_name", "role", "display_name", "goal", "context_package"]
+                "required": ["task_name", "role", "display_name", "goal", "delegation", "context_package"]
             }),
             Self::AgentSend => serde_json::json!({
                 "type": "object",
@@ -2204,7 +2283,7 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
     let action = json_field_string(&request, "action");
 
     match action.as_deref() {
-        Some("read" | "list" | "kill") => return low_risk_policy(),
+        Some("read" | "wait" | "list" | "kill") => return low_risk_policy(),
         Some("write") => {
             return medium_risk_policy();
         }

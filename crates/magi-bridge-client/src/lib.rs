@@ -2,6 +2,8 @@ pub mod cache_boundary;
 mod clients;
 mod dispatch;
 mod endpoint_url;
+mod executor_capabilities;
+mod executor_receipt;
 pub mod final_text_policy;
 mod http_model_client;
 mod image_generation;
@@ -25,6 +27,15 @@ pub use clients::{
 };
 pub use dispatch::BridgeDispatchRuntime;
 pub use endpoint_url::EndpointUrlMode;
+pub use executor_capabilities::{
+    native_executor_capabilities, text_executor_capabilities, validate_executor_request,
+    validate_executor_response,
+};
+pub use executor_receipt::{
+    EXECUTOR_RECEIPT_KIND, ExecutorCommandEvidence, ExecutorCommandStatus, ExecutorFailureEvidence,
+    ExecutorReceipt, executor_receipts,
+};
+
 pub use http_model_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
 pub use image_generation::{GeneratedImage, HttpImageGenerationClient, ImageGenerationRequest};
 pub use local_process_protocol::{
@@ -33,6 +44,10 @@ pub use local_process_protocol::{
     BridgeServerServiceDescriptor, BridgeServerSessionDescriptor, BridgeServerShellManifest,
     BridgeServerShellProfile, BridgeServerWorkspaceContext, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
     LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, LOCAL_BRIDGE_PROTOCOL_VERSION,
+};
+pub use magi_app_server_protocol::{
+    ExecutorApprovalMode, ExecutorCancellationMode, ExecutorCapabilities, ExecutorContextOwnership,
+    ExecutorInputModality, ExecutorResumeMode, ExecutorSteerMode, ExecutorToolMode,
 };
 pub use mcp_client::{
     HttpMcpServerConfig, McpServerClient, McpServerConfig, McpServerConnectionConfig, McpToolInfo,
@@ -53,7 +68,7 @@ pub use types::{
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest, ModelProviderContext, ModelResponse,
-    ModelResponseStatus, ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta,
-    model_invocation_cancelled_error, model_invocation_error_is_cancelled,
+    ModelBridgeClient, ModelExecutionScope, ModelInvocationRequest, ModelProviderContext,
+    ModelResponse, ModelResponseStatus, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
+    ModelStreamingDelta, model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };

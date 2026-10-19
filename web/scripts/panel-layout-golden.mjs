@@ -686,13 +686,13 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /function canGuideQueuedMessage\(queued: QueuedMessage\): boolean \{\s*return queued\.canGuide === true;\s*\}/,
-  '排队消息能否转引导必须只使用服务端权威能力字段',
+  /expectedTurnId:\s*queued\.guide\.targetTurnId/,
+  '补充当前任务必须保留用户看到的服务端目标 Turn',
 );
 assert.doesNotMatch(
   inputAreaSource,
-  /function canGuideQueuedMessage\(queued: QueuedMessage\): boolean \{[^}]*isSending[^}]*\}/,
-  '前端不得再用瞬时发送状态阻断服务端允许的引导操作',
+  /queued\.canGuide|function canGuideQueuedMessage/,
+  '移除只有布尔值的旧引导能力投影',
 );
 assert.match(
   inputAreaSource,

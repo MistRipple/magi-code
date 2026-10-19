@@ -22,6 +22,8 @@ pub enum DomainError {
     },
     #[error("校验失败: {message}")]
     Validation { message: String },
+    #[error("run_safety_limit: {message}")]
+    RunSafetyLimit { message: String },
     #[error("持久化失败: {message}")]
     Persistence { message: String },
 }

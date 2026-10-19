@@ -19,12 +19,15 @@ pub use generated::{
     CanonicalWorkerRef, ClientCapabilities, ClientInfo, ClientNotification, ClientRequest,
     ClientResponse, EmptyParams, ErrorObject, EventCategory, EventEnvelope,
     EventNotificationParams, EventResyncReason, EventResyncRequiredParams, EventSnapshotParams,
-    EventStreamSnapshot, EventSubscribeParams, EventSubscribeResult, InitializeParams,
-    InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcRequestId, JsonRpcResponse, PingResult, ProtocolVersion, RequestId, ServerCapabilities,
-    ServerNotification, ServerRequest, ServerResponse, SessionContextReference,
-    SessionContextReferenceKind, SessionListParams, SessionListResult, SessionReadParams,
-    SessionReadResult, SessionScope, SessionSummary, SessionTurnCommand, SessionTurnImage,
+    EventStreamSnapshot, EventSubscribeParams, EventSubscribeResult, GoalActionParams,
+    GoalReadParams, GoalSnapshot, GoalUpdateParams, InitializeParams, InitializeResult,
+    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcRequestId,
+    JsonRpcResponse, PingResult, ProtocolVersion, RequestId, ResolveToolApprovalParams,
+    ResolveToolApprovalResult, ResolveUserQuestionParams, ResolveUserQuestionResult,
+    ServerCapabilities, ServerNotification, ServerRequest, ServerResponse, SessionContextReference,
+    SessionContextReferenceKind, SessionInteractionScope, SessionInteractionsResult,
+    SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, SessionScope,
+    SessionSummary, SessionTurnCommand, SessionTurnImage, TurnInterruptParams, TurnInterruptResult,
     TurnQueueInfo, TurnStartKind, TurnStartParams, TurnStartResult, TurnStartRoute,
 };
 
@@ -39,6 +42,29 @@ pub use generated::{
     PluginScopeKind, PluginScopeRequest, PluginToolContribution, PluginViewContribution,
     PluginViewPlacement,
 };
+
+pub use generated::{
+    ExecutorApprovalMode, ExecutorCancellationMode, ExecutorCapabilities, ExecutorContextOwnership,
+    ExecutorInputModality, ExecutorResumeMode, ExecutorSteerMode, ExecutorToolMode,
+};
+
+impl ExecutorCapabilities {
+    /// 校验 schema 中 Rust 反序列化无法表达的数组约束。
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.input_modalities.is_empty()
+            || self
+                .input_modalities
+                .iter()
+                .enumerate()
+                .any(|(index, modality)| self.input_modalities[..index].contains(modality))
+        {
+            return Err(ProtocolError::InvalidRequest(
+                "executor_invalid_capabilities: 输入模态必须非空且唯一".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub const ERROR_INVALID_REQUEST: i32 = -32600;
 pub const ERROR_METHOD_NOT_FOUND: i32 = -32601;

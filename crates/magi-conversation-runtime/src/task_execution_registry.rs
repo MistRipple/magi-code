@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    ExecutionOwnership, PlanItemId, SessionId, Task, TaskExecutionTarget, TaskId, ThreadId,
-    UtcMillis, WorkerId, WorkspaceId,
+    PlanItemId, SessionId, Task, TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
+    WorkspaceId,
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ExecutionThread, SessionPlan, SessionStore};
@@ -29,6 +29,10 @@ use crate::{session_images::SessionTurnImage, session_thread};
 
 pub const DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE: usize = 5;
 
+/// 宿主在原 Task 终态提交后结算这一组任务的资源与执行线程。
+/// 只保存进程内能力句柄，不拥有另一份 Task 或资源状态。
+type AgentSubtreeSettler = dyn Fn(&SessionId, &[TaskId]) -> Result<(), String> + Send + Sync;
+
 /// `agent_spawn` 创建前预检需要的进程级运行时事实。
 ///
 /// 该配置只保存可共享的句柄，不在预检阶段执行任何持久化或 Git mutation。测试和
@@ -41,6 +45,7 @@ pub struct AgentSpawnPreflightRuntime {
     pub workspace_registry: Option<Arc<magi_workspace::WorkspaceStore>>,
     pub session_code_contexts: Option<magi_git::SessionCodeContextRegistry>,
     pub git_service_configured: bool,
+    pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +65,6 @@ pub enum TaskExecutionPlan {
         /// 此任务实际执行的根目录。个人会话使用 Magi 管理的目录，项目会话使用项目根目录。
         /// 它与 `workspace_id` 分离，避免把“是否属于项目”和“工具 cwd”混为同一概念。
         execution_root: Option<PathBuf>,
-        ownership: ExecutionOwnership,
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
         skill_name: Option<String>,
@@ -114,17 +118,29 @@ pub struct SpawnedChildExecution {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpawnedChildExecutionError {
+    GoalPaused(String),
+    DuplicateTaskName {
+        existing_task_id: TaskId,
+    },
     RoleCapacityExceeded {
         role: String,
         active: usize,
         limit: usize,
     },
+    SharedWorkspaceWriterActive,
     InvalidState(String),
 }
 
 impl std::fmt::Display for SpawnedChildExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::GoalPaused(message) => f.write_str(message),
+            Self::DuplicateTaskName { existing_task_id } => {
+                write!(
+                    f,
+                    "同一父任务下 canonical task name 已存在，原任务: {existing_task_id}"
+                )
+            }
             Self::RoleCapacityExceeded {
                 role,
                 active,
@@ -132,6 +148,9 @@ impl std::fmt::Display for SpawnedChildExecutionError {
             } => write!(
                 f,
                 "角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"
+            ),
+            Self::SharedWorkspaceWriterActive => f.write_str(
+                "当前工作区没有 Git 隔离，已有一个具有写入权限的代理未结束；请等待它结束后再派发",
             ),
             Self::InvalidState(message) => f.write_str(message),
         }
@@ -145,6 +164,7 @@ pub struct TaskExecutionRegistry {
     plans: Arc<RwLock<HashMap<TaskId, TaskExecutionPlan>>>,
     execution_admission: Arc<ExecutionAdmissionController>,
     agent_spawn_preflight: Arc<RwLock<AgentSpawnPreflightRuntime>>,
+    agent_subtree_settler: Arc<RwLock<Option<Arc<AgentSubtreeSettler>>>>,
     /// 序列化跨 `TaskStore`、`SessionStore` 和执行计划的子任务注册。
     ///
     /// 预检发生在该锁之外，因此注册入口必须再次检查所有依赖唯一性的事实；
@@ -159,12 +179,138 @@ impl Default for TaskExecutionRegistry {
             plans: Arc::new(RwLock::new(HashMap::new())),
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             agent_spawn_preflight: Arc::new(RwLock::new(AgentSpawnPreflightRuntime::default())),
+            agent_subtree_settler: Arc::new(RwLock::new(None)),
             registration_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 impl TaskExecutionRegistry {
+    /// 只从已有拥有方和 Goal 控制版本派生撤销范围，不保存另一份授权状态。
+    pub fn revoked_goal_agent_roots(
+        task_store: &TaskStore,
+        session_store: &SessionStore,
+        session_id: &SessionId,
+    ) -> Vec<Task> {
+        let goals = session_store.goals_for_session(session_id);
+        task_store
+            .all_tasks()
+            .into_iter()
+            .filter(|task| {
+                task.agent_run_transfer().is_some_and(|transfer| {
+                    &transfer.session_id == session_id
+                        && match &transfer.owner {
+                            magi_core::AgentRunOwner::Session => false,
+                            magi_core::AgentRunOwner::Goal {
+                                goal_id,
+                                control_revision,
+                            } => !goals.iter().any(|goal| {
+                                &goal.goal_id == goal_id
+                                    && goal.status == magi_session_store::GoalStatus::Active
+                                    && goal.control_revision == *control_revision
+                            }),
+                        }
+                })
+            })
+            .collect()
+    }
+
+    /// 模型工具和宿主控制共用同一个 Task 收口与资源结算入口。
+    /// 调用者不能属于被结算范围；当前仅主线可以修改共享 Goal。
+    pub fn settle_revoked_goal_agent_run(
+        &self,
+        task_store: &TaskStore,
+        session_id: &SessionId,
+        root: &TaskId,
+    ) -> Result<bool, String> {
+        let terminal = crate::task_runner::settle_subtree_in_store(
+            task_store,
+            &self.execution_admission,
+            root,
+            magi_core::TaskStatus::Killed,
+            Vec::new(),
+            true,
+        );
+        let ids = task_store.collect_execution_subtree_ids(root);
+        // 写盘失败仍应取消实际资源；但不能把失败的终态提交报告为已结算。
+        let resources = self.settle_agent_subtree(session_id, &ids);
+        terminal?;
+        resources
+    }
+
+    pub fn settle_revoked_goal_agent_runs(
+        &self,
+        task_store: &TaskStore,
+        session_store: &SessionStore,
+        session_id: &SessionId,
+    ) -> Result<usize, String> {
+        let roots = Self::revoked_goal_agent_roots(task_store, session_store, session_id);
+        let mut errors = Vec::new();
+        for root in &roots {
+            match self.settle_revoked_goal_agent_run(task_store, session_id, &root.task_id) {
+                Ok(true) => {}
+                Ok(false) => errors.push(format!("{} 未装配资源结算能力", root.task_id)),
+                Err(error) => errors.push(format!("{}: {error}", root.task_id)),
+            }
+        }
+        if errors.is_empty() {
+            Ok(roots.len())
+        } else {
+            Err(errors.join("；"))
+        }
+    }
+
+    pub fn set_agent_subtree_settler(
+        &self,
+        settle: impl Fn(&SessionId, &[TaskId]) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        *self
+            .agent_subtree_settler
+            .write()
+            .expect("agent settler lock poisoned") = Some(Arc::new(settle));
+    }
+
+    /// false 表示轻量装配未提供结算能力，不能声称资源已退出。
+    pub(crate) fn settle_agent_subtree(
+        &self,
+        session: &SessionId,
+        tasks: &[TaskId],
+    ) -> Result<bool, String> {
+        let settle = self
+            .agent_subtree_settler
+            .read()
+            .expect("agent settler lock poisoned")
+            .clone();
+        match settle {
+            Some(settle) => settle(session, tasks).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// 工作流说明可选择不继承；显式封闭工具范围不能通过创建子代理移除。
+    pub(crate) fn validate_spawn_skill_inheritance(
+        &self,
+        parent: &TaskId,
+        inherit: bool,
+    ) -> Result<(), String> {
+        if inherit {
+            return Ok(());
+        }
+        let skill = self.get(parent).and_then(|plan| match plan {
+            TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name,
+        });
+        let runtime = self.agent_spawn_preflight_runtime();
+        let policy = crate::active_skill_tool_execution_policy(
+            magi_core::AccessProfile::Restricted,
+            runtime.skill_runtime.as_deref(),
+            skill.as_deref(),
+        );
+        if policy.allowed_tool_names.is_none() {
+            Ok(())
+        } else {
+            Err("父任务 Skill 明确限制了工具范围；必须使用 inherit_skill=true，不能通过子代理移除该范围".into())
+        }
+    }
     /// 返回与 Dispatcher/Runner 共用的执行准入控制器。
     pub fn execution_admission(&self) -> Arc<ExecutionAdmissionController> {
         Arc::clone(&self.execution_admission)
@@ -278,32 +424,83 @@ impl TaskExecutionRegistry {
         removed
     }
 
+    pub(crate) fn bind_agent_turn(
+        &self,
+        task: &TaskId,
+        source: &str,
+        owned: &magi_session_store::CanonicalTurn,
+    ) -> Result<(), String> {
+        let mut plans = self
+            .plans
+            .write()
+            .expect("execution registry lock poisoned");
+        let Some(TaskExecutionPlan::Dispatch {
+            turn_id,
+            session_id,
+            thread_id,
+            skill_name,
+            ..
+        }) = plans.get_mut(task)
+        else {
+            return Err("接纳 Agent Turn 后 Task 执行计划消失".into());
+        };
+        if turn_id != source
+            || &owned.session_id != session_id
+            || owned
+                .agent_turn_binding()
+                .map_err(|error| error.to_string())?
+                .is_none_or(|binding| &binding.task_id != task || &binding.thread_id != thread_id)
+            || owned.status.is_terminal()
+        {
+            return Err("Agent Turn 执行计划来源变化，拒绝改绑".into());
+        }
+        *turn_id = owned.turn_id.clone();
+        if let Some(skill) = owned
+            .agent_active_skill_id()
+            .map_err(|error| error.to_string())?
+        {
+            *skill_name = Some(skill);
+        }
+        Ok(())
+    }
+
     pub fn update_active_skill(
         &self,
         task_id: &TaskId,
         session_store: &SessionStore,
         session_id: &SessionId,
+        expected_turn_id: &str,
         skill_id: String,
     ) -> Result<(), String> {
-        if self.get(task_id).is_none() {
-            return Err(format!("任务 {task_id} 缺少执行计划，无法记录 Skill 激活"));
+        let plan = self
+            .get(task_id)
+            .ok_or_else(|| format!("任务 {task_id} 缺少执行计划，无法记录 Skill 激活"))?;
+        let TaskExecutionPlan::Dispatch {
+            turn_id,
+            session_id: plan_session,
+            ..
+        } = &plan;
+        if plan_session != session_id || turn_id != expected_turn_id {
+            return Err("Skill 激活的 Session/Turn 来源已变化".into());
         }
-        let mut chain = session_store
-            .active_execution_chain(session_id)
-            .ok_or_else(|| format!("会话 {session_id} 缺少活跃执行链"))?;
-        let branch = chain
-            .branches
-            .iter_mut()
-            .find(|branch| &branch.task_id == task_id)
-            .ok_or_else(|| format!("任务 {task_id} 不在当前执行链分支中"))?;
-        branch.skill_name = Some(skill_id.clone());
-        if &chain.root_task_id == task_id {
-            chain.dispatch_context.skill_name = Some(skill_id.clone());
+        let owned = session_store
+            .canonical_turn_for_session_turn_id(session_id, turn_id)
+            .map(|turn| turn.agent_turn_binding())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if let Some(binding) = owned {
+            if &binding.task_id != task_id {
+                return Err("Skill 激活 Task 与 Agent Turn 不匹配".into());
+            }
+            session_store
+                .update_agent_turn_active_skill(session_id, task_id, turn_id, &skill_id)
+                .map_err(|error| error.to_string())?;
+        } else {
+            session_store
+                .update_execution_branch_active_skill(session_id, task_id, turn_id, &skill_id)
+                .map_err(|error| error.to_string())?;
         }
-        chain.normalize();
-        session_store
-            .upsert_active_execution_chain(session_id.clone(), chain)
-            .map_err(|error| error.to_string())?;
 
         let mut plans = self
             .plans
@@ -313,7 +510,15 @@ impl TaskExecutionRegistry {
             .get_mut(task_id)
             .ok_or_else(|| format!("任务 {task_id} 执行计划在更新期间消失"))?;
         match plan {
-            TaskExecutionPlan::Dispatch { skill_name, .. } => {
+            TaskExecutionPlan::Dispatch {
+                skill_name,
+                turn_id: actual_turn,
+                session_id: actual_session,
+                ..
+            } => {
+                if actual_turn != turn_id || actual_session != session_id {
+                    return Err("Skill 激活期间执行计划的 Turn/Session 已变化".into());
+                }
                 *skill_name = Some(skill_id);
             }
         }
@@ -366,6 +571,19 @@ impl TaskExecutionRegistry {
                 child_task.task_id
             ))
         })?;
+        let parent = task_store.get_task(&parent_task_id).ok_or_else(|| {
+            SpawnedChildExecutionError::InvalidState("agent_spawn 父任务不存在".into())
+        })?;
+        self.validate_spawn_skill_inheritance(&parent_task_id, inherit_skill)
+            .map_err(SpawnedChildExecutionError::InvalidState)?;
+        task_store
+            .validate_agent_delegation(&parent)
+            .map_err(|error| SpawnedChildExecutionError::InvalidState(error.to_string()))?;
+        if parent.parent_task_id.is_some() && plan_item_id.is_some() {
+            return Err(SpawnedChildExecutionError::InvalidState(
+                "嵌套任务不能绑定主线共享计划".into(),
+            ));
+        }
         if task_store.get_task(&child_task.task_id).is_some() {
             return Err(SpawnedChildExecutionError::InvalidState(format!(
                 "agent_spawn 子任务 {} 已存在于 TaskStore，拒绝重复注册",
@@ -379,18 +597,51 @@ impl TaskExecutionRegistry {
             )));
         }
 
+        if let Some(goal) = chain
+            .current_turn
+            .as_ref()
+            .and_then(|turn| session_store.model_step_goal(session_id, &turn.turn_id))
+            && goal.status != magi_session_store::GoalStatus::Active
+        {
+            return Err(SpawnedChildExecutionError::GoalPaused(
+                "当前 Goal 未处于执行状态，不能创建新的子代理".into(),
+            ));
+        }
+
+        if let Some(activation) = child_task.agent_activation() {
+            if activation.session_id != *session_id {
+                return Err(SpawnedChildExecutionError::InvalidState(
+                    "Agent activation 会话归属不匹配".into(),
+                ));
+            }
+            if let magi_core::AgentLifetime::Goal { goal_id } = &activation.lifetime
+                && chain
+                    .current_turn
+                    .as_ref()
+                    .and_then(|turn| session_store.model_step_goal(session_id, &turn.turn_id))
+                    .is_none_or(|goal| {
+                        goal.goal_id != *goal_id
+                            || goal.status != magi_session_store::GoalStatus::Active
+                    })
+            {
+                return Err(SpawnedChildExecutionError::GoalPaused(
+                    "Agent 所属 Goal 已关闭或不属于当前 Turn".into(),
+                ));
+            }
+        }
+
         // `preflight_agent_spawn` 已经检查过一次 task_name，但它与原子注册之间
         // 可能存在并发窗口。这里用注册锁下的最新 TaskStore 快照再做一次唯一性
         // 校验，确保同一父任务不会出现两个相同的 canonical task name。
         if let Some(canonical_task_name) = child_task.canonical_task_name()
-            && task_store
+            && let Some(existing) = task_store
                 .get_children(&parent_task_id)
                 .iter()
-                .any(|child| child.canonical_task_name() == Some(canonical_task_name))
+                .find(|child| child.canonical_task_name() == Some(canonical_task_name))
         {
-            return Err(SpawnedChildExecutionError::InvalidState(format!(
-                "同一父任务下 canonical task name 已存在: {canonical_task_name}"
-            )));
+            return Err(SpawnedChildExecutionError::DuplicateTaskName {
+                existing_task_id: existing.task_id.clone(),
+            });
         }
 
         if let Some(limit) = role_parallelism_limit {
@@ -447,18 +698,18 @@ impl TaskExecutionRegistry {
         if !isolated_by_git
             && writes(child_task)
             && task_store
-                .get_children(&parent_task_id)
+                .collect_subtree_ids(&parent.root_task_id)
                 .iter()
+                .filter_map(|id| task_store.get_task(id))
                 .any(|child| {
                     matches!(
                         child.status,
                         magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
-                    ) && writes(child)
+                    ) && child.task_id != parent.root_task_id
+                        && writes(&child)
                 })
         {
-            return Err(SpawnedChildExecutionError::InvalidState(
-                "当前工作区不是 Git 仓库，无法隔离多个可写代理；已有一个可写代理未结束，请等它结束后再派发，或由主线直接完成".to_string(),
-            ));
+            return Err(SpawnedChildExecutionError::SharedWorkspaceWriterActive);
         }
 
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
@@ -554,14 +805,6 @@ impl TaskExecutionRegistry {
             turn_id: inherited_turn_id,
             workspace_id: workspace_id.clone(),
             execution_root: inherited_execution_root,
-            ownership: ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                workspace_id: workspace_id.clone(),
-                mission_id: Some(child_task.mission_id.clone()),
-                task_id: Some(child_task.task_id.clone()),
-                worker_id: Some(worker_id.clone()),
-                execution_chain_ref: Some(execution_chain_ref.clone()),
-            },
             writebacks: ExecutionWritebackPlans::default(),
             use_tools: true,
             skill_name: inherited_skill_name,
@@ -569,22 +812,15 @@ impl TaskExecutionRegistry {
             execution_settings_snapshot,
         };
 
-        if let Err(error) = task_store.insert_task(child_task.clone()) {
-            return Err(SpawnedChildExecutionError::InvalidState(error.to_string()));
-        }
-        let task_inserted = true;
-
         if let Err(error) =
             session_store.upsert_active_execution_chain(session_id.clone(), chain.clone())
         {
             return Err(rollback_spawned_local_agent_child(
                 self,
-                task_store,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
-                task_inserted,
                 false,
                 false,
                 None,
@@ -596,12 +832,10 @@ impl TaskExecutionRegistry {
         if let Err(_plan) = self.insert(child_task.task_id.clone(), plan) {
             return Err(rollback_spawned_local_agent_child(
                 self,
-                task_store,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
-                task_inserted,
                 true,
                 false,
                 None,
@@ -616,12 +850,10 @@ impl TaskExecutionRegistry {
         if let Err(error) = session_store.register_thread(thread.clone()) {
             return Err(rollback_spawned_local_agent_child(
                 self,
-                task_store,
                 session_store,
                 session_id,
                 &child_task.task_id,
                 &original_chain,
-                task_inserted,
                 true,
                 true,
                 None,
@@ -640,12 +872,10 @@ impl TaskExecutionRegistry {
                 Err(error) => {
                     return Err(rollback_spawned_local_agent_child(
                         self,
-                        task_store,
                         session_store,
                         session_id,
                         &child_task.task_id,
                         &original_chain,
-                        task_inserted,
                         true,
                         true,
                         Some(&thread),
@@ -660,12 +890,10 @@ impl TaskExecutionRegistry {
             (None, Some(_)) => {
                 return Err(rollback_spawned_local_agent_child(
                     self,
-                    task_store,
                     session_store,
                     session_id,
                     &child_task.task_id,
                     &original_chain,
-                    task_inserted,
                     true,
                     true,
                     Some(&thread),
@@ -677,12 +905,31 @@ impl TaskExecutionRegistry {
             }
         };
 
-        // 所有注册步骤成功后才预占执行名额，失败回滚路径不需要释放名额。
+        // Runner 只以 TaskStore 判断可调度性。完整准备描述与准入后才发布 Task；
+        // 提前插入 Pending Task 会让并发 Runner 在计划/Thread 尚未存在时派发。
         let queue_reason = self.execution_admission.reserve(
             child_task.task_id.clone(),
             Some(session_id.clone()),
             role,
         );
+        if let Err(error) = task_store.insert_task(child_task.clone()) {
+            self.execution_admission
+                .release_pending(&child_task.task_id);
+            return Err(rollback_spawned_local_agent_child(
+                self,
+                session_store,
+                session_id,
+                &child_task.task_id,
+                &original_chain,
+                true,
+                true,
+                Some(&thread),
+                plan_binding
+                    .as_ref()
+                    .map(|(original, updated)| (original, updated.revision)),
+                SpawnedChildExecutionError::InvalidState(error.to_string()),
+            ));
+        }
         Ok(SpawnedChildExecution {
             worker_id,
             thread_id,
@@ -696,12 +943,10 @@ impl TaskExecutionRegistry {
 #[allow(clippy::too_many_arguments)]
 fn rollback_spawned_local_agent_child(
     registry: &TaskExecutionRegistry,
-    task_store: &TaskStore,
     session_store: &SessionStore,
     session_id: &SessionId,
     child_task_id: &TaskId,
     original_chain: &magi_session_store::ActiveExecutionChain,
-    task_inserted: bool,
     session_chain_updated: bool,
     registry_inserted: bool,
     registered_thread: Option<&ExecutionThread>,
@@ -732,13 +977,6 @@ fn rollback_spawned_local_agent_child(
             session_store.upsert_active_execution_chain(session_id.clone(), original_chain.clone())
     {
         rollback_errors.push(format!("session active chain 回滚失败: {error}"));
-    }
-    if task_inserted {
-        match task_store.remove_task(child_task_id) {
-            Ok(Some(_)) => {}
-            Ok(None) => rollback_errors.push("TaskStore 回滚时未找到子任务".to_string()),
-            Err(error) => rollback_errors.push(format!("TaskStore 回滚失败: {error}")),
-        }
     }
 
     if rollback_errors.is_empty() {
@@ -832,6 +1070,11 @@ mod tests {
         let root_task_id = TaskId::new("task-root");
         let parent_worker_id = WorkerId::new("worker-parent");
         let now = UtcMillis(10_000);
+        let mut parent = test_task(root_task_id.as_str(), root_task_id.as_str(), &mission_id);
+        parent.parent_task_id = None;
+        parent.status = TaskStatus::Running;
+        parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        task_store.insert_task(parent).expect("真实父任务应注册");
         let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
             .upsert_active_execution_chain(
@@ -902,7 +1145,6 @@ mod tests {
                     turn_id: "turn-atomic-spawn".to_string(),
                     workspace_id: workspace_id.clone(),
                     execution_root: None,
-                    ownership: ExecutionOwnership::default(),
                     writebacks: ExecutionWritebackPlans::default(),
                     use_tools: true,
                     skill_name: None,
@@ -916,11 +1158,58 @@ mod tests {
                 &root_task_id,
                 &session_store,
                 &session_id,
+                "turn-atomic-spawn",
                 "code-review".to_string(),
             )
             .expect("dynamic parent skill activation should update runtime ownership");
 
         let child = test_task("task-child", root_task_id.as_str(), &mission_id);
+        let skills = magi_skill_runtime::SkillRegistry::new();
+        let skill = |restricted| magi_skill_runtime::SkillDefinition {
+            skill_id: "code-review".into(),
+            title: "Review".into(),
+            instruction: "Review".into(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "test".into(),
+                tags: vec![],
+            },
+            restrict_standard_tools: restricted,
+            allowed_tools: vec!["agent_spawn".into(), "file_read".into()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        };
+        skills.register(skill(true));
+        registry
+            .clone()
+            .with_agent_spawn_preflight_runtime(AgentSpawnPreflightRuntime {
+                skill_runtime: Some(Arc::new(magi_skill_runtime::SkillRuntime::new(
+                    skills.clone(),
+                ))),
+                ..Default::default()
+            });
+        assert!(
+            registry
+                .validate_spawn_skill_inheritance(&root_task_id, false)
+                .is_err()
+        );
+        let rejected = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                session_store: &session_store,
+                child_task: &child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                role_parallelism_limit: None,
+                plan_store: None,
+                plan_item_id: None,
+                execution_root: None,
+                inherit_skill: false,
+                now,
+            })
+            .expect_err("封闭范围不能通过不继承 Skill 绕过");
+        assert!(rejected.to_string().contains("inherit_skill=true"));
+        assert!(task_store.get_task(&child.task_id).is_none());
         let registered = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
                 task_store: &task_store,
@@ -937,6 +1226,12 @@ mod tests {
                 now,
             })
             .expect("spawned child runtime registration should succeed");
+        skills.register(skill(false));
+        assert!(
+            registry
+                .validate_spawn_skill_inheritance(&root_task_id, false)
+                .is_ok()
+        );
 
         assert_eq!(registered.execution_chain_ref, "chain-atomic-spawn");
         assert!(
@@ -1224,10 +1519,11 @@ mod tests {
 
         let second_writer = test_task("task-writer-b", root_task_id.as_str(), &mission_id);
         let error = register(&second_writer).expect_err("第二个可写代理必须被拒绝");
-        assert!(matches!(
+        assert_eq!(
             error,
-            SpawnedChildExecutionError::InvalidState(ref message) if message.contains("不是 Git 仓库")
-        ));
+            SpawnedChildExecutionError::SharedWorkspaceWriterActive
+        );
+        assert!(error.to_string().contains("等待它结束后再派发"));
         assert!(task_store.get_task(&second_writer.task_id).is_none());
     }
 
@@ -1261,7 +1557,6 @@ mod tests {
                         turn_id: "turn-registry-cleanup".to_string(),
                         workspace_id: None,
                         execution_root: None,
-                        ownership: ExecutionOwnership::default(),
                         writebacks: ExecutionWritebackPlans::default(),
                         use_tools: true,
                         skill_name: None,
@@ -1291,6 +1586,11 @@ mod tests {
         let root_task_id = TaskId::new("task-root-capacity");
         let parent_worker_id = WorkerId::new("worker-parent-capacity");
         let now = UtcMillis(20_000);
+        let mut parent = test_task(root_task_id.as_str(), root_task_id.as_str(), &mission_id);
+        parent.parent_task_id = None;
+        parent.status = TaskStatus::Running;
+        parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        task_store.insert_task(parent).expect("真实父任务应注册");
         let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
             .upsert_active_execution_chain(
@@ -1431,6 +1731,116 @@ mod tests {
                 now: UtcMillis(now.0 + 11),
             })
             .expect("同角色已有实例完成后，第六个代理应能占用释放的名额");
+    }
+
+    #[test]
+    fn spawned_child_is_published_only_after_runtime_preparation_and_rolls_back_on_commit_failure()
+    {
+        for fail_commit in [false, true] {
+            let (tasks, sessions, registry, session, workspace, mission, root, now) =
+                spawn_fixture("publish-last");
+            let sessions = Arc::new(sessions);
+            sessions
+                .create_session(session.clone(), "publication")
+                .unwrap();
+            sessions
+                .upsert_plan(
+                    &session,
+                    SessionPlan {
+                        plan_id: magi_core::PlanId::new("publication-plan"),
+                        session_id: session.clone(),
+                        goal_id: None,
+                        revision: 1,
+                        language: "zh-CN".into(),
+                        state: magi_core::PlanState::Active,
+                        items: vec![magi_core::PlanItem::new(
+                            magi_core::PlanItemId::new("work"),
+                            "独立工作",
+                            magi_core::PlanItemStatus::InProgress,
+                        )],
+                        task_bindings: HashMap::new(),
+                        updated_at: now,
+                    },
+                    Some(0),
+                )
+                .unwrap();
+            let plans = magi_plan::PlanStore::from_store(&sessions, session.clone());
+            let chain_before = sessions.active_execution_chain(&session).unwrap();
+            let threads_before = sessions.thread_registry_snapshot(&session);
+            let child = test_task("publication-child", root.as_str(), &mission);
+            let child_id = child.task_id.clone();
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_registry = registry.clone();
+            let callback_sessions = sessions.clone();
+            let callback_session = session.clone();
+            let callback_observed = observed.clone();
+            tasks.set_checkpoint_callback(Box::new(move |snapshot| {
+                assert!(snapshot.tasks.iter().any(|task| task.task_id == child_id));
+                let plan = callback_registry
+                    .get(&child_id)
+                    .expect("Task 的发布提交之前必须已有执行计划，Runner 不能观察半注册任务");
+                let TaskExecutionPlan::Dispatch { thread_id, .. } = plan;
+                assert!(
+                    callback_sessions
+                        .thread_registry_snapshot(&callback_session)
+                        .iter()
+                        .any(|thread| thread.thread_id == thread_id
+                            && thread.handled_task_ids.contains(&child_id))
+                );
+                assert!(
+                    callback_sessions
+                        .plan(&callback_session)
+                        .unwrap()
+                        .task_bindings
+                        .contains_key(&child_id)
+                );
+                let admission = callback_registry.execution_admission.snapshot();
+                assert!(
+                    admission.active_task_ids.contains(&child_id.to_string())
+                        || admission
+                            .queued
+                            .iter()
+                            .any(|entry| entry.task_id == child_id.as_str())
+                );
+                callback_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                if fail_commit {
+                    Err(magi_core::DomainError::Persistence {
+                        message: "injected publication failure".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }));
+            let result =
+                registry.register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                    task_store: &tasks,
+                    session_store: &sessions,
+                    child_task: &child,
+                    session_id: &session,
+                    workspace_id: &workspace,
+                    role: "executor",
+                    role_parallelism_limit: None,
+                    plan_store: Some(&plans),
+                    plan_item_id: Some(magi_core::PlanItemId::new("work")),
+                    execution_root: None,
+                    inherit_skill: false,
+                    now,
+                });
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(result.is_err(), fail_commit, "{result:?}");
+            if fail_commit {
+                assert!(tasks.get_task(&child.task_id).is_none());
+                assert!(registry.get(&child.task_id).is_none());
+                assert_eq!(sessions.thread_registry_snapshot(&session), threads_before);
+                assert_eq!(
+                    format!("{:?}", sessions.active_execution_chain(&session).unwrap()),
+                    format!("{chain_before:?}")
+                );
+                assert!(plans.snapshot().unwrap().task_bindings.is_empty());
+                let admission = registry.execution_admission.snapshot();
+                assert!(admission.active_task_ids.is_empty() && admission.queued.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -1589,7 +1999,7 @@ mod tests {
             .expect_err("重复 canonical task name 必须被拒绝");
 
         assert!(
-            matches!(error, SpawnedChildExecutionError::InvalidState(message) if message.contains("canonical task name"))
+            matches!(error, SpawnedChildExecutionError::DuplicateTaskName { existing_task_id } if existing_task_id == first.task_id)
         );
         assert!(task_store.get_task(&duplicate.task_id).is_none());
         assert!(registry.get(&duplicate.task_id).is_none());
@@ -1602,6 +2012,66 @@ mod tests {
         policy.access_profile = magi_core::AccessProfile::ReadOnly;
         task.policy_snapshot = Some(policy);
         task
+    }
+
+    #[test]
+    fn mainline_skill_activation_rejects_stale_or_closed_turn_without_changing_the_chain() {
+        let (_, sessions, _, session, _, _, root, _) = spawn_fixture("skill-source");
+        let snapshot = || {
+            (
+                serde_json::to_value(sessions.durable_state()).unwrap(),
+                serde_json::to_value(sessions.execution_sidecar_store_state()).unwrap(),
+                sessions.execution_sidecar_flush_metadata(),
+            )
+        };
+        let before = snapshot();
+        for (task, turn) in [
+            (root.clone(), "stale-turn"),
+            (TaskId::new("foreign-task"), "turn-skill-source"),
+        ] {
+            assert!(
+                sessions
+                    .update_execution_branch_active_skill(&session, &task, turn, "closed-skill")
+                    .is_err()
+            );
+            assert_eq!(snapshot(), before);
+        }
+        sessions
+            .update_execution_branch_active_skill(
+                &session,
+                &root,
+                "turn-skill-source",
+                "closed-skill",
+            )
+            .unwrap();
+        let chain = sessions.active_execution_chain(&session).unwrap();
+        assert_eq!(
+            chain.dispatch_context.skill_name.as_deref(),
+            Some("closed-skill")
+        );
+        assert_eq!(
+            chain.branches[0].skill_name.as_deref(),
+            Some("closed-skill")
+        );
+        sessions
+            .update_current_turn_status_for_turn_with_change(
+                &session,
+                Some("turn-skill-source"),
+                "completed",
+            )
+            .unwrap();
+        let closed = snapshot();
+        assert!(
+            sessions
+                .update_execution_branch_active_skill(
+                    &session,
+                    &root,
+                    "turn-skill-source",
+                    "another-skill"
+                )
+                .is_err()
+        );
+        assert_eq!(snapshot(), closed, "已关闭 Turn 的迟到激活不能更新恢复状态");
     }
 
     fn spawn_fixture(
@@ -1625,6 +2095,11 @@ mod tests {
         let root_task_id = TaskId::new(format!("task-root-{label}"));
         let parent_worker_id = WorkerId::new(format!("worker-parent-{label}"));
         let now = UtcMillis(30_000);
+        let mut parent = test_task(root_task_id.as_str(), root_task_id.as_str(), &mission_id);
+        parent.parent_task_id = None;
+        parent.status = TaskStatus::Running;
+        parent.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        task_store.insert_task(parent).expect("真实父任务应注册");
         let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
             .upsert_active_execution_chain(

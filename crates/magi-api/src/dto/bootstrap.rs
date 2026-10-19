@@ -155,7 +155,7 @@ impl BootstrapDto {
     }
 
     /// 与 [`BootstrapDto::from_projection`] 相同,但额外接收一份从持久化用量账本
-    /// 回放出的每会话用量观测值,在装配运行时读模型时用于回填重启后缺失的预算。
+    /// 回放出的每会话用量观测值，在装配运行时读模型时回填重启后的用量。
     #[allow(clippy::too_many_arguments)]
     pub fn from_projection_with_usage(
         runtime_epoch: String,
@@ -719,6 +719,7 @@ mod tests {
         let other_session_id = SessionId::new("session-other");
         let now = UtcMillis::now();
         let canonical_turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session_id.clone(),
             turn_id: "canonical-turn-1".to_string(),
             turn_seq: 1,
@@ -869,6 +870,7 @@ mod tests {
         let now = UtcMillis::now();
         let turn_id = "canonical-turn-mainline";
         let canonical_turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session_id.clone(),
             turn_id: turn_id.to_string(),
             turn_seq: 1,

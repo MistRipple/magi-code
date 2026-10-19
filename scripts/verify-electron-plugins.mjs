@@ -764,21 +764,6 @@ try {
   check("终止后 HTTP 统计减少一个", JSON.parse((await api(page, "/api/mcp-server/status")).body).httpSessions === beforeHttpDelete - 1);
   const sharedSessions = JSON.parse((await api(page, "/api/mcp-server/sessions")).body).sessions.filter((entry) => entry.tokenId === autoIssued.token.tokenId);
   check("多个 HTTP 传输会话仍合并到同一 Magi 外部会话", sharedSessions.length === 1 && sharedSessions[0].workspaceId === workspaceId);
-  // 非回环网卡上的真实 HTTP 直连；不使用 tunnel 或伪造来源。
-  const lanIp = Object.values(networkInterfaces()).flat().find((entry) => entry?.family === "IPv4" && !entry.internal)?.address;
-  if (!lanIp) throw new Error("缺少可用于网络直连验收的非回环 IPv4 网卡");
-  const direct = await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, bindHost: "0.0.0.0", publicHosts: [lanIp], confirmRisk: true }) });
-  check("无需 tunnel 即可监听真实网卡地址", direct.status === 200, direct.body.slice(0, 150));
-  const lanUrl = JSON.parse(direct.body).direct.mcpUrl;
-  const localOnly = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "lan-local-only", workspaceId, ttlDays: 1 })).body);
-  const lanList = (secret) => fetch(lanUrl, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${secret}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
-  check("内网直连接受网络令牌并拒绝本机令牌", (await lanList(autoIssued.secret)).status === 200 && (await lanList(localOnly.secret)).status === 401);
-  await openSettingsTab(page, "mcpServer");
-  await click(page, '[data-mcp-tab="remote"]');
-  await waitFor(() => documentBodyIncludes("网络直连（内网／公网）"), "桌面端展示网络直连文案");
-  check("网络设置明确区分直连与公网隧道", await documentBodyIncludes("公网隧道") && await documentBodyIncludes("客户端访问地址"));
-  await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
-  await click(page, '[data-testid="settings-back"]');
   // 使用设置页实际生成的配置，验证发行包自己的 stdio 中继，避免维护另一套命令与权限合同。
   const snippets = JSON.parse((await api(page, `/api/mcp-server/config-snippets?tokenId=${autoIssued.token.tokenId}`)).body);
   check("客户端配置服务名包含工作区和客户端", snippets.serverName === "magi-workspace-e2e-auto-agent");
@@ -1016,13 +1001,39 @@ try {
   await post(page, "/api/mcp-server/enabled", { enabled: false });
   const stoppedStatus = JSON.parse((await api(page, "/api/mcp-server/status")).body);
   check("服务关闭后两种连接统计归零", stoppedStatus.httpSessions === 0 && stoppedStatus.localConnections === 0);
-  await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
 
   // 11. Renderer 无未处理异常
   const logText = electronLog.join("");
+  check("移除工作区后 sidecar 维护没有归属错误", !/刷新 sidecar 失败[^\n]*未注册 workspace/u.test(logText));
   check("历史快照与实时事件无 canonical 事实冲突", !rendererErrors.some((error) => error.includes('[canonical-turn-store]')), rendererErrors.slice(-4).join('\n'));
   check("Electron 日志没有 Desktop IPC 协议拒绝", !/IPC.*(validation|拒绝)/iu.test(logText));
   check("插件 iframe 没有 sandbox 初始化异常或串入应用消息协议", !/sandboxed_renderer.bundle.js script failed|binding.startupData|未知消息类型: request/u.test([...rendererErrors, logText].join("\n")));
+  // 最后验证非回环网卡直连，环境不可达时仍保留前面的 stdio、审批与吊销证据。
+  const lanIp = Object.values(networkInterfaces()).flat().find((entry) => entry?.family === "IPv4" && !entry.internal)?.address;
+  if (!lanIp) throw new Error("缺少可用于网络直连验收的非回环 IPv4 网卡");
+  await post(page, "/api/mcp-server/enabled", { enabled: true });
+  const networkIssued = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "lan-network", workspaceId, approvalMode: "always", allowNetwork: true, ttlDays: 1 })).body);
+  const direct = await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, bindHost: "0.0.0.0", publicHosts: [lanIp], confirmRisk: true }) });
+  check("无需 tunnel 即可监听真实网卡地址", direct.status === 200, direct.body.slice(0, 150));
+  const lanUrl = JSON.parse(direct.body).direct.mcpUrl;
+  const localOnly = JSON.parse((await post(page, "/api/mcp-server/tokens", { clientName: "lan-local-only", workspaceId, ttlDays: 1 })).body);
+  await openSettingsTab(page, "mcpServer");
+  await click(page, '[data-mcp-tab="remote"]');
+  await waitFor(() => documentBodyIncludes("网络直连（内网／公网）"), "桌面端展示网络直连文案");
+  check("网络设置明确区分直连与公网隧道", await documentBodyIncludes("公网隧道") && await documentBodyIncludes("客户端访问地址"));
+  const lanList = (secret) => fetch(lanUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    signal: AbortSignal.timeout(10_000),
+  }).catch((cause) => ({ status: null, error: `网络直连验收无法连接 ${lanUrl}：${cause.message}` }));
+  const [networkReply, localReply] = await Promise.all([lanList(networkIssued.secret), lanList(localOnly.secret)]);
+  check("内网直连接受网络令牌并拒绝本机令牌", networkReply.status === 200 && localReply.status === 401,
+    JSON.stringify({ network: networkReply.status, local: localReply.status, error: networkReply.error ?? localReply.error }));
+  await api(page, "/api/mcp-server/direct", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+  await click(page, '[data-testid="settings-back"]');
+  await post(page, "/api/mcp-server/enabled", { enabled: false });
+  await post(page, `/api/plugins/${MCP_ID}/deactivate`, { scope: "application" });
 } catch (error) {
   failure = error;
   if (page) {

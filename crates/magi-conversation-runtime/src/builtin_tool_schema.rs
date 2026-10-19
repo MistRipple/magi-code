@@ -1,4 +1,3 @@
-use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry, is_internal_builtin_tool_surface};
 
@@ -22,9 +21,6 @@ pub(crate) fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefin
 }
 
 fn model_tool_description(tool: BuiltinToolName) -> String {
-    if tool == BuiltinToolName::AgentSpawn {
-        return "模型调用此工具创建一个子代理任务并立即返回 child_task_id；role 已知时 capabilities 可省略，由服务端按角色默认能力补齐；需要结果时使用 agent_wait。必须传入结构化 context_package。".to_string();
-    }
     const MAX_MODEL_TOOL_DESCRIPTION_CHARS: usize = 800;
     let description = tool
         .description()
@@ -42,25 +38,11 @@ fn model_tool_description(tool: BuiltinToolName) -> String {
     compact
 }
 
-fn apply_runtime_schema(
-    definition: ChatToolDefinition,
-    _agent_role_registry: &AgentRoleRegistry,
-) -> ChatToolDefinition {
-    // 角色能力是运行时注册表的事实源，不能把全局能力集合写入工具 Schema。
-    // agent_spawn 缺省 capabilities 时由服务端按目标角色补齐；显式值仍由
-    // preflight 严格校验，避免模型依据一个跨角色的 enum 生成必然会被拒绝的参数。
-    definition
-}
-
-pub fn public_builtin_tool_definitions(
-    registry: &ToolRegistry,
-    agent_role_registry: &AgentRoleRegistry,
-) -> Vec<ChatToolDefinition> {
+pub fn public_builtin_tool_definitions(registry: &ToolRegistry) -> Vec<ChatToolDefinition> {
     registry
         .public_builtin_specs()
         .into_iter()
         .filter_map(|spec| public_builtin_tool_definition(&spec.name))
-        .map(|definition| apply_runtime_schema(definition, agent_role_registry))
         .collect()
 }
 
@@ -135,15 +117,41 @@ mod tests {
                 .contains("capabilities 可省略")
         );
         assert!(definition.function.description.contains("context_package"));
+        assert!(definition.function.description.contains("delegation"));
+        assert!(definition.function.description.contains("existing_task_id"));
+        assert!(
+            definition
+                .function
+                .description
+                .contains("普通后续步骤由当前代理完成")
+        );
+        assert!(
+            definition
+                .function
+                .description
+                .contains("默认由主线直接完成")
+        );
+        assert!(
+            definition
+                .function
+                .description
+                .contains("省略时只激活 general_engineering")
+        );
+        assert_eq!(
+            definition.function.description,
+            BuiltinToolName::AgentSpawn
+                .description()
+                .split("\n\n")
+                .next()
+                .unwrap(),
+            "模型短描述必须从目录生成，不能维护另一套代理能力或派发规则"
+        );
         assert!(definition.function.description.chars().count() < 800);
     }
 
     #[test]
     fn agent_spawn_schema_keeps_capabilities_optional_and_role_scoped() {
-        let definition = apply_runtime_schema(
-            public_builtin_tool_definition("agent_spawn").expect("public agent_spawn"),
-            &AgentRoleRegistry::load_default(),
-        );
+        let definition = public_builtin_tool_definition("agent_spawn").expect("public agent_spawn");
 
         assert!(
             definition.function.parameters["properties"]["capabilities"]

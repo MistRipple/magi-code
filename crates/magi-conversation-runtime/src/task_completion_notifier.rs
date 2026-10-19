@@ -226,6 +226,14 @@ impl TaskCompletionNotifier {
         ) {
             return;
         }
+        // 异步旧终态可能晚于同一 Task 的显式 Continue；不能消费新执行的绑定或释放资源。
+        if self.store.get_task(&task_id).is_none_or(|current| {
+            current.status != status
+                || current.updated_at != task.updated_at
+                || current.retry_count != task.retry_count
+        }) {
+            return;
+        }
         let stored_context = {
             let mut contexts = self
                 .task_contexts
@@ -491,5 +499,43 @@ mod tests {
             1,
             "repeated callbacks for the same durable terminal generation must notify once"
         );
+    }
+
+    #[test]
+    fn late_terminal_does_not_consume_resumed_execution_context() {
+        let store = Arc::new(TaskStore::new());
+        let id = TaskId::new("resumed-notifier");
+        store.insert_task(pending_task(id.as_str())).unwrap();
+        store
+            .revoke_active_lease_and_set_task_terminal(&id, &id, TaskStatus::Failed, Vec::new())
+            .unwrap();
+        let mut old = store.get_task(&id).unwrap();
+        store.reopen_failed_task_for_recovery(&id).unwrap();
+        let notifier = TaskCompletionNotifier::new(store.clone());
+        notifier.bind_task_context(
+            &id,
+            Some(SessionId::new("resumed-session")),
+            Some("new-turn".into()),
+        );
+        let (tx, rx) = mpsc::channel();
+        notifier.set_observer(move |notification| {
+            tx.send(notification).unwrap();
+        });
+        notifier.notify_terminal_status(&id, TaskStatus::Failed, &old);
+        assert!(rx.try_recv().is_err());
+        // 第二次也以 Failed 结算，旧回调仍不得领取新执行的绑定。
+        store
+            .revoke_active_lease_and_set_task_terminal(&id, &id, TaskStatus::Failed, Vec::new())
+            .unwrap();
+        let current = store.get_task(&id).unwrap();
+        // 确定性模拟前后终态落在同一毫秒；不能用时钟精度代替恢复代际。
+        old.updated_at = current.updated_at;
+        assert_ne!(old.retry_count, current.retry_count);
+        notifier.notify_terminal_status(&id, TaskStatus::Failed, &old);
+        assert!(rx.try_recv().is_err());
+        notifier.notify_terminal_status(&id, TaskStatus::Failed, &current);
+        assert_eq!(rx.recv().unwrap().turn_id.as_deref(), Some("new-turn"));
+        notifier.notify_terminal_status(&id, TaskStatus::Failed, &current);
+        assert!(rx.try_recv().is_err());
     }
 }

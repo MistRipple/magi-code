@@ -89,10 +89,13 @@ pub fn active_skill_tool_execution_policy(
         access_profile,
         ..ToolExecutionPolicy::default()
     };
-    let (Some(skill_runtime), Some(skill_name)) = (
-        skill_runtime,
-        skill_name.map(str::trim).filter(|value| !value.is_empty()),
-    ) else {
+    let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return policy;
+    };
+    let Some(skill_runtime) = skill_runtime else {
+        // 已激活配置被移除/运行时失效时不能退回全工具，避免旧 schema 绕过撤销。
+        policy.source_skill_ids.push(skill_name.to_string());
+        policy.allowed_tool_names = Some(Vec::new());
         return policy;
     };
 
@@ -791,6 +794,10 @@ mod tests {
     struct BusinessFailureModelClient;
 
     impl magi_bridge_client::ModelBridgeClient for BusinessFailureModelClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,

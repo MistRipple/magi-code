@@ -66,8 +66,12 @@ impl PluginPackage {
         for index in 0..archive.len() {
             let mut file = archive
                 .by_index(index)
-                .map_err(|_| invalid("无法读取发布包目录"))?;
-            let name = file.name().trim_end_matches('/').to_string();
+                .map_err(|_| invalid("无法读取发布包条目"))?;
+            let name = file
+                .name()
+                .map_err(|_| invalid("无法读取发布包文件路径"))?
+                .trim_end_matches('/')
+                .to_string();
             if !valid_path(&name) || !names.insert(name.to_ascii_lowercase()) {
                 return Err(invalid("发布包包含非法、重复或大小写冲突路径"));
             }

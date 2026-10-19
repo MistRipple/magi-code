@@ -6,7 +6,7 @@ import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
 import type { AgentId, AnyAgentId } from '../shared/types/agent-types';
 import type { LocaleCode } from '../i18n/locales';
 import type { ProcessingStateSnapshot } from '../shared/protocol/processing-state';
-import type { PluginSelection } from '../shared/app-server-protocol.generated';
+import type { PluginSelection, SessionTurnGuideCapability } from '../shared/app-server-protocol.generated';
 
 // --- 从 orchestrator/runtime/orchestration-runtime-state-types 内联前端所需子集 ---
 
@@ -467,7 +467,6 @@ export interface WaveState {
 
 export interface OrchestratorRuntimeDecisionGateState {
   noProgressStreak: number;
-  budgetBreachStreak: number;
   externalWaitBreachStreak: number;
   consecutiveUpstreamModelErrors: number;
 }
@@ -573,6 +572,8 @@ export interface OrchestratorRuntimeState {
 }
 
 // 单条消息
+export type InputDeliveryStatus = 'waiting' | 'in_request' | 'used' | 'outcome_unknown' | 'not_recorded';
+
 export interface Message {
   id: string;
   role: MessageRole;
@@ -594,6 +595,7 @@ export interface Message {
   /** 用户在真实 Chromium 中选中的 DOM 节点，只读地随本轮提交。 */
   browserNodeSelections?: MessageBrowserNodeSelection[];
   metadata?: {
+    inputDelivery?: InputDeliveryStatus;
     model?: string;
     tokens?: number;
     duration?: number;
@@ -762,6 +764,9 @@ export interface QueuedMessageBrowserAnnotationReference {
 export type QueuedMessageBrowserNodeSelection = MessageBrowserNodeSelection;
 
 export interface QueuedMessage {
+  interruptTurnId?: string | null;
+  interruptionError?: string | null;
+  revision?: number;
   id: string;
   requestId?: string;
   localMessageId?: string;
@@ -784,7 +789,7 @@ export interface QueuedMessage {
   browserAnnotationRefs?: string[];
   browserNodeSelections?: QueuedMessageBrowserNodeSelection[];
   pluginSelections?: PluginSelection[];
-  canGuide: boolean;
+  guide?: SessionTurnGuideCapability;
 }
 
 // 处理中的 Actor

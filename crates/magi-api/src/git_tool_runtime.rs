@@ -21,6 +21,7 @@ use std::{
 
 #[derive(Clone)]
 pub struct GitToolRuntimeDependencies {
+    pub task_store: Option<Arc<magi_orchestrator::task_store::TaskStore>>,
     pub git_service: Arc<magi_git::GitService>,
     pub session_code_contexts: magi_git::SessionCodeContextRegistry,
     pub workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
@@ -47,6 +48,18 @@ fn execute_git_tool(
         Ok(arguments) => arguments,
         Err(message) => return rejected(tool, "git_invalid_input", message),
     };
+    if execution_context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline {
+        if tool == "agent_apply"
+            && execution_context.caller_scope == magi_tool_runtime::ToolCallerScope::DelegatingTask
+        {
+            let binding = match resolve_delegating_binding(deps, execution_context) {
+                Ok(binding) => binding,
+                Err(result) => return result,
+            };
+            return execute_agent_apply(deps, tool, &arguments, binding, execution_context);
+        }
+        return execute_delegated_git_query(deps, tool, &arguments, execution_context);
+    }
     let binding = match resolve_binding(deps, execution_context, &arguments) {
         Ok(binding) => binding,
         Err(result) => return result,
@@ -108,10 +121,10 @@ fn execute_git_tool(
     }
 }
 
-/// 把已结束代理分支上的改动应用到主线工作树。
+/// 把已结束的直接子代理改动应用到调用者工作树。
 ///
 /// 只应用代理快照基线到代理分支 HEAD 的差异；任一文件无法干净应用时整体拒绝，
-/// 主线工作树保持原样。成功后标记已应用并删除代理分支。
+/// 调用者工作树保持原样。成功后标记已应用并删除代理分支。
 fn execute_agent_apply(
     deps: &GitToolRuntimeDependencies,
     tool: &str,
@@ -119,17 +132,45 @@ fn execute_agent_apply(
     binding: GitToolBinding,
     execution_context: &ToolExecutionContext,
 ) -> (String, ExecutionResultStatus) {
-    if execution_context.worker_id.is_some() {
-        return rejected(
-            tool,
-            "agent_git_mutation_forbidden",
-            "只有主线可以把代理改动应用到主工作树",
-        );
-    }
     let task_id = match required_string(arguments, "task_id") {
         Ok(value) => value,
         Err(message) => return rejected(tool, "git_invalid_input", message),
     };
+    {
+        let (Some(store), Some(caller_id)) =
+            (deps.task_store.as_ref(), execution_context.task_id.as_ref())
+        else {
+            return rejected(
+                tool,
+                "agent_apply_missing_task_scope",
+                "采用代理产出需要真实调用任务与 TaskStore 归属",
+            );
+        };
+        let child = store.get_task(&magi_core::TaskId::new(&task_id));
+        let caller = store.get_task(caller_id);
+        if child.as_ref().is_none_or(|child| {
+            child.status != magi_core::TaskStatus::Completed
+                || caller.as_ref().is_none_or(|caller| {
+                    caller.status != magi_core::TaskStatus::Running
+                        || caller.mission_id != child.mission_id
+                        || caller.workspace_scope != child.workspace_scope
+                        || caller.write_scope != child.write_scope
+                        || if caller.parent_task_id.is_none() {
+                            // 主线可采用本会话历史主线直接派发的产出；不能绕过活跃中间代理。
+                            child.parent_task_id.as_ref() != Some(&child.root_task_id)
+                        } else {
+                            child.parent_task_id.as_ref() != Some(caller_id)
+                                || caller.root_task_id != child.root_task_id
+                        }
+                })
+        }) {
+            return rejected(
+                tool,
+                "agent_output_not_direct_child",
+                "只能采用当前任务直接派发且已完成的子代理产出；主线可采用本会话历史主线的直接产出",
+            );
+        }
+    }
     let Some(worktree) = binding
         .context
         .agent_worktrees
@@ -175,13 +216,13 @@ fn execute_agent_apply(
                     "status": "rejected",
                     "ok": false,
                     "error_code": "git_apply_conflict",
-                    "error": "代理改动与主线当前工作树冲突，未做任何修改",
+                    "error": "代理改动与当前任务工作树冲突，未做任何修改",
                     "conflicted_paths": conflicted_paths,
                     "base": worktree.base_head,
                     "head": result_head,
                     "branch": worktree.branch,
                     "stderr": stderr,
-                    "instruction": "主线工作树保持原样。可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理在冲突文件上的改动，再用文件工具手动合并。",
+                    "instruction": "当前任务工作树保持原样。可用 shell_exec 执行 `git diff <base> <head> -- <path>` 查看代理在冲突文件上的改动，再用文件工具手动合并。",
                 })
                 .to_string(),
                 ExecutionResultStatus::Rejected,
@@ -199,7 +240,7 @@ fn execute_agent_apply(
     if let Err(message) = persist_contexts(deps) {
         return failed(tool, "git_context_persist_failed", message);
     }
-    // 改动已经进入主线工作树，代理分支不再需要；删除失败只影响分支整洁度。
+    // 改动已经进入调用者工作树，代理分支不再需要；删除失败只影响分支整洁度。
     let branch_deleted = worktree.branch.as_ref().is_some_and(|branch| {
         block_on(deps.git_service.branch_delete_after_revision_apply(
             &binding.path,
@@ -214,7 +255,9 @@ fn execute_agent_apply(
         ))
         .is_ok()
     });
-    schedule_code_index_refresh(deps, &binding.workspace_id, &binding.path);
+    if execution_context.caller_scope == magi_tool_runtime::ToolCallerScope::SessionMainline {
+        schedule_code_index_refresh(deps, &binding.workspace_id, &binding.path);
+    }
     succeeded(
         tool,
         json!({
@@ -224,6 +267,153 @@ fn execute_agent_apply(
             "branch_deleted": branch_deleted,
         }),
     )
+}
+
+/// 子任务查询自己的执行目录，不刷新或修改主对话的 Git context/CAS/基线。
+fn execute_delegated_git_query(
+    deps: &GitToolRuntimeDependencies,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext,
+) -> (String, ExecutionResultStatus) {
+    if !matches!(tool, "git_status" | "git_branch_list" | "git_worktree_list") {
+        return rejected(
+            tool,
+            "agent_git_mutation_forbidden",
+            "子代理只能查询自己获授的 Git 资源；主工作区操作需由主代理执行",
+        );
+    }
+    let (Some(session_id), Some(workspace_id), Some(task_id), Some(path)) = (
+        context.session_id.as_ref(),
+        context.workspace_id.as_ref(),
+        context.task_id.as_ref(),
+        context.working_directory.as_ref(),
+    ) else {
+        return rejected(
+            tool,
+            "git_missing_task_scope",
+            "Git 查询缺少任务与执行目录归属",
+        );
+    };
+    let Some(session) = deps.session_code_contexts.get(session_id.as_str()) else {
+        return rejected(tool, "git_missing_context", "当前会话尚未建立 Git context");
+    };
+    if session.workspace_id != workspace_id.as_str() {
+        return rejected(
+            tool,
+            "git_workspace_mismatch",
+            "任务与 Git 资源不属于同一工作区",
+        );
+    }
+    let assigned = session
+        .agent_worktrees
+        .iter()
+        .find(|assigned| assigned.task_id == task_id.as_str());
+    let permitted = match assigned {
+        Some(assigned) => {
+            assigned.active
+                && same_path(path, &assigned.path)
+                && context
+                    .worker_id
+                    .as_ref()
+                    .is_none_or(|worker| worker.as_str() == assigned.worker_id)
+        }
+        None => same_path(path, &session.execution_root),
+    };
+    if !permitted {
+        return rejected(
+            tool,
+            "git_task_resource_mismatch",
+            "任务执行目录不属于当前获授的 Git 资源",
+        );
+    }
+    let result = match tool {
+        "git_status" => block_on(deps.git_service.observe(path))
+            .map(|observation| json!({"observation": observation})),
+        "git_branch_list" => block_on(
+            deps.git_service
+                .branch_list(path, bool_arg(arguments, "includeRemote", false)),
+        )
+        .map(|list| json!({"observation": list.observation, "branches": list.branches})),
+        "git_worktree_list" => block_on(deps.git_service.worktree_list(path))
+            .map(|worktrees| json!({"worktrees": worktrees})),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(mut result) => {
+            result["resource"] = json!({"ownerTaskId": task_id, "workingDirectory": path});
+            succeeded(tool, result)
+        }
+        Err(error) => git_error(tool, error),
+    }
+}
+
+/// 受委派代理仅能在自己的活动副本中采用直接子代理改动，不更新主线 Git 基线。
+fn resolve_delegating_binding(
+    deps: &GitToolRuntimeDependencies,
+    context: &ToolExecutionContext,
+) -> Result<GitToolBinding, (String, ExecutionResultStatus)> {
+    let reject = || {
+        rejected(
+            "agent_apply",
+            "agent_apply_scope_mismatch",
+            "代理委派权限、任务租约或执行目录已失效",
+        )
+    };
+    let (Some(store), Some(session_id), Some(workspace_id), Some(task_id), Some(path)) = (
+        deps.task_store.as_ref(),
+        context.session_id.as_ref(),
+        context.workspace_id.as_ref(),
+        context.task_id.as_ref(),
+        context.working_directory.as_ref(),
+    ) else {
+        return Err(reject());
+    };
+    let caller = store.get_task(task_id).ok_or_else(reject)?;
+    if caller.status != magi_core::TaskStatus::Running || !caller.delegation_allowed() {
+        return Err(reject());
+    }
+    store
+        .validate_agent_delegation(&caller)
+        .map_err(|_| reject())?;
+    let session = deps
+        .session_code_contexts
+        .get(session_id.as_str())
+        .ok_or_else(reject)?;
+    let assigned = session
+        .agent_worktrees
+        .iter()
+        .find(|assigned| assigned.task_id == task_id.as_str())
+        .ok_or_else(reject)?;
+    if session.workspace_id != workspace_id.as_str()
+        || !assigned.active
+        || !same_path(path, &assigned.path)
+        || assigned.mode != magi_git::AgentWorktreeMode::Writable
+        || store
+            .get_active_lease(task_id)
+            .is_none_or(|lease| assigned.lease_id.as_deref() != Some(lease.lease_id.as_str()))
+        || context
+            .worker_id
+            .as_ref()
+            .is_some_and(|id| id.as_str() != assigned.worker_id)
+    {
+        return Err(reject());
+    }
+    let observation = block_on(deps.git_service.observe(path))
+        .map_err(|error| git_error("agent_apply", error))?;
+    let precondition = GitPrecondition {
+        expected_head: observation.head.clone(),
+        expected_branch: observation.branch.clone(),
+        expected_worktree_path: Some(path.clone()),
+    };
+    Ok(GitToolBinding {
+        session_id: session_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        path: path.clone(),
+        context: session,
+        observation,
+        precondition,
+    })
 }
 
 struct GitToolBinding {
@@ -1002,6 +1192,39 @@ mod tests {
         git(root, &["commit", "-m", "base"]);
     }
 
+    fn apply_task(
+        id: &str,
+        parent: Option<&str>,
+        status: magi_core::TaskStatus,
+    ) -> magi_core::Task {
+        magi_core::Task {
+            task_id: magi_core::TaskId::new(id),
+            mission_id: magi_core::MissionId::new("apply-mission"),
+            root_task_id: magi_core::TaskId::new("apply-root"),
+            parent_task_id: parent.map(magi_core::TaskId::new),
+            kind: magi_core::TaskKind::LocalAgent,
+            title: id.into(),
+            goal: id.into(),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: Default::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: Default::default(),
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        }
+    }
+
     #[test]
     fn agent_apply_brings_finished_agent_changes_into_main_worktree_once() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1066,7 +1289,30 @@ mod tests {
             temp.path().join("state/workspaces.json"),
             temp.path().join("state/knowledge.json"),
         ));
+        let store = Arc::new(magi_orchestrator::task_store::TaskStore::new());
+        store
+            .insert_task(apply_task(
+                "apply-root",
+                None,
+                magi_core::TaskStatus::Running,
+            ))
+            .unwrap();
+        store
+            .insert_task(apply_task(
+                "task-agent-apply",
+                Some("apply-root"),
+                magi_core::TaskStatus::Completed,
+            ))
+            .unwrap();
+        store
+            .insert_task(apply_task(
+                "grandchild",
+                Some("task-agent-apply"),
+                magi_core::TaskStatus::Completed,
+            ))
+            .unwrap();
         let executor = build_git_tool_executor(GitToolRuntimeDependencies {
+            task_store: Some(store),
             git_service: git_service.clone(),
             session_code_contexts: contexts.clone(),
             workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
@@ -1077,12 +1323,26 @@ mod tests {
             managed_worktree_root: temp.path().join("worktrees"),
         });
         let context = ToolExecutionContext {
+            task_id: Some(magi_core::TaskId::new("apply-root")),
             session_id: Some(SessionId::new("session-agent-apply")),
             workspace_id: Some(WorkspaceId::new("workspace-agent-apply")),
             working_directory: Some(repository.clone()),
             access_profile: AccessProfile::Restricted,
             ..ToolExecutionContext::default()
         };
+
+        let (payload, status) = executor("agent_apply", r#"{"task_id":"grandchild"}"#, &context);
+        assert_eq!(status, ExecutionResultStatus::Rejected, "{payload}");
+        assert!(payload.contains("agent_output_not_direct_child"));
+        let mut anonymous = context.clone();
+        anonymous.task_id = None;
+        let (payload, status) = executor(
+            "agent_apply",
+            r#"{"task_id":"task-agent-apply"}"#,
+            &anonymous,
+        );
+        assert_eq!(status, ExecutionResultStatus::Rejected, "{payload}");
+        assert!(payload.contains("agent_apply_missing_task_scope"));
 
         let (payload, status) =
             executor("agent_apply", r#"{"task_id":"task-agent-apply"}"#, &context);
@@ -1139,6 +1399,7 @@ mod tests {
         ));
         let snapshot_manager = Arc::new(magi_snapshot::SnapshotManager::new());
         let executor = build_git_tool_executor(GitToolRuntimeDependencies {
+            task_store: None,
             git_service: git_service.clone(),
             session_code_contexts: contexts.clone(),
             workspace_git_coordinator: coordinator,
@@ -1252,6 +1513,53 @@ mod tests {
             .expect("worktree path")
             .to_string();
         assert!(Path::new(&worktree_path).is_dir());
+        contexts
+            .register_agent_worktree(
+                "session-git-tool",
+                magi_git::AgentWorktreeContext {
+                    task_id: "query-child".into(),
+                    lease_id: Some("query-lease".into()),
+                    worker_id: "query-worker".into(),
+                    path: PathBuf::from(&worktree_path),
+                    mode: magi_git::AgentWorktreeMode::ReadOnly,
+                    base_head: git(&repository, &["rev-parse", "HEAD"]),
+                    branch: None,
+                    active: true,
+                    result_head: None,
+                    changed_paths: vec![],
+                    applied: false,
+                },
+            )
+            .unwrap();
+        let child_context = ToolExecutionContext {
+            caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
+            task_id: Some(magi_core::TaskId::new("query-child")),
+            worker_id: Some(WorkerId::new("query-worker")),
+            working_directory: Some(PathBuf::from(&worktree_path)),
+            ..context.clone()
+        };
+        let main_before = contexts.get("session-git-tool").unwrap();
+        let (child_status, status) = executor("git_status", "{}", &child_context);
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{child_status}");
+        let child_status: Value = serde_json::from_str(&child_status).unwrap();
+        assert_eq!(
+            child_status["result"]["resource"]["workingDirectory"],
+            worktree_path
+        );
+        for query in ["git_branch_list", "git_worktree_list"] {
+            let (payload, status) = executor(query, "{}", &child_context);
+            assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        }
+        assert_eq!(contexts.get("session-git-tool").unwrap(), main_before);
+        contexts
+            .release_agent_worktree("session-git-tool", "query-child")
+            .unwrap();
+        let (_, released_status) = executor("git_status", "{}", &child_context);
+        assert_eq!(
+            released_status,
+            ExecutionResultStatus::Rejected,
+            "已释放资源不能被旧任务继续调用"
+        );
 
         let (_, remove_status) = executor(
             "git_worktree_remove",
@@ -1290,6 +1598,8 @@ mod tests {
             .expect("release running agent");
 
         let side_agent_context = ToolExecutionContext {
+            caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
+            task_id: Some(magi_core::TaskId::new("task-side-agent")),
             worker_id: Some(WorkerId::new("worker-side-agent")),
             ..context.clone()
         };
@@ -1304,6 +1614,20 @@ mod tests {
             "agent_git_mutation_forbidden"
         );
 
+        let before_query = contexts.get("session-git-tool").unwrap();
+        let (query, query_status) = executor("git_status", "{}", &side_agent_context);
+        assert_eq!(query_status, ExecutionResultStatus::Succeeded, "{query}");
+        assert_eq!(
+            contexts.get("session-git-tool").unwrap(),
+            before_query,
+            "子代理查询不能改写主会话上下文"
+        );
+        let wrong_scope = ToolExecutionContext {
+            working_directory: Some(temp.path().to_path_buf()),
+            ..side_agent_context.clone()
+        };
+        let (_, wrong_status) = executor("git_status", "{}", &wrong_scope);
+        assert_eq!(wrong_status, ExecutionResultStatus::Rejected);
         let (_, merge_status) = executor("git_merge", r#"{"target":"main"}"#, &context);
         assert_eq!(merge_status, ExecutionResultStatus::Rejected);
         assert!(

@@ -22,41 +22,77 @@ pub(crate) fn evaluate_policy(
     selected_skills: &[SkillDefinition],
     requested_tools: &[String],
 ) -> SkillPolicyDecision {
-    let mut allowlist = selected_skills
+    let restricted = selected_skills
         .iter()
-        .flat_map(|skill| skill.allowed_tools.iter().cloned())
-        .collect::<HashSet<_>>();
-    let mut allowed_tools = Vec::new();
-    let mut denied_tools = Vec::new();
-
-    if requested_tools.is_empty() {
-        let mut tools = allowlist.into_iter().collect::<Vec<_>>();
-        tools.sort();
-        return SkillPolicyDecision {
-            allowed_tools: tools,
-            denied_tools,
-        };
-    }
-
-    for tool in requested_tools {
-        if allowlist.remove(tool)
-            || selected_skills
+        .filter(|skill| skill.standard_tool_access().is_restricted())
+        .collect::<Vec<_>>();
+    let candidates = if requested_tools.is_empty() {
+        selected_skills
+            .iter()
+            .flat_map(|skill| skill.allowed_tools.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        requested_tools.to_vec()
+    };
+    let (mut allowed_tools, mut denied_tools): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|tool| {
+            restricted
                 .iter()
-                .any(|skill| skill.allowed_tools.iter().any(|item| item == tool))
-        {
-            allowed_tools.push(tool.clone());
-        } else {
-            denied_tools.push(tool.clone());
-        }
-    }
-
+                .all(|skill| skill.standard_tool_access().allows(tool))
+        });
     allowed_tools.sort();
     allowed_tools.dedup();
     denied_tools.sort();
     denied_tools.dedup();
-
     SkillPolicyDecision {
         allowed_tools,
         denied_tools,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn skill(restrict: bool, allowed: &[&str]) -> SkillDefinition {
+        SkillDefinition {
+            skill_id: format!("skill-{restrict}-{}", allowed.join("-")),
+            title: "test".into(),
+            instruction: String::new(),
+            metadata: crate::SkillMetadata {
+                category: "test".into(),
+                tags: vec![],
+            },
+            restrict_standard_tools: restrict,
+            allowed_tools: allowed.iter().map(|s| (*s).into()).collect(),
+            custom_tool_bindings: vec![],
+            prompt_priority: 0,
+        }
+    }
+    #[test]
+    fn skill_recommendations_cannot_expand_a_closed_workflow() {
+        let skills = vec![
+            skill(true, &["file_read", "search_text"]),
+            skill(true, &["file_read"]),
+            skill(false, &["shell_exec"]),
+        ];
+        let policy = evaluate_policy(&skills, &[]);
+        assert_eq!(policy.allowed_tools, ["file_read"]);
+        assert!(policy.denied_tools.contains(&"shell_exec".into()));
+        assert!(!skills[0].standard_tool_access().allows("shell_exec"));
+    }
+    #[test]
+    fn empty_inherit_and_empty_deny_all_remain_distinct() {
+        let requested = vec!["file_read".into()];
+        assert_eq!(
+            evaluate_policy(&[skill(false, &[])], &requested).allowed_tools,
+            requested
+        );
+        assert!(
+            evaluate_policy(&[skill(true, &[])], &requested)
+                .allowed_tools
+                .is_empty()
+        );
     }
 }

@@ -188,20 +188,44 @@ fn stable_prompt_hash(value: &str) -> u64 {
 
 const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
 多代理协作（root coordinator 必须遵守）：\n\
-1. 是否派发代理由你根据任务边界、并行收益和独立复核价值自主判断；1-3 步即可完成的工作直接做，不要为组队而组队。\n\
-2. 用户明确要求使用子代理、多代理或指定角色时，必须通过 agent_spawn 创建真实代理；用户明确要求单线完成时不要派发。不得用主线读取、shell_exec 或口头总结冒充代理执行。\n\
-3. 多个互相独立的工作单元在同一轮发起多次 agent_spawn，每次都提供最小充分的结构化 context_package（直接传 JSON 对象）。需要结果时用 agent_wait 收集；所有已创建代理都必须等待到结束或用 agent_cancel 取消，并在最终答复中整合其结果。\n\
-4. 收到 `agent_spawn`、`agent_send`、`agent_cancel`、`agent_wait`、`agent_apply` 定义即可直接调用；`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。\n\
-5. root coordinator 保留主线推进职责；代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
+1. 主线保留推进、集成与验收职责；所有派发选择遵循上面的共享唤起规则，不按角色或计划步骤自动组队。\n\
+2. 收到 `agent_spawn`、`agent_send`、`agent_cancel`、`agent_wait`、`agent_apply` 定义表示具备调用能力，不代表必须使用；`runtime_internal=true` 只表示由运行时接管，不表示工具不可用。\n\
+3. 代理需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
 
 const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
 子代理模式（当前模式：worker；worker 必须遵守）：\n\
-1. 你是被 root coordinator 派发的 worker，只完成当前 agent_spawn goal；启动上下文以 AgentContextPackage 为唯一事实包，不假定拥有主对话完整历史。\n\
+1. 你是被父任务派发的 worker，只完成当前 agent_spawn goal；启动上下文以 AgentContextPackage 为唯一事实包，不假定拥有主对话完整历史。\n\
 2. 不要继续创建代理，也不要把任务再分派给其他 worker。\n\
 3. 需要会话或同一执行链信息时，先用 context_search 找引用，再用 context_read 读取正文；已有信息不足时调用 context_request 向父任务请求，不要凭猜测补齐。";
 
 pub fn current_turn_context_priority_prompt() -> String {
     CURRENT_TURN_CONTEXT_PRIORITY_RULE.to_string()
+}
+
+/// 只从本轮真实工具定义派生委派提示，不另存能力状态。
+pub(crate) fn current_agent_mode_prompt(
+    task: &magi_core::Task,
+    limits: &crate::execution_admission::ExecutionAdmissionLimits,
+    roles: &magi_agent_role::AgentRoleRegistry,
+    tools: &[magi_bridge_client::ChatToolDefinition],
+) -> Option<String> {
+    if task.kind != magi_core::TaskKind::LocalAgent {
+        return None;
+    }
+    let coordinator = crate::task_helpers::task_is_coordinator(Some(task), Some(roles));
+    let can_delegate = crate::task_helpers::task_can_delegate(Some(task), Some(roles));
+    let spawn_visible = tools.iter().any(|tool| tool.function.name == "agent_spawn");
+    if can_delegate && spawn_visible {
+        return Some(if coordinator {
+            root_multi_agent_mode_prompt(limits, roles)
+        } else {
+            delegating_agent_mode_prompt(limits, roles)
+        });
+    }
+    if can_delegate {
+        return Some("当前代理调用边界：本轮 tools 未提供 agent_spawn，不能创建或重新激活子代理；先使用本轮可用能力推进。只有本轮 tools 提供的 agent_send/wait/cancel/apply 可用于管理已有直接子代理。角色、Skill、历史记录或明确代理请求都不能开放缺失工具；确需委派而能力尚未开放时说明限制，不伪装已派发，也不反复尝试绕过。下一轮以新的工具定义重新判断，工具恢复可用也不代表必须委派。".into());
+    }
+    Some(subagent_multi_agent_mode_prompt())
 }
 
 /// 当前执行轮次的权限快照。
@@ -247,6 +271,7 @@ pub fn current_access_profile_prompt(
 pub fn skill_prompt_message(runtime: &SkillRuntime, skill_id: &str) -> Option<ChatMessage> {
     let skill = runtime.registry().get(skill_id)?;
     Some(ChatMessage {
+        input_request_id: None,
         context_origin: magi_bridge_client::ChatMessageOrigin::Skill,
         role: "developer".to_string(),
         content: Some(format!(
@@ -281,7 +306,8 @@ pub fn root_multi_agent_mode_prompt(
     roles: &magi_agent_role::AgentRoleRegistry,
 ) -> String {
     format!(
-        "{ROOT_MULTI_AGENT_MODE_RULE}\n{}\n{}",
+        "{}\n{ROOT_MULTI_AGENT_MODE_RULE}\n{}\n{}",
+        magi_tool_runtime::AGENT_DELEGATION_GUIDANCE,
         execution_capacity_rule(limits),
         spawnable_roles_rule(roles)
     )
@@ -314,10 +340,22 @@ fn execution_capacity_rule(
     limits: &crate::execution_admission::ExecutionAdmissionLimits,
 ) -> String {
     format!(
-        "执行容量：全局最多同时运行 {} 个执行单元，单个会话 {} 个，每个角色 {} 个（自定义角色可能设置更低的实例上限）；主线在 agent_wait 期间不占用名额。超出容量时 agent_spawn 返回 queued，表示代理已创建并会在有名额后自动开始，保留 child_task_id 继续 agent_wait；rejected 表示没有创建代理，需按 error_code 修正后再派发。",
+        "执行容量：全局最多同时运行 {} 个执行单元，单个会话 {} 个，每个角色 {} 个（自定义角色可能设置更低的实例上限）；当前代理在 agent_wait 期间不占用名额。超出容量时 agent_spawn 返回 queued，表示代理已创建并会在有名额后自动开始，保留 child_task_id 继续 agent_wait；rejected 表示没有创建代理，先判断是否应直接接管，确需委派时再按 error_code 修正。",
         limits.max_active_tasks,
         limits.max_active_tasks_per_session,
         limits.max_active_tasks_per_role
+    )
+}
+
+pub fn delegating_agent_mode_prompt(
+    limits: &crate::execution_admission::ExecutionAdmissionLimits,
+    roles: &magi_agent_role::AgentRoleRegistry,
+) -> String {
+    format!(
+        "受委派代理模式：只完成父任务交付的 goal；上下文以 AgentContextPackage 为准。你已被显式授权派发自己的直接子任务，最多两层代理；不能再向孙代理授予 allow_delegation。\n使用 agent_send/wait/cancel 管理自己的子代理，不能管理兄弟或祖先任务。子代理基于你的当前工作树建立隔离副本；agent_apply 只把直接子代理已完成的改动合入你的副本，主工作树仍由主线决定是否采用。结束前必须等待或取消所有子代理；不得把共享 Goal/计划/记忆或主分支作为自己的状态修改。获授委派能力不要求创建子代理；具体判断遵循同一子代理唤起规则，遵守父任务与用户的派发限制。需要更多信息时使用 context_request。\n{}\n{}\n{}",
+        magi_tool_runtime::AGENT_DELEGATION_GUIDANCE,
+        execution_capacity_rule(limits),
+        spawnable_roles_rule(roles)
     )
 }
 
@@ -338,6 +376,7 @@ pub enum PromptFragmentKind {
     ThreadHistoryBoundary,
     KnowledgeContext,
     CurrentAccessProfile,
+    CurrentAgentMode,
     CurrentTurnPriority,
 }
 
@@ -369,6 +408,7 @@ impl PromptFragmentKind {
             Self::ThreadHistoryBoundary => "thread_history_boundary",
             Self::KnowledgeContext => "knowledge_context",
             Self::CurrentAccessProfile => "current_access_profile",
+            Self::CurrentAgentMode => "current_agent_mode",
             Self::CurrentTurnPriority => "current_turn_priority",
         }
     }
@@ -379,6 +419,7 @@ impl PromptFragmentKind {
             | Self::WorkspaceContext
             | Self::DeveloperInstructions
             | Self::CurrentAccessProfile
+            | Self::CurrentAgentMode
             | Self::CurrentTurnPriority => "developer",
             Self::ProjectMemory
             | Self::ContextReferences
@@ -396,6 +437,7 @@ impl PromptFragmentKind {
             | Self::WorkspaceContext
             | Self::DeveloperInstructions
             | Self::CurrentAccessProfile
+            | Self::CurrentAgentMode
             | Self::CurrentTurnPriority => PromptTrustLevel::TrustedInstruction,
             Self::ThreadHistoryBoundary => PromptTrustLevel::Transcript,
             Self::UserPlan | Self::TaskContext => PromptTrustLevel::TaskFact,
@@ -418,6 +460,7 @@ impl PromptFragmentKind {
             | Self::ThreadHistoryBoundary
             | Self::KnowledgeContext
             | Self::CurrentAccessProfile
+            | Self::CurrentAgentMode
             | Self::CurrentTurnPriority => PromptStability::Dynamic,
         }
     }
@@ -447,6 +490,7 @@ pub fn system_prompt_fragment_message(
     content: impl AsRef<str>,
 ) -> ChatMessage {
     ChatMessage {
+        input_request_id: None,
         context_origin: kind.context_origin(),
         role: kind.role().to_string(),
         content: Some(render_prompt_fragment(kind, content)),
@@ -493,6 +537,7 @@ pub fn reference_context_message(
 
 pub fn runtime_context_message(kind: PromptFragmentKind, content: impl AsRef<str>) -> ChatMessage {
     ChatMessage {
+        input_request_id: None,
         context_origin: kind.context_origin(),
         role: "user".to_string(),
         content: Some(render_prompt_fragment(kind, content)),
@@ -575,6 +620,16 @@ mod tests {
         assert!(prompt.contains("- reviewer（Reviewer，只读）"), "{prompt}");
         assert!(prompt.contains("- executor（Executor）"));
         assert!(!prompt.contains("- coordinator"), "协调者不是可派发角色");
+        assert!(prompt.contains("默认由当前代理直接完成"));
+        assert!(prompt.contains("不能明确说明收益时自己做"));
+        assert!(!prompt.contains("否则只派一个或由主线顺序完成"));
+        assert_eq!(
+            prompt
+                .matches(magi_tool_runtime::AGENT_DELEGATION_GUIDANCE)
+                .count(),
+            1,
+            "角色边界应引用同一唤起规则，不再维护第二份派发选择"
+        );
     }
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
 
@@ -786,6 +841,7 @@ mod tests {
             PromptFragmentKind::WorkspaceContext,
             PromptFragmentKind::DeveloperInstructions,
             PromptFragmentKind::CurrentAccessProfile,
+            PromptFragmentKind::CurrentAgentMode,
             PromptFragmentKind::CurrentTurnPriority,
         ] {
             assert_eq!(trusted_kind.role(), "developer");

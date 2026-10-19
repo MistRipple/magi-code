@@ -47,13 +47,17 @@ impl BridgeDispatchRuntime {
                         .ok_or(BridgeClientError::MissingClient {
                             bridge_kind: BridgeBindingKind::Model,
                         })?;
-                let response = client.invoke(ModelInvocationRequest {
+                let request = ModelInvocationRequest {
                     provider: binding.bridge_target.clone(),
                     prompt: input.payload.clone(),
                     messages: None,
                     tools: None,
                     tool_choice: None,
-                })?;
+                };
+                let capabilities = client.executor_capabilities();
+                crate::validate_executor_request(&capabilities, &request)?;
+                let response = client.invoke(request)?;
+                crate::validate_executor_response(&capabilities, &response)?;
                 if response
                     .content
                     .as_deref()

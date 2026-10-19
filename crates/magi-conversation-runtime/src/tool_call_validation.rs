@@ -20,6 +20,8 @@ impl ToolCallValidationIssue {
     pub(crate) fn model_feedback(&self) -> String {
         let instruction = if self.reason_code == "tool_not_available" {
             "该工具不在本轮可用工具列表中；请改用本轮已提供的工具，或直接返回文本结果。"
+        } else if self.tool_name == "agent_spawn" {
+            "先重新判断是否值得委派：不符合条件时主线直接完成，不要为通过校验编造收益；确需派发时按 expected_input_schema 提供完整决策与独立工作包，不要重复相同无效调用。"
         } else {
             "请根据 expected_input_schema 重新生成完整参数；不要重复提交相同的无效调用。"
         };
@@ -153,6 +155,7 @@ pub(crate) fn validate_tool_call_batch(
 
 pub(crate) fn invalid_tool_result_message(invalid: &InvalidToolCall) -> ChatMessage {
     ChatMessage {
+        input_request_id: None,
         context_origin: Default::default(),
         role: "tool".to_string(),
         content: Some(invalid.issue.model_feedback()),
@@ -240,6 +243,20 @@ fn validate_tool_call(
         )));
     }
 
+    // 在资源准备前验证决策；执行预检复用相同校验，不能通过直接调用绕过。
+    if magi_tool_runtime::BuiltinToolName::from_name(&call.function.name)
+        == Some(magi_tool_runtime::BuiltinToolName::AgentSpawn)
+        && let Err(message) = magi_tool_runtime::AgentDelegationDecision::from_arguments(&arguments)
+    {
+        return Err(Box::new(validation_issue(
+            call,
+            "invalid_delegation_decision",
+            message,
+            Vec::new(),
+            expected_input_schema,
+        )));
+    }
+
     Ok(())
 }
 
@@ -290,11 +307,17 @@ fn shell_exec_missing_fields(tool_name: &str, object: &Map<String, Value>) -> Ve
     let has_terminal_id = object
         .get("terminal_id")
         .is_some_and(|value| value.is_number());
+    let has_job_id = object
+        .get("job_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
 
     match action.as_deref() {
-        Some("read" | "write" | "kill") if !has_terminal_id => vec!["terminal_id".to_string()],
+        Some("read" | "write" | "kill") if !has_terminal_id && !has_job_id => {
+            vec!["terminal_id".to_string()]
+        }
         Some("list") => Vec::new(),
-        None if has_terminal_id && !has_command => Vec::new(),
+        Some("wait") if !has_job_id => vec!["job_id".to_string()],
         None | Some("run") if !has_command => vec!["command".to_string()],
         _ => Vec::new(),
     }
@@ -323,7 +346,7 @@ fn schema_allows_null(schema: &Value) -> bool {
             .any(schema_allows_null)
 }
 
-fn validate_json_schema_value(value: &Value, schema: &Value) -> Result<(), String> {
+pub(crate) fn validate_json_schema_value(value: &Value, schema: &Value) -> Result<(), String> {
     validate_json_schema_value_at(value, schema, "$".to_string())
 }
 
@@ -427,6 +450,13 @@ fn validate_json_schema_value_at(
             }
         }
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            if schema
+                .get("additionalProperties")
+                .is_some_and(|value| value == &Value::Bool(false))
+                && let Some(unknown) = object.keys().find(|field| !properties.contains_key(*field))
+            {
+                return Err(format!("{path} 不支持未知参数 {unknown}"));
+            }
             for (field, field_schema) in properties {
                 if let Some(field_value) = object.get(field) {
                     validate_json_schema_value_at(
@@ -547,6 +577,128 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawn_validates_delegation_with_the_real_model_schema() {
+        let definition = crate::builtin_tool_schema::public_builtin_tool_definition("agent_spawn")
+            .expect("agent_spawn must be public");
+        let arguments = serde_json::json!({
+            "task_name":"review_parser", "role":"reviewer", "display_name":"解析器独立复核",
+            "goal":"复核解析器的边界处理并返回具体缺陷与证据",
+            "delegation":{"purpose":"independent_review", "reason":"独立检查解析器边界，避免实现者遗漏相同假设"},
+            "context_package":{"summary":"仅复核已完成的解析器改动", "constraints":["不修改文件"],
+                "expected_output":"缺陷位置、复现输入和证据；无缺陷时说明检查范围", "references":[]}
+        });
+        for purpose in [
+            "user_requested",
+            "parallel_work",
+            "context_isolation",
+            "independent_review",
+        ] {
+            let mut valid = arguments.clone();
+            valid["delegation"]["purpose"] = serde_json::json!(purpose);
+            if purpose == "parallel_work" {
+                valid["delegation"]["parent_work"] =
+                    serde_json::json!("主线同时准备独立的接口兼容验收");
+            }
+            let batch = validate_tool_call_batch(
+                &[call("agent_spawn", &valid.to_string())],
+                std::slice::from_ref(&definition),
+            );
+            assert!(batch.invalid_calls.is_empty(), "{valid}");
+            assert_eq!(batch.valid_calls.len(), 1);
+        }
+        // 比较真实模型 Schema 与直接预检共用的解析器，避免 trim 前后长度不同。
+        for field in ["reason", "parent_work"] {
+            for (text, expected_valid) in [
+                ("独".repeat(600), true),
+                (format!(" {} ", "独".repeat(598)), true),
+                (format!(" {}", "独".repeat(600)), false),
+                (" ".repeat(600), false),
+            ] {
+                let mut candidate = arguments.clone();
+                candidate["delegation"] = serde_json::json!({
+                    "purpose":"parallel_work", "reason":"独立模块",
+                    "parent_work":"主线完成接口适配"
+                });
+                candidate["delegation"][field] = serde_json::json!(text);
+                assert_eq!(
+                    magi_tool_runtime::AgentDelegationDecision::from_arguments(&candidate).is_ok(),
+                    expected_valid,
+                    "direct: {candidate}"
+                );
+                let batch = validate_tool_call_batch(
+                    &[call("agent_spawn", &candidate.to_string())],
+                    std::slice::from_ref(&definition),
+                );
+                assert_eq!(
+                    batch.invalid_calls.is_empty(),
+                    expected_valid,
+                    "model: {candidate}"
+                );
+            }
+        }
+        for decision in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!({"purpose":"many_files","reason":"large task"})),
+            Some(serde_json::json!({"purpose":"independent_review","reason":"  "})),
+            Some(serde_json::json!({"purpose":"context_isolation","reason":"x".repeat(601)})),
+            Some(serde_json::json!({"purpose":"parallel_work","reason":"independent modules"})),
+            Some(
+                serde_json::json!({"purpose":"parallel_work","reason":"independent modules","parent_work":"  "}),
+            ),
+            Some(
+                serde_json::json!({"purpose":"user_requested","reason":"request","approved":true}),
+            ),
+            Some(serde_json::json!(
+                "{\"purpose\":\"user_requested\",\"reason\":\"request\"}"
+            )),
+        ] {
+            let mut invalid = arguments.clone();
+            invalid.as_object_mut().unwrap().remove("delegation");
+            if let Some(decision) = decision {
+                invalid["delegation"] = decision;
+            }
+            let batch = validate_tool_call_batch(
+                &[call("agent_spawn", &invalid.to_string())],
+                std::slice::from_ref(&definition),
+            );
+            assert!(batch.valid_calls.is_empty(), "{invalid}");
+            assert_eq!(batch.invalid_calls.len(), 1);
+            let feedback: Value =
+                serde_json::from_str(&batch.invalid_calls[0].issue.model_feedback()).unwrap();
+            assert_eq!(feedback["status"], "rejected");
+            assert_eq!(
+                feedback["expected_input_schema"],
+                definition.function.parameters
+            );
+            assert!(
+                feedback["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("主线直接完成")
+            );
+        }
+        // 决策只能解释收益，不能恢复一个未在本轮授予的工具。
+        let batch = validate_tool_call_batch(&[call("agent_spawn", &arguments.to_string())], &[]);
+        assert_eq!(
+            batch.invalid_calls[0].issue.reason_code,
+            "tool_not_available"
+        );
+
+        let mut unknown = arguments;
+        unknown["unexpected"] = serde_json::json!(true);
+        let batch = validate_tool_call_batch(
+            &[call("agent_spawn", &unknown.to_string())],
+            std::slice::from_ref(&definition),
+        );
+        assert_eq!(
+            batch.invalid_calls[0].issue.reason_code,
+            "tool_arguments_schema_mismatch"
+        );
+        assert!(batch.invalid_calls[0].issue.message.contains("unexpected"));
+    }
+
+    #[test]
     fn empty_shell_call_is_rejected_before_execution() {
         let definitions = vec![definition(
             "shell_exec",
@@ -569,19 +721,43 @@ mod tests {
     }
 
     #[test]
-    fn shell_process_control_call_does_not_require_command() {
-        let definitions = vec![definition(
-            "shell_exec",
-            serde_json::json!({"type": "object", "required": []}),
-        )];
-
-        let batch = validate_tool_call_batch(
-            &[call("shell_exec", r#"{"action":"read","terminal_id":7}"#)],
-            &definitions,
-        );
-
-        assert_eq!(batch.valid_calls.len(), 1);
-        assert!(batch.invalid_calls.is_empty());
+    fn shell_process_control_uses_the_published_job_and_terminal_contract() {
+        let definitions = vec![
+            crate::builtin_tool_schema::public_builtin_tool_definition("shell_exec")
+                .expect("shell_exec must be public"),
+        ];
+        for arguments in [
+            r#"{"action":"read","terminal_id":7}"#,
+            r#"{"action":"write","terminal_id":7,"input":"test"}"#,
+            r#"{"action":"kill","terminal_id":7}"#,
+            r#"{"action":"read","job_id":"job-1"}"#,
+            r#"{"action":"write","job_id":"job-1","input":"test"}"#,
+            r#"{"action":"kill","job_id":"job-1"}"#,
+            r#"{"action":"wait","job_id":"job-1","timeout_ms":1000}"#,
+            r#"{"action":"list"}"#,
+            r#"{"action":"run","command":"pwd","job_id":"unused"}"#,
+        ] {
+            let batch = validate_tool_call_batch(&[call("shell_exec", arguments)], &definitions);
+            assert!(batch.invalid_calls.is_empty(), "{arguments}");
+            assert_eq!(batch.valid_calls.len(), 1);
+        }
+        for (arguments, required) in [
+            (r#"{"action":"read"}"#, "terminal_id"),
+            (r#"{"action":"write"}"#, "terminal_id"),
+            (r#"{"action":"kill","job_id":" "}"#, "terminal_id"),
+            (r#"{"action":"wait","terminal_id":7}"#, "job_id"),
+            (r#"{"terminal_id":7}"#, "command"),
+            (r#"{"job_id":"job-1"}"#, "command"),
+            (r#"{"action":"run","job_id":"unused"}"#, "command"),
+        ] {
+            let batch = validate_tool_call_batch(&[call("shell_exec", arguments)], &definitions);
+            assert_eq!(
+                batch.invalid_calls[0].issue.missing_fields,
+                [required],
+                "{arguments}"
+            );
+            assert!(batch.valid_calls.is_empty());
+        }
     }
 
     #[test]
@@ -604,26 +780,26 @@ mod tests {
     #[test]
     fn schema_required_field_accepts_explicit_null_when_property_is_nullable() {
         let definitions = vec![definition(
-            "create_goal",
+            "nullable_fixture",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string"},
-                    "token_budget": {
+                    "optional_count": {
                         "anyOf": [
                             {"type": "integer", "minimum": 16000},
                             {"type": "null"}
                         ]
                     }
                 },
-                "required": ["objective", "token_budget"]
+                "required": ["objective", "optional_count"]
             }),
         )];
 
         let batch = validate_tool_call_batch(
             &[call(
-                "create_goal",
-                r#"{"objective":"读取 Cargo.toml","token_budget":null}"#,
+                "nullable_fixture",
+                r#"{"objective":"读取 Cargo.toml","optional_count":null}"#,
             )],
             &definitions,
         );

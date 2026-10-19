@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "$ROOT_DIR/scripts/prune-target.py" "$@"
+fi
+
+# Fallback: legacy bash logic if python3 is unavailable
 if [[ "${CARGO_TARGET_DIR:-}" = /* ]]; then
   TARGET_DIR="$CARGO_TARGET_DIR"
 else

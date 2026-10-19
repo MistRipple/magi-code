@@ -1,6 +1,7 @@
 import type {
   AgentId,
   ContentBlock,
+  InputDeliveryStatus,
   Message,
   MessageBrowserAnnotationReference,
   MessageBrowserNodeSelection,
@@ -638,6 +639,7 @@ function buildMessage(
   presentation: TurnPresentation,
 ): Message {
   const content = resolveItemContent(item);
+  const inputDelivery = steeringInputDelivery(turn, item);
   const isAgentTaskSidechain = isAgentTaskSidechainItem(item);
   const workerId = isAgentTaskSidechain ? normalizeCanonicalWorkerId(item) : undefined;
   const roleId = isAgentTaskSidechain ? normalizeCanonicalRoleId(item) : undefined;
@@ -709,6 +711,7 @@ function buildMessage(
     ...(normalizedNoticeType ? { noticeType: normalizedNoticeType } : {}),
     metadata: {
       ...messageMetadataWithoutTransportAttachments(item.metadata),
+      ...(inputDelivery ? { inputDelivery } : {}),
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,
@@ -739,6 +742,7 @@ function buildMessage(
         item.status,
         turn.status,
         turn.completedAt ?? 0,
+        inputDelivery ?? '',
         content.length,
         blocks?.length ?? 0,
         valueToDisplayText(item.tool?.result)?.length ?? 0,
@@ -754,6 +758,22 @@ function buildMessage(
     conversationPresentationRole: inferConversationPresentationRole(message),
   };
   return message;
+}
+
+function steeringInputDelivery(turn: CanonicalTurn, item: CanonicalTurnItem): InputDeliveryStatus | undefined {
+  if (item.kind !== 'user_message' || item.metadata?.route !== 'steer') return undefined;
+  const requestId = item.metadata?.requestId;
+  if (typeof requestId !== 'string' || !requestId) return undefined;
+  const steps = (turn.modelSteps || []).filter((step) => (
+    step.purpose !== 'context_compaction' && step.inputRequestIds.includes(requestId)
+  ));
+  if (steps.some((step) => step.status === 'response_received')) return 'used';
+  if (steps.length > 0) {
+    return !isCanonicalTerminalStatus(turn.status) && steps.some((step) => step.status === 'started')
+      ? 'in_request' : 'outcome_unknown';
+  }
+  // 旧历史可能尚无 Step 日志；缺失记录也不能反向声称输入一定未发送。
+  return isCanonicalTerminalStatus(turn.status) ? 'not_recorded' : 'waiting';
 }
 
 function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string {

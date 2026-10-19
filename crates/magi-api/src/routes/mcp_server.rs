@@ -1926,7 +1926,7 @@ mod tests {
         let waiter = match state
             .conversation_registry
             .tool_approvals()
-            .request_with_arguments(
+            .request_external_with_arguments(
                 magi_conversation_runtime::PendingToolApproval {
                     approval_id: "approval-1".to_string(),
                     session_id: session_id.clone(),

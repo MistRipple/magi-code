@@ -322,7 +322,7 @@ impl PermissionEngine {
 
         match action.as_deref() {
             None if has_terminal_id && !has_command => return true,
-            Some("read" | "poll" | "status" | "list" | "ls") => return true,
+            Some("read" | "wait" | "poll" | "status" | "list" | "ls") => return true,
             // 已受 session/workspace 作用域约束的停止动作不会扩大命令的写入能力，
             // 在只读模式下也必须可以停止自己已启动的后台进程。
             Some("kill" | "stop" | "terminate" | "cancel") => return true,
@@ -377,8 +377,8 @@ impl PermissionEngine {
             None => has_command || has_terminal_id,
             Some("run" | "exec" | "command") => has_command,
             Some(
-                "read" | "poll" | "status" | "list" | "ls" | "write" | "stdin" | "send" | "kill"
-                | "stop" | "terminate" | "cancel",
+                "read" | "wait" | "poll" | "status" | "list" | "ls" | "write" | "stdin" | "send"
+                | "kill" | "stop" | "terminate" | "cancel",
             ) => true,
             Some(_) => false,
         }
@@ -1464,6 +1464,11 @@ mod tests {
             (
                 "background read-only process",
                 r#"{"command":"printf hello","access_mode":"read_only","background":true}"#,
+                true,
+            ),
+            (
+                "wait for durable job",
+                r#"{"action":"wait","job_id":"job-owned","timeout_ms":1000}"#,
                 true,
             ),
             (

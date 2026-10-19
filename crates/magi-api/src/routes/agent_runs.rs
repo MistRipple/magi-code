@@ -96,6 +96,12 @@ struct AgentProjectionDto {
     response_duration_ms: Option<u64>,
     updated_at: magi_core::UtcMillis,
     result: Option<AgentProjectionResultDto>,
+    /// 只读控制建议；执行时仍经同一应用服务复核原 Task/Turn/拥有方。
+    transfer_request: Option<magi_app_server_protocol::generated::AgentTransferParams>,
+    execution_owner: Option<magi_app_server_protocol::generated::AgentTransferTarget>,
+    transfer_unavailable_reason: Option<&'static str>,
+    continue_request: Option<magi_app_server_protocol::generated::AgentContinueParams>,
+    continue_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +373,11 @@ fn agent_projection_from_task(
             .map(|thread| thread.last_used_at)
             .unwrap_or(task.updated_at),
         result: agent_projection_result(task, thread),
+        transfer_request: None,
+        execution_owner: None,
+        transfer_unavailable_reason: None,
+        continue_request: None,
+        continue_unavailable_reason: None,
     }
 }
 
@@ -400,7 +411,7 @@ fn agent_failure_details(
         return (
             Some("dispatch".to_string()),
             Some("agent_unavailable".to_string()),
-            Some("代理当前不可用，主线需要改派或接管。".to_string()),
+            Some("代理当前不可用。".to_string()),
             Some("mainline_or_reassign".to_string()),
         );
     }
@@ -669,13 +680,30 @@ async fn get_agent_run_projection(
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
-    let agents = agent_read_model_for_projection(
+    let mut agents = agent_read_model_for_projection(
         &projection,
         active_chain.as_ref(),
         &session_threads,
         &agent_model_bindings,
         &queue_reasons,
     );
+    for agent in &mut agents {
+        if let Some(task) = projection
+            .tasks
+            .iter()
+            .find(|task| task.task_id.as_str() == agent.agent_run_id)
+        {
+            let transfer =
+                crate::agent_service::project_agent_transfer(&state, &scope.execution, task);
+            agent.transfer_request = transfer.request;
+            agent.execution_owner = transfer.owner;
+            agent.transfer_unavailable_reason = transfer.unavailable_reason;
+            let (request, reason) =
+                crate::agent_service::project_agent_continuation(&state, &scope.execution, task);
+            agent.continue_request = request;
+            agent.continue_unavailable_reason = reason;
+        }
+    }
     Ok(Json(agent_run_projection_response(
         projection, &scope, agents,
     )))
@@ -764,19 +792,11 @@ fn apply_recoverable_chain_summary(
         projection.recoverable_branch_count = 0;
         return Ok(());
     }
-    let worker_runtime_handle = state
-        .execution_pipeline()
-        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
     let count = chain
         .branches
         .iter()
         .filter(|branch| {
-            active_execution_branch_is_continue_recoverable(
-                worker_runtime_handle,
-                state.task_store(),
-                &chain,
-                branch,
-            )
+            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
         })
         .count();
     projection.has_recoverable_chain = count > 0;
@@ -1124,6 +1144,7 @@ mod tests {
             observed_context_window_tokens: None,
             handled_task_ids: vec![child_id.clone()],
             message_history: vec![magi_session_store::ThreadChatMessage {
+                input_request_id: None,
                 role: "assistant".to_string(),
                 content: Some("代理完成：thread transcript 是权威结果。".to_string()),
                 images: Vec::new(),
@@ -1241,6 +1262,11 @@ mod tests {
             response_duration_ms: None,
             updated_at: UtcMillis(2),
             result: None,
+            transfer_request: None,
+            execution_owner: None,
+            transfer_unavailable_reason: None,
+            continue_request: None,
+            continue_unavailable_reason: None,
         }];
 
         let value = serde_json::to_value(agent_run_projection_response(projection, &scope, agents))

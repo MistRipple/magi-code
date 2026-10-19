@@ -94,8 +94,7 @@ enum AdmissionPhase {
     /// 子代理注册时预占的名额，Runner 派发时转为 Running。
     Reserved,
     Running,
-    /// 正在 agent_wait 等待子代理的协调者：不占用会话、全局和角色名额，
-    /// 否则协调者会和自己派发的子代理抢同一批名额。
+    /// 等待代理或 Job 的任务：不占用会话、全局和角色名额。
     Waiting,
 }
 
@@ -105,7 +104,7 @@ impl AdmissionPhase {
     }
 }
 
-/// 协调者等待子代理期间的名额让渡；drop 时恢复占用。
+/// 等待期间让出名额；返回模型前显式重新准入，停止或异常退出撤下等待记录。
 pub struct AdmissionWaitGuard {
     controller: ExecutionAdmissionController,
     task_id: TaskId,
@@ -114,11 +113,62 @@ pub struct AdmissionWaitGuard {
 impl Drop for AdmissionWaitGuard {
     fn drop(&mut self) {
         if let Ok(mut state) = self.controller.state.lock()
-            && let Some(active) = state.active.get_mut(&self.task_id)
+            && let Some(active) = state.active.get(&self.task_id)
             && active.phase == AdmissionPhase::Waiting
         {
-            active.phase = AdmissionPhase::Running;
+            state.active.remove(&self.task_id);
         }
+    }
+}
+
+impl AdmissionWaitGuard {
+    fn try_resume(&self) -> bool {
+        let resources = self.controller.resource_snapshot();
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .expect("execution admission lock poisoned");
+        let Some(active) = state.active.get(&self.task_id) else {
+            return false;
+        };
+        if active.phase == AdmissionPhase::Running {
+            return true;
+        }
+        if self
+            .controller
+            .block_reason(&state, active.session_id.as_ref(), &active.role, &resources)
+            .is_some()
+        {
+            return false;
+        }
+        state
+            .active
+            .get_mut(&self.task_id)
+            .expect("waiting task")
+            .phase = AdmissionPhase::Running;
+        true
+    }
+
+    /// 重新取得名额后才允许返回模型；等待期间继续检查原 Task 是否仍活跃。
+    pub fn resume(&self, keep_waiting: impl Fn() -> bool) -> bool {
+        while keep_waiting() {
+            if self.try_resume() {
+                return true;
+            }
+            if !self
+                .controller
+                .state
+                .lock()
+                .expect("execution admission lock poisoned")
+                .active
+                .contains_key(&self.task_id)
+            {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
     }
 }
 
@@ -222,7 +272,7 @@ impl ExecutionAdmissionController {
         .err()
     }
 
-    /// 协调者开始等待子代理：让出名额，guard drop 时恢复。没有执行许可时返回 `None`。
+    /// 等待时让出名额，返回模型前必须 resume 重新准入。没有许可时返回 `None`。
     pub fn suspend_while_waiting(&self, task_id: &TaskId) -> Option<AdmissionWaitGuard> {
         let mut state = self
             .state
@@ -575,11 +625,59 @@ mod tests {
             )
             .expect("reservation turns into the dispatch permit");
         assert_eq!(controller.snapshot().active_task_count, 3);
-        drop(waiting);
-
+        assert!(!waiting.try_resume(), "等待结束不能绕过已被占满的容量");
         drop(child_a);
+        assert!(waiting.resume(|| true));
+        drop(waiting);
         drop(child_b);
         drop(coordinator);
+        assert_eq!(controller.snapshot().active_task_count, 0);
+    }
+
+    #[test]
+    fn waiting_tasks_reenter_capacity_one_at_a_time_and_cancel_without_restoring_a_slot() {
+        let controller = ExecutionAdmissionController::new(ExecutionAdmissionLimits {
+            max_active_tasks: 2,
+            max_active_tasks_per_session: 2,
+            max_active_tasks_per_role: 2,
+            min_available_memory_bytes: 0,
+        });
+        let first = controller
+            .acquire(TaskId::new("waiting-first"), None, "executor")
+            .unwrap();
+        let second = controller
+            .acquire(TaskId::new("waiting-second"), None, "executor")
+            .unwrap();
+        let first_wait = controller.suspend_while_waiting(&first.task_id).unwrap();
+        let second_wait = controller.suspend_while_waiting(&second.task_id).unwrap();
+        let other = controller
+            .acquire(TaskId::new("other-running"), None, "executor")
+            .unwrap();
+        assert!(first_wait.try_resume());
+        assert!(!second_wait.try_resume(), "一个名额只能唤醒一个等待任务");
+        assert!(!second_wait.resume(|| false));
+        drop(second_wait);
+        assert!(
+            !controller
+                .snapshot()
+                .active_task_ids
+                .contains(&"waiting-second".to_string())
+        );
+        assert!(
+            controller
+                .acquire(TaskId::new("must-still-wait"), None, "executor")
+                .is_err()
+        );
+        drop(first_wait);
+        assert!(
+            controller
+                .snapshot()
+                .active_task_ids
+                .contains(&"waiting-first".to_string())
+        );
+        drop(first);
+        drop(second);
+        drop(other);
         assert_eq!(controller.snapshot().active_task_count, 0);
     }
 

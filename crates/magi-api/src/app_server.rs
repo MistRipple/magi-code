@@ -4,6 +4,8 @@
 //! 仍由现有 ApiState、SessionStore、EventBus 与 BrowserAuthority 持有，避免再造
 //! 一份与 HTTP API 并行的状态模型。
 
+mod session_controls;
+
 use axum::{
     Router,
     extract::{
@@ -509,7 +511,9 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                                     .await
                                     .insert(request.id.clone(), control.clone());
                                 let request_id_for_cleanup = request.id.clone();
-                                let approval_request = request.method == "approval/request";
+                                // 已接纳的交互或停止必须完成持久写回/资源结算。
+                                // RPC 超时或连接取消不能中途 abort 留下半个停止操作。
+                                let must_settle = matches!(request.method.as_str(), "approval/request" | "turn/interrupt" | "session/approval/resolve" | "session/question/resolve" | "session/queue/remove" | "session/queue/update" | "session/queue/retry" | "session/queue/guide" | "goal/pause" | "goal/resume" | "goal/clear" | "goal/update" | "agent/transfer" | "agent/continue");
                                 let browser_tool_request = request.method == "browser/tool";
                                 let browser_timeout_retryable = browser_tool_retryable(&request);
                                 request_tasks.spawn(async move {
@@ -541,8 +545,8 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                                             )
                                             .await
                                         } else {
-                                            if !approval_request {
-                                            dispatch_task.abort();
+                                            if !must_settle {
+                                                dispatch_task.abort();
                                             }
                                             error_response(
                                                 request_id,
@@ -566,8 +570,8 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                                                     )
                                                     .await
                                                 } else {
-                                                    if !approval_request {
-                                                    dispatch_task.abort();
+                                                    if !must_settle {
+                                                        dispatch_task.abort();
                                                     }
                                                     error_response(
                                                         request_id.clone(),
@@ -590,8 +594,8 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                                                     )
                                                     .await
                                                 } else {
-                                                    if !approval_request {
-                                                    dispatch_task.abort();
+                                                    if !must_settle {
+                                                        dispatch_task.abort();
                                                     }
                                                     let error = ErrorObject::new(
                                                         ERROR_REQUEST_TIMEOUT,
@@ -834,6 +838,11 @@ async fn initialize_connection(
             capabilities: ServerCapabilities {
                 sessions: true,
                 turns: true,
+                turn_interrupt: true,
+                session_interactions: true,
+                goal_control: true,
+                session_queue: true,
+                agent_transfer: state.runner_manager().is_some() && state.task_store().is_some(),
                 events: true,
                 approvals: true,
                 // 方法存在不代表当前连接有权调用。只有可信 Desktop 传输且客户端
@@ -996,6 +1005,26 @@ async fn dispatch_request(
         Some(AppServerRequestMethod::TurnStart) => {
             start_turn(state, connection_state, request.id, request.params).await
         }
+        Some(AppServerRequestMethod::TurnInterrupt) => {
+            interrupt_turn(state, request.id, request.params).await
+        }
+        Some(
+            method @ (AppServerRequestMethod::SessionInteractions
+            | AppServerRequestMethod::SessionApprovalResolve
+            | AppServerRequestMethod::SessionQuestionResolve
+            | AppServerRequestMethod::SessionQueueRead
+            | AppServerRequestMethod::SessionQueueRemove
+            | AppServerRequestMethod::SessionQueueUpdate
+            | AppServerRequestMethod::SessionQueueRetry
+            | AppServerRequestMethod::SessionQueueGuide
+            | AppServerRequestMethod::AgentTransfer
+            | AppServerRequestMethod::AgentContinue
+            | AppServerRequestMethod::GoalRead
+            | AppServerRequestMethod::GoalUpdate
+            | AppServerRequestMethod::GoalPause
+            | AppServerRequestMethod::GoalResume
+            | AppServerRequestMethod::GoalClear),
+        ) => session_controls::dispatch(state, request.id, method, request.params).await,
         Some(AppServerRequestMethod::BrowserToolsList) => {
             if !browser_tools_authorized(connection_state).await {
                 error_response(
@@ -1812,6 +1841,53 @@ async fn read_session(
         }),
         "session/read",
     )
+}
+
+async fn interrupt_turn(
+    state: &ApiState,
+    request_id: RequestId,
+    params: Value,
+) -> magi_app_server_protocol::ServerResponse {
+    let params =
+        match serde_json::from_value::<magi_app_server_protocol::TurnInterruptParams>(params) {
+            Ok(params)
+                if !params.session_id.trim().is_empty()
+                    && !params.expected_turn_id.trim().is_empty() =>
+            {
+                params
+            }
+            _ => {
+                return error_response(
+                    request_id,
+                    ErrorObject::new(
+                        ERROR_INVALID_PARAMS,
+                        "停止需要非空 sessionId 与 expectedTurnId",
+                    ),
+                );
+            }
+        };
+    match crate::turn_service::interrupt_session_turn_with_expected(
+        state,
+        &SessionId::new(params.session_id.trim()),
+        params.workspace_id.as_deref(),
+        None,
+        Some(params.expected_turn_id.trim()),
+    )
+    .await
+    {
+        Ok(result) => {
+            match serde_json::to_value(result) {
+                Ok(result) => typed_success_from_json::<
+                    magi_app_server_protocol::TurnInterruptResult,
+                >(request_id, result, "turn/interrupt"),
+                Err(error) => error_response(
+                    request_id,
+                    ErrorObject::new(ERROR_INTERNAL, error.to_string()),
+                ),
+            }
+        }
+        Err(error) => error_response(request_id, api_error_to_protocol(error)),
+    }
 }
 
 async fn start_turn(

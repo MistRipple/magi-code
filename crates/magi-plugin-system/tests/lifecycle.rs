@@ -930,7 +930,7 @@ fn package_from_manifest(manifest: Value) -> PluginPackage {
 }
 
 #[test]
-fn revoking_authorization_cancels_in_flight_runs_immediately() {
+fn revoking_authorization_cancels_runs_but_uninstall_waits_for_settlement() {
     let root = tempdir().unwrap();
     let mut manager = PluginManager::open(root.path()).unwrap();
     let package = package(true);
@@ -949,7 +949,7 @@ fn revoking_authorization_cancels_in_flight_runs_immediately() {
     manager.activate("acme.lifecycle", "application").unwrap();
     let manager = Arc::new(Mutex::new(manager));
     let run = magi_plugin_system::RunCancellation::default();
-    let _lease = magi_plugin_system::PluginRuntimeLease::acquire(
+    let lease = magi_plugin_system::PluginRuntimeLease::acquire(
         Arc::clone(&manager),
         "acme.lifecycle",
         package.digest(),
@@ -964,6 +964,30 @@ fn revoking_authorization_cancels_in_flight_runs_immediately() {
         .authorize("acme.lifecycle", "application", Vec::new())
         .unwrap();
     assert!(run.is_cancelled(), "撤权优先于排空：在途调用立即取消");
+    {
+        let mut manager = manager.lock().unwrap();
+        manager.disable("acme.lifecycle", "application").unwrap();
+        let before = manager.state().clone();
+        let package_path = root
+            .path()
+            .join(&before.plugins["acme.lifecycle"].package_path);
+        assert!(
+            manager.uninstall("acme.lifecycle").is_err(),
+            "撤权与禁用不能把取消信号当成资源已经结算"
+        );
+        assert_eq!(manager.state(), &before);
+        assert!(package_path.is_file(), "在途调用仍引用的包必须保留");
+    }
+    drop(lease);
+    manager.lock().unwrap().uninstall("acme.lifecycle").unwrap();
+    assert!(
+        !manager
+            .lock()
+            .unwrap()
+            .state()
+            .plugins
+            .contains_key("acme.lifecycle")
+    );
 }
 
 #[test]

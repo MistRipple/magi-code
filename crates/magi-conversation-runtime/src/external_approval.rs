@@ -126,7 +126,7 @@ fn run_approval(
         requested_at: UtcMillis::now(),
         agent: None,
     };
-    let waiter = match registry.request_with_arguments(pending, request.arguments_json) {
+    let waiter = match registry.request_external_with_arguments(pending, request.arguments_json) {
         Ok(ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
         Ok(ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
         Ok(ToolApprovalRequestOutcome::PreviouslyDenied) => {

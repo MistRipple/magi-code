@@ -1,3 +1,5 @@
+import type { ModelStep } from '../app-server-protocol.generated';
+
 export const CANONICAL_TURN_SCHEMA_VERSION = 'canonical-turn.v1' as const;
 
 export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'interrupted' | 'cancelled' | 'superseded';
@@ -13,7 +15,11 @@ export type CanonicalTurnItemKind =
   | 'task_status'
   | 'system_notice';
 
-export type CanonicalTurnEventKind = 'turn_started' | 'turn_item_upsert' | 'turn_completed' | 'turn_superseded';
+export type CanonicalTurnEventKind = 'turn_started' | 'turn_item_upsert' | 'turn_completed' | 'turn_superseded' | 'model_step_updated';
+
+/** canonical ModelStep 的展示投影；不保存请求正文或建立另一份消费状态。 */
+export type CanonicalModelStep = Pick<ModelStep,
+  'stepId' | 'status' | 'purpose' | 'inputRequestIds' | 'startedAt' | 'settledAt'>;
 
 export interface CanonicalTurnVisibility {
   renderable: boolean;
@@ -70,6 +76,7 @@ export interface CanonicalTurn {
   responseDurationMs?: number;
   usage?: unknown;
   items: CanonicalTurnItem[];
+  modelSteps?: CanonicalModelStep[];
   metadata?: Record<string, unknown>;
 }
 
@@ -85,6 +92,7 @@ export interface CanonicalTurnEvent {
   turn?: CanonicalTurn;
   item?: CanonicalTurnItem;
   stream?: CanonicalTurnStreamUpdate;
+  modelStep?: CanonicalModelStep;
 }
 
 export interface CanonicalTurnStreamUpdate {
@@ -117,7 +125,32 @@ const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'task_status',
   'system_notice',
 ];
-const CANONICAL_TURN_EVENT_KINDS: CanonicalTurnEventKind[] = ['turn_started', 'turn_item_upsert', 'turn_completed', 'turn_superseded'];
+const CANONICAL_TURN_EVENT_KINDS: CanonicalTurnEventKind[] = ['turn_started', 'turn_item_upsert', 'turn_completed', 'turn_superseded', 'model_step_updated'];
+
+function normalizeCanonicalModelStep(value: unknown, path: string): CanonicalModelStep {
+  const record = readRecord(value);
+  const status = record?.status;
+  const startedAt = record ? readNumber(record, 'startedAt') : undefined;
+  const settledAt = record ? readNumber(record, 'settledAt') : undefined;
+  if (!record || !readString(record, 'stepId') || startedAt === undefined
+    || !['started', 'response_received', 'outcome_unknown'].includes(String(status))
+    || !Array.isArray(record.inputRequestIds)
+    || record.inputRequestIds.some((id) => typeof id !== 'string' || !id.trim())
+    || new Set(record.inputRequestIds).size !== record.inputRequestIds.length
+    || (status === 'started' ? settledAt !== undefined : settledAt === undefined)
+    || (settledAt !== undefined && settledAt < startedAt)
+    || (record.purpose != null && !['execution', 'context_compaction'].includes(String(record.purpose)))) {
+    throw new CanonicalProtocolError(path, 'invalid model Step identity, inputs or status');
+  }
+  return {
+    stepId: readString(record, 'stepId'),
+    status: status as CanonicalModelStep['status'],
+    ...(record.purpose ? { purpose: record.purpose as CanonicalModelStep['purpose'] } : {}),
+    inputRequestIds: [...record.inputRequestIds] as string[],
+    startedAt,
+    settledAt: settledAt ?? null,
+  };
+}
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -423,6 +456,12 @@ export function normalizeCanonicalTurn(value: unknown): CanonicalTurn | undefine
   }
   const items = (normalizedItems as CanonicalTurnItem[])
     .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId));
+  if (record.modelSteps !== undefined && !Array.isArray(record.modelSteps)) {
+    throw new CanonicalProtocolError('canonical_turn.modelSteps', 'must be an array');
+  }
+  const modelSteps = Array.isArray(record.modelSteps)
+    ? record.modelSteps.map((step, index) => normalizeCanonicalModelStep(step, `canonical_turn.modelSteps[${index}]`))
+    : undefined;
   return {
     sessionId,
     turnId,
@@ -433,6 +472,7 @@ export function normalizeCanonicalTurn(value: unknown): CanonicalTurn | undefine
     ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
     ...(record.usage !== undefined ? { usage: record.usage } : {}),
     items,
+    ...(modelSteps ? { modelSteps } : {}),
     ...(metadata ? { metadata } : {}),
   };
 }
@@ -500,6 +540,12 @@ export function parseCanonicalTurnEventPayload(
     ? undefined
     : normalizeCanonicalTurnItemStrict(rawItem);
   const kind = readEventKind(readString(record, 'canonical_event_kind'));
+  const modelStep = record.canonical_model_step === undefined
+    ? undefined
+    : normalizeCanonicalModelStep(record.canonical_model_step, 'canonical_event.modelStep');
+  if (kind === 'model_step_updated' && !modelStep) {
+    throw new CanonicalProtocolError('canonical_event.modelStep', 'Step update requires a model Step');
+  }
   const sessionId = turn?.sessionId || item?.sessionId || readString(record, 'session_id');
   const turnId = turn?.turnId || item?.turnId || readString(record, 'turn_id');
   const turnSeq = turn?.turnSeq ?? item?.turnSeq ?? readNumber(record, 'turn_seq');
@@ -537,6 +583,7 @@ export function parseCanonicalTurnEventPayload(
     ...(turn ? { turn } : {}),
     ...(item ? { item } : {}),
     ...(stream ? { stream } : {}),
+    ...(modelStep ? { modelStep } : {}),
   };
 }
 

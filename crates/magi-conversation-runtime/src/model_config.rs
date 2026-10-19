@@ -1109,13 +1109,14 @@ mod tests {
 
     #[test]
     fn invalid_api_protocol_is_rejected() {
-        let error = NormalizedModelConfig::from_settings_value(&json!({
-            "baseUrl": "https://gateway.example.com",
-            "apiProtocol": "auto"
-        }))
-        .expect_err("未知协议不得进入运行时");
-
-        assert!(error.contains("apiProtocol 无效"));
+        for protocol in ["auto", "codex_exec"] {
+            let error = NormalizedModelConfig::from_settings_value(&json!({
+                "baseUrl": "https://gateway.example.com",
+                "apiProtocol": protocol
+            }))
+            .expect_err("未知或已撤下的协议不得启动执行，也不能回退为 HTTP 模型");
+            assert!(error.contains("apiProtocol 无效"));
+        }
     }
 
     #[test]

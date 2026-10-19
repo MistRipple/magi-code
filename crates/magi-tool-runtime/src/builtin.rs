@@ -9,6 +9,7 @@ use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallI
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod cancellation;
 mod diagram;
 pub(crate) mod failure;
 mod file_transfer;
@@ -23,7 +24,9 @@ mod web;
 
 pub use files::file_read_result_matches_request;
 
-pub(crate) use process::{cancel_active_processes, cancel_all_active_processes};
+pub(crate) use process::{
+    cancel_active_processes, cancel_all_active_processes, has_active_processes,
+};
 #[cfg(test)]
 pub(crate) use shell::read_child_pipe;
 
@@ -78,7 +81,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
                 knowledge::execute_search_semantic(input, context, resources)
             }
             BuiltinToolName::ShellExec => {
-                shell::execute_shell_exec(input, context, None, resources.cancellation.as_ref())
+                shell::execute_shell_exec(tool_call_id, input, context, None, resources)
             }
             BuiltinToolName::ProcessLaunch => process::execute_process_launch(input, context),
             BuiltinToolName::ProcessRead => process::execute_process_read(input, context),
@@ -170,10 +173,11 @@ impl BuiltinTool for NormalizedBuiltinTool {
     ) -> String {
         if self.name == BuiltinToolName::ShellExec {
             shell::execute_shell_exec(
+                tool_call_id,
                 input,
                 context,
                 Some((tool_call_id, on_progress)),
-                resources.cancellation.as_ref(),
+                resources,
             )
         } else {
             self.execute(tool_call_id, input, context, resources)

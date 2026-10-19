@@ -109,7 +109,6 @@ fn workspace_session_loader_preserves_goals() {
             "turn-goal-load",
             "恢复工作区目标",
             AccessProfile::Restricted,
-            Some(256_000),
         )
         .expect("goal should create");
     let workspace_state = session_store.durable_state();
@@ -336,7 +335,7 @@ async fn wait_for_execution_group(
     }
 }
 
-fn assert_completed_two_agent_run_projection(projection: &Value) {
+fn assert_completed_agent_run_projection(projection: &Value) {
     let total_tasks = projection["progress_summary"]["total_tasks"]
         .as_u64()
         .expect("total_tasks should serialize as integer");
@@ -531,7 +530,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
         session_store.clone(),
         workspace_store.clone(),
     );
-    session_store.install_canonical_event_writer(Arc::new(repository.clone()));
+    session_store.install_session_event_writer(Arc::new(repository.clone()));
     let session_id = SessionId::new("session-flush-canonical");
     let workspace_id = WorkspaceId::new("workspace-flush-canonical");
 
@@ -1110,29 +1109,49 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "resume parser after crash"
     );
 
-    let detach_deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
+    // 失败的 branch 保留给显式 Continue；运行占位仍须在 canonical Turn 终态后释放，
+    // 让下一条用户输入能够接纳新执行，而不是丢弃恢复入口来换取“已停止”投影。
+    let terminal_deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
     loop {
-        let detached = state
+        let settled = state
             .session_store
             .runtime_sidecar(&session_id)
             .is_some_and(|sidecar| {
-                matches!(sidecar.status, SessionExecutionSidecarStatus::Detached)
-                    && sidecar.active_execution_chain.is_none()
-                    && sidecar.current_turn.as_ref().is_some_and(|turn| {
-                        matches!(
-                            turn.status.trim().to_ascii_lowercase().as_str(),
-                            "failed" | "cancelled" | "completed"
-                        )
-                    })
-            });
-        if detached {
+                sidecar
+                    .current_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.status == "failed")
+            })
+            && state
+                .turn_coordinator()
+                .active_turn_id(&session_id)
+                .is_none();
+        if settled {
             break;
         }
-        if Instant::now() >= detach_deadline {
-            panic!("恢复任务终态通知未在超时前释放 session execution chain");
+        if Instant::now() >= terminal_deadline {
+            panic!(
+                "恢复任务失败后未在超时前释放运行占位: {:?}",
+                state.session_store.runtime_sidecar(&session_id)
+            );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let retained_chain = state
+        .session_store
+        .active_execution_chain(&session_id)
+        .expect("失败分支仍须保留显式 Continue 的恢复入口");
+    assert!(
+        retained_chain.branches.iter().any(|branch| {
+            branch.task_id == task_id
+                && magi_conversation_runtime::execution_chain_recovery::active_execution_branch_is_continue_recoverable(
+                    state.task_store(),
+                    &retained_chain,
+                    branch,
+                )
+        }),
+        "原失败分支应保持可恢复，不能被伪造完成或归档"
+    );
     let first_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let recovery_summary = first_read_model["recovery"]["summaries"]
         .as_array()
@@ -1152,8 +1171,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .find(|entry| entry["session_id"] == session_id.to_string())
         .expect("session summary should exist");
     assert_eq!(
-        session_summary["current_status"], "detached",
-        "恢复 runner 已进入失败终态后应释放执行链，后续普通 followup 再重新绑定新链"
+        session_summary["current_status"], "resumed",
+        "恢复 runner 失败后保留原分支，后续普通 followup 仍可接纳新链"
     );
     assert!(session_summary["recovery_ref"].is_null());
     let workspace_summary = first_read_model["details"]["workspaces"]
@@ -1176,7 +1195,6 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             "scope": "workspace",
             "sessionId": session_id.to_string(),
             "text": "修复恢复任务后续问题，完成后运行测试并汇总验证结果",
-            "skillName": "resume",
             "images": [],
             "workspaceId": workspace_id.to_string(),
             "requestId": followup_request_id,
@@ -1265,7 +1283,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_agent_run_projection(&followup_projection);
+    assert_completed_agent_run_projection(&followup_projection);
 }
 
 #[tokio::test]
@@ -1296,7 +1314,6 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
             "scope": "workspace",
             "sessionId": "test-session-bootstrap",
             "text": "修复路由解析刷新问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
             "images": [],
             "workspaceId": active_workspace_id.to_string(),
         }),
@@ -1326,7 +1343,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         active_workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_agent_run_projection(&first_projection);
+    assert_completed_agent_run_projection(&first_projection);
 
     let second_request_id = "request-bootstrap-context-summary-followup";
     let (status, second_body) = post_json(
@@ -1336,7 +1353,6 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
             "scope": "workspace",
             "sessionId": "test-session-bootstrap",
             "text": "继续修复路由解析刷新后续问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
             "images": [],
             "workspaceId": active_workspace_id.to_string(),
             "requestId": second_request_id,
@@ -1402,7 +1418,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         active_workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_agent_run_projection(&second_projection);
+    assert_completed_agent_run_projection(&second_projection);
     let bootstrap = get_json(
         app.clone(),
         "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
@@ -1454,7 +1470,6 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             "scope": "workspace",
             "sessionId": "test-session-bootstrap-recovery",
             "text": "修复 bootstrap 恢复状态初始化问题，完成后运行测试并汇总验证结果",
-            "skillName": "resume",
             "images": [],
             "workspaceId": active_workspace_id.to_string(),
         }),
@@ -1545,7 +1560,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_agent_run_projection(&seed_projection);
+    assert_completed_agent_run_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     // continue 接纳请求后，恢复消费由后台执行完成；等待可观察的消费事实。
     let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
@@ -1614,7 +1629,6 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             "scope": "workspace",
             "sessionId": "test-session-bootstrap-recovery",
             "text": "修复 resumed bootstrap memory 消费问题，完成后运行测试并汇总验证结果",
-            "skillName": "resume",
             "images": [],
             "workspaceId": workspace_id.to_string(),
             "requestId": followup_request_id,
@@ -1696,7 +1710,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_agent_run_projection(&followup_projection);
+    assert_completed_agent_run_projection(&followup_projection);
     let bootstrap = get_json(
         app.clone(),
         "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
@@ -2890,7 +2904,6 @@ async fn task_turn_replays_after_daemon_restart_without_duplicate_canonical_acce
     let request = json!({
         "scope": "workspace",
         "text": "执行任务并在 daemon 重启后验证同一 Turn 回放",
-        "skillName": "code",
         "images": [],
         "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         "requestId": request_id,
@@ -3182,7 +3195,6 @@ async fn daemon_http_server_restart_replays_task_turn_without_duplicate_acceptan
     let request = json!({
         "scope": "workspace",
         "text": "执行任务并在 HTTP daemon 实例重启后回放同一 Turn",
-        "skillName": "code",
         "images": [],
         "workspaceId": workspace_id,
         "requestId": "request-http-daemon-instance-restart",
@@ -3689,7 +3701,6 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         json!({
             "scope": "workspace",
             "text": "修复集成测试消息链路问题，完成后运行测试并汇总验证结果",
-            "skillName": "code",
             "images": [],
             "workspaceId": "test-workspace-001",
         }),
@@ -3722,7 +3733,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_agent_run_projection(&projection);
+    assert_completed_agent_run_projection(&projection);
 
     let messages_page = get_json(
         app.clone(),
@@ -3790,7 +3801,6 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
         json!({
             "scope": "workspace",
             "text": "修复重启持久化验证问题，完成后运行测试并汇总验证结果",
-            "skillName": "code",
             "images": [],
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
@@ -4628,7 +4638,6 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
         json!({
             "scope": "workspace",
             "text": "修复工作区绑定会话重启恢复问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
             "images": [],
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
@@ -4814,7 +4823,6 @@ async fn session_action_publishes_domain_event_on_event_bus() {
             "scope": "workspace",
             "sessionId": "session-e2e-events",
             "text": "修复事件总线任务事件发布问题，完成后运行测试并汇总验证结果",
-            "skillName": "code",
             "images": [],
             "workspaceId": active_workspace_id.to_string(),
         }),
@@ -4866,7 +4874,6 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         json!({
             "scope": "workspace",
             "text": "修复连续会话第一阶段问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
             "images": [],
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
@@ -4886,7 +4893,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_agent_run_projection(&first_projection);
+    assert_completed_agent_run_projection(&first_projection);
 
     let second_request_id = "request-sequential-session-actions-followup";
     let (status, second_body) = post_json(
@@ -4896,7 +4903,6 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
             "scope": "workspace",
             "sessionId": session_id,
             "text": "修复连续会话第二阶段问题，完成后运行测试并汇总验证结果",
-            "skillName": "refactor",
             "images": [],
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
             "requestId": second_request_id,
@@ -4942,7 +4948,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_agent_run_projection(&second_projection);
+    assert_completed_agent_run_projection(&second_projection);
 
     let messages_page = get_json(
         app.clone(),

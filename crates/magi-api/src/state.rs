@@ -26,8 +26,6 @@ use magi_browser_authority::{
     BrowserHostControlUpdate, BrowserHostStatus, BrowserLeaseEndReason, BrowserLeaseSelector,
     BrowserProfile, BrowserProfileKind, BrowserSessionLifecycle, BrowserSurfaceControlSnapshot,
 };
-#[cfg(test)]
-use magi_conversation_runtime::task_runner_bridge::EventBasedResultReceiver;
 use magi_conversation_runtime::{
     CanonicalTurnEventSink, ConversationRegistry, CoordinatorCommandResult, SessionTurnCoordinator,
     TaskCompletionNotifier,
@@ -65,7 +63,7 @@ use magi_tool_runtime::{
 };
 use magi_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -582,7 +580,9 @@ impl RunnerManager {
                     RunCycleOutcome::Unrunnable(task_ids) => {
                         let runner_status =
                             match task_runner.finalize_unrunnable_outcome(&root_id, &task_ids) {
-                                Ok(_) => "error",
+                                // 候选可能已被别的循环领取、完成或转交；未提交失败就继续观察。
+                                Ok(false) => continue,
+                                Ok(true) => "error",
                                 Err(err) => {
                                     let mut last_error = bg_handle
                                         .last_error
@@ -700,18 +700,41 @@ impl RunnerManager {
         lock.lock_owned().await
     }
 
+    fn restart_lock(&self, root_task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.restart_locks
+            .lock()
+            .expect("runner restart locks should hold")
+            .entry(root_task_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub async fn lock_for_restart(&self, root_task_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .restart_locks
-                .lock()
-                .expect("runner restart locks should hold");
-            locks
-                .entry(root_task_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        lock.lock_owned().await
+        self.restart_lock(root_task_id).lock_owned().await
+    }
+
+    /// 只在 TaskStore 提交后的普通回调线程使用；不能在 Tokio worker 或 mutation guard 内调用。
+    /// 终态投影与显式 Continue 共用原 scope 锁，避免校验后重开导致旧回调清理新资源。
+    pub fn lock_for_task_status_change(
+        &self,
+        task: &magi_core::Task,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        loop {
+            let scope = self
+                .task_store
+                .execution_scope_root(&task.task_id)
+                .unwrap_or_else(|_| task.root_task_id.clone());
+            let guard = self.restart_lock(scope.as_str()).blocking_lock_owned();
+            if self
+                .task_store
+                .execution_scope_root(&task.task_id)
+                .unwrap_or_else(|_| task.root_task_id.clone())
+                == scope
+            {
+                return guard;
+            }
+            // 等待期间可能刚完成转交；必须改用当前独立范围的同一把锁。
+        }
     }
 
     pub async fn quiesce_for_restart(&self, root_task_id: &str) {
@@ -820,18 +843,21 @@ impl RunnerManager {
 
     /// Cancel all runners bound to the given session and remove the binding.
     /// Called when a session is closed.
-    pub async fn unbind_session(&self, session_id: &SessionId) -> usize {
+    pub async fn unbind_session(&self, session_id: &SessionId) -> Result<usize, String> {
         let _session_guard = self.lock_session_lifecycle(session_id).await;
         self.unbind_session_after_lifecycle_lock(session_id).await
     }
 
-    pub async fn unbind_session_after_lifecycle_lock(&self, session_id: &SessionId) -> usize {
+    pub async fn unbind_session_after_lifecycle_lock(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, String> {
         let mut root_task_ids = {
-            let mut index = self
+            let index = self
                 .session_runner_index
                 .lock()
                 .expect("session_runner_index lock should hold");
-            index.remove(session_id).unwrap_or_default()
+            index.get(session_id).cloned().unwrap_or_default()
         };
         if let Some(chain) = self.session_store.active_execution_chain(session_id)
             && !root_task_ids
@@ -840,12 +866,54 @@ impl RunnerManager {
         {
             root_task_ids.push(chain.root_task_id.to_string());
         }
+        // 重启后或注册交接期间可能尚无进程内绑定；从既有 Task/Agent 与 canonical
+        // 归属补全审计 root，不能只依赖当前主线指针或 Runner 内存索引。
+        let mut owned_tasks = self
+            .session_store
+            .execution_task_ids_for_session(session_id);
+        owned_tasks.extend(
+            self.task_store
+                .all_tasks()
+                .into_iter()
+                .filter(|task| {
+                    task.agent_activation()
+                        .is_some_and(|activation| &activation.session_id == session_id)
+                })
+                .map(|task| task.task_id),
+        );
+        for task_id in owned_tasks {
+            if let Some(task) = self.task_store.get_task(&task_id)
+                && !root_task_ids
+                    .iter()
+                    .any(|id| id == task.root_task_id.as_str())
+            {
+                root_task_ids.push(task.root_task_id.to_string());
+            }
+        }
         for root_task_id in &root_task_ids {
             let _restart_guard = self.lock_for_restart(root_task_id).await;
+            // Session 销毁跨过转交边界；先撤销全部 Task/lease，再等执行线程退出，
+            // 不能只停止 Runner 循环后等仍有效的已转交执行自然结束。
+            if self
+                .task_store
+                .get_task(&TaskId::new(root_task_id))
+                .is_some()
+            {
+                self.kill_tree(root_task_id)?;
+            }
             self.quiesce_for_restart(root_task_id).await;
+            if let Some(dispatcher) = self.dispatcher.as_ref() {
+                dispatcher
+                    .wait_for_audit_tree_quiesce(&TaskId::new(root_task_id))
+                    .await;
+            }
         }
         self.execution_admission.release_pending_session(session_id);
-        root_task_ids.len()
+        self.session_runner_index
+            .lock()
+            .expect("session runner index lock poisoned")
+            .remove(session_id);
+        Ok(root_task_ids.len())
     }
 
     /// Get the status of a runner.
@@ -887,9 +955,26 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.signal_stop_if_present(root_task_id);
+        // 整体销毁也停止子树内独立拥有方的 Runner；只停审计 root 会留下空转调度器。
+        let scope_roots = self.task_store.collect_subtree_ids(&tid);
+        for scope in &scope_roots {
+            self.signal_stop_if_present(scope.as_str());
+        }
         let result = self.build_task_runner(None).kill_tree(&tid);
-        self.set_runner_status_if_present(root_task_id, "killed");
+        for scope in scope_roots {
+            self.set_runner_status_if_present(scope.as_str(), "killed");
+        }
+        result
+    }
+
+    pub(crate) fn kill_execution_scope(&self, scope_root: &str) -> Result<(), String> {
+        let tid = TaskId::new(scope_root);
+        self.task_store
+            .get_task(&tid)
+            .ok_or_else(|| format!("任务不存在: {scope_root}"))?;
+        self.signal_stop_if_present(scope_root);
+        let result = self.build_task_runner(None).kill_execution_scope(&tid);
+        self.set_runner_status_if_present(scope_root, "killed");
         result
     }
 
@@ -1128,6 +1213,7 @@ impl ExecutionResourceCoordinator {
             workspace_id: query.workspace_id.clone(),
             task_id: query.task_id.clone(),
             worker_id: query.worker_id.clone(),
+            taskless_only: query.taskless_only,
             ..BrowserLeaseSelector::default()
         };
         let (revoked, controls) = {
@@ -1300,24 +1386,31 @@ impl WebModelProbeSnapshot {
 /// 在后台执行一段需要 session Turn 锁的异步工作。
 ///
 /// TaskStore 状态回调可能运行在普通的提交后线程上，不能在没有 runtime 的线程里直接
-/// `tokio::spawn`：有 runtime 时挂到当前 runtime，否则在独立线程里驱动。
+/// `tokio::spawn`：有 runtime 时挂到当前 runtime，否则使用进程级后台 runtime。
+/// 不能为每项工作创建临时 runtime：finalizer 派生的队列/Goal 续跑会在父 future
+/// 返回时随临时 runtime 一起取消，留下永远没有下一次唤醒的持久 Pending 输入。
 pub(crate) fn spawn_session_turn_work(
     thread_name: &str,
     work: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(work);
-    } else if let Err(error) = std::thread::Builder::new()
-        .name(thread_name.to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+    } else {
+        static BACKGROUND_RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+            std::sync::OnceLock::new();
+        match BACKGROUND_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("magi-session-background")
                 .enable_all()
                 .build()
-                .expect("session turn work runtime should build");
-            runtime.block_on(work);
-        })
-    {
-        tracing::error!(?error, thread_name, "启动 session Turn 后台线程失败");
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(runtime) => {
+                runtime.spawn(work);
+            }
+            Err(error) => tracing::error!(%error, thread_name, "启动 session Turn 后台运行时失败"),
+        }
     }
 }
 
@@ -1409,7 +1502,6 @@ pub struct ApiState {
     pub(crate) role_configuration_lock: Arc<Mutex<()>>,
     /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
-    session_turn_queue: Arc<Mutex<HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>>>,
     session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_change_sync_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_navigation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -2148,6 +2240,59 @@ impl ApiState {
             Arc::clone(&browser_host_client),
             Arc::clone(&event_bus),
         );
+        let input_event_bus = Arc::clone(&event_bus);
+        let canonical_item_event_bus = Arc::clone(&event_bus);
+        session_store.install_canonical_item_commit_observer(Arc::new(move |notice| {
+            magi_conversation_runtime::session_writeback::publish_committed_canonical_item_event(
+                &canonical_item_event_bus,
+                notice,
+            );
+        }));
+        session_store.install_input_commit_observer(Arc::new(move |notice| {
+            input_event_bus.publish(EventEnvelope::domain(
+                magi_core::EventId::unique("session-inbox"), "session.inbox.changed",
+                serde_json::json!({ "cursor": magi_app_server_protocol::generated::SessionInboxCursor {
+                    epoch: notice.epoch, through_sequence: notice.through_sequence,
+                }}),
+            ).with_context(EventContext { session_id: Some(notice.session_id),
+                workspace_id: notice.workspace_id.map(WorkspaceId::new), ..EventContext::default() }));
+        }));
+        let model_step_event_bus = Arc::clone(&event_bus);
+        session_store.install_model_step_commit_observer(Arc::new(move |notice| {
+            let context = EventContext {
+                session_id: Some(notice.session_id.clone()),
+                workspace_id: notice.workspace_id.map(WorkspaceId::new),
+                ..EventContext::default()
+            };
+            model_step_event_bus.publish(EventEnvelope::domain(
+                magi_core::EventId::unique("session-model-step"),
+                "session.turn.step",
+                serde_json::json!({
+                    "session_id": notice.session_id,
+                    "canonical_turn": notice.turn,
+                    "canonical_schema_version": magi_session_store::CANONICAL_TURN_SCHEMA_VERSION,
+                    "canonical_event_kind": "model_step_updated",
+                    "canonical_model_step": notice.step,
+                }),
+            ).with_context(context.clone()));
+            let Some(goal_id) = notice.step.goal_id else {
+                return;
+            };
+            model_step_event_bus.publish(
+                EventEnvelope::domain(
+                    magi_core::EventId::unique("session-goal-usage"),
+                    "session.goal.usage.changed",
+                    serde_json::to_value(
+                        magi_app_server_protocol::generated::SessionGoalUsageChanged {
+                            goal_id: goal_id.to_string(),
+                            step_id: notice.step.step_id,
+                        },
+                    )
+                    .expect("Goal usage notice contains only strings"),
+                )
+                .with_context(context),
+            );
+        }));
         let service_name = service_name.into();
         let turn_coordinator = Arc::new(SessionTurnCoordinator::new());
         let conversation_registry = Arc::new(ConversationRegistry::with_turn_coordinator(
@@ -2231,7 +2376,6 @@ impl ApiState {
             terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             role_configuration_lock: Arc::new(Mutex::new(())),
-            session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
             session_change_sync_locks: Arc::new(Mutex::new(HashMap::new())),
             session_navigation_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2247,13 +2391,12 @@ impl ApiState {
     pub fn install_snapshot_lifecycle_observer(&self) {
         let observer = Arc::new(crate::snapshot_lifecycle::SnapshotLifecycleObserver::new(
             self.snapshot_manager.clone(),
-            self.workspace_registry.clone(),
         ));
-        self.session_store.set_lifecycle_observer(observer.clone());
+        self.session_store.set_lifecycle_observer(observer);
     }
 
-    /// 同步取 session + workspace 对应的 SnapshotSession。未装载表示生命周期接线异常，
-    /// 调用方应显式报错或触发 lazy start。
+    /// 同步取 session + workspace 对应的 SnapshotSession。按需资源尚未装载时返回 None；
+    /// 需要变更账本的操作必须先经 ensure 入口准备。
     pub fn snapshot_session(
         &self,
         session_id: &SessionId,
@@ -2682,6 +2825,10 @@ impl ApiState {
     /// 任务（含子任务）进入终态：释放它自己的进程、浏览器租约与默认浏览器目标，
     /// 不等整轮结束，避免子代理结束后仍占着页面阻塞主代理。
     pub fn release_finished_task_resources(&self, session_id: &SessionId, task_id: &TaskId) {
+        // 已排队但从未进入模型循环的代理也会收到 TaskStore 终态通知，
+        // 不能只依赖执行栈退出时回收其初始 assignment。
+        self.conversation_registry
+            .close_task_signal_channel(session_id, task_id);
         self.cancel_execution_resources(
             Some(session_id),
             None,
@@ -2732,10 +2879,136 @@ impl ApiState {
                 workspace_id: workspace_id.cloned(),
                 task_id: task_id.cloned(),
                 worker_id: None,
+                taskless_only: false,
             },
             reason,
             UtcMillis::now(),
         )
+    }
+
+    pub(crate) fn cancel_conversation_execution_resources(
+        &self,
+        session_id: &SessionId,
+        reason: BrowserLeaseEndReason,
+    ) -> ExecutionResourceCancellationReport {
+        self.execution_resources.cancel(
+            ToolExecutionContextQuery::for_taskless_session(session_id),
+            reason,
+            UtcMillis::now(),
+        )
+    }
+
+    /// 按 TaskStore 当前拥有方的执行范围取消资源；已转交子树及同会话的其他执行
+    /// 由各自拥有方结算。Session 关闭使用 session 级资源入口，覆盖全部拥有方。
+    /// 即使原 Task 已被收口或移除，仍结算调用方明确指定的 root 身份。
+    pub(crate) fn cancel_task_execution_scope_resources(
+        &self,
+        session_id: &SessionId,
+        root_task_id: &TaskId,
+        reason: BrowserLeaseEndReason,
+    ) -> ExecutionResourceCancellationReport {
+        let mut task_ids = self
+            .task_store()
+            .map(|store| store.collect_execution_subtree_ids(root_task_id))
+            .unwrap_or_default();
+        if !task_ids.contains(root_task_id) {
+            task_ids.push(root_task_id.clone());
+        }
+        let mut report = ExecutionResourceCancellationReport::default();
+        for task_id in task_ids {
+            let cancelled =
+                self.cancel_execution_resources(Some(session_id), None, Some(&task_id), reason);
+            report.tool_execution_count = report
+                .tool_execution_count
+                .saturating_add(cancelled.tool_execution_count);
+            report.browser_lease_count = report
+                .browser_lease_count
+                .saturating_add(cancelled.browser_lease_count);
+        }
+        report
+    }
+
+    /// Goal 控制版本是现有执行撤销事实。修改/暂停/清除后，主动结算其已转交的
+    /// 执行范围与资源；不触及 Session 拥有的分支，也不从主轮当前指针猜测归属。
+    pub(crate) async fn settle_revoked_goal_agent_runs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, ApiError> {
+        let Some(store) = self.task_store.clone() else {
+            return Ok(0);
+        };
+        let goals = self.session_store.goals_for_session(session_id);
+        let roots = TaskExecutionRegistry::revoked_goal_agent_roots(
+            &store,
+            &self.session_store,
+            session_id,
+        );
+        let mut errors = Vec::new();
+        for root in &roots {
+            let manager = self.runner_manager();
+            let _restart_guard = match manager {
+                Some(manager) => Some(manager.lock_for_restart(root.task_id.as_str()).await),
+                None => None,
+            };
+            let goal_is_paused = root.agent_run_transfer().is_some_and(|transfer| {
+                matches!(&transfer.owner, magi_core::AgentRunOwner::Goal { goal_id, .. }
+                    if goals.iter().any(|goal| &goal.goal_id == goal_id && goal.status == magi_session_store::GoalStatus::Paused))
+            });
+            let end_reason = if goal_is_paused {
+                BrowserLeaseEndReason::GoalPaused
+            } else {
+                BrowserLeaseEndReason::OwnerReleased
+            };
+            self.cancel_task_execution_scope_resources(session_id, &root.task_id, end_reason);
+            let registry = self.task_execution_registry.clone();
+            let execution_store = store.clone();
+            let execution_session = session_id.clone();
+            let execution_root = root.task_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                registry.settle_revoked_goal_agent_run(
+                    &execution_store,
+                    &execution_session,
+                    &execution_root,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(error) => errors.push(format!("目标代理结算线程退出：{error}")),
+            }
+
+            if let Some(manager) = manager {
+                manager.quiesce_for_restart(root.task_id.as_str()).await;
+            } else if let Some(dispatcher) = self.session_turn_dispatcher() {
+                dispatcher.wait_for_quiesce(&root.task_id).await;
+            }
+            let ids = store.collect_execution_subtree_ids(&root.task_id);
+            if ids.iter().filter_map(|id| store.get_task(id)).any(|task| {
+                matches!(
+                    task.status,
+                    magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                )
+            }) || self.tool_registry().is_some_and(|registry| {
+                ids.iter().any(|id| {
+                    registry.has_active_executions(&ToolExecutionContextQuery {
+                        session_id: Some(session_id.clone()),
+                        task_id: Some(id.clone()),
+                        ..Default::default()
+                    })
+                })
+            }) {
+                errors.push(format!("目标代理 {} 尚未完成资源结算", root.task_id));
+            }
+        }
+        if errors.is_empty() {
+            Ok(roots.len())
+        } else {
+            Err(ApiError::Conflict(format!(
+                "目标已更新，部分代理结算失败：{}",
+                errors.join("；")
+            )))
+        }
     }
 
     /// Browser Host 连接断开时的窄域清理。连接断开只代表浏览器自动化暂时
@@ -2753,6 +3026,7 @@ impl ApiState {
                 workspace_id: workspace_id.cloned(),
                 task_id: task_id.cloned(),
                 worker_id: None,
+                taskless_only: false,
             },
             reason,
             UtcMillis::now(),
@@ -3692,60 +3966,127 @@ impl ApiState {
         })
     }
 
+    /// 旧文件只读取迁移一次；完成前保留原文件，崩溃重试按稳定 input 身份去重。
     pub fn restore_regular_session_turn_queues(&self) -> Result<usize, ApiError> {
-        let Some(persistence) = &self.runtime_persistence else {
-            return Ok(0);
-        };
-        let Some(state_root) = persistence.state_root() else {
-            return Ok(0);
-        };
-        let path = state_root.join("session-turn-queue.json");
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(ApiError::internal_assembly(
-                    "读取 session turn 排队状态失败",
-                    error,
-                ));
-            }
-        };
-        let turns =
-            serde_json::from_slice::<Vec<QueuedRegularSessionTurn>>(&bytes).map_err(|error| {
-                ApiError::internal_assembly("解析 session turn 排队状态失败", error)
-            })?;
-        let mut queues = HashMap::<SessionId, VecDeque<QueuedRegularSessionTurn>>::new();
-        for mut turn in turns {
-            turn.normalize_identity();
-            if turn.request_fingerprint.is_none() {
-                turn.request_fingerprint = Some(
-                    turn.request
-                        .request_fingerprint()
-                        .map_err(ApiError::InvalidInput)?,
-                );
-            }
-            let session_is_active = self
-                .session_store
-                .session(&turn.session_id)
-                .is_some_and(|session| session.status == SessionLifecycleStatus::Active);
-            let route_is_queueable = matches!(
-                turn.route,
-                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute
-            );
-            if session_is_active && route_is_queueable {
-                queues
-                    .entry(turn.session_id.clone())
-                    .or_default()
-                    .push_back(turn);
+        if let Some(root) = self
+            .runtime_persistence
+            .as_ref()
+            .and_then(|p| p.state_root())
+        {
+            let path = root.join("session-turn-queue.json");
+            match fs::read(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ApiError::internal_assembly("读取旧输入队列失败", error)),
+                Ok(bytes) => {
+                    let turns: Vec<QueuedRegularSessionTurn> = serde_json::from_slice(&bytes)
+                        .map_err(|error| {
+                            ApiError::internal_assembly("解析旧输入队列失败", error)
+                        })?;
+                    // 先完整校验再迁移，防止损坏文件留下部分输入。
+                    let mut normalized = Vec::new();
+                    let mut identities = HashSet::new();
+                    let mut requests = HashSet::new();
+                    for mut turn in turns {
+                        turn.normalize_identity();
+                        if !identities.insert((turn.session_id.clone(), turn.queue_id.clone())) {
+                            return Err(ApiError::Conflict(
+                                "旧输入队列存在重复身份，保留原文件供核对".into(),
+                            ));
+                        }
+                        if turn.request_fingerprint.is_none() {
+                            turn.request_fingerprint = Some(
+                                turn.request
+                                    .request_fingerprint()
+                                    .map_err(ApiError::InvalidInput)?,
+                            );
+                        }
+                        if !requests.insert(turn.request.request_id().expect("normalized request"))
+                        {
+                            return Err(ApiError::Conflict(
+                                "旧输入队列存在重复 requestId，保留原文件供核对".into(),
+                            ));
+                        }
+                        if !matches!(
+                            turn.route,
+                            crate::dto::SessionTurnRouteDto::Chat
+                                | crate::dto::SessionTurnRouteDto::Execute
+                        ) {
+                            return Err(ApiError::Conflict(
+                                "旧输入队列投递类型无效，保留原文件供核对".into(),
+                            ));
+                        }
+                        if self.session_store.session(&turn.session_id).is_none() {
+                            return Err(ApiError::Conflict(format!(
+                                "旧排队输入所属会话不存在: {}",
+                                turn.session_id
+                            )));
+                        }
+                        normalized.push(turn);
+                    }
+                    let backup = root.join("session-turn-queue.migrated.json");
+                    if backup.exists()
+                        && fs::read(&backup).map_err(|error| {
+                            ApiError::internal_assembly("读取迁移备份失败", error)
+                        })? != bytes
+                    {
+                        return Err(ApiError::Conflict(
+                            "旧队列迁移备份冲突，原文件已保留".into(),
+                        ));
+                    }
+                    for turn in normalized {
+                        self.enqueue_regular_session_turn(turn)?;
+                    }
+                    fs::rename(&path, &backup).map_err(|error| {
+                        ApiError::internal_assembly("保留旧队列迁移备份失败", error)
+                    })?;
+                }
             }
         }
-        let restored_count = queues.values().map(VecDeque::len).sum();
-        self.persist_regular_session_turn_queues(&queues)?;
-        *self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned") = queues;
-        Ok(restored_count)
+        for input in self.session_store.all_session_inputs() {
+            if input.state == magi_session_store::SessionInputState::Pending {
+                let turn: QueuedRegularSessionTurn = serde_json::from_value(input.payload.clone())
+                    .map_err(|error| ApiError::internal_assembly("持久输入请求损坏", error))?;
+                if turn.session_id != input.session_id
+                    || turn.queue_id != input.input_id
+                    || turn.request.request_id().as_deref() != Some(input.request_id.as_str())
+                    || turn.request.user_message_id().as_deref()
+                        != Some(input.user_message_id.as_str())
+                    || turn.request_fingerprint.as_deref()
+                        != Some(input.request_fingerprint.as_str())
+                    || turn.request.interrupt_turn_id.as_deref()
+                        != input
+                            .interruption
+                            .as_ref()
+                            .map(|value| value.turn_id.as_str())
+                {
+                    return Err(ApiError::Conflict(
+                        "持久输入与原始请求身份不一致，拒绝执行".into(),
+                    ));
+                }
+            }
+        }
+        let inputs = self.session_store.all_session_inputs();
+        for mut input in inputs {
+            if input.state == magi_session_store::SessionInputState::Pending
+                && !self
+                    .session_store
+                    .session(&input.session_id)
+                    .is_some_and(|s| s.status == SessionLifecycleStatus::Active)
+            {
+                let revision = input.revision;
+                input.revision += 1;
+                input.state = magi_session_store::SessionInputState::Cancelled;
+                self.session_store
+                    .commit_input(input, Some(revision))
+                    .map_err(|error| ApiError::internal_assembly("提交输入事务失败", error))?;
+            }
+        }
+        Ok(self
+            .session_store
+            .all_session_inputs()
+            .iter()
+            .filter(|input| input.state == magi_session_store::SessionInputState::Pending)
+            .count())
     }
 
     pub fn persist_session_git_contexts(&self) -> Result<(), ApiError> {
@@ -3786,7 +4127,7 @@ impl ApiState {
         self.persist_session_git_contexts()
     }
 
-    /// 每轮执行前重新观测 session 绑定的 Git branch/HEAD/worktree。
+    /// 本轮首次工作区执行前重新观测 session 绑定的 Git branch/HEAD/worktree。
     ///
     /// 同仓库、同 worktree、同分支的线性快进会自动成为新基线，保证提交、拉取或其他
     /// 正常协作操作不会中断后续对话。分支切换、HEAD 回退或历史改写仍需用户明确接受。
@@ -3812,7 +4153,7 @@ impl ApiState {
             self.begin_session_git_execution(session_id, &existing_context.git.git_common_dir)
                 .await?;
         }
-        let observation = match self.git_service.observe(&workspace_root).await {
+        let mut observation = match self.git_service.observe(&workspace_root).await {
             Ok(observation) => observation,
             Err(magi_git::GitError::NotRepository { .. }) => {
                 self.release_session_git_execution_lease(session_id);
@@ -3826,6 +4167,27 @@ impl ApiState {
             }
         };
         if existing_context.is_none() {
+            // 首次观测只用于确定需要哪把 repository lease。等到执行权后重新观测，
+            // 再建立快照基线，不能记录另一个会话尚未完成写入的中间状态。
+            self.begin_session_git_execution(session_id, &observation.git_common_dir)
+                .await?;
+            let leased_common_dir = observation.git_common_dir.clone();
+            observation = match self.git_service.observe(&workspace_root).await {
+                Ok(observation) if observation.git_common_dir == leased_common_dir => observation,
+                Ok(_) => {
+                    self.release_session_git_execution_lease(session_id);
+                    return Err(ApiError::Conflict(
+                        "等待执行期间工作区 Git repository 已变化，请重新核对".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.release_session_git_execution_lease(session_id);
+                    return Err(ApiError::internal_assembly(
+                        "取得执行租约后观测 Git 失败",
+                        error,
+                    ));
+                }
+            };
             let snapshot = match self
                 .ensure_snapshot_session(session_id, &observation.worktree_path)
                 .await
@@ -3933,10 +4295,6 @@ impl ApiState {
                 "当前 workspace 存在未解决的 Git merge conflict，必须先解决或 abort 后再执行新一轮：{}",
                 context.git.dirty.conflicted_paths.join(", ")
             )));
-        }
-        if existing_context.is_none() {
-            self.begin_session_git_execution(session_id, &context.git.git_common_dir)
-                .await?;
         }
         if let Err(error) = self.persist_session_git_contexts() {
             self.release_session_git_execution_lease(session_id);
@@ -4398,6 +4756,16 @@ impl ApiState {
     }
 
     pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
+        let source = Arc::downgrade(&store);
+        self.session_store
+            .set_agent_run_transfer_resolver(Arc::new(move |task| {
+                source
+                    .upgrade()
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "Agent 运行拥有方查询不可用".into(),
+                    })?
+                    .agent_run_transfer_for_task(task)
+            }));
         self.task_store = Some(store);
         self
     }
@@ -4441,6 +4809,46 @@ impl ApiState {
     }
 
     pub fn with_session_turn_dispatcher(mut self, dispatcher: Arc<LlmTaskDispatcher>) -> Self {
+        let execution = Arc::downgrade(&dispatcher);
+        let resources = self.execution_resources.clone();
+        self.task_execution_registry
+            .set_agent_subtree_settler(move |session, tasks| {
+                let queries = tasks
+                    .iter()
+                    .map(|task| ToolExecutionContextQuery {
+                        session_id: Some(session.clone()),
+                        task_id: Some(task.clone()),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                for query in &queries {
+                    resources.cancel(
+                        query.clone(),
+                        BrowserLeaseEndReason::TaskFinished,
+                        UtcMillis::now(),
+                    );
+                }
+                let execution = execution
+                    .upgrade()
+                    .ok_or("代理执行器已不可用，无法核对线程退出")?;
+                // 这是取消结算的观察期限，不限制任务的正常执行时长。
+                execution
+                    .wait_for_task_dispatches_blocking(tasks, std::time::Duration::from_secs(30))?;
+                if resources
+                    .tool_registry
+                    .read()
+                    .expect("execution resource tool registry lock poisoned")
+                    .as_ref()
+                    .is_some_and(|registry| {
+                        queries
+                            .iter()
+                            .any(|query| registry.has_active_executions(query))
+                    })
+                {
+                    return Err("代理仍有未退出的工具或进程，取消已接纳但资源尚未结算".into());
+                }
+                Ok(())
+            });
         self.session_turn_dispatcher = Some(dispatcher);
         self
     }
@@ -4598,103 +5006,152 @@ impl ApiState {
         lock.lock_owned().await
     }
 
-    fn persist_regular_session_turn_queues(
-        &self,
-        queues: &HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>,
-    ) -> Result<(), ApiError> {
-        let Some(persistence) = &self.runtime_persistence else {
-            return Ok(());
-        };
-        let Some(state_root) = persistence.state_root() else {
-            return Ok(());
-        };
-        let turns = queues
-            .values()
-            .flat_map(|queue| queue.iter().cloned())
-            .collect::<Vec<_>>();
-        persistence.save_json(&state_root.join("session-turn-queue.json"), &turns)
-    }
-
     pub(crate) fn enqueue_regular_session_turn(
         &self,
         mut turn: QueuedRegularSessionTurn,
     ) -> Result<usize, ApiError> {
+        use magi_session_store::{SessionInput, SessionInputState};
         turn.normalize_identity();
-        if turn.request_fingerprint.is_none() {
-            turn.request_fingerprint = Some(
-                turn.request
-                    .request_fingerprint()
-                    .map_err(ApiError::InvalidInput)?,
+        let fingerprint = match &turn.request_fingerprint {
+            Some(fingerprint) => fingerprint.clone(),
+            None => turn
+                .request
+                .request_fingerprint()
+                .map_err(ApiError::InvalidInput)?,
+        };
+        turn.request_fingerprint = Some(fingerprint.clone());
+        let request_id = turn.request.request_id().expect("normalized request ID");
+        let user_message_id = turn
+            .request
+            .user_message_id()
+            .expect("normalized user item ID");
+        let existing = self
+            .session_store
+            .inputs_for_session(&turn.session_id)
+            .into_iter()
+            .find(|input| input.input_id == turn.queue_id || input.request_id == request_id);
+        if let Some(existing) = existing {
+            let compatible_binding = matches!(
+                existing.state,
+                magi_session_store::SessionInputState::Attached
+                    | magi_session_store::SessionInputState::Consumed
             );
-        }
-        let session_id = turn.session_id.clone();
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let queue = queues.entry(session_id.clone()).or_default();
-        queue.push_back(turn);
-        let queue_len = queue.len();
-        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
-            let queue = queues
-                .get_mut(&session_id)
-                .expect("刚入队的 session 队列必须存在");
-            queue.pop_back();
-            if queue.is_empty() {
-                queues.remove(&session_id);
+            if (existing.input_id != turn.queue_id && !compatible_binding)
+                || existing.session_id != turn.session_id
+                || existing.request_id != request_id
+                || existing.user_message_id != user_message_id
+                || existing.request_fingerprint != fingerprint
+            {
+                return Err(ApiError::Conflict("输入身份或请求指纹冲突".into()));
             }
-            return Err(error);
+            return Ok(self.queued_regular_session_turn_count(&turn.session_id));
         }
-        Ok(queue_len)
+        let bound = self
+            .session_store
+            .canonical_turns_for_session(&turn.session_id)
+            .into_iter()
+            .find(|canonical| {
+                crate::turn_service::canonical_turn_matches_queued_regular_turn(canonical, &turn)
+            });
+        let active = self
+            .session_store
+            .session(&turn.session_id)
+            .is_some_and(|s| s.status == SessionLifecycleStatus::Active);
+        let interruption = turn.request.interrupt_turn_id.as_ref().map(|turn_id| {
+            magi_session_store::InputInterruption {
+                turn_id: turn_id.clone(),
+                root_task_id: self
+                    .session_store
+                    .active_execution_chain(&turn.session_id)
+                    .filter(|chain| {
+                        chain
+                            .current_turn
+                            .as_ref()
+                            .is_some_and(|current| &current.turn_id == turn_id)
+                    })
+                    .map(|chain| chain.root_task_id),
+                settled_at: None,
+                error: None,
+            }
+        });
+        self.session_store
+            .commit_input(
+                SessionInput {
+                    input_id: turn.queue_id.clone(),
+                    session_id: turn.session_id.clone(),
+                    request_id,
+                    user_message_id,
+                    request_fingerprint: fingerprint,
+                    accepted_at: turn.accepted_at,
+                    revision: 1,
+                    state: if bound.is_some() {
+                        SessionInputState::Attached
+                    } else if active {
+                        SessionInputState::Pending
+                    } else {
+                        SessionInputState::Cancelled
+                    },
+                    attached_turn_id: bound.map(|turn| turn.turn_id),
+                    consumption: None,
+                    interruption,
+                    payload: serde_json::to_value(&turn)
+                        .map_err(|error| ApiError::internal_assembly("编码输入失败", error))?,
+                },
+                None,
+            )
+            .map_err(|error| ApiError::internal_assembly("提交输入事务失败", error))?;
+        Ok(self
+            .queued_regular_session_turns(&turn.session_id)
+            .iter()
+            .position(|queued| queued.queue_id == turn.queue_id)
+            .map_or(0, |position| position + 1))
     }
 
     pub(crate) fn peek_next_regular_session_turn(
         &self,
         session_id: &SessionId,
     ) -> Option<QueuedRegularSessionTurn> {
-        self.session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned")
-            .get(session_id)
-            .and_then(|queue| queue.front())
-            .cloned()
+        self.queued_regular_session_turns(session_id)
+            .into_iter()
+            .next()
     }
 
     pub(crate) fn queued_regular_session_turns(
         &self,
         session_id: &SessionId,
     ) -> Vec<QueuedRegularSessionTurn> {
-        self.session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned")
-            .get(session_id)
-            .map(|queue| queue.iter().cloned().collect())
-            .unwrap_or_default()
+        let mut inputs = self.session_store.inbox_snapshot(session_id).0;
+        // 明确的停止并改做先于普通下一轮输入；原 FIFO 输入继续保留。
+        inputs.sort_by_key(|input| {
+            (
+                input.interruption.is_none(),
+                input.accepted_at,
+                input.input_id.clone(),
+            )
+        });
+        inputs
+            .into_iter()
+            .map(|input| {
+                serde_json::from_value(input.payload).expect("validated queued input payload")
+            })
+            .collect()
     }
 
-    /// 按 requestId 查找仍在队列中的 Turn，并返回当前队列位置。
-    ///
-    /// App Server 重试可能发生在首轮尚未出队时；这段状态还未进入
-    /// SessionStore 的 canonical turn，因此必须和持久化队列使用同一个幂等查询面。
     pub(crate) fn queued_regular_session_turn_for_request_id(
         &self,
         request_id: &str,
     ) -> Option<(QueuedRegularSessionTurn, usize)> {
-        let request_id = request_id.trim();
-        if request_id.is_empty() {
-            return None;
-        }
-        let queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        queues.values().find_map(|queue| {
-            queue
-                .iter()
-                .enumerate()
-                .find(|(_, turn)| turn.request.request_id().as_deref() == Some(request_id))
-                .map(|(index, turn)| (turn.clone(), index + 1))
-        })
+        self.queued_regular_session_ids()
+            .into_iter()
+            .find_map(|session_id| {
+                self.queued_regular_session_turns(&session_id)
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, turn)| {
+                        turn.request.request_id().as_deref() == Some(request_id.trim())
+                    })
+                    .map(|(index, turn)| (turn, index + 1))
+            })
     }
 
     pub(crate) fn remove_regular_session_turn(
@@ -4702,60 +5159,32 @@ impl ApiState {
         session_id: &SessionId,
         queue_id: &str,
     ) -> Result<bool, ApiError> {
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let Some(queue) = queues.get_mut(session_id) else {
+        let Some(mut input) = self
+            .session_store
+            .inputs_for_session(session_id)
+            .into_iter()
+            .find(|input| input.input_id == queue_id)
+        else {
             return Ok(false);
         };
-        let Some(position) = queue.iter().position(|turn| turn.queue_id == queue_id) else {
+        // 已绑定的输入不能再被取回编辑或删除。
+        if matches!(
+            input.state,
+            magi_session_store::SessionInputState::Attached
+                | magi_session_store::SessionInputState::Consumed
+        ) {
+            return Err(ApiError::Conflict("输入已被领取，不能取回或删除".into()));
+        }
+        if input.state != magi_session_store::SessionInputState::Pending {
             return Ok(false);
-        };
-        let removed = queue
-            .remove(position)
-            .expect("已定位的 session turn 队列项必须存在");
-        if queue.is_empty() {
-            queues.remove(session_id);
         }
-        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
-            let queue = queues.entry(session_id.clone()).or_default();
-            queue.insert(position.min(queue.len()), removed);
-            return Err(error);
-        }
+        let revision = input.revision;
+        input.revision += 1;
+        input.state = magi_session_store::SessionInputState::Cancelled;
+        self.session_store
+            .commit_input(input, Some(revision))
+            .map_err(|error| ApiError::internal_assembly("提交输入事务失败", error))?;
         Ok(true)
-    }
-
-    pub(crate) fn acknowledge_regular_session_turn(
-        &self,
-        session_id: &SessionId,
-        queue_id: &str,
-    ) -> Result<(), ApiError> {
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let Some(queue) = queues.get_mut(session_id) else {
-            return Ok(());
-        };
-        if !queue.front().is_some_and(|turn| turn.queue_id == queue_id) {
-            return Err(ApiError::internal_assembly(
-                "确认 session turn 队列消费失败",
-                "队首消息已变化",
-            ));
-        }
-        let acknowledged = queue.pop_front().expect("已确认队首存在");
-        if queue.is_empty() {
-            queues.remove(session_id);
-        }
-        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
-            queues
-                .entry(session_id.clone())
-                .or_default()
-                .push_front(acknowledged);
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub(crate) fn record_regular_session_turn_retry(
@@ -4763,71 +5192,45 @@ impl ApiState {
         session_id: &SessionId,
         queue_id: &str,
     ) -> Result<u8, ApiError> {
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let queue = queues.get_mut(session_id).ok_or_else(|| {
-            ApiError::internal_assembly("记录 session turn 重试失败", "session 队列不存在")
-        })?;
-        let turn = queue.front_mut().ok_or_else(|| {
-            ApiError::internal_assembly("记录 session turn 重试失败", "session 队列为空")
-        })?;
-        if turn.queue_id != queue_id {
-            return Err(ApiError::internal_assembly(
-                "记录 session turn 重试失败",
-                "队首消息已变化",
-            ));
-        }
-        let previous_retry_count = turn.retry_count;
+        let mut input = self
+            .session_store
+            .inputs_for_session(session_id)
+            .into_iter()
+            .find(|input| {
+                input.input_id == queue_id
+                    && input.state == magi_session_store::SessionInputState::Pending
+            })
+            .ok_or_else(|| ApiError::Conflict("输入已被领取或撤销".into()))?;
+        let mut turn: QueuedRegularSessionTurn = serde_json::from_value(input.payload.clone())
+            .map_err(|error| ApiError::internal_assembly("解码输入失败", error))?;
         turn.retry_count = turn.retry_count.saturating_add(1);
         let retry_count = turn.retry_count;
-        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
-            queues
-                .get_mut(session_id)
-                .and_then(|queue| queue.front_mut())
-                .expect("重试计数更新期间队首必须存在")
-                .retry_count = previous_retry_count;
-            return Err(error);
-        }
+        let revision = input.revision;
+        input.revision += 1;
+        input.payload = serde_json::to_value(turn)
+            .map_err(|error| ApiError::internal_assembly("编码输入失败", error))?;
+        self.session_store
+            .commit_input(input, Some(revision))
+            .map_err(|error| ApiError::internal_assembly("提交输入事务失败", error))?;
         Ok(retry_count)
     }
 
     pub(crate) fn queued_regular_session_turn_count(&self, session_id: &SessionId) -> usize {
-        self.session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned")
-            .get(session_id)
-            .map(VecDeque::len)
-            .unwrap_or(0)
+        self.session_store.pending_input_count(session_id)
     }
-
     pub(crate) fn queued_regular_session_ids(&self) -> Vec<SessionId> {
-        self.session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.session_store.pending_input_session_ids()
     }
 
     pub(crate) fn clear_regular_session_turn_queue_for_lifecycle(
         &self,
         session_id: &SessionId,
     ) -> Result<usize, ApiError> {
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let removed = queues.remove(session_id).unwrap_or_default();
-        let removed_count = removed.len();
-        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
-            if !removed.is_empty() {
-                queues.insert(session_id.clone(), removed);
-            }
-            return Err(error);
+        let queued = self.queued_regular_session_turns(session_id);
+        for turn in &queued {
+            self.remove_regular_session_turn(session_id, &turn.queue_id)?;
         }
-        Ok(removed_count)
+        Ok(queued.len())
     }
 
     /// 会话删除的唯一资源回收入口。先停止并等待后台 runner，再删除所有运行态与
@@ -4851,11 +5254,17 @@ impl ApiState {
         session_id: &SessionId,
         replacement_session_id: Option<SessionId>,
     ) -> Result<(), ApiError> {
+        let job_outputs = self
+            .session_store
+            .background_jobs_for_session(session_id)
+            .map_err(|error| ApiError::internal_assembly("读取会话 Job 输出归属失败", error))?;
         let manager = self.runner_manager();
+        crate::turn_service::cancel_active_session_turn_for_lifecycle(self, session_id);
         if let Some(manager) = manager {
             manager
                 .unbind_session_after_lifecycle_lock(session_id)
-                .await;
+                .await
+                .map_err(|error| ApiError::internal_assembly("删除会话时停止执行失败", error))?;
         }
         // 会话持有 GPT Web 槽位时一并释放，避免槽位悬挂在已不存在的会话上。
         self.release_web_slot_for_session(session_id).await;
@@ -4940,6 +5349,25 @@ impl ApiState {
                 }
                 magi_session_store::SessionMutationTransactionError::Persistence(error) => error,
             })?;
+        if let Some(root) = self
+            .runtime_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.state_root())
+        {
+            for job in job_outputs {
+                let directory = root.join("job-output").join(&job.job_id);
+                if job.stdout_path != directory.join("stdout.log")
+                    || job.stderr_path != directory.join("stderr.log")
+                {
+                    continue;
+                }
+                if let Err(error) = fs::remove_dir_all(&directory)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%session_id, job_id = %job.job_id, %error, "删除会话 Job 输出失败");
+                }
+            }
+        }
         self.session_turn_locks
             .lock()
             .expect("session turn locks should hold")
@@ -5108,7 +5536,21 @@ fn normalize_public_tool_catalog_item_json(raw: &serde_json::Value) -> serde_jso
     if let Some(schema) = raw.get("parameters_schema") {
         item["parametersSchema"] = schema.clone();
     }
+    project_tool_availability_fields(raw, &mut item);
     item
+}
+
+fn project_tool_availability_fields(raw: &serde_json::Value, item: &mut serde_json::Value) {
+    for (source, target) in [
+        ("model_available", "modelAvailable"),
+        ("availability", "availability"),
+        ("reason_code", "reasonCode"),
+        ("schema_included", "schemaIncluded"),
+    ] {
+        if let Some(value) = raw.get(source) {
+            item[target] = value.clone();
+        }
+    }
 }
 
 fn normalize_public_skill_tool_json(raw: &serde_json::Value) -> serde_json::Value {
@@ -5141,7 +5583,7 @@ fn normalize_public_mcp_server_catalog_json(raw: &serde_json::Value) -> serde_js
 }
 
 fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
+    let mut item = serde_json::json!({
         "serverId": raw.get("server_id").cloned().unwrap_or(serde_json::Value::Null),
         "serverName": raw.get("server_name").cloned().unwrap_or(serde_json::Value::Null),
         "modelToolName": raw.get("model_tool_name").cloned().unwrap_or(serde_json::Value::Null),
@@ -5149,7 +5591,23 @@ fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json
         "description": raw.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
         "readOnly": raw.get("read_only").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "inputSchema": raw.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
-    })
+    });
+    project_tool_availability_fields(raw, &mut item);
+    item
+}
+
+fn normalize_public_plugin_tool_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "pluginId": raw.get("plugin_id"),
+        "contributionId": raw.get("contribution_id"),
+        "modelToolName": raw.get("model_tool_name"),
+        "title": raw.get("title"),
+        "description": raw.get("description"),
+        "readOnly": raw.get("read_only"),
+        "inputSchema": raw.get("input_schema"),
+    });
+    project_tool_availability_fields(raw, &mut item);
+    item
 }
 
 fn normalize_public_agent_role_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
@@ -5209,6 +5667,7 @@ fn public_tool_catalog_response_json(raw: &serde_json::Value) -> serde_json::Val
         "skillTools": public_tool_catalog_array(raw, "skill_tools", normalize_public_skill_tool_json),
         "mcpServers": public_tool_catalog_array(raw, "mcp_servers", normalize_public_mcp_server_catalog_json),
         "mcpTools": public_tool_catalog_array(raw, "mcp_tools", normalize_public_mcp_tool_catalog_json),
+        "pluginTools": public_tool_catalog_array(raw, "plugin_tools", normalize_public_plugin_tool_catalog_json),
         "agentRoles": public_tool_catalog_array(raw, "agent_roles", normalize_public_agent_role_catalog_json),
     })
 }
@@ -5442,6 +5901,37 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn background_turn_followup_survives_its_parent_work_returning() {
+        let (outer_done, outer_received) = std::sync::mpsc::channel();
+        let (finished, received) = std::sync::mpsc::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            super::spawn_session_turn_work("test-terminal-parent", async move {
+                super::spawn_session_turn_work("test-queued-followup", async move {
+                    if released.await.is_ok() {
+                        let _ = finished.send(());
+                    }
+                });
+                outer_done.send(()).unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+        outer_received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // 模拟 finalizer 已返回，但后续队列任务仍等待 Session 提交锁。
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.send(()).expect("父工作结束不能取消派生任务");
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[test]
     fn browser_capability_settings_default_to_safe_values_and_round_trip() {
         let defaults = BrowserCapabilitySettings::from_section(&serde_json::json!({}));
         assert!(defaults.in_app_browser_enabled);
@@ -5606,6 +6096,7 @@ mod tests {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -5680,6 +6171,10 @@ mod tests {
         );
         let session_id = SessionId::new("session-queue-identity");
         let workspace_id = WorkspaceId::new("workspace-queue-identity");
+        state
+            .session_store
+            .create_session(session_id.clone(), "identity")
+            .unwrap();
         let mut queued = queued_turn_fixture(&session_id, &workspace_id, "queue-identity", 100);
         queued.request.request_id = None;
         queued.request.user_message_id = None;
@@ -5716,6 +6211,10 @@ mod tests {
         let session_id = SessionId::new("session-queued-request-lookup");
         let workspace_id = WorkspaceId::new("workspace-queued-request-lookup");
         state
+            .session_store
+            .create_session(session_id.clone(), "lookup")
+            .unwrap();
+        state
             .enqueue_regular_session_turn(queued_turn_fixture(
                 &session_id,
                 &workspace_id,
@@ -5745,7 +6244,70 @@ mod tests {
     }
 
     #[test]
-    fn execution_resource_coordinator_revokes_browser_lease_by_task_scope() {
+    fn terminal_task_releases_undispatched_input_without_closing_sibling() {
+        let store = Arc::new(TaskStore::new());
+        let task = task_with_status("queued-agent-cancelled", TaskStatus::Killed);
+        store.insert_task(task.clone()).unwrap();
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(store);
+        let session = SessionId::new("queued-agent-session");
+        let sibling = TaskId::new("other-agent");
+        let signal = magi_conversation_runtime::RuntimeSignal {
+            author: magi_conversation_runtime::MailboxAuthor::System,
+            kind: magi_conversation_runtime::MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({"type":"agent_assignment"}),
+            enqueued_at: UtcMillis(1),
+        };
+        for id in [&task.task_id, &sibling] {
+            state
+                .conversation_registry
+                .open_task_signal_channel(&session, id);
+            state
+                .conversation_registry
+                .enqueue_task_signal(&session, id, signal.clone())
+                .unwrap();
+        }
+        state.release_finished_task_resources(&session, &task.task_id);
+        state.release_finished_task_resources(&session, &task.task_id);
+        assert!(
+            state
+                .conversation_registry
+                .drain_task_signals(&session, &task.task_id)
+                .is_empty()
+        );
+        assert!(
+            state
+                .conversation_registry
+                .enqueue_task_signal(&session, &task.task_id, signal.clone())
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .conversation_registry
+                .drain_task_signals(&session, &sibling),
+            [signal]
+        );
+        assert_eq!(state.conversation_registry.len(), 1);
+    }
+
+    #[test]
+    fn execution_resource_coordinator_revokes_browser_leases_by_subtree_scope() {
+        run_browser_resource_scope(false);
+    }
+
+    #[test]
+    fn execution_resource_coordinator_preserves_transferred_browser_lease() {
+        run_browser_resource_scope(true);
+    }
+
+    fn run_browser_resource_scope(transferred: bool) {
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -5764,6 +6326,25 @@ mod tests {
         let completed_task_id = TaskId::new("task-resource-coordinator-completed");
         let retained_task_id = TaskId::new("task-resource-coordinator-retained");
         let now = UtcMillis(100);
+        let store = Arc::new(TaskStore::new());
+        let mut root = task_with_status("task-resource-coordinator-root", TaskStatus::Running);
+        root.root_task_id = root.task_id.clone();
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        let mut child = task_with_status(completed_task_id.as_str(), TaskStatus::Running);
+        child.parent_task_id = Some(root.task_id.clone());
+        child.root_task_id = root.task_id.clone();
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child).unwrap();
+        if transferred {
+            insert_transferred_agent_fixture(
+                &store,
+                &root,
+                &session_id,
+                retained_task_id.as_str(),
+                magi_core::AgentRunOwner::Session,
+            );
+        }
+        let state = state.with_task_store(store);
 
         state
             .mutate_browser_authority(|authority| {
@@ -5874,10 +6455,9 @@ mod tests {
             })
             .expect("browser resource fixture should initialize");
 
-        let report = state.cancel_execution_resources(
-            Some(&session_id),
-            None,
-            Some(&completed_task_id),
+        let report = state.cancel_task_execution_scope_resources(
+            &session_id,
+            &root.task_id,
             magi_browser_authority::BrowserLeaseEndReason::TaskFinished,
         );
         assert_eq!(report.browser_lease_count, 1);
@@ -6011,6 +6591,191 @@ mod tests {
         assert!(!retained.agent_worktrees[0].active);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn task_subtree_resource_cancel_keeps_other_tasks_in_the_same_session_running() {
+        run_task_scope_resource_cancellation(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_scope_resource_cancel_preserves_transferred_shell_until_session_close() {
+        run_task_scope_resource_cancellation(true, true);
+    }
+
+    #[cfg(unix)]
+    fn run_task_scope_resource_cancellation(transferred: bool, close_session: bool) {
+        use magi_core::{AccessProfile, ExecutionResultStatus, ToolCallId};
+        use magi_tool_runtime::{
+            BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy,
+        };
+        let store = Arc::new(TaskStore::new());
+        let mut root = task_with_status("resource-tree-root", TaskStatus::Running);
+        root.root_task_id = root.task_id.clone();
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        let mut child = task_with_status("resource-tree-child", TaskStatus::Running);
+        child.parent_task_id = Some(root.task_id.clone());
+        child.root_task_id = root.task_id.clone();
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let session = SessionId::new(format!(
+            "resource-tree-session-{transferred}-{close_session}"
+        ));
+        let outside = TaskId::new("resource-tree-independent");
+        if transferred {
+            insert_transferred_agent_fixture(
+                &store,
+                &root,
+                &session,
+                outside.as_str(),
+                magi_core::AgentRunOwner::Session,
+            );
+        }
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let governance = Arc::new(GovernanceService::default());
+        let mut registry = ToolRegistry::new(governance.clone(), event_bus.clone());
+        registry.register_default_builtins();
+        let state = ApiState::new(
+            "resource-tree-test",
+            event_bus,
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            governance,
+        )
+        .with_task_store(store)
+        .with_tool_registry(registry.clone());
+        let fixture = tempfile::tempdir().unwrap();
+        let release = fixture.path().join("release-shells");
+        let mut runs = Vec::new();
+        for (index, task) in [&root.task_id, &child.task_id, &outside]
+            .into_iter()
+            .enumerate()
+        {
+            // 独立执行目录，避免本测试被正确的并发写保护先行拒绝。
+            let cwd = fixture.path().join(index.to_string());
+            std::fs::create_dir(&cwd).unwrap();
+            let context = ToolExecutionContext {
+                session_id: Some(session.clone()),
+                task_id: Some(task.clone()),
+                workspace_id: Some(WorkspaceId::new("resource-tree-workspace")),
+                working_directory: Some(cwd),
+                access_profile: AccessProfile::FullAccess,
+                ..Default::default()
+            };
+            let registry = registry.clone();
+            let call = ToolCallId::new(format!("resource-tree-{index}"));
+            runs.push(std::thread::spawn(move || registry.execute_with_policy(
+                ToolExecutionInput::for_builtin_invocation(call, BuiltinToolName::ShellExec.as_str(),
+                    serde_json::json!({"command":"while [ ! -f ../release-shells ]; do sleep 0.02; done; printf survives", "timeout_ms":10000}).to_string()),
+                context, &ToolExecutionPolicy { access_profile: AccessProfile::FullAccess, ..Default::default() },
+            )));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for task in [&root.task_id, &child.task_id, &outside] {
+            let query = ToolExecutionContextQuery {
+                session_id: Some(session.clone()),
+                task_id: Some(task.clone()),
+                ..Default::default()
+            };
+            while !registry.has_active_executions(&query) {
+                if std::time::Instant::now() >= deadline {
+                    std::fs::write(&release, "release").unwrap();
+                    let results = runs
+                        .into_iter()
+                        .map(|run| run.join().unwrap())
+                        .collect::<Vec<_>>();
+                    panic!("资源未按预期启动: {task}; {results:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        state.cancel_task_execution_scope_resources(
+            &session,
+            &root.task_id,
+            BrowserLeaseEndReason::GoalPaused,
+        );
+        let retained = registry.has_active_executions(&ToolExecutionContextQuery {
+            session_id: Some(session.clone()),
+            task_id: Some(outside.clone()),
+            ..Default::default()
+        });
+        if close_session {
+            state.cancel_execution_resources(
+                Some(&session),
+                None,
+                None,
+                BrowserLeaseEndReason::SessionClosed,
+            );
+        }
+        std::fs::write(release, "release").unwrap();
+        let results = runs
+            .into_iter()
+            .map(|run| run.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(retained, "子树外进程不能被取消");
+        for result in &results[..2] {
+            assert_eq!(
+                result.status,
+                ExecutionResultStatus::Cancelled,
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            results[2].status,
+            if close_session {
+                ExecutionResultStatus::Cancelled
+            } else {
+                ExecutionResultStatus::Succeeded
+            },
+            "{:?}",
+            results[2]
+        );
+    }
+
+    fn insert_transferred_agent_fixture(
+        store: &TaskStore,
+        root: &Task,
+        session: &SessionId,
+        id: &str,
+        owner: magi_core::AgentRunOwner,
+    ) -> Task {
+        let mut child = task_with_status(id, TaskStatus::Running);
+        child.root_task_id = root.task_id.clone();
+        child.parent_task_id = Some(root.task_id.clone());
+        let lifetime = match &owner {
+            magi_core::AgentRunOwner::Session => magi_core::AgentLifetime::Session,
+            magi_core::AgentRunOwner::Goal { goal_id, .. } => magi_core::AgentLifetime::Goal {
+                goal_id: goal_id.clone(),
+            },
+        };
+        let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+        binding.agent_activation = Some(magi_core::AgentActivation {
+            agent_id: child.task_id.clone(),
+            session_id: session.clone(),
+            lifetime,
+            generation: 1,
+            previous_task_id: None,
+        });
+        child.executor_binding = Some(binding);
+        store.insert_task(child.clone()).unwrap();
+        store
+            .transfer_agent_subtree(
+                &root.task_id,
+                &child.task_id,
+                magi_core::AgentRunTransfer {
+                    operation_id: format!("transfer-{id}"),
+                    session_id: session.clone(),
+                    source_turn_id: "resource-source".into(),
+                    transferred_by: root.task_id.clone(),
+                    activation_generation: 1,
+                    owner,
+                    transferred_at: UtcMillis::now(),
+                },
+            )
+            .unwrap();
+        store.get_task(&child.task_id).unwrap()
+    }
+
     fn task_with_status(task_id: &str, status: TaskStatus) -> Task {
         let now = UtcMillis::now();
         Task {
@@ -6062,7 +6827,7 @@ mod tests {
     }
 
     struct CompletingDispatcher {
-        result_receiver: Arc<EventBasedResultReceiver>,
+        completion_notifier: Arc<TaskCompletionNotifier>,
     }
 
     impl TaskDispatcher for CompletingDispatcher {
@@ -6073,7 +6838,7 @@ mod tests {
             lease: &TaskLease,
             _admission_permit: magi_conversation_runtime::execution_admission::ExecutionAdmissionPermit,
         ) -> Result<(), String> {
-            self.result_receiver.push_result(
+            self.completion_notifier.notify(
                 magi_conversation_runtime::task_runner_bridge::TaskResult {
                     task_id: task.task_id.clone(),
                     lease_id: lease.lease_id.clone(),
@@ -6260,6 +7025,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbind_session_keeps_ownership_on_checkpoint_failure_and_retries_full_tree() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = task_with_status("unbind-source", TaskStatus::Running);
+        root.root_task_id = root.task_id.clone();
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        store.insert_task(root.clone()).unwrap();
+        let session = SessionId::new("unbind-transferred-session");
+        let child = insert_transferred_agent_fixture(
+            &store,
+            &root,
+            &session,
+            "unbind-transferred",
+            magi_core::AgentRunOwner::Session,
+        );
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+        );
+        manager.bind_session(session.clone(), root.task_id.as_str());
+        manager.bind_session(session.clone(), child.task_id.as_str());
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(magi_core::DomainError::InvalidState {
+                message: "unbind checkpoint failed".into(),
+            })
+        }));
+        assert!(manager.unbind_session(&session).await.is_err());
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            manager.session_runner_index.lock().unwrap()[&session].len(),
+            2
+        );
+        store.set_checkpoint_callback(Box::new(|_| Ok(())));
+        assert_eq!(manager.unbind_session(&session).await.unwrap(), 2);
+        assert!(
+            !manager
+                .session_runner_index
+                .lock()
+                .unwrap()
+                .contains_key(&session)
+        );
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_control_settles_only_revoked_goal_agent_scopes() {
+        for action in ["pause", "update", "clear", "failure_retry"] {
+            let session_store = Arc::new(SessionStore::new());
+            let session = SessionId::new(format!("goal-agent-control-{action}"));
+            session_store
+                .create_session(session.clone(), "goal controls")
+                .unwrap();
+            let (_, thread) =
+                session_store.ensure_session_mission(&session, UtcMillis::now(), || {
+                    MissionId::new("goal-control-mission")
+                });
+            let goal = session_store
+                .create_goal(
+                    session.clone(),
+                    thread,
+                    "resource-source",
+                    "控制目标代理",
+                    magi_core::AccessProfile::FullAccess,
+                )
+                .unwrap();
+            let store = Arc::new(TaskStore::new());
+            let mut root = task_with_status("goal-control-root", TaskStatus::Running);
+            root.root_task_id = root.task_id.clone();
+            root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+            store.insert_task(root.clone()).unwrap();
+            let retained = insert_transferred_agent_fixture(
+                &store,
+                &root,
+                &session,
+                "goal-control-session",
+                magi_core::AgentRunOwner::Session,
+            );
+            let revoked = insert_transferred_agent_fixture(
+                &store,
+                &root,
+                &session,
+                "goal-control-goal",
+                magi_core::AgentRunOwner::Goal {
+                    goal_id: goal.goal_id.clone(),
+                    control_revision: goal.control_revision,
+                },
+            );
+            let state = ApiState::new(
+                "goal-agent-control",
+                Arc::new(InMemoryEventBus::new(64)),
+                session_store,
+                Arc::new(WorkspaceStore::default()),
+                Arc::new(GovernanceService::default()),
+            )
+            .with_task_store(store.clone());
+            assert_eq!(
+                state
+                    .settle_revoked_goal_agent_runs(&session)
+                    .await
+                    .unwrap(),
+                0
+            );
+            if action == "failure_retry" {
+                store.set_checkpoint_callback(Box::new(|_| {
+                    Err(magi_core::DomainError::InvalidState {
+                        message: "goal checkpoint failed".into(),
+                    })
+                }));
+            }
+            let request = serde_json::json!({ "sessionId": session, "scope":"personal", "goalId":goal.goal_id, "expectedRevision":goal.control_revision, "objective":"新目标" });
+            let result = match action {
+                "pause" => crate::goal_service::pause_current_goal(&state, serde_json::from_value(serde_json::json!({
+                    "sessionId":session, "scope":"personal", "goalId":goal.goal_id, "expectedRevision":goal.control_revision
+                })).unwrap()).await.map(|_| ()),
+                "clear" => crate::goal_service::clear_current_goal(&state, serde_json::from_value(serde_json::json!({
+                    "sessionId":session, "scope":"personal", "goalId":goal.goal_id, "expectedRevision":goal.control_revision
+                })).unwrap()).await.map(|_| ()),
+                _ => crate::goal_service::update_current_goal(&state, serde_json::from_value(request).unwrap()).await.map(|_| ()),
+            };
+            if action == "failure_retry" {
+                assert!(result.is_err());
+                assert_eq!(
+                    store.get_task(&revoked.task_id).unwrap().status,
+                    TaskStatus::Running
+                );
+                store.set_checkpoint_callback(Box::new(|_| Ok(())));
+                state
+                    .settle_revoked_goal_agent_runs(&session)
+                    .await
+                    .unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                store.get_task(&root.task_id).unwrap().status,
+                TaskStatus::Running
+            );
+            assert_eq!(
+                store.get_task(&retained.task_id).unwrap().status,
+                TaskStatus::Running
+            );
+            assert_eq!(
+                store.get_task(&revoked.task_id).unwrap().status,
+                TaskStatus::Killed
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unbind_session_waits_for_blocked_runner_and_removes_handle() {
         let store = Arc::new(TaskStore::new());
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
@@ -6295,7 +7226,7 @@ mod tests {
         );
         manager.bind_session(session_id.clone(), root_task_id);
 
-        assert_eq!(manager.unbind_session(&session_id).await, 1);
+        assert_eq!(manager.unbind_session(&session_id).await.unwrap(), 1);
         assert!(manager.status(root_task_id).is_none());
     }
 
@@ -6358,8 +7289,65 @@ mod tests {
             }),
         );
 
-        assert_eq!(manager.unbind_session(&session_id).await, 1);
+        assert_eq!(manager.unbind_session(&session_id).await.unwrap(), 1);
         assert!(manager.status(root_task_id.as_str()).is_none());
+    }
+
+    #[tokio::test]
+    async fn status_callback_and_restart_share_the_execution_scope_lock() {
+        let store = Arc::new(TaskStore::new());
+        let mut task = task_with_status("status-restart-root", TaskStatus::Failed);
+        task.root_task_id = task.task_id.clone();
+        task.parent_task_id = None;
+        store.insert_task(task.clone()).unwrap();
+        let manager = Arc::new(RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            Arc::new(SessionStore::new()),
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+        ));
+        let callback_manager = manager.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let callback = tokio::task::spawn_blocking(move || {
+            let _guard = callback_manager.lock_for_task_status_change(&task);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                manager.lock_for_restart("status-restart-root")
+            )
+            .await
+            .is_err(),
+            "已通过版本校验的回调结束前不能重开执行"
+        );
+        release_tx.send(()).unwrap();
+        callback.await.unwrap();
+        let restart = manager.lock_for_restart("status-restart-root").await;
+        let callback_manager = manager.clone();
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let callback = tokio::task::spawn_blocking(move || {
+            let task = callback_manager
+                .task_store
+                .get_task(&TaskId::new("status-restart-root"))
+                .unwrap();
+            let _guard = callback_manager.lock_for_task_status_change(&task);
+            let _ = entered_tx.send(());
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut entered_rx)
+                .await
+                .is_err(),
+            "恢复提交期间旧回调必须等待，之后才能核对最新代际"
+        );
+        drop(restart);
+        entered_rx.await.unwrap();
+        callback.await.unwrap();
     }
 
     #[tokio::test]
@@ -6545,8 +7533,7 @@ mod tests {
             .update_status_checked(&task_id, TaskStatus::Pending)
             .expect("pending policy should freeze");
 
-        let result_receiver = Arc::new(EventBasedResultReceiver::new());
-        result_receiver.set_completion_sink(Arc::new(TaskCompletionNotifier::new(store.clone())));
+        let completion_notifier = Arc::new(TaskCompletionNotifier::new(store.clone()));
         let runner_checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner_checkpoint_count_for_callback = runner_checkpoint_count.clone();
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
@@ -6562,7 +7549,7 @@ mod tests {
                 }]
             }),
             Arc::new(CompletingDispatcher {
-                result_receiver: result_receiver.clone(),
+                completion_notifier,
             }),
         )
         .with_checkpoint_persist(Arc::new(move |_| {
@@ -7147,7 +8134,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_session_turn_queue_round_trips_with_acknowledge_and_retry_state() {
+    fn session_input_projection_survives_api_recreation_and_retry_updates() {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {
             Arc::new(RuntimeStatePersistence::new(
@@ -7207,10 +8194,10 @@ mod tests {
             .enqueue_regular_session_turn(queued_turn_fixture(
                 &session_id,
                 &workspace_id,
-                "queue-second",
-                12,
+                "queue-third",
+                13,
             ))
-            .expect("removed turn should be re-enqueued for retry coverage");
+            .expect("new input should be enqueued for retry coverage");
         assert_eq!(
             restored
                 .peek_next_regular_session_turn(&session_id)
@@ -7219,11 +8206,11 @@ mod tests {
             "queue-first"
         );
         restored
-            .acknowledge_regular_session_turn(&session_id, "queue-first")
+            .remove_regular_session_turn(&session_id, "queue-first")
             .expect("acknowledgement should persist");
         assert_eq!(
             restored
-                .record_regular_session_turn_retry(&session_id, "queue-second")
+                .record_regular_session_turn_retry(&session_id, "queue-third")
                 .expect("retry should persist"),
             1
         );
@@ -7240,12 +8227,12 @@ mod tests {
         let remaining = reloaded
             .peek_next_regular_session_turn(&session_id)
             .expect("second turn should remain persisted");
-        assert_eq!(remaining.queue_id, "queue-second");
+        assert_eq!(remaining.queue_id, "queue-third");
         assert_eq!(remaining.retry_count, 1);
     }
 
     #[test]
-    fn regular_session_turn_queue_restore_removes_archived_session_entries_from_disk() {
+    fn session_input_restore_cancels_archived_session_pending_entries() {
         let root = tempfile::tempdir().expect("state root");
         let persistence = || {
             Arc::new(RuntimeStatePersistence::new(
@@ -7289,12 +8276,57 @@ mod tests {
         )
         .with_runtime_persistence(persistence());
         assert_eq!(restored.restore_regular_session_turn_queues().unwrap(), 0);
-        let persisted: Vec<QueuedRegularSessionTurn> = serde_json::from_slice(
-            &fs::read(root.path().join("session-turn-queue.json"))
-                .expect("cleaned queue file should exist"),
+        assert!(!root.path().join("session-turn-queue.json").exists());
+        assert_eq!(
+            restored.session_store.inputs_for_session(&session_id)[0].state,
+            magi_session_store::SessionInputState::Cancelled
+        );
+    }
+
+    #[test]
+    fn legacy_queue_migration_keeps_backup_and_does_not_recreate_cancelled_input() {
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionId::new("session-legacy-input");
+        let workspace = WorkspaceId::new("workspace-legacy-input");
+        let store = Arc::new(SessionStore::new());
+        store.create_session(session.clone(), "legacy").unwrap();
+        let legacy = vec![queued_turn_fixture(
+            &session,
+            &workspace,
+            "queue-legacy",
+            50,
+        )];
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(root.path().join("session-turn-queue.json"), &bytes).unwrap();
+        let state = ApiState::new(
+            "test",
+            Arc::new(InMemoryEventBus::new(16)),
+            store.clone(),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
         )
-        .expect("cleaned queue file should parse");
-        assert!(persisted.is_empty());
+        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            root.path(),
+            root.path().join("workspaces.json"),
+            root.path().join("knowledge.json"),
+        )));
+        assert_eq!(state.restore_regular_session_turn_queues().unwrap(), 1);
+        assert_eq!(
+            fs::read(root.path().join("session-turn-queue.migrated.json")).unwrap(),
+            bytes
+        );
+        assert!(!root.path().join("session-turn-queue.json").exists());
+        state
+            .remove_regular_session_turn(&session, "queue-legacy")
+            .unwrap();
+        // 模拟 rename 前崩溃遗留旧文件；已迁移的终态输入不能被旧文件复活。
+        fs::write(root.path().join("session-turn-queue.json"), bytes).unwrap();
+        assert_eq!(state.restore_regular_session_turn_queues().unwrap(), 0);
+        assert_eq!(store.inputs_for_session(&session).len(), 1);
+        assert_eq!(
+            store.inputs_for_session(&session)[0].state,
+            magi_session_store::SessionInputState::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -7353,6 +8385,23 @@ mod tests {
                 .get_session(orphan_session_id.as_str())
                 .is_none(),
             "unregistered workspace session should not start a stale snapshot lifecycle"
+        );
+        let new_session_id = SessionId::new("session-snapshot-new-lazy");
+        state
+            .session_store
+            .create_session_for_workspace(
+                new_session_id.clone(),
+                "new",
+                Some(registered_workspace_id.to_string()),
+            )
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .snapshot_manager
+                .get_session(new_session_id.as_str())
+                .is_none(),
+            "新建会话同样不得扫描工作区"
         );
         state
             .ensure_snapshot_session(&known_session_id, &workspace_root)
@@ -7948,6 +8997,10 @@ mod tests {
                 "schema_warnings": [],
                 "runtime_status": "ready",
                 "runtime_warnings": [],
+                "model_available": false,
+                "availability": "denied",
+                "reason_code": "tool_not_in_allowed_scope",
+                "schema_included": true,
                 "parameters_schema": {"type": "object", "properties": {"old_string": {"type": "string"}}}
             }],
             "skill_tools": [{
@@ -7980,7 +9033,17 @@ mod tests {
                 "tool_name": "inspect",
                 "description": "inspect",
                 "read_only": true,
+                "model_available": false,
+                "availability": "denied",
+                "reason_code": "tool_explicitly_denied",
                 "input_schema": {"type": "object", "properties": {}}
+            }],
+            "plugin_tools": [{
+                "plugin_id":"acme.tools", "contribution_id":"inspect",
+                "model_tool_name":"plugin__acme.tools__inspect", "title":"Inspect",
+                "description":"Inspect", "read_only":false,
+                "input_schema":{"type":"object"},
+                "model_available":true, "availability":"needs_approval", "reason_code":null
             }],
             "agent_roles": [{
                 "role_id": "executor",
@@ -8008,6 +9071,13 @@ mod tests {
         assert_eq!(public["runtimeDependencies"][0]["enabledToolCount"], 2);
         assert_eq!(public["tools"][0]["effectiveApprovalPolicy"], "none");
         assert_eq!(public["tools"][0]["modelCallScope"], "session_or_task");
+        assert_eq!(public["tools"][0]["modelAvailable"], false);
+        assert_eq!(public["tools"][0]["availability"], "denied");
+        assert_eq!(
+            public["tools"][0]["reasonCode"],
+            "tool_not_in_allowed_scope"
+        );
+        assert_eq!(public["tools"][0]["schemaIncluded"], true);
         assert_eq!(
             public["tools"][0]["parametersSchema"]["properties"]["old_string"]["type"],
             "string"
@@ -8020,6 +9090,17 @@ mod tests {
         assert_eq!(public["mcpServers"][0]["serverId"], "mcp-1");
         assert_eq!(public["mcpServers"][0]["toolCount"], 3);
         assert_eq!(public["mcpTools"][0]["readOnly"], true);
+        assert_eq!(public["mcpTools"][0]["modelAvailable"], false);
+        assert_eq!(
+            public["mcpTools"][0]["reasonCode"],
+            "tool_explicitly_denied"
+        );
+        assert_eq!(
+            public["pluginTools"][0]["modelToolName"],
+            "plugin__acme.tools__inspect"
+        );
+        assert_eq!(public["pluginTools"][0]["availability"], "needs_approval");
+        assert_eq!(public["pluginTools"][0]["modelAvailable"], true);
         assert_eq!(public["agentRoles"][0]["roleId"], "executor");
         assert_eq!(public["agentRoles"][0]["parallelismLimit"], 2);
     }

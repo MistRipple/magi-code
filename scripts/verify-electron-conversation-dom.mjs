@@ -501,6 +501,17 @@ function latestPromptText(messages) {
 
 function providerResponse(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const currentPrompt = latestPromptText(messages);
+  for (const [label, root] of [["漂移", gitDriftRoot], ["冲突", gitConflictRoot]]) {
+    if (currentPrompt.includes(`Git ${label} 对话 DOM 验收`)) {
+      return openAiStream(`ELECTRON_DOM_GIT_${label}_CHAT_OK`);
+    }
+    if (currentPrompt.includes(`Git ${label} 写入 DOM 验收`)) {
+      return toolCallStream(requestToolName(body, "file_write"), {
+        path: join(root, "must-not-exist.txt"), content: "must not execute",
+      }, `electron-dom-git-${label}-write`);
+    }
+  }
   const promptText = messages
     .filter((message) => message?.role === "user")
     .map(messageText)
@@ -675,7 +686,6 @@ function createProvider() {
           goalStates.set(currentUserText, goalState);
           payload = toolCallStream(createGoalName, {
             objective: "完成目标 DOM 验收并保留可见计划",
-            token_budget: null,
           }, "electron-dom-goal-create-goal-1");
         } else if (goalState.phase === 2 && requestContainsTool(parsed, "update_plan") && goal) {
           goalState.phase = 3;
@@ -750,6 +760,7 @@ function createProvider() {
         }
         payload = toolCallStream(requestToolName(parsed, "agent_spawn"), {
           task_name: "electron_failure_probe",
+            delegation: { purpose: "user_requested", reason: "验收请求明确要求真实子代理执行与状态投影" },
           display_name: "Electron DOM 失败子代理",
           role: "unregistered_electron_role",
           goal: "验证子代理失败投影与恢复入口",
@@ -782,6 +793,7 @@ function createProvider() {
           multiAgentStates.set(currentUserText, multiAgentState);
           payload = toolCallStream(agentSpawnName, {
             task_name: "electron_dom_multi_success",
+            delegation: { purpose: "user_requested", reason: "验收请求明确要求真实子代理执行与状态投影" },
             display_name: "Electron DOM 多状态成功子代理",
             role: "executor",
             goal: "Electron DOM 多状态成功子代理：返回 ELECTRON_DOM_MULTI_CHILD_OK",
@@ -798,6 +810,7 @@ function createProvider() {
           multiAgentStates.set(currentUserText, multiAgentState);
           payload = toolCallStream(agentSpawnName, {
             task_name: "electron_dom_multi_failure",
+            delegation: { purpose: "user_requested", reason: "验收请求明确要求真实子代理执行与状态投影" },
             display_name: "Electron DOM 多状态失败子代理",
             role: "reviewer",
             goal: "Electron DOM 多状态失败子代理：验证失败状态投影",
@@ -845,6 +858,7 @@ function createProvider() {
           agentStates.set(currentUserText, agentState);
           payload = toolCallStream(agentSpawnName, {
             task_name: "electron_dom_child",
+            delegation: { purpose: "user_requested", reason: "验收请求明确要求真实子代理执行与状态投影" },
             display_name: "Electron DOM 子代理",
             role: "executor",
             goal: "完成 Electron DOM 子代理验收并返回明确结果",
@@ -1146,6 +1160,8 @@ async function rendererState(page) {
         agentCards: [...document.querySelectorAll('[data-tool-name="agent_spawn"]')].map((item) => ({
           text: item.innerText || '',
           taskId: item.getAttribute('data-agent-task-id'),
+          status: item.className,
+          disabled: item.disabled,
         })),
       };
     })(),
@@ -1303,13 +1319,6 @@ function backendTimingHasAbnormalRequiredStages(record) {
     && stages.session_terminal_finalize_core_completed?.count > 0;
 }
 
-function backendTimingHasPreDispatchRequiredStages(record) {
-  const stages = record?.stages || {};
-  return stages.accepted_response_sent?.count > 0
-    && stages.canonical_terminal_published?.count > 0
-    && stages.session_terminal_finalize_core_completed?.count > 0;
-}
-
 function checkBackendTimingStages(label, backend, scenario = "") {
   check(`${label} accepted_response_sent`, backend?.stages?.accepted_response_sent?.count > 0);
   check(`${label} runner_started`, backend?.stages?.runner_started?.count > 0);
@@ -1329,20 +1338,6 @@ function checkAbnormalBackendTimingStages(label, backend) {
   check(
     `${label} session_terminal_finalize_core_completed`,
     backend?.stages?.session_terminal_finalize_core_completed?.count > 0,
-  );
-}
-
-function checkPreDispatchBackendTimingStages(label, backend) {
-  check(`${label} accepted_response_sent`, backend?.stages?.accepted_response_sent?.count > 0);
-  check(`${label} canonical_terminal_published`, backend?.stages?.canonical_terminal_published?.count > 0);
-  check(
-    `${label} session_terminal_finalize_core_completed`,
-    backend?.stages?.session_terminal_finalize_core_completed?.count > 0,
-  );
-  check(
-    `${label} Provider 未 dispatch`,
-    !backend?.stages?.provider_request_started,
-    JSON.stringify(backend?.stages || {}),
   );
 }
 
@@ -1386,16 +1381,70 @@ async function waitForAbnormalBackendTiming(turnId, label) {
   }, label, 45_000);
 }
 
-async function waitForPreDispatchBackendTiming(turnId, label) {
-  return waitFor(() => {
-    const evidence = backendTimingEvidence(turnId);
-    return backendTimingHasPreDispatchRequiredStages(evidence) ? evidence : null;
-  }, label, 45_000);
+async function checkDeferredGitPreparation(page, { label, root, workspaceId, scenario }) {
+  await waitForComposerReady(page, `Git ${label} 输入区就绪`);
+  await chooseAccessProfile(page, "full_access");
+  const chatPrompt = `Git ${label} 对话 DOM 验收：只回答，不使用工作区工具`;
+  const chatReply = `ELECTRON_DOM_GIT_${label}_CHAT_OK`;
+  const chatRequestsBefore = provider.requests.length;
+  await setComposerText(page, chatPrompt);
+  await clickSend(page);
+  const chat = await waitForAssistant(page, chatReply, `Git ${label} 普通对话`);
+  await waitForComposerReady(page, `Git ${label} 普通对话收口`);
+  check(`Git ${label} 不阻断普通对话`, provider.requests.length === chatRequestsBefore + 1);
+  const chatTurnId = assistantTurnId(chat, chatReply);
+  const chatTiming = await waitForTimingRecord(page, chatTurnId, `Git ${label} 对话 Renderer timing`);
+  const chatBackend = await waitForBackendTiming(chatTurnId, `Git ${label} 对话 backend timing`);
+  rendererTimingSamples.push(timingEvidenceRecord(`${scenario}_chat`, chatTurnId, chatTiming, chatBackend));
+
+  const readGitState = async () => ({
+    head: (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout,
+    index: (await execFileAsync("git", ["ls-files", "--stage"], { cwd: root })).stdout,
+    readme: await readFile(join(root, "README.md"), "utf8"),
+  });
+  const before = await readGitState();
+  const requestsBefore = provider.requests.length;
+  const prompt = `Git ${label} 写入 DOM 验收：调用 file_write 创建 must-not-exist.txt`;
+  await setComposerText(page, prompt);
+  await clickSend(page);
+  const result = await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop && /工作区执行准备失败/u.test(state.assistant.at(-1)?.text || "")
+      ? state : null;
+  }, `Git ${label} 写入拒绝终态`, 60_000);
+  check(`Git ${label} 写入拒绝来自真实准备检查`,
+    /Git context|merge conflict/u.test(result.assistant.at(-1)?.text || ""));
+  check(`Git ${label} 在首次工具执行时拒绝`, provider.requests.length === requestsBefore + 1);
+  check(`Git ${label} 工作区身份仍可见`, result.workspaceIds.includes(workspaceId));
+  check(`Git ${label} 没有写入文件`, !await access(join(root, "must-not-exist.txt")).then(() => true, () => false));
+  check(`Git ${label} 原文件、HEAD 和 index 未变化`, JSON.stringify(before) === JSON.stringify(await readGitState()));
+  const turnId = result.turns.at(-1)?.id || result.assistant.at(-1)?.turnId;
+  const backend = await waitForAbnormalBackendTiming(turnId, `Git ${label} 工具拒绝 backend timing`);
+  const timing = await waitForTimingRecord(page, turnId, `Git ${label} 工具拒绝 Renderer timing`);
+  checkAbnormalBackendTimingStages(`Git ${label} 后端`, backend);
+  checkTimingStages(`Git ${label} Renderer`, timing);
+  const turn = await page.evaluate(`(async () => {
+    const sessionId = new URL(location.href).searchParams.get('sessionId');
+    const query = new URLSearchParams(${JSON.stringify({ scope: "workspace", workspaceId, workspacePath: root })});
+    query.set('sessionId', sessionId);
+    const response = await fetch('/bootstrap?' + query);
+    if (!response.ok) throw new Error('Git preparation bootstrap failed: ' + response.status);
+    return (await response.json()).canonicalTurns?.find(turn => turn.turnId === ${JSON.stringify(turnId)});
+  })()`);
+  check(`Git ${label} 原工具持久化明确未执行回执`, turn?.status === "failed" && turn.items.some(item => {
+    if (item.kind !== "tool_call" || item.tool?.name !== "file_write") return false;
+    const receipt = typeof item.tool.result === "string" ? JSON.parse(item.tool.result) : item.tool.result;
+    return receipt?.error_code === "workspace_preparation_failed" && receipt.execution_started === false;
+  }), JSON.stringify(turn));
+  rendererTimingSamples.push(timingEvidenceRecord(scenario, turnId, timing, backend, {
+    trajectoryMode: "abnormal", expectedOutcome: "failed", outcome: "failed",
+    inputHash: hashText(prompt), providerDispatch: "dispatched",
+    providerRequestCount: provider.requests.length - requestsBefore, settlementRequired: true,
+  }));
 }
 
 async function runGitDriftConflictChecks(page) {
-  // Git drift/conflict 必须经真实 workspace、Git 观测和 Task preflight；两种阻断
-  // 都发生在 Provider dispatch 前，不以本地 Provider 文本冒充 Git 错误证据。
+  // 从真实 DOM 发送普通对话和写入；拒绝证据来自真实 Git 准备与持久化回执。
   gitDriftRoot = await mkdtemp(join(stateRoot, "git-drift-"));
   await createGitRepository(gitDriftRoot);
   const driftWorkspaceId = await registerWorkspace(page, gitDriftRoot);
@@ -1422,43 +1471,9 @@ async function runGitDriftConflictChecks(page) {
     throw new Error(`${error.message}；Git drift 当前 Renderer 状态：${JSON.stringify(await rendererState(page))}`);
   }
   await page.evaluate(`document.querySelector('.git-context-trigger')?.click()`);
-  const driftProviderRequests = provider.requests.length;
-  const driftPrompt = "Git 漂移 DOM 验收：执行一个复杂任务，读取当前工作区并汇总结果";
-  await setComposerText(page, driftPrompt);
-  await clickSend(page);
-  const driftResult = await waitFor(async () => {
-    const state = await rendererState(page);
-    const text = state.assistant.at(-1)?.text || "";
-    return state.input && !state.stop && /git|漂移|不一致|失败|error/iu.test(text) ? state : null;
-  }, "Git drift 失败终态", 60_000);
-  check("Git drift 失败事实进入真实 DOM", /git|漂移|不一致|失败|error/iu.test(driftResult.assistant.at(-1)?.text || ""));
-  check("Git drift 在 Provider 前阻断", provider.requests.length === driftProviderRequests);
-  check("Git drift 工作区注册身份仍可见", driftResult.workspaceIds.includes(driftWorkspaceId));
-  const driftTurnId = driftResult.turns.at(-1)?.id || driftResult.assistant.at(-1)?.turnId || null;
-  check("Git drift Turn 具有稳定 canonical Turn 身份", Boolean(driftTurnId));
-  const driftTiming = await waitForTimingRecord(page, driftTurnId, "Git drift Renderer timing");
-  const driftBackend = await waitForPreDispatchBackendTiming(
-    driftTurnId,
-    "Git drift Provider 前置阻断后端 timing 关联",
-  );
-  checkPreDispatchBackendTimingStages("Git drift 后端", driftBackend);
-  checkTimingStages("Git drift Renderer", driftTiming);
-  rendererTimingSamples.push(timingEvidenceRecord(
-    "git_branch_drift",
-    driftTurnId,
-    driftTiming,
-    driftBackend,
-    {
-      trajectoryMode: "abnormal",
-      expectedOutcome: "failed",
-      outcome: "failed",
-      inputHash: hashText(driftPrompt),
-      providerDispatch: "not_dispatched",
-      providerBlockReason: "git_branch_drift",
-      providerRequestCount: provider.requests.length - driftProviderRequests,
-      settlementRequired: true,
-    },
-  ));
+  await checkDeferredGitPreparation(page, {
+    label: "漂移", root: gitDriftRoot, workspaceId: driftWorkspaceId, scenario: "git_branch_drift",
+  });
 
   gitConflictRoot = await mkdtemp(join(stateRoot, "git-conflict-"));
   await createGitConflictRepository(gitConflictRoot);
@@ -1467,43 +1482,9 @@ async function runGitDriftConflictChecks(page) {
     const state = await rendererState(page);
     return state.git.some((item) => /冲突|conflict/iu.test(`${item.title} ${item.text} ${item.conflict}`)) ? state : null;
   }, "Git conflict 状态进入真实 DOM");
-  const conflictProviderRequests = provider.requests.length;
-  const conflictPrompt = "Git 冲突 DOM 验收：执行一个复杂任务，处理当前工作区冲突并汇总结果";
-  await setComposerText(page, conflictPrompt);
-  await clickSend(page);
-  const conflictResult = await waitFor(async () => {
-    const state = await rendererState(page);
-    const text = state.assistant.at(-1)?.text || "";
-    return state.input && !state.stop && /git|冲突|merge conflict|失败|error/iu.test(text) ? state : null;
-  }, "Git conflict 失败终态", 60_000);
-  check("Git conflict 失败事实进入真实 DOM", /git|冲突|merge conflict|失败|error/iu.test(conflictResult.assistant.at(-1)?.text || ""));
-  check("Git conflict 在 Provider 前阻断", provider.requests.length === conflictProviderRequests);
-  check("Git conflict 工作区注册身份仍可见", conflictResult.workspaceIds.includes(conflictWorkspaceId));
-  const conflictTurnId = conflictResult.turns.at(-1)?.id || conflictResult.assistant.at(-1)?.turnId || null;
-  check("Git conflict Turn 具有稳定 canonical Turn 身份", Boolean(conflictTurnId));
-  const conflictTiming = await waitForTimingRecord(page, conflictTurnId, "Git conflict Renderer timing");
-  const conflictBackend = await waitForPreDispatchBackendTiming(
-    conflictTurnId,
-    "Git conflict Provider 前置阻断后端 timing 关联",
-  );
-  checkPreDispatchBackendTimingStages("Git conflict 后端", conflictBackend);
-  checkTimingStages("Git conflict Renderer", conflictTiming);
-  rendererTimingSamples.push(timingEvidenceRecord(
-    "git_merge_conflict",
-    conflictTurnId,
-    conflictTiming,
-    conflictBackend,
-    {
-      trajectoryMode: "abnormal",
-      expectedOutcome: "failed",
-      outcome: "failed",
-      inputHash: hashText(conflictPrompt),
-      providerDispatch: "not_dispatched",
-      providerBlockReason: "git_merge_conflict",
-      providerRequestCount: provider.requests.length - conflictProviderRequests,
-      settlementRequired: true,
-    },
-  ));
+  await checkDeferredGitPreparation(page, {
+    label: "冲突", root: gitConflictRoot, workspaceId: conflictWorkspaceId, scenario: "git_merge_conflict",
+  });
 }
 
 async function runApprovalExpiryCheck(page) {
@@ -1990,7 +1971,7 @@ async function startRecoveryCancellationTurn(page, prompt, label, options = {}) 
     await waitForComposerReady(page, `${label} 工作区输入区就绪`);
     await chooseAccessProfile(page, "restricted");
   } else {
-    await openPersonalDraft(page);
+    await openSessionDraft(page);
   }
   const knownTurnIds = new Set(backendTimingByTurn.keys());
   await setComposerText(page, prompt);
@@ -2180,7 +2161,7 @@ async function runRecoveryAcceptance(page, electron) {
     stopMethod: websocketStopMethod,
   };
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page, { personal: true });
   const restartPrompt = "daemon 重启 DOM 验收 replay：请只回复重启后的最终消息";
   await setComposerText(page, restartPrompt);
   await clickSend(page);
@@ -2333,20 +2314,27 @@ async function waitForComposerReady(page, label) {
   }
 }
 
-async function openPersonalDraft(page) {
-  await waitFor(async () => {
+// 默认沿当前作用域新建；显式个人会话必须使用最近会话栏入口。
+async function openSessionDraft(page, { personal = false } = {}) {
+  const previous = await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && state.inputEditable && !state.stop ? state : null;
-  }, "个人上一轮 Turn 收口", 45_000);
+  }, "上一轮 Turn 收口", 45_000);
+  const expectedWorkspaceId = personal ? null : new URL(previous.url).searchParams.get('workspaceId');
+  const selector = personal ? '.recent-sessions-header .btn-icon' : '[data-testid="sidebar-new-session"]';
   await page.evaluate(`(() => {
-    const button = document.querySelector('[data-testid="sidebar-new-session"]');
+    const button = document.querySelector(${JSON.stringify(selector)});
     if (!button || button.disabled) throw new Error('new session button unavailable');
     button.click();
   })()`);
   await waitFor(async () => {
     const state = await rendererState(page);
-    return state.input && state.inputEditable && !state.stop ? state : null;
-  }, "个人新会话草稿就绪", 45_000);
+    const route = new URL(state.url);
+    return state.input && state.inputEditable && !state.stop
+      && route.searchParams.get('workspaceId') === expectedWorkspaceId
+      && route.searchParams.get('sessionId') !== new URL(previous.url).searchParams.get('sessionId')
+      ? state : null;
+  }, "新会话草稿及作用域就绪", 45_000);
 }
 
 async function clickSend(page) {
@@ -2389,6 +2377,16 @@ async function waitForAssistant(page, text, label) {
       : "Renderer state unavailable";
     throw new Error(`${error instanceof Error ? error.message : String(error)}; latestRendererState=${detail}`);
   }
+}
+
+async function expandLatestAgentGroup(page) {
+  await waitFor(() => page.evaluate(`(() => {
+    const group = [...document.querySelectorAll('.conversation-agent-group')].at(-1);
+    const button = group?.querySelector('.agent-group-header');
+    if (!button) return false;
+    if (button.getAttribute('aria-expanded') !== 'true') button.click();
+    return true;
+  })()`), "展开本轮代理组");
 }
 
 async function gitFixtureCommand(repositoryRoot, args) {
@@ -2900,7 +2898,7 @@ try {
 
     // 在同一 Session 累积历史后验证 3 个连续 Turn；至少一次真正完成压缩。
     // 这里只验证行为，不生成批量性能统计。
-    await openPersonalDraft(page);
+    await openSessionDraft(page);
     await waitForCompactionInput("Electron context compaction Session 草稿");
     let compactionSessionId = null;
     let historySeedTurnId = null;
@@ -3114,7 +3112,7 @@ try {
   checkTimingStages("个人 Chat 生产 Renderer", personalTiming);
 
   // 真实输入、排队和停止入口必须共同驱动同一 Turn 事务。
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   const beforeQueueSessionIds = (await rendererState(page)).personalSessionIds;
   await setComposerText(page, "服务边界挂起：保持响应直到我停止");
   await clickSend(page);
@@ -3134,7 +3132,7 @@ try {
   check("快速追加和队列执行始终属于同一会话", new URL(afterQueueState.url).searchParams.get('sessionId') === queueSessionId
     && afterQueueState.personalSessionIds.filter(id => !beforeQueueSessionIds.includes(id)).length === 1);
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await setComposerText(page, "服务边界挂起：保持响应，测试恢复入口");
   await clickSend(page);
   await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-stop-button"]:not([disabled])'))`), "继续验收已确认会话的活动 Turn");
@@ -3226,7 +3224,7 @@ try {
     item.kind === "tool_call" && item.tool?.name === "tool_catalog" && item.visibility?.renderable !== false
   )));
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;
@@ -3268,7 +3266,7 @@ try {
   }, "Goal 卡片展开");
   check("Goal 卡片支持二级展开", expandedGoal.goalCard.expanded === "true");
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;
@@ -3315,7 +3313,7 @@ try {
     },
   ));
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await clearGoalMode(page);
   await chooseGoalMode(page);
   await setComposerText(page, "目标 DOM 验收：失败后重新建立目标并完成计划");
@@ -3328,7 +3326,7 @@ try {
   }, "Goal 失败后恢复卡片", 45_000);
   check("Goal 失败后恢复卡片进入真实 DOM", Boolean(recoveredGoalCard.goalCard && recoveredGoalCard.planCard));
 
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;
@@ -3361,12 +3359,24 @@ try {
       turns.at(-1)?.querySelector('.turn-disclosure-header')?.click();
     })()`);
   }
+  await expandLatestAgentGroup(page);
   const agentSpawnCard = await waitFor(async () => {
     const state = await rendererState(page);
-    return state.agentCenter.agentCards.length > 0 || state.text.includes("ELECTRON_DOM_AGENT_OK") ? state : null;
+    return state.agentCenter.agentCards.length > 0 ? state : null;
   }, "子代理工具卡片加载", 45_000);
-  check("子代理工具卡片进入真实 DOM", agentSpawnCard.agentCenter.agentCards.length > 0 || agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
-  check("子代理工具卡片包含 child task id", Boolean(agentSpawnCard.agentCenter.agentCards.at(-1)?.taskId) || agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
+  check("子代理工具卡片进入真实 DOM", agentSpawnCard.agentCenter.agentCards.length > 0);
+  const childTaskId = agentSpawnCard.agentCenter.agentCards.at(-1)?.taskId || "";
+  check("子代理工具卡片包含 child task id", Boolean(childTaskId));
+  await page.evaluate(`(() => {
+    const card = [...document.querySelectorAll('.agent-spawn-card[data-agent-task-id]')].at(-1);
+    if (!card) throw new Error('agent spawn card with child task id missing');
+    card.click();
+  })()`);
+  const agentDetail = await waitFor(async () => {
+    const text = await page.evaluate(`document.querySelector('.agent-tab-content')?.innerText || ''`);
+    return text.includes(responseText) ? text : null;
+  }, "子代理详情页展示真实 Task", 45_000);
+  check("子代理详情页展示真实执行结果", agentDetail.includes(responseText));
   const agentCenterBeforeExpand = await rendererState(page);
   if (agentCenterBeforeExpand.agentCenter.visible) {
     await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
@@ -3376,26 +3386,34 @@ try {
     }, "代理运行中心展开");
     check("代理运行中心支持展开", expandedAgentCenter.agentCenter.expanded === "true");
     check("代理运行中心显示子代理", expandedAgentCenter.agentCenter.rows.length > 0);
-  } else {
-    check("代理运行中心支持展开", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
-    check("代理运行中心显示子代理", agentResult.text.includes("ELECTRON_DOM_AGENT_OK"));
   }
 
   // 失败代理也必须沿真实 agent_spawn -> canonical/tool projection -> Agent
   // Run read model 进入 Renderer；不能只验成功卡片或直接注入失败状态。
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;
   }, "子代理失败 DOM 验收输入");
   await setComposerText(page, "子代理失败 DOM 验收：派发一个不可用角色并展示失败原因");
   await clickSend(page);
+  await waitFor(async () => {
+    const state = await rendererState(page);
+    return state.input && !state.stop ? state : null;
+  }, "子代理失败 Turn 收口", 60_000);
+  await page.evaluate(`(() => {
+    const turn = [...document.querySelectorAll('[data-conversation-turn-id]')].at(-1);
+    if (turn?.querySelector('.turn-disclosure-header')?.getAttribute('aria-expanded') === 'false') {
+      turn.querySelector('.turn-disclosure-header').click();
+    }
+  })()`);
+  await expandLatestAgentGroup(page);
   const failedAgent = await waitFor(async () => {
     const state = await rendererState(page);
     const cardText = state.agentCenter.agentCards.at(-1)?.text || "";
     const assistantText = state.assistant.at(-1)?.text || "";
-    const hasFailure = /失败|拒绝|不可用|failed|rejected|error/iu.test(`${cardText} ${assistantText}`);
-    return state.text.includes("子代理失败 DOM 验收") && !state.stop
+    const hasFailure = /失败|拒绝|不可用|failed|rejected|error/iu.test(cardText);
+    return state.agentCenter.agentCards.length > 0 && hasFailure && !state.stop
       ? { ...state, cardText, assistantText, hasFailure }
       : null;
   }, "子代理失败卡片进入真实 DOM", 60_000);
@@ -3404,9 +3422,8 @@ try {
     failedAgent.hasFailure,
     `card=${failedAgent.cardText.slice(-240)} assistant=${failedAgent.assistantText.slice(-240)}`,
   );
-  if (failedAgent.agentCenter.agentCards.length > 0) {
-    check("子代理失败卡片未伪造 child task id", !failedAgent.agentCenter.agentCards.at(-1)?.taskId);
-  }
+  check("子代理失败卡片未伪造 child task id", !failedAgent.agentCenter.agentCards.at(-1)?.taskId);
+  check("未创建的代理卡片不可打开", failedAgent.agentCenter.agentCards.at(-1)?.disabled);
   if (failedAgent.agentCenter.visible) {
     await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
     const failedAgentCenter = await waitFor(async () => {
@@ -3472,12 +3489,16 @@ try {
     throw new Error(`${error.message}；当前多状态 Renderer：${JSON.stringify(await rendererState(page))}；Provider requests=${provider.requests.length}`);
   }
   check("子代理多状态摘要同时保留成功和失败计数", /1\s*已完成\s*[·.]\s*1\s*失败/iu.test(multiAgentCenter.text));
-  check(
-    "子代理多状态同时包含成功和失败事实",
-    /成功|完成|completed|success/iu.test(`${multiAgentCenter.agentCenter.text} ${multiAgentCenter.text}`)
-      && /失败|failed|error/iu.test(`${multiAgentCenter.agentCenter.text} ${multiAgentCenter.text}`),
-    `DOM text: ${multiAgentCenter.text.slice(-480)}`,
-  );
+  await expandLatestAgentGroup(page);
+  const multiCards = await waitFor(async () => {
+    const cards = (await rendererState(page)).agentCenter.agentCards;
+    return cards.length === 2 && cards.every(card => card.taskId && !card.disabled)
+      && cards.some(card => card.status.includes('status-success'))
+      && cards.some(card => card.status.includes('status-error')) ? cards : null;
+  }, "两个真实子代理卡片保留各自终态");
+  check("子代理多状态卡片保留不同任务身份", new Set(multiCards.map(card => card.taskId)).size === 2);
+  check("子代理多状态卡片分别显示成功和失败", multiCards.some(card => card.status.includes('status-success'))
+    && multiCards.some(card => card.status.includes('status-error')));
   if (multiAgentCenter.agentCenter.visible) {
     if (multiAgentCenter.agentCenter.expanded !== "true") {
       await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
@@ -3543,9 +3564,7 @@ try {
     },
   ));
 
-  // Git dirty/drift/conflict 必须通过真实 workspace 注册、Git 观测和 Task
-  // preflight 进入 Renderer；Provider 只为 dirty 场景返回最终文本，drift/conflict
-  // 场景应在 Provider 之前失败，避免把 mock 文本误当成 Git 错误证据。
+  // Git dirty/drift/conflict 通过真实 workspace 注册、Git 观测与按需工具准备验收。
   gitDirtyRoot = await mkdtemp(join(stateRoot, "git-dirty-"));
   await createGitRepository(gitDirtyRoot);
   await writeFile(join(gitDirtyRoot, "dirty.txt"), "uncommitted\n", "utf8");
@@ -3913,7 +3932,7 @@ try {
 
   // 再建立一个有独立最终文本的个人会话，用于 daemon 重启和历史切换断言。
   await selectMostRecentPersonalSession(page);
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await waitFor(async () => {
     const state = await rendererState(page);
     return state.input && !state.stop ? state : null;
@@ -4011,7 +4030,7 @@ try {
   const reconnectHistoryBefore = await rendererState(page);
   const reconnectHistoryBeforeIds = new Set(reconnectHistoryBefore.personalSessionIds);
   const reconnectTurnMarker = "ELECTRON_DOM_RECONNECT_TURN";
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await chooseAccessProfile(page, "restricted");
   await waitFor(async () => {
     const state = await rendererState(page);
@@ -4137,7 +4156,7 @@ try {
 
   const shutdownSettlementEventsBefore = daemonShutdownSettlementEvents;
   const shutdownSettledTurnCountBefore = daemonShutdownSettledTurnCount;
-  await openPersonalDraft(page);
+  await openSessionDraft(page);
   await chooseAccessProfile(page, "restricted");
   await waitFor(async () => {
     const state = await rendererState(page);

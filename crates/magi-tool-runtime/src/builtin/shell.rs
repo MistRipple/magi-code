@@ -202,11 +202,16 @@ pub(super) fn missing_executables_failure(
 }
 
 pub(super) fn execute_shell_exec(
+    tool_call_id: &ToolCallId,
     input: &str,
     context: &ToolExecutionContext,
     progress: Option<(&ToolCallId, &(dyn Fn(ToolExecutionProgress) + Sync))>,
-    cancellation: Option<&Arc<AtomicBool>>,
+    resources: &crate::ToolRuntimeResources,
 ) -> String {
+    let cancellation = resources.cancellation.as_ref();
+    if let Some(payload) = super::process::execute_durable_job_action(input, context, resources) {
+        return payload;
+    }
     let request = parse_json_object(input);
     if let Some(payload) = execute_shell_exec_background_action(input, request.as_ref(), context) {
         return payload;
@@ -230,6 +235,11 @@ pub(super) fn execute_shell_exec(
             context,
             "shell_exec",
             Some("background"),
+            resources
+                .background_job_journal
+                .as_ref()
+                .map(|journal| (tool_call_id.as_str(), journal)),
+            cancellation,
         );
     }
     let requested_access_mode = requested_access_mode(request.as_ref());
@@ -497,9 +507,10 @@ pub(super) fn execute_shell_exec_background_action(
             "shell_exec",
             Some("background_list"),
         )),
+        "wait" => Some(invalid_input("shell_exec", "action=wait 需要持久 job_id")),
         other => Some(invalid_input(
             "shell_exec",
-            format!("未知后台进程动作: {other}（支持 run / read / write / kill / list）"),
+            format!("未知后台进程动作: {other}（支持 run / read / wait / write / kill / list）"),
         )),
     }
 }

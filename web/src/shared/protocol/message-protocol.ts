@@ -394,7 +394,6 @@ export interface MessageMetadata {
   sendingAnimation?: boolean;
   wasPlaceholder?: boolean;
   images?: StandardMessageImage[];
-  isSupplementary?: boolean;
   toolCallId?: string;
   toolName?: string;
 }

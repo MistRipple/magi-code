@@ -690,6 +690,20 @@ impl BrowserWebModelBridgeClient {
 }
 
 impl ModelBridgeClient for BrowserWebModelBridgeClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        let mut caps = magi_bridge_client::text_executor_capabilities();
+        caps.input_modalities
+            .push(magi_bridge_client::ExecutorInputModality::Image);
+        caps.context = magi_bridge_client::ExecutorContextOwnership::ExecutorOwned;
+        caps.approvals = magi_bridge_client::ExecutorApprovalMode::Interactive;
+        caps.resume = if self.config.mode == WebConversationMode::Saved {
+            magi_bridge_client::ExecutorResumeMode::NativeSession
+        } else {
+            magi_bridge_client::ExecutorResumeMode::None
+        };
+        caps
+    }
+
     fn invoke(
         &self,
         _request: ModelInvocationRequest,
@@ -724,8 +738,7 @@ impl ModelBridgeClient for BrowserWebModelBridgeClient {
         _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, magi_bridge_client::BridgeClientError> {
-        let driver = Arc::clone(&self.driver);
-        let _ = driver;
+        magi_bridge_client::validate_executor_request(&self.executor_capabilities(), &request)?;
         let client = self;
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| {
@@ -738,7 +751,9 @@ impl ModelBridgeClient for BrowserWebModelBridgeClient {
                 .expect("web model runtime")
                 .block_on(client.execute(request, on_delta, is_cancelled))
         };
-        result.map_err(Self::bridge_error)
+        let response = result.map_err(Self::bridge_error)?;
+        magi_bridge_client::validate_executor_response(&self.executor_capabilities(), &response)?;
+        Ok(response)
     }
 }
 
@@ -1233,6 +1248,7 @@ mod tests {
         let mut messages: Vec<magi_bridge_client::ChatMessage> = history
             .into_iter()
             .map(|(role, text)| magi_bridge_client::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: role.to_string(),
                 content: Some(text.to_string()),
@@ -1243,6 +1259,7 @@ mod tests {
             })
             .collect();
         messages.push(magi_bridge_client::ChatMessage {
+            input_request_id: None,
             context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(prompt.to_string()),
@@ -1453,6 +1470,44 @@ mod tests {
         );
         assert_eq!(slots.owner().map(|o| o.session_id), Some("s1".to_string()));
         assert_eq!(client.runtime().snapshot(None)[0].sent_messages, 1);
+    }
+
+    #[test]
+    fn bridge_rejects_empty_results_without_resending_or_releasing_the_remote_context() {
+        for reply in ["", " \n", "done"] {
+            let driver = FakeDriver::new(reply);
+            let slots = Arc::new(WebSlotTable::new());
+            let client = client_with(
+                driver.clone(),
+                slots.clone(),
+                "s1",
+                WebModelClientConfig::default(),
+            );
+            let result = client.invoke_streaming(request("question", vec![]), &|_| {});
+            if reply.trim().is_empty() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("executor_incomplete_response")
+                );
+            } else {
+                assert_eq!(result.unwrap().content.as_deref(), Some(reply));
+            }
+            assert_eq!(
+                driver
+                    .calls()
+                    .iter()
+                    .filter(|call| *call == "submit")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                slots.owner().map(|owner| owner.session_id),
+                Some("s1".into())
+            );
+            assert_eq!(client.runtime().snapshot(None)[0].sent_messages, 1);
+        }
     }
 
     #[derive(Default)]

@@ -1,4 +1,5 @@
 import type {
+  CanonicalModelStep,
   CanonicalTurn,
   CanonicalTurnEvent,
   CanonicalTurnItem,
@@ -334,6 +335,8 @@ function mergeCanonicalTurn(
     changed = changed || merged.changed;
   }
 
+  const modelSteps = mergeModelSteps(existing.modelSteps, incoming.modelSteps);
+  if (modelSteps.error) return { turn: existing, changed: false, error: modelSteps.error };
   const nextTurn: CanonicalTurn = {
     ...existing,
     status: incoming.status,
@@ -342,6 +345,7 @@ function mergeCanonicalTurn(
     usage: incoming.usage,
     metadata: incoming.metadata ? { ...incoming.metadata } : existing.metadata,
     items: nextItems,
+    ...(modelSteps.steps ? { modelSteps: modelSteps.steps } : {}),
   };
 
   if (
@@ -350,6 +354,7 @@ function mergeCanonicalTurn(
     || existing.responseDurationMs !== nextTurn.responseDurationMs
     || !valuesEqual(existing.usage, nextTurn.usage)
     || !valuesEqual(existing.metadata, nextTurn.metadata)
+    || !valuesEqual(existing.modelSteps, nextTurn.modelSteps)
   ) {
     changed = true;
   }
@@ -358,6 +363,25 @@ function mergeCanonicalTurn(
     turn: nextTurn,
     changed,
   };
+}
+
+function mergeModelSteps(
+  existing: CanonicalModelStep[] | undefined,
+  incoming: CanonicalModelStep[] | undefined,
+): { steps?: CanonicalModelStep[]; error?: string } {
+  if (!incoming?.length) return { steps: existing };
+  const steps = new Map(existing?.map((step) => [step.stepId, step]));
+  for (const step of incoming) {
+    const old = steps.get(step.stepId);
+    if (old && (old.startedAt !== step.startedAt || old.purpose !== step.purpose
+      || !valuesEqual(old.inputRequestIds, step.inputRequestIds)
+      || (old.status !== 'started' && step.status !== 'started' && !valuesEqual(old, step)))) {
+      return { error: `canonical model Step ${step.stepId} changed immutable request or settled outcome` };
+    }
+    // 一般 item/终态快照可能在 Step 提交前冻结；旧快照不能撤回已结算回执。
+    if (!old || old.status === 'started') steps.set(step.stepId, step);
+  }
+  return { steps: [...steps.values()] };
 }
 
 function applyCanonicalStreamUpdate(
@@ -535,6 +559,29 @@ export function reduceCanonicalTurnEvent(
   let targetTurn: CanonicalTurn | undefined = event.turn;
   const existingIndex = findCanonicalTurnIndex(state, event);
   const existing = existingIndex >= 0 ? turns[existingIndex] : undefined;
+
+  if (event.modelStep) {
+    const baseline = existing ?? event.turn;
+    if (!baseline) {
+      return { state, changed: false, recoveryRequired: true,
+        error: `model Step ${event.modelStep.stepId} has no canonical Turn baseline` };
+    }
+    const modelSteps = mergeModelSteps(baseline.modelSteps, [event.modelStep]);
+    if (modelSteps.error) return { state, changed: false, error: modelSteps.error };
+    const updated = !existing || !valuesEqual(existing.modelSteps, modelSteps.steps);
+    const nextTurns = updated ? [...turns] : turns;
+    if (updated) {
+      const nextTurn = { ...baseline, modelSteps: modelSteps.steps };
+      if (existing) nextTurns[existingIndex] = nextTurn;
+      else nextTurns.push(nextTurn);
+      nextTurns.sort(compareCanonicalTurns);
+    }
+    return {
+      state: stateWithTurns({ ...state, lastAppliedEventSeq: Math.max(state.lastAppliedEventSeq, event.eventSeq) }, nextTurns),
+      changed: updated,
+      ...(updated ? { changedTurnIds: [baseline.turnId] } : { cursorAdvanced: true }),
+    };
+  }
 
   if (existing?.status === 'superseded') {
     const nextEventSeq = event.eventSeq > 0

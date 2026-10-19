@@ -2,7 +2,7 @@
 
 > 状态：**本机模式（回环 HTTP + stdio）与网络模式（Cloudflare Quick Tunnel：默认、地址每次开启都会变；命名隧道：用户自己的域名、地址固定、重启后自动恢复）已实现，GPT Web 侧接入接口就绪**。本文定义 Magi 对外提供的**标准 MCP 服务端**：任何支持 MCP 的客户端（Claude Desktop、Cursor、Cline、ChatGPT 连接器等）都可以连接它，在 Magi 已注册的工作区里使用 Magi 的工具（文件创建 / 编辑 / 删除、搜索、git、变更账本等），审批、审计与变更记录仍由 Magi 负责。
 > 更新日期：2026-10-13。
-> 相关文档：[GPT Web 开发文档](./web-model-browser-development.md)（其工具能力是本服务的一个客户端）、[工程约束与运行入口](./README.md)、[Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)、[内置浏览器完整设计](./browser-runtime-design.md)。
+> 相关文档：[GPT Web 开发文档](./web-model-browser-development.md)（其工具能力是本服务的一个客户端）、[工程约束与运行入口](./README.md)、[内置浏览器完整设计](./browser-runtime-design.md)。
 
 ---
 
@@ -234,7 +234,6 @@ Magi 里有三种“有工具被调用”的场景，界面遵循同一条原则
 | --- | --- | --- |
 | Quick Tunnel | 无需账号；地址每次启动都变；无法做稳定连接器配置 | **默认、已实现**：零配置，适合临时或偶尔的远程使用；网络模式开关**不持久化**，daemon 重启后关闭 |
 | **命名隧道** | 用户自己的 Cloudflare 账号与域名；稳定地址；令牌（隧道 token）按文件引用，不进命令行、日志、settings | **已实现**，见下 §10.2.1 |
-| Magi Connect 托管地址 | 由 Connect 提供稳定 MCP 地址与设备凭据，用户无需自建 | Connect 就绪后优先采用 |
 
 - 复用现有 `cloudflared` 托管能力（sidecar 检测、启动、监控），但**入口规则独立**：隧道只转发到 MCP 服务的独立回环端口，不转发到 Magi 主应用端口（M10）。
 - 隧道凭据的存储与吊销规则与 GPT Web 文档 §8.4 对 OpenAI Tunnel 的要求一致。

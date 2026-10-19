@@ -5,9 +5,9 @@ export const PROTOCOL_NAME = "magi.app-server" as const;
 export const PROTOCOL_MAJOR = 1 as const;
 export const PROTOCOL_MINOR = 0 as const;
 export const JSONRPC_VERSION = "2.0" as const;
-export const APP_SERVER_METHODS = ["initialize","initialized","ping","session/list","session/read","turn/start","events/subscribe","browser/tools/list","browser/tool","approval/request","$/cancelRequest"] as const;
+export const APP_SERVER_METHODS = ["initialize","initialized","ping","session/list","session/read","turn/start","turn/interrupt","session/interactions","session/approval/resolve","session/question/resolve","goal/read","goal/pause","goal/resume","goal/clear","goal/update","events/subscribe","browser/tools/list","browser/tool","approval/request","$/cancelRequest","session/queue/read","session/queue/remove","session/queue/update","session/queue/retry","session/queue/guide","agent/transfer","agent/continue"] as const;
 
-export type AppServerRequestMethod = "initialize" | "ping" | "session/list" | "session/read" | "turn/start" | "events/subscribe" | "browser/tools/list" | "browser/tool" | "approval/request";
+export type AppServerRequestMethod = "initialize" | "ping" | "session/list" | "session/read" | "turn/start" | "turn/interrupt" | "session/interactions" | "session/approval/resolve" | "session/question/resolve" | "goal/read" | "goal/pause" | "goal/resume" | "goal/clear" | "goal/update" | "events/subscribe" | "browser/tools/list" | "browser/tool" | "approval/request" | "session/queue/read" | "session/queue/remove" | "session/queue/update" | "session/queue/retry" | "session/queue/guide" | "agent/transfer" | "agent/continue";
 export type AppServerNotificationMethod = "initialized" | "$/cancelRequest";
 export type AppServerMethod = AppServerRequestMethod | AppServerNotificationMethod;
 
@@ -18,11 +18,27 @@ export interface AppServerMethodParams {
   "session/list": SessionListParams;
   "session/read": SessionReadParams;
   "turn/start": TurnStartParams;
+  "turn/interrupt": TurnInterruptParams;
+  "session/interactions": SessionInteractionScope;
+  "session/approval/resolve": ResolveToolApprovalParams;
+  "session/question/resolve": ResolveUserQuestionParams;
+  "goal/read": GoalReadParams;
+  "goal/pause": GoalActionParams;
+  "goal/resume": GoalActionParams;
+  "goal/clear": GoalActionParams;
+  "goal/update": GoalUpdateParams;
   "events/subscribe": EventSubscribeParams;
   "browser/tools/list": EmptyParams;
   "browser/tool": BrowserToolParams;
   "approval/request": ApprovalRequestParams;
   "$/cancelRequest": CancelRequestParams;
+  "session/queue/read": SessionInteractionScope;
+  "session/queue/remove": SessionQueueItemParams;
+  "session/queue/update": SessionQueueUpdateParams;
+  "session/queue/retry": SessionQueueItemParams;
+  "session/queue/guide": SessionQueueGuideParams;
+  "agent/transfer": AgentTransferParams;
+  "agent/continue": AgentContinueParams;
 }
 
 export interface AppServerMethodResults {
@@ -31,10 +47,26 @@ export interface AppServerMethodResults {
   "session/list": SessionListResult;
   "session/read": SessionReadResult;
   "turn/start": TurnStartResult;
+  "turn/interrupt": TurnInterruptResult;
+  "session/interactions": SessionInteractionsResult;
+  "session/approval/resolve": ResolveToolApprovalResult;
+  "session/question/resolve": ResolveUserQuestionResult;
+  "goal/read": GoalSnapshot;
+  "goal/pause": GoalSnapshot;
+  "goal/resume": GoalSnapshot;
+  "goal/clear": GoalSnapshot;
+  "goal/update": GoalSnapshot;
   "events/subscribe": EventSubscribeResult;
   "browser/tools/list": BrowserToolsListResult;
   "browser/tool": BrowserToolResult;
   "approval/request": ApprovalDecision;
+  "session/queue/read": SessionQueueSnapshot;
+  "session/queue/remove": SessionQueueSnapshot;
+  "session/queue/update": SessionQueueSnapshot;
+  "session/queue/retry": SessionQueueSnapshot;
+  "session/queue/guide": SessionQueueSnapshot;
+  "agent/transfer": AgentTransferResult;
+  "agent/continue": AgentContinueResult;
 }
 
 export type AppServerRequestParams<M extends AppServerRequestMethod> = AppServerMethodParams[M];
@@ -78,6 +110,51 @@ export const APP_SERVER_METHOD_SIGNATURES = {
     params: "TurnStartParams",
     result: "TurnStartResult"
   },
+  "turn/interrupt": {
+    kind: "request",
+    params: "TurnInterruptParams",
+    result: "TurnInterruptResult"
+  },
+  "session/interactions": {
+    kind: "request",
+    params: "SessionInteractionScope",
+    result: "SessionInteractionsResult"
+  },
+  "session/approval/resolve": {
+    kind: "request",
+    params: "ResolveToolApprovalParams",
+    result: "ResolveToolApprovalResult"
+  },
+  "session/question/resolve": {
+    kind: "request",
+    params: "ResolveUserQuestionParams",
+    result: "ResolveUserQuestionResult"
+  },
+  "goal/read": {
+    kind: "request",
+    params: "GoalReadParams",
+    result: "GoalSnapshot"
+  },
+  "goal/pause": {
+    kind: "request",
+    params: "GoalActionParams",
+    result: "GoalSnapshot"
+  },
+  "goal/resume": {
+    kind: "request",
+    params: "GoalActionParams",
+    result: "GoalSnapshot"
+  },
+  "goal/clear": {
+    kind: "request",
+    params: "GoalActionParams",
+    result: "GoalSnapshot"
+  },
+  "goal/update": {
+    kind: "request",
+    params: "GoalUpdateParams",
+    result: "GoalSnapshot"
+  },
   "events/subscribe": {
     kind: "request",
     params: "EventSubscribeParams",
@@ -102,6 +179,41 @@ export const APP_SERVER_METHOD_SIGNATURES = {
   "$/cancelRequest": {
     kind: "notification",
     params: "CancelRequestParams"
+  },
+  "session/queue/read": {
+    kind: "request",
+    params: "SessionInteractionScope",
+    result: "SessionQueueSnapshot"
+  },
+  "session/queue/remove": {
+    kind: "request",
+    params: "SessionQueueItemParams",
+    result: "SessionQueueSnapshot"
+  },
+  "session/queue/update": {
+    kind: "request",
+    params: "SessionQueueUpdateParams",
+    result: "SessionQueueSnapshot"
+  },
+  "session/queue/retry": {
+    kind: "request",
+    params: "SessionQueueItemParams",
+    result: "SessionQueueSnapshot"
+  },
+  "session/queue/guide": {
+    kind: "request",
+    params: "SessionQueueGuideParams",
+    result: "SessionQueueSnapshot"
+  },
+  "agent/transfer": {
+    kind: "request",
+    params: "AgentTransferParams",
+    result: "AgentTransferResult"
+  },
+  "agent/continue": {
+    kind: "request",
+    params: "AgentContinueParams",
+    result: "AgentContinueResult"
   }
 } as const;
 
@@ -150,6 +262,11 @@ export interface ServerCapabilities {
   events: boolean;
   approvals: boolean;
   browserTools: boolean;
+  turnInterrupt?: boolean;
+  sessionInteractions?: boolean;
+  goalControl?: boolean;
+  sessionQueue?: boolean;
+  agentTransfer?: boolean;
 }
 
 export interface InitializeParams {
@@ -262,6 +379,7 @@ export interface TurnStartParams {
   expectedTurnId?: string | null;
   replaceTurnId?: string | null;
   pluginSelections?: Array<PluginSelection>;
+  interruptTurnId?: string | null;
 }
 
 export interface SessionSummary {
@@ -347,6 +465,7 @@ export interface CanonicalTurn {
   usage?: JsonValue | null;
   items: Array<CanonicalTurnItem>;
   metadata?: Record<string, JsonValue>;
+  modelSteps?: Array<ModelStep>;
 }
 
 export type TurnStartKind = "accepted" | "queued";
@@ -757,4 +876,450 @@ export interface PluginResource {
 export interface PluginResourceWriteRequest {
   expectedVersion: number;
   value: unknown;
+}
+
+export type SessionTurnGuideStatus = "ready" | "no_active_turn" | "input_closed" | "unsupported_input" | "unsupported_executor";
+
+export type SessionTurnGuideEffectiveAt = "next_model_step" | "unavailable";
+
+export interface SessionTurnGuideInputSupport {
+  text: boolean;
+  images: boolean;
+  contextReferences: boolean;
+  browserAnnotationRefs: boolean;
+  pluginSelections: boolean;
+}
+
+export interface SessionTurnGuideCapability {
+  status: SessionTurnGuideStatus;
+  targetTurnId?: string | null;
+  effectiveAt?: SessionTurnGuideEffectiveAt;
+  inputSupport?: SessionTurnGuideInputSupport;
+}
+
+export interface SessionInboxCursor {
+  epoch: string;
+  throughSequence: number;
+}
+
+export type ModelStepStatus = "started" | "response_received" | "outcome_unknown";
+
+export interface ModelStep {
+  stepId: string;
+  taskId: string | null;
+  threadId: string;
+  checkpointGeneration: number;
+  requestFingerprint: string;
+  provider: string;
+  messageCount: number;
+  toolCount: number;
+  inputRequestIds: Array<string>;
+  startedAt: number;
+  settledAt: number | null;
+  status: ModelStepStatus;
+  responseFingerprint: string | null;
+  attempts: Array<ModelAttempt>;
+  binding?: ModelStepBinding | null;
+  maxOutputTokens?: number | null;
+  goalId?: string | null;
+  usageTokens?: number | null;
+  goalTokensAfter?: number | null;
+  executorCapabilities?: ExecutorCapabilities | null;
+  purpose?: ModelStepPurpose | null;
+}
+
+export interface ModelAttempt {
+  attemptId: string;
+  startedAt: number;
+  settledAt: number | null;
+  status: ModelStepStatus;
+}
+
+export interface ModelStepBinding {
+  model: string | null;
+  provider: string | null;
+  bindingRevision: number;
+  settingsRevision: number;
+}
+
+export interface SessionGoalUsageChanged {
+  goal_id: string;
+  step_id: string;
+}
+
+export type ExecutorInputModality = "text" | "image";
+
+export type ExecutorSteerMode = "none" | "between_steps" | "interruptible";
+
+export type ExecutorResumeMode = "none" | "checkpoint" | "native_session";
+
+export type ExecutorToolMode = "native_calls" | "magi_gateway" | "executor_owned" | "none";
+
+export type ExecutorApprovalMode = "interactive" | "delegated" | "unavailable";
+
+export type ExecutorCancellationMode = "signal" | "settled";
+
+export type ExecutorContextOwnership = "magi_owned" | "executor_owned";
+
+export interface ExecutorCapabilities {
+  inputModalities: Array<ExecutorInputModality>;
+  steer: ExecutorSteerMode;
+  resume: ExecutorResumeMode;
+  tools: ExecutorToolMode;
+  approvals: ExecutorApprovalMode;
+  cancellation: ExecutorCancellationMode;
+  context: ExecutorContextOwnership;
+  structuredOutput: boolean;
+  background: boolean;
+  inspection: boolean;
+  outputLimit: boolean;
+}
+
+export type ModelStepPurpose = "execution" | "context_compaction";
+
+export interface TurnInterruptParams {
+  sessionId: string;
+  expectedTurnId: string;
+  workspaceId?: string | null;
+}
+
+export interface TurnInterruptResult {
+  interrupted: boolean;
+  sessionId: string;
+  workspaceId: string | null;
+  turnId: string | null;
+  eventId: string;
+  requestedAt: number;
+  cancelledToolProcessCount: number;
+  remainingQueuedTurnCount: number;
+  nextQueuedTurnStarted: boolean;
+  removedTimelineEntryIds: Array<string>;
+}
+
+export interface SessionInteractionScope {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+}
+
+export type ToolApprovalDecision = "allow_once" | "allow_for_turn" | "deny";
+
+export interface ApprovalRequestAgent {
+  role: string;
+  title: string;
+}
+
+export interface PendingToolApproval {
+  approvalId: string;
+  sessionId: string;
+  taskId: string;
+  turnId: string;
+  toolCallId: string;
+  toolName: string;
+  reason: string;
+  requestedAt: number;
+  agent?: ApprovalRequestAgent | null;
+}
+
+export interface UserQuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface UserQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  allowOther: boolean;
+  options: Array<UserQuestionOption>;
+}
+
+export interface PendingUserQuestion {
+  questionId: string;
+  sessionId: string;
+  taskId?: string | null;
+  turnId: string;
+  toolCallId: string;
+  questions: Array<UserQuestion>;
+  requestedAt: number;
+  canSkip: boolean;
+}
+
+export interface UserQuestionAnswer {
+  selected?: Array<string>;
+  other?: string | null;
+}
+
+export type AnsweredQuestionKind = "answered";
+
+export type SkippedQuestionKind = "skipped";
+
+export interface AnsweredQuestionResponse {
+  kind: AnsweredQuestionKind;
+  answers: Array<UserQuestionAnswer>;
+}
+
+export interface SkippedQuestionResponse {
+  kind: SkippedQuestionKind;
+}
+
+export type UserQuestionResponse = AnsweredQuestionResponse | SkippedQuestionResponse;
+
+export interface SessionInteractionsResult {
+  sessionId: string;
+  pendingApprovals: Array<PendingToolApproval>;
+  pendingQuestions: Array<PendingUserQuestion>;
+}
+
+export interface ResolveToolApprovalParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  approvalId: string;
+  decision: ToolApprovalDecision;
+}
+
+export interface ResolveToolApprovalResult {
+  sessionId: string;
+  approvalId: string;
+  decision: ToolApprovalDecision;
+  status: string;
+}
+
+export interface ResolveUserQuestionParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  questionId: string;
+  response: UserQuestionResponse;
+}
+
+export interface ResolveUserQuestionResult {
+  sessionId: string;
+  questionId: string;
+  status: string;
+}
+
+export type GoalStatus = "active" | "paused" | "blocked" | "complete";
+
+export type GoalContinuationPhase = "idle" | "running" | "waiting";
+
+export interface GoalBlocker {
+  blockerKey: string;
+  reason: string;
+  consecutiveTurns: number;
+  lastObservedTurnId: string;
+}
+
+export interface GoalContinuation {
+  phase: GoalContinuationPhase;
+  turnId?: string | null;
+  reason?: string | null;
+}
+
+export interface GoalCompletion {
+  turnId: string;
+  summary: string;
+  planRevision?: number | null;
+  evidenceRefs: Array<string>;
+  completedAt: number;
+}
+
+export interface SessionGoal {
+  goalId: string;
+  sessionId: string;
+  threadId: string;
+  createdByTurnId?: string | null;
+  objective: string;
+  status: GoalStatus;
+  controlRevision: number;
+  accessProfile: AccessProfile;
+  tokensUsed: number;
+  modelAttemptsUsed: number;
+  timeUsedSeconds: number;
+  timeUsedMillis: number;
+  timingStartedAt?: number | null;
+  timingTurnId?: string | null;
+  blocker?: GoalBlocker | null;
+  continuation: GoalContinuation;
+  completion?: GoalCompletion | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type PlanItemStatus = "pending" | "in_progress" | "completed" | "blocked" | "canceled";
+
+export type PlanState = "active" | "paused" | "completed" | "canceled";
+
+export interface PlanItem {
+  itemId: string;
+  title: string;
+  status: PlanItemStatus;
+}
+
+export interface SessionPlan {
+  planId: string;
+  sessionId: string;
+  goalId?: string | null;
+  revision: number;
+  language: string;
+  state: PlanState;
+  items: Array<PlanItem>;
+  taskBindings: Record<string, string>;
+  updatedAt: number;
+}
+
+export interface GoalAllowedActions {
+  canEdit: boolean;
+  canPause: boolean;
+  canResume: boolean;
+  canClear: boolean;
+}
+
+export interface GoalSnapshot {
+  sessionId: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
+  observedAt: number;
+  goal: SessionGoal | null;
+  plan: SessionPlan | null;
+  allowedActions: GoalAllowedActions;
+}
+
+export interface GoalReadParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  scope: SessionScope;
+}
+
+export interface GoalActionParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  scope: SessionScope;
+  goalId: string;
+  expectedRevision: number;
+  expectedPlanRevision?: number | null;
+  accessProfile?: AccessProfile | null;
+}
+
+export interface GoalUpdateParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  scope: SessionScope;
+  goalId: string;
+  expectedRevision: number;
+  expectedPlanRevision?: number | null;
+  objective: string;
+}
+
+export interface SessionQueueItemParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  queueId: string;
+  expectedRevision?: number | null;
+}
+
+export interface SessionQueueUpdateParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  queueId: string;
+  expectedRevision: number;
+  request: TurnStartParams;
+}
+
+export interface SessionQueueGuideParams {
+  sessionId: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  queueId: string;
+  expectedRevision?: number | null;
+  expectedTurnId?: string;
+}
+
+export interface QueuedSessionTurn {
+  revision: number;
+  queueId: string;
+  queuePosition: number;
+  requestId: string | null;
+  sessionId: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
+  acceptedAt: number;
+  content: string;
+  text: string | null;
+  command: SessionTurnCommand | null;
+  workflowId: string | null;
+  pluginCommandId: string | null;
+  skillName: string | null;
+  goalMode: boolean;
+  accessProfile: AccessProfile | null;
+  images: Array<SessionTurnImage>;
+  contextReferences: Array<SessionContextReference>;
+  browserAnnotationRefs: Array<string>;
+  browserNodeSelections: Array<BrowserNodeSelection>;
+  pluginSelections: Array<PluginSelection>;
+  guide: SessionTurnGuideCapability;
+  retryCount: number;
+  interruptTurnId: string | null;
+  interruptionError: string | null;
+}
+
+export interface SessionQueueSnapshot {
+  cursor: SessionInboxCursor;
+  sessionId: string;
+  queuedTurns: Array<QueuedSessionTurn>;
+}
+
+export type AgentTransferTarget = "session" | "goal";
+
+export interface AgentTransferParams {
+  sessionId: string;
+  scope: SessionScope;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  operationId: string;
+  taskId: string;
+  expectedParentTurnId: string;
+  expectedGeneration: number;
+  owner: AgentTransferTarget;
+  goalId?: string | null;
+  expectedGoalControlRevision?: number | null;
+}
+
+export interface AgentTransferResult {
+  sessionId: string;
+  operationId: string;
+  taskId: string;
+  sourceTurnId: string;
+  activationGeneration: number;
+  owner: AgentTransferTarget;
+  goalId?: string | null;
+  goalControlRevision?: number | null;
+  transferredAt: number;
+  runnerStarted: boolean;
+}
+
+export interface AgentContinueParams {
+  sessionId: string;
+  scope: SessionScope;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  operationId: string;
+  taskId: string;
+  expectedGeneration: number;
+  expectedTurnId: string;
+}
+
+export interface AgentContinueResult {
+  sessionId: string;
+  taskId: string;
+  operationId: string;
+  sourceTurnId: string;
+  turnId: string;
+  replayed: boolean;
 }

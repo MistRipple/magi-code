@@ -323,7 +323,7 @@ struct CoordinatorState {
 pub struct SessionTurnCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     attempt_sequence: Arc<AtomicU64>,
-    /// 当前活跃 Turn 的 steer 输入由 Coordinator 持有，避免 ConversationRegistry
+    /// 当前活跃 Turn 的 steer 输入由 Coordinator 持有，避免任务信号通道
     /// 同时成为 Session Turn 的第二个生命周期所有者。
     session_turn_inputs: Arc<Mutex<HashMap<SessionId, SessionTurnInputState>>>,
     tool_approvals: ToolApprovalRegistry,
@@ -926,17 +926,20 @@ impl SessionTurnCoordinator {
         true
     }
 
-    /// 活动 Turn 只有在输入边界仍开放时才接受引导；模型结束后不可静默接收。
-    pub fn active_turn_accepts_steer(&self, session_id: &SessionId) -> bool {
-        let turn_id = self
-            .state
+    pub fn active_turn_id(&self, session_id: &SessionId) -> Option<String> {
+        self.state
             .lock()
             .expect("turn coordinator state poisoned")
             .sessions
             .get(session_id)
             .and_then(|session| session.active.as_ref())
             .filter(|active| !active.status.is_terminal())
-            .map(|active| active.admission.turn_id.clone());
+            .map(|active| active.admission.turn_id.clone())
+    }
+
+    /// 活动 Turn 只有在输入边界仍开放时才接受引导；模型结束后不可静默接收。
+    pub fn active_turn_accepts_steer(&self, session_id: &SessionId) -> bool {
+        let turn_id = self.active_turn_id(session_id);
         self.session_turn_inputs
             .lock()
             .expect("session turn input mutex poisoned")
@@ -1000,7 +1003,7 @@ impl SessionTurnCoordinator {
     }
 
     /// 注册当前 Turn 的 steer 输入边界。Conversation profile 和 Task profile
-    /// 共用该边界，但 Task worker 的 mailbox 仍由 ConversationRegistry 按 task 持有。
+    /// 共用该边界；Task worker 的运行时消息由 ConversationRegistry 按 task 持有。
     pub fn begin_session_turn_input(
         &self,
         session_id: SessionId,
@@ -1455,6 +1458,7 @@ mod tests {
         let source_session = SessionId::new("session-recover-source");
         let target_session = SessionId::new("session-recover-target");
         let turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: source_session,
             turn_id: "turn-cross-session".to_string(),
             turn_seq: 1,
@@ -1487,6 +1491,7 @@ mod tests {
     fn recover_command_requires_complete_replay_identity() {
         let session = SessionId::new("session-recover-identity");
         let mut turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-missing-attempt".to_string(),
             turn_seq: 1,
@@ -1524,6 +1529,7 @@ mod tests {
     fn recover_command_rejects_unknown_execution_profile() {
         let session = SessionId::new("session-recover-unknown-profile");
         let turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-unknown-profile".to_string(),
             turn_seq: 1,
@@ -1933,6 +1939,7 @@ mod tests {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-restore");
         let turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-restored".to_string(),
             turn_seq: 1,
@@ -1981,6 +1988,7 @@ mod tests {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-restore-active");
         let turn = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-active".to_string(),
             turn_seq: 1,
@@ -2051,6 +2059,7 @@ mod tests {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-restore-order");
         let make_turn = |turn_id: &str, turn_seq: u64, request_id: &str| CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: turn_id.to_string(),
             turn_seq,
@@ -2102,6 +2111,7 @@ mod tests {
         let coordinator = SessionTurnCoordinator::new();
         let session = SessionId::new("session-restore-terminal-order");
         let terminal = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-terminal-new".to_string(),
             turn_seq: 20,
@@ -2124,6 +2134,7 @@ mod tests {
             .collect(),
         };
         let stale_active = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: "turn-active-old".to_string(),
             turn_seq: 10,
@@ -2280,6 +2291,7 @@ mod tests {
             CoordinatorAdmission::Replay(_) => panic!("first admission must be accepted"),
         };
         let active = CanonicalTurn {
+            model_steps: Vec::new(),
             session_id: session.clone(),
             turn_id: admission.turn_id.clone(),
             turn_seq: 10,
@@ -2356,6 +2368,7 @@ mod tests {
                 &session,
                 "turn-coordinator-steer",
                 UserSignal {
+                    images: Vec::new(),
                     text: Some("收口".to_string()),
                     request_id: Some("request-coordinator-steer".to_string()),
                     user_message_id: None,

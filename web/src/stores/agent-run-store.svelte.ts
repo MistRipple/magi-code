@@ -20,6 +20,7 @@ import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
 import { onBridgeMessage } from '../shared/bridges/bridge-runtime';
 import { messagesState } from './messages.svelte';
+import type { AgentTransferParams, AgentTransferResult } from '../shared/app-server-protocol.generated';
 
 export interface AgentRunState {
   projection: AgentRunProjectionDto | null;
@@ -27,6 +28,8 @@ export interface AgentRunState {
   error: string | null;
   actionInFlight: AgentRunActionKind | null;
   actionError: string | null;
+  transferInFlight: string | null;
+  transferError: { taskId: string; message: string } | null;
   rootTaskId: string | null;
   selectedAgentRunId: string | null;
 }
@@ -45,6 +48,8 @@ const EMPTY_AGENT_RUN_STATE: AgentRunState = {
   error: null,
   actionInFlight: null,
   actionError: null,
+  transferInFlight: null,
+  transferError: null,
   rootTaskId: null,
   selectedAgentRunId: null,
 };
@@ -153,6 +158,8 @@ function createEmptyInternalState(
     error: null,
     actionInFlight: null,
     actionError: null,
+    transferInFlight: null,
+    transferError: null,
     rootTaskId: null,
     selectedAgentRunId: null,
     fetchGeneration: 0,
@@ -494,7 +501,7 @@ export async function performAgentRunAction(
     normalizedWorkspaceId,
     normalizedWorkspacePath,
   );
-  if (state.actionInFlight) {
+  if (state.actionInFlight || state.transferInFlight) {
     return null;
   }
   state.actionInFlight = action;
@@ -541,6 +548,31 @@ export async function performAgentRunAction(
     throw error;
   } finally {
     state.actionInFlight = null;
+  }
+}
+
+export async function transferAgentRun(
+  request: AgentTransferParams,
+): Promise<AgentTransferResult | null> {
+  const { sessionId, taskId, workspaceId, workspacePath } = request;
+  if (!sessionId?.trim() || !taskId?.trim() || !request.operationId?.trim()) {
+    throw new Error('agent_transfer_capability_unavailable');
+  }
+  const state = ensureSessionState(sessionId, workspaceId, workspacePath ?? '');
+  if (state.actionInFlight || state.transferInFlight) return null;
+  state.transferInFlight = taskId;
+  state.transferError = null;
+  try {
+    const result = await createClient().transferAgentRun(request);
+    await refreshAgentRunProjection(sessionId, workspaceId, workspacePath);
+    return result;
+  } catch (error) {
+    state.transferError = { taskId, message: agentRunActionErrorMessage(error) };
+    // 响应丢失时转交可能已提交；重新读取服务端事实，不生成新 operation。
+    await refreshAgentRunProjection(sessionId, workspaceId, workspacePath);
+    throw error;
+  } finally {
+    state.transferInFlight = null;
   }
 }
 

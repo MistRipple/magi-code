@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod agent_service;
 mod app_server;
 pub mod browser_downloads;
 mod browser_image;
@@ -12,7 +13,10 @@ mod dto;
 mod errors;
 mod external_turns;
 pub mod git_tool_runtime;
+mod goal_service;
 mod host_paths;
+mod input_service;
+mod interaction_service;
 mod isolation;
 mod locales;
 pub mod mcp_config;
@@ -61,7 +65,7 @@ pub use state::{
     TaskCheckpointPersist, build_runtime_capability_dependency_provider,
     recover_role_delete_transaction,
 };
-pub use task_dispatch::schedule_restored_session_task_dispatches;
+pub use task_dispatch::{schedule_restored_session_task_dispatches, workspace_execution_preparer};
 pub use web_model_channel::{
     WEB_MODEL_TUNNEL_SECTION, WebModelChannelRuntime, WebModelTunnelConfig, WebModelTunnelStatus,
     restore_configured_channel,

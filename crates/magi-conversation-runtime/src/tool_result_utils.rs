@@ -109,59 +109,20 @@ pub fn non_retryable_tool_failure(
     })
 }
 
-/// 单轮对话允许的模型调用轮数上限；任务轮次与对话轮次共用。
-pub(crate) const MAX_MODEL_ROUNDS_PER_TURN: usize = 200;
-/// 单个子代理允许的模型调用轮数上限。子代理负责边界清晰的子任务，超过上限说明
-/// 方向有问题，应尽早把控制权还给主线改派或接管，而不是耗尽整轮预算。
-pub(crate) const MAX_MODEL_ROUNDS_PER_SUBAGENT: usize = 80;
+/// 每次 activation 的防失控保险，主线与子代理共用同一上限。
+pub(crate) const EMERGENCY_MODEL_ROUND_LIMIT: usize = 1_000;
 /// 没有任务策略时同一失败调用允许的重试次数（共尝试 retry + 1 次）。
 pub(crate) const DEFAULT_TOOL_RETRY_LIMIT: u32 = 1;
 
-/// 达到轮数上限时以明确原因结束本轮，避免模型陷入无限循环。
-pub(crate) fn model_round_limit_failure(
-    round: usize,
-    is_subagent: bool,
-) -> Option<DeterministicToolFailure> {
-    if is_subagent {
-        return (round >= MAX_MODEL_ROUNDS_PER_SUBAGENT).then(|| DeterministicToolFailure {
-            summary: format!(
-                "代理已达到 {MAX_MODEL_ROUNDS_PER_SUBAGENT} 次模型调用上限，已停止继续执行。"
-            ),
-            detail: format!(
-                "代理连续进行 {MAX_MODEL_ROUNDS_PER_SUBAGENT} 次模型调用仍未完成，可能陷入了重复操作或任务边界过大。主线应根据已有进展缩小范围后改派，或由主线接管。"
-            ),
-        });
-    }
-    (round >= MAX_MODEL_ROUNDS_PER_TURN).then(|| DeterministicToolFailure {
-        summary: format!("本轮已达到 {MAX_MODEL_ROUNDS_PER_TURN} 次模型调用上限，已停止继续执行。"),
-        detail: format!(
-            "本轮已连续进行 {MAX_MODEL_ROUNDS_PER_TURN} 次模型调用仍未完成，可能陷入了重复操作。请检查进展后拆分任务或补充说明再继续。"
-        ),
+pub(crate) fn emergency_model_round_failure(round: usize) -> Option<DeterministicToolFailure> {
+    (round >= EMERGENCY_MODEL_ROUND_LIMIT).then(|| DeterministicToolFailure {
+        summary: format!("本次执行已达到 {EMERGENCY_MODEL_ROUND_LIMIT} 次模型循环安全上限，已停止。"),
+        detail: "run_safety_limit: 请检查已保存的进展、重复调用与任务范围后再继续。当前执行树的 transport 安全上限由持久 Step 日志统一检查，子代理和显式继续不会重置它。".into(),
     })
 }
 
 /// 工具参数的规范形式：JSON 按键排序、去除空白差异；无法解析时取去除首尾空白的原文。
-pub(crate) fn normalized_tool_arguments(arguments: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
-        return arguments.trim().to_string();
-    };
-    serde_json::to_string(&canonicalize_json(&value))
-        .unwrap_or_else(|_| arguments.trim().to_string())
-}
-
-fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
-        Value::Object(object) => {
-            let sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        _ => value.clone(),
-    }
-}
+pub(crate) use magi_tool_runtime::normalized_tool_arguments;
 
 /// 重复失败检测：按“工具 + 规范化参数 + 错误”计数。其他调用的成功不会清零计数；
 /// 只有同一调用本身成功才说明它不再失败。
@@ -322,23 +283,21 @@ pub(crate) fn tool_interrupted_before_execution_result(
     )
 }
 
-/// 工具调用当前记录的结果是否仍是“等待授权”：等待中的调用尚未执行，批准后会先改写为
-/// running 再执行，因此中断恢复时不能把它当成“可能已经执行”。
-pub(crate) fn tool_payload_is_awaiting_approval(payload: &Value) -> bool {
-    payload.get("status").and_then(Value::as_str) == Some("awaiting_approval")
-}
-
-pub(crate) fn tool_result_is_awaiting_approval(result: &str) -> bool {
-    serde_json::from_str::<Value>(result)
-        .is_ok_and(|value| tool_payload_is_awaiting_approval(&value))
+/// 人工等待不是副作用已执行的证据。授权批准后先提交 running；提问答复由 canonical 交互记录恢复。
+pub(crate) fn tool_payload_waits_for_user(payload: &Value) -> bool {
+    matches!(
+        payload.get("status").and_then(Value::as_str),
+        Some("awaiting_approval" | "awaiting_user_input")
+    )
 }
 
 pub(crate) fn tool_result_is_interrupted_not_started(result: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(result) else {
         return false;
     };
-    value.get("status").and_then(Value::as_str) == Some("interrupted")
-        && value.get("execution").and_then(Value::as_str) == Some("not_started")
+    value.get("execution_started").and_then(Value::as_bool) == Some(false)
+        || (value.get("status").and_then(Value::as_str) == Some("interrupted")
+            && value.get("execution").and_then(Value::as_str) == Some("not_started"))
 }
 
 pub fn tool_execution_failed_result(tool_name: &str) -> (String, ExecutionResultStatus) {
@@ -374,8 +333,18 @@ pub fn infer_tool_call_status(result: &str) -> &'static str {
         .and_then(|v| v.as_str())
     {
         match status.to_ascii_lowercase().as_str() {
-            "error" | "failed" | "blocked" | "rejected" | "needs_approval" | "needsapproval"
-            | "timeout" | "timed_out" => return "error",
+            "error"
+            | "failed"
+            | "blocked"
+            | "rejected"
+            | "needs_approval"
+            | "needsapproval"
+            | "timeout"
+            | "timed_out"
+            | "interrupted"
+            | "outcome_unknown"
+            | "awaiting_approval"
+            | "awaiting_user_input" => return "error",
             "cancelled" | "canceled" | "killed" | "aborted" => return "cancelled",
             "succeeded" | "success" | "ok" | "completed" => explicit_success = true,
             "degraded" => {
@@ -1067,14 +1036,10 @@ mod tests {
 
     #[test]
     fn model_round_limit_stops_turn_at_shared_cap() {
-        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN - 1, false).is_none());
-        assert!(model_round_limit_failure(MAX_MODEL_ROUNDS_PER_SUBAGENT - 1, true).is_none());
-        let subagent_failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_SUBAGENT, true)
-            .expect("子代理有独立且更低的轮数上限");
-        assert!(subagent_failure.detail.contains("改派"));
-        let failure = model_round_limit_failure(MAX_MODEL_ROUNDS_PER_TURN, false)
-            .expect("达到轮数上限必须以明确原因结束本轮");
-        assert!(failure.summary.contains("模型调用上限"));
+        assert!(emergency_model_round_failure(EMERGENCY_MODEL_ROUND_LIMIT - 1).is_none());
+        let failure = emergency_model_round_failure(EMERGENCY_MODEL_ROUND_LIMIT)
+            .expect("安全保险必须保留明确失败");
+        assert!(failure.detail.contains("run_safety_limit"));
     }
 
     #[test]

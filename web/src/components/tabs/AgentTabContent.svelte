@@ -4,17 +4,21 @@
     AgentContextPackageDto,
     AgentContextReferenceKind,
     AgentProjectionDto,
+    AgentRunProjectionDto,
     TaskDto,
   } from '../../shared/rust-backend-types';
   import { agentTerminalOutput, type AgentTerminalOutput } from '../../lib/agent-output';
   import { buildTimelineRenderItems } from '../../lib/timeline-render-items';
   import { getTaskDisplayGoal, getTaskDisplayText, getTaskDisplayTitle } from '../../lib/task-labels';
   import { agentRuntimeTiming } from '../../lib/active-agent-center';
-  import { messagesState } from '../../stores/messages.svelte';
-  import { getAgentRunState } from '../../stores/agent-run-store.svelte';
+  import { addToast, messagesState } from '../../stores/messages.svelte';
+  import { getAgentRunState, transferAgentRun } from '../../stores/agent-run-store.svelte';
   import { i18n } from '../../stores/i18n.svelte';
   import { uiClockState, retainUiClock } from '../../stores/ui-clock.svelte';
   import MessageList from '../MessageList.svelte';
+  import { RustDaemonClient } from '../../shared/rust-daemon-client';
+  import { resolveAgentBaseUrl } from '../../web/agent-api';
+  import { onBridgeMessage } from '../../shared/bridges/bridge-runtime';
 
   interface Props {
     /** 代理运行 ID —— 与后端 AgentRun 对齐，用于过滤该代理运行的 transcript artifacts */
@@ -31,6 +35,10 @@
     sessionId = null,
   }: Props = $props();
   let contextExpanded = $state(false);
+  let inspectorProjection = $state<AgentRunProjectionDto | null>(null);
+  let inspectorError = $state<string | null>(null);
+  let refreshInspector: (() => Promise<void>) | null = null;
+  let continuation = $state<{ taskId: string; pending: boolean; error: string | null } | null>(null);
 
   interface AgentAssignmentSummary {
     title: string;
@@ -68,9 +76,55 @@
     scopedSessionId,
     scopedWorkspaceId,
   ));
+  const currentRootContainsAgent = $derived(!!agentRunState.projection?.tasks.some((task) => task.task_id === agentRunId));
+  const agentReadModel = $derived(currentRootContainsAgent ? agentRunState.projection : inspectorProjection);
+
+  // 代理转交后可能跨越主线 root；详情只读原 Task 的服务端投影，不能改投当前主线。
+  $effect(() => {
+    const taskId = agentRunId;
+    const session = scopedSessionId;
+    const workspace = scopedWorkspaceId;
+    const path = scopedWorkspacePath;
+    inspectorProjection = null;
+    inspectorError = null;
+    refreshInspector = null;
+    if (currentRootContainsAgent || !session || !taskId) return;
+    const controller = new AbortController();
+    let loading = false;
+    let pending = false;
+    let terminal = false;
+    const refresh = async () => {
+      if (controller.signal.aborted) return;
+      if (loading) { pending = true; return; }
+      loading = true;
+      try {
+        const result = await new RustDaemonClient(resolveAgentBaseUrl()).getAgentRunProjection(
+          taskId, session, workspace || path ? 'workspace' : 'personal', workspace || undefined, path || undefined, controller.signal,
+        );
+        if (!controller.signal.aborted) {
+          inspectorProjection = result;
+          inspectorError = null;
+          const task = [result.root_task, ...result.tasks].find((task) => task.task_id === taskId);
+          terminal = !!task && terminalStatus(task.status);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) inspectorError = error instanceof Error ? error.message : String(error);
+      } finally {
+        loading = false;
+        if (pending) { pending = false; void refresh(); }
+      }
+    };
+    refreshInspector = refresh;
+    void refresh();
+    const unsubscribe = onBridgeMessage((event) => {
+      if (event.type === 'rustTaskEvent' && (!event.sessionId || event.sessionId === session)) void refresh();
+    });
+    const timer = setInterval(() => { if (!terminal) void refresh(); }, 5000);
+    return () => { controller.abort(); unsubscribe(); clearInterval(timer); refreshInspector = null; };
+  });
 
   const projectionTask = $derived.by<TaskDto | null>(() => {
-    const projection = agentRunState.projection;
+    const projection = agentReadModel;
     if (!agentRunId || !projection) {
       return null;
     }
@@ -81,7 +135,7 @@
   });
 
   const agentProjection = $derived.by<AgentProjectionDto | null>(() => {
-    const projection = agentRunState.projection;
+    const projection = agentReadModel;
     if (!agentRunId || !projection?.agents) {
       return null;
     }
@@ -319,9 +373,93 @@
     };
   }
 
+  async function transfer(): Promise<void> {
+    const request = agentProjection?.transferRequest;
+    if (!request || agentRunState.transferInFlight) return;
+    try {
+      const result = await transferAgentRun(request);
+      await refreshInspector?.();
+      if (result) addToast(i18n.t(`agentTab.transfer.${result.owner}Succeeded`), 'success');
+    } catch {
+      // 错误保留在该会话/代理的操作区域，切换对话后不污染其他代理。
+      // 服务端可能已转交成功；独立详情也必须刷新原 Task 的拥有方事实。
+      await refreshInspector?.();
+    }
+  }
+
+  async function continueAgent(): Promise<void> {
+    const request = agentProjection?.continueRequest;
+    if (!request || continuation?.pending) return;
+    continuation = { taskId: agentRunId, pending: true, error: null };
+    try {
+      await new RustDaemonClient(resolveAgentBaseUrl()).continueAgentRun(request);
+      await refreshInspector?.();
+      addToast(i18n.t('agentTab.continue.succeeded'), 'success');
+    } catch (error) {
+      continuation = { taskId: request.taskId, pending: false, error: error instanceof Error ? error.message : String(error) };
+      await refreshInspector?.();
+    } finally {
+      if (continuation?.taskId === request.taskId) continuation.pending = false;
+    }
+  }
+
+  function transferReason(reason: string | null | undefined): string {
+    switch (reason) {
+      case 'turn_lifetime': return i18n.t('agentTab.transfer.turnLifetime');
+      case 'runtime_unavailable': return i18n.t('agentTab.transfer.runtimeUnavailable');
+      case 'owner_unavailable': return i18n.t('agentTab.transfer.ownerUnavailable');
+      default: return i18n.t('agentTab.transfer.sourceUnavailable');
+    }
+  }
+
 </script>
 
 <div class="agent-tab-content">
+  {#if inspectorError}<div class="agent-transfer-error" role="alert">{inspectorError}</div>{/if}
+  {#if agentProjection && (agentRuntimeActive || agentProjection.executionOwner)}
+    <section class="agent-transfer" aria-label={i18n.t('agentTab.transfer.title')}>
+      <div class="agent-transfer-copy">
+        {#if agentProjection.executionOwner}
+          <strong>{i18n.t(`agentTab.transfer.${agentProjection.executionOwner}Owned`)}</strong>
+        {:else if agentProjection.transferRequest}
+          <span>{i18n.t(`agentTab.transfer.${agentProjection.transferRequest.owner}Hint`)}</span>
+        {:else}
+          <span>{transferReason(agentProjection.transferUnavailableReason)}</span>
+        {/if}
+        {#if agentRunState.transferError?.taskId === agentRunId}
+          <span class="agent-transfer-error" role="alert">{agentRunState.transferError.message}</span>
+        {/if}
+        {#if agentProjection.continueRequest}
+          <span>{i18n.t('agentTab.continue.hint')}</span>
+        {:else if agentProjection.continueUnavailableReason}
+          <span>{agentProjection.continueUnavailableReason}</span>
+        {/if}
+        {#if continuation?.taskId === agentRunId && continuation.error}
+          <span class="agent-transfer-error" role="alert">{continuation.error}</span>
+        {/if}
+      </div>
+      {#if agentProjection.transferRequest}
+        <button
+          type="button"
+          data-testid="agent-transfer-button"
+          class="btn btn--sm btn--secondary"
+          disabled={agentRunState.transferInFlight !== null || agentRunState.actionInFlight !== null}
+          onclick={transfer}
+        >
+          {agentRunState.transferInFlight === agentRunId
+            ? i18n.t('agentTab.transfer.pending')
+            : i18n.t(`agentTab.transfer.${agentProjection.transferRequest.owner}Action`)}
+        </button>
+      {/if}
+      {#if agentProjection.continueRequest}
+        <button type="button" data-testid="agent-continue-button" class="btn btn--sm btn--secondary"
+          disabled={continuation?.pending === true || agentRunState.actionInFlight !== null || agentRunState.transferInFlight !== null}
+          onclick={continueAgent}>
+          {continuation?.pending ? i18n.t('agentTab.continue.pending') : i18n.t('agentTab.continue.action')}
+        </button>
+      {/if}
+    </section>
+  {/if}
   {#if activeCapabilityIds.length > 0}
     <div class="agent-capabilities" aria-label={i18n.t('settings.agents.sectionCapabilities')}>
       <strong>{i18n.t('settings.agents.sectionCapabilities')}</strong>
@@ -421,6 +559,30 @@
 </div>
 
 <style>
+  .agent-transfer {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+    font-size: 12px;
+    color: var(--foreground-muted);
+  }
+
+  .agent-transfer-copy {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .agent-transfer-error {
+    color: var(--error);
+    overflow-wrap: anywhere;
+  }
+
   .agent-tab-content {
     display: flex;
     flex-direction: column;

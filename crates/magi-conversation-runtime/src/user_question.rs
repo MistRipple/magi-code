@@ -1,246 +1,27 @@
-//! 模型向用户提出的选择题（`ask_user_question`）的待处理注册表。
-//!
-//! 和工具授权同一类运行时事实：工具调用在执行线程里阻塞等待用户，注册表按会话保存待处理项，
-//! 用户通过 API 回答后唤醒等待方。区别在于决定的形状（每题选中的选项 + “其他”自由输入），
-//! 以及没有超时：用户可能需要想很久，只有回答、跳过、轮次结束或任务停止才会收口。
-use magi_core::{SessionId, TaskId, UtcMillis};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! 用户提问的进程内等待通道；问题和答复由 SessionStore 持久化。
+#[cfg(test)]
+use magi_core::UtcMillis;
+use magi_core::{SessionId, TaskId};
+pub use magi_session_store::user_question::{
+    MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, PendingUserQuestion, UserQuestion, UserQuestionAnswer,
+    UserQuestionOption, UserQuestionResponse, answered_result_payload, parse_questions,
+    validate_answers,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
-fn default_true() -> bool {
-    true
-}
-
-pub const MAX_QUESTIONS: usize = 4;
-pub const MIN_OPTIONS: usize = 2;
-pub const MAX_OPTIONS: usize = 4;
-const MAX_TEXT_CHARS: usize = 2_000;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserQuestionOption {
-    pub label: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub description: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserQuestion {
-    pub question: String,
-    pub header: String,
-    pub multi_select: bool,
-    #[serde(default = "default_true")]
-    pub allow_other: bool,
-    pub options: Vec<UserQuestionOption>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingUserQuestion {
-    pub question_id: String,
-    pub session_id: SessionId,
-    #[serde(default)]
-    pub task_id: Option<TaskId>,
-    pub turn_id: String,
-    pub tool_call_id: String,
-    pub questions: Vec<UserQuestion>,
-    pub requested_at: UtcMillis,
-    #[serde(default = "default_true")]
-    pub can_skip: bool,
-}
-
-/// 用户对一道题的回答：选中的选项 label（可多个），以及“其他”里输入的原文。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UserQuestionAnswer {
-    #[serde(default)]
-    pub selected: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub other: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum UserQuestionResponse {
-    /// 按题目顺序给出每题的回答。
-    Answered { answers: Vec<UserQuestionAnswer> },
-    /// 用户选择不回答。
-    Skipped,
-}
-
-/// 解析并校验工具参数。校验失败的原因直接返回给模型，让它改正后重试。
-pub fn parse_questions(arguments: &str) -> Result<Vec<UserQuestion>, String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Raw {
-        questions: Vec<RawQuestion>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawQuestion {
-        question: String,
-        header: String,
-        #[serde(default)]
-        multi_select: bool,
-        options: Vec<RawOption>,
-    }
-    #[derive(Deserialize)]
-    struct RawOption {
-        label: String,
-        #[serde(default)]
-        description: String,
-    }
-    let raw: Raw = serde_json::from_str(arguments)
-        .map_err(|error| format!("参数不是合法的 ask_user_question 输入：{error}"))?;
-    if raw.questions.is_empty() || raw.questions.len() > MAX_QUESTIONS {
-        return Err(format!("questions 需要 1–{MAX_QUESTIONS} 个问题"));
-    }
-    let mut questions = Vec::with_capacity(raw.questions.len());
-    for (index, item) in raw.questions.into_iter().enumerate() {
-        let number = index + 1;
-        let question = item.question.trim().to_string();
-        let header = item.header.trim().to_string();
-        if question.is_empty() || header.is_empty() {
-            return Err(format!("第 {number} 个问题的 question 与 header 不能为空"));
-        }
-        if question.chars().count() > MAX_TEXT_CHARS {
-            return Err(format!("第 {number} 个问题的 question 过长"));
-        }
-        if item.options.len() < MIN_OPTIONS || item.options.len() > MAX_OPTIONS {
-            return Err(format!(
-                "第 {number} 个问题需要 {MIN_OPTIONS}–{MAX_OPTIONS} 个选项（“其他”由界面自动追加，不要自己写）"
-            ));
-        }
-        let mut options: Vec<UserQuestionOption> = Vec::with_capacity(item.options.len());
-        for option in item.options {
-            let label = option.label.trim().to_string();
-            if label.is_empty() {
-                return Err(format!("第 {number} 个问题存在空的选项 label"));
-            }
-            if is_other_label(&label) {
-                return Err(format!(
-                    "第 {number} 个问题不要自己写“其他”选项，界面会自动追加"
-                ));
-            }
-            if options
-                .iter()
-                .any(|existing| existing.label.eq_ignore_ascii_case(&label))
-            {
-                return Err(format!("第 {number} 个问题存在重复的选项 label：{label}"));
-            }
-            options.push(UserQuestionOption {
-                label,
-                description: option.description.trim().to_string(),
-            });
-        }
-        questions.push(UserQuestion {
-            question,
-            header,
-            multi_select: item.multi_select,
-            allow_other: true,
-            options,
-        });
-    }
-    Ok(questions)
-}
-
-fn is_other_label(label: &str) -> bool {
-    let normalized = label.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "其他" | "其它" | "other" | "others" | "其他（请说明）"
-    )
-}
-
-/// 校验用户的回答与题目对得上：数量一致、选中的 label 都在选项里、单选最多一个，
-/// 且每题至少有一个选中项或“其他”输入。
-pub fn validate_answers(
-    questions: &[UserQuestion],
-    answers: &[UserQuestionAnswer],
-) -> Result<Vec<UserQuestionAnswer>, String> {
-    if answers.len() != questions.len() {
-        return Err(format!(
-            "需要回答 {} 个问题，收到 {} 个回答",
-            questions.len(),
-            answers.len()
-        ));
-    }
-    let mut normalized = Vec::with_capacity(answers.len());
-    for (index, (question, answer)) in questions.iter().zip(answers).enumerate() {
-        let number = index + 1;
-        let other = answer
-            .other
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string);
-        if other.is_some() && !question.allow_other {
-            return Err(format!("第 {number} 个问题不支持自定义输入"));
-        }
-        if let Some(text) = &other
-            && text.chars().count() > MAX_TEXT_CHARS
-        {
-            return Err(format!("第 {number} 个问题的“其他”内容过长"));
-        }
-        let mut selected: Vec<String> = Vec::with_capacity(answer.selected.len());
-        for label in &answer.selected {
-            if !question.options.iter().any(|option| &option.label == label) {
-                return Err(format!("第 {number} 个问题的选项不存在：{label}"));
-            }
-            if !selected.contains(label) {
-                selected.push(label.clone());
-            }
-        }
-        if selected.is_empty() && other.is_none() {
-            return Err(format!("第 {number} 个问题还没有回答"));
-        }
-        if !question.multi_select && selected.len() + usize::from(other.is_some()) > 1 {
-            return Err(format!("第 {number} 个问题是单选"));
-        }
-        normalized.push(UserQuestionAnswer { selected, other });
-    }
-    Ok(normalized)
-}
-
-/// 返回给模型的工具结果（成功回答）。
-pub fn answered_result_payload(
-    questions: &[UserQuestion],
-    answers: &[UserQuestionAnswer],
-) -> Value {
-    let items: Vec<Value> = questions
-        .iter()
-        .zip(answers)
-        .map(|(question, answer)| {
-            // `answer` 是这道题用户最终的决定（预设选项与“其他”输入合并），模型直接按它行动。
-            let mut decided: Vec<&str> = answer.selected.iter().map(String::as_str).collect();
-            if let Some(other) = answer.other.as_deref() {
-                decided.push(other);
-            }
-            serde_json::json!({
-                "question": question.question,
-                "header": question.header,
-                "answer": decided,
-                "selected": answer.selected,
-                "other": answer.other,
-                "custom_answer": answer.other.is_some(),
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "tool": "ask_user_question",
-        "status": "answered",
-        "answers": items,
-        "instruction": "answer 就是用户对每道题的最终决定，直接按它继续。`other`/`custom_answer` 表示用户没有选你给的选项，而是自己写了答案：这是合法的决定，要按字面采纳，哪怕它不在你给出的选项范围内；不要因此拒绝、质疑或重复追问同一个问题。",
-    })
-}
-
-#[derive(Debug)]
 struct PendingEntry {
+    store: Option<magi_session_store::SessionStore>,
     request: PendingUserQuestion,
     response_tx: mpsc::Sender<UserQuestionResponse>,
+}
+
+impl std::fmt::Debug for PendingEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingEntry")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct UserQuestionWaiter {
@@ -258,11 +39,37 @@ impl UserQuestionRegistry {
         self.pending.lock().expect("user question registry lock")
     }
 
-    pub fn request(&self, request: PendingUserQuestion) -> UserQuestionWaiter {
+    #[cfg(test)]
+    fn request(&self, request: PendingUserQuestion) -> UserQuestionWaiter {
+        Self::insert_pending(&mut self.lock(), request, None)
+    }
+
+    pub fn request_persisted(
+        &self,
+        store: &magi_session_store::SessionStore,
+        request: PendingUserQuestion,
+    ) -> Result<UserQuestionWaiter, String> {
+        let mut pending = self.lock();
+        store
+            .register_user_question(request.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(Self::insert_pending(
+            &mut pending,
+            request,
+            Some(store.clone()),
+        ))
+    }
+
+    fn insert_pending(
+        pending: &mut HashMap<String, PendingEntry>,
+        request: PendingUserQuestion,
+        store: Option<magi_session_store::SessionStore>,
+    ) -> UserQuestionWaiter {
         let (response_tx, response_rx) = mpsc::channel();
-        self.lock().insert(
+        pending.insert(
             request.question_id.clone(),
             PendingEntry {
+                store,
                 request: request.clone(),
                 response_tx,
             },
@@ -311,26 +118,64 @@ impl UserQuestionRegistry {
             },
             UserQuestionResponse::Skipped => UserQuestionResponse::Skipped,
         };
+        if let Some(store) = &entry.store {
+            store
+                .resolve_user_question(session_id, question_id, response.clone())
+                .map_err(|error| match error {
+                    magi_core::DomainError::Persistence { .. } => {
+                        format!("提问答复持久化失败：{error}")
+                    }
+                    error => error.to_string(),
+                })?;
+        }
         let entry = pending.remove(question_id).expect("entry checked above");
+        // 答复已持久化，即使等待方刚退出，也保留给恢复链消费。
         let _ = entry.response_tx.send(response);
         Ok(entry.request)
     }
 
     pub fn cancel(&self, question_id: &str) {
-        self.lock().remove(question_id);
+        if let Some(entry) = self.lock().remove(question_id) {
+            Self::persist_cancel(&entry);
+        }
+    }
+
+    fn persist_cancel(entry: &PendingEntry) {
+        if let Some(store) = &entry.store
+            && let Err(error) =
+                store.cancel_user_question(&entry.request.session_id, &entry.request.question_id)
+        {
+            tracing::error!(%error, question_id = %entry.request.question_id, "提问取消事实提交失败");
+        }
+    }
+
+    fn remove_where(&self, matches: impl Fn(&PendingUserQuestion) -> bool) {
+        self.lock().retain(|_, entry| {
+            if matches(&entry.request) {
+                Self::persist_cancel(entry);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn remove_turn(&self, session_id: &SessionId, turn_id: &str) {
-        self.lock().retain(|_, entry| {
-            !(&entry.request.session_id == session_id && entry.request.turn_id == turn_id)
+        self.remove_where(|request| {
+            &request.session_id == session_id && request.turn_id == turn_id
         });
     }
 
     pub fn remove_task(&self, session_id: &SessionId, task_id: &TaskId) {
-        self.lock().retain(|_, entry| {
-            !(&entry.request.session_id == session_id
-                && entry.request.task_id.as_ref() == Some(task_id))
+        self.remove_where(|request| {
+            &request.session_id == session_id && request.task_id.as_ref() == Some(task_id)
         });
+    }
+
+    /// Session 删除时清理所有进程内等待项，并先记录持久取消事实。
+    /// 丢弃发送端会让等待方立即收到通道关闭，不再持有已删除会话。
+    pub fn remove_session(&self, session_id: &SessionId) {
+        self.remove_where(|request| &request.session_id == session_id);
     }
 }
 
@@ -376,6 +221,46 @@ mod tests {
             requested_at: UtcMillis(1),
             can_skip: true,
         }
+    }
+
+    #[test]
+    fn remove_session_clears_only_the_deleted_session_questions() {
+        let registry = UserQuestionRegistry::default();
+        let questions = parse_questions(&sample_arguments()).unwrap();
+        let task_waiter = registry.request(pending(questions.clone()));
+        let mut taskless = pending(questions.clone());
+        taskless.question_id = "q-taskless".to_string();
+        taskless.task_id = None;
+        let taskless_waiter = registry.request(taskless);
+        let mut other = pending(questions);
+        other.question_id = "q2".to_string();
+        other.session_id = SessionId::new("s2");
+        let other_waiter = registry.request(other);
+
+        registry.remove_session(&SessionId::new("s1"));
+        assert!(
+            registry
+                .pending_for_session(&SessionId::new("s1"))
+                .is_empty()
+        );
+        assert_eq!(registry.pending_for_session(&SessionId::new("s2")).len(), 1);
+        for waiter in [task_waiter, taskless_waiter] {
+            assert_eq!(
+                waiter.response_rx.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            );
+        }
+        assert_eq!(
+            other_waiter.response_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        registry
+            .resolve(&SessionId::new("s2"), "q2", UserQuestionResponse::Skipped)
+            .unwrap();
+        assert_eq!(
+            other_waiter.response_rx.try_recv().unwrap(),
+            UserQuestionResponse::Skipped
+        );
     }
 
     #[test]

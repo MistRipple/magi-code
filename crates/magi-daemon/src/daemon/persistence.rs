@@ -5,8 +5,9 @@ use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
 use magi_orchestrator::task_store::{TaskStore, TaskStoreSnapshot};
 use magi_session_store::{
-    CanonicalTurnEventWriter, CanonicalTurnMutation, SessionAcceptanceRecord, SessionDurableState,
-    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionStore, UnavailableSession,
+    CanonicalTurnMutation, SessionAcceptanceRecord, SessionDurableState, SessionEventWriter,
+    SessionExecutionSidecarStoreState, SessionInputMutation, SessionRuntimeSidecar, SessionStore,
+    UnavailableSession,
 };
 use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
 use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
@@ -144,7 +145,7 @@ fn trim_resident_event_projections(
     }
 }
 
-const STATE_LAYOUT_VERSION: u32 = 2;
+const STATE_LAYOUT_VERSION: u32 = 18;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -406,8 +407,21 @@ impl StateRepository {
             )));
         }
         let empty_projection = SessionConversationProjection::load(&event_root, &session_id)?;
-        let prepared =
-            empty_projection.prepare_transaction_write(&event_root, &session_id, &mutations)?;
+        let prepared = empty_projection.prepare_transaction_write(
+            &event_root,
+            &session_id,
+            &mutations,
+            &snapshot
+                .durable
+                .inputs
+                .iter()
+                .cloned()
+                .map(|next| SessionInputMutation {
+                    previous: None,
+                    next,
+                })
+                .collect::<Vec<_>>(),
+        )?;
         let original_event_seq = snapshot.canonical_event_seq;
         snapshot.canonical_event_seq = prepared.projection.last_event_seq();
         Self::validate_cached_canonical_projection(
@@ -585,6 +599,7 @@ impl StateRepository {
                         )?;
                         snapshot.durable.canonical_turns =
                             event_projection.canonical_turns().to_vec();
+                        snapshot.durable.inputs = event_projection.inputs().to_vec();
                         // canonical event 是唯一事实源；sidecar 只是执行恢复缓存。
                         // event 游标相等只说明 durable canonical 已同步，不能证明 sidecar
                         // 没有停留在较早的活动快照，因此每次恢复都从事件结果重建它。
@@ -771,6 +786,12 @@ impl StateRepository {
                             sidecars.upsert_runtime_sidecar(sidecar);
                             event_accepted_submissions.extend(accepted);
                         }
+                        durable
+                            .inputs
+                            .retain(|input| input.session_id != session_id);
+                        durable
+                            .inputs
+                            .extend(event_projection.inputs().iter().cloned());
                         event_cache.insert(session_id, event_projection);
                     }
                     Err(error) => unavailable.push(Self::unavailable_session_from_path(
@@ -1119,6 +1140,22 @@ impl StateRepository {
         self.recover_session_projection_transaction(workspace_roots)?;
         let layout_path = self.state_layout_marker_path();
         if layout_path.exists() {
+            let marker: StateLayoutMarker = self.read_json_strict(&layout_path)?;
+            if matches!(marker.version, 2..=17) {
+                // 升级写屏障，防止旧 daemon 重写新 Agent activation 与 Goal/Step。
+                let backup = self
+                    .state_root
+                    .join(format!("state-layout.v{}.json", marker.version));
+                if !backup.exists() {
+                    self.write_json_atomically(backup, &marker)?;
+                }
+                return self.write_json_atomically(
+                    layout_path,
+                    &StateLayoutMarker {
+                        version: STATE_LAYOUT_VERSION,
+                    },
+                );
+            }
             return self.validate_state_layout_marker(&layout_path);
         }
         self.write_json_atomically(
@@ -1334,9 +1371,14 @@ impl StateRepository {
         let session_id = snapshot.durable.sessions[0].session_id.clone();
         let scoped = snapshot
             .durable
-            .timeline
+            .inputs
             .iter()
-            .all(|entry| entry.session_id == session_id)
+            .all(|input| input.session_id == session_id && input.validate_snapshot().is_ok())
+            && snapshot
+                .durable
+                .timeline
+                .iter()
+                .all(|entry| entry.session_id == session_id)
             && snapshot
                 .durable
                 .canonical_turns
@@ -1507,6 +1549,7 @@ impl StateRepository {
                 )));
             }
             next_durable.canonical_turns = event_projection.canonical_turns().to_vec();
+            next_durable.inputs = event_projection.inputs().to_vec();
             event_projection.touch();
         }
         let snapshot = SessionProjectionSnapshot {
@@ -1694,25 +1737,32 @@ impl StateRepository {
             }
         }
 
-        let current_path = self.state_root.join("session-current.json");
-        let current_content =
-            serde_json::to_vec_pretty(&durable.current_session_id).map_err(DaemonError::from)?;
-        let current_content = String::from_utf8(current_content).map_err(|error| {
-            DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
-        })?;
-        let current_digest = ContentDigest::of(&current_content);
-        if next_cache
-            .global
-            .as_ref()
-            .map(|(_, previous)| previous != &current_digest)
-            .unwrap_or(true)
-        {
-            writes.push(SessionProjectionWrite {
-                path: current_path.clone(),
-                content: current_content,
-            });
+        // 增量运行态 checkpoint 只拥有被标记 session 的 projection。它的 durable
+        // 快照是在释放 SessionStore 锁后传入的，`current_session_id` 可能已经被用户
+        // 导航更新；如果在这里照旧写全局 current 指针，就会用旧快照覆盖用户刚选中的
+        // 会话。current 指针只由完整投影和导航事务写入，增量 checkpoint 保持原文件和
+        // 缓存不变。
+        if !partial_snapshot {
+            let current_path = self.state_root.join("session-current.json");
+            let current_content = serde_json::to_vec_pretty(&durable.current_session_id)
+                .map_err(DaemonError::from)?;
+            let current_content = String::from_utf8(current_content).map_err(|error| {
+                DaemonError::internal(format!("session current state 不是 UTF-8: {error}"))
+            })?;
+            let current_digest = ContentDigest::of(&current_content);
+            if next_cache
+                .global
+                .as_ref()
+                .map(|(_, previous)| previous != &current_digest)
+                .unwrap_or(true)
+            {
+                writes.push(SessionProjectionWrite {
+                    path: current_path.clone(),
+                    content: current_content,
+                });
+            }
+            next_cache.global = Some((current_path, current_digest));
         }
-        next_cache.global = Some((current_path, current_digest));
 
         if !partial_snapshot {
             let app_meta = SessionDurableState {
@@ -2126,31 +2176,23 @@ fn json_values_semantically_equal(left: &serde_json::Value, right: &serde_json::
     }
 }
 
-impl CanonicalTurnEventWriter for StateRepository {
-    fn append_canonical_turn_transaction(
+impl SessionEventWriter for StateRepository {
+    fn append_session_transaction(
         &self,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
-    ) -> DomainResult<()> {
-        let _write_guard = self
-            .write_lock
-            .lock()
-            .expect("state repository write lock poisoned");
-        self.append_canonical_turn_transaction_locked(session_id, mutations, None)
-    }
-
-    fn append_canonical_turn_transaction_with_acceptance(
-        &self,
-        session_id: &SessionId,
-        mutations: &[CanonicalTurnMutation],
-        acceptance: &SessionAcceptanceRecord,
-        task: Option<&Task>,
+        inputs: &[SessionInputMutation],
+        acceptance: Option<(&SessionAcceptanceRecord, Option<&Task>)>,
     ) -> DomainResult<()> {
         let _write_guard = self
             .write_lock
             .lock()
             .expect("state repository write lock poisoned");
 
+        let Some((acceptance, task)) = acceptance else {
+            return self
+                .append_canonical_turn_transaction_locked(session_id, mutations, inputs, None);
+        };
         let Some(last_mutation) = mutations.last() else {
             return Err(DomainError::InvalidState {
                 message: "accepted canonical event transaction 不能为空".to_string(),
@@ -2186,7 +2228,12 @@ impl CanonicalTurnEventWriter for StateRepository {
             task_checkpointed: task.is_none(),
             task_projection_generation_at_acceptance,
         };
-        self.append_canonical_turn_transaction_locked(session_id, mutations, Some(acceptance))
+        self.append_canonical_turn_transaction_locked(
+            session_id,
+            mutations,
+            inputs,
+            Some(acceptance),
+        )
     }
 }
 
@@ -2195,6 +2242,7 @@ impl StateRepository {
         &self,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> DomainResult<()> {
         let mut cache = self
@@ -2219,18 +2267,17 @@ impl StateRepository {
         let projection = cache
             .get(session_id)
             .expect("projection was made resident above");
-        let next = match acceptance.as_ref() {
-            Some(acceptance) => projection.append_transaction_with_acceptance(
+        let next = projection
+            .append_session_transaction(
                 &event_root,
                 session_id,
                 mutations,
+                inputs,
                 acceptance.clone(),
-            ),
-            None => projection.append_transaction(&event_root, session_id, mutations),
-        }
-        .map_err(|error| DomainError::Persistence {
-            message: error.to_string(),
-        })?;
+            )
+            .map_err(|error| DomainError::Persistence {
+                message: error.to_string(),
+            })?;
         let mut next = next;
         next.touch();
         cache.insert(session_id.clone(), next);
@@ -2285,47 +2332,13 @@ impl RuntimeSidecarPersistence {
         self.worker_runtime.durable_snapshot_dirty()
     }
 
-    fn persist_session_snapshot(
-        &self,
-        durable: &SessionDurableState,
-        sidecars: &SessionExecutionSidecarStoreState,
-        changed_session_ids: Option<&[SessionId]>,
-    ) -> Result<(), DaemonError> {
-        // workspace 注册事实必须先于引用它的 session projection 落盘。进程若在两步之间
-        // 退出，最多留下一个尚未被会话引用的 workspace；反向顺序会产生无法恢复的悬空归属。
-        self.state_repository
-            .save_workspace_durable_state(&self.workspace_store.durable_state())?;
-        match changed_session_ids {
-            Some(session_ids) => self
-                .state_repository
-                .save_session_projection_state_for_sessions(durable, sidecars, session_ids)?,
-            None => self
-                .state_repository
-                .save_session_projection_state(durable, sidecars)?,
-        }
-        Ok(())
-    }
-
     fn persist_session_snapshot_incremental(
         &self,
         durable: &SessionDurableState,
         sidecars: &SessionExecutionSidecarStoreState,
         session_ids: &[SessionId],
-    ) -> Result<(), DaemonError> {
+    ) -> Result<Vec<SessionId>, DaemonError> {
         let started_at = std::time::Instant::now();
-        if session_ids.is_empty() {
-            // 理论上每个运行态 mutation 都携带 session 归属；若遇到旧调用方
-            // 或未归属的全局 dirty 标记，宁可执行一次完整快照，也不能丢失事实。
-            let result = self.persist_session_snapshot(durable, sidecars, None);
-            tracing::info!(
-                target: "magi.performance",
-                session_count = session_ids.len(),
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                stage = "session_projection_unscoped_full_snapshot_completed",
-                "conversation response timing"
-            );
-            return result;
-        }
         // workspace 注册/删除本身已经在 workspace mutation 事务中持久化；session
         // 运行态 checkpoint 不再重复写入并 fsync 整个 workspaces.json。
         let workspace_roots = self
@@ -2339,24 +2352,45 @@ impl RuntimeSidecarPersistence {
                 )
             })
             .collect::<HashMap<_, _>>();
+        // 工作区移除后仍可能收到原调用的结算更新。没有注册路径时保留其脏版本，
+        // 既不回落到全局目录，也不让它阻断其他工作区的 checkpoint；重新注册后再补交。
+        let writable_sessions = session_ids
+            .iter()
+            .filter(|id| {
+                durable
+                    .sessions
+                    .iter()
+                    .find(|session| &session.session_id == *id)
+                    .is_none_or(|session| {
+                        session
+                            .workspace_id
+                            .as_ref()
+                            .is_none_or(|workspace| workspace_roots.contains_key(workspace))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if writable_sessions.is_empty() {
+            return Ok(Vec::new());
+        }
         let result = self
             .state_repository
             .save_session_projection_partial_state_with_roots(
                 durable,
                 sidecars,
-                session_ids,
+                &writable_sessions,
                 &workspace_roots,
             );
         if result.is_ok() {
             tracing::info!(
                 target: "magi.performance",
-                session_count = session_ids.len(),
+                session_count = writable_sessions.len(),
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 stage = "session_projection_incremental_completed",
                 "conversation response timing"
             );
         }
-        result
+        result.map(|()| writable_sessions)
     }
 
     pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {
@@ -2388,8 +2422,8 @@ impl RuntimeSidecarPersistence {
                 self.persist_session_snapshot_incremental(durable, sidecars, session_ids)
             },
         )?;
-        // false 表示本轮没有新的 sidecar dirty 事实；canonical event 已经是 durable
-        // 提交点，不应因此触发一次全量 session projection 重写。
+        // 没有可提交的 sidecar 时也不回退全量快照；离线工作区保留脏版本，
+        // canonical event 仍是业务事实的 durable 提交点。
         Ok(true)
     }
 }
@@ -2398,14 +2432,14 @@ impl RuntimeSidecarPersistence {
 mod tests {
     use super::*;
     use magi_core::{
-        AbsolutePath, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState,
-        SessionId, SessionLifecycleStatus, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis,
-        WorkerId, WorkspaceId,
+        AbsolutePath, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
+        PlanState, SessionId, SessionLifecycleStatus, TaskId, TaskKind, TaskStatus, ThreadId,
+        UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        ActiveExecutionTurnItem, CanonicalTurnEventWriter, CanonicalTurnMutation, ExecutionThread,
-        ExecutionThreadStatus, NotificationRecord, NotificationScope, SessionDurableState,
+        ActiveExecutionTurnItem, CanonicalTurnMutation, ExecutionThread, ExecutionThreadStatus,
+        NotificationRecord, NotificationScope, SessionDurableState, SessionEventWriter,
         SessionPlan, SessionRecord, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntry,
         TimelineEntryKind,
     };
@@ -2501,14 +2535,14 @@ mod tests {
         for (session_id, turns) in turns_by_session {
             let mutations = StateRepository::initial_canonical_mutations(turns);
             repository
-                .append_canonical_turn_transaction(&session_id, &mutations)
+                .append_session_transaction(&session_id, &mutations, &[], None)
                 .expect("test canonical events should initialize");
         }
     }
 
     fn install_test_event_authority(repository: &StateRepository, session_store: &SessionStore) {
         initialize_test_session_events(repository, &session_store.durable_state());
-        session_store.install_canonical_event_writer(Arc::new(repository.clone()));
+        session_store.install_session_event_writer(Arc::new(repository.clone()));
     }
 
     fn accepted_task(task_id: TaskId, accepted_at: u64) -> Task {
@@ -2774,16 +2808,31 @@ mod tests {
             .join("session-projections")
             .join(StateRepository::session_projection_file_name(&second));
         let second_before = fs::read(&second_path).expect("second projection should exist");
+        session_store
+            .select_current_session(&first)
+            .expect("first session should be selected before checkpoint snapshot");
         session_store.append_timeline_entry(
             first.clone(),
             TimelineEntryKind::AssistantMessage,
             "partial update",
         );
-        let state = session_store.export_state();
+        // 模拟后台 checkpoint 在释放 SessionStore 快照锁后才开始写盘：此时它携带
+        // 的 current 指针仍是 first，但用户已经切换到了 second 并完成了导航提交。
+        let stale = session_store.durable_state();
+        session_store
+            .select_current_session(&second)
+            .expect("user navigation should update current session");
+        repository
+            .save_session_navigation_state(
+                &session_store.durable_state(),
+                &session_store.execution_sidecar_store_state(),
+                Some(&second),
+            )
+            .expect("new current session should persist before stale checkpoint");
         let sidecars = session_store.execution_sidecar_store_state();
         repository
             .save_session_projection_partial_state_with_roots(
-                &state.durable_state_for_session(&first),
+                &stale,
                 &sidecars,
                 std::slice::from_ref(&first),
                 &HashMap::new(),
@@ -2796,6 +2845,16 @@ mod tests {
             fs::read(&second_path).expect("second projection should remain"),
             second_before,
             "未变化 session 的 projection 不应被重写"
+        );
+        let current: Option<SessionId> = serde_json::from_str(
+            &fs::read_to_string(state_root.join("session-current.json"))
+                .expect("current pointer should remain readable"),
+        )
+        .expect("current pointer should parse");
+        assert_eq!(
+            current,
+            Some(second),
+            "旧的增量 checkpoint 不得覆盖用户刚提交的 current session"
         );
 
         let _ = fs::remove_dir_all(state_root);
@@ -2842,6 +2901,101 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn background_checkpoint_cannot_overwrite_a_session_rename_or_deletion() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        for delete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let repository = StateRepository::new(root.path().to_path_buf());
+            let (store, turn_id, _) = accepted_session_store("checkpoint-race", None, 45);
+            let session = SessionId::new("checkpoint-race");
+            install_test_event_authority(&repository, &store);
+            store
+                .persist_projection_with(|durable, sidecars| {
+                    repository.save_session_projection_state(durable, sidecars)
+                })
+                .unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let checkpoint_store = store.clone();
+            let checkpoint_repository = repository.clone();
+            let checkpoint = thread::spawn(move || {
+                checkpoint_store
+                    .flush_execution_sidecar_snapshot_with(|durable, sidecars, ids| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        checkpoint_repository.save_session_projection_partial_state_with_roots(
+                            durable,
+                            sidecars,
+                            ids,
+                            &HashMap::new(),
+                        )?;
+                        Ok::<_, DaemonError>(ids.to_vec())
+                    })
+                    .unwrap()
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            // checkpoint 的磁盘 IO 不得持有 canonical 或 state 锁：新工具结果仍可
+            // 提交事件，投影 builder 会从日志补齐它，而不是覆盖成旧快照。
+            append_test_tool_item(&store, &session, &turn_id, "tool-during-checkpoint", 2);
+            assert_eq!(store.canonical_turns_for_session(&session).len(), 1);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let mutation_store = store.clone();
+            let mutation_session = session.clone();
+            let mutation_repository = repository.clone();
+            let mutation = thread::spawn(move || {
+                let persist =
+                    |durable: &SessionDurableState,
+                     sidecars: &SessionExecutionSidecarStoreState| {
+                        mutation_repository.save_session_projection_state_for_sessions(
+                            durable,
+                            sidecars,
+                            std::slice::from_ref(&mutation_session),
+                        )
+                    };
+                if delete {
+                    mutation_store
+                        .delete_session_with_persistence(&mutation_session, None, persist)
+                        .unwrap();
+                } else {
+                    mutation_store
+                        .rename_session_with_persistence(&mutation_session, "renamed", persist)
+                        .unwrap();
+                }
+                finished_tx.send(()).unwrap();
+            });
+            let overtook_checkpoint = finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+            release_tx.send(()).unwrap();
+            assert!(checkpoint.join().unwrap());
+            mutation.join().unwrap();
+
+            let (restored, _) = StateRepository::new(root.path().to_path_buf())
+                .load_session_projections(&[])
+                .unwrap();
+            if delete {
+                assert!(
+                    restored.sessions.is_empty(),
+                    "旧 checkpoint 不得恢复已删除会话"
+                );
+                assert!(!repository.session_event_root(&session).exists());
+            } else {
+                assert_eq!(
+                    restored.sessions[0].title, "renamed",
+                    "旧 checkpoint 不得撤销重命名"
+                );
+                assert!(
+                    restored.canonical_turns[0]
+                        .items
+                        .iter()
+                        .any(|item| { item.item_id == "tool-during-checkpoint" })
+                );
+            }
+            assert!(!overtook_checkpoint, "会话投影事务必须按快照捕获顺序提交");
+        }
     }
 
     #[test]
@@ -2991,6 +3145,137 @@ mod tests {
         path
     }
 
+    #[test]
+    fn removed_workspace_does_not_block_other_session_checkpoints_and_readd_flushes_pending() {
+        let root = unique_temp_dir("magi-removed-workspace-checkpoint");
+        let repository = StateRepository::new(root.join("state"));
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = WorkspaceId::new("removed-workspace");
+        let workspaces = Arc::new(WorkspaceStore::new());
+        workspaces
+            .register(
+                workspace.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy()),
+            )
+            .unwrap();
+        repository
+            .save_workspace_durable_state(&workspaces.durable_state())
+            .unwrap();
+        let store = Arc::new(SessionStore::new());
+        let offline = SessionId::new("checkpoint-offline");
+        let healthy = SessionId::new("checkpoint-healthy");
+        store
+            .create_session_for_workspace(offline.clone(), "offline", Some(workspace.to_string()))
+            .unwrap();
+        store.create_session(healthy.clone(), "healthy").unwrap();
+        for id in [&offline, &healthy] {
+            store.bind_execution_ownership(id.clone(), ExecutionOwnership::default());
+        }
+        let persistence = RuntimeSidecarPersistence::new(
+            repository.clone(),
+            store.clone(),
+            workspaces.clone(),
+            WorkerRuntime::new(),
+        );
+        assert!(
+            persistence
+                .flush_runtime_sidecars()
+                .unwrap()
+                .session_sidecars_flushed
+        );
+        let offline_path = workspace_root
+            .join(".magi/session-projections")
+            .join(StateRepository::session_projection_file_name(&offline));
+        let healthy_path = repository
+            .session_projection_root()
+            .join(StateRepository::session_projection_file_name(&healthy));
+        let old_offline = fs::read(&offline_path).unwrap();
+        let old_healthy = fs::read(&healthy_path).unwrap();
+        workspaces.deregister(&workspace).unwrap();
+        repository
+            .save_workspace_durable_state(&workspaces.durable_state())
+            .unwrap();
+        for id in [&offline, &healthy] {
+            let mut sidecar = store.runtime_sidecar(id).unwrap();
+            sidecar.updated_at = UtcMillis(sidecar.updated_at.0 + 1000);
+            store.upsert_runtime_sidecar(sidecar);
+        }
+        // 原来的全批提交会在离线工作区失败，健康会话的文件也无法更新。
+        assert!(
+            store
+                .persist_projection_with(
+                    |durable, sidecars| repository.save_session_projection_state(durable, sidecars)
+                )
+                .is_err()
+        );
+        assert!(
+            persistence
+                .flush_runtime_sidecars()
+                .unwrap()
+                .session_sidecars_flushed
+        );
+        assert_eq!(fs::read(&offline_path).unwrap(), old_offline);
+        assert_ne!(fs::read(&healthy_path).unwrap(), old_healthy);
+        assert_eq!(
+            store.pending_execution_sidecar_session_ids(),
+            vec![offline.clone()]
+        );
+        assert!(
+            !persistence
+                .flush_runtime_sidecars()
+                .unwrap()
+                .session_sidecars_flushed
+        );
+        assert!(
+            !repository
+                .session_projection_root()
+                .join(StateRepository::session_projection_file_name(&offline))
+                .exists()
+        );
+        workspaces
+            .register(
+                workspace.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy()),
+            )
+            .unwrap();
+        repository
+            .save_workspace_durable_state(&workspaces.durable_state())
+            .unwrap();
+        assert!(
+            persistence
+                .flush_runtime_sidecars()
+                .unwrap()
+                .session_sidecars_flushed
+        );
+        assert!(store.pending_execution_sidecar_session_ids().is_empty());
+        assert_ne!(fs::read(&offline_path).unwrap(), old_offline);
+        let restarted = StateRepository::new(root.join("state"));
+        let workspace_roots = workspaces
+            .workspaces()
+            .into_iter()
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.to_string(),
+                    workspace.native_root_path(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (durable, sidecars) = restarted
+            .load_session_projections(&workspace_roots)
+            .unwrap();
+        let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.runtime_sidecar(&offline)).unwrap(),
+            serde_json::to_value(store.runtime_sidecar(&offline)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(restored.runtime_sidecar(&healthy)).unwrap(),
+            serde_json::to_value(store.runtime_sidecar(&healthy)).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn session_incident(
         notification_id: &str,
         workspace_id: &str,
@@ -3085,6 +3370,7 @@ mod tests {
                 occurred_at: now,
             }],
             canonical_turns: vec![],
+            inputs: vec![],
             notifications: vec![
                 app_incident,
                 session_incident(
@@ -3123,6 +3409,7 @@ mod tests {
                 observed_context_window_tokens: Some(32_000),
                 handled_task_ids: vec![TaskId::new("task-persisted")],
                 message_history: vec![ThreadChatMessage {
+                    input_request_id: None,
                     role: "tool".to_string(),
                     content: Some("exit code 1: persisted tool error".to_string()),
                     images: Vec::new(),
@@ -3136,6 +3423,7 @@ mod tests {
                 checkpoint_id: "checkpoint-persisted".to_string(),
                 source_message_count: 1,
                 summary_message: ThreadChatMessage {
+                    input_request_id: None,
                     role: "system".to_string(),
                     content: Some("恢复后的上下文检查点".to_string()),
                     images: Vec::new(),
@@ -3202,6 +3490,108 @@ mod tests {
 
         let _ = fs::remove_dir_all(state_root);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn input_only_transaction_restores_from_events_over_a_stale_session_projection() {
+        let root = unique_temp_dir("magi-input-event-restore");
+        let repository = StateRepository::new(root.clone());
+        repository.verify_state_layout(&[]).unwrap();
+        let store = SessionStore::new();
+        let session = SessionId::new("session-pending-input-restore");
+        store.create_session(session.clone(), "pending").unwrap();
+        store.install_session_event_writer(Arc::new(repository.clone()));
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        let input = magi_session_store::SessionInput {
+            input_id: "input-restore".into(),
+            session_id: session.clone(),
+            request_id: "request-restore".into(),
+            user_message_id: "user-restore".into(),
+            request_fingerprint: "fingerprint-restore".into(),
+            accepted_at: UtcMillis(50),
+            revision: 1,
+            state: magi_session_store::SessionInputState::Pending,
+            attached_turn_id: None,
+            consumption: None,
+            interruption: None,
+            payload: serde_json::json!({"request":"frozen"}),
+        };
+        store.commit_input(input.clone(), None).unwrap();
+        // 只保留写入前的 Session projection，销毁内存并从新 repository 重放。
+        let restarted = StateRepository::new(root.clone());
+        let (restored, _) = restarted.load_session_projections(&[]).unwrap();
+        assert_eq!(restored.inputs, vec![input]);
+        assert!(restored.canonical_turns.is_empty());
+        assert!(restarted.unavailable_sessions().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_barrier_and_settlement_replay_from_canonical_log_without_checkpoint() {
+        let root = unique_temp_dir("magi-replacement-barrier-replay");
+        let repository = StateRepository::new(root.clone());
+        repository.verify_state_layout(&[]).unwrap();
+        let (store, turn, task) = accepted_session_store("replacement-replay", None, 10);
+        let session = SessionId::new("replacement-replay");
+        install_test_event_authority(&repository, &store);
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        let pending = magi_session_store::SessionInput {
+            input_id: "replacement-replay-input".into(),
+            session_id: session.clone(),
+            request_id: "replacement-replay-request".into(),
+            user_message_id: "replacement-replay-user".into(),
+            request_fingerprint: "replacement-fingerprint".into(),
+            accepted_at: UtcMillis(20),
+            revision: 1,
+            state: magi_session_store::SessionInputState::Pending,
+            attached_turn_id: None,
+            consumption: None,
+            interruption: Some(magi_session_store::InputInterruption {
+                turn_id: turn,
+                root_task_id: Some(task),
+                settled_at: None,
+                error: None,
+            }),
+            payload: serde_json::json!({"request":"frozen"}),
+        };
+        store.commit_input(pending.clone(), None).unwrap();
+        // 输入提交后未做快照：重启必须从同一个 Session 日志恢复屏障。
+        let restarted = StateRepository::new(root.clone());
+        let (durable, sidecar) = restarted.load_session_projections(&[]).unwrap();
+        let store = SessionStore::from_persisted_parts(durable, sidecar).unwrap();
+        assert_eq!(
+            store.input_for_request(&pending.request_id),
+            Some(pending.clone())
+        );
+        store.install_session_event_writer(Arc::new(restarted));
+        store
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        let mut settled = pending;
+        settled.revision = 2;
+        settled.interruption.as_mut().unwrap().settled_at = Some(UtcMillis(30));
+        store.commit_input(settled.clone(), Some(1)).unwrap();
+        let final_repository = StateRepository::new(root.clone());
+        let (durable, sidecar) = final_repository.load_session_projections(&[]).unwrap();
+        let store = SessionStore::from_persisted_parts(durable, sidecar).unwrap();
+        assert_eq!(store.input_for_request(&settled.request_id), Some(settled));
+        assert!(
+            store.canonical_turns_for_session(&session)[0]
+                .status
+                .is_terminal()
+        );
+        assert!(final_repository.unavailable_sessions().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3605,7 +3995,7 @@ mod tests {
             StateRepository::initial_canonical_mutations(snapshot.durable.canonical_turns.clone());
         let prepared = SessionConversationProjection::load(&event_root, &session_id)
             .expect("empty target event projection")
-            .prepare_transaction_write(&event_root, &session_id, &mutations)
+            .prepare_transaction_write(&event_root, &session_id, &mutations, &[])
             .expect("event import transaction should prepare");
         snapshot.canonical_event_seq = prepared.projection.last_event_seq();
         let projection_content =
@@ -3695,19 +4085,19 @@ mod tests {
         let task = accepted_task(task_id.clone(), 57);
 
         repository
-            .append_canonical_turn_transaction_with_acceptance(
+            .append_session_transaction(
                 &session_id,
                 &[CanonicalTurnMutation {
                     previous: None,
                     next: acceptance.canonical_turn.clone(),
                 }],
-                &acceptance,
-                Some(&task),
+                &[],
+                Some((&acceptance, Some(&task))),
             )
             .expect("accepted event transaction should commit");
         // accepted 事务之后继续追加 canonical item 并完成 Turn，模拟 projection 尚未
         // checkpoint 时 daemon 退出。恢复必须从 event-only canonical 结果重建旧 sidecar。
-        session_store.install_canonical_event_writer(Arc::new(repository.clone()));
+        session_store.install_session_event_writer(Arc::new(repository.clone()));
         magi_conversation_runtime::CanonicalTurnEventSink::for_store(&session_store, None)
             .append_item_sidecar(
                 &session_id,
@@ -3946,6 +4336,489 @@ mod tests {
     }
 
     #[test]
+    fn model_step_journal_replays_after_checkpoint_and_layout_upgrade() {
+        let state_root = unique_temp_dir("magi-step-journal");
+        let repository = StateRepository::new(state_root.clone());
+        fs::write(state_root.join("state-layout.json"), r#"{"version":4}"#).unwrap();
+        repository.verify_state_layout(&[]).unwrap();
+        let marker: StateLayoutMarker = repository
+            .read_json_strict(&state_root.join("state-layout.json"))
+            .unwrap();
+        assert_eq!(marker.version, STATE_LAYOUT_VERSION);
+        assert!(state_root.join("state-layout.v4.json").exists());
+        let (store, turn_id, task_id) = accepted_session_store("step-journal", None, 10);
+        let session = SessionId::new("step-journal");
+        let (_, main_thread) = store.ensure_session_mission(&session, UtcMillis::now(), || {
+            MissionId::new("mission-metered-steps")
+        });
+        store
+            .create_goal(
+                session.clone(),
+                main_thread,
+                turn_id.clone(),
+                "metered steps",
+                magi_core::AccessProfile::Restricted,
+            )
+            .unwrap();
+        install_test_event_authority(&repository, &store);
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        for index in 0..70 {
+            let step_id = format!("model-call-{index}");
+            let now = UtcMillis::now();
+            store
+                .begin_model_step(
+                    &session,
+                    &turn_id,
+                    magi_session_store::ModelStep {
+                        attempts: vec![magi_session_store::ModelAttempt {
+                            attempt_id: format!("{step_id}:attempt:1"),
+                            started_at: now,
+                            settled_at: None,
+                            status: magi_session_store::ModelStepStatus::Started,
+                        }],
+                        step_id: step_id.clone(),
+                        task_id: Some(task_id.clone()),
+                        thread_id: ThreadId::new("thread-step"),
+                        goal_id: None,
+                        usage_tokens: None,
+                        goal_tokens_after: None,
+                        checkpoint_generation: 0,
+                        request_fingerprint: "a".repeat(64),
+                        binding: None,
+                        executor_capabilities: Some(
+                            magi_bridge_client::native_executor_capabilities(),
+                        ),
+                        purpose: Some(magi_session_store::ModelStepPurpose::Execution),
+                        provider: "test".into(),
+                        message_count: 1,
+                        tool_count: 0,
+                        max_output_tokens: None,
+                        input_request_ids: vec![],
+                        started_at: now,
+                        settled_at: None,
+                        status: magi_session_store::ModelStepStatus::Started,
+                        response_fingerprint: None,
+                    },
+                )
+                .unwrap();
+            if index == 0 {
+                store
+                    .start_model_step_retry(&session, &turn_id, &step_id)
+                    .unwrap();
+            }
+            // The last request simulates a crash after send, before receiving a result.
+            if index < 69 {
+                store
+                    .settle_model_step(
+                        &session,
+                        &turn_id,
+                        &step_id,
+                        Some("b".repeat(64)),
+                        Some(2),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        for entry in fs::read_dir(repository.session_event_root(&session)).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("checkpoint-")
+            {
+                continue;
+            }
+            let transaction: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            for event in transaction["events"].as_array().unwrap() {
+                assert_eq!(event["kind"], "model_step_updated");
+                assert!(
+                    event.get("turn").is_none(),
+                    "普通 Step 更新不能重写完整 Turn/Step 历史"
+                );
+                assert!(event.get("modelStep").is_some());
+            }
+        }
+        // 模拟旧版 projection、checkpoint 和增量 Step 事件；读取迁移不能丢失 journal。
+        fn add_retired_budget_fields(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if object.contains_key("stepId") && object.contains_key("requestFingerprint") {
+                        object.insert("reservationTokens".into(), serde_json::json!(4096));
+                    }
+                    if object.contains_key("goalId") && object.contains_key("objective") {
+                        object.insert("tokenBudget".into(), serde_json::json!(1));
+                        object.insert("tokensReserved".into(), serde_json::json!(4096));
+                        object.insert("budgetRequiredTokens".into(), serde_json::json!(4096));
+                        object.insert("budgetActiveMillis".into(), serde_json::json!(1));
+                        object.insert(
+                            "runBudget".into(),
+                            serde_json::json!({"maxModelAttempts":1}),
+                        );
+                        object.insert("status".into(), serde_json::json!("budget_limited"));
+                    }
+                    for child in object.values_mut() {
+                        add_retired_budget_fields(child);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        add_retired_budget_fields(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for directory in [
+            repository.session_projection_root(),
+            repository.session_event_root(&session),
+        ] {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    add_retired_budget_fields(&mut value);
+                    fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+                }
+            }
+        }
+        let expected = store
+            .canonical_turn_for_session_turn_id(&session, &turn_id)
+            .unwrap();
+        let (restored, _) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .unwrap();
+        assert_eq!(
+            restored.canonical_turns[0].model_steps,
+            expected.model_steps
+        );
+        assert_eq!(
+            restored.canonical_turns[0]
+                .model_steps
+                .last()
+                .unwrap()
+                .status,
+            magi_session_store::ModelStepStatus::Started
+        );
+        assert_eq!(restored.canonical_turns[0].model_steps[0].attempts.len(), 2);
+        let recovered =
+            SessionStore::from_persisted_parts(restored, store.execution_sidecar_store_state())
+                .unwrap();
+        let goal = recovered.current_goal(&session).unwrap();
+        assert_eq!(goal.status, magi_session_store::GoalStatus::Paused);
+        let resumed = recovered
+            .resume_goal_with_plan(&session, &goal.goal_id, goal.control_revision, None, None)
+            .unwrap()
+            .0;
+        assert_eq!(resumed.tokens_used, goal.tokens_used);
+        assert_eq!(
+            goal.model_attempts_used, 71,
+            "重放必须保留压缩/主子代理和重试的累计次数"
+        );
+        assert_eq!(
+            goal.tokens_used, 138,
+            "旧 projection 不得漏掉 checkpoint/事件中已结算的用量"
+        );
+        assert!(
+            expected
+                .model_steps
+                .iter()
+                .all(|step| step.goal_id.as_ref() == Some(&goal.goal_id))
+        );
+
+        assert!(
+            fs::read_dir(repository.session_event_root(&session))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("checkpoint-"))
+        );
+        // 模拟取消后才收到最后一个请求的响应；只追加结算事件，不重开 Turn。
+        store
+            .update_current_turn_status_for_turn_with_change(&session, Some(&turn_id), "cancelled")
+            .unwrap();
+        store
+            .settle_model_step(
+                &session,
+                &turn_id,
+                "model-call-69",
+                Some("d".repeat(64)),
+                Some(3),
+                None,
+            )
+            .unwrap();
+        let (late_durable, late_sidecars) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .unwrap();
+        let late_restored =
+            SessionStore::from_persisted_parts(late_durable, late_sidecars).unwrap();
+        assert_eq!(
+            late_restored.current_goal(&session).unwrap().tokens_used,
+            141
+        );
+        let closed = late_restored
+            .canonical_turn_for_session_turn_id(&session, &turn_id)
+            .unwrap();
+        assert_eq!(
+            closed.status,
+            magi_session_store::CanonicalTurnStatus::Cancelled
+        );
+        assert_eq!(
+            closed.model_steps.last().unwrap().status,
+            magi_session_store::ModelStepStatus::ResponseReceived
+        );
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn user_question_answer_replays_from_event_log_with_a_stale_projection() {
+        let state_root = unique_temp_dir("magi-question-journal");
+        let repository = StateRepository::new(state_root.clone());
+        repository.verify_state_layout(&[]).unwrap();
+        let (store, turn_id, task_id) = accepted_session_store("question-journal", None, 10);
+        let session = SessionId::new("question-journal");
+        install_test_event_authority(&repository, &store);
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        store.append_current_turn_item_for_turn(&session,Some(&turn_id),serde_json::from_value(serde_json::json!({
+            "itemId":"question-journal-item", "itemSeq":1, "kind":"tool_call_started", "status":"running",
+            "source":"orchestrator", "sourceThreadId":"thread-question-journal", "taskId":task_id,
+            "toolName":"ask_user_question", "toolCallId":"question-journal-call"
+        })).unwrap()).unwrap();
+        let request = magi_session_store::user_question::PendingUserQuestion {
+            question_id: "question-journal-id".into(),
+            session_id: session.clone(),
+            task_id: Some(task_id),
+            turn_id: turn_id.clone(),
+            tool_call_id: "question-journal-call".into(),
+            requested_at: UtcMillis(11),
+            can_skip: true,
+            questions: magi_session_store::user_question::parse_questions(
+                &serde_json::json!({"questions":[{
+                    "header":"方案","question":"选哪个？","options":[{"label":"A"},{"label":"B"}]
+                }]})
+                .to_string(),
+            )
+            .unwrap(),
+        };
+        store.register_user_question(request.clone()).unwrap();
+        // 没有刷新 projection，进程在等待时退出，新的 repository 只能沿日志恢复。
+        let restored_repository = StateRepository::new(state_root.clone());
+        let (durable, sidecars) = restored_repository.load_session_projections(&[]).unwrap();
+        let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+        restored.install_session_event_writer(Arc::new(restored_repository.clone()));
+        restored
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        assert_eq!(
+            restored.pending_user_questions(&session).unwrap(),
+            vec![request.clone()]
+        );
+        let response = magi_session_store::user_question::UserQuestionResponse::Answered {
+            answers: vec![magi_session_store::user_question::UserQuestionAnswer {
+                selected: vec!["B".into()],
+                other: None,
+            }],
+        };
+        restored
+            .resolve_user_question(&session, &request.question_id, response.clone())
+            .unwrap();
+        let (durable, sidecars) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .unwrap();
+        let reloaded = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+        assert!(
+            reloaded
+                .pending_user_questions(&session)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reloaded
+                .user_question_state(&session, &request.question_id)
+                .unwrap()
+                .unwrap()
+                .response,
+            Some(response)
+        );
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn approval_decision_and_cross_turn_claim_replay_without_relaunching_a_tool() {
+        use magi_session_store::tool_approval::{PendingToolApproval, ToolApprovalDecision};
+        let state_root = unique_temp_dir("magi-approval-journal");
+        let repository = StateRepository::new(state_root.clone());
+        repository.verify_state_layout(&[]).unwrap();
+        let (store, turn_id, task_id) = accepted_session_store("approval-journal", None, 10);
+        let session = SessionId::new("approval-journal");
+        install_test_event_authority(&repository, &store);
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        let tool = |id: &str, call: &str| {
+            serde_json::from_value(serde_json::json!({
+            "itemId":id,"itemSeq":1,"kind":"tool_call_started","status":"running","source":"orchestrator", "sourceThreadId":"thread-approval-journal",
+            "taskId":task_id,"toolName":"shell_exec","toolCallId":call,"toolArguments":"{\"command\":\"publish\"}"
+        })).unwrap()
+        };
+        store
+            .append_current_turn_item_for_turn(
+                &session,
+                Some(&turn_id),
+                tool("approval-origin-item", "approval-origin-call"),
+            )
+            .unwrap();
+        let request = PendingToolApproval {
+            approval_id: "approval-journal-id".into(),
+            session_id: session.clone(),
+            task_id: task_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: "approval-origin-call".into(),
+            tool_name: "shell_exec".into(),
+            reason: "publish".into(),
+            requested_at: UtcMillis::now(),
+            agent: None,
+        };
+        store
+            .register_tool_approval(request.clone(), None, serde_json::Value::Null, None)
+            .unwrap();
+        let restored_repository = StateRepository::new(state_root.clone());
+        let (durable, sidecars) = restored_repository.load_session_projections(&[]).unwrap();
+        let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+        restored.install_session_event_writer(Arc::new(restored_repository));
+        restored
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        assert_eq!(
+            restored.pending_tool_approvals(&session).unwrap(),
+            vec![request.clone()]
+        );
+        restored
+            .resolve_tool_approvals(
+                &session,
+                std::slice::from_ref(&request.approval_id),
+                ToolApprovalDecision::AllowOnce,
+            )
+            .unwrap();
+        let now = UtcMillis::now();
+        restored
+            .accept_conversation_turn_with_timeline_entry(
+                session.clone(),
+                None,
+                magi_session_store::TimelineEntryInput::new(
+                    "approval-resume-input",
+                    TimelineEntryKind::UserMessage,
+                    "继续",
+                    now,
+                ),
+                ActiveExecutionTurn {
+                    turn_id: "approval-resume-turn".into(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    status: "running".into(),
+                    completed_at: None,
+                    user_message: Some("继续".into()),
+                    items: vec![tool("approval-target-item", "approval-target-call")],
+                },
+            )
+            .unwrap();
+        let receipt = restored
+            .claim_tool_approval(
+                &session,
+                &task_id,
+                "approval-target-call",
+                "shell_exec",
+                r#"{"command":"publish"}"#,
+                None,
+                &serde_json::Value::Null,
+                std::slice::from_ref(&task_id),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.approval_id, request.approval_id);
+        let (durable, sidecars) = StateRepository::new(state_root.clone())
+            .load_session_projections(&[])
+            .unwrap();
+        let replayed = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+        replayed
+            .validate_approval_execution_links(&session)
+            .unwrap();
+        assert!(
+            replayed
+                .claim_tool_approval(
+                    &session,
+                    &task_id,
+                    "approval-target-call",
+                    "shell_exec",
+                    r#"{"command":"publish"}"#,
+                    None,
+                    &serde_json::Value::Null,
+                    std::slice::from_ref(&task_id),
+                    None
+                )
+                .unwrap()
+                .is_none()
+        );
+        let target = replayed
+            .canonical_turn_for_session_turn_id(&session, "approval-resume-turn")
+            .unwrap();
+        assert_eq!(
+            target.items[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()["status"],
+            "running"
+        );
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn prior_state_layouts_upgrade_write_barrier_once() {
+        for version in 2..=17 {
+            let state_root = unique_temp_dir("magi-state-layout-upgrade");
+            let repository = StateRepository::new(state_root.clone());
+            fs::write(
+                state_root.join("state-layout.json"),
+                format!("{{\"version\":{version}}}"),
+            )
+            .unwrap();
+            repository.verify_state_layout(&[]).unwrap();
+            repository.verify_state_layout(&[]).unwrap();
+            let old: StateLayoutMarker = repository
+                .read_json_strict(&state_root.join(format!("state-layout.v{version}.json")))
+                .unwrap();
+            let current: StateLayoutMarker = repository
+                .read_json_strict(&state_root.join("state-layout.json"))
+                .unwrap();
+            assert_eq!(old.version, version);
+            assert_eq!(current.version, STATE_LAYOUT_VERSION);
+            fs::remove_dir_all(state_root).unwrap();
+        }
+    }
+
+    #[test]
     fn state_layout_only_accepts_the_current_marked_layout() {
         let fresh_root = unique_temp_dir("magi-layout-fresh");
         let fresh = StateRepository::new(fresh_root.clone());
@@ -3983,14 +4856,14 @@ mod tests {
             .session_acceptance_record(&session_id, &turn_id)
             .expect("accepted session should provide recovery record");
         repository
-            .append_canonical_turn_transaction_with_acceptance(
+            .append_session_transaction(
                 &session_id,
                 &[CanonicalTurnMutation {
                     previous: None,
                     next: acceptance.canonical_turn.clone(),
                 }],
-                &acceptance,
-                Some(&accepted_task(task_id, 60)),
+                &[],
+                Some((&acceptance, Some(&accepted_task(task_id, 60)))),
             )
             .expect("accepted event transaction should persist");
         repository
@@ -4096,7 +4969,7 @@ mod tests {
         );
         let session_store =
             SessionStore::from_persisted_parts(durable, sidecars).expect("store should restore");
-        session_store.install_canonical_event_writer(Arc::new(repository.clone()));
+        session_store.install_session_event_writer(Arc::new(repository.clone()));
         let restored_turn = session_store.canonical_turns_for_session(&session_id);
         let turn_id = restored_turn[0].turn_id.clone();
 

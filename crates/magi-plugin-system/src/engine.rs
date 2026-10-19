@@ -38,7 +38,10 @@ pub enum EngineEvent {
 }
 
 pub trait SessionEngineAdapter: Send + Sync {
+    /// 仅检查是否可调用；future 可以在取消时丢弃，不得启动需另行结算的执行。
     fn readiness<'a>(&'a self) -> Pin<Box<dyn Future<Output = EngineReadiness> + Send + 'a>>;
+    /// 取消后必须结算本次调用及资源再返回；不得派生脱离调用的后台执行。
+    /// 宿主同步边界等待该 future 与执行线程退出后，才向 Turn 返回结果。
     fn invoke<'a>(
         &'a self,
         request: SessionEngineRequest,
@@ -147,7 +150,7 @@ impl SessionEngineAdapter for PluginSessionEngine {
                     detail: "会话引擎未返回 events 数组".into(),
                 })?;
             for value in events {
-                if cancelled() {
+                if cancelled() || cancellation.is_cancelled() {
                     return Err(EngineEvent::Failed {
                         code: "cancelled".into(),
                         detail: "会话引擎调用已取消".into(),

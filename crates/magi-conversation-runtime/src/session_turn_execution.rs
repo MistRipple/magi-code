@@ -43,11 +43,11 @@ use crate::{
         upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
         upsert_session_turn_item_for_turn,
     },
-    tool_result_utils::{DeterministicToolFailure, model_round_limit_failure},
+    tool_result_utils::{DeterministicToolFailure, emergency_model_round_failure},
     turn_stream_buffer::TurnStreamBuffer,
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_usage, publish_model_usage_record_for_turn,
+        publish_model_usage_record_for_turn,
         publish_model_usage_record_for_turn_with_context_window, resolved_model_for_usage_binding,
         resolved_provider_for_usage_binding, session_turn_model_usage_binding,
         vision_model_usage_binding,
@@ -356,6 +356,7 @@ fn canonical_session_turn_history(
                                 return None;
                             }
                             Some(ThreadChatMessage {
+                                input_request_id: None,
                                 role: role.to_string(),
                                 content: Some(content),
                                 images: Vec::new(),
@@ -369,6 +370,7 @@ fn canonical_session_turn_history(
                     // 指令才有上下文可依，未处理的引导也不会被模型忽略。
                     if stopped_by_user {
                         messages.push(ThreadChatMessage {
+                            input_request_id: None,
                             role: "assistant".to_string(),
                             content: Some(
                                 "（上面这一轮回复已被用户中断，可能不完整。）".to_string(),
@@ -402,7 +404,7 @@ fn started_tool_call_ids_for_session_thread(
             !tool
                 .result
                 .as_ref()
-                .is_some_and(crate::tool_result_utils::tool_payload_is_awaiting_approval)
+                .is_some_and(crate::tool_result_utils::tool_payload_waits_for_user)
         })
         .map(|tool| tool.call_id)
         .collect()
@@ -548,8 +550,15 @@ fn build_session_turn_messages_with_runtime(
         ));
     }
     messages.extend(history.iter().map(thread_chat_message_to_chat_message));
-    if request.command.is_none() {
+    if request.command.is_none()
+        && !request.request_id.as_ref().is_some_and(|id| {
+            messages
+                .iter()
+                .any(|message| message.input_request_id.as_ref() == Some(id))
+        })
+    {
         messages.push(ChatMessage {
+            input_request_id: request.request_id.clone(),
             context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(prompt.to_string()),
@@ -699,7 +708,7 @@ fn rebuild_messages_for_context_window(
         skill_runtime,
         persist_checkpoint,
     } = input;
-    let fixed_messages =
+    let mut fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,
             request,
@@ -710,6 +719,14 @@ fn rebuild_messages_for_context_window(
             safety_gate: None,
             skill_runtime,
         });
+    let pending_inputs = crate::context_authority::unprojected_input_messages(
+        session_store,
+        &request.session_id,
+        Some(&request.turn_id),
+        thread_id,
+        messages,
+    );
+    fixed_messages.extend(pending_inputs.iter().cloned());
     let compaction_item_id =
         new_context_compaction_item_id(&request.turn_id, thread_id, "context_limit_recovery");
     let compaction_writeback = ContextCompactionWritebackContext {
@@ -774,6 +791,14 @@ fn rebuild_messages_for_context_window(
             safety_gate: None,
             skill_runtime,
         });
+    for input in pending_inputs {
+        if !messages
+            .iter()
+            .any(|message| message.input_request_id == input.input_request_id)
+        {
+            messages.push(input);
+        }
+    }
     Ok(compacted)
 }
 
@@ -1174,7 +1199,7 @@ fn run_session_turn_execution_inner(
     let mut round = 0usize;
     loop {
         // 轮数上限与任务轮次共用：达到上限时按终止失败收口，不再继续调用模型。
-        let round_result = match model_round_limit_failure(round, false) {
+        let round_result = match emergency_model_round_failure(round) {
             Some(failure) => Err(SessionTurnRoundError::RoundLimitReached(failure)),
             None => stream_session_turn_round(SessionTurnRoundRuntime {
                 client,
@@ -1280,6 +1305,7 @@ fn run_session_turn_execution_inner(
                 {
                     empty_response_recovery_attempts += 1;
                     messages.push(ChatMessage {
+                        input_request_id: None,
                         context_origin: Default::default(),
                         role: "user".to_string(),
                         content: Some(model_empty_response_recovery_prompt(false).to_string()),
@@ -1386,6 +1412,7 @@ fn run_session_turn_execution_inner(
             {
                 SessionTurnInputBoundary::Pending(steers) => {
                     messages.push(ChatMessage {
+                        input_request_id: None,
                         context_origin: Default::default(),
                         role: "assistant".to_string(),
                         content: Some(content),
@@ -1411,6 +1438,7 @@ fn run_session_turn_execution_inner(
         }
         if !response_provider_context.is_empty() {
             messages.push(ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
@@ -1422,6 +1450,7 @@ fn run_session_turn_execution_inner(
         }
         empty_response_recovery_attempts += 1;
         messages.push(ChatMessage {
+            input_request_id: None,
             context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(model_empty_response_recovery_prompt(false).to_string()),
@@ -1495,28 +1524,33 @@ fn run_session_turn_execution_inner(
 pub(crate) fn append_session_turn_steers_to_messages(
     messages: &mut Vec<ChatMessage>,
     steers: Vec<UserSignal>,
-) -> bool {
-    let mut appended = false;
+) {
     for signal in steers {
-        let Some(text) = signal
+        if signal.request_id.as_ref().is_some_and(|id| {
+            messages
+                .iter()
+                .any(|message| message.input_request_id.as_ref() == Some(id))
+        }) {
+            continue;
+        }
+        let text = signal
             .text
             .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-        else {
+            .filter(|text| !text.is_empty());
+        if text.is_none() && signal.images.is_empty() {
             continue;
-        };
+        }
         messages.push(ChatMessage {
+            input_request_id: signal.request_id,
             context_origin: Default::default(),
             role: "user".to_string(),
-            content: Some(text),
-            images: Vec::new(),
+            content: text,
+            images: signal.images,
             tool_calls: Vec::new(),
             tool_call_id: None,
             provider_context: Vec::new(),
         });
-        appended = true;
     }
-    appended
 }
 
 fn session_turn_model_error(
@@ -1691,7 +1725,11 @@ fn stream_session_turn_round(
     let thinking_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let writeback_aborted = std::cell::Cell::new(false);
     let writeback_error = std::cell::RefCell::new(None::<String>);
-    let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
+    let call_id = format!(
+        "session-turn-{}-{round}-{}",
+        request.turn_id,
+        UtcMillis::now().0
+    );
     let provider_started_at = Instant::now();
     let first_raw_delta_reported = std::cell::Cell::new(false);
     let first_delta_reported = std::cell::Cell::new(false);
@@ -1897,9 +1935,6 @@ fn stream_session_turn_round(
         }
     };
 
-    let round_goal_id = session_store
-        .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
-        .map(|goal| goal.goal_id);
     let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
         if retry_event.phase == magi_bridge_client::ModelRetryRuntimePhase::Scheduled {
             provider_retry_attempts.set(provider_retry_attempts.get() + 1);
@@ -1920,6 +1955,17 @@ fn stream_session_turn_round(
         tools: None,
         tool_choice: None,
     };
+    let step_client = crate::model_step::StepModelClient::new(
+        client,
+        session_store,
+        &request.session_id,
+        Some(&request.turn_id),
+        None,
+        orchestrator_thread_id,
+        &call_id,
+    )
+    .with_model_binding(settings_store, usage_binding);
+    let client: &dyn ModelBridgeClient = &step_client;
     let non_stream_recovery_template = invocation_request.clone();
     let response = match client.invoke_streaming_with_cancellation(
         invocation_request,
@@ -2041,6 +2087,7 @@ fn stream_session_turn_round(
                     );
                 }
                 messages.push(ChatMessage {
+                    input_request_id: None,
                     context_origin: Default::default(),
                     role: "assistant".to_string(),
                     content: Some(partial_visible_content.clone()),
@@ -2051,6 +2098,7 @@ fn stream_session_turn_round(
                 });
             }
             messages.push(ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "user".to_string(),
                 content: Some(
@@ -2085,9 +2133,11 @@ fn stream_session_turn_round(
                 preserved_visible_chars = partial_visible_content.len(),
                 "流式恢复已耗尽，降级为非流式完成请求"
             );
-            match client.invoke_with_cancellation(recovery_request, &|| {
-                !request_turn_is_writable(session_store, request)
-            }) {
+            match client.invoke_with_retry_events_and_cancellation(
+                recovery_request,
+                &on_retry,
+                &|| !request_turn_is_writable(session_store, request),
+            ) {
                 Ok(response) => response,
                 Err(recovery_error) => {
                     let recovery_raw_error = recovery_error.to_string();
@@ -2175,12 +2225,6 @@ fn stream_session_turn_round(
                 (!has_actionable_output).then(|| "model_empty_response".to_string())
             },
         },
-    );
-    account_active_goal_usage(
-        session_store,
-        &request.session_id,
-        round_goal_id.as_ref(),
-        parsed.usage.as_ref(),
     );
     let timeline_entry_id = None;
     if let Some(error) = writeback_error.into_inner() {
@@ -2307,6 +2351,7 @@ fn stream_session_turn_round(
     // 需要 retire——空回复直接在 canonical turn 里留白即可。
 
     let assistant_response_message = ChatMessage {
+        input_request_id: None,
         context_origin: Default::default(),
         role: "assistant".to_string(),
         content: parsed
@@ -2477,6 +2522,31 @@ fn append_final_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_only_steer_is_delivered_with_its_input_identity_and_original_source() {
+        let image = crate::session_images::SessionTurnImage::from_data_url(
+            "image.png",
+            "data:image/png;base64,AA==",
+        )
+        .unwrap();
+        let mut messages = Vec::new();
+        append_session_turn_steers_to_messages(
+            &mut messages,
+            vec![UserSignal {
+                text: None,
+                images: vec![image.source.clone()],
+                request_id: Some("image-steer".into()),
+                user_message_id: Some("user-image-steer".into()),
+                placeholder_message_id: None,
+                accepted_at: magi_core::UtcMillis(1),
+            }],
+        );
+        assert_eq!(messages[0].input_request_id.as_deref(), Some("image-steer"));
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.is_none());
+        assert_eq!(messages[0].images, vec![image.source]);
+    }
     use crate::session_writeback::append_session_turn_item_for_turn;
     use crate::{
         CanonicalTurnEventSink, CoordinatorAdmission, CoordinatorCommandResult,
@@ -2846,6 +2916,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for CancellingModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -2877,6 +2951,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for RetryEventModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -2930,6 +3008,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for StreamingTextModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -2955,6 +3037,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for CountingEmptyModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -2976,6 +3062,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for CountingTextModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -3007,6 +3097,20 @@ mod tests {
     }
 
     impl ModelBridgeClient for SemanticContextCompactionModelBridgeClient {
+        fn invoke_with_cancellation_and_output_limit(
+            &self,
+            request: ModelInvocationRequest,
+            limit: u32,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            assert!(limit > 0, "压缩夹具必须收到实际输出上限");
+            self.invoke_with_cancellation(request, cancelled)
+        }
+
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -3030,6 +3134,20 @@ mod tests {
     }
 
     impl ModelBridgeClient for FailingContextCompactionModelBridgeClient {
+        fn invoke_with_cancellation_and_output_limit(
+            &self,
+            request: ModelInvocationRequest,
+            limit: u32,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            assert!(limit > 0, "压缩夹具必须收到实际输出上限");
+            self.invoke_with_cancellation(request, cancelled)
+        }
+
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3052,6 +3170,20 @@ mod tests {
     }
 
     impl ModelBridgeClient for CancellingContextCompactionModelBridgeClient {
+        fn invoke_with_cancellation_and_output_limit(
+            &self,
+            request: ModelInvocationRequest,
+            limit: u32,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            assert!(limit > 0, "压缩夹具必须收到实际输出上限");
+            self.invoke_with_cancellation(request, cancelled)
+        }
+
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3072,6 +3204,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for EmptyStreamThenRecoveredSessionModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3228,6 +3364,7 @@ mod tests {
             &thread_id,
             vec![
                 ThreadChatMessage {
+                    input_request_id: None,
                     role: "user".to_string(),
                     content: Some("历史约束：保留表格结构".to_string()),
                     images: Vec::new(),
@@ -3236,6 +3373,7 @@ mod tests {
                     provider_context: Vec::new(),
                 },
                 ThreadChatMessage {
+                    input_request_id: None,
                     role: "assistant".to_string(),
                     content: Some("已确认历史约束".to_string()),
                     images: Vec::new(),
@@ -3455,6 +3593,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for FailingModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3501,6 +3643,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for SteeringModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -3517,6 +3663,7 @@ mod tests {
                         &self.session_id,
                         &self.turn_id,
                         UserSignal {
+                            images: Vec::new(),
                             text: Some("优先收口，不要继续扩展".to_string()),
                             request_id: Some("request-steer-runtime".to_string()),
                             user_message_id: Some("user-steer-runtime".to_string()),
@@ -3570,6 +3717,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for PlanFollowUpModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -3759,7 +3910,6 @@ mod tests {
                 goal_turn_id,
                 "验证普通 Turn 不接管等待中的 Goal",
                 AccessProfile::Restricted,
-                None,
             )
             .expect("goal should create");
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
@@ -3794,7 +3944,6 @@ mod tests {
                 &goal.goal_id,
                 paused.control_revision,
                 Some(paused_plan.revision),
-                None,
                 None,
             )
             .expect("goal resume request should wait for an owner");
@@ -3877,6 +4026,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
@@ -3904,6 +4057,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for InterruptedThenRecoveredSessionModelBridgeClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -4616,6 +4773,7 @@ mod tests {
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
+            input_request_id: None,
             context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(request.prompt.clone()),
@@ -4735,6 +4893,7 @@ mod tests {
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
+            input_request_id: None,
             context_origin: Default::default(),
             role: "user".to_string(),
             content: Some(request.prompt.clone()),
@@ -4784,6 +4943,7 @@ mod tests {
     fn session_turn_messages_include_persisted_history_before_current_turn() {
         let session_id = SessionId::new("session-context-history");
         let store = SessionStore::from_state(SessionStoreState {
+            inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -4821,6 +4981,7 @@ mod tests {
                 },
             ],
             canonical_turns: vec![CanonicalTurn {
+                model_steps: Vec::new(),
                 session_id: session_id.clone(),
                 turn_id: "turn-prev".to_string(),
                 turn_seq: 1000,
@@ -5008,6 +5169,7 @@ mod tests {
         let tool_call_id = "call-interrupted-shell".to_string();
         let tool_arguments = r#"{"command":"sleep 20; printf done"}"#.to_string();
         let store = SessionStore::from_state(SessionStoreState {
+            inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -5023,6 +5185,7 @@ mod tests {
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
+                model_steps: Vec::new(),
                 session_id: session_id.clone(),
                 turn_id: "turn-interrupted-tool".to_string(),
                 turn_seq: 1_000,
@@ -5078,6 +5241,7 @@ mod tests {
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
                 message_history: vec![ThreadChatMessage {
+                    input_request_id: None,
                     role: "assistant".to_string(),
                     content: None,
                     images: Vec::new(),
@@ -5125,6 +5289,7 @@ mod tests {
         let tool_call_id = "call-interrupted-shell".to_string();
         let tool_arguments = r#"{"command":"rm -rf build"}"#.to_string();
         let store = SessionStore::from_state(SessionStoreState {
+            inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -5140,6 +5305,7 @@ mod tests {
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
+                model_steps: Vec::new(),
                 session_id: session_id.clone(),
                 turn_id: "turn-interrupted-tool".to_string(),
                 turn_seq: 1_000,
@@ -5199,6 +5365,7 @@ mod tests {
                 observed_context_window_tokens: None,
                 handled_task_ids: Vec::new(),
                 message_history: vec![ThreadChatMessage {
+                    input_request_id: None,
                     role: "assistant".to_string(),
                     content: None,
                     images: Vec::new(),
@@ -5260,6 +5427,7 @@ mod tests {
         let session_id = SessionId::new("session-context-history-cancelled");
         let thread_id = magi_core::ThreadId::new("thread-context-history-cancelled");
         let store = SessionStore::from_state(SessionStoreState {
+            inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -5275,6 +5443,7 @@ mod tests {
             }],
             timeline: Vec::new(),
             canonical_turns: vec![CanonicalTurn {
+                model_steps: Vec::new(),
                 session_id: session_id.clone(),
                 turn_id: "turn-cancelled".to_string(),
                 turn_seq: 1_000,
@@ -5383,6 +5552,7 @@ mod tests {
             .map(|index| {
                 let turn_seq = 1_000 + index * 100;
                 CanonicalTurn {
+                    model_steps: Vec::new(),
                     session_id: session_id.clone(),
                     turn_id: format!("turn-history-{index}"),
                     turn_seq,
@@ -5442,6 +5612,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let store = SessionStore::from_state(SessionStoreState {
+            inputs: Vec::new(),
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
                 session_id: session_id.clone(),
@@ -6026,6 +6197,7 @@ mod tests {
         let content_hash = magi_snapshot::path_content_hash(&file_path).expect("hash file fact");
         let mut history = vec![
             ThreadChatMessage {
+                input_request_id: None,
                 role: "user".to_string(),
                 content: Some("读取 facts.txt 并继续完成任务".to_string()),
                 images: Vec::new(),
@@ -6034,6 +6206,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -6049,6 +6222,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "tool".to_string(),
                 content: Some(
                     serde_json::json!({
@@ -6067,6 +6241,7 @@ mod tests {
             },
         ];
         history.extend((0..24).map(|index| ThreadChatMessage {
+            input_request_id: None,
             role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
             content: Some("x".repeat(1_000)),
             images: Vec::new(),
@@ -6165,6 +6340,7 @@ mod tests {
             &thread_id,
             (0..32)
                 .map(|index| ThreadChatMessage {
+                    input_request_id: None,
                     role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
                     content: Some("x".repeat(1_000)),
                     images: Vec::new(),
@@ -6263,6 +6439,7 @@ mod tests {
             &thread_id,
             (0..32)
                 .map(|index| ThreadChatMessage {
+                    input_request_id: None,
                     role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
                     content: Some("x".repeat(1_000)),
                     images: Vec::new(),

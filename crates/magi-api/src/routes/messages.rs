@@ -465,6 +465,7 @@ mod tests {
                 }],
                 timeline: Vec::new(),
                 canonical_turns: Vec::new(),
+                inputs: Vec::new(),
                 notifications: Vec::new(),
                 goals: Vec::new(),
                 plans: Vec::new(),

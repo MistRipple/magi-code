@@ -4,6 +4,8 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 await withGoldenViteServer(async (server) => {
   const policy = await server.ssrLoadModule('/src/lib/composer-policy.ts');
   const actions = await server.ssrLoadModule('/src/lib/composer-actions.ts');
+  assert.equal(policy.queuedMessageEditable({ interruptTurnId: 'old-turn' }), false,
+    '停止并改做的原输入不能编辑成普通投递');
 
   // 会话命令：草稿会话没有可压缩内容；带附件时 daemon 会拒绝。
   assert.equal(

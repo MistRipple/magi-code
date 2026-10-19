@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount, type Component } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
+  import { turnStoreState } from '../stores/turn-store.svelte';
+  import { isLocalOptimisticTurn } from '../stores/turn-reducer';
+  import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
   import {
     addToast,
     cancelTurnEditing,
@@ -137,7 +140,17 @@
     return `${selection.pluginId}/${selection.resourceId}@${selection.version}:${JSON.stringify(selection.selection ?? null)}`;
   }
 
+  interface QueuedMessageEdit {
+    queueId: string;
+    revision: number;
+    sessionId: string;
+    workspaceId: string;
+    workspacePath: string;
+  }
+
   interface ComposerSubmissionDraft {
+    queuedEdit?: QueuedMessageEdit | null;
+    accessProfile?: AccessProfile;
     text: string;
     images: SelectedImage[];
     contextReferences: ComposerContextReference[];
@@ -501,8 +514,19 @@
     if (!projection || !sessionId || !rootTaskId) return false;
     return projection.runner_status === 'running';
   });
+  const interruptTargetTurnId = $derived.by(() => {
+    const turns = turnStoreState.reducer.turns.filter((turn) => (
+      turn.sessionId === messagesState.currentSessionId
+      && !isCanonicalTerminalStatus(turn.status)
+      && !isLocalOptimisticTurn(turn)
+    ));
+    return turns.length === 1 ? turns[0].turnId : null;
+  });
+  let queueEditPending = $state(false);
+  let queueEditConflict = $state('');
+  let editingQueuedMessage = $state<QueuedMessageEdit | null>(null);
   const sessionInputLocked = $derived.by(() => (
-    sessionNavigationState.pending !== null || messagesState.sessionHydrating
+    queueEditPending || sessionNavigationState.pending !== null || messagesState.sessionHydrating
   ));
 
   const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
@@ -521,6 +545,7 @@
     if (sendPreparing) {
       return i18n.t('input.sending');
     }
+    if (editingQueuedMessage) return i18n.t('input.queue.save');
     if (isSending) {
       return i18n.t('input.followUp.queueTitle');
     }
@@ -533,8 +558,8 @@
   let webSendBlocked = $state(false);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || isInteractionBlocking || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!mainModelReady && selectedPluginCommand?.pluginCommandId !== WEB_MODEL_SETUP_COMMAND && !setupIsActive(setupStatus))
-    || (isDraftSession && isSending) || (webSendBlocked && !setupIsActive(setupStatus))
+    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady && selectedPluginCommand?.pluginCommandId !== WEB_MODEL_SETUP_COMMAND && !setupIsActive(setupStatus))
+    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked && !setupIsActive(setupStatus))
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -668,6 +693,8 @@
     if (!options.preserveScopedDraft && composerReferenceScopeKey) {
       scopedComposerDrafts.delete(composerReferenceScopeKey);
     }
+    editingQueuedMessage = null;
+    queueEditConflict = '';
     inputValue = '';
     selectedImages = [];
     selectedContextReferences = [];
@@ -687,7 +714,7 @@
 
   function composerHasDraft(): boolean {
     return Boolean(
-      inputValue.trim()
+      editingQueuedMessage || inputValue.trim()
       || selectedImages.length > 0
       || selectedContextReferences.length > 0
       || selectedBrowserAnnotations.length > 0
@@ -835,6 +862,8 @@
 
   function captureComposerSubmissionDraft(text: string): ComposerSubmissionDraft {
     return {
+      queuedEdit: editingQueuedMessage ? { ...editingQueuedMessage } : null,
+      accessProfile: selectedAccessProfile,
       text,
       images: selectedImages.map((image) => ({ ...image })),
       contextReferences: selectedContextReferences.map((reference) => ({ ...reference })),
@@ -850,7 +879,7 @@
   }
 
   function composerIsPristineForSubmissionRecovery(): boolean {
-    return !editingTurn
+    return !editingTurn && !editingQueuedMessage
       && !resolveComposerRawContent().trim()
       && selectedImages.length === 0
       && selectedContextReferences.length === 0
@@ -866,6 +895,9 @@
 
   function restoreComposerSubmissionDraft(draft: ComposerSubmissionDraft): void {
     invalidateEnhanceState();
+    editingQueuedMessage = draft.queuedEdit ? { ...draft.queuedEdit } : null;
+    queueEditConflict = '';
+    if (draft.accessProfile) selectedAccessProfile = draft.accessProfile;
     inputValue = draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({ ...image }));
@@ -914,6 +946,8 @@
     if (draft.turnId === loadedEditingTurnId) return;
     loadedEditingTurnId = draft.turnId;
     invalidateEnhanceState();
+    editingQueuedMessage = null;
+    queueEditConflict = '';
     inputValue = draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({
@@ -948,7 +982,8 @@
   });
 
   function cancelMessageEditing(): void {
-    cancelTurnEditing();
+    if (editingQueuedMessage) clearComposerState();
+    else cancelTurnEditing();
   }
 
   let imageReadWaiters: Array<() => void> = [];
@@ -1896,14 +1931,15 @@
   }
 
   // 发送消息（支持图片附件）。
-  // 空闲时直接执行；正在响应时自动进入排队，由 bridge 在当前轮结束后逐条提交。
-  async function sendMessage() {
+  // daemon 持久接纳投递意图；替代输入等待原执行结算后才启动。
+  async function sendMessage(interruptTurnId: string | null = null) {
     if (sendPreparing) return;
     sendPreparing = true;
     try {
       await waitForPendingImageReads();
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
+      if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
       // 配置正在等待用户时，短回复作为明确的配置控制输入；不交给 GPT Web 回发。
       if (setupIsActive(setupStatus)) {
         if (/\bsk[-_][A-Za-z0-9_-]{8,}/u.test(normalizedContent)) {
@@ -1934,7 +1970,7 @@
       if (
         (!normalizedContent && selectedSessionCommand === null && selectedWorkflow === null && selectedPluginCommand === null && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0 && selectedBrowserNodeSelections.length === 0 && selectedPluginSelections.length === 0)
         || sessionInputLocked
-        || isInteractionBlocking
+        || (isInteractionBlocking && !interruptTurnId)
         || (isDraftSession && isSending)
       ) return;
       if (selectedSessionCommand !== null && attachmentTotal > 0) {
@@ -1972,6 +2008,7 @@
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
+      if (interruptTurnId && (replaceTurnId || selectedSessionCommand || selectedPluginCommand)) return;
       if (!replaceTurnId) {
         submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
       }
@@ -1989,8 +2026,8 @@
         pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
         accessProfile: selectedAccessProfile,
         ...(isDraftSession ? { orchestratorSessionConfig } : {}),
-        followUpMode: !replaceTurnId && !isDraftSession && isSending ? 'queue' : undefined,
         replaceTurnId,
+        interruptTurnId,
         images: selectedImages.map((img) => ({
           name: img.name,
           dataUrl: img.dataUrl,
@@ -2099,42 +2136,43 @@
     }
   }
 
-  function deleteQueuedMessage(queuedMessageId: string) {
+  function deleteQueuedMessage(queuedMessageId: string, expectedRevision?: number) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
+    if (!normalizedId || typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) return;
     vscode.postMessage({
       type: 'removeQueuedMessage',
       queuedMessageId: normalizedId,
+      expectedRevision,
     });
-  }
-
-  function canGuideQueuedMessage(queued: QueuedMessage): boolean {
-    return queued.canGuide === true;
   }
 
   function guideQueuedMessageTitle(queued: QueuedMessage): string {
-    if (queued.canGuide !== true) {
-      return i18n.t('input.queue.guideUnavailable');
+    switch (queued.guide?.status) {
+      case 'ready': return i18n.t('input.queue.guideTitle');
+      case 'no_active_turn': return i18n.t('input.queue.guideNoActiveTurn');
+      case 'input_closed': return i18n.t('input.queue.guideInputClosed');
+      case 'unsupported_input': return i18n.t('input.queue.guideUnsupportedInput');
+      case 'unsupported_executor': return i18n.t('input.queue.guideUnsupportedExecutor');
+      default: return i18n.t('input.queue.guideUnavailable');
     }
-    return i18n.t('input.queue.guideTitle');
   }
 
-  function guideQueuedMessage(queuedMessageId: string) {
-    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
+  function guideQueuedMessage(queued: QueuedMessage) {
+    if (queued.guide?.status !== 'ready' || !queued.guide.targetTurnId) return;
     vscode.postMessage({
       type: 'guideQueuedMessage',
-      queuedMessageId: normalizedId,
+      queuedMessageId: queued.id,
+      expectedTurnId: queued.guide.targetTurnId,
+      expectedRevision: queued.revision,
     });
   }
 
-  // 编辑 = 把排队消息整条取回输入框（文字、图片、引用、命令、目标 / skill），队列移除仍由服务端权威请求完成，
-  // 失败时原消息会保留并重新同步。输入框里已有草稿时不覆盖，更不能悄悄丢掉排队消息里的附件。
+  // 草稿只保存视图编辑状态；原 Input 一直留在 daemon，保存时以原 revision 竞争领取。
   function editQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
+    if (!normalizedId || queueEditPending) return;
     const target = messagesState.queuedMessages.find((message) => message.id === normalizedId);
-    if (!target) return;
+    if (!target || typeof target.revision !== 'number' || target.revision < 1) return;
     if (!queuedMessageEditable(target)) {
       addToast('info', i18n.t('input.queue.editBlocked'), undefined, { forceVisible: true });
       return;
@@ -2152,11 +2190,10 @@
       ? availableSkills.find((skill) => skill.skillId === skillId)
         ?? { skillId, name: skillId, description: '' }
       : null;
-    vscode.postMessage({
-      type: 'removeQueuedMessage',
-      queuedMessageId: normalizedId,
-    });
-    restoreComposerSubmissionDraft({
+    const draft: ComposerSubmissionDraft = {
+      accessProfile: isAccessProfile(target.accessProfile) ? target.accessProfile : selectedAccessProfile,
+      queuedEdit: { queueId: target.id, revision: target.revision, sessionId: messagesState.currentSessionId || '',
+        workspaceId: target.workspaceId || '', workspacePath: target.workspacePath || '' },
       text: (target.text ?? target.content ?? '').toString(),
       images: (target.images ?? []).map((image) => ({
         id: generateId(),
@@ -2179,7 +2216,62 @@
         ? availablePluginCommands.find((command) => command.pluginCommandId === target.pluginCommandId)
           ?? { pluginCommandId: target.pluginCommandId, name: target.pluginCommandId, description: '' }
         : null,
-    });
+    };
+    restoreComposerSubmissionDraft(draft);
+  }
+
+  async function saveQueuedMessage(text: string): Promise<void> {
+    const target = editingQueuedMessage;
+    if (!target || target.sessionId !== messagesState.currentSessionId || sessionInputLocked) return;
+    if (text.length > MAX_INPUT_CHARS) {
+      addToast('warning', i18n.t('input.inputTooLong', { length: text.length, max: MAX_INPUT_CHARS }));
+      return;
+    }
+    const originScope = currentComposerReferenceScopeKey();
+    const editRequestId = generateId();
+    queueEditPending = true;
+    queueEditConflict = '';
+    let onUpdated: (event: Event) => void = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await new Promise<{ updated: boolean; errorMessage?: string }>((resolve) => {
+        onUpdated = (event: Event) => {
+          const detail = (event as CustomEvent<{ requestId: string; sessionId: string; updated: boolean; errorMessage?: string }>).detail;
+          if (detail?.requestId === editRequestId && detail.sessionId === target.sessionId) {
+            resolve({ updated: detail.updated === true, errorMessage: detail.errorMessage });
+          }
+        };
+        window.addEventListener('magi:queuedMessageUpdated', onUpdated);
+        timer = setTimeout(() => {
+          resolve({ updated: false, errorMessage: i18n.t('input.queue.saveUnknown') });
+        }, 120_000);
+        vscode.postMessage({ type: 'updateQueuedMessage', queuedMessageId: target.queueId,
+          expectedRevision: target.revision, editRequestId, request: {
+            scope: target.workspaceId || target.workspacePath ? 'workspace' : 'personal',
+            sessionId: target.sessionId, workspaceId: target.workspaceId || null, workspacePath: target.workspacePath || null,
+            text, skillName: selectedSkill?.skillId ?? null, goalMode: selectedGoalMode, command: selectedSessionCommand,
+            workflowId: selectedWorkflow?.workflowId ?? null, pluginCommandId: selectedPluginCommand?.pluginCommandId ?? null,
+            accessProfile: selectedAccessProfile, locale: i18n.locale,
+            images: selectedImages.map(image => ({ name: image.name, dataUrl: image.dataUrl })),
+            contextReferences: toSessionContextReferencePayload(selectedContextReferences),
+            browserAnnotationRefs: selectedBrowserAnnotations.map(annotation => annotation.annotationId),
+            browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
+            pluginSelections: selectedPluginSelections.map(selection => ({ ...selection })),
+          } });
+      });
+      if (!result.updated) {
+        if (currentComposerReferenceScopeKey() === originScope) {
+          queueEditConflict = result.errorMessage || i18n.t('input.queue.saveConflict');
+        }
+        return;
+      }
+      if (currentComposerReferenceScopeKey() === originScope) clearComposerState();
+      else scopedComposerDrafts.delete(originScope);
+    } finally {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener('magi:queuedMessageUpdated', onUpdated);
+      queueEditPending = false;
+    }
   }
 
   // 拖动调整大小
@@ -2917,7 +3009,7 @@
       </div>
       <div class="ia-queue-list">
         {#each queuedMessages as queued (queued.id)}
-          {@const guideAvailable = canGuideQueuedMessage(queued)}
+          {@const guideAvailable = queued.guide?.status === 'ready' && Boolean(queued.guide.targetTurnId)}
           {@const attachments = summarizeQueuedMessage(queued)}
           {@const commandLabel = resolveUserMessageCommandLabel({
             sessionCommand: queued.command,
@@ -2927,6 +3019,9 @@
           <div class="ia-queue-item dock-row">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>
+              {#if queued.interruptTurnId}
+                <span class="ia-queue-badge">{i18n.t('input.followUp.replacing')}</span>
+              {/if}
               {#if commandLabel}<span class="ia-queue-command">{commandLabel}</span>{/if}
               {#if attachments.images > 0}
                 <span class="ia-queue-badge">{i18n.t('input.queue.badge.images', { count: attachments.images })}</span>
@@ -2938,13 +3033,22 @@
                 <span class="ia-queue-badge">{i18n.t('input.queue.badge.annotations', { count: attachments.annotations })}</span>
               {/if}
               {queued.content}
+              {#if queued.interruptionError}
+                <span class="ia-queue-badge" title={queued.interruptionError}>{queued.interruptionError}</span>
+              {/if}
             </div>
             <div class="ia-queue-actions">
+              {#if queued.interruptTurnId && queued.interruptionError}
+                <button type="button" class="ia-queue-action dock-btn"
+                  onclick={() => vscode.postMessage({ type: 'retryQueuedMessage', queuedMessageId: queued.id, expectedRevision: queued.revision })}
+                >{i18n.t('input.followUp.retry')}</button>
+              {/if}
+              {#if !queued.interruptTurnId}
               <button
                 type="button"
                 class="ia-queue-action ia-queue-guide dock-btn"
                 disabled={!guideAvailable}
-                onclick={() => guideQueuedMessage(queued.id)}
+                onclick={() => guideQueuedMessage(queued)}
                 title={guideQueuedMessageTitle(queued)}
                 aria-label={guideQueuedMessageTitle(queued)}
               >
@@ -2954,16 +3058,18 @@
               <button
                 type="button"
                 class="ia-queue-action dock-icon-btn"
+                disabled={!queuedMessageEditable(queued)}
                 onclick={() => editQueuedMessage(queued.id)}
                 title={i18n.t('input.queue.edit')}
                 aria-label={i18n.t('input.queue.edit')}
               >
                 <Icon name="edit" size={12} />
               </button>
+              {/if}
               <button
                 type="button"
                 class="ia-queue-action dock-icon-btn dock-icon-btn--danger"
-                onclick={() => deleteQueuedMessage(queued.id)}
+                onclick={() => deleteQueuedMessage(queued.id, queued.revision)}
                 title={i18n.t('input.queue.delete')}
                 aria-label={i18n.t('input.queue.delete')}
               >
@@ -2993,10 +3099,11 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
 
-    {#if editingTurn}
-      <div class="ia-editing-bar" role="status">
-        <span>{i18n.t('input.editingPreviousMessage')}</span>
-        <button type="button" onclick={cancelMessageEditing}>{i18n.t('input.cancelEditing')}</button>
+    {#if editingTurn || editingQueuedMessage}
+      <div class="ia-editing-bar" role="status" data-testid="input-editing-bar">
+        <span>{i18n.t(editingQueuedMessage ? 'input.queue.editing' : 'input.editingPreviousMessage')}</span>
+        {#if queueEditConflict}<span class="ia-editing-conflict" role="alert">{queueEditConflict}</span>{/if}
+        <button type="button" onclick={cancelMessageEditing} disabled={queueEditPending}>{i18n.t('input.cancelEditing')}</button>
       </div>
     {/if}
 
@@ -3186,11 +3293,11 @@
       data-testid="input-textarea"
       class:has-images={selectedImages.length > 0}
       class:is-empty={!inputValue}
-      contenteditable={!(sessionInputLocked || isInteractionBlocking)}
+      contenteditable={!(sessionInputLocked || (isInteractionBlocking && !editingQueuedMessage))}
       role="textbox"
-      tabindex={sessionInputLocked || isInteractionBlocking ? -1 : 0}
+      tabindex={sessionInputLocked || (isInteractionBlocking && !editingQueuedMessage) ? -1 : 0}
       aria-multiline="true"
-      aria-disabled={sessionInputLocked || isInteractionBlocking}
+      aria-disabled={sessionInputLocked || (isInteractionBlocking && !editingQueuedMessage)}
       data-placeholder={selectedGoalMode
         ? i18n.t('input.placeholderWithGoal')
         : selectedSessionCommand
@@ -3703,12 +3810,31 @@
             <Icon name="undo" size={14} />
           </button>
           {/if}
-          {#if isSending}
+          {#if editingQueuedMessage}
+          <button
+            class="ia-send ready"
+            data-testid="input-queue-save-button"
+            onclick={() => sendMessage()}
+            disabled={sendDisabled || !hasContent}
+            title={sendButtonTitle}
+            aria-label={sendButtonTitle}
+          >
+            <Icon name={sendPreparing ? 'loader' : 'check'} size={14} class={sendPreparing ? 'spinning' : ''} />
+          </button>
+          {:else if isSending}
           {#if hasContent}
+            <button
+              type="button"
+              class="ia-queue-action dock-btn"
+              data-testid="input-replace-button"
+              onclick={() => interruptTargetTurnId && sendMessage(interruptTargetTurnId)}
+              disabled={sessionInputLocked || sendPreparing || pendingImageReadCount > 0 || !mainModelReady || !interruptTargetTurnId || Boolean(editingTurn || editingQueuedMessage || selectedSessionCommand || selectedPluginCommand)}
+              title={i18n.t('input.followUp.replaceTitle')}
+            >{i18n.t('input.followUp.replace')}</button>
             <button
               class="ia-send ready"
               data-testid="input-followup-send-button"
-              onclick={sendMessage}
+              onclick={() => sendMessage()}
               disabled={sendDisabled}
               title={sendButtonTitle}
             >
@@ -3729,7 +3855,7 @@
           <button
             class="ia-send ready"
             data-testid="input-send-button"
-            onclick={sendMessage}
+            onclick={() => sendMessage()}
             disabled={sendDisabled}
             title={sendButtonTitle}
           >
@@ -3873,6 +3999,7 @@
 
   .ia-editing-bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: var(--space-3);
@@ -3897,6 +4024,12 @@
   .ia-editing-bar button:hover,
   .ia-editing-bar button:focus-visible {
     background: var(--primary-muted);
+  }
+
+  .ia-editing-conflict {
+    flex-basis: 100%;
+    order: 1;
+    color: var(--error);
   }
 
   /* 拖拽调整：视觉 2px 指示器，交互区域 10px */

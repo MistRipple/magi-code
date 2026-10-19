@@ -17,7 +17,27 @@ use magi_session_store::{ActiveExecutionTurn, SessionPlan};
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/agent-runs/action", post(perform_task_action))
+        .route("/agent-runs/transfer", post(transfer_agent_run))
+        .route("/agent-runs/continue", post(continue_agent_run))
         .route("/agent-runs/workflow-answer", post(answer_workflow))
+}
+
+async fn continue_agent_run(
+    State(state): State<ApiState>,
+    Json(request): Json<magi_app_server_protocol::generated::AgentContinueParams>,
+) -> Result<Json<magi_app_server_protocol::generated::AgentContinueResult>, ApiError> {
+    crate::agent_service::continue_agent_run(&state, request)
+        .await
+        .map(Json)
+}
+
+async fn transfer_agent_run(
+    State(state): State<ApiState>,
+    Json(request): Json<magi_app_server_protocol::generated::AgentTransferParams>,
+) -> Result<Json<magi_app_server_protocol::generated::AgentTransferResult>, ApiError> {
+    crate::agent_service::transfer_agent_run(&state, request)
+        .await
+        .map(Json)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -314,6 +334,18 @@ fn ensure_terminal_root_action(
     Ok(root_task)
 }
 
+/// 运行中心的 Continue/Restart/Archive 是执行链级操作，不能把某个子代理的
+/// task_id 当成 root task_id 处理。否则收到子代理的“重新执行”请求时，
+/// 旧实现会静默重启整条主线，造成错误的唤起和重复副作用。
+fn ensure_root_action_target(task: &magi_core::Task, action: &str) -> Result<(), ApiError> {
+    if task.task_id != task.root_task_id || task.parent_task_id.is_some() {
+        return Err(ApiError::InvalidInput(format!(
+            "主线{action}入口只接受根任务 taskId；不能把子代理请求转换为主线操作"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_supported_root_action(
     root_task: &magi_core::Task,
     action: AgentRunActionKind,
@@ -406,7 +438,7 @@ async fn continue_task(
     if task_id.is_empty() {
         return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
     }
-    let (scope, task) = require_session_owned_task(
+    let (scope, task) = require_session_historical_task(
         &state,
         request.session_id.as_deref(),
         request.scope,
@@ -414,9 +446,10 @@ async fn continue_task(
         request.workspace_path.as_deref(),
         task_id,
     )?;
+    ensure_root_action_target(&task, "继续")?;
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "继续")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Continue, "继续")?;
-    let response = crate::turn_service::continue_session(
+    let response = crate::turn_service::continue_session_with_expected_root(
         &state,
         crate::dto::ContinueSessionRequest {
             session_id: scope.session_id.to_string(),
@@ -428,6 +461,7 @@ async fn continue_task(
             user_message_id: None,
             placeholder_message_id: None,
         },
+        Some(&task.task_id),
     )
     .await?;
     let mut payload = serde_json::to_value(response)
@@ -456,6 +490,7 @@ async fn restart_task(
         request.workspace_path.as_deref(),
         task_id,
     )?;
+    ensure_root_action_target(&task, "重新执行")?;
     let session_id = scope.session_id.clone();
     let requested_root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
     let manager = state
@@ -510,6 +545,7 @@ async fn restart_task(
         steer_current_turn: false,
         expected_turn_id: None,
         replace_turn_id: None,
+        interrupt_turn_id: None,
         command: None,
         workflow_id: None,
         plugin_command_id: None,
@@ -593,7 +629,7 @@ async fn archive_task(
     if task_id.is_empty() {
         return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
     }
-    let (scope, task) = require_session_owned_task(
+    let (scope, task) = require_session_historical_task(
         &state,
         request.session_id.as_deref(),
         request.scope,
@@ -601,6 +637,7 @@ async fn archive_task(
         request.workspace_path.as_deref(),
         task_id,
     )?;
+    ensure_root_action_target(&task, "从面板移除")?;
     let session_id = scope.session_id.clone();
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "从面板移除")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Archive, "归档")?;
@@ -733,5 +770,17 @@ mod tests {
             vec![AgentRunActionKind::Archive]
         );
         assert!(!AgentRunActionKind::Restart.supports_status(TaskStatus::Completed));
+    }
+
+    #[test]
+    fn root_actions_reject_child_tasks_before_resolving_or_mutating_the_root() {
+        let mut child = terminal_root_task_with_binding(TaskExecutorBinding::for_role("executor"));
+        child.task_id = TaskId::new("task-child");
+        child.root_task_id = TaskId::new("task-root");
+        child.parent_task_id = Some(TaskId::new("task-root"));
+        for action in ["继续", "重新执行", "从面板移除"] {
+            let error = ensure_root_action_target(&child, action).unwrap_err();
+            assert!(matches!(error, ApiError::InvalidInput(message) if message.contains("根任务")));
+        }
     }
 }

@@ -614,6 +614,7 @@ mod tests {
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
             },
+            inputs: vec![],
         });
         let project_recent_turn_store = ProjectRecentTurnStore::default();
         project_recent_turn_store.upsert(ProjectRecentTurnRecord {
@@ -798,6 +799,7 @@ mod tests {
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
             },
+            inputs: vec![],
         });
 
         // --- project recent turns: 2 entries ---
@@ -1054,6 +1056,7 @@ mod tests {
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
             },
+            inputs: vec![],
         });
 
         let shared_context_pool = SharedContextPool::default();
@@ -1615,6 +1618,7 @@ mod tests {
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
             },
+            inputs: vec![],
         });
 
         // project recent turns: 2 entries, one with same content "shared turn"
@@ -1799,6 +1803,7 @@ mod tests {
                 execution_sidecar_store: SessionExecutionSidecarStoreState {
                     runtime_sidecars: vec![],
                 },
+                inputs: vec![],
             }),
             shared_context_pool,
             file_summary_store,

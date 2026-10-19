@@ -184,7 +184,9 @@ function rustEnum(name, definition) {
       : `${pascal.charAt(0).toUpperCase()}${pascal.slice(1)}`.replace(/^[0-9]/, 'Value$&') || 'Value';
     return `    #[serde(rename = ${JSON.stringify(value)})]\n    ${variant},`;
   });
-  return ['#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]', '#[serde(rename_all = "camelCase")]', `pub enum ${name} {`, ...variants, '}'].join('\n');
+  const derives = ['Clone', 'Debug', 'PartialEq', 'Serialize', 'Deserialize'];
+  if (definition['x-rust-derive-eq']) derives.push('Eq');
+  return [`#[derive(${derives.join(', ')})]`, '#[serde(rename_all = "camelCase")]', `pub enum ${name} {`, ...variants, '}'].join('\n');
 }
 
 function rustUnionVariantName(schema, index) {
@@ -223,6 +225,7 @@ function rustStruct(name, definition) {
   });
   const derives = ['Clone', 'Debug', 'PartialEq', 'Serialize', 'Deserialize'];
   if (definition['x-rust-derive-default']) derives.push('Default');
+  if (definition['x-rust-derive-eq']) derives.push('Eq');
   const declaration = fields.length
     ? [`pub struct ${name} {`, ...fields, '}']
     : [`pub struct ${name} {}`];

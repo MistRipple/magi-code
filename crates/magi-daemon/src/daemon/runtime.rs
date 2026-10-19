@@ -35,7 +35,6 @@ use magi_conversation_runtime::{
     task_completion_notifier::TaskCompletionNotifier,
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
     task_execution_registry::{AgentSpawnPreflightRuntime, TaskExecutionRegistry},
-    task_runner_bridge::EventBasedResultReceiver,
     usage_recording::{
         ModelUsageRecordInput, image_generation_model_usage_binding,
         publish_model_usage_record_with_config,
@@ -51,7 +50,7 @@ use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{OrchestratedExecutionRuntime, task_store::TaskStore};
 use magi_process::ManagedProcessGroup;
-use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
+use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_settings_store::SettingsStore;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_snapshot::SnapshotManager;
@@ -627,6 +626,10 @@ impl UnavailableBusinessModelBridgeClient {
 }
 
 impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::text_executor_capabilities()
+    }
+
     fn invoke(
         &self,
         _request: magi_bridge_client::ModelInvocationRequest,
@@ -691,11 +694,101 @@ impl SettingsBackedBusinessModelBridgeClient {
 }
 
 impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridgeClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::native_executor_capabilities()
+    }
+
+    fn invoke_streaming_with_output_limit(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        max_output_tokens: u32,
+        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?.invoke_streaming_with_output_limit(
+            request,
+            max_output_tokens,
+            on_delta,
+            on_retry,
+            is_cancelled,
+        )
+    }
     fn invoke(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
     ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         self.build_client()?.invoke(request)
+    }
+
+    fn invoke_with_cancellation(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?
+            .invoke_with_cancellation(request, is_cancelled)
+    }
+
+    fn invoke_with_retry_events_and_cancellation(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?
+            .invoke_with_retry_events_and_cancellation(request, on_retry, is_cancelled)
+    }
+
+    fn invoke_with_cancellation_and_output_limit(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        max_output_tokens: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?
+            .invoke_with_cancellation_and_output_limit(request, max_output_tokens, is_cancelled)
+    }
+
+    fn invoke_with_retry_events_cancellation_and_output_limit(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        max_output_tokens: u32,
+        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?
+            .invoke_with_retry_events_cancellation_and_output_limit(
+                request,
+                max_output_tokens,
+                on_retry,
+                is_cancelled,
+            )
+    }
+
+    fn invoke_streaming_with_retry_events(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?
+            .invoke_streaming_with_retry_events(request, on_delta, on_retry)
+    }
+
+    fn invoke_streaming_with_cancellation(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        on_retry: &dyn Fn(&magi_bridge_client::ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?.invoke_streaming_with_cancellation(
+            request,
+            on_delta,
+            on_retry,
+            is_cancelled,
+        )
     }
 
     fn invoke_streaming(
@@ -709,6 +802,10 @@ impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridge
 
 #[cfg(test)]
 impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::native_executor_capabilities()
+    }
+
     fn invoke(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
@@ -758,23 +855,6 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
                 .to_string(),
             ));
         }
-        if request
-            .tool_choice
-            .as_ref()
-            .is_some_and(|choice| choice.function.name == "agent_spawn")
-        {
-            return Ok(static_test_chat_response(static_test_agent_spawn_payload(
-                &request,
-            )));
-        }
-        if let Some(payload) = static_test_agent_wait_payload(&request) {
-            return Ok(static_test_chat_response(payload));
-        }
-        if let Some(result) = static_test_agent_wait_result(&request) {
-            return Ok(magi_bridge_client::ModelResponse::completed(format!(
-                "已吸收测试代理结果：{result}"
-            )));
-        }
         Ok(magi_bridge_client::ModelResponse::completed(format!(
             "loopback-model::{}",
             request.prompt.trim()
@@ -795,131 +875,6 @@ fn static_test_chat_response(payload: String) -> magi_bridge_client::ModelRespon
     magi_bridge_client::ModelResponse::from_chat_payload(
         serde_json::from_str(&payload).expect("daemon 测试模型响应必须符合统一响应结构"),
     )
-}
-
-#[cfg(test)]
-fn static_test_agent_spawn_payload(request: &magi_bridge_client::ModelInvocationRequest) -> String {
-    let spawn_count = request
-        .messages
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .filter(|call| call.function.name == "agent_spawn")
-        .count();
-    let (task_name, display_name, role, goal) = if spawn_count == 0 {
-        (
-            "test_executor",
-            "测试执行代理",
-            "executor",
-            "执行测试任务并返回完成结果",
-        )
-    } else {
-        (
-            "test_validator",
-            "测试验证代理",
-            "tester",
-            "验证测试任务并返回检查结果",
-        )
-    };
-    let arguments = serde_json::json!({
-        "task_name": task_name,
-        "display_name": display_name,
-        "role": role,
-        "goal": goal,
-        "context_package": {
-            "summary": "daemon 测试协调任务",
-            "constraints": ["仅用于测试运行时协调链路"],
-            "expected_output": "返回任务已完成",
-            "references": [],
-        },
-    });
-    serde_json::json!({
-        "content": null,
-        "finish_reason": "tool_calls",
-        "tool_calls": [{
-            "id": format!("call-test-agent-spawn-{}", spawn_count + 1),
-            "type": "function",
-            "function": {
-                "name": "agent_spawn",
-                "arguments": arguments.to_string(),
-            }
-        }]
-    })
-    .to_string()
-}
-
-#[cfg(test)]
-fn static_test_agent_wait_payload(
-    request: &magi_bridge_client::ModelInvocationRequest,
-) -> Option<String> {
-    let messages = request.messages.as_deref()?;
-    let spawn_count = messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .filter(|call| call.function.name == "agent_spawn")
-        .count();
-    let already_waited = messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .any(|call| call.function.name == "agent_wait");
-    if spawn_count < 2 || already_waited {
-        return None;
-    }
-    let task_ids = messages
-        .iter()
-        .filter(|message| message.role == "tool")
-        .filter_map(|message| message.content.as_deref())
-        .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
-        .filter_map(|payload| {
-            payload
-                .get("child_task_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-    if task_ids.len() < 2 {
-        return None;
-    }
-    let arguments = serde_json::json!({
-        "task_ids": task_ids,
-        "timeout_ms": 60_000,
-    });
-    Some(
-        serde_json::json!({
-            "content": null,
-            "finish_reason": "tool_calls",
-            "tool_calls": [{
-                "id": "call-test-agent-wait",
-                "type": "function",
-                "function": {
-                    "name": "agent_wait",
-                    "arguments": arguments.to_string(),
-                }
-            }]
-        })
-        .to_string(),
-    )
-}
-
-#[cfg(test)]
-fn static_test_agent_wait_result(
-    request: &magi_bridge_client::ModelInvocationRequest,
-) -> Option<&str> {
-    let messages = request.messages.as_deref()?;
-    let wait_call_ids = messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .filter(|call| call.function.name == "agent_wait")
-        .map(|call| call.id.as_str())
-        .collect::<HashSet<_>>();
-    messages.iter().rev().find_map(|message| {
-        let tool_call_id = message.tool_call_id.as_deref()?;
-        wait_call_ids
-            .contains(tool_call_id)
-            .then_some(message.content.as_deref())
-            .flatten()
-    })
 }
 
 #[cfg(test)]
@@ -1035,7 +990,10 @@ impl DaemonRuntime {
                 |error| DaemonError::internal(format!("恢复 session canonical turn 失败: {error}")),
             )?,
         );
-        session_store.install_canonical_event_writer(Arc::new(state_repository.clone()));
+        session_store.install_session_event_writer(Arc::new(state_repository.clone()));
+        session_store
+            .reconcile_background_jobs_after_restart()
+            .map_err(DaemonError::internal)?;
         session_store.set_unavailable_sessions(state_repository.unavailable_sessions());
         state_repository.validate_session_event_log_coverage(&session_store.durable_state())?;
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
@@ -1487,8 +1445,51 @@ impl DaemonRuntime {
         let git_service = Arc::new(magi_git::GitService::new());
         let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
         let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
+        let worker_runtime = self.worker_runtime.clone();
+        let task_store_projection_path = self.state_repository.task_store_projection_path();
+        let accepted_submission_repository = self.state_repository.clone();
+        let accepted_submission_repository_for_checkpoint = accepted_submission_repository.clone();
+        let task_checkpoint_persist: TaskCheckpointPersist = Arc::new(move |snapshot| {
+            accepted_submission_repository_for_checkpoint
+                .checkpoint_task_store_snapshot(snapshot)
+                .map_err(|error| DomainError::Persistence {
+                    message: format!("task checkpoint 持久化失败: {error}"),
+                })?;
+            Ok(())
+        });
+        let restored_from_projection =
+            TaskStore::restore_from_projection_directory(&task_store_projection_path)?;
+        let mut task_store_requires_checkpoint = false;
+        let task_store = if let Some(restored) = restored_from_projection {
+            let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
+            restored.set_checkpoint_callback(Box::new(move |store| {
+                task_checkpoint_persist_for_store(store)
+            }));
+            let (revoked_leases, failed_tasks) = restored
+                .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot())
+                .map_err(|error| {
+                    DaemonError::internal(format!("恢复任务运行态收敛失败: {error}"))
+                })?;
+            if revoked_leases > 0 || failed_tasks > 0 {
+                warn!(
+                    revoked_leases,
+                    failed_tasks, "检测到 projection 中残留的易失执行态，已统一收口为可恢复状态"
+                );
+            }
+            restored
+        } else {
+            TaskStore::new()
+        };
+        let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
+        task_store.set_checkpoint_callback(Box::new(move |store| {
+            task_checkpoint_persist_for_store(store)
+        }));
+        // Worker 结果直接提交 TaskStore durable 终态，再由完成通知唤醒 Turn 侧；
+        // Runner 仍可在未装配该通知目标的嵌入测试中使用结果队列。
+        let task_store = Arc::new(task_store);
         let git_tool_executor = magi_api::git_tool_runtime::build_git_tool_executor(
             magi_api::git_tool_runtime::GitToolRuntimeDependencies {
+                task_store: Some(task_store.clone()),
                 git_service: git_service.clone(),
                 session_code_contexts: session_code_contexts.clone(),
                 workspace_git_coordinator: workspace_git_coordinator.clone(),
@@ -1542,6 +1543,10 @@ impl DaemonRuntime {
             })
         };
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
+            .with_background_job_journal(
+                self.session_store
+                    .background_job_journal(self.state_root.join("job-output")),
+            )
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
@@ -1620,12 +1625,9 @@ impl DaemonRuntime {
             .with_model_client(business_model_client.clone())
             .with_mcp_client(Arc::new(settings_backed_mcp_client));
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
-        let worker_runtime = self.worker_runtime.clone();
         let tool_registry_for_dispatcher = tool_registry;
-        let task_store_projection_path = self.state_repository.task_store_projection_path();
         let event_bus_for_task_store = self.event_bus.clone();
         let session_store_for_task_status = self.session_store.clone();
-        let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
         // `agent_spawn` 创建前预检与 Runner 必须共享同一个执行准入控制器，否则
         // 预检看到的容量和真正派发时的容量可能不一致，导致“已创建后才排队/失败”。
         let execution_admission = Arc::new(ExecutionAdmissionController::default());
@@ -1640,137 +1642,9 @@ impl DaemonRuntime {
                 workspace_registry: Some(self.workspace_store.clone()),
                 session_code_contexts: Some(session_code_contexts.clone()),
                 git_service_configured: true,
+                skill_runtime: Some(app_skill_runtime.clone()),
             });
-        let accepted_submission_repository = self.state_repository.clone();
-        let accepted_submission_repository_for_checkpoint = accepted_submission_repository.clone();
-        let task_checkpoint_persist: TaskCheckpointPersist = Arc::new(move |snapshot| {
-            accepted_submission_repository_for_checkpoint
-                .checkpoint_task_store_snapshot(snapshot)
-                .map_err(|error| DomainError::Persistence {
-                    message: format!("task checkpoint 持久化失败: {error}"),
-                })?;
-            Ok(())
-        });
-        let restored_from_projection =
-            TaskStore::restore_from_projection_directory(&task_store_projection_path)?;
-        let mut task_store_requires_checkpoint = false;
-        let task_store = if let Some(restored) = restored_from_projection {
-            let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
-            restored.set_checkpoint_callback(Box::new(move |store| {
-                task_checkpoint_persist_for_store(store)
-            }));
-            let (revoked_leases, failed_tasks) = restored
-                .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot())
-                .map_err(|error| {
-                    DaemonError::internal(format!("恢复任务运行态收敛失败: {error}"))
-                })?;
-            if revoked_leases > 0 || failed_tasks > 0 {
-                warn!(
-                    revoked_leases,
-                    failed_tasks, "检测到 projection 中残留的易失执行态，已统一收口为可恢复状态"
-                );
-            }
-            restored
-        } else {
-            TaskStore::new()
-        };
-        let task_checkpoint_persist_for_store = task_checkpoint_persist.clone();
-        task_store.set_checkpoint_callback(Box::new(move |store| {
-            task_checkpoint_persist_for_store(store)
-        }));
-        // Worker 结果直接提交 TaskStore durable 终态，再由完成通知唤醒 Turn 侧；
-        // Runner 仍可在未装配该通知目标的嵌入测试中使用结果队列。
-        let task_store = Arc::new(task_store);
         let completion_notifier = Arc::new(TaskCompletionNotifier::new(Arc::clone(&task_store)));
-        let eb = event_bus_for_task_store.clone();
-        let session_store = session_store_for_task_status.clone();
-        let task_execution_registry_for_status = task_execution_registry.clone();
-        let completion_notifier_for_status = completion_notifier.clone();
-        task_store.set_status_change_callback(Box::new(
-            move |task_id, old_status, new_status, task: magi_core::Task| {
-                // TaskStore 在 production 模式下已经把 callback 放到 mutation guard
-                // 之外执行。终态事实提交后立即通知 Turn Coordinator，避免计划/事件等
-                // 投影工作把 Turn 终态延迟到不可观测的后台窗口；后续任务侧投影仍在
-                // 同一回调中继续完成。
-                let callback_started_at = Instant::now();
-                if matches!(
-                    new_status,
-                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-                ) {
-                    if let Some(plan) = task_execution_registry_for_status.get(task_id) {
-                        match plan {
-                            magi_conversation_runtime::task_execution_registry::TaskExecutionPlan::Dispatch {
-                                session_id,
-                                turn_id,
-                                ..
-                            } => completion_notifier_for_status.bind_task_context(
-                                task_id,
-                                Some(session_id),
-                                Some(turn_id),
-                            ),
-                        }
-                    }
-                    // kill、租约过期和恢复收敛可能没有仍在 registry 中的执行计划；
-                    // 从当前 session sidecar 读取绑定的 Turn，仍然把同一 durable
-                    // Task 终态路由到 Coordinator，而不是丢弃为无主通知。
-                    for sidecar in session_store
-                        .active_execution_sidecars_for_task(task_id, &task.root_task_id)
-                    {
-                        if let Some(turn) = sidecar.current_turn.as_ref() {
-                            completion_notifier_for_status.bind_task_context(
-                                task_id,
-                                Some(sidecar.session_id.clone()),
-                                Some(turn.turn_id.clone()),
-                            );
-                            break;
-                        }
-                    }
-                    completion_notifier_for_status.notify_terminal_status(
-                        task_id,
-                        new_status,
-                        &task,
-                    );
-                }
-                sync_task_plan_status(eb.as_ref(), session_store.as_ref(), &task, new_status);
-                settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
-                publish_task_status_changed_event(
-                    eb.as_ref(),
-                    session_store.as_ref(),
-                    task_id,
-                    old_status,
-                    new_status,
-                    &task,
-                );
-                if let Err(error) = publish_task_status_turn_item_for_active_sessions(
-                    &eb,
-                    session_store.as_ref(),
-                    None,
-                    &task,
-                    new_status,
-                ) {
-                    tracing::error!(
-                        task_id = %task_id,
-                        %error,
-                        "任务状态事实写回会话 Turn 失败"
-                    );
-                }
-                if matches!(
-                    new_status,
-                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-                ) {
-                    task_execution_registry_for_status.remove(task_id);
-                }
-                tracing::info!(
-                    target: "magi.performance",
-                    task_id = %task_id,
-                    stage = "task_status_callback_completed",
-                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
-                    "conversation response timing"
-                );
-            },
-        ));
-        task_store.set_status_change_callback_async(true);
-        runner_result_receiver.set_completion_sink(completion_notifier.clone());
         let accepted_submissions = self.state_repository.load_accepted_submissions()?;
         let mut restored_accepted_task_count = 0;
         for record in accepted_submissions
@@ -1802,6 +1676,17 @@ impl DaemonRuntime {
                 reconciled_threads,
                 "已将历史终态任务关联的活动线程统一收口为 Idle"
             );
+        }
+        // 独立代理可能属于已结束、已归档或已被下一轮替换的主线；不能只扫
+        // 当前 sidecar。TaskStore 先撤销旧运行态，canonical 再按原任务结算，
+        // 写盘失败阻止启动服务，不让旧 Agent 看起来仍在运行或接受新执行。
+        let restored_tasks = task_store.all_tasks();
+        for session in self.session_store.session_index() {
+            self.session_store
+                .reconcile_agent_turns_after_restart(&session, &restored_tasks)
+                .map_err(|error| {
+                    DaemonError::internal(format!("恢复独立 Agent Turn 失败: {error}"))
+                })?;
         }
         let stale_task_count = self.reconcile_stale_session_task_chains(task_store.as_ref());
         task_store_requires_checkpoint |= stale_task_count > 0;
@@ -1864,7 +1749,7 @@ impl DaemonRuntime {
             session_code_contexts,
             workspace_git_coordinator,
         )
-        .with_task_execution_registry(task_execution_registry)
+        .with_task_execution_registry(task_execution_registry.clone())
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_plugin_manager(self.plugins.manager())
@@ -1952,7 +1837,7 @@ impl DaemonRuntime {
             LlmTaskDispatcherDependencies {
                 session_store: state.session_store.clone(),
                 execution_registry: state.task_execution_registry().clone(),
-                result_receiver: runner_result_receiver.clone(),
+                completion_sink: completion_notifier.clone(),
                 conversation_registry: state.conversation_registry.clone(),
                 agent_role_registry: state.agent_role_registry.clone(),
             },
@@ -2027,7 +1912,8 @@ impl DaemonRuntime {
                 .with_workspace_git_coordinator(state.workspace_git_coordinator.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
-                .with_snapshot_manager(state.snapshot_manager.clone()),
+                .with_snapshot_manager(state.snapshot_manager.clone())
+                .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state)),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state
@@ -2046,7 +1932,99 @@ impl DaemonRuntime {
         .with_execution_admission(Arc::clone(&execution_admission))
         .with_checkpoint_persist(task_checkpoint_persist);
         let runner_manager = Arc::new(runner_manager);
-        state = state.with_shared_runner_manager(runner_manager);
+        state = state.with_shared_runner_manager(runner_manager.clone());
+        // 回调在 mutation guard 外的普通线程等待原 restart 锁；整个投影/释放
+        // 过程结束前不能重开该 scope，也不会持有 TaskStore mutation 锁执行 IO。
+        task_store.set_status_change_callback_async(true);
+        let status_runner_manager = Arc::downgrade(&runner_manager);
+        let eb = event_bus_for_task_store.clone();
+        let session_store = session_store_for_task_status.clone();
+        let task_execution_registry_for_status = task_execution_registry.clone();
+        let completion_notifier_for_status = completion_notifier.clone();
+        let task_store_for_status = Arc::downgrade(&task_store);
+        task_store.set_status_change_callback(Box::new(
+            move |task_id, old_status, new_status, task: magi_core::Task| {
+                let Some(current_store) = task_store_for_status.upgrade() else {
+                    return;
+                };
+                let Some(status_runner_manager) = status_runner_manager.upgrade() else {
+                    return;
+                };
+                let _restart = status_runner_manager.lock_for_task_status_change(&task);
+                if current_store.get_task(task_id).is_none_or(|current| {
+                    current.status != new_status
+                        || current.updated_at != task.updated_at
+                        || current.retry_count != task.retry_count
+                }) {
+                    return;
+                }
+                // TaskStore 在 production 模式下已经把 callback 放到 mutation guard
+                // 之外执行。终态事实提交后立即通知 Turn Coordinator，避免计划/事件等
+                // 投影工作把 Turn 终态延迟到不可观测的后台窗口；后续任务侧投影仍在
+                // 同一回调中继续完成。
+                let callback_started_at = Instant::now();
+                if matches!(
+                    new_status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                ) {
+                    match terminal_task_context(
+                        &session_store,
+                        &task_execution_registry_for_status,
+                        &task,
+                    ) {
+                        Ok(Some((session_id, turn_id))) => {
+                            completion_notifier_for_status.bind_task_context(
+                                task_id,
+                                Some(session_id),
+                                Some(turn_id),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(%task_id, %error, "解析 Task 终态的原执行来源失败")
+                        }
+                    }
+                    completion_notifier_for_status
+                        .notify_terminal_status(task_id, new_status, &task);
+                }
+                sync_task_plan_status(eb.as_ref(), session_store.as_ref(), &task, new_status);
+                settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
+                publish_task_status_changed_event(
+                    eb.as_ref(),
+                    session_store.as_ref(),
+                    task_id,
+                    old_status,
+                    new_status,
+                    &task,
+                );
+                if let Err(error) = publish_task_status_turn_item_for_active_sessions(
+                    &eb,
+                    session_store.as_ref(),
+                    None,
+                    &task,
+                    new_status,
+                ) {
+                    tracing::error!(
+                        task_id = %task_id,
+                        %error,
+                        "任务状态事实写回会话 Turn 失败"
+                    );
+                }
+                if matches!(
+                    new_status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                ) {
+                    task_execution_registry_for_status.remove(task_id);
+                }
+                tracing::info!(
+                    target: "magi.performance",
+                    task_id = %task_id,
+                    stage = "task_status_callback_completed",
+                    elapsed_ms = callback_started_at.elapsed().as_millis() as u64,
+                    "conversation response timing"
+                );
+            },
+        ));
 
         // 完成通知器必须捕获已经装配 RunnerManager 的最终 ApiState。若在
         // with_shared_runner_manager 之前注册 observer，队列出队时会使用缺少
@@ -2596,6 +2574,39 @@ fn settle_task_execution_threads(
     }
 }
 
+fn terminal_task_context(
+    session_store: &SessionStore,
+    registry: &TaskExecutionRegistry,
+    task: &magi_core::Task,
+) -> Result<Option<(SessionId, String)>, String> {
+    // 独立 Agent 的 canonical 绑定优先于进程内计划与 Session 当前指针。
+    // 后两者可能仍指向原父轮；状态回调先到时也不能把 Agent 终态发送给主线。
+    if let Some(activation) = task.agent_activation()
+        && let Some(turn) = session_store
+            .agent_turn_for_task(&activation.session_id, &task.task_id)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(Some((activation.session_id.clone(), turn.turn_id)));
+    }
+    if let Some(plan) = registry.get(&task.task_id) {
+        let magi_conversation_runtime::task_execution_registry::TaskExecutionPlan::Dispatch {
+            session_id,
+            turn_id,
+            ..
+        } = plan;
+        return Ok(Some((session_id, turn_id)));
+    }
+    // kill、租约过期及排队任务可能没有执行计划。普通 Task 才从原执行链补齐关联。
+    Ok(session_store
+        .active_execution_sidecars_for_task(&task.task_id, &task.root_task_id)
+        .into_iter()
+        .find_map(|sidecar| {
+            sidecar
+                .current_turn
+                .map(|turn| (sidecar.session_id, turn.turn_id))
+        }))
+}
+
 fn reconcile_terminal_task_execution_threads(
     session_store: &SessionStore,
     task_store: &TaskStore,
@@ -2702,10 +2713,18 @@ fn task_status_event_scope(
     session_store: &SessionStore,
     task: &magi_core::Task,
 ) -> Option<(SessionId, Option<magi_core::WorkspaceId>)> {
+    if let Some(activation) = task.agent_activation()
+        && let Some(session) = session_store.session(&activation.session_id)
+    {
+        return Some((
+            session.session_id,
+            session.workspace_id.map(magi_core::WorkspaceId::new),
+        ));
+    }
     session_store
-        .active_execution_sidecars()
+        .active_execution_sidecars_for_task(&task.task_id, &task.root_task_id)
         .into_iter()
-        .find(|sidecar| task_matches_runtime_sidecar(sidecar, task))
+        .next()
         .map(|sidecar| {
             let workspace_id = sidecar
                 .active_execution_chain
@@ -2714,30 +2733,6 @@ fn task_status_event_scope(
                 .or_else(|| sidecar.ownership.workspace_id.clone());
             (sidecar.session_id, workspace_id)
         })
-}
-
-fn task_matches_runtime_sidecar(sidecar: &SessionRuntimeSidecar, task: &magi_core::Task) -> bool {
-    let active_chain_matches = sidecar
-        .active_execution_chain
-        .as_ref()
-        .is_some_and(|chain| {
-            chain.root_task_id == task.root_task_id
-                || chain.root_task_id == task.task_id
-                || chain
-                    .active_branch_task_ids
-                    .iter()
-                    .any(|task_id| task_id == &task.task_id)
-                || chain
-                    .branches
-                    .iter()
-                    .any(|branch| branch.task_id == task.task_id)
-        });
-    let turn_matches = sidecar.current_turn.as_ref().is_some_and(|turn| {
-        turn.items
-            .iter()
-            .any(|item| item.task_id.as_ref() == Some(&task.task_id))
-    });
-    active_chain_matches || turn_matches
 }
 
 #[cfg(test)]
@@ -2757,6 +2752,7 @@ mod tests {
         BridgeClientError, BridgeResponse, McpBridgeClient, McpServerClient, McpServerConfig,
         McpToolCallRequest, ModelInvocationRequest,
     };
+    use magi_conversation_runtime::task_execution_registry::TaskExecutionRegistry;
     use magi_core::{
         AbsolutePath, MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
         ThreadId, UtcMillis, WorkerId, WorkspaceId,
@@ -3007,6 +3003,329 @@ done
             runtime_payload: TaskRuntimePayload::default(),
             created_at: UtcMillis(created_at),
             updated_at: UtcMillis(created_at + 1),
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_restart_recovers_detached_agent_question_without_replaying_execution() {
+        use magi_conversation_runtime::session_writeback::session_turn_item;
+        use magi_session_store::user_question::{PendingUserQuestion, UserQuestionResponse};
+        use magi_session_store::{CanonicalTurnStatus, ExecutionThread, ExecutionThreadStatus};
+        // 两个独立测试进程分别执行首次恢复/回答和再次重启，不能复用父进程的
+        // SessionStore、TaskStore、resolver、线程或审批/问题注册表。
+        const CHILD_STATE: &str = "MAGI_INDEPENDENT_AGENT_RESTART_TEST_STATE";
+        const CHILD_STAGE: &str = "MAGI_INDEPENDENT_AGENT_RESTART_TEST_STAGE";
+        if let Ok(root) = std::env::var(CHILD_STATE) {
+            let config = DaemonConfig::new("127.0.0.1", 0, "independent-restart", root);
+            let runtime = DaemonRuntime::restore(&config).unwrap();
+            let (_, state) = runtime.router_with_state_for_tests("independent-restart".into());
+            let session = SessionId::new("detached-agent-restart");
+            let child = TaskId::new("restart-independent");
+            let store = state.task_store().unwrap();
+            assert_eq!(
+                store
+                    .get_task(&TaskId::new("restart-source"))
+                    .unwrap()
+                    .status,
+                TaskStatus::Completed
+            );
+            assert_eq!(store.get_task(&child).unwrap().status, TaskStatus::Failed);
+            let turn = state
+                .session_store
+                .agent_turn_for_task(&session, &child)
+                .unwrap()
+                .unwrap();
+            assert_eq!(turn.status, CanonicalTurnStatus::Interrupted);
+            assert!(turn.model_steps.is_empty(), "恢复不能自动向 Provider 重发");
+            assert!(
+                !state
+                    .session_store
+                    .turn_execution_is_active(&session, &turn.turn_id)
+            );
+            assert!(
+                state
+                    .session_store
+                    .runtime_sidecar(&session)
+                    .unwrap()
+                    .active_execution_chain
+                    .is_none()
+            );
+            assert!(store.collect_all_active_leases().is_empty());
+            assert_eq!(store.all_tasks().len(), 2);
+            assert!(state.task_execution_registry().get(&child).is_none());
+            if std::env::var(CHILD_STAGE).unwrap() == "answer" {
+                let pending = state
+                    .session_store
+                    .pending_user_questions(&session)
+                    .unwrap();
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].question_id, "detached-question");
+                assert_eq!(pending[0].task_id.as_ref(), Some(&child));
+                assert_eq!(pending[0].turn_id, turn.turn_id);
+                state
+                    .session_store
+                    .resolve_user_question(
+                        &session,
+                        "detached-question",
+                        UserQuestionResponse::Skipped,
+                    )
+                    .unwrap();
+                assert!(
+                    !state
+                        .session_store
+                        .turn_execution_is_active(&session, &turn.turn_id)
+                );
+            } else {
+                assert!(
+                    state
+                        .session_store
+                        .pending_user_questions(&session)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    state
+                        .session_store
+                        .user_question_state(&session, "detached-question")
+                        .unwrap()
+                        .unwrap()
+                        .response,
+                    Some(UserQuestionResponse::Skipped)
+                );
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::new("127.0.0.1", 0, "independent-restart", directory.path());
+        let repository = StateRepository::new(config.state_root.clone());
+        let store = SessionStore::new();
+        store.install_session_event_writer(Arc::new(repository.clone()));
+        let session = SessionId::new("detached-agent-restart");
+        store
+            .create_session(session.clone(), "detached agent")
+            .unwrap();
+        let now = UtcMillis::now();
+        let mut root = restore_task_fixture(
+            "restart-source",
+            "restart-source",
+            None,
+            TaskStatus::Running,
+            now.0,
+        );
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        let (_, root_thread) =
+            store.ensure_session_mission(&session, now, || root.mission_id.clone());
+        let mut user = session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some("run independent work".into()),
+            Some("source-user".into()),
+            root_thread,
+        );
+        user.task_id = Some(root.task_id.clone());
+        user.item_seq = 1;
+        let source_turn = "detached-agent-source-turn";
+        store
+            .upsert_active_execution_chain(
+                session.clone(),
+                ActiveExecutionChain {
+                    session_id: session.clone(),
+                    mission_id: root.mission_id.clone(),
+                    root_task_id: root.task_id.clone(),
+                    execution_chain_ref: "detached-agent-chain".into(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root.task_id.clone()],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "source-user".into(),
+                        trimmed_text: Some("run independent work".into()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: source_turn.into(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "running".into(),
+                        user_message: Some("run independent work".into()),
+                        items: vec![user],
+                    }),
+                },
+            )
+            .unwrap();
+        let tasks = TaskStore::new();
+        tasks.insert_task(root.clone()).unwrap();
+        let mut child = restore_task_fixture(
+            "restart-independent",
+            root.task_id.as_str(),
+            Some(root.task_id.as_str()),
+            TaskStatus::Pending,
+            now.0,
+        );
+        let mut executor = magi_core::TaskExecutorBinding::for_role("executor");
+        executor.agent_activation = Some(magi_core::AgentActivation {
+            agent_id: child.task_id.clone(),
+            session_id: session.clone(),
+            lifetime: magi_core::AgentLifetime::Session,
+            generation: 1,
+            previous_task_id: None,
+        });
+        child.executor_binding = Some(executor);
+        tasks.insert_task(child.clone()).unwrap();
+        let thread = ThreadId::new("detached-agent-thread");
+        store
+            .register_thread(ExecutionThread {
+                thread_id: thread.clone(),
+                session_id: session.clone(),
+                mission_id: child.mission_id.clone(),
+                role_id: "executor".into(),
+                worker_instance_id: WorkerId::new("detached-agent-worker"),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                observed_context_window_tokens: None,
+                handled_task_ids: vec![child.task_id.clone()],
+                message_history: vec![],
+            })
+            .unwrap();
+        let owned = store
+            .create_agent_turn(&child, source_turn, &thread)
+            .unwrap();
+        // 模拟 TaskStore 回调先于显式 Worker 结果到达。即使计划尚指向父轮，
+        // 或 Dispatcher 已移除计划，通知也必须收口子代理自己的 Turn。
+        let registry = TaskExecutionRegistry::default();
+        registry
+            .insert(
+                child.task_id.clone(),
+                magi_conversation_runtime::task_execution_registry::TaskExecutionPlan::Dispatch {
+                    target: magi_core::TaskExecutionTarget {
+                        mission_id: child.mission_id.clone(),
+                        root_task_id: child.root_task_id.clone(),
+                        task_id: child.task_id.clone(),
+                        requested_worker_id: None,
+                        recovery_id: None,
+                        execution_chain_ref: None,
+                    },
+                    worker_id: WorkerId::new("detached-agent-worker"),
+                    thread_id: thread.clone(),
+                    is_primary: false,
+                    session_id: session.clone(),
+                    turn_id: source_turn.into(),
+                    workspace_id: None,
+                    execution_root: None,
+                    writebacks: Default::default(),
+                    use_tools: true,
+                    skill_name: None,
+                    images: Vec::new(),
+                    execution_settings_snapshot: None,
+                },
+            )
+            .unwrap();
+        for has_plan in [true, false] {
+            if !has_plan {
+                registry.remove(&child.task_id);
+            }
+            assert_eq!(
+                super::terminal_task_context(&store, &registry, &child).unwrap(),
+                Some((session.clone(), owned.turn_id.clone())),
+                "Agent 终态来源不能被同 root 的当前主线覆盖"
+            );
+        }
+        assert_eq!(
+            super::terminal_task_context(&store, &registry, &root).unwrap(),
+            Some((session.clone(), source_turn.into())),
+            "主线仍从原执行链解析自己的 Turn"
+        );
+        let mut question_item = session_turn_item(
+            "tool_call_started",
+            "running",
+            None,
+            None,
+            Some("detached-question-item".into()),
+            thread,
+        );
+        question_item.task_id = Some(child.task_id.clone());
+        question_item.role_id = Some("executor".into());
+        question_item.tool_call_id = Some("detached-question-call".into());
+        question_item.tool_name = Some("ask_user_question".into());
+        question_item.tool_arguments = Some("{}".into());
+        store
+            .upsert_agent_turn_item(&session, &child.task_id, &owned.turn_id, question_item)
+            .unwrap();
+        let question = PendingUserQuestion {
+            question_id: "detached-question".into(), session_id: session.clone(), task_id: Some(child.task_id.clone()), turn_id: owned.turn_id.clone(), tool_call_id: "detached-question-call".into(),
+            requested_at: UtcMillis::now(), can_skip: true,
+            questions: magi_session_store::user_question::parse_questions(&json!({"questions":[{"header":"选择","question":"继续？","options":[{"label":"A"},{"label":"B"}]}]}).to_string()).unwrap(),
+        };
+        store.register_user_question(question.clone()).unwrap();
+        tasks
+            .transfer_agent_subtree(
+                &root.task_id,
+                &child.task_id,
+                magi_core::AgentRunTransfer {
+                    operation_id: "detached-transfer".into(),
+                    session_id: session.clone(),
+                    source_turn_id: source_turn.into(),
+                    transferred_by: root.task_id.clone(),
+                    activation_generation: 1,
+                    owner: magi_core::AgentRunOwner::Session,
+                    transferred_at: UtcMillis::now(),
+                },
+            )
+            .unwrap();
+        tasks
+            .complete_task(
+                &root.task_id,
+                magi_core::TaskCompletionAttempt {
+                    final_response: Some("source done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_current_turn_status_for_turn_with_change(
+                &session,
+                Some(source_turn),
+                "completed",
+            )
+            .unwrap();
+        store
+            .archive_active_execution_chain(&session, &root.task_id)
+            .unwrap();
+        assert_eq!(
+            super::task_status_event_scope(&store, &child),
+            Some((session.clone(), None)),
+            "原主线归档后，子代理状态事件仍属于原会话"
+        );
+        assert_eq!(
+            super::terminal_task_context(&store, &registry, &child).unwrap(),
+            Some((session.clone(), owned.turn_id.clone()))
+        );
+        repository
+            .save_session_projection_state(
+                &store.durable_state(),
+                &store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+        tasks
+            .checkpoint_to_projection_directory(&repository.task_store_projection_path())
+            .unwrap();
+        for stage in ["answer", "verify"] {
+            let output = magi_process::std_command(std::env::current_exe().unwrap())
+                .args(["--exact", "daemon::runtime::tests::daemon_restart_recovers_detached_agent_question_without_replaying_execution", "--nocapture"])
+                .env(CHILD_STATE, directory.path())
+                .env(CHILD_STAGE, stage)
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{stage}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -3975,7 +4294,7 @@ done
         }
     }
 
-    fn assert_completed_two_agent_run_projection(projection: &Value) {
+    fn assert_completed_agent_run_projection(projection: &Value) {
         let total_tasks = projection["progress_summary"]["total_tasks"]
             .as_u64()
             .expect("total_tasks should serialize as integer");
@@ -4198,7 +4517,6 @@ done
                 "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 parser constraint 记忆问题，完成后运行测试并汇总验证结果",
-                "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
             }),
@@ -4235,7 +4553,7 @@ done
             active_workspace_id.as_str(),
         )
         .await;
-        assert_completed_two_agent_run_projection(&first_projection);
+        assert_completed_agent_run_projection(&first_projection);
 
         let second_request_id = "request-router-session-action-followup";
         let (status, second_body) = post_json(
@@ -4245,7 +4563,6 @@ done
                 "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 parser 后续工作问题，完成后运行测试并汇总验证结果",
-                "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
                 "requestId": second_request_id,
@@ -4313,7 +4630,7 @@ done
             active_workspace_id.as_str(),
         )
         .await;
-        assert_completed_two_agent_run_projection(&second_projection);
+        assert_completed_agent_run_projection(&second_projection);
     }
 
     #[tokio::test]
@@ -4423,7 +4740,6 @@ done
                 "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 recovery route 初始状态问题，完成后运行测试并汇总验证结果",
-                "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
             }),
@@ -4515,7 +4831,6 @@ done
                 "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 recovery memory 消费问题，完成后运行测试并汇总验证结果",
-                "skillName": "refactor",
                 "images": [],
                 "workspaceId": workspace_id.to_string(),
             }),

@@ -458,8 +458,12 @@ pub fn parse_update_plan_arguments(
 ) -> Result<UpdatePlanInput, PlanUpdateError> {
     let mut input = serde_json::from_str::<UpdatePlanInput>(arguments_json)
         .map_err(|error| PlanUpdateError::InvalidJson(error.to_string()))?;
-    input.plan_id = normalize_optional_id(input.plan_id);
-    input.expected_goal_id = normalize_optional_id(input.expected_goal_id);
+    // 模型可能把缺省身份写成字符串 null；Plan/Goal ID 由服务端生成，
+    // 空标记不替代已有身份或版本校验。itemId 可由调用方定义，保持原值。
+    input.plan_id =
+        normalize_optional_id(input.plan_id).filter(|value| !value.eq_ignore_ascii_case("null"));
+    input.expected_goal_id = normalize_optional_id(input.expected_goal_id)
+        .filter(|value| !value.eq_ignore_ascii_case("null"));
     for item in &mut input.plan {
         item.item_id = normalize_optional_id(item.item_id.take());
     }
@@ -691,7 +695,7 @@ pub enum PlanUpdateError {
     InvalidItemId(String),
     #[error("计划项 ID 重复: {0}")]
     DuplicateItemId(String),
-    #[error("首次创建计划时不能传 planId，计划 ID 由后端生成")]
+    #[error("首次创建计划时 planId 必须为 JSON null，计划 ID 由后端生成")]
     UnexpectedPlanId,
     #[error("更新现有计划时每个步骤都必须携带 itemId")]
     MissingItemId,
@@ -777,11 +781,11 @@ impl PlanUpdateError {
     /// 面向模型的修复指引。
     pub fn instruction(&self, current: Option<&SessionPlan>) -> String {
         match self {
-            Self::RevisionConflict { actual: 0, .. } => {
-                "当前会话还没有计划：首次创建计划时 expected_revision 传 0，且不要传 planId。".to_string()
+            Self::UnexpectedPlanId | Self::RevisionConflict { actual: 0, .. } => {
+                "首次创建计划时 expectedRevision 传 0，planId 和各 itemId 传 JSON null（不带引号）；没有 Goal 时 expectedGoalId 和 expectedGoalControlRevision 也传 JSON null。".to_string()
             }
             Self::RevisionConflict { actual, .. } => format!(
-                "计划已经被更新到 revision {actual}（之前的调用或界面操作已修改过它），你用的是过期版本。以 current_plan 为准重新提交：expected_revision 传 {actual}，沿用 current_plan 里的 planId 和每个步骤的 itemId；不要再用旧版本号。"
+                "计划已经被更新到 revision {actual}（之前的调用或界面操作已修改过它），你用的是过期版本。以 current_plan 为准重新提交：expectedRevision 传 {actual}，沿用 current_plan 里的 planId 和每个步骤的 itemId；不要再用旧版本号。"
             ),
             Self::MissingPlanId | Self::PlanIdMismatch => {
                 "更新现有计划必须携带 current_plan.planId；请用它重新提交。".to_string()
@@ -1126,6 +1130,59 @@ mod tests {
 
         assert_eq!(input.plan_id, None);
         assert_eq!(input.plan[0].item_id, None);
+    }
+
+    #[test]
+    fn parses_literal_null_strings_as_omitted_ids() {
+        let input = parse_update_plan_arguments(
+            r#"{
+                "planId": "null",
+                "expectedRevision": 0,
+                "expectedGoalId": "NULL",
+                "expectedGoalControlRevision": null,
+                "language": "zh-CN",
+                "plan": [{"itemId": null, "step": "检查现状", "status": "in_progress"}]
+            }"#,
+        )
+        .expect("literal null strings should be treated as omitted");
+
+        assert_eq!(input.plan_id, None);
+        assert_eq!(input.expected_goal_id, None);
+        assert_eq!(input.plan[0].item_id, None);
+
+        let store = test_store("literal-null");
+        let created = store.update(input.clone()).expect("first plan should save");
+        assert!(created.plan_id.as_str().starts_with("plan-"));
+        assert!(created.items[0].item_id.as_str().starts_with("plan-"));
+        assert!(created.goal_id.is_none());
+        // 空标记不授予覆盖既有计划的权利；已有身份和 revision 仍必须精确匹配。
+        assert_eq!(
+            store.update(input.clone()).unwrap_err(),
+            PlanUpdateError::MissingPlanId
+        );
+        assert_eq!(store.snapshot(), Some(created));
+
+        let guarded = test_store("literal-null-goal");
+        let (_, thread) = guarded.session_store.ensure_session_mission(
+            &guarded.session_id,
+            UtcMillis::now(),
+            || magi_core::MissionId::new("literal-null-goal"),
+        );
+        guarded
+            .session_store
+            .create_goal(
+                guarded.session_id.clone(),
+                thread,
+                "goal-turn",
+                "保留 Goal 绑定",
+                magi_core::AccessProfile::Restricted,
+            )
+            .unwrap();
+        assert!(
+            guarded.update(input).is_err(),
+            "空标记不能绕过现有 Goal 绑定"
+        );
+        assert!(guarded.snapshot().is_none());
     }
 
     #[test]
@@ -1613,7 +1670,7 @@ mod tests {
         assert_eq!(failure["current_plan"]["planId"], plan_id);
         let instruction = failure["instruction"].as_str().expect("instruction");
         assert!(
-            instruction.contains("expected_revision 传 2"),
+            instruction.contains("expectedRevision 传 2"),
             "{instruction}"
         );
     }
@@ -1633,7 +1690,7 @@ mod tests {
         assert!(
             failure["instruction"]
                 .as_str()
-                .is_some_and(|text| text.contains("expected_revision 传 0"))
+                .is_some_and(|text| text.contains("expectedRevision 传 0"))
         );
     }
 

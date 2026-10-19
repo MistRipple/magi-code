@@ -652,7 +652,7 @@ Windows 使用 `py -3 catalog.py example.echo-1.0.0.zip`。脚本生成只有这
 | `run_id, attempt_id, action_id` | 宿主签发的运行、本次尝试和当前动作身份 |
 | `stage` | 当前阶段字符串 |
 | `user_input` | 本次用户输入 |
-| `model_result, tool_result` | 上一步结果或 `null`；当前模型结果是字符串，工具结果是 `{status,output}` |
+| `model_result, tool_result` | 上一步结果或 `null`；模型结果为 `{content,tool_calls,status}`，工具结果是 `{status,output}` |
 | `context_summary` | 宿主提供的 JSON 上下文摘要 |
 | `config` | 上次持久化的 JSON 检查点，初次为运行配置 |
 
@@ -660,12 +660,20 @@ Windows 使用 `py -3 catalog.py example.echo-1.0.0.zip`。脚本生成只有这
 
 | `action.kind` | 除 `kind, action_id` 外的字段 | 行为 |
 | --- | --- | --- |
-| `model_request` | `model: null, system: string, context_refs: [], tools: []` | 使用宿主当前模型；当前不支持指定 model、上下文引用或工具子集，非空会被拒绝 |
+| `model_request` | `model: null, system: string, context_refs: string[], tools: string[]` | 使用宿主当前角色模型；引用必须属于当前 Task 的 `input_refs`，以引用文本加入请求，不自动读取资源正文。工具从宿主当前授权目录中选择子集，空列表表示本次不提供工具；空名称或不可用工具拒绝，不能覆盖模型配置 |
 | `tool_call` | `tool: string, input: JSON` | 调用当前宿主工具目录中的工具，仍执行正常权限检查 |
-| `dispatch_task` | `role: string, instruction: string` | 由宿主按角色调度子任务 |
+| `dispatch_task` | `role: string, instruction: string, delegation: object` | 明确独立工作价值，经宿主原 `agent_spawn` 入口调度子任务 |
 | `wait_user` | `question: string` | 等待用户回答 |
 | `save_stage` | `stage: string, checkpoint: JSON` | 保存检查点；后续输入的 `config` 取此值 |
 | `complete` | `summary: string` | 提交完成意图，由宿主校验并结算 |
+
+`model_request` 只生成模型结果，返回的 `tool_calls` 不会自动执行；工作流须通过后续 `tool_call` 提交工具动作，再经过宿主权限和资源检查。发送前，原任务的待决动作保存请求正文、工具定义、引用和对应 Step 身份；模型失败或结果提交中断时保留证据，恢复不得自动重发。它沿用原生 Step/attempt 日志，不建立另一套模型或工具执行循环。
+
+工作流同样受已选择和运行中激活的 Skill 限制。模型工具子集与后续 `tool_call` 读取同一当前 Skill；`skill_apply` 的限制先经过原持久化入口提交，再交付成功结果。保存失败时停止工作流，不能用初始 Task 绑定或普通工具目录继续调用。同名 Skill 被收紧、停用或重载时重新解析工具面，不使用仅按名称缓存的旧目录。
+
+任务关闭原生工具时，工作流也不能提交 `tool_call`、`dispatch_task` 或携带非空 `tools` 的 `model_request`；宿主在记录新动作意图前拒绝。保存检查点、等待用户、纯文本模型请求及完成仍按原合同处理；关闭工具不妨碍读取已发生动作的原结果。
+
+`dispatch_task.delegation` 遵循 [子代理决策合同](subagent-delegation-design.md)，`reason` 为 1–600 字符的实际理由。该动作派发后立即等待子任务，因此只接受 `user_requested / context_isolation / independent_review`；即使填写 `parent_work`，`parallel_work` 仍被拒绝。普通步骤直接使用 `model_request / tool_call`；工作流选择或角色存在本身不构成委派收益，也不授予代理权限。插件中的文字不等于用户明确要求代理。宿主不为旧插件缺失的理由补默认值；新动作必须提供有效决策，旧检查点中的已创建子任务继续按原事实结算。通过 `tool_call` 调用 `agent_spawn` 时同样需要完整决策，不能把工作流后续串行步骤写成同时推进的工作。
 
 最小工作流处理分支如下；放在函数内部取得 `{kind,id}` 之后、最终 `throw` 之前。此例只结束运行，不调用模型；发送后应在对话中看到“检查已完成。”：
 
@@ -678,7 +686,7 @@ if (kind === 'workflow' && id === 'review') {
 }
 ```
 
-工作流状态必须通过检查点和宿主结果推进，不能依赖全局变量。失败、取消或未知副作用不能伪装成完成，也不能假定宿主会自动重放上一步。
+工作流状态必须通过检查点和宿主结果推进，不能依赖全局变量。宿主在输入实际接纳为 Turn 时固定插件包摘要；排队输入在领取时才固定版本。升级不会把旧检查点交给新包，缺少包摘要的历史检查点也会明确拒绝执行，需要核对旧结果后重新发起。插件停用、升级或排空不影响相同请求读取原接纳回执，但不能据此启动新的执行。`complete.summary` 随原任务结果持久化并进入对话终态展示。失败、取消或未知副作用不能伪装成完成，也不能假定宿主会自动重放上一步。
 
 ### 会话引擎
 
@@ -690,7 +698,9 @@ if (kind === 'workflow' && id === 'review') {
 - `{kind:'completed', content:string, metadata:JSON}`：完整结果。
 - `{kind:'failed', code:string, detail:string}`：明确失败。
 
-正常调用应以 `completed` 收口，失败以 `failed` 收口。当前通用 Worker 在函数返回后才发布整个事件数组，不能靠返回数组实现实时流式回调；也没有调用远端模型的网络 SDK。需要集成测试时，可用以下本地处理分支验证输入输出合同；同时声明 ID 为 `echo` 的引擎贡献和对应 `models` 权限。它只回显输入，不提供真实模型推理：
+通用适配器由可信宿主固定声明为文本输入：不支持图片、Magi 原生工具、运行中引导、检查点恢复或供应商输出上限；清单和插件输出不能自行提高能力。包含 `messages` 的调用会把完整 `{prompt,messages}` JSON 编码到 `prompt` 字符串，保留历史角色与内容；没有历史时仍传入原始文字。图片和工具请求在 Worker 启动前拒绝，不再截取最后一条消息或忽略图片。能力随模型 Step 冻结持久化，历史缺失声明时保持未知。
+
+正常调用应以唯一 `completed` 收口，失败以 `failed` 收口；完成后继续发事件会被拒绝，`delta.text` 始终是新增片段。每次调用重新取得绑定包摘要和当前激活状态的运行租约，停用、撤权或升级后的旧适配器不能获得新的执行权。当前通用 Worker 在函数返回后才发布整个事件数组，不能靠返回数组实现实时流式回调；也没有调用远端模型的网络 SDK。需要集成测试时，可用以下本地处理分支验证输入输出合同；同时声明 ID 为 `echo` 的引擎贡献和对应 `models` 权限。它只回显输入，不提供真实模型推理：
 
 ```js
 if (kind === 'engine' && id === 'echo') {

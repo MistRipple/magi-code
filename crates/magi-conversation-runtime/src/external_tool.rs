@@ -312,6 +312,7 @@ pub fn execute_external_tool_call(
         );
         tool_policy.access_profile = effective;
         let context = ToolExecutionContext {
+            caller_scope: magi_tool_runtime::ToolCallerScope::SessionMainline,
             worker_id: None,
             task_id: None,
             session_id: Some(call.session_id.clone()),

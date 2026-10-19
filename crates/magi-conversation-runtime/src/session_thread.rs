@@ -84,6 +84,7 @@ mod tests {
                 observed_context_window_tokens: None,
                 handled_task_ids: vec![old_task_id],
                 message_history: vec![magi_session_store::ThreadChatMessage {
+                    input_request_id: None,
                     role: "user".to_string(),
                     content: Some("历史任务：写 validation_auto_save_marker.txt".to_string()),
                     images: Vec::new(),

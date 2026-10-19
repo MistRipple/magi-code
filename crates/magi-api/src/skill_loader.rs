@@ -304,9 +304,24 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                 let mut restrict_standard_tools = false;
 
                 let config_path = skill_dir.join("config.json");
-                if let Ok(content) = fs::read_to_string(config_path)
-                    && let Ok(parsed) = serde_json::from_str::<Value>(&content)
-                {
+                let parsed_config = match fs::read_to_string(&config_path) {
+                    Ok(content) => match serde_json::from_str::<Value>(&content) {
+                        Ok(Value::Object(parsed)) => Some(parsed),
+                        _ => {
+                            tracing::warn!(
+                                skill_id,
+                                "Skill config.json 无效，跳过该 Skill，保留不可用状态"
+                            );
+                            continue;
+                        }
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        tracing::warn!(skill_id, %error, "Skill config.json 不可读，跳过该 Skill，保留不可用状态");
+                        continue;
+                    }
+                };
+                if let Some(parsed) = parsed_config {
                     restrict_standard_tools = parsed.get("allowed_tools").is_some();
                     if let Some(allowed) = parsed.get("allowed_tools").and_then(|v| v.as_array()) {
                         for t in allowed {
@@ -368,11 +383,7 @@ pub fn build_skill_runtime_from_settings(store: &SettingsStore) -> SkillRuntime 
 
 pub fn reload_skill_runtime_from_settings(skill_runtime: &SkillRuntime, store: &SettingsStore) {
     let loaded = load_skills_into_registry(store);
-    let registry = skill_runtime.registry();
-    registry.clear();
-    for skill in loaded.list() {
-        registry.register(skill);
-    }
+    skill_runtime.registry().replace(loaded.list());
 }
 
 #[cfg(test)]
@@ -420,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn instruction_skill_without_tool_config_inherits_standard_tool_surface() {
+    fn instruction_skill_inherits_only_when_tool_config_is_absent_or_valid() {
         let skill_dir = make_local_skill_dir(
             "inherit-standard-tools",
             "# Prompt Only Skill\n\n先取证，再回答。\n",
@@ -446,8 +457,25 @@ mod tests {
         });
 
         assert!(
-            plan.tool_policy.source_skill_ids.is_empty(),
+            plan.tool_policy.allowed_tool_names.is_none(),
             "未声明 allowed_tools 的 instruction Skill 不应创建标准工具白名单"
+        );
+        for invalid in ["{", "null", "[]"] {
+            std::fs::write(skill_dir.join("config.json"), invalid).unwrap();
+            assert!(
+                load_skills_into_registry(&store)
+                    .get("prompt-only")
+                    .is_none(),
+                "无效配置不能被当成没有工具限制：{invalid}"
+            );
+        }
+        std::fs::remove_file(skill_dir.join("config.json")).unwrap();
+        std::fs::create_dir(skill_dir.join("config.json")).unwrap();
+        assert!(
+            load_skills_into_registry(&store)
+                .get("prompt-only")
+                .is_none(),
+            "配置不可读时不能扩大工具范围"
         );
         std::fs::remove_dir_all(&skill_dir).expect("skill dir should be removed");
     }
@@ -674,7 +702,26 @@ mod tests {
             )
             .unwrap();
 
-        reload_skill_runtime_from_settings(&runtime, &store);
+        // 重载期间只能观察到完整旧目录或完整新目录；registry 克隆共享事实源。
+        let observed_registry = runtime.registry();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..1_000 {
+                    reload_skill_runtime_from_settings(&runtime, &store);
+                }
+            });
+            barrier.wait();
+            for _ in 0..10_000 {
+                let snapshot = observed_registry.list();
+                assert_eq!(snapshot.len(), 1, "重载期间必须保留完整注册快照");
+                assert!(matches!(
+                    snapshot[0].skill_id.as_str(),
+                    "first-skill" | "second-skill"
+                ));
+            }
+        });
         let registry = runtime.registry();
         assert!(registry.get("first-skill").is_none());
         assert!(registry.get("second-skill").is_some());

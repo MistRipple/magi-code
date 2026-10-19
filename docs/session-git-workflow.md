@@ -43,7 +43,7 @@
 - upstream、dirty summary、lease generation；
 - 子代理 worktree 的 task、worker、mode、base HEAD、branch、path、active 状态。
 
-状态持久化到 `session-git-contexts.json`。每轮执行前重新观测 Git；外部终端改变
+状态持久化到 `session-git-contexts.json`。每轮首次执行写入、Shell、结构化 Git 或代理派发前重新观测 Git；纯文本和文件检索不提前准备。外部终端改变
 branch 或 HEAD 后保留原期望基线，返回 drift/409，不静默接受。用户可以通过
 `/workspace/vcs/context/accept` 明确接受新基线。
 
@@ -54,12 +54,12 @@ branch 或 HEAD 后保留原期望基线，返回 drift/409，不静默接受。
 1. `GitService` repository mutex 串行化 refs、HEAD、index 和 worktree 元数据操作；
 2. `WorkspaceGitOperationCoordinator` 在 turn/worker 与 Git mutation 之间建立 lease。
 
-同一 repository 的两个主 session 不并行执行；运行中的任何 session 会阻止结构化
+同一 repository 的两个主 session 的工作区执行由租约串行化；纯对话和文件检索不占用该租约。持有执行租约的 session 会阻止结构化
 branch/merge/delete/worktree mutation。外部终端不服从进程内 lease，因此持锁后的实时
-观测与 CAS 仍是最终保护。每轮开始发现外部漂移后拒绝执行。
+观测与 CAS 仍是最终保护。首次工作区执行准备时发现外部漂移后拒绝执行工具，已经发出的模型请求不因此重放。
 
 仓库正被别的会话执行时，新的一轮（用户消息、排队消息、目标续跑）不会失败，而是排队等待：
-`ensure_session_code_context` 在该会话确有一轮正在启动时轮询占用租约，并向协调器登记为等待者；
+`ensure_session_code_context` 在该会话确有进行中轮次需要执行工作区工具时轮询占用租约，并向协调器登记为等待者；
 租约空闲时按登记先后交接，连续续跑的目标在两轮之间重新占用也要排在已有等待者之后，
 避免其它会话饥饿。等待者每次重试都会刷新自己，超过 5 秒没刷新视为放弃；轮次被取消后停止等待。
 没有进行中轮次的调用方（例如用户手动触发的 Git 操作）仍然立即失败。
@@ -78,12 +78,14 @@ worktree，也就不需要这把租约。机制、触发条件和合并语义见
 
 ### 2.4 子代理
 
-子代理从父会话派发时的工作树快照创建独立 worktree。GitService::snapshot_worktree 使用独立 index，把已跟踪和未跟踪的当前内容写成临时提交，不改变用户的 HEAD、index 或工作树。
+子代理在首次本地文件、检索、进程或 Git 工具准备时，从直接父任务当时的工作树快照创建独立 worktree（主线或父代理副本，包含未提交内容）。只使用模型、网络或会话协调能力的子代理不创建 worktree。GitService::snapshot_worktree 使用独立 index，把已跟踪和未跟踪的当前内容写成临时提交，不改变用户的 HEAD、index 或工作树。
 
 - 只读代理使用 detached worktree；可写代理从同一快照创建独立代理分支。
-- 工具 working_directory 指向代理 worktree；ProjectMemory 与 session snapshot 仍以主 workspace identity root 归档。
+- 工具 working_directory 与路径权限一起指向代理 worktree；ProjectMemory 仍以主 workspace identity root 归档。独立 worktree 的改动归代理分支，不使用主会话 snapshot hook 记录代理相对路径；普通目录和会话隔离副本里的子代理沿用该目录的变更账本。
+- 模型已生成的工具参数仍引用旧目录时返回明确未执行回执，下一次请求使用更新后的 workspace 上下文；路径别名与 Windows JSON 路径按同一边界处理。
 - 可写代理终态时把产出提交到代理分支，回执包含分支、提交和改动路径；提交失败须保留工作目录并返回错误。
-- agent_apply 将代理产出相对快照的差异合入主线，不能用切换主 HEAD 或丢弃 dirty 文件代替；冲突返回明确结果。
+- `agent_apply` 只采用已完成的直接子代理产出：主线合入主工作树，获授委派权的代理合入自己的活动可写副本。缺少真实任务身份、越级或父租约失效时拒绝；产出相对各自快照计算，不能用切换 HEAD 或丢弃 dirty 文件代替，冲突返回明确结果。
+- 主线可显式用 `allow_delegation=true` 授予直接子代理继续派发的能力，最多两层；孙代理不能再委派。嵌套快照检查父 Task 和 worktree 的租约，父目录释放后不会回落主目录。共享计划/Goal/主分支操作仍由主线持有。
 - 活动代理的占用按 TaskStore 生命周期释放，重启后核对真实任务状态；主线 Git mutation 不得与活动代理竞态。
 
 因此并行代理不会切换主 HEAD、互相覆盖文件，diff 可以按 task/branch/path 归属。
@@ -139,8 +141,7 @@ Mutation 推荐始终携带：
 
 工具运行时只负责路由，实际 Git 命令仍唯一落到 `magi-git::GitService`。模型工具从
 `ToolExecutionContext` 获取 session、workspace 与 working directory，不允许模型自行传入
-另一个 workspace。Git 工具只对普通主会话和 coordinator 主线可见，sidechain 子代理既
-看不到这些工具，执行层也会再次拒绝带 `worker_id` 的 mutation。
+另一个 workspace。子代理可使用 `git_status`、`git_branch_list`、`git_worktree_list` 查询获授目录，且不更新主会话 Git context；Git mutation 仅对普通主会话和 coordinator 主线开放，执行层再次校验可信调用者范围。
 
 外部 UI mutation 在 turn/worker 运行期间仍被拒绝；主模型在当前 turn 内调用 mutation
 时必须已经持有该 repository 的 execution lease，因此不会与其他 session 竞态。mutation

@@ -42,8 +42,9 @@ use magi_tool_runtime::{
 };
 
 use crate::agent_spawn_preflight::{
-    AGENT_CONTEXT_PREVIEW_MAX_CHARS, AGENT_CONTEXT_SUMMARY_MAX_CHARS, AgentSpawnPreflightInput,
-    parse_agent_context_references, preflight_agent_spawn, required_bounded_context_text,
+    AGENT_CONTEXT_PREVIEW_MAX_CHARS, AGENT_CONTEXT_SUMMARY_MAX_CHARS,
+    AGENT_SPAWN_DUPLICATE_INSTRUCTION, AgentSpawnPreflightInput, parse_agent_context_references,
+    preflight_agent_spawn, required_bounded_context_text,
 };
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::goal_tool_failure;
@@ -53,7 +54,7 @@ use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
-    task_helpers::task_can_see_builtin_tool,
+    task_helpers::{task_can_delegate, task_can_see_builtin_tool, task_is_coordinator},
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
     tool_result_utils::{
         approval_resume_contract_failure, approval_resume_is_safe, safety_gate_public_error,
@@ -64,8 +65,6 @@ use crate::{
     active_skill_tool_execution_policy, execute_skill_custom_tool, parse_skill_custom_tool_name,
     tool_execution_policy_scope,
 };
-
-const MIN_CREATE_GOAL_TOKEN_BUDGET: u64 = 16_000;
 
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
 ///
@@ -210,10 +209,17 @@ pub(crate) fn execute_task_tool_call_batch(
     browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
+    if !execution_allowed() {
+        return tool_calls
+            .iter()
+            .map(|call| tool_interrupted_before_execution_result(&call.function.name))
+            .collect();
+    }
     tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
         execute_task_tool_call_batch_unchecked(
             event_bus,
@@ -239,6 +245,7 @@ pub(crate) fn execute_task_tool_call_batch(
             on_progress,
             snapshot_session.clone(),
             execution_group_id.clone(),
+            execution_allowed,
         )
     })
 }
@@ -265,9 +272,10 @@ fn execute_task_tool_call_batch_unchecked(
     worker_id: Option<&magi_core::WorkerId>,
     browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_calls: &[ChatToolCall],
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(String, ExecutionResultStatus)> {
     let hook_contexts = tool_calls
         .iter()
@@ -280,17 +288,18 @@ fn execute_task_tool_call_batch_unchecked(
         .collect::<Vec<_>>();
     // 任务一旦进入终态（被中断为 Killed、租约失效收口为 Failed 等），执行权已不再属于
     // 本次 Runner，剩余调用不得继续产生副作用。
-    let execution_allowed = || {
-        !task_store.get_task(&task.task_id).is_some_and(|current| {
-            matches!(
-                current.status,
-                magi_core::TaskStatus::Completed
-                    | magi_core::TaskStatus::Failed
-                    | magi_core::TaskStatus::Killed
-            )
-        })
+    let batch_execution_allowed = || {
+        execution_allowed()
+            && !task_store.get_task(&task.task_id).is_some_and(|current| {
+                matches!(
+                    current.status,
+                    magi_core::TaskStatus::Completed
+                        | magi_core::TaskStatus::Failed
+                        | magi_core::TaskStatus::Killed
+                )
+            })
     };
-    let results = run_tool_call_batches(tool_calls, &execution_allowed, &|tool_index| {
+    let results = run_tool_call_batches(tool_calls, &batch_execution_allowed, &|tool_index| {
         let mut hook_ctx = hook_contexts[tool_index].clone();
         if let Some(snapshot) = snapshot_session.as_deref() {
             snapshot.before_tool(&hook_ctx);
@@ -329,6 +338,7 @@ fn execute_task_tool_call_batch_unchecked(
                     browser_capability_snapshot.clone(),
                     tool_call,
                     on_progress,
+                    execution_allowed,
                 )
             },
         );
@@ -452,6 +462,8 @@ struct CoordinatorToolContext<'a> {
     task: &'a magi_core::Task,
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
+    workspace_root_path: Option<&'a PathBuf>,
+    execution_allowed: &'a (dyn Fn() -> bool + Sync),
 }
 
 /// `agent_spawn` 在创建前失败时仍要返回可被模型、前端和通知中心共同消费的诊断合同。
@@ -466,7 +478,7 @@ fn agent_spawn_failure_payload(
     error: impl Into<String>,
     instruction: impl Into<String>,
 ) -> String {
-    agent_spawn_failure_payload_for_child(
+    agent_spawn_failure_payload_for_existing_task(
         tool_call,
         status,
         error_code,
@@ -477,27 +489,24 @@ fn agent_spawn_failure_payload(
     )
 }
 
-fn agent_spawn_failure_payload_for_child(
+fn agent_spawn_failure_payload_for_existing_task(
     tool_call: &ChatToolCall,
     status: &str,
     error_code: &str,
     failure_stage: &str,
     error: impl Into<String>,
     instruction: impl Into<String>,
-    child_task_id: Option<&TaskId>,
+    existing_task_id: Option<&TaskId>,
 ) -> String {
-    // 参数问题和容量/注册冲突由主线修正参数或稍后重试即可解决；模型配置、工作区、
-    // Git 和执行链问题主线无法自行修复，必须改由主线完成并告知用户。
-    let retryable = matches!(failure_stage, "input_validation" | "registration");
-    let instruction = instruction.into();
-    let instruction = if retryable {
-        instruction
-    } else {
-        format!(
-            "这不是参数问题，主线无法自行修复：请由主线直接完成这部分工作或改派其他角色，并在最终答复中告诉用户需要处理的问题（{instruction}）"
-        )
-    };
-    serde_json::json!({
+    // retryable 只说明可按诊断修正输入/注册冲突，不构成再次派发的决定。
+    let retryable =
+        existing_task_id.is_none() && matches!(failure_stage, "input_validation" | "registration");
+    let instruction = format!(
+        "{} 具体诊断：{}",
+        magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE,
+        instruction.into()
+    );
+    let mut payload = serde_json::json!({
         "tool": BuiltinToolName::AgentSpawn.as_str(),
         "status": status,
         "error_code": error_code,
@@ -506,9 +515,13 @@ fn agent_spawn_failure_payload_for_child(
         "error": error.into(),
         "instruction": instruction,
         "diagnostic_ref": format!("tool_call:{}", tool_call.id),
-        "child_task_id": child_task_id.map(ToString::to_string),
-    })
-    .to_string()
+        "child_task_id": null,
+    });
+    if let Some(existing_task_id) = existing_task_id {
+        // 这是已存在任务的引用，不能伪装成本次拒绝调用创建的新 child。
+        payload["existing_task_id"] = serde_json::json!(existing_task_id);
+    }
+    payload.to_string()
 }
 
 fn execute_coordinator_tool(
@@ -527,6 +540,8 @@ fn execute_coordinator_tool(
         task,
         session_id,
         workspace_id,
+        workspace_root_path,
+        execution_allowed,
     } = context;
     let parsed: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
         Ok(value) => value,
@@ -588,6 +603,8 @@ fn execute_coordinator_tool(
                 task,
                 session_id,
                 workspace_id,
+                workspace_root_path,
+                execution_allowed,
             },
             tool_call,
             &parsed,
@@ -596,9 +613,11 @@ fn execute_coordinator_tool(
         magi_tool_runtime::BuiltinToolName::AgentWait => execute_agent_wait_with_runtime(
             AgentWaitRuntime {
                 task_store,
+                session_store,
                 admission: &execution_registry.execution_admission(),
                 conversation_registry,
                 session_id,
+                execution_allowed,
             },
             task,
             tool,
@@ -613,9 +632,25 @@ fn execute_coordinator_tool(
             &parsed,
             &publish_event,
         ),
-        magi_tool_runtime::BuiltinToolName::AgentCancel => {
-            execute_agent_cancel(task_store, execution_registry, task, tool, &parsed)
-        }
+        magi_tool_runtime::BuiltinToolName::AgentCancel => run_with_task_execution_wait(
+            task_store,
+            execution_registry,
+            task,
+            tool.as_str(),
+            || {
+                execute_agent_cancel(
+                    task_store,
+                    execution_registry,
+                    session_store,
+                    task,
+                    session_id,
+                    tool,
+                    &parsed,
+                )
+            },
+            execution_allowed,
+        )
+        .unwrap_or_else(std::convert::identity),
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
 }
@@ -637,6 +672,8 @@ fn execute_agent_spawn(
         task,
         session_id,
         workspace_id,
+        workspace_root_path,
+        ..
     } = context;
 
     // 预检只读事实；直到它成功后才生成 child_task_id 或写入任何任务状态。
@@ -652,6 +689,7 @@ fn execute_agent_spawn(
         plan_store,
         session_id,
         workspace_id,
+        execution_root: workspace_root_path,
         now,
         sequence,
     }) {
@@ -664,13 +702,14 @@ fn execute_agent_spawn(
                 "agent_spawn 创建前预检拒绝"
             );
             return (
-                agent_spawn_failure_payload(
+                agent_spawn_failure_payload_for_existing_task(
                     tool_call,
                     "rejected",
                     &error.error_code,
                     &error.failure_stage,
                     error.message,
                     error.instruction,
+                    error.existing_task_id.as_ref(),
                 ),
                 ExecutionResultStatus::Rejected,
             );
@@ -683,6 +722,29 @@ fn execute_agent_spawn(
         now.0,
         sequence
     ));
+    let activation = magi_core::AgentActivation {
+        agent_id: preflight
+            .previous_activation
+            .as_ref()
+            .map(|source| source.agent_id.clone())
+            .unwrap_or_else(|| child_task_id.clone()),
+        session_id: session_id.clone(),
+        lifetime: preflight.agent_lifetime.clone(),
+        generation: match preflight.previous_activation.as_ref() {
+            Some(source) => match source.generation.checked_add(1) {
+                Some(value) => value,
+                None => {
+                    return context_tool_failure(
+                        BuiltinToolName::AgentSpawn,
+                        "agent_activation_overflow",
+                        "Agent activation generation 溢出",
+                    );
+                }
+            },
+            None => 1,
+        },
+        previous_task_id: preflight.previous_task_id.clone(),
+    };
     let context_package_id = preflight.context_package.package_id.clone();
     let context_revision = preflight.context_package.revision;
     let plan_item_id = preflight.plan_item_id.clone();
@@ -722,6 +784,30 @@ fn execute_agent_spawn(
         updated_at: now,
     };
 
+    let mut child = child;
+    child
+        .executor_binding
+        .as_mut()
+        .expect("spawn role binding")
+        .agent_activation = Some(activation.clone());
+    child
+        .executor_binding
+        .as_mut()
+        .expect("spawn role binding")
+        .delegation_allowed = preflight.delegation_allowed;
+    // 初始消息必须早于 TaskStore 的可调度发布，和后续 agent_send 共用同一 FIFO。
+    conversation_registry.open_task_signal_channel(session_id, &child_task_id);
+    if let Err(error) = enqueue_agent_assignment_message(
+        conversation_registry,
+        session_id,
+        task,
+        &child,
+        &preflight.role,
+        now,
+    ) {
+        conversation_registry.close_task_signal_channel(session_id, &child_task_id);
+        return context_tool_failure(BuiltinToolName::AgentSpawn, "agent_input_closed", error);
+    }
     let registered_execution = match execution_registry.register_spawned_local_agent_child(
         SpawnedChildExecutionRequest {
             task_store,
@@ -735,13 +821,17 @@ fn execute_agent_spawn(
                 .and_then(|definition| definition.parallelism_limit),
             plan_store: preflight.plan_item_id.as_ref().map(|_| plan_store),
             plan_item_id: plan_item_id.clone(),
-            execution_root: preflight.working_dir.clone(),
+            execution_root: preflight
+                .working_dir
+                .clone()
+                .or_else(|| workspace_root_path.cloned()),
             inherit_skill: preflight.inherit_skill,
             now,
         },
     ) {
         Ok(registered) => registered,
         Err(error) => {
+            conversation_registry.close_task_signal_channel(session_id, &child_task_id);
             tracing::warn!(
                 error = %error,
                 parent_task_id = %task.task_id,
@@ -750,6 +840,14 @@ fn execute_agent_spawn(
             );
             let (error_code, failure_stage, status, execution_status, message, instruction) =
                 match error {
+                    SpawnedChildExecutionError::GoalPaused(message) => (
+                        "agent_goal_paused",
+                        "registration",
+                        "rejected",
+                        ExecutionResultStatus::Rejected,
+                        message,
+                        "由用户显式恢复当前 Goal 后再创建新的子代理。",
+                    ),
                     SpawnedChildExecutionError::RoleCapacityExceeded {
                         role,
                         active,
@@ -764,13 +862,35 @@ fn execute_agent_spawn(
                         ),
                         "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。",
                     ),
+                    SpawnedChildExecutionError::SharedWorkspaceWriterActive => (
+                        "agent_workspace_busy",
+                        "registration",
+                        "rejected",
+                        ExecutionResultStatus::Rejected,
+                        SpawnedChildExecutionError::SharedWorkspaceWriterActive.to_string(),
+                        "本次未创建代理。请用 agent_wait 等待已有代理结束后再派发；用户明确要求多个真实代理时可以按序完成，不能用主线自述代替。角色的只读职责不等于只读授权。",
+                    ),
+                    SpawnedChildExecutionError::DuplicateTaskName { existing_task_id } => {
+                        return (
+                            agent_spawn_failure_payload_for_existing_task(
+                                tool_call,
+                                "rejected",
+                                "duplicate_task_name",
+                                "registration",
+                                "同一父任务下 task_name 已存在",
+                                AGENT_SPAWN_DUPLICATE_INSTRUCTION,
+                                Some(&existing_task_id),
+                            ),
+                            ExecutionResultStatus::Rejected,
+                        );
+                    }
                     SpawnedChildExecutionError::InvalidState(_) => (
                         "agent_spawn_registration_failed",
                         "registration",
                         "failed",
                         ExecutionResultStatus::Failed,
-                        "代理启动失败，请由主线继续或改派其他角色".to_string(),
-                        "请根据当前任务继续推进，或改派其他可用角色；如需排查，请使用本次诊断引用定位工具调用。",
+                        "代理启动失败".to_string(),
+                        "使用本次诊断引用定位工具调用，核对当前执行链和注册状态；不要重复相同调用。",
                     ),
                 };
             return (
@@ -787,7 +907,6 @@ fn execute_agent_spawn(
         }
     };
 
-    conversation_registry.open_task_signal_channel(session_id, &child_task_id);
     if let Some(plan) = registered_execution.plan.as_ref() {
         magi_plan::publish_plan_event(
             event_bus,
@@ -801,8 +920,11 @@ fn execute_agent_spawn(
     publish_event(
         "task.coordinator.agent_spawn",
         serde_json::json!({
+            "delegation": preflight.delegation,
             "parent_task_id": task.task_id.to_string(),
             "child_task_id": child_task_id.to_string(),
+            "agent_id": activation.agent_id,
+            "activation": activation,
             "task_name": preflight.task_name.clone(),
             "canonical_task_name": preflight.canonical_task_name,
             "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
@@ -820,15 +942,6 @@ fn execute_agent_spawn(
             "queue_reason": registered_execution.queue_reason,
         }),
     );
-    enqueue_agent_assignment_message(
-        conversation_registry,
-        session_id,
-        task,
-        &child,
-        &preflight.role,
-        now,
-    );
-
     let queue_reason = registered_execution.queue_reason.clone();
     let status = if queue_reason.is_some() {
         "queued"
@@ -843,7 +956,10 @@ fn execute_agent_spawn(
         serde_json::json!({
             "tool": BuiltinToolName::AgentSpawn.as_str(),
             "status": status,
+            "delegation": preflight.delegation,
             "child_task_id": child_task_id.to_string(),
+            "agent_id": activation.agent_id,
+            "activation": activation,
             "task_name": preflight.task_name,
             "canonical_task_name": preflight.canonical_task_name,
             "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
@@ -980,12 +1096,12 @@ fn execute_agent_send(
     // 排队中的代理尚未开始：补充写入其上下文包即可，启动时随上下文包一起渲染进提示词，
     // 不依赖只在运行期存在的信号通道。
     if target_task.status == TaskStatus::Pending {
-        let committed = task_store
-            .append_agent_context_supplement(&target_task_id, supplement.clone())
-            .and_then(|package| {
-                task_store.append_agent_context_access(&target_task_id, access.clone())?;
-                Ok(package)
-            });
+        let committed = task_store.deliver_agent_context_supplement(
+            &target_task_id,
+            TaskStatus::Pending,
+            supplement.clone(),
+            access.clone(),
+        );
         let package = match committed {
             Ok(package) => package,
             Err(error) => {
@@ -1020,9 +1136,12 @@ fn execute_agent_send(
     }
     let commit =
         conversation_registry.enqueue_task_signal_with(session_id, &target_task_id, || {
-            let package =
-                task_store.append_agent_context_supplement(&target_task_id, supplement.clone())?;
-            task_store.append_agent_context_access(&target_task_id, access.clone())?;
+            let package = task_store.deliver_agent_context_supplement(
+                &target_task_id,
+                TaskStatus::Running,
+                supplement.clone(),
+                access.clone(),
+            )?;
             let signal = RuntimeSignal {
                 author: MailboxAuthor::Parent(parent_task.task_id.to_string()),
                 kind: MailboxKind::Message,
@@ -1050,6 +1169,9 @@ fn execute_agent_send(
             return context_tool_failure(tool, "context_persist_failed", error.to_string());
         }
     };
+    // agent_wait 等待 TaskStore 的变化通知；FIFO 就绪通知只唤醒 context_request。
+    // 补充和运行中投递都已提交后，才能唤醒正在等待其子代理的接收方。
+    task_store.notify_runtime_change();
     publish_event(
         "task.coordinator.agent_send",
         serde_json::json!({
@@ -1389,8 +1511,8 @@ fn execute_context_request(
                         ExecutionResultStatus::Succeeded,
                     );
                 }
-                if task_store.get_task(&task.task_id).is_some_and(|current| {
-                    matches!(current.status, TaskStatus::Failed | TaskStatus::Killed)
+                if task_store.get_task(&task.task_id).is_none_or(|current| {
+                    !matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
                 }) {
                     return context_tool_failure(
                         tool,
@@ -1399,11 +1521,17 @@ fn execute_context_request(
                     );
                 }
                 let wait_ms = (timeout_ms - elapsed_ms).min(250);
-                let responses = conversation_registry.wait_for_task_signals(
+                let Some(responses) = conversation_registry.wait_for_task_signals(
                     session_id,
                     &task.task_id,
                     std::time::Duration::from_millis(wait_ms),
-                );
+                ) else {
+                    return context_tool_failure(
+                        tool,
+                        "task_interrupted",
+                        "等待上下文回复时任务输入已关闭",
+                    );
+                };
                 if !responses.is_empty() {
                     return (
                         serde_json::json!({
@@ -1416,6 +1544,16 @@ fn execute_context_request(
                         })
                         .to_string(),
                         ExecutionResultStatus::Succeeded,
+                    );
+                }
+                // 已投递的补充先交付；没有答复且父任务已退出时不再等到工具超时。
+                if task_store.get_task(&parent_task_id).is_none_or(|parent| {
+                    !matches!(parent.status, TaskStatus::Pending | TaskStatus::Running)
+                }) {
+                    return context_tool_failure(
+                        tool,
+                        "parent_not_running",
+                        "等待上下文回复时父任务已结束",
                     );
                 }
             }
@@ -1474,8 +1612,11 @@ fn collect_context_candidates(
             })
         })
         .collect::<Vec<_>>();
+    let previous_activations =
+        crate::agent_activation::previous_activation_ids(task_store, task, session_id);
     for candidate_task in task_store.all_tasks().into_iter().filter(|candidate| {
-        candidate.root_task_id == task.root_task_id && candidate.mission_id == task.mission_id
+        (candidate.root_task_id == task.root_task_id && candidate.mission_id == task.mission_id)
+            || previous_activations.contains(&candidate.task_id)
     }) {
         for (index, content) in candidate_task.output_refs.iter().enumerate() {
             candidates.push(ResolvedAgentContext {
@@ -1492,6 +1633,26 @@ fn collect_context_candidates(
                 title: format!("{} · 证据 {}", candidate_task.title, index + 1),
                 content: content.clone(),
             });
+        }
+    }
+    if !previous_activations.is_empty() {
+        for thread in session_store.thread_registry_snapshot(session_id) {
+            for previous in &previous_activations {
+                if !thread.handled_task_ids.contains(previous) {
+                    continue;
+                }
+                // Thread 仍归原 activation；按引用读取的 transcript 不成为新调用授权。
+                let history = thread.message_history.iter().map(|message| serde_json::json!({
+                    "role":message.role, "content":message.content, "tool_calls":message.tool_calls,
+                    "tool_call_id":message.tool_call_id,
+                })).collect::<Vec<_>>();
+                candidates.push(ResolvedAgentContext {
+                    reference_id: format!("task:{previous}:transcript"),
+                    kind: AgentContextReferenceKind::Other,
+                    title: "Agent 前序执行记录（历史参考）".into(),
+                    content: serde_json::to_string(&history).expect("thread projection serializes"),
+                });
+            }
         }
     }
     if let Some(package) = task.agent_context_package() {
@@ -1630,58 +1791,12 @@ pub(crate) fn execute_goal_tool(
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .trim();
-            let token_budget = match parsed.get("token_budget") {
-                Some(serde_json::Value::Null) => None,
-                Some(value) => match value.as_u64() {
-                    Some(budget) => Some(budget),
-                    None => {
-                        return goal_tool_failure::invalid_input(
-                            tool.as_str(),
-                            "token_budget 必须是正整数；用户没有明确预算时传 null",
-                            "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
-                        );
-                    }
-                },
-                None => {
-                    return goal_tool_failure::invalid_input(
-                        tool.as_str(),
-                        "create_goal 必须提供 token_budget；用户没有明确预算时传 null",
-                        "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
-                    );
-                }
-            };
-            if token_budget == Some(0) {
-                return goal_tool_failure::invalid_input(
-                    tool.as_str(),
-                    "token_budget 必须大于 0",
-                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
-                );
-            }
-            if token_budget.is_some_and(|budget| budget < MIN_CREATE_GOAL_TOKEN_BUDGET) {
-                return goal_tool_failure::invalid_input(
-                    tool.as_str(),
-                    format!(
-                        "token_budget 不能低于 {MIN_CREATE_GOAL_TOKEN_BUDGET}；若用户没有明确给出预算，请传 null"
-                    ),
-                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
-                );
-            }
-            if token_budget.is_some_and(|budget| {
-                !objective_text_explicitly_allows_goal_budget(objective, budget)
-            }) {
-                return goal_tool_failure::invalid_input(
-                    tool.as_str(),
-                    "token_budget 必须来自用户目标原文里的明确预算数值；若用户未明确给预算或要求不要设置预算，请传 null",
-                    "按工具参数要求修正后重新调用；用户没有在原文里明确给出预算时，token_budget 传 null。",
-                );
-            }
             match session_store.create_goal(
                 session_id.clone(),
                 thread_id,
                 turn_id,
                 objective,
                 access_profile,
-                token_budget,
             ) {
                 Ok(goal) => (
                     serde_json::json!({
@@ -1818,40 +1933,6 @@ pub(crate) fn execute_goal_tool(
     }
 }
 
-fn objective_text_explicitly_allows_goal_budget(objective: &str, token_budget: u64) -> bool {
-    let normalized = objective.to_ascii_lowercase();
-    if [
-        "不要设置 token_budget",
-        "不要设置预算",
-        "不要给预算",
-        "不要设预算",
-        "no token_budget",
-        "no token budget",
-        "without token_budget",
-        "without token budget",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    if ![
-        "token_budget",
-        "token budget",
-        "token 预算",
-        "tokens",
-        "token",
-        "预算",
-        "budget",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    normalized.contains(&token_budget.to_string())
-}
-
 #[cfg(test)]
 fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
@@ -1880,19 +1961,14 @@ fn enqueue_agent_assignment_message(
     child: &magi_core::Task,
     role: &str,
     now: UtcMillis,
-) {
+) -> Result<(), String> {
     let access_profile = child
         .policy_snapshot
         .as_ref()
         .map(magi_core::TaskPolicy::effective_access_profile)
         .unwrap_or_default()
         .as_str();
-    let child_conversation =
-        conversation_registry.conversation_for_task(session_id, &child.task_id);
-    child_conversation
-        .lock()
-        .expect("child conversation mutex poisoned")
-        .ingest_runtime_signal(RuntimeSignal {
+    conversation_registry.enqueue_task_signal(session_id, &child.task_id, RuntimeSignal {
             author: MailboxAuthor::Parent(parent.task_id.to_string()),
             kind: MailboxKind::Message,
             trigger_turn: true,
@@ -1909,14 +1985,16 @@ fn enqueue_agent_assignment_message(
                 "context_revision": child.agent_context_package().map(|package| package.revision),
             }),
             enqueued_at: now,
-        });
+        })
 }
 
 struct AgentWaitRuntime<'a> {
     task_store: &'a TaskStore,
+    session_store: &'a SessionStore,
     admission: &'a crate::execution_admission::ExecutionAdmissionController,
     conversation_registry: &'a ConversationRegistry,
     session_id: &'a SessionId,
+    execution_allowed: &'a (dyn Fn() -> bool + Sync),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1942,9 +2020,11 @@ fn execute_agent_wait_with_runtime(
 ) -> (String, ExecutionResultStatus) {
     let AgentWaitRuntime {
         task_store,
+        session_store,
         admission,
         conversation_registry,
         session_id,
+        execution_allowed,
     } = runtime;
     let request = match parse_agent_wait_request(parsed) {
         Ok(request) => request,
@@ -1986,17 +2066,43 @@ fn execute_agent_wait_with_runtime(
     let started_at = std::time::Instant::now();
     let mut observed_status_version = task_store.status_change_version();
     // 等待子代理期间让出执行名额，避免与自己派发的子代理争抢同一批名额。
-    let _waiting = admission.suspend_while_waiting(&parent_task.task_id);
+    let waiting = admission.suspend_while_waiting(&parent_task.task_id);
+    let parent_is_active = || {
+        execution_allowed()
+            && task_store
+                .get_task(&parent_task.task_id)
+                .is_some_and(|task| {
+                    matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                })
+    };
     loop {
+        if !execution_allowed()
+            || waiting.is_some() && !parent_is_active()
+            || task_store
+                .get_task(&parent_task.task_id)
+                .is_some_and(|task| {
+                    !matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                })
+        {
+            return (
+                serde_json::json!({"tool":tool.as_str(),"status":"cancelled",
+                "error_code":"agent_wait_cancelled","execution_started":false})
+                .to_string(),
+                ExecutionResultStatus::Cancelled,
+            );
+        }
         let runtime_signals =
             conversation_registry.drain_task_signals(session_id, &parent_task.task_id);
         let mut receipts = Vec::new();
         let mut pending_task_ids = Vec::new();
         for task_id in &task_ids {
-            match task_store
-                .get_task(task_id)
-                .and_then(|child| crate::agent_receipt::AgentReceipt::from_terminal_task(&child))
-            {
+            match task_store.get_task(task_id).and_then(|child| {
+                crate::agent_receipt::AgentReceipt::from_terminal_task_in_session(
+                    &child,
+                    session_store,
+                    session_id,
+                )
+            }) {
                 Some(receipt) => receipts.push(receipt),
                 None => pending_task_ids.push(task_id.to_string()),
             }
@@ -2034,13 +2140,21 @@ fn execute_agent_wait_with_runtime(
         } else if pending_task_ids.is_empty() {
             (
                 "completed",
-                "对照每个代理的 assignment.goal 阅读 result.final_text 与 activity（实际执行的命令、退出码和改动文件），合并结论、证据、风险与缺口；代理失败时决定改派或由主线接管。",
+                "对照每个代理的 assignment.goal 阅读 result.final_text 与 activity（实际执行的命令、退出码和改动文件），合并结论、证据、风险与缺口。",
             )
         } else {
             (
                 "completed",
                 "已有代理结束，results 中的结果已经收集。处理后对 pending_task_ids 继续 agent_wait。",
             )
+        };
+        let instruction = if failed > 0 || killed > 0 {
+            format!(
+                "{instruction} {}",
+                magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE
+            )
+        } else {
+            instruction.to_string()
         };
         let mut payload = serde_json::json!({
             "tool": tool.as_str(),
@@ -2066,6 +2180,17 @@ fn execute_agent_wait_with_runtime(
         if !runtime_signals.is_empty() {
             payload["runtime_signals"] = serde_json::json!(runtime_signals);
         }
+        if waiting
+            .as_ref()
+            .is_some_and(|guard| !guard.resume(parent_is_active))
+        {
+            return (
+                serde_json::json!({"tool":tool.as_str(),"status":"cancelled",
+                "error_code":"agent_wait_cancelled","execution_started":false})
+                .to_string(),
+                ExecutionResultStatus::Cancelled,
+            );
+        }
         return (payload.to_string(), ExecutionResultStatus::Succeeded);
     }
 }
@@ -2082,10 +2207,12 @@ fn execute_agent_wait(
     registry.open_task_signal_channel(&session_id, &parent_task.task_id);
     execute_agent_wait_with_runtime(
         AgentWaitRuntime {
+            session_store: &SessionStore::new(),
             task_store,
             admission: &crate::execution_admission::ExecutionAdmissionController::default(),
             conversation_registry: &registry,
             session_id: &session_id,
+            execution_allowed: &|| true,
         },
         parent_task,
         tool,
@@ -2098,7 +2225,9 @@ fn execute_agent_wait(
 fn execute_agent_cancel(
     task_store: &TaskStore,
     execution_registry: &TaskExecutionRegistry,
+    session_store: &SessionStore,
     parent_task: &magi_core::Task,
+    session_id: &SessionId,
     tool: magi_tool_runtime::BuiltinToolName,
     parsed: &serde_json::Value,
 ) -> (String, ExecutionResultStatus) {
@@ -2160,21 +2289,65 @@ fn execute_agent_cancel(
             );
         }
     };
-    let child_status = task_store
-        .get_task(&child_task_id)
-        .map(|child| format!("{:?}", child.status).to_ascii_lowercase())
-        .unwrap_or_else(|| "missing".to_string());
+    // TaskStore 终态只撤销执行资格；线程、进程及 worktree 仍可能正在退出。
+    // 父任务本身也在执行，不能等待整个 root，否则会等待当前调用而死锁。
+    let task_ids = task_store.collect_subtree_ids(&child_task_id);
+    let settlement = execution_registry.settle_agent_subtree(session_id, &task_ids);
+    // 取消与完成可能竞争。没有改变状态不等于主线已经读过产物，不能把
+    // already_terminal 当作无结果的取消成功，也不能引导模型重新派发同一工作。
+    let receipt = task_store.get_task(&child_task_id).and_then(|child| {
+        crate::agent_receipt::AgentReceipt::from_terminal_task_in_session(
+            &child,
+            session_store,
+            session_id,
+        )
+    });
+    let Some(receipt) = receipt else {
+        return (
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "failed",
+                "error_code": "cancel_unsettled",
+                "child_task_id": child_task_id,
+                "instruction": "取消后未能核对代理终态；先用 agent_wait 核对原任务，不得假定已停止或重复执行其工作。",
+            }).to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let child_status = receipt.child_status().to_string();
+    let resources_settled = matches!(settlement, Ok(true));
+    let settlement_error = settlement.err();
+    let instruction = if !resources_settled {
+        "Task 已进入终态，但尚未确认执行资源退出。不得开始与该子树冲突的替代工作或宣称资源已释放；先核对原产物及结算诊断。"
+    } else if changed {
+        "取消已结算且执行资源已退出，results 包含终态回执；取消不保证此前没有副作用。"
+    } else {
+        "代理在取消生效前已进入终态，原结果未被覆盖。先读取 results 中的 assignment.goal、result.final_text、activity 和 workspace，核对已有产物，不要把 already_terminal 当成任务尚未执行。"
+    };
     (
         serde_json::json!({
             "tool": tool.as_str(),
-            "status": if changed { "cancelled" } else { "already_terminal" },
+            "status": if settlement_error.is_some() { "failed" } else if changed { "cancelled" } else { "already_terminal" },
+            "cancellation_status": if changed { "cancelled" } else { "already_terminal" },
+            "error_code": settlement_error.as_ref().map(|_| "cancel_unsettled"),
             "child_task_id": child_task_id.to_string(),
             "child_status": child_status,
             "reason": reason,
-            "instruction": "该代理已结束，不需要再 agent_wait 它；如仍需要它负责的工作，请改派或由主线接管。",
+            "resources_settled": resources_settled,
+            "settlement_error": settlement_error,
+            "results": crate::agent_receipt::render_receipts(
+                vec![receipt],
+                crate::agent_receipt::AGENT_WAIT_FINAL_TEXT_BUDGET_BYTES,
+            ),
+            "model_budgeted": true,
+            "instruction": format!("{instruction} {}", magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE),
         })
         .to_string(),
-        ExecutionResultStatus::Succeeded,
+        if settlement_error.is_none() {
+            ExecutionResultStatus::Succeeded
+        } else {
+            ExecutionResultStatus::Failed
+        },
     )
 }
 
@@ -2280,8 +2453,12 @@ fn execute_task_tool_call(
     worker_id: Option<&magi_core::WorkerId>,
     browser_capability_snapshot: Option<BrowserCapabilitySnapshot>,
     tool_call: &ChatToolCall,
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> (String, ExecutionResultStatus) {
+    if !execution_allowed() {
+        return tool_interrupted_before_execution_result(&tool_call.function.name);
+    }
     // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
     // 不进 BuiltinTool::execute —— 它需要 task_store / event_bus 等上下文。
     // S9：UpdatePlan 同样在此层拦截，因为它要操作 session 维度的 PlanStore。
@@ -2292,6 +2469,44 @@ fn execute_task_tool_call(
     {
         let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
         return (decision.payload, decision.status);
+    }
+
+    // 关闭 Skill 的工具范围是执行约束，不能只隐藏 schema。所有标准工具先在
+    // 同一入口校验，避免 MCP/插件或编排拦截分支绕过稍后的 Builtin registry。
+    // Goal 模式的四个生命周期工具由运行时保留；自定义 handler 另有绑定校验。
+    let goal_lifecycle = task.is_goal_mode()
+        && matches!(
+            tool_call.function.name.as_str(),
+            "get_goal" | "create_goal" | "update_goal" | "update_plan"
+        );
+    let live_skill_rejection = || {
+        if !goal_lifecycle && parse_skill_custom_tool_name(&tool_call.function.name).is_none() {
+            let access_profile = task
+                .policy_snapshot
+                .as_ref()
+                .map(TaskPolicy::effective_access_profile)
+                .unwrap_or_default();
+            let policy =
+                active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+            if let Some(rejection) = policy.tool_name_rejection(&tool_call.function.name) {
+                let decision = task_policy_decision_payload(
+                    &tool_call.function.name,
+                    ExecutionResultStatus::Rejected,
+                    format!(
+                        "{}: 当前 Skill 不允许调用 {}",
+                        rejection.reason_code(),
+                        tool_call.function.name
+                    ),
+                    Some(access_profile),
+                );
+                return Some((decision.payload, decision.status));
+            }
+        }
+
+        None
+    };
+    if let Some(rejection) = live_skill_rejection() {
+        return rejection;
     }
 
     if let Some(gate) = safety_gate {
@@ -2324,24 +2539,41 @@ fn execute_task_tool_call(
         workspace_root_path,
     ) {
         if decision.status == ExecutionResultStatus::NeedsApproval {
-            match await_task_tool_approval(
-                event_bus,
-                conversation_registry,
+            match run_with_task_execution_wait(
                 task_store,
-                session_store,
+                execution_registry,
                 task,
-                session_id,
-                workspace_id,
-                tool_call,
-                &decision,
-                on_progress,
-            ) {
+                &tool_call.function.name,
+                || {
+                    await_task_tool_approval(
+                        event_bus,
+                        conversation_registry,
+                        task_store,
+                        session_store,
+                        task,
+                        session_id,
+                        workspace_id,
+                        workspace_root_path,
+                        tool_call,
+                        &decision,
+                        on_progress,
+                        execution_allowed,
+                    )
+                },
+                execution_allowed,
+            )
+            .and_then(std::convert::identity)
+            {
                 Ok(()) => approval_granted = true,
                 Err(result) => return result,
             }
         } else {
             return (decision.payload, decision.status);
         }
+    }
+
+    if approval_granted && let Some(rejection) = live_skill_rejection() {
+        return rejection;
     }
 
     if let Some(canonical) =
@@ -2353,7 +2585,7 @@ fn execute_task_tool_call(
                 | magi_tool_runtime::BuiltinToolName::CreateGoal
                 | magi_tool_runtime::BuiltinToolName::UpdateGoal
         ) {
-            return execute_goal_tool(
+            let (payload, mut status) = execute_goal_tool(
                 session_store,
                 session_id,
                 session_store
@@ -2369,6 +2601,41 @@ fn execute_task_tool_call(
                 canonical,
                 &tool_call.function.arguments,
             );
+            if canonical != BuiltinToolName::UpdateGoal {
+                return (payload, status);
+            }
+            // Goal 的控制事实可能已经提交，即使本次更新因旧版本被拒绝也应核对
+            // 原撤销范围。不能因此重建代理，或等待/取消正在调用工具的主线。
+            let settlement = match run_with_task_execution_wait(
+                task_store,
+                execution_registry,
+                task,
+                canonical.as_str(),
+                || {
+                    execution_registry.settle_revoked_goal_agent_runs(
+                        task_store,
+                        session_store,
+                        session_id,
+                    )
+                },
+                execution_allowed,
+            ) {
+                Ok(settlement) => settlement,
+                Err(interrupted) => return interrupted,
+            };
+            let mut result: serde_json::Value =
+                serde_json::from_str(&payload).expect("Goal 工具返回 JSON");
+            result["agent_resources_settled"] = serde_json::json!(settlement.is_ok());
+            if let Err(error) = settlement {
+                result["status"] = serde_json::json!("failed");
+                result["error_code"] = serde_json::json!("update_goal_agent_settlement_failed");
+                result["settlement_error"] = serde_json::json!(error);
+                result["instruction"] = serde_json::json!(
+                    "Goal 的更新结果见 goal；所属代理尚未确认退出，不能宣称资源已释放或重新派发同一工作。先核对原代理与产物，勿重复目标更新或副作用操作。"
+                );
+                status = ExecutionResultStatus::Failed;
+            }
+            return (result.to_string(), status);
         }
         if matches!(
             canonical,
@@ -2389,6 +2656,8 @@ fn execute_task_tool_call(
                     task,
                     session_id,
                     workspace_id,
+                    workspace_root_path,
+                    execution_allowed,
                 },
                 canonical,
                 tool_call,
@@ -2400,15 +2669,36 @@ fn execute_task_tool_call(
                 | magi_tool_runtime::BuiltinToolName::ContextRead
                 | magi_tool_runtime::BuiltinToolName::ContextRequest
         ) {
-            return execute_agent_context_tool(
+            if canonical != BuiltinToolName::ContextRequest {
+                return execute_agent_context_tool(
+                    task_store,
+                    session_store,
+                    conversation_registry,
+                    task,
+                    session_id,
+                    canonical,
+                    &tool_call.function.arguments,
+                );
+            }
+            return run_with_task_execution_wait(
                 task_store,
-                session_store,
-                conversation_registry,
+                execution_registry,
                 task,
-                session_id,
-                canonical,
-                &tool_call.function.arguments,
-            );
+                &tool_call.function.name,
+                || {
+                    execute_agent_context_tool(
+                        task_store,
+                        session_store,
+                        conversation_registry,
+                        task,
+                        session_id,
+                        canonical,
+                        &tool_call.function.arguments,
+                    )
+                },
+                execution_allowed,
+            )
+            .unwrap_or_else(std::convert::identity);
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::UpdatePlan) {
             return magi_plan::execute_update_plan_tool(
@@ -2425,17 +2715,28 @@ fn execute_task_tool_call(
             canonical,
             magi_tool_runtime::BuiltinToolName::AskUserQuestion
         ) {
-            return await_user_question_answer(
-                event_bus,
-                conversation_registry,
+            return run_with_task_execution_wait(
                 task_store,
-                session_store,
+                execution_registry,
                 task,
-                session_id,
-                workspace_id,
-                tool_call,
-                on_progress,
-            );
+                &tool_call.function.name,
+                || {
+                    await_user_question_answer(
+                        event_bus,
+                        conversation_registry,
+                        task_store,
+                        session_store,
+                        task,
+                        session_id,
+                        workspace_id,
+                        tool_call,
+                        on_progress,
+                        execution_allowed,
+                    )
+                },
+                execution_allowed,
+            )
+            .unwrap_or_else(std::convert::identity);
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::MemoryWrite) {
             return magi_project_memory::execute_memory_write_tool(
@@ -2493,6 +2794,22 @@ fn execute_task_tool_call(
             .unwrap_or_default()
     };
     let execute_runtime_tool = |effective_access_profile: AccessProfile| {
+        if !execution_allowed()
+            || task_store.get_task(&task.task_id).is_some_and(|latest| {
+                matches!(latest.status, TaskStatus::Failed | TaskStatus::Killed)
+            })
+        {
+            return (
+                serde_json::json!({"tool":tool_call.function.name,"status":"cancelled",
+                    "error_code":"task_stopped_before_tool","execution_started":false,
+                })
+                .to_string(),
+                ExecutionResultStatus::Cancelled,
+            );
+        }
+        if let Some(rejection) = live_skill_rejection() {
+            return rejection;
+        }
         if let Some((tool_skill_name, binding_id)) =
             parse_skill_custom_tool_name(&tool_call.function.name)
         {
@@ -2509,6 +2826,13 @@ fn execute_task_tool_call(
                 skill_runtime,
                 skill_dispatch_runtime,
                 ToolExecutionContext {
+                    caller_scope: if task_is_coordinator(Some(task), Some(agent_role_registry)) {
+                        magi_tool_runtime::ToolCallerScope::SessionMainline
+                    } else if task_can_delegate(Some(task), Some(agent_role_registry)) {
+                        magi_tool_runtime::ToolCallerScope::DelegatingTask
+                    } else {
+                        magi_tool_runtime::ToolCallerScope::DelegatedTask
+                    },
                     worker_id: worker_id.cloned(),
                     task_id: Some(task.task_id.clone()),
                     session_id: Some(session_id.clone()),
@@ -2538,7 +2862,9 @@ fn execute_task_tool_call(
 
         let mut tool_policy =
             active_skill_tool_execution_policy(effective_access_profile, skill_runtime, skill_name);
-        apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
+        if let Some(policy) = task.policy_snapshot.as_ref() {
+            tool_policy.apply_task_policy(policy);
+        }
         tool_policy.access_profile = effective_access_profile;
         let input = ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
@@ -2546,6 +2872,13 @@ fn execute_task_tool_call(
             tool_call.function.arguments.clone(),
         );
         let context = ToolExecutionContext {
+            caller_scope: if task_is_coordinator(Some(task), Some(agent_role_registry)) {
+                magi_tool_runtime::ToolCallerScope::SessionMainline
+            } else if task_can_delegate(Some(task), Some(agent_role_registry)) {
+                magi_tool_runtime::ToolCallerScope::DelegatingTask
+            } else {
+                magi_tool_runtime::ToolCallerScope::DelegatedTask
+            },
             worker_id: worker_id.cloned(),
             task_id: Some(task.task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -2563,12 +2896,67 @@ fn execute_task_tool_call(
         ) {
             return result;
         }
+        // 等待 Job 不占模型执行名额；后台进程仍可能写入，不能让出仓库租约。
+        let job_wait = (tool_call.function.name == BuiltinToolName::ShellExec.as_str()
+            && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                .ok()
+                .is_some_and(|arguments| arguments["action"] == "wait"))
+        .then(|| {
+            execution_registry
+                .execution_admission()
+                .suspend_while_waiting(&task.task_id)
+        })
+        .flatten();
         let output = match on_progress {
-            Some(on_progress) => {
-                registry.execute_with_policy_and_progress(input, context, &tool_policy, on_progress)
-            }
+            Some(on_progress) => registry.execute_with_policy_and_progress(
+                input,
+                context,
+                &tool_policy,
+                &|progress| {
+                    let _ = on_progress(progress);
+                },
+            ),
             None => registry.execute_with_policy(input, context, &tool_policy),
         };
+        let resumed = job_wait.as_ref().is_none_or(|guard| {
+            guard.resume(|| {
+                execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    })
+            })
+        });
+        if !resumed
+            || !execution_allowed()
+            || task_store.get_task(&task.task_id).is_some_and(|latest| {
+                matches!(latest.status, TaskStatus::Failed | TaskStatus::Killed)
+            })
+        {
+            // 取消可能发生在进程尚未登记时；工具返回前再结算该任务迟到创建的资源。
+            registry.cancel_active_executions(&magi_tool_runtime::ToolExecutionContextQuery {
+                session_id: Some(session_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                ..Default::default()
+            });
+            return (serde_json::json!({"tool":tool_call.function.name,"status":"cancelled",
+                "error_code":"task_stopped_during_tool","execution":"unknown",
+                "source_result":serde_json::from_str::<serde_json::Value>(&output.payload).unwrap_or(serde_json::Value::String(output.payload)),
+            }).to_string(), ExecutionResultStatus::Cancelled);
+        }
+        if tool_call.function.name == BuiltinToolName::ToolCatalog.as_str()
+            && output.status == ExecutionResultStatus::Succeeded
+            && task_can_delegate(Some(task), Some(agent_role_registry))
+            && let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&output.payload)
+        {
+            payload["session_agents"] = serde_json::json!(crate::agent_activation::retained_agent_heads(
+                task_store, session_store, session_id, task,
+            ).into_iter()
+                .map(|head| serde_json::json!({
+                    "activation":head.agent_activation(), "task_id":head.task_id,
+                    "title":head.title, "status":head.status, "role":head.executor_binding_target_role(),
+                })).collect::<Vec<_>>());
+            return (payload.to_string(), output.status);
+        }
         (output.payload, output.status)
     };
 
@@ -2581,18 +2969,31 @@ fn execute_task_tool_call(
             payload: result.0,
             status: result.1,
         };
-        match await_task_tool_approval(
-            event_bus,
-            conversation_registry,
+        match run_with_task_execution_wait(
             task_store,
-            session_store,
+            execution_registry,
             task,
-            session_id,
-            workspace_id,
-            tool_call,
-            &runtime_decision,
-            on_progress,
-        ) {
+            &tool_call.function.name,
+            || {
+                await_task_tool_approval(
+                    event_bus,
+                    conversation_registry,
+                    task_store,
+                    session_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    workspace_root_path,
+                    tool_call,
+                    &runtime_decision,
+                    on_progress,
+                    execution_allowed,
+                )
+            },
+            execution_allowed,
+        )
+        .and_then(std::convert::identity)
+        {
             Ok(()) => result = execute_runtime_tool(AccessProfile::FullAccess),
             Err(rejected) => return rejected,
         }
@@ -2603,6 +3004,40 @@ fn execute_task_tool_call(
     result
 }
 
+/// 等待外部答复时释放执行名额，答复后重新准入；不修改工作区资源归属。
+fn run_with_task_execution_wait<T>(
+    task_store: &TaskStore,
+    execution_registry: &TaskExecutionRegistry,
+    task: &magi_core::Task,
+    tool: &str,
+    run: impl FnOnce() -> T,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
+) -> Result<T, (String, ExecutionResultStatus)> {
+    let waiting = execution_registry
+        .execution_admission()
+        .suspend_while_waiting(&task.task_id);
+    let result = run();
+    if !execution_allowed()
+        || waiting.as_ref().is_some_and(|guard| {
+            !guard.resume(|| {
+                execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    })
+            })
+        })
+    {
+        return Err((
+            serde_json::json!({"tool":tool,"status":"cancelled",
+                "error_code":"task_stopped_while_waiting","execution_started":false,
+            })
+            .to_string(),
+            ExecutionResultStatus::Cancelled,
+        ));
+    }
+    Ok(result)
+}
+
 /// 同一会话里除 `task` 以外是否还有任务在运行：它们仍在使用工作区，
 /// 所以等人期间不能让出仓库执行租约。
 fn session_has_other_active_tasks(task_store: &TaskStore, task: &magi_core::Task) -> bool {
@@ -2611,6 +3046,32 @@ fn session_has_other_active_tasks(task_store: &TaskStore, task: &magi_core::Task
             && other.task_id != task.task_id
             && matches!(other.status, TaskStatus::Pending | TaskStatus::Running)
     })
+}
+
+/// 交互必须绑定发起调用所在的 canonical Turn。独立 Agent Turn 不会改写
+/// Session 当前 Turn 指针，因此不能只从 runtime sidecar 读取目标。
+fn task_execution_turn_id(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    task_id: &TaskId,
+) -> Option<String> {
+    let owned = session_store
+        .agent_turn_for_task(session_id, task_id)
+        .ok()?;
+    if let Some(turn) = owned {
+        return session_store
+            .turn_execution_is_active(session_id, &turn.turn_id)
+            .then_some(turn.turn_id);
+    }
+    session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| {
+            turn.items
+                .iter()
+                .any(|item| item.task_id.as_ref() == Some(task_id))
+        })
+        .map(|turn| turn.turn_id)
 }
 
 /// `ask_user_question`：把选择题交给用户，阻塞到用户回答、跳过，或轮次 / 任务结束。
@@ -2625,7 +3086,8 @@ fn await_user_question_answer(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     tool_call: &ChatToolCall,
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> (String, ExecutionResultStatus) {
     let tool_name = tool_call.function.name.as_str();
     let failed = |code: &str, message: String| {
@@ -2656,17 +3118,17 @@ fn await_user_question_answer(
         Ok(questions) => questions,
         Err(message) => return failed("ask_user_question_invalid", message),
     };
-    let Some(turn_id) = session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
-        .filter(|turn_id| {
-            crate::tool_approval::session_turn_is_active(session_store, session_id, turn_id)
+    let Some(turn_id) =
+        task_execution_turn_id(session_store, session_id, &task.task_id).filter(|turn_id| {
+            session_store
+                .canonical_turn_for_session_turn_id(session_id, turn_id)
+                .is_some_and(|turn| !turn.status.is_terminal() && turn.completed_at.is_none())
         })
     else {
         return cancelled("当前对话轮次已经结束，问题没有发给用户");
     };
     let registry = conversation_registry.user_questions();
-    let question_id = format!("user-question-{}-{}", task.task_id, tool_call.id);
+    let question_id = EventId::unique("user-question").to_string();
     let request = crate::PendingUserQuestion {
         question_id: question_id.clone(),
         session_id: session_id.clone(),
@@ -2677,10 +3139,12 @@ fn await_user_question_answer(
         requested_at: UtcMillis::now(),
         can_skip: true,
     };
-    let waiter = registry.request(request.clone());
-
-    if let Some(on_progress) = on_progress {
-        on_progress(ToolExecutionProgress {
+    let waiter = match registry.request_persisted(session_store, request.clone()) {
+        Ok(waiter) => waiter,
+        Err(error) => return failed("user_question_persist_failed", error),
+    };
+    if let Some(on_progress) = on_progress
+        && let Err(error) = on_progress(ToolExecutionProgress {
             tool_call_id: ToolCallId::new(&tool_call.id),
             tool_name: tool_name.to_string(),
             payload: serde_json::json!({
@@ -2690,7 +3154,13 @@ fn await_user_question_answer(
                 "questions": request.questions,
             })
             .to_string(),
-        });
+        })
+    {
+        registry.cancel(&question_id);
+        return failed(
+            "user_question_persist_failed",
+            format!("问题持久化失败：{error}"),
+        );
     }
     let publish = |event_name: &str, extra: serde_json::Value| {
         let mut payload = serde_json::json!({
@@ -2724,9 +3194,11 @@ fn await_user_question_answer(
     );
     let reacquire_execution = || {
         human_wait.finish(|| {
-            task_store.get_task(&task.task_id).is_some_and(|current| {
-                matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-            }) && crate::tool_approval::session_turn_is_active(session_store, session_id, &turn_id)
+            execution_allowed()
+                && task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                })
+                && session_store.turn_execution_is_active(session_id, &turn_id)
         })
     };
 
@@ -2759,14 +3231,11 @@ fn await_user_question_answer(
                 );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
-                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-                });
-                let turn_is_active = crate::tool_approval::session_turn_is_active(
-                    session_store,
-                    session_id,
-                    &turn_id,
-                );
+                let task_is_active = execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    });
+                let turn_is_active = session_store.turn_execution_is_active(session_id, &turn_id);
                 if !task_is_active || !turn_is_active {
                     registry.cancel(&question_id);
                     publish(
@@ -2791,6 +3260,41 @@ fn await_user_question_answer(
     }
 }
 
+// 等待审批明确表示未执行；获批后的 running 必须先提交，才能恢复真实执行。
+// 否则写盘失败后重启仍看到 awaiting_approval，会错误地允许重复副作用。
+fn publish_approved_tool_progress(
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
+    tool_call: &ChatToolCall,
+    approval_id: &str,
+) -> Result<(), (String, ExecutionResultStatus)> {
+    if let Some(on_progress) = on_progress {
+        on_progress(ToolExecutionProgress {
+            tool_call_id: ToolCallId::new(&tool_call.id),
+            tool_name: tool_call.function.name.clone(),
+            payload: serde_json::json!({
+                "tool": tool_call.function.name, "status": "running", "approval_id": approval_id,
+            })
+            .to_string(),
+        })
+        .map_err(|error| tool_progress_persist_failure(tool_call, error))?;
+    }
+    Ok(())
+}
+
+fn tool_progress_persist_failure(
+    tool_call: &ChatToolCall,
+    error: String,
+) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_call.function.name, "status": "failed", "execution_started": false,
+            "error_code": "tool_progress_persist_failed", "error": error,
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn await_task_tool_approval(
     event_bus: &InMemoryEventBus,
@@ -2800,15 +3304,17 @@ fn await_task_tool_approval(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
     tool_call: &ChatToolCall,
     decision: &ToolPreflightDecision,
-    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) -> Result<(), String> + Sync)>,
+    execution_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), (String, ExecutionResultStatus)> {
-    let Some(turn_id) = session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
-        .filter(|turn_id| {
-            crate::tool_approval::session_turn_is_active(session_store, session_id, turn_id)
+    let Some(turn_id) =
+        task_execution_turn_id(session_store, session_id, &task.task_id).filter(|turn_id| {
+            session_store
+                .canonical_turn_for_session_turn_id(session_id, turn_id)
+                .is_some_and(|turn| !turn.status.is_terminal() && turn.completed_at.is_none())
         })
     else {
         return Err((
@@ -2822,8 +3328,74 @@ fn await_task_tool_approval(
             ExecutionResultStatus::Cancelled,
         ));
     };
+    let execution_root = match workspace_root_path.map(std::fs::canonicalize).transpose() {
+        Ok(root) => root,
+        Err(error) => return Err(tool_progress_persist_failure(tool_call, error.to_string())),
+    };
+    let policy = serde_json::json!({"policy":task.policy_snapshot,"workspaceScope":task.workspace_scope,"writeScope":task.write_scope});
+    let mut sources = vec![task.task_id.clone()];
+    let mut source = task.recovery_checkpoint().cloned();
+    while let Some(checkpoint) = source {
+        let Some(previous) = task_store.get_task(&checkpoint.source_task_id) else {
+            return Err(tool_progress_persist_failure(
+                tool_call,
+                "审批恢复来源任务缺失".into(),
+            ));
+        };
+        if checkpoint.source_session_id != *session_id
+            || sources.contains(&previous.task_id)
+            || previous.mission_id != task.mission_id
+            || previous.workspace_scope != task.workspace_scope
+            || previous.write_scope != task.write_scope
+        {
+            return Err(tool_progress_persist_failure(
+                tool_call,
+                "审批恢复来源越界或存在循环".into(),
+            ));
+        }
+        sources.push(previous.task_id.clone());
+        source = previous.recovery_checkpoint().cloned();
+    }
+    let claim = |id: Option<&str>| {
+        let current = task_store.get_task(&task.task_id).ok_or_else(|| {
+            tool_progress_persist_failure(tool_call, "审批目标任务已不存在".into())
+        })?;
+        let current_policy = serde_json::json!({"policy":current.policy_snapshot,"workspaceScope":current.workspace_scope,"writeScope":current.write_scope});
+        if !execution_allowed()
+            || !matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+            || current_policy != policy
+        {
+            return Err(tool_progress_persist_failure(
+                tool_call,
+                "审批等待期间任务已停止或权限范围已变化，需要按当前权限重新评估".into(),
+            ));
+        }
+        session_store
+            .claim_tool_approval(
+                session_id,
+                &task.task_id,
+                &tool_call.id,
+                &tool_call.function.name,
+                &tool_call.function.arguments,
+                execution_root.as_deref(),
+                &policy,
+                &sources,
+                id,
+            )
+            .map_err(|error| tool_progress_persist_failure(tool_call, error.to_string()))
+    };
+    if let Some(receipt) = claim(None)? {
+        if receipt.decision == crate::ToolApprovalDecision::Deny {
+            return Err(crate::tool_approval::rejected_tool_approval_result(
+                &tool_call.function.name,
+                &receipt.approval_id,
+                true,
+            ));
+        }
+        return publish_approved_tool_progress(on_progress, tool_call, &receipt.approval_id);
+    }
     let registry = conversation_registry.tool_approvals();
-    let approval_id = format!("tool-approval-{}-{}", task.task_id, tool_call.id);
+    let approval_id = EventId::unique("tool-approval").to_string();
     let reason = serde_json::from_str::<serde_json::Value>(&decision.payload)
         .ok()
         .and_then(|payload| {
@@ -2844,30 +3416,43 @@ fn await_task_tool_approval(
         requested_at: UtcMillis::now(),
         agent: crate::tool_approval::ApprovalRequestAgent::for_task(task),
     };
-    let waiter =
-        match registry.request_with_arguments(request.clone(), &tool_call.function.arguments) {
-            Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => return Ok(()),
-            Ok(crate::ToolApprovalRequestOutcome::PreviouslyDenied) => {
-                return Err(crate::tool_approval::rejected_tool_approval_result(
-                    &tool_call.function.name,
-                    &approval_id,
-                    true,
+    let waiter = match registry.request_persisted(
+        session_store,
+        request.clone(),
+        &tool_call.function.arguments,
+        execution_root.clone(),
+        policy.clone(),
+    ) {
+        Ok(crate::ToolApprovalRequestOutcome::AlreadyAllowed) => {
+            if claim(Some(&approval_id))?.is_none() {
+                return Err(tool_progress_persist_failure(
+                    tool_call,
+                    "审批批准不可领取".into(),
                 ));
             }
-            Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
-            Err(error) => {
-                return Err((
-                    serde_json::json!({
-                        "tool": tool_call.function.name,
-                        "status": "failed",
-                        "error_code": "tool_approval_runtime_failed",
-                        "error": error,
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                ));
-            }
-        };
+            return publish_approved_tool_progress(on_progress, tool_call, &approval_id);
+        }
+        Ok(crate::ToolApprovalRequestOutcome::PreviouslyDenied) => {
+            return Err(crate::tool_approval::rejected_tool_approval_result(
+                &tool_call.function.name,
+                &approval_id,
+                true,
+            ));
+        }
+        Ok(crate::ToolApprovalRequestOutcome::Pending(waiter)) => waiter,
+        Err(error) => {
+            return Err((
+                serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "failed",
+                    "error_code": "tool_approval_runtime_failed",
+                    "error": error,
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            ));
+        }
+    };
 
     let progress_payload = serde_json::json!({
         "tool": tool_call.function.name,
@@ -2878,12 +3463,15 @@ fn await_task_tool_approval(
         "approval": request,
     })
     .to_string();
-    if let Some(on_progress) = on_progress {
-        on_progress(ToolExecutionProgress {
+    if let Some(on_progress) = on_progress
+        && let Err(error) = on_progress(ToolExecutionProgress {
             tool_call_id: ToolCallId::new(&tool_call.id),
             tool_name: tool_call.function.name.clone(),
             payload: progress_payload.clone(),
-        });
+        })
+    {
+        registry.cancel(&approval_id);
+        return Err(tool_progress_persist_failure(tool_call, error));
     }
     let _ = event_bus.publish(
         EventEnvelope::domain(
@@ -2915,9 +3503,11 @@ fn await_task_tool_approval(
     );
     let reacquire_execution = || {
         human_wait.finish(|| {
-            task_store.get_task(&task.task_id).is_some_and(|current| {
-                matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-            }) && crate::tool_approval::session_turn_is_active(session_store, session_id, &turn_id)
+            execution_allowed()
+                && task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                })
+                && session_store.turn_execution_is_active(session_id, &turn_id)
         })
     };
     let stopped_while_reacquiring = || {
@@ -2966,14 +3556,11 @@ fn await_task_tool_approval(
             Ok(
                 crate::ToolApprovalDecision::AllowOnce | crate::ToolApprovalDecision::AllowForTurn,
             ) => {
-                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
-                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-                });
-                let turn_is_active = crate::tool_approval::session_turn_is_active(
-                    session_store,
-                    session_id,
-                    &turn_id,
-                );
+                let task_is_active = execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    });
+                let turn_is_active = session_store.turn_execution_is_active(session_id, &turn_id);
                 if !task_is_active || !turn_is_active {
                     if !turn_is_active {
                         registry.remove_turn(session_id, &turn_id);
@@ -2995,19 +3582,13 @@ fn await_task_tool_approval(
                 if !reacquire_execution() {
                     return Err(stopped_while_reacquiring());
                 }
-                if let Some(on_progress) = on_progress {
-                    on_progress(ToolExecutionProgress {
-                        tool_call_id: ToolCallId::new(&tool_call.id),
-                        tool_name: tool_call.function.name.clone(),
-                        payload: serde_json::json!({
-                            "tool": tool_call.function.name,
-                            "status": "running",
-                            "approval_id": approval_id,
-                        })
-                        .to_string(),
-                    });
+                if claim(Some(&approval_id))?.is_none() {
+                    return Err(tool_progress_persist_failure(
+                        tool_call,
+                        "审批批准已过期或不可领取".into(),
+                    ));
                 }
-                return Ok(());
+                return publish_approved_tool_progress(on_progress, tool_call, &approval_id);
             }
             Ok(crate::ToolApprovalDecision::Deny) => {
                 if !reacquire_execution() {
@@ -3029,14 +3610,11 @@ fn await_task_tool_approval(
                         &approval_id,
                     ));
                 }
-                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
-                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-                });
-                let turn_is_active = crate::tool_approval::session_turn_is_active(
-                    session_store,
-                    session_id,
-                    &turn_id,
-                );
+                let task_is_active = execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    });
+                let turn_is_active = session_store.turn_execution_is_active(session_id, &turn_id);
                 if !task_is_active || !turn_is_active {
                     if !turn_is_active {
                         registry.remove_turn(session_id, &turn_id);
@@ -3066,14 +3644,11 @@ fn await_task_tool_approval(
                         &approval_id,
                     ));
                 }
-                let task_is_active = task_store.get_task(&task.task_id).is_some_and(|current| {
-                    matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
-                });
-                let turn_is_active = crate::tool_approval::session_turn_is_active(
-                    session_store,
-                    session_id,
-                    &turn_id,
-                );
+                let task_is_active = execution_allowed()
+                    && task_store.get_task(&task.task_id).is_some_and(|current| {
+                        matches!(current.status, TaskStatus::Pending | TaskStatus::Running)
+                    });
+                let turn_is_active = session_store.turn_execution_is_active(session_id, &turn_id);
                 if !task_is_active || !turn_is_active {
                     if !turn_is_active {
                         registry.remove_turn(session_id, &turn_id);
@@ -3124,19 +3699,6 @@ fn task_tool_execution_policy_scope_with_access_profile(
     );
     tool_policy.read_only_paths = policy.read_only_paths.clone();
     tool_policy
-}
-
-fn apply_task_policy_scope(
-    tool_policy: &mut ToolExecutionPolicy,
-    policy_snapshot: Option<&TaskPolicy>,
-) {
-    if let Some(policy) = policy_snapshot {
-        tool_policy.access_profile = policy.access_profile;
-        tool_policy.allowed_paths = policy.allowed_paths.clone();
-        tool_policy.denied_paths = policy.denied_paths.clone();
-        tool_policy.read_only_paths = policy.read_only_paths.clone();
-        tool_policy.command_mode = policy.command_mode.clone();
-    }
 }
 
 #[cfg(test)]
@@ -3458,6 +4020,7 @@ fn task_policy_decision_payload(
     access_profile: Option<magi_core::AccessProfile>,
 ) -> ToolPreflightDecision {
     let restriction_kind = policy_restriction_kind(status, &reason);
+    let constrained_by_skill = restriction_kind == "skill_tool_scope";
     let constrained_by_access_profile = reason.starts_with("只读任务")
         || reason.starts_with("受限执行")
         || reason.starts_with("只读访问");
@@ -3470,7 +4033,9 @@ fn task_policy_decision_payload(
         ),
         ExecutionResultStatus::Rejected => (
             "tool_policy_rejected",
-            if !constrained_by_access_profile
+            if constrained_by_skill {
+                "当前激活 Skill 不允许调用该工具"
+            } else if !constrained_by_access_profile
                 || access_profile == Some(magi_core::AccessProfile::FullAccess)
             {
                 TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR
@@ -3478,7 +4043,9 @@ fn task_policy_decision_payload(
                 "该工具在当前访问模式下不可用"
             },
             constrained_by_access_profile.then_some("full_access"),
-            if constrained_by_access_profile {
+            if constrained_by_skill {
+                "不要重复相同调用。请使用当前 Skill 明确允许的工具；Skill 被移除时需要重新选择有效 Skill。"
+            } else if constrained_by_access_profile {
                 "不要重复相同调用。只读目的必须改用专用读取、搜索工具；需要写入时应等待当前授权结果。"
             } else {
                 "不要重复相同调用。该工具受当前任务角色、路径范围或显式策略限制，请使用当前任务允许的工具和路径。"
@@ -3519,6 +4086,11 @@ fn policy_restriction_kind(status: ExecutionResultStatus, reason: &str) -> &'sta
     if status == ExecutionResultStatus::NeedsApproval {
         return "approval_required";
     }
+    if reason.starts_with("tool_not_in_allowed_scope:")
+        || reason.starts_with("tool_explicitly_denied:")
+    {
+        return "skill_tool_scope";
+    }
     if reason.starts_with("只读任务") || reason.starts_with("只读访问") {
         return "read_only";
     }
@@ -3554,6 +4126,10 @@ fn task_tool_visibility_decision_payload(
             "status": ExecutionResultStatus::Rejected.wire_label(),
             "error_code": "tool_policy_rejected",
             "error": TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR,
+            "reason_code": "model_call_scope_mismatch",
+            "model_call_scope": magi_tool_runtime::BuiltinToolName::from_name(tool_name)
+                .map(|tool| tool.model_call_scope().as_str()),
+            "task_id": task.task_id,
             "retryable_with_same_arguments": false,
             "instruction": "不要重复相同调用，请改用当前可用工具或直接返回文本结果。",
         })
@@ -3754,6 +4330,337 @@ mod tests {
     fn coordinator_task(mut task: Task) -> Task {
         task.executor_binding = Some(TaskExecutorBinding::for_role("coordinator"));
         task
+    }
+
+    #[test]
+    fn direct_agent_spawn_rejects_invalid_inputs_before_registration() {
+        let event_bus = InMemoryEventBus::new(16);
+        let roles = magi_agent_role::AgentRoleRegistry::load_default();
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversations = ConversationRegistry::new();
+        let session_id = SessionId::new("invalid-delegation-direct");
+        session_store
+            .create_session(session_id.clone(), "invalid delegation")
+            .unwrap();
+        let plans = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let parent = coordinator_task(test_task("delegation-root", "delegation-root", None));
+        let assert_rejected = |arguments: serde_json::Value, error_code: &str| {
+            let call = ChatToolCall {
+                id: "invalid-spawn".into(),
+                kind: "function".into(),
+                function: ChatToolFunction {
+                    name: "agent_spawn".into(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let definition =
+                crate::builtin_tool_schema::public_builtin_tool_definition("agent_spawn").unwrap();
+            let model_validation = crate::tool_call_validation::validate_tool_call_batch(
+                std::slice::from_ref(&call),
+                &[definition],
+            );
+            assert!(model_validation.valid_calls.is_empty(), "{arguments}");
+            assert_eq!(model_validation.invalid_calls.len(), 1);
+            let (payload, status) = execute_coordinator_tool(
+                CoordinatorToolContext {
+                    event_bus: &event_bus,
+                    agent_role_registry: &roles,
+                    task_store: &task_store,
+                    session_store: &session_store,
+                    execution_registry: &execution_registry,
+                    conversation_registry: &conversations,
+                    plan_store: &plans,
+                    task: &parent,
+                    session_id: &session_id,
+                    workspace_id: &None,
+                    workspace_root_path: None,
+                    execution_allowed: &|| true,
+                },
+                BuiltinToolName::AgentSpawn,
+                &call,
+            );
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(status, ExecutionResultStatus::Rejected, "{arguments}");
+            assert_eq!(payload["error_code"], error_code, "{arguments}: {payload}");
+            assert_eq!(payload["failure_stage"], "input_validation");
+            assert!(payload["child_task_id"].is_null());
+            assert!(task_store.all_tasks().is_empty());
+            assert!(session_store.runtime_sidecar(&session_id).is_none());
+            assert!(
+                session_store
+                    .thread_registry_snapshot(&session_id)
+                    .is_empty()
+            );
+            assert!(plans.snapshot().is_none());
+        };
+        for decision in [
+            None,
+            Some(serde_json::json!({"purpose":"long_task", "reason":"many files"})),
+            Some(serde_json::json!({"purpose":"parallel_work", "reason":"independent modules"})),
+            Some(serde_json::json!({"purpose":"user_requested", "reason":"  "})),
+            Some(
+                serde_json::json!({"purpose":"user_requested", "reason":format!(" {}", "独".repeat(600))}),
+            ),
+            Some(
+                serde_json::json!({"purpose":"parallel_work", "reason":"独立模块", "parent_work":format!(" {}", "独".repeat(600))}),
+            ),
+            Some(
+                serde_json::json!({"purpose":"user_requested", "reason":"request", "approved":true}),
+            ),
+        ] {
+            let mut arguments =
+                serde_json::json!({"task_name":"invalid_decision", "role":"executor"});
+            if let Some(decision) = decision {
+                arguments["delegation"] = decision;
+            }
+            assert_rejected(arguments, "invalid_delegation_decision");
+        }
+        let valid = serde_json::json!({
+            "task_name":"schema_gate", "role":"executor", "display_name":"合同检查员",
+            "goal":"检查独立模块合同", "delegation":{"purpose":"independent_review", "reason":"独立核对解析器授权边界"},
+            "context_package":{"summary":"检查指定解析器", "constraints":[], "expected_output":"边界与证据", "references":[]}
+        });
+        // 直接入口不能接受模型入口已拒绝的旧形式；无需配置角色模型或活跃执行链，
+        // 输入必须在触及这些动态事实之前被拒绝。
+        for (pointer, value) in [
+            (
+                "/context_package",
+                serde_json::json!(valid["context_package"].to_string()),
+            ),
+            ("/context_package/extra", serde_json::json!(true)),
+            (
+                "/context_package/references",
+                serde_json::json!([{"kind":"file", "source_ref":"Cargo.toml", "extra":true}]),
+            ),
+            ("/capabilities", serde_json::Value::Null),
+            ("/allow_delegation", serde_json::Value::Null),
+            ("/inherit_skill", serde_json::Value::Null),
+            ("/plan_item_id", serde_json::Value::Null),
+            ("/parallelism_group", serde_json::Value::Null),
+            ("/working_dir", serde_json::Value::Null),
+            ("/lifetime", serde_json::Value::Null),
+            ("/resume_task_id", serde_json::Value::Null),
+        ] {
+            let mut arguments = valid.clone();
+            let (parent_pointer, field) = pointer.rsplit_once('/').unwrap();
+            arguments
+                .pointer_mut(parent_pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            assert_rejected(arguments, "invalid_arguments");
+        }
+        for field in ["display_name", "context_package"] {
+            let mut arguments = valid.clone();
+            arguments.as_object_mut().unwrap().remove(field);
+            assert_rejected(arguments, "invalid_arguments");
+        }
+    }
+
+    #[test]
+    fn agent_spawn_rejects_incomplete_lifecycle_permissions_without_creating_resources() {
+        for scope in [
+            "deny_wait",
+            "deny_cancel",
+            "spawn_only",
+            "skill_wait",
+            "skill_cancel",
+        ] {
+            let event_bus = InMemoryEventBus::new(16);
+            let roles = magi_agent_role::AgentRoleRegistry::load_default();
+            let tasks = TaskStore::new();
+            let sessions = SessionStore::new();
+            let skills = magi_skill_runtime::SkillRegistry::new();
+            let mut parent = coordinator_task(test_task("lifecycle-root", "lifecycle-root", None));
+            let mut policy = default_agent_spawn_policy();
+            match scope {
+                "deny_wait" => policy.denied_tools = vec!["agent_wait".into()],
+                "deny_cancel" => policy.denied_tools = vec!["agent_cancel".into()],
+                "spawn_only" => policy.allowed_tools = vec!["agent_spawn".into()],
+                _ => {
+                    skills.register(magi_skill_runtime::SkillDefinition {
+                        skill_id: "incomplete-agent-scope".into(),
+                        title: "不完整代理范围".into(),
+                        instruction: "派发日志调查".into(),
+                        metadata: magi_skill_runtime::SkillMetadata {
+                            category: "test".into(),
+                            tags: vec![],
+                        },
+                        restrict_standard_tools: true,
+                        allowed_tools: vec![
+                            "agent_spawn".into(),
+                            if scope == "skill_wait" {
+                                "agent_cancel"
+                            } else {
+                                "agent_wait"
+                            }
+                            .into(),
+                        ],
+                        custom_tool_bindings: vec![],
+                        prompt_priority: 50,
+                    });
+                    parent.executor_binding.as_mut().unwrap().active_skill_id =
+                        Some("incomplete-agent-scope".into());
+                }
+            }
+            parent.policy_snapshot = Some(policy);
+            let executions = TaskExecutionRegistry::default().with_agent_spawn_preflight_runtime(
+                crate::task_execution_registry::AgentSpawnPreflightRuntime {
+                    skill_runtime: Some(Arc::new(magi_skill_runtime::SkillRuntime::new(skills))),
+                    ..Default::default()
+                },
+            );
+            let conversations = ConversationRegistry::new();
+            let session = SessionId::new(format!("incomplete-{scope}"));
+            sessions
+                .create_session(session.clone(), "lifecycle")
+                .unwrap();
+            let plans = magi_plan::PlanStore::from_store(&sessions, session.clone());
+            let call = ChatToolCall {
+                id: "incomplete-lifecycle".into(), kind: "function".into(),
+                function: ChatToolFunction { name: "agent_spawn".into(), arguments: serde_json::json!({
+                    "task_name":"log_investigation", "role":"explorer", "display_name":"日志调查员",
+                    "goal":"调查日志错误", "inherit_skill":true,
+                    "delegation":{"purpose":"context_isolation", "reason":"隔离大量日志中间输出，只返回定位证据"},
+                    "context_package":{"summary":"定位指定日志错误", "constraints":[], "expected_output":"结论与行号", "references":[]}
+                }).to_string() },
+            };
+            let (payload, status) = execute_coordinator_tool(
+                CoordinatorToolContext {
+                    event_bus: &event_bus,
+                    agent_role_registry: &roles,
+                    task_store: &tasks,
+                    session_store: &sessions,
+                    execution_registry: &executions,
+                    conversation_registry: &conversations,
+                    plan_store: &plans,
+                    task: &parent,
+                    session_id: &session,
+                    workspace_id: &None,
+                    workspace_root_path: None,
+                    execution_allowed: &|| true,
+                },
+                BuiltinToolName::AgentSpawn,
+                &call,
+            );
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(
+                status,
+                ExecutionResultStatus::Rejected,
+                "{scope}: {payload}"
+            );
+            assert_eq!(
+                payload["error_code"], "agent_lifecycle_tool_unavailable",
+                "{scope}: {payload}"
+            );
+            assert_eq!(payload["failure_stage"], "authorization");
+            assert_eq!(payload["retryable"], false);
+            assert!(payload["child_task_id"].is_null());
+            assert!(tasks.all_tasks().is_empty());
+            assert!(sessions.runtime_sidecar(&session).is_none());
+            assert!(sessions.thread_registry_snapshot(&session).is_empty());
+            assert_eq!(conversations.len(), 0);
+            assert!(plans.snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_agent_spawn_points_to_existing_task_without_creating_resources() {
+        for child_status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let event_bus = InMemoryEventBus::new(16);
+            let roles = magi_agent_role::AgentRoleRegistry::load_default();
+            let tasks = TaskStore::new();
+            let sessions = SessionStore::new();
+            let executions = TaskExecutionRegistry::default();
+            let conversations = ConversationRegistry::new();
+            let session = SessionId::new("duplicate-agent");
+            sessions
+                .create_session(session.clone(), "duplicate agent")
+                .unwrap();
+            let plans = magi_plan::PlanStore::from_store(&sessions, session.clone());
+            let parent = coordinator_task(test_task("root", "root", None));
+            tasks.insert_task(parent.clone()).unwrap();
+            let mut child = test_task("original-child", "root", Some("root".into()));
+            child.executor_binding = Some(
+                TaskExecutorBinding::for_role("reviewer")
+                    .with_canonical_task_name("/root/parser_review"),
+            );
+            child.status = child_status;
+            tasks.insert_task(child.clone()).unwrap();
+            let before_task_ids = tasks
+                .all_tasks()
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>();
+            let call = ChatToolCall {
+                id: "duplicate-call".into(), kind: "function".into(),
+                function: ChatToolFunction {
+                    name: "agent_spawn".into(),
+                    arguments: serde_json::json!({
+                        "task_name":"parser_review", "role":"reviewer", "display_name":"解析器复核",
+                        "goal":"复核解析器的边界处理", "delegation":{
+                            "purpose":"independent_review", "reason":"独立核对解析器边界，避免实现者的共同假设"
+                        },
+                        "context_package":{"summary":"指定解析器改动", "constraints":[],
+                            "expected_output":"具体缺陷和定位证据", "references":[]}
+                    }).to_string(),
+                },
+            };
+            let (payload, status) = execute_coordinator_tool(
+                CoordinatorToolContext {
+                    event_bus: &event_bus,
+                    agent_role_registry: &roles,
+                    task_store: &tasks,
+                    session_store: &sessions,
+                    execution_registry: &executions,
+                    conversation_registry: &conversations,
+                    plan_store: &plans,
+                    task: &parent,
+                    session_id: &session,
+                    workspace_id: &None,
+                    workspace_root_path: None,
+                    execution_allowed: &|| true,
+                },
+                BuiltinToolName::AgentSpawn,
+                &call,
+            );
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(status, ExecutionResultStatus::Rejected);
+            assert_eq!(payload["error_code"], "duplicate_task_name");
+            assert_eq!(payload["existing_task_id"], child.task_id.as_str());
+            assert!(payload["child_task_id"].is_null());
+            assert_eq!(payload["retryable"], false);
+            assert!(
+                payload["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("不得仅换名重派")
+            );
+            assert_eq!(
+                tasks
+                    .all_tasks()
+                    .into_iter()
+                    .map(|task| task.task_id)
+                    .collect::<Vec<_>>(),
+                before_task_ids
+            );
+            assert!(sessions.runtime_sidecar(&session).is_none());
+            assert!(sessions.thread_registry_snapshot(&session).is_empty());
+            assert_eq!(conversations.len(), 0);
+            assert!(plans.snapshot().is_none());
+            let admission = executions.execution_admission().snapshot();
+            assert!(admission.active_task_ids.is_empty());
+            assert!(admission.queued.is_empty());
+        }
     }
 
     struct SnapshotReconcileProbeTool {
@@ -3987,6 +4894,7 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
@@ -4027,17 +4935,51 @@ mod tests {
             None,
             None,
             None,
-            &[second_round_call],
+            std::slice::from_ref(&second_round_call),
             &mut ledger,
             None,
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         let reused: serde_json::Value =
             serde_json::from_str(&second_results[0].0).expect("reused result should be json");
         assert_eq!(reused["execution"], "reused");
+        let obsolete_results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            None,
+            &[second_round_call],
+            &mut ledger,
+            None,
+            None,
+            None,
+            &|| false,
+        );
+        assert_eq!(
+            obsolete_results[0].1,
+            ExecutionResultStatus::Cancelled,
+            "执行资格失效时不能交付旧缓存中的成功"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4099,6 +5041,7 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
         assert_eq!(first_results[0].1, ExecutionResultStatus::Succeeded);
 
@@ -4134,13 +5077,14 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         let skipped: serde_json::Value =
             serde_json::from_str(&second_results[0].0).expect("budget result should be json");
         assert_eq!(skipped["execution"], "skipped");
-        assert_eq!(skipped["reason"], "tool_call_budget_exhausted");
+        assert_eq!(skipped["reason"], "user_tool_call_limit_reached");
     }
 
     fn read_only_agent_spawn_policy() -> TaskPolicy {
@@ -4233,7 +5177,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_context_package_accepts_model_json_string_encoding() {
+    fn agent_spawn_context_package_rejects_model_json_string_encoding() {
         let parent = test_task(
             "task-agent-context-string-parent",
             "task-agent-context-string-root",
@@ -4250,14 +5194,9 @@ mod tests {
                 .expect("context package JSON should serialize")
         });
 
-        let parsed_package =
-            parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(101), 8).expect(
-                "JSON-string encoded model argument should restore to a structured package",
-            );
-
-        assert_eq!(parsed_package.summary, "检查配置文件");
-        assert_eq!(parsed_package.constraints, vec!["只读，不修改文件"]);
-        assert_eq!(parsed_package.references.len(), 0);
+        let error = parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(101), 8)
+            .expect_err("新调用必须直接传结构化对象，不再保留二次编码兜底");
+        assert!(error.contains("不能二次编码"));
     }
 
     #[test]
@@ -4354,10 +5293,10 @@ mod tests {
             .expect("failure payload should be JSON");
         assert_eq!(runtime_failure["retryable"], false);
         assert!(
-            runtime_failure["instruction"]
-                .as_str()
-                .is_some_and(|text| text.contains("主线直接完成")),
-            "主线无法修复的失败必须指引由主线接管"
+            runtime_failure["instruction"].as_str().is_some_and(
+                |text| text.contains("直接接管") && text.contains("请检查模型配置后重试。")
+            ),
+            "恢复指导允许当前代理接管，并保留具体诊断"
         );
     }
 
@@ -4422,6 +5361,323 @@ mod tests {
         )
         .expect("project memory write should remain blocked in read-only mode");
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+    }
+
+    #[test]
+    fn task_catalog_and_execution_share_explicit_tool_restrictions() {
+        let bus = InMemoryEventBus::new(16);
+        let tasks = TaskStore::new();
+        let sessions = SessionStore::new();
+        let execution = TaskExecutionRegistry::default();
+        let conversations = ConversationRegistry::new();
+        let roles = magi_agent_role::AgentRoleRegistry::load_default();
+        let session = SessionId::new("task-catalog-policy");
+        sessions
+            .create_session(session.clone(), "tool scope")
+            .unwrap();
+        let plans = magi_plan::PlanStore::from_store(&sessions, session.clone());
+        let root = tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        std::fs::write(path.join("kept.txt"), "original").unwrap();
+        let workspace = Some(WorkspaceId::new("task-catalog-workspace"));
+        let external_calls = Arc::new(AtomicUsize::new(0));
+        let mcp_calls = external_calls.clone();
+        let plugin_calls = external_calls.clone();
+        let mut tools = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(16)),
+        )
+        .with_external_tool_catalog_provider(Arc::new(|| {
+            magi_tool_runtime::ExternalToolCatalogSnapshot {
+                mcp_tools: ["read", "blocked", "excluded"]
+                    .map(|name| magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "repo".into(),
+                        server_name: "Repo".into(),
+                        model_tool_name: format!("mcp__repo__{name}"),
+                        tool_name: name.into(),
+                        description: name.into(),
+                        read_only: true,
+                        input_schema: serde_json::json!({"type":"object"}),
+                    })
+                    .into(),
+                ..Default::default()
+            }
+        }))
+        .with_external_mcp_tool_executor(Arc::new(move |_, _, _| {
+            mcp_calls.fetch_add(1, Ordering::SeqCst);
+            (
+                r#"{"status":"succeeded"}"#.into(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }))
+        .with_plugin_tools(
+            Arc::new(|_| {
+                ["read", "blocked", "excluded"]
+                    .map(|name| magi_tool_runtime::PluginToolCatalogEntry {
+                        plugin_id: "repo".into(),
+                        contribution_id: name.into(),
+                        model_tool_name: format!("plugin__repo__{name}"),
+                        title: name.into(),
+                        description: name.into(),
+                        read_only: true,
+                        input_schema: serde_json::json!({"type":"object"}),
+                    })
+                    .into()
+            }),
+            Arc::new(move |_, _, _| {
+                plugin_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    r#"{"status":"succeeded"}"#.into(),
+                    ExecutionResultStatus::Succeeded,
+                )
+            }),
+        );
+        tools.register_default_builtins();
+
+        for child in [false, true] {
+            let mut task = coordinator_task(test_task(
+                "catalog-task",
+                if child {
+                    "catalog-root"
+                } else {
+                    "catalog-task"
+                },
+                child.then(|| TaskId::new("catalog-root")),
+            ));
+            assert_eq!(task_is_coordinator(Some(&task), Some(&roles)), !child);
+            let mut policy = default_agent_spawn_policy();
+            policy.allowed_tools = [
+                "tool_catalog",
+                "file_read",
+                "mcp__repo__read",
+                "plugin__repo__read",
+                "mcp__repo__blocked",
+                "plugin__repo__blocked",
+            ]
+            .map(str::to_string)
+            .into();
+            policy.denied_tools = ["file_remove", "mcp__repo__blocked", "plugin__repo__blocked"]
+                .map(str::to_string)
+                .into();
+            task.policy_snapshot = Some(policy);
+            let invoke = |name: &str, arguments: serde_json::Value| {
+                execute_task_tool_call(
+                    &bus,
+                    Some(&tools),
+                    &roles,
+                    None,
+                    None,
+                    None,
+                    &tasks,
+                    &sessions,
+                    &execution,
+                    &conversations,
+                    None,
+                    &plans,
+                    None,
+                    &task,
+                    &session,
+                    &workspace,
+                    Some(&path),
+                    None,
+                    None,
+                    &ChatToolCall {
+                        id: format!("{child}-{name}"),
+                        kind: "function".into(),
+                        function: ChatToolFunction {
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                        },
+                    },
+                    None,
+                    &|| true,
+                )
+            };
+            let (catalog, status) = invoke("tool_catalog", serde_json::json!({}));
+            assert_eq!(status, ExecutionResultStatus::Succeeded, "{catalog}");
+            let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+            let entry = |name| {
+                catalog["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == name)
+                    .unwrap()
+            };
+            assert_eq!(entry("file_read")["model_available"], true);
+            for (name, reason) in [
+                ("file_remove", "tool_explicitly_denied"),
+                ("search_text", "tool_not_in_allowed_scope"),
+            ] {
+                assert_eq!(entry(name)["availability"], "denied", "{child}: {catalog}");
+                assert_eq!(entry(name)["reason_code"], reason);
+                assert_eq!(
+                    invoke(
+                        name,
+                        serde_json::json!({"path":"kept.txt", "query":"original"})
+                    )
+                    .1,
+                    ExecutionResultStatus::Rejected
+                );
+            }
+            for (key, prefix) in [("mcp_tools", "mcp"), ("plugin_tools", "plugin")] {
+                for (suffix, reason) in [
+                    ("read", None),
+                    ("blocked", Some("tool_explicitly_denied")),
+                    ("excluded", Some("tool_not_in_allowed_scope")),
+                ] {
+                    let name = format!("{prefix}__repo__{suffix}");
+                    let entry = catalog[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["model_tool_name"] == name)
+                        .unwrap();
+                    assert_eq!(entry["reason_code"], serde_json::json!(reason));
+                    assert_eq!(entry["model_available"], reason.is_none());
+                    let before = external_calls.load(Ordering::SeqCst);
+                    assert_eq!(
+                        invoke(&name, serde_json::json!({})).1,
+                        if reason.is_some() {
+                            ExecutionResultStatus::Rejected
+                        } else {
+                            ExecutionResultStatus::Succeeded
+                        }
+                    );
+                    assert_eq!(
+                        external_calls.load(Ordering::SeqCst) - before,
+                        usize::from(reason.is_none()),
+                        "{name}: denied tools must not reach an executor"
+                    );
+                }
+            }
+            assert_eq!(
+                invoke("file_read", serde_json::json!({"path":"kept.txt"})).1,
+                ExecutionResultStatus::Succeeded
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.join("kept.txt")).unwrap(),
+                "original"
+            );
+        }
+    }
+
+    #[test]
+    fn live_closed_skill_policy_precedes_mcp_plugin_and_orchestration_dispatch() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let session_id = SessionId::new("closed-skill-all-dispatch");
+        session_store
+            .create_session(session_id.clone(), "closed skill")
+            .unwrap();
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let task = coordinator_task(test_task("skill-root", "skill-root", None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        )
+        .with_external_tool_catalog_provider(Arc::new(|| {
+            magi_tool_runtime::ExternalToolCatalogSnapshot {
+                mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                    server_id: "repo".into(),
+                    server_name: "Repo".into(),
+                    model_tool_name: "mcp__repo__inspect".into(),
+                    tool_name: "inspect".into(),
+                    description: "inspect".into(),
+                    read_only: true,
+                    input_schema: serde_json::json!({"type":"object"}),
+                }],
+                ..Default::default()
+            }
+        }))
+        .with_external_mcp_tool_executor(Arc::new(move |_, _, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ("{}".into(), ExecutionResultStatus::Succeeded)
+        }));
+        let skill_registry = magi_skill_runtime::SkillRegistry::new();
+        let skill = |restricted| magi_skill_runtime::SkillDefinition {
+            skill_id: "workflow".into(),
+            title: "Workflow".into(),
+            instruction: "Inspect".into(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "test".into(),
+                tags: vec![],
+            },
+            restrict_standard_tools: restricted,
+            allowed_tools: vec!["file_read".into()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        };
+        skill_registry.register(skill(false));
+        let runtime = magi_skill_runtime::SkillRuntime::new(skill_registry.clone());
+        let invoke = |name: &str| {
+            execute_task_tool_call(
+                &event_bus,
+                Some(&tool_registry),
+                &agent_role_registry,
+                Some(&runtime),
+                None,
+                Some("workflow"),
+                &task_store,
+                &session_store,
+                &execution_registry,
+                &conversation_registry,
+                None,
+                &plan_store,
+                None,
+                &task,
+                &session_id,
+                &None,
+                None,
+                None,
+                None,
+                &ChatToolCall {
+                    id: name.into(),
+                    kind: "function".into(),
+                    function: ChatToolFunction {
+                        name: name.into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+                &|| true,
+            )
+        };
+        assert_eq!(
+            invoke("mcp__repo__inspect").1,
+            ExecutionResultStatus::Succeeded
+        );
+        skill_registry.register(skill(true));
+        for name in [
+            "mcp__repo__inspect",
+            "plugin__repo__inspect",
+            "agent_spawn",
+            "update_plan",
+            "file_write",
+        ] {
+            let (payload, status) = invoke(name);
+            assert_eq!(status, ExecutionResultStatus::Rejected, "{name}: {payload}");
+            assert!(payload.contains("tool_policy_rejected"));
+        }
+        skill_registry.replace([]);
+        assert_eq!(
+            invoke("mcp__repo__inspect").1,
+            ExecutionResultStatus::Rejected,
+            "移除 Skill 不能使旧 schema 重新获得全部工具"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "关闭 Skill 后不能再进入 MCP executor"
+        );
+        assert!(session_store.plan(&session_id).is_none());
+        assert!(task_store.all_tasks().is_empty());
     }
 
     #[test]
@@ -4525,12 +5781,161 @@ mod tests {
             None,
             &tool_call,
             None,
+            &|| true,
         );
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("plan payload json");
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         assert_eq!(parsed["status"].as_str(), Some("succeeded"));
         assert!(!plan_store.is_empty(), "只读访问不能阻止会话内部计划更新");
+    }
+
+    #[test]
+    fn model_goal_completion_settles_only_revoked_agents_and_reports_failures() {
+        for settlement_fails in [false, true] {
+            let event_bus = InMemoryEventBus::new(16);
+            let roles = magi_agent_role::AgentRoleRegistry::load_default();
+            let tasks = TaskStore::new();
+            let sessions = SessionStore::new();
+            let registry = TaskExecutionRegistry::default();
+            let conversations = ConversationRegistry::new();
+            let plans = crate::test_plan_store("goal-agent-settlement");
+            let session = SessionId::new("model-goal-agent-settlement");
+            sessions
+                .create_session(session.clone(), "model Goal control")
+                .unwrap();
+            let parent = coordinator_task(test_task("goal-controller", "goal-controller", None));
+            tasks.insert_task(parent.clone()).unwrap();
+            let (_, thread) = sessions
+                .ensure_session_mission(&session, UtcMillis::now(), || parent.mission_id.clone());
+            let goal = sessions
+                .create_goal(
+                    session.clone(),
+                    thread,
+                    parent.task_id.as_str(),
+                    "核对代理资源",
+                    AccessProfile::FullAccess,
+                )
+                .unwrap();
+            for (id, owner) in [
+                (
+                    "goal-owned-agent",
+                    magi_core::AgentRunOwner::Goal {
+                        goal_id: goal.goal_id.clone(),
+                        control_revision: goal.control_revision,
+                    },
+                ),
+                ("session-owned-agent", magi_core::AgentRunOwner::Session),
+            ] {
+                let mut child =
+                    test_task(id, parent.task_id.as_str(), Some(parent.task_id.clone()));
+                let lifetime = match &owner {
+                    magi_core::AgentRunOwner::Session => magi_core::AgentLifetime::Session,
+                    magi_core::AgentRunOwner::Goal { goal_id, .. } => {
+                        magi_core::AgentLifetime::Goal {
+                            goal_id: goal_id.clone(),
+                        }
+                    }
+                };
+                let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+                binding.agent_activation = Some(magi_core::AgentActivation {
+                    agent_id: child.task_id.clone(),
+                    session_id: session.clone(),
+                    lifetime,
+                    generation: 1,
+                    previous_task_id: None,
+                });
+                child.executor_binding = Some(binding);
+                tasks.insert_task(child.clone()).unwrap();
+                tasks
+                    .transfer_agent_subtree(
+                        &parent.task_id,
+                        &child.task_id,
+                        magi_core::AgentRunTransfer {
+                            operation_id: format!("transfer-{id}"),
+                            session_id: session.clone(),
+                            source_turn_id: parent.task_id.to_string(),
+                            transferred_by: parent.task_id.clone(),
+                            activation_generation: 1,
+                            owner,
+                            transferred_at: UtcMillis::now(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let settled = Arc::new(AtomicUsize::new(0));
+            let observed = settled.clone();
+            registry.set_agent_subtree_settler(move |_, ids| {
+                assert_eq!(ids, &[TaskId::new("goal-owned-agent")]);
+                observed.fetch_add(1, Ordering::SeqCst);
+                if settlement_fails {
+                    Err("进程尚未退出".into())
+                } else {
+                    Ok(())
+                }
+            });
+            let call = ChatToolCall { id: "goal-complete".into(), kind: "function".into(), function: ChatToolFunction {
+                name: "update_goal".into(), arguments: serde_json::json!({
+                    "goal_id":goal.goal_id, "status":"complete", "expected_revision":goal.control_revision,
+                    "expected_plan_revision":null, "completion_summary":"已核对工作产物", "evidence_refs":[]
+                }).to_string(),
+            }};
+            let (payload, status) = execute_task_tool_call(
+                &event_bus,
+                None,
+                &roles,
+                None,
+                None,
+                None,
+                &tasks,
+                &sessions,
+                &registry,
+                &conversations,
+                None,
+                &plans,
+                None,
+                &parent,
+                &session,
+                &None,
+                None,
+                None,
+                None,
+                &call,
+                None,
+                &|| true,
+            );
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["goal"]["status"], "complete");
+            assert_eq!(payload["agent_resources_settled"], !settlement_fails);
+            assert_eq!(
+                status,
+                if settlement_fails {
+                    ExecutionResultStatus::Failed
+                } else {
+                    ExecutionResultStatus::Succeeded
+                }
+            );
+            assert_eq!(settled.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                tasks
+                    .get_task(&TaskId::new("goal-owned-agent"))
+                    .unwrap()
+                    .status,
+                TaskStatus::Killed
+            );
+            assert_eq!(
+                tasks
+                    .get_task(&TaskId::new("session-owned-agent"))
+                    .unwrap()
+                    .status,
+                TaskStatus::Running
+            );
+            assert_eq!(
+                tasks.get_task(&parent.task_id).unwrap().status,
+                TaskStatus::Running
+            );
+            assert_eq!(tasks.all_tasks().len(), 3, "结算不能创建替代代理");
+        }
     }
 
     #[test]
@@ -4583,6 +5988,7 @@ mod tests {
                 None,
                 &tool_call,
                 None,
+                &|| true,
             );
             (
                 serde_json::from_str::<serde_json::Value>(&payload).expect("payload is json"),
@@ -4592,7 +5998,7 @@ mod tests {
 
         let (created, created_status) = call(
             BuiltinToolName::CreateGoal,
-            serde_json::json!({ "objective": "失败分类", "token_budget": null }),
+            serde_json::json!({ "objective": "失败分类" }),
         );
         assert_eq!(created_status, ExecutionResultStatus::Succeeded);
         assert_eq!(created["status"], "succeeded", "状态只用规范标签");
@@ -4608,7 +6014,7 @@ mod tests {
         // 已有未结束的目标：不能再创建，并带回当前目标。
         let (duplicate, duplicate_status) = call(
             BuiltinToolName::CreateGoal,
-            serde_json::json!({ "objective": "再来一个", "token_budget": null }),
+            serde_json::json!({ "objective": "再来一个" }),
         );
         assert_eq!(duplicate_status, ExecutionResultStatus::Failed);
         assert_eq!(duplicate["error_code"], "create_goal_already_unfinished");
@@ -4701,47 +6107,14 @@ mod tests {
                 None,
                 &tool_call,
                 None,
+                &|| true,
             )
         };
-
-        let (missing_budget_payload, missing_budget_status) = call(
-            BuiltinToolName::CreateGoal,
-            serde_json::json!({
-                "objective": "完成 goal 模式升级",
-            }),
-        );
-        assert_eq!(missing_budget_status, ExecutionResultStatus::Failed);
-        let missing_budget: serde_json::Value =
-            serde_json::from_str(&missing_budget_payload).expect("failure payload should be json");
-        assert!(
-            missing_budget["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("必须提供 token_budget")
-        );
-
-        let (small_budget_payload, small_budget_status) = call(
-            BuiltinToolName::CreateGoal,
-            serde_json::json!({
-                "objective": "完成 goal 模式升级",
-                "token_budget": 1000,
-            }),
-        );
-        assert_eq!(small_budget_status, ExecutionResultStatus::Failed);
-        let small_budget: serde_json::Value =
-            serde_json::from_str(&small_budget_payload).expect("failure payload should be json");
-        assert!(
-            small_budget["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("token_budget 不能低于")
-        );
 
         let (created_payload, created_status) = call(
             BuiltinToolName::CreateGoal,
             serde_json::json!({
                 "objective": "完成 goal 模式升级",
-                "token_budget": null,
             }),
         );
         assert_eq!(created_status, ExecutionResultStatus::Succeeded);
@@ -4811,22 +6184,6 @@ mod tests {
                 .status,
             GoalStatus::Complete
         );
-    }
-
-    #[test]
-    fn goal_token_budget_must_be_explicit_in_objective_text() {
-        assert!(!objective_text_explicitly_allows_goal_budget(
-            "目标模式抽屉验收：不要设置 token_budget。只回复 DONE。",
-            16_000,
-        ));
-        assert!(!objective_text_explicitly_allows_goal_budget(
-            "完成一个没有预算要求的目标模式任务",
-            16_000,
-        ));
-        assert!(objective_text_explicitly_allows_goal_budget(
-            "以 token 预算 16000 完成目标模式任务",
-            16_000,
-        ));
     }
 
     #[test]
@@ -6038,8 +7395,68 @@ mod tests {
         );
     }
 
+    fn persist_test_approval_tool(
+        store: &SessionStore,
+        session: &SessionId,
+        task: &magi_core::Task,
+        call: &ChatToolCall,
+    ) {
+        let turn = store
+            .runtime_sidecar(session)
+            .unwrap()
+            .current_turn
+            .unwrap();
+        store.append_current_turn_item_for_turn(session,Some(&turn.turn_id),serde_json::from_value(serde_json::json!({
+            "itemId":format!("test-tool-{}",call.id),"itemSeq":turn.items.len()+1,"kind":"tool_call_started","status":"running",
+            "source":"orchestrator","sourceThreadId":"thread-approval-test","taskId":task.task_id,
+            "toolCallId":call.id,"toolName":call.function.name,"toolArguments":call.function.arguments,
+        })).unwrap()).unwrap();
+    }
+
     #[test]
     fn task_tool_approval_resumes_original_file_remove_call() {
+        run_remove_approval_case("file_remove", false, None);
+    }
+
+    #[test]
+    fn task_tool_approval_persistence_failure_prevents_real_file_remove() {
+        run_remove_approval_case("file_remove", false, Some("awaiting_approval"));
+        run_remove_approval_case("file_remove", false, Some("running"));
+    }
+
+    #[test]
+    fn task_tool_approval_recovers_original_permission_and_executes_real_file_remove_once() {
+        run_remove_approval_case("file_remove", false, Some("recover_approval"));
+    }
+
+    #[test]
+    fn skill_revocation_during_approval_prevents_real_file_remove() {
+        run_remove_approval_case("file_remove", false, Some("revoke_skill"));
+    }
+
+    #[test]
+    fn obsolete_execution_after_approval_cannot_remove_file() {
+        run_remove_approval_case("file_remove", false, Some("revoke_execution"));
+    }
+
+    #[test]
+    fn mainline_and_child_external_tools_obey_approval_and_live_revocation() {
+        for tool_name in ["mcp__approval__remove", "plugin__approval__remove"] {
+            for child in [false, true] {
+                for outcome in [
+                    None,
+                    Some("deny"),
+                    Some("read_only"),
+                    Some("full_access"),
+                    Some("revoke_skill"),
+                ] {
+                    run_remove_approval_case(tool_name, child, outcome);
+                }
+            }
+        }
+    }
+
+    fn run_remove_approval_case(tool_name: &'static str, child: bool, failure_stage: Option<&str>) {
         let event_bus = InMemoryEventBus::new(16);
         let task_store = TaskStore::new();
         let session_store = SessionStore::new();
@@ -6047,6 +7464,22 @@ mod tests {
         let conversation_registry = ConversationRegistry::new();
         let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let skills = magi_skill_runtime::SkillRegistry::new();
+        let definition = |restricted| magi_skill_runtime::SkillDefinition {
+            skill_id: "approval-skill".into(),
+            title: "Approval".into(),
+            instruction: "inspect".into(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "test".into(),
+                tags: Vec::new(),
+            },
+            restrict_standard_tools: restricted,
+            allowed_tools: Vec::new(),
+            custom_tool_bindings: Vec::new(),
+            prompt_priority: 50,
+        };
+        skills.register(definition(false));
+        let skill_runtime = magi_skill_runtime::SkillRuntime::new(skills.clone());
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
             Arc::new(InMemoryEventBus::new(8)),
@@ -6055,7 +7488,75 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let target = dir.path().join("probe.txt");
         std::fs::write(&target, "probe").expect("write probe");
-        let task = test_task("task-file-remove", "task-file-remove", None);
+        let external_calls = Arc::new(AtomicUsize::new(0));
+        let calls = external_calls.clone();
+        let execute_remove = Arc::new(move |arguments: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let arguments: serde_json::Value = serde_json::from_str(arguments).unwrap();
+            std::fs::remove_file(arguments["path"].as_str().unwrap()).unwrap();
+            (
+                serde_json::json!({"tool": tool_name, "status":"succeeded"}).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        });
+        let mcp_remove = execute_remove.clone();
+        tool_registry = tool_registry
+            .with_external_tool_catalog_provider(Arc::new(|| {
+                magi_tool_runtime::ExternalToolCatalogSnapshot {
+                    mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "approval".into(),
+                        server_name: "Approval".into(),
+                        model_tool_name: "mcp__approval__remove".into(),
+                        tool_name: "remove".into(),
+                        description: "Remove file".into(),
+                        read_only: false,
+                        input_schema: serde_json::json!({"type":"object"}),
+                    }],
+                    ..Default::default()
+                }
+            }))
+            .with_external_mcp_tool_executor(Arc::new(move |_, _, arguments| mcp_remove(arguments)))
+            .with_plugin_tools(
+                Arc::new(|_| {
+                    vec![magi_tool_runtime::PluginToolCatalogEntry {
+                        plugin_id: "approval".into(),
+                        contribution_id: "remove".into(),
+                        model_tool_name: "plugin__approval__remove".into(),
+                        title: "Remove".into(),
+                        description: "Remove file".into(),
+                        read_only: false,
+                        input_schema: serde_json::json!({"type":"object"}),
+                    }]
+                }),
+                Arc::new(move |_, arguments, context| {
+                    assert_eq!(
+                        context.caller_scope,
+                        if child {
+                            magi_tool_runtime::ToolCallerScope::DelegatedTask
+                        } else {
+                            magi_tool_runtime::ToolCallerScope::SessionMainline
+                        }
+                    );
+                    execute_remove(arguments)
+                }),
+            );
+        let mut task = coordinator_task(test_task("task-file-remove", "task-file-remove", None));
+        if child {
+            let parent = test_task("approval-parent", "approval-parent", None);
+            task.root_task_id = parent.task_id.clone();
+            task.parent_task_id = Some(parent.task_id.clone());
+            task.executor_binding = Some(TaskExecutorBinding::for_role("executor"));
+            task_store.insert_task(parent).unwrap();
+        }
+        if matches!(failure_stage, Some("read_only" | "full_access")) {
+            let mut policy = default_agent_spawn_policy();
+            policy.access_profile = if failure_stage == Some("read_only") {
+                AccessProfile::ReadOnly
+            } else {
+                AccessProfile::FullAccess
+            };
+            task.policy_snapshot = Some(policy);
+        }
         task_store.insert_task(task.clone()).expect("任务应插入");
         let session_id = SessionId::new("session-file-remove");
         session_store
@@ -6129,7 +7630,7 @@ mod tests {
             id: "call-file-remove".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
-                name: BuiltinToolName::FileRemove.as_str().to_string(),
+                name: tool_name.to_string(),
                 arguments: serde_json::json!({
                     "path": target.to_string_lossy()
                 })
@@ -6137,8 +7638,17 @@ mod tests {
             },
         };
 
+        persist_test_approval_tool(&session_store, &session_id, &task, &tool_call);
+        let interrupted = std::sync::Mutex::new(None);
+        let execution_active = std::sync::atomic::AtomicBool::new(true);
         let result = thread::scope(|scope| {
             let resolver = scope.spawn(|| {
+                if matches!(
+                    failure_stage,
+                    Some("awaiting_approval" | "recover_approval" | "read_only" | "full_access")
+                ) {
+                    return;
+                }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 loop {
                     if let Some(pending) = conversation_registry
@@ -6148,12 +7658,17 @@ mod tests {
                         .next()
                     {
                         assert!(target.exists(), "授权前不能执行删除");
+                        assert_eq!(pending.agent.is_some(), child);
                         conversation_registry
                             .tool_approvals()
                             .resolve(
                                 &session_id,
                                 &pending.approval_id,
-                                crate::ToolApprovalDecision::AllowOnce,
+                                if failure_stage == Some("deny") {
+                                    crate::ToolApprovalDecision::Deny
+                                } else {
+                                    crate::ToolApprovalDecision::AllowOnce
+                                },
                             )
                             .expect("task approval should resolve");
                         break;
@@ -6165,13 +7680,36 @@ mod tests {
                     std::thread::yield_now();
                 }
             });
+            let progress = |update: ToolExecutionProgress| {
+                let payload: serde_json::Value = serde_json::from_str(&update.payload).unwrap();
+                if failure_stage == Some("recover_approval")
+                    && payload["status"] == "awaiting_approval"
+                {
+                    *interrupted.lock().unwrap() = Some((
+                        session_store.durable_state(),
+                        session_store.execution_sidecar_store_state(),
+                    ));
+                    return Err("simulated process exit after durable approval".into());
+                }
+                if failure_stage == Some("revoke_skill") && payload["status"] == "running" {
+                    skills.register(definition(true));
+                }
+                if failure_stage == Some("revoke_execution") && payload["status"] == "running" {
+                    execution_active.store(false, Ordering::SeqCst);
+                }
+                if failure_stage.is_some() && payload["status"].as_str() == failure_stage {
+                    Err("injected durable write failure".to_string())
+                } else {
+                    Ok(())
+                }
+            };
             let result = execute_task_tool_call_batch(
                 &event_bus,
                 Some(&tool_registry),
                 &agent_role_registry,
+                Some(&skill_runtime),
                 None,
-                None,
-                None,
+                Some("approval-skill"),
                 &task_store,
                 &session_store,
                 &execution_registry,
@@ -6187,20 +7725,237 @@ mod tests {
                 None,
                 &[tool_call],
                 &mut ToolExecutionLedger::default(),
+                Some(&progress),
                 None,
                 None,
-                None,
+                &|| execution_active.load(Ordering::SeqCst),
             );
             resolver.join().expect("task approval resolver should join");
             result
         });
 
+        assert!(
+            conversation_registry
+                .tool_approvals()
+                .pending_for_session(&session_id)
+                .is_empty()
+        );
+        if matches!(failure_stage, Some("read_only" | "deny")) {
+            assert_eq!(
+                result[0].1,
+                ExecutionResultStatus::Rejected,
+                "{}",
+                result[0].0
+            );
+            assert!(target.exists(), "只读或明确拒绝必须保留文件");
+            assert_eq!(external_calls.load(Ordering::SeqCst), 0);
+            return;
+        }
+        if failure_stage == Some("revoke_execution") {
+            assert_eq!(result[0].1, ExecutionResultStatus::Cancelled);
+            assert!(target.exists(), "批准后执行资格失效必须阻止真实删除");
+            return;
+        }
+        if failure_stage == Some("revoke_skill") {
+            assert_eq!(result[0].1, ExecutionResultStatus::Rejected);
+            assert_eq!(external_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                target.exists(),
+                "等待期间撤销 Skill 必须阻止获批后的真实删除"
+            );
+            return;
+        }
+        if failure_stage.is_some() && failure_stage != Some("full_access") {
+            assert_eq!(result[0].1, ExecutionResultStatus::Failed);
+            assert!(target.exists(), "持久化失败时授权不能触发真实删除");
+            let payload: serde_json::Value = serde_json::from_str(&result[0].0).unwrap();
+            assert_eq!(payload["error_code"], "tool_progress_persist_failed");
+            assert_eq!(payload["execution_started"], false);
+            if failure_stage == Some("recover_approval") {
+                let (durable, sidecars) = interrupted.into_inner().unwrap().unwrap();
+                let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+                let now = UtcMillis::now();
+                restored
+                    .upsert_active_execution_chain(
+                        session_id.clone(),
+                        magi_session_store::ActiveExecutionChain {
+                            session_id: session_id.clone(),
+                            mission_id: task.mission_id.clone(),
+                            root_task_id: task.task_id.clone(),
+                            execution_chain_ref: "approval-recovery-chain".into(),
+                            workspace_id: workspace_id.clone(),
+                            active_branch_task_ids: vec![],
+                            active_worker_bindings: vec![],
+                            branches: vec![],
+                            recovery_ref: None,
+                            dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                                accepted_at: now,
+                                entry_id: "approval-recovery-entry".into(),
+                                trimmed_text: Some("remove".into()),
+                                skill_name: None,
+                            },
+                            current_turn: restored
+                                .runtime_sidecar(&session_id)
+                                .unwrap()
+                                .current_turn,
+                        },
+                    )
+                    .unwrap();
+                restored
+                    .interrupt_current_turn_by_daemon_restart(&session_id)
+                    .unwrap();
+                let pending = restored
+                    .pending_tool_approvals(&session_id)
+                    .unwrap()
+                    .remove(0);
+                restored
+                    .resolve_tool_approvals(
+                        &session_id,
+                        std::slice::from_ref(&pending.approval_id),
+                        crate::ToolApprovalDecision::AllowOnce,
+                    )
+                    .unwrap();
+                let call = ChatToolCall {
+                    id: "resumed-file-remove-call".into(),
+                    kind: "function".into(),
+                    function: ChatToolFunction {
+                        name: "file_remove".into(),
+                        arguments: serde_json::json!({"path":target.to_string_lossy()}).to_string(),
+                    },
+                };
+                restored
+                    .accept_conversation_turn_with_timeline_entry(
+                        session_id.clone(),
+                        workspace_id.clone(),
+                        magi_session_store::TimelineEntryInput::new(
+                            "resume-file-remove",
+                            magi_session_store::TimelineEntryKind::UserMessage,
+                            "继续",
+                            now,
+                        ),
+                        magi_session_store::ActiveExecutionTurn {
+                            turn_id: "resumed-file-remove-turn".into(),
+                            turn_seq: now.0,
+                            accepted_at: now,
+                            status: "running".into(),
+                            completed_at: None,
+                            user_message: Some("继续".into()),
+                            items: vec![],
+                        },
+                    )
+                    .unwrap();
+                persist_test_approval_tool(&restored, &session_id, &task, &call);
+                let registry = ConversationRegistry::new();
+                let progress = |update: ToolExecutionProgress| {
+                    if update.payload.contains("awaiting_approval") {
+                        return Err("recovery unexpectedly asked a second approval".into());
+                    }
+                    Ok(())
+                };
+                let (payload, status) = execute_task_tool_call(
+                    &event_bus,
+                    Some(&tool_registry),
+                    &agent_role_registry,
+                    Some(&skill_runtime),
+                    None,
+                    Some("approval-skill"),
+                    &task_store,
+                    &restored,
+                    &execution_registry,
+                    &registry,
+                    None,
+                    &plan_store,
+                    None,
+                    &task,
+                    &session_id,
+                    &workspace_id,
+                    Some(&dir.path().to_path_buf()),
+                    None,
+                    None,
+                    &call,
+                    Some(&progress),
+                    &|| true,
+                );
+                assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+                assert!(!target.exists());
+                let thread = magi_core::ThreadId::new("thread-approval-test");
+                let before = ToolExecutionLedger::from_canonical_task(
+                    &restored,
+                    &task_store,
+                    &session_id,
+                    &task,
+                    &thread,
+                    Some(&tool_registry),
+                )
+                .unwrap();
+                assert!(matches!(
+                    before
+                        .ledger
+                        .plan(std::slice::from_ref(&call), Some(&tool_registry))[0],
+                    crate::tool_execution_ledger::ToolCallExecutionDecision::RecoveryBlocked { .. }
+                ));
+                let mut item = restored
+                    .runtime_sidecar(&session_id)
+                    .unwrap()
+                    .current_turn
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .find(|item| item.tool_call_id.as_deref() == Some(call.id.as_str()))
+                    .unwrap();
+                item.kind = "tool_call_result".into();
+                item.status = "completed".into();
+                item.tool_status = Some("succeeded".into());
+                item.tool_result = Some(payload.clone());
+                restored
+                    .upsert_current_turn_item_for_turn(
+                        &session_id,
+                        Some("resumed-file-remove-turn"),
+                        item,
+                    )
+                    .unwrap();
+                let after = ToolExecutionLedger::from_canonical_task(
+                    &restored,
+                    &task_store,
+                    &session_id,
+                    &task,
+                    &thread,
+                    Some(&tool_registry),
+                )
+                .unwrap();
+                assert!(matches!(
+                    after
+                        .ledger
+                        .plan(std::slice::from_ref(&call), Some(&tool_registry))[0],
+                    crate::tool_execution_ledger::ToolCallExecutionDecision::Reuse { .. }
+                ));
+                assert!(
+                    registry
+                        .tool_approvals()
+                        .pending_for_session(&session_id)
+                        .is_empty()
+                );
+                let original = restored
+                    .canonical_turn_for_session_turn_id(&session_id, turn_id)
+                    .unwrap();
+                assert!(original.items.iter().any(|item| {
+                    item.tool_approval()
+                        .unwrap()
+                        .is_some_and(|approval| approval.execution.is_some())
+                }));
+            }
+            return;
+        }
         assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
         let payload: serde_json::Value =
             serde_json::from_str(&result[0].0).expect("tool payload should be json");
-        assert_eq!(payload["tool"].as_str(), Some("file_remove"));
+        assert_eq!(payload["tool"].as_str(), Some(tool_name));
         assert_eq!(payload["status"].as_str(), Some("succeeded"));
         assert!(!target.exists(), "授权后必须恢复并完成原始删除调用");
+        assert_eq!(
+            external_calls.load(Ordering::SeqCst),
+            usize::from(tool_name != "file_remove")
+        );
     }
 
     #[test]
@@ -6299,6 +8054,7 @@ mod tests {
                 arguments: r#"{"command":"printf disconnected"}"#.to_string(),
             },
         };
+        persist_test_approval_tool(&session_store, &session_id, &task, &tool_call);
         let decision = ToolPreflightDecision {
             payload: serde_json::json!({ "error": "需要用户审批" }).to_string(),
             status: ExecutionResultStatus::NeedsApproval,
@@ -6314,9 +8070,11 @@ mod tests {
                     &task,
                     &session_id,
                     &workspace_id,
+                    None,
                     &tool_call,
                     &decision,
                     None,
+                    &|| true,
                 )
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -6347,9 +8105,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("failure payload");
         assert_eq!(status, ExecutionResultStatus::Failed);
         assert_eq!(parsed["error_code"], "tool_approval_runtime_failed");
-        assert_eq!(
-            parsed["approval_id"],
-            "tool-approval-task-approval-disconnect-call-task-approval-disconnect"
+        assert!(
+            parsed["approval_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool-approval-")
         );
         let signals = conversation_registry.drain_task_signals(&session_id, &parent_task_id);
         assert!(
@@ -6401,6 +8161,7 @@ mod tests {
         let captured = Arc::clone(&progress);
         let on_progress = move |update| {
             captured.lock().expect("progress lock").push(update);
+            Ok(())
         };
 
         let result = execute_task_tool_call_batch(
@@ -6428,6 +8189,7 @@ mod tests {
             Some(&on_progress),
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
@@ -6507,6 +8269,7 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(results.len(), 3);
@@ -6586,6 +8349,7 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
 
         assert_eq!(result.len(), 1);
@@ -6663,6 +8427,7 @@ mod tests {
             None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
+            &|| true,
         );
 
         assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
@@ -6719,6 +8484,7 @@ mod tests {
             None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
+            &|| true,
         );
 
         assert_eq!(mainline_result[0].1, ExecutionResultStatus::Succeeded);
@@ -6830,6 +8596,7 @@ mod tests {
             None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
+            &|| true,
         );
 
         assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
@@ -6852,6 +8619,224 @@ mod tests {
             assert_eq!(
                 change.execution_group_id.as_deref(),
                 Some("mission-mailbox")
+            );
+        }
+    }
+
+    #[test]
+    fn agent_wait_and_cancel_read_persisted_partial_executor_evidence_without_replay() {
+        use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest, ModelResponse};
+        use magi_session_store::{ActiveExecutionTurn, TimelineEntryInput, TimelineEntryKind};
+
+        #[derive(Clone)]
+        struct PartialExecutor {
+            calls: Arc<AtomicUsize>,
+            evidence: magi_core::ExecutorFailureEvidence,
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+            cancel: bool,
+        }
+        impl ModelBridgeClient for PartialExecutor {
+            fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+                let mut caps = magi_bridge_client::text_executor_capabilities();
+                caps.tools = magi_bridge_client::ExecutorToolMode::ExecutorOwned;
+                caps
+            }
+            fn bind_execution_scope(
+                &self,
+                _: magi_bridge_client::ModelExecutionScope,
+            ) -> Result<Option<Arc<dyn ModelBridgeClient>>, magi_bridge_client::BridgeClientError>
+            {
+                Ok(Some(Arc::new(self.clone())))
+            }
+            fn invoke(
+                &self,
+                _: ModelInvocationRequest,
+            ) -> Result<ModelResponse, magi_bridge_client::BridgeClientError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.stopped.store(self.cancel, Ordering::SeqCst);
+                Err(magi_bridge_client::BridgeClientError::ExecutorFailed {
+                    source: Box::new(magi_bridge_client::BridgeClientError::CallFailed {
+                        layer: magi_bridge_client::BridgeErrorLayer::Transport,
+                        code: None,
+                        message: "fixture interrupted after command started".into(),
+                    }),
+                    evidence: Box::new(self.evidence.clone()),
+                })
+            }
+            fn invoke_streaming(
+                &self,
+                request: ModelInvocationRequest,
+                _: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+            ) -> Result<ModelResponse, magi_bridge_client::BridgeClientError> {
+                self.invoke(request)
+            }
+        }
+
+        for cancel in [false, true] {
+            let tasks = TaskStore::new();
+            let sessions = SessionStore::new();
+            let session = SessionId::new(format!("partial-executor-{cancel}"));
+            let parent = test_task("partial-parent", "partial-parent", None);
+            let mut child = test_task(
+                "partial-child",
+                "partial-parent",
+                Some(parent.task_id.clone()),
+            );
+            child.status = if cancel {
+                TaskStatus::Killed
+            } else {
+                TaskStatus::Failed
+            };
+            child.output_refs = vec!["executor outcome unknown".into()];
+            tasks.insert_task(parent.clone()).unwrap();
+            tasks.insert_task(child.clone()).unwrap();
+            sessions
+                .create_session(session.clone(), "partial executor")
+                .unwrap();
+            sessions
+                .accept_current_turn_with_timeline_entry(
+                    session.clone(),
+                    TimelineEntryInput::new(
+                        "partial-input",
+                        TimelineEntryKind::UserMessage,
+                        "inspect",
+                        UtcMillis(1),
+                    ),
+                    ActiveExecutionTurn {
+                        turn_id: "partial-turn".into(),
+                        turn_seq: 1,
+                        accepted_at: UtcMillis(1),
+                        status: "running".into(),
+                        completed_at: None,
+                        user_message: Some("inspect".into()),
+                        items: vec![],
+                    },
+                )
+                .unwrap();
+            let executor = PartialExecutor {
+                calls: Default::default(), stopped: Default::default(), cancel,
+                evidence: serde_json::from_value(serde_json::json!({
+                    "receipts":[{"executor":"fixture", "execution_id":"original-run", "commands":[
+                        {"command":"inspect", "exit_code":null, "status":"outcome_unknown", "output":"partial observation"}
+                    ]}],
+                    "usage":{"input_tokens":3, "output_tokens":2}, "items":[], "resourcesSettled":true
+                })).unwrap(),
+            };
+            let thread = magi_core::ThreadId::new("partial-thread");
+            let request = || ModelInvocationRequest {
+                provider: "fixture".into(),
+                prompt: "inspect".into(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            };
+            let scope = || magi_bridge_client::ModelExecutionScope {
+                working_dir: None,
+                policy: default_agent_spawn_policy(),
+                requires_native_tools: false,
+                closed_skill_scope: false,
+            };
+            let client = crate::model_step::StepModelClient::new(
+                &executor,
+                &sessions,
+                &session,
+                Some("partial-turn"),
+                Some(&child.task_id),
+                &thread,
+                "partial-step",
+            )
+            .with_execution_scope(scope());
+            assert!(
+                client
+                    .invoke_with_cancellation(request(), &|| executor
+                        .stopped
+                        .load(Ordering::SeqCst))
+                    .is_err()
+            );
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+            // 真正经过序列化与读取，避免测试只验证共享内存中的证据。
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&sessions.durable_state()).unwrap(),
+            )
+            .unwrap();
+            let restored = SessionStore::from_persisted_parts(
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+                sessions.execution_sidecar_store_state(),
+            )
+            .unwrap();
+            executor.stopped.store(false, Ordering::SeqCst);
+            let replay = crate::model_step::StepModelClient::new(
+                &executor,
+                &restored,
+                &session,
+                Some("partial-turn"),
+                Some(&child.task_id),
+                &thread,
+                "partial-step",
+            )
+            .with_execution_scope(scope());
+            assert!(replay.invoke(request()).is_err());
+            let before = restored
+                .canonical_turn_for_session_turn_id(&session, "partial-turn")
+                .unwrap();
+            assert_eq!(
+                before.model_steps[0].status,
+                magi_session_store::ModelStepStatus::OutcomeUnknown
+            );
+            assert_eq!(before.model_steps[0].usage_tokens, Some(5));
+
+            let registry = TaskExecutionRegistry::default();
+            let (wait, status) = execute_agent_wait_with_runtime(
+                AgentWaitRuntime {
+                    task_store: &tasks,
+                    session_store: &restored,
+                    admission: &registry.execution_admission(),
+                    conversation_registry: &ConversationRegistry::new(),
+                    session_id: &session,
+                    execution_allowed: &|| true,
+                },
+                &parent,
+                BuiltinToolName::AgentWait,
+                &serde_json::json!({"task_ids":[child.task_id]}),
+            );
+            assert_eq!(status, ExecutionResultStatus::Succeeded);
+            let wait: serde_json::Value = serde_json::from_str(&wait).unwrap();
+            let receipt = &wait["results"][0];
+            assert_eq!(receipt["activity"]["external_commands"], 1);
+            assert_eq!(receipt["activity"]["tool_calls"], 0);
+            assert_eq!(
+                receipt["executor_receipts"][0]["model_step_id"],
+                "partial-step"
+            );
+            assert_eq!(
+                receipt["executor_receipts"][0]["commands"][0]["status"],
+                "outcome_unknown"
+            );
+            assert!(receipt["executor_receipts"][0]["commands"][0]["exit_code"].is_null());
+            assert_eq!(receipt["executor_failures"][0]["resources_settled"], true);
+            let (cancelled, status) = execute_agent_cancel(
+                &tasks,
+                &registry,
+                &restored,
+                &parent,
+                &session,
+                BuiltinToolName::AgentCancel,
+                &serde_json::json!({"task_id":child.task_id, "reason":"核对原任务"}),
+            );
+            assert_eq!(status, ExecutionResultStatus::Succeeded);
+            let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+            assert_eq!(cancelled["results"], wait["results"]);
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(tasks.all_tasks().len(), 2);
+            assert_eq!(
+                restored
+                    .canonical_turn_for_session_turn_id(&session, "partial-turn")
+                    .unwrap(),
+                before
             );
         }
     }
@@ -7060,6 +9045,16 @@ mod tests {
         assert_eq!(
             parsed["results"][0]["failure_stage"].as_str(),
             Some("cancellation")
+        );
+        assert_eq!(
+            parsed["results"][0]["instruction"],
+            magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE,
+        );
+        assert!(
+            parsed["instruction"]
+                .as_str()
+                .unwrap()
+                .contains(magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE)
         );
     }
 
@@ -7391,13 +9386,10 @@ mod tests {
             result["error_code"].as_str(),
             Some("model_invocation_failed")
         );
-        assert_eq!(
-            result["error"].as_str(),
-            Some("子代理模型调用失败，请改派或接管。")
-        );
+        assert_eq!(result["error"].as_str(), Some("子代理模型调用失败。"));
         assert_eq!(
             result["result"]["final_text"].as_str(),
-            Some("子代理模型调用失败，请改派或接管。")
+            Some("子代理模型调用失败。")
         );
         assert!(
             !result.to_string().contains("provider transport failed"),
@@ -7495,7 +9487,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_assignment_message_enters_child_conversation_mailbox() {
+    fn agent_spawn_assignment_message_enters_child_signal_fifo() {
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-assignment-mailbox");
         let parent = coordinator_task(test_task(
@@ -7527,6 +9519,7 @@ mod tests {
             accesses: Vec::new(),
         };
 
+        registry.open_task_signal_channel(&session_id, &child.task_id);
         enqueue_agent_assignment_message(
             &registry,
             &session_id,
@@ -7534,33 +9527,30 @@ mod tests {
             &child,
             "explorer",
             UtcMillis(42),
-        );
+        )
+        .unwrap();
 
-        let child_conversation = registry.conversation_for_task(&session_id, &child.task_id);
-        let items = child_conversation.lock().unwrap().drain_mailbox_items();
+        let items = registry.drain_task_signals(&session_id, &child.task_id);
 
         assert_eq!(items.len(), 1);
-        match &items[0] {
-            crate::MailboxItem::Runtime(signal) => {
-                assert_eq!(
-                    signal.author,
-                    MailboxAuthor::Parent("task-agent-assignment-parent".to_string())
-                );
-                assert_eq!(signal.kind, MailboxKind::Message);
-                assert!(signal.trigger_turn);
-                assert_eq!(signal.payload["type"].as_str(), Some("agent_assignment"));
-                assert_eq!(signal.payload["goal"].as_str(), Some("列出目录并汇报"));
-                assert_eq!(
-                    signal.payload["dependency_ids"],
-                    serde_json::json!(["task-agent-assignment-dependency"])
-                );
-                assert_eq!(
-                    signal.payload["context_package_id"],
-                    "agent-context-assignment"
-                );
-                assert_eq!(signal.payload["context_revision"], 1);
-            }
-        }
+        let signal = &items[0];
+        assert_eq!(
+            signal.author,
+            MailboxAuthor::Parent("task-agent-assignment-parent".to_string())
+        );
+        assert_eq!(signal.kind, MailboxKind::Message);
+        assert!(signal.trigger_turn);
+        assert_eq!(signal.payload["type"].as_str(), Some("agent_assignment"));
+        assert_eq!(signal.payload["goal"].as_str(), Some("列出目录并汇报"));
+        assert_eq!(
+            signal.payload["dependency_ids"],
+            serde_json::json!(["task-agent-assignment-dependency"])
+        );
+        assert_eq!(
+            signal.payload["context_package_id"],
+            "agent-context-assignment"
+        );
+        assert_eq!(signal.payload["context_revision"], 1);
     }
 
     #[test]
@@ -7654,11 +9644,19 @@ mod tests {
         for task in [parent.clone(), child.clone(), queued_sibling.clone()] {
             task_store.insert_task(task).expect("任务应插入");
         }
+        let grandchild = test_task(
+            "task-cancel-grandchild",
+            "task-cancel-parent",
+            Some(child.task_id.clone()),
+        );
+        task_store.insert_task(grandchild.clone()).unwrap();
 
         let (payload, status) = execute_agent_cancel(
             &task_store,
             &registry,
+            &SessionStore::new(),
             &parent,
+            &SessionId::new("agent-cancel-session"),
             BuiltinToolName::AgentCancel,
             &serde_json::json!({"task_id": child.task_id, "reason": "方向错误"}),
         );
@@ -7666,8 +9664,21 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("结果应为 JSON");
         assert_eq!(parsed["status"].as_str(), Some("cancelled"));
         assert_eq!(parsed["child_status"].as_str(), Some("killed"));
+        assert_eq!(
+            parsed["resources_settled"], false,
+            "未接宿主结算不能声称资源退出"
+        );
+        assert_eq!(parsed["results"][0]["child_status"], "killed");
+        assert_eq!(
+            parsed["results"][0]["result"]["final_text"],
+            "主线取消：方向错误"
+        );
         let killed = task_store.get_task(&child.task_id).expect("子任务应存在");
         assert_eq!(killed.status, TaskStatus::Killed);
+        assert_eq!(
+            task_store.get_task(&grandchild.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
         assert!(
             killed
                 .output_refs
@@ -7683,7 +9694,9 @@ mod tests {
         let (payload, _) = execute_agent_cancel(
             &task_store,
             &registry,
+            &SessionStore::new(),
             &parent,
+            &SessionId::new("agent-cancel-session"),
             BuiltinToolName::AgentCancel,
             &serde_json::json!({"task_id": child.task_id, "reason": "重复取消"}),
         );
@@ -7693,7 +9706,9 @@ mod tests {
         let (payload, status) = execute_agent_cancel(
             &task_store,
             &registry,
+            &SessionStore::new(),
             &child,
+            &SessionId::new("agent-cancel-session"),
             BuiltinToolName::AgentCancel,
             &serde_json::json!({"task_id": queued_sibling.task_id, "reason": "越权"}),
         );
@@ -7707,7 +9722,184 @@ mod tests {
     }
 
     #[test]
+    fn agent_cancel_settlement_failure_keeps_original_result_and_can_be_rechecked() {
+        let store = Arc::new(TaskStore::new());
+        let registry = TaskExecutionRegistry::default();
+        let session = SessionId::new("agent-settlement-session");
+        let parent = test_task("settle-parent", "settle-parent", None);
+        let child = test_task(
+            "settle-child",
+            parent.task_id.as_str(),
+            Some(parent.task_id.clone()),
+        );
+        let leaf = test_task(
+            "settle-leaf",
+            parent.task_id.as_str(),
+            Some(child.task_id.clone()),
+        );
+        let sibling = test_task(
+            "settle-sibling",
+            parent.task_id.as_str(),
+            Some(parent.task_id.clone()),
+        );
+        for task in [&parent, &child, &leaf, &sibling] {
+            store.insert_task(task.clone()).unwrap();
+        }
+        let expected_session = session.clone();
+        let expected = vec![child.task_id.clone(), leaf.task_id.clone()];
+        let facts = store.clone();
+        registry.set_agent_subtree_settler(move |session, tasks| {
+            assert_eq!(session, &expected_session);
+            assert_eq!(tasks, expected);
+            assert!(
+                tasks
+                    .iter()
+                    .all(|id| facts.get_task(id).unwrap().status == TaskStatus::Killed)
+            );
+            Err("进程仍在退出".into())
+        });
+        let args = serde_json::json!({"task_id":child.task_id,"reason":"停止无用分支"});
+        let (payload, status) = execute_agent_cancel(
+            &store,
+            &registry,
+            &SessionStore::new(),
+            &parent,
+            &session,
+            BuiltinToolName::AgentCancel,
+            &args,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["cancellation_status"], "cancelled");
+        assert_eq!(payload["error_code"], "cancel_unsettled");
+        assert_eq!(payload["resources_settled"], false);
+        assert_eq!(payload["settlement_error"], "进程仍在退出");
+        let original = serde_json::to_value(store.get_task(&child.task_id).unwrap()).unwrap();
+        registry.set_agent_subtree_settler(|_, _| Ok(()));
+        let (recheck, status) = execute_agent_cancel(
+            &store,
+            &registry,
+            &SessionStore::new(),
+            &parent,
+            &session,
+            BuiltinToolName::AgentCancel,
+            &args,
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let recheck: serde_json::Value = serde_json::from_str(&recheck).unwrap();
+        assert_eq!(recheck["status"], "already_terminal");
+        assert_eq!(recheck["resources_settled"], true);
+        assert_eq!(recheck["results"], payload["results"]);
+        assert_eq!(
+            serde_json::to_value(store.get_task(&child.task_id).unwrap()).unwrap(),
+            original
+        );
+        assert_eq!(
+            store.get_task(&parent.task_id).unwrap().status,
+            parent.status
+        );
+        assert_eq!(
+            store.get_task(&sibling.task_id).unwrap().status,
+            sibling.status
+        );
+        assert_eq!(store.all_tasks().len(), 4);
+    }
+
+    #[test]
+    fn agent_cancel_after_completion_preserves_the_original_receipt_and_task() {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let task_store = TaskStore::new();
+            let registry = TaskExecutionRegistry::default();
+            let parent = test_task("cancel-terminal-parent", "cancel-terminal-parent", None);
+            let mut child = test_task(
+                "cancel-terminal-child",
+                parent.task_id.as_str(),
+                Some(parent.task_id.clone()),
+            );
+            child.status = terminal;
+            child.output_refs = if terminal == TaskStatus::Completed {
+                vec![
+                    completed_output_ref(&format!("已完成{}结尾证据", "原始结果".repeat(3_000))),
+                    serde_json::json!({"agent_workspace": {
+                        "branch":"magi/agent/original", "base":"base", "head":"head",
+                        "changed_paths":["src/parser.rs"]
+                    }})
+                    .to_string(),
+                ]
+            } else {
+                vec!["原任务已停止，先核对副作用".into()]
+            };
+            task_store.insert_task(parent.clone()).unwrap();
+            task_store.insert_task(child.clone()).unwrap();
+            let before = serde_json::to_value(&child).unwrap();
+            let (wait, _) = execute_agent_wait(
+                &task_store,
+                &parent,
+                BuiltinToolName::AgentWait,
+                &serde_json::json!({"task_ids":[child.task_id]}),
+            );
+            let wait: serde_json::Value = serde_json::from_str(&wait).unwrap();
+            for _ in 0..2 {
+                let (payload, status) = execute_agent_cancel(
+                    &task_store,
+                    &registry,
+                    &SessionStore::new(),
+                    &parent,
+                    &SessionId::new("agent-cancel-session"),
+                    BuiltinToolName::AgentCancel,
+                    &serde_json::json!({"task_id":child.task_id, "reason":"已不再需要"}),
+                );
+                assert_eq!(status, ExecutionResultStatus::Succeeded);
+                assert_eq!(
+                    crate::tool_result_utils::model_visible_tool_result(&payload, status),
+                    payload,
+                    "长回执必须以有效 JSON 实际交付给模型，不能在通用截断中丢失 results"
+                );
+                let result: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(result["status"], "already_terminal");
+                assert_eq!(result["results"], wait["results"]);
+                assert!(
+                    result["instruction"]
+                        .as_str()
+                        .unwrap()
+                        .contains(magi_tool_runtime::AGENT_DELEGATION_RECOVERY_GUIDANCE)
+                );
+                assert_eq!(
+                    serde_json::to_value(task_store.get_task(&child.task_id).unwrap()).unwrap(),
+                    before
+                );
+                assert_eq!(task_store.get_children(&parent.task_id).len(), 1);
+                if terminal == TaskStatus::Completed {
+                    assert_eq!(
+                        result["results"][0]["workspace"]["branch"],
+                        "magi/agent/original"
+                    );
+                    assert_eq!(
+                        result["results"][0]["activity"]["commands"][0]["exit_code"],
+                        0
+                    );
+                    assert_eq!(result["results"][0]["result"]["truncated"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn agent_send_updates_package_revision_and_reaches_running_child() {
+        run_agent_send_to_running_child(false);
+    }
+
+    #[test]
+    fn agent_send_checkpoint_failure_leaves_no_partial_supplement_or_wakeup() {
+        run_agent_send_to_running_child(true);
+    }
+
+    fn run_agent_send_to_running_child(reject_checkpoint: bool) {
         let task_store = TaskStore::new();
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-send");
@@ -7741,7 +9933,20 @@ mod tests {
             .expect("父任务应插入");
         task_store.insert_task(child.clone()).expect("子任务应插入");
         registry.open_task_signal_channel(&session_id, &child.task_id);
+        let checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::clone(&checkpoint_count);
+        task_store.set_checkpoint_callback(Box::new(move |_| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            if reject_checkpoint {
+                Err(magi_core::DomainError::Persistence {
+                    message: "injected".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }));
 
+        let observed_version = task_store.status_change_version();
         let (payload, status) = execute_agent_send(
             &task_store,
             &registry,
@@ -7754,7 +9959,37 @@ mod tests {
             }),
             &|_, _| {},
         );
+        assert_eq!(
+            checkpoint_count.load(Ordering::SeqCst),
+            1,
+            "一次发送只提交一次任务事务"
+        );
+        if reject_checkpoint {
+            assert_eq!(status, ExecutionResultStatus::Failed);
+            assert_eq!(task_store.status_change_version(), observed_version);
+            let stored = task_store.get_task(&child.task_id).unwrap();
+            assert_eq!(stored.agent_context_package().unwrap().revision, 1);
+            assert!(
+                stored
+                    .agent_context_package()
+                    .unwrap()
+                    .supplements
+                    .is_empty()
+            );
+            assert!(stored.agent_context_accesses().is_empty());
+            assert!(
+                registry
+                    .drain_task_signals(&session_id, &child.task_id)
+                    .is_empty()
+            );
+            return;
+        }
         assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        assert_ne!(
+            task_store.wait_for_status_change_since(observed_version, std::time::Duration::ZERO),
+            observed_version,
+            "运行中代理可能正阻塞在 agent_wait，补充提交后必须唤醒它，不能等孙代理完成或超时"
+        );
         let stored = task_store.get_task(&child.task_id).unwrap();
         let package = stored.agent_context_package().unwrap();
         assert_eq!(package.revision, 2);
@@ -7885,114 +10120,346 @@ mod tests {
 
     #[test]
     fn context_request_reaches_parent_task_channel() {
-        let task_store = TaskStore::new();
-        let registry = ConversationRegistry::new();
-        let session_id = SessionId::new("session-context-request");
-        let parent = coordinator_task(test_task(
-            "task-context-request-parent",
-            "task-context-request-parent",
-            None,
-        ));
-        let mut child = test_task(
-            "task-context-request-child",
-            "task-context-request-parent",
-            Some(parent.task_id.clone()),
-        );
-        child.runtime_payload = TaskRuntimePayload::AgentContext {
-            package: Box::new(AgentContextPackage {
-                package_id: "agent-context-request".to_string(),
-                revision: 1,
-                parent_task_id: parent.task_id.clone(),
-                summary: "检查配置".to_string(),
-                constraints: Vec::new(),
-                expected_output: "完成检查".to_string(),
-                references: Vec::new(),
-                supplements: Vec::new(),
-                created_at: UtcMillis(1),
-                updated_at: UtcMillis(1),
-            }),
-            accesses: Vec::new(),
-        };
-        task_store
-            .insert_task(parent.clone())
-            .expect("父任务应插入");
-        task_store.insert_task(child.clone()).expect("子任务应插入");
-        registry.open_task_signal_channel(&session_id, &parent.task_id);
-        registry.open_task_signal_channel(&session_id, &child.task_id);
+        for delivery in [
+            "reply",
+            "task_closed",
+            "session_removed",
+            "parent_stopped",
+            "reply_then_parent_stopped",
+        ] {
+            let task_store = TaskStore::new();
+            let registry = ConversationRegistry::new();
+            let session_id = SessionId::new("session-context-request");
+            let parent = coordinator_task(test_task(
+                "task-context-request-parent",
+                "task-context-request-parent",
+                None,
+            ));
+            let mut child = test_task(
+                "task-context-request-child",
+                "task-context-request-parent",
+                Some(parent.task_id.clone()),
+            );
+            child.runtime_payload = TaskRuntimePayload::AgentContext {
+                package: Box::new(AgentContextPackage {
+                    package_id: "agent-context-request".to_string(),
+                    revision: 1,
+                    parent_task_id: parent.task_id.clone(),
+                    summary: "检查配置".to_string(),
+                    constraints: Vec::new(),
+                    expected_output: "完成检查".to_string(),
+                    references: Vec::new(),
+                    supplements: Vec::new(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                }),
+                accesses: Vec::new(),
+            };
+            task_store
+                .insert_task(parent.clone())
+                .expect("父任务应插入");
+            task_store.insert_task(child.clone()).expect("子任务应插入");
+            registry.open_task_signal_channel(&session_id, &parent.task_id);
+            registry.open_task_signal_channel(&session_id, &child.task_id);
 
-        std::thread::scope(|scope| {
-            let request_handle = scope.spawn(|| {
-                execute_context_request(
-                    &task_store,
-                    &registry,
-                    &child,
-                    &session_id,
-                    BuiltinToolName::ContextRequest,
+            let execution_registry =
+                TaskExecutionRegistry::default().with_execution_admission(Arc::new(
+                    crate::execution_admission::ExecutionAdmissionController::new(
+                        crate::execution_admission::ExecutionAdmissionLimits {
+                            max_active_tasks: 1,
+                            max_active_tasks_per_session: 1,
+                            max_active_tasks_per_role: 1,
+                            min_available_memory_bytes: 0,
+                        },
+                    ),
+                ));
+            let admission = execution_registry.execution_admission();
+            let _parent_permit = admission
+                .acquire(
+                    parent.task_id.clone(),
+                    Some(session_id.clone()),
+                    "coordinator",
+                )
+                .unwrap();
+            std::thread::scope(|scope| {
+                let request_handle = scope.spawn(|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let _child_permit = loop {
+                        if let Ok(permit) = admission.acquire(
+                            child.task_id.clone(),
+                            Some(session_id.clone()),
+                            "explorer",
+                        ) {
+                            break permit;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "父任务等待后必须让出唯一执行名额"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    };
+                    run_with_task_execution_wait(
+                        &task_store,
+                        &execution_registry,
+                        &child,
+                        "context_request",
+                        || {
+                            execute_context_request(
+                                &task_store,
+                                &registry,
+                                &child,
+                                &session_id,
+                                BuiltinToolName::ContextRequest,
+                                &serde_json::json!({
+                                    "request": "请提供模型配置来源",
+                                    "timeout_ms": 5000,
+                                }),
+                            )
+                        },
+                        &|| true,
+                    )
+                    .unwrap()
+                });
+                let (wait_payload, wait_status) = execute_agent_wait_with_runtime(
+                    AgentWaitRuntime {
+                        session_store: &SessionStore::new(),
+                        task_store: &task_store,
+                        admission: &admission,
+                        conversation_registry: &registry,
+                        session_id: &session_id,
+                        execution_allowed: &|| true,
+                    },
+                    &parent,
+                    BuiltinToolName::AgentWait,
                     &serde_json::json!({
-                        "request": "请提供模型配置来源",
+                        "task_ids": [child.task_id],
                         "timeout_ms": 5000,
                     }),
+                );
+                assert_eq!(wait_status, ExecutionResultStatus::Succeeded);
+                let wait: serde_json::Value = serde_json::from_str(&wait_payload).unwrap();
+                assert_eq!(wait["status"], "attention_required");
+                assert_eq!(
+                    wait["runtime_signals"][0]["payload"]["type"],
+                    "agent_context_request"
+                );
+
+                match delivery {
+                    "task_closed" => {
+                        registry.close_task_signal_channel(&session_id, &child.task_id);
+                    }
+                    "session_removed" => {
+                        registry.remove_session(&session_id);
+                    }
+                    "parent_stopped" => {}
+                    _ => {
+                        let (send_payload, send_status) = execute_agent_send(
+                            &task_store,
+                            &registry,
+                            &parent,
+                            &session_id,
+                            BuiltinToolName::AgentSend,
+                            &serde_json::json!({
+                                "task_id": child.task_id,
+                                "message": "模型配置来自当前 session 的 orchestrator 设置",
+                            }),
+                            &|_, _| {},
+                        );
+                        assert_eq!(
+                            send_status,
+                            ExecutionResultStatus::Succeeded,
+                            "{send_payload}"
+                        );
+                    }
+                }
+                if matches!(delivery, "parent_stopped" | "reply_then_parent_stopped") {
+                    task_store
+                        .revoke_active_lease_and_set_task_terminal(
+                            &parent.task_id,
+                            &parent.root_task_id,
+                            TaskStatus::Killed,
+                            Vec::new(),
+                        )
+                        .unwrap();
+                    registry.close_task_signal_channel(&session_id, &parent.task_id);
+                }
+                // 父任务再次等待，子任务才可重新取得唯一名额并消费答复。
+                let parent_wait = admission.suspend_while_waiting(&parent.task_id).unwrap();
+                let (request_payload, request_status) = request_handle.join().unwrap();
+                assert!(parent_wait.resume(|| true));
+                if matches!(
+                    delivery,
+                    "task_closed" | "session_removed" | "parent_stopped"
+                ) {
+                    assert_eq!(
+                        request_status,
+                        ExecutionResultStatus::Failed,
+                        "{request_payload}"
+                    );
+                    let request: serde_json::Value =
+                        serde_json::from_str(&request_payload).unwrap();
+                    assert_eq!(
+                        request["error_code"],
+                        if delivery == "parent_stopped" {
+                            "parent_not_running"
+                        } else {
+                            "task_interrupted"
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        request_status,
+                        ExecutionResultStatus::Succeeded,
+                        "{request_payload}"
+                    );
+                    let request: serde_json::Value =
+                        serde_json::from_str(&request_payload).unwrap();
+                    assert_eq!(request["status"], "resolved");
+                    assert_eq!(
+                        request["responses"][0]["payload"]["type"],
+                        "agent_context_supplement"
+                    );
+                }
+            });
+            assert_eq!(
+                task_store
+                    .get_task(&child.task_id)
+                    .unwrap()
+                    .agent_context_accesses()[0]
+                    .operation,
+                AgentContextAccessOperation::Request
+            );
+        }
+    }
+
+    #[test]
+    fn worker_question_returns_the_answer_only_to_its_original_call() {
+        let bus = InMemoryEventBus::new(32);
+        let tasks = TaskStore::new();
+        let sessions = SessionStore::new();
+        let registry = ConversationRegistry::new();
+        let roles = magi_agent_role::AgentRoleRegistry::load_default();
+        let execution = TaskExecutionRegistry::default();
+        let session_id = SessionId::new("session-worker-question");
+        sessions
+            .create_session(session_id.clone(), "子代理提问")
+            .unwrap();
+        let now = UtcMillis::now();
+        CanonicalTurnEventSink::for_store(&sessions, None)
+            .accept_conversation_turn_with_timeline_entry(
+                session_id.clone(),
+                None,
+                magi_session_store::TimelineEntryInput::new(
+                    "worker-question-timeline",
+                    magi_session_store::TimelineEntryKind::UserMessage,
+                    "开始工作",
+                    now,
+                ),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-worker-question".into(),
+                    turn_seq: 1,
+                    accepted_at: now,
+                    status: "running".into(),
+                    user_message: Some("开始工作".into()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        let parent = coordinator_task(test_task("question-parent", "question-parent", None));
+        let child = test_task(
+            "question-child",
+            "question-parent",
+            Some(parent.task_id.clone()),
+        );
+        tasks.insert_task(parent.clone()).unwrap();
+        tasks.insert_task(child.clone()).unwrap();
+        let plan = magi_plan::PlanStore::new(Arc::new(sessions.clone()), session_id.clone());
+        let call = ChatToolCall {
+            id: "question-call-child".into(), kind: "function".into(),
+            function: ChatToolFunction { name: "ask_user_question".into(), arguments: serde_json::json!({
+                "questions": [{ "header": "范围", "question": "检查哪些文件？", "multiSelect": false,
+                    "options": [{ "label": "相关文件", "description": "定向检查" },
+                        { "label": "全部文件", "description": "完整检查" }] }]
+            }).to_string() },
+        };
+        sessions.append_current_turn_item_for_turn(&session_id, Some("turn-worker-question"),
+            serde_json::from_value(serde_json::json!({
+                "itemId": "question-child-item", "itemSeq": 1, "kind": "tool_call_started", "status": "running",
+                "source": "worker", "sourceThreadId": "thread-child", "taskId": child.task_id,
+                "toolName": "ask_user_question", "toolCallId": call.id, "toolArguments": call.function.arguments
+            })).unwrap()).unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                execute_task_tool_call(
+                    &bus,
+                    None,
+                    &roles,
+                    None,
+                    None,
+                    None,
+                    &tasks,
+                    &sessions,
+                    &execution,
+                    &registry,
+                    None,
+                    &plan,
+                    None,
+                    &child,
+                    &session_id,
+                    &None,
+                    None,
+                    None,
+                    None,
+                    &call,
+                    None,
+                    &|| true,
                 )
             });
-            let (wait_payload, wait_status) = execute_agent_wait_with_runtime(
-                AgentWaitRuntime {
-                    task_store: &task_store,
-                    admission: &crate::execution_admission::ExecutionAdmissionController::default(),
-                    conversation_registry: &registry,
-                    session_id: &session_id,
-                },
-                &parent,
-                BuiltinToolName::AgentWait,
-                &serde_json::json!({
-                    "task_ids": [child.task_id],
-                    "timeout_ms": 5000,
-                }),
-            );
-            assert_eq!(wait_status, ExecutionResultStatus::Succeeded);
-            let wait: serde_json::Value = serde_json::from_str(&wait_payload).unwrap();
-            assert_eq!(wait["status"], "attention_required");
-            assert_eq!(
-                wait["runtime_signals"][0]["payload"]["type"],
-                "agent_context_request"
-            );
-
-            let (send_payload, send_status) = execute_agent_send(
-                &task_store,
-                &registry,
-                &parent,
-                &session_id,
-                BuiltinToolName::AgentSend,
-                &serde_json::json!({
-                    "task_id": child.task_id,
-                    "message": "模型配置来自当前 session 的 orchestrator 设置",
-                }),
-                &|_, _| {},
-            );
-            assert_eq!(
-                send_status,
-                ExecutionResultStatus::Succeeded,
-                "{send_payload}"
-            );
-            let (request_payload, request_status) = request_handle.join().unwrap();
-            assert_eq!(
-                request_status,
-                ExecutionResultStatus::Succeeded,
-                "{request_payload}"
-            );
-            let request: serde_json::Value = serde_json::from_str(&request_payload).unwrap();
-            assert_eq!(request["status"], "resolved");
-            assert_eq!(
-                request["responses"][0]["payload"]["type"],
-                "agent_context_supplement"
-            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let pending = loop {
+                if let Some(question) = registry
+                    .user_questions()
+                    .pending_for_session(&session_id)
+                    .into_iter()
+                    .next()
+                {
+                    break question;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "子代理必须能产生真实待回答交互"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert_eq!(pending.task_id.as_ref(), Some(&child.task_id));
+            assert_eq!(pending.tool_call_id, call.id);
+            registry
+                .user_questions()
+                .resolve(
+                    &session_id,
+                    &pending.question_id,
+                    crate::UserQuestionResponse::Answered {
+                        answers: vec![crate::UserQuestionAnswer {
+                            selected: vec!["相关文件".into()],
+                            other: None,
+                        }],
+                    },
+                )
+                .unwrap();
+            let (payload, status) = worker.join().unwrap();
+            assert_eq!(status, ExecutionResultStatus::Succeeded);
+            assert!(payload.contains("相关文件"));
         });
+        assert!(
+            registry
+                .user_questions()
+                .pending_for_session(&session_id)
+                .is_empty()
+        );
         assert_eq!(
-            task_store
-                .get_task(&child.task_id)
-                .unwrap()
-                .agent_context_accesses()[0]
-                .operation,
-            AgentContextAccessOperation::Request
+            tasks.get_task(&parent.task_id).unwrap().status,
+            TaskStatus::Running
         );
     }
 
@@ -8041,6 +10508,7 @@ mod tests {
             None,
             None,
             None,
+            &|| true,
         );
         assert_eq!(worker_result[0].1, ExecutionResultStatus::Rejected);
         let worker_payload: serde_json::Value =

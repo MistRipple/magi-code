@@ -7,5 +7,10 @@ edition.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 getrandom.workspace = true
+magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-core = { path = "../magi-core" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
+
+[dev-dependencies]
+magi-event-bus = { path = "../magi-event-bus" }
+magi-governance = { path = "../magi-governance" }

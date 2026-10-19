@@ -89,6 +89,7 @@ export function formatImageSize(bytes: number): string {
 }
 
 export interface QueuedMessageShape {
+  interruptTurnId?: string | null;
   images?: unknown[];
   contextReferences?: unknown[];
   browserAnnotationRefs?: string[];
@@ -111,9 +112,9 @@ export function summarizeQueuedMessage(queued: QueuedMessageShape): QueuedAttach
 }
 
 /**
- * 编辑排队消息 = 取回内容放回输入框。浏览器标注在队列里只剩 ID，无法还原成输入框里的
- * 标注对象，这类消息不提供编辑，避免取回时悄悄丢掉标注。
+ * 编辑保留 daemon 原输入，保存时按 revision 更新。浏览器标注在队列里只剩 ID，
+ * 无法还原为编辑对象；替代输入也不能编辑以免改变已接纳的停止意图。
  */
 export function queuedMessageEditable(queued: QueuedMessageShape): boolean {
-  return (queued.browserAnnotationRefs?.length ?? 0) === 0;
+  return !queued.interruptTurnId && (queued.browserAnnotationRefs?.length ?? 0) === 0;
 }

@@ -338,6 +338,49 @@ fn unknown_durable_schema_version_is_rejected_without_migration() {
 }
 
 #[test]
+fn taskless_lease_selector_preserves_task_owned_control() {
+    for task_id in [None, Some(magi_core::TaskId::new("independent-agent"))] {
+        let mut authority = BrowserAuthority::new();
+        register_profile(&mut authority);
+        let session = ready_session(&mut authority);
+        let tab = ready_tab(&mut authority, &session);
+        authority
+            .set_primary_surface(binding(&tab, &surface_id(), 1), at(6))
+            .unwrap();
+        let mut execution_owner = owner();
+        execution_owner.task_id = task_id.clone();
+        let lease = authority
+            .acquire_lease(AcquireBrowserLease {
+                lease_id: BrowserLeaseId::new("taskless-selector"),
+                tab_id: tab.clone(),
+                surface_id: surface_id(),
+                owner: execution_owner,
+                turn_id: "turn-1".into(),
+                goal_binding: None,
+                acquired_at: at(7),
+                expires_at: at(100),
+            })
+            .unwrap();
+        let revoked = authority.revoke_leases(
+            &crate::BrowserLeaseSelector {
+                session_id: lease.owner.session_id.clone(),
+                taskless_only: true,
+                ..Default::default()
+            },
+            BrowserLeaseEndReason::TurnStopped,
+            at(8),
+        );
+        assert_eq!(revoked.len(), usize::from(task_id.is_none()));
+        assert_eq!(
+            authority
+                .active_lease_for_surface(&tab, &surface_id())
+                .is_some(),
+            task_id.is_some()
+        );
+    }
+}
+
+#[test]
 fn lease_is_scoped_to_one_tab_and_surface() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

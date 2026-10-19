@@ -24,6 +24,8 @@
     "test:electron-cursor-presentation": "node scripts/verify-electron-cursor-presentation.mjs",
     "test:electron-cursor-desktop-live": "node scripts/verify-electron-cursor-desktop-live.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
+    "test:daemon-input-queue": "npm --prefix web run build && node scripts/verify-daemon-input-queue.mjs",
+    "test:daemon-approval-recovery": "npm --prefix web run build && node scripts/verify-daemon-approval-recovery.mjs",
     "plugin:center": "node scripts/plugin-center.mjs",
     "plugin-center:build": "node scripts/build-plugin-center.mjs",
     "plugin-center:check": "node scripts/build-plugin-center.mjs --check",
@@ -39,7 +41,10 @@
     "docs:architecture": "node scripts/render-crate-architecture.mjs",
     "docs:architecture:check": "node scripts/render-crate-architecture.mjs --check",
     "test:electron-browser-viewport": "node scripts/verify-electron-browser-viewport.mjs",
-    "test:electron-right-pane-links": "node scripts/verify-electron-right-pane-links.mjs"
+    "test:electron-right-pane-links": "node scripts/verify-electron-right-pane-links.mjs",
+    "test:daemon-controls": "node scripts/verify-daemon-controls.mjs",
+    "prune:target": "./scripts/prune-target.sh",
+    "posttest": "./scripts/prune-target.sh"
   },
   "engines": {
     "node": ">=22"

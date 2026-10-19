@@ -24,7 +24,7 @@ use magi_conversation_runtime::{
         ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
     },
     task_execution_registry::AgentSpawnPreflightRuntime,
-    task_runner_bridge::EventBasedResultReceiver,
+    task_runner_bridge::TaskCompletionSink,
 };
 use magi_core::{AccessProfile, SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
@@ -169,6 +169,10 @@ enum ProviderBehavior {
         child_count: usize,
         role: String,
         display_name: String,
+        child_steps: Vec<(String, String)>,
+    },
+    NestedAgents {
+        hold_leaf: bool,
     },
     TransientThenCompleted {
         response: String,
@@ -181,11 +185,18 @@ enum ProviderBehavior {
 struct ProviderState {
     behavior: Option<ProviderBehavior>,
     requests: Vec<ModelInvocationRequest>,
+    execution_scopes: Vec<magi_bridge_client::ModelExecutionScope>,
     deltas: Vec<ModelStreamingDelta>,
     tool_round_emitted: usize,
     tool_round_limit: usize,
     agent_spawn_emitted: usize,
+    repeat_spawn_task_name: bool,
+    agent_lifetime: Option<String>,
+    resume_agent_task: Option<String>,
     transient_failures_remaining: usize,
+    reported_usage: Option<serde_json::Value>,
+    before_response: Option<Arc<dyn Fn() + Send + Sync>>,
+    agent_cancel_ready: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// 可观测的真流式 Provider 替身。
@@ -244,6 +255,7 @@ impl HarnessModelClient {
             child_count: 2,
             role: "executor".to_string(),
             display_name: "验收子代理".to_string(),
+            child_steps: Vec::new(),
         });
         state.agent_spawn_emitted = 0;
     }
@@ -263,6 +275,7 @@ impl HarnessModelClient {
             child_count: 1,
             role: role.into(),
             display_name: display_name.into(),
+            child_steps: Vec::new(),
         });
         state.agent_spawn_emitted = 0;
     }
@@ -408,6 +421,22 @@ impl HarnessModelClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<ModelResponse, BridgeClientError> {
+        let hook = self.state.lock().unwrap().before_response.clone();
+        if !request.prompt.contains("Session Turn 编排分类器")
+            && let Some(hook) = hook
+        {
+            hook();
+        }
+        let mut response = self.invoke_streaming_unmetered(request, on_delta)?;
+        response.usage = self.state.lock().unwrap().reported_usage.clone();
+        Ok(response)
+    }
+
+    fn invoke_streaming_unmetered(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+    ) -> Result<ModelResponse, BridgeClientError> {
         let track_timing = !request.prompt.contains("Session Turn 编排分类器");
         if track_timing {
             self.timing.mark_provider_request_started();
@@ -504,23 +533,205 @@ impl HarnessModelClient {
                 message,
             }),
             ProviderBehavior::HoldForCancellation => Ok(ModelResponse::completed("")),
+            ProviderBehavior::NestedAgents { hold_leaf } => {
+                let tools = request.tools.as_deref().unwrap_or_default();
+                let has_tool = |name: &str| tools.iter().any(|tool| tool.function.name == name);
+                let mainline = !has_tool("context_request");
+                let delegator = has_tool("agent_spawn");
+                let messages = request.messages.as_deref().unwrap_or_default();
+                let calls = messages
+                    .iter()
+                    .flat_map(|message| &message.tool_calls)
+                    .filter(|call| call.id.starts_with("nested-step-"))
+                    .count();
+                let child = messages
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .filter_map(|message| {
+                        serde_json::from_str::<serde_json::Value>(message.content.as_deref()?).ok()
+                    })
+                    .find_map(|value| value["child_task_id"].as_str().map(str::to_owned));
+                let spawn = |name: &str, delegate: bool| {
+                    let lifetime = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .agent_lifetime
+                        .clone()
+                        .unwrap_or_else(|| "turn".into());
+                    (
+                        "agent_spawn",
+                        serde_json::json!({
+                            "task_name": name, "display_name": name, "role": "executor", "goal": name,
+                            "delegation": {"purpose":"user_requested", "reason":"验收请求明确要求实际父子代理执行与逐级合入"},
+                            "allow_delegation": delegate,
+                            "lifetime": lifetime,
+                            "context_package": {"summary":name, "constraints":[], "expected_output":"文件与验证结果", "references":[]}
+                        }),
+                    )
+                };
+                let wait = || {
+                    (
+                        "agent_wait",
+                        serde_json::json!({"task_ids":[child], "timeout_ms":60_000}),
+                    )
+                };
+                let apply = || ("agent_apply", serde_json::json!({"task_id":child}));
+                let action = if mainline {
+                    match calls {
+                        0 => Some(spawn("nested_parent", true)),
+                        1 => Some(wait()),
+                        2 => Some(apply()),
+                        _ => None,
+                    }
+                } else if delegator {
+                    match calls {
+                        0 => Some((
+                            "file_write",
+                            serde_json::json!({"path":"parent.txt", "content":"parent uncommitted"}),
+                        )),
+                        1 => Some(spawn("nested_leaf", false)),
+                        2 => Some(wait()),
+                        3 => Some(apply()),
+                        4 => Some(("file_read", serde_json::json!({"path":"leaf.txt"}))),
+                        _ => None,
+                    }
+                } else {
+                    let job_id = messages
+                        .iter()
+                        .rev()
+                        .filter(|message| message.role == "tool")
+                        .filter_map(|message| {
+                            serde_json::from_str::<serde_json::Value>(message.content.as_deref()?)
+                                .ok()
+                        })
+                        .find_map(|result| result["job_id"].as_str().map(str::to_owned));
+                    match calls {
+                        0 => Some(("file_read", serde_json::json!({"path":"parent.txt"}))),
+                        1 if hold_leaf => Some((
+                            "shell_exec",
+                            serde_json::json!({"command":"sleep 30; printf orphan > orphan.txt", "background":true}),
+                        )),
+                        2 if hold_leaf => Some((
+                            "shell_exec",
+                            serde_json::json!({"action":"wait", "job_id":job_id, "timeout_ms":60000}),
+                        )),
+                        1 => Some((
+                            "file_write",
+                            serde_json::json!({"path":"leaf.txt", "content":"leaf output"}),
+                        )),
+                        _ => None,
+                    }
+                };
+                if let Some((name, arguments)) = action {
+                    let call = ChatToolCall {
+                        id: format!("nested-step-{calls}"),
+                        kind: "function".into(),
+                        function: magi_bridge_client::ChatToolFunction {
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                        },
+                    };
+                    self.record_delta(
+                        &ModelStreamingDelta {
+                            tool_calls: vec![call.clone()],
+                            ..Default::default()
+                        },
+                        on_delta,
+                        track_timing,
+                    );
+                    Ok(ModelResponse {
+                        status: ModelResponseStatus::RequiresToolExecution,
+                        content: None,
+                        thinking: None,
+                        tool_calls: vec![call],
+                        usage: None,
+                        finish_reason: Some("tool_calls".into()),
+                        provider_context: Vec::new(),
+                    })
+                } else {
+                    Ok(ModelResponse::completed("嵌套代理完成"))
+                }
+            }
             ProviderBehavior::AgentSpawnThenWait {
                 response,
                 child_count,
                 role,
                 display_name,
+                child_steps,
             } => {
                 let classifier_request = request.prompt.contains("Session Turn 编排分类器");
                 let messages = request.messages.as_deref().unwrap_or_default();
-                let spawn_count = messages
+                // Goal 转交夹具沿真实启动合同建立 Goal/计划，再进入代理链路。
+                // 保留 forced tool 的真实输入，不通过直接修改 SessionStore 伪造归属。
+                if self.state.lock().unwrap().agent_lifetime.as_deref() == Some("goal") {
+                    let forced = request
+                        .tool_choice
+                        .as_ref()
+                        .map(|choice| choice.function.name.trim_start_matches("magi_builtin_"));
+                    let arguments = match forced {
+                        Some("get_goal") => Some(serde_json::json!({})),
+                        Some("create_goal") => {
+                            Some(serde_json::json!({"objective":"Goal 转交控制验收"}))
+                        }
+                        Some("update_plan") => {
+                            let result = messages
+                                .iter()
+                                .rev()
+                                .filter(|message| message.role == "tool")
+                                .filter_map(|message| message.content.as_deref())
+                                .filter_map(|text| {
+                                    serde_json::from_str::<serde_json::Value>(text).ok()
+                                })
+                                .find(|result| {
+                                    result.get("goal").is_some_and(|goal| goal.is_object())
+                                })
+                                .expect("计划前应已读取或创建 Goal");
+                            Some(serde_json::json!({
+                                "planId":result["plan"]["planId"],
+                                "expectedRevision":result["plan"]["revision"].as_u64().unwrap_or(0),
+                                "expectedGoalId":result["goal"]["goalId"],
+                                "expectedGoalControlRevision":result["goal"]["controlRevision"],
+                                "language":"zh-CN",
+                                "plan":[{"itemId":null,"step":"验证 Goal 代理转交和控制撤销","status":"in_progress"}]
+                            }))
+                        }
+                        _ => None,
+                    };
+                    if let Some(arguments) = arguments {
+                        return Ok(ModelResponse {
+                            status: ModelResponseStatus::RequiresToolExecution,
+                            content: None,
+                            thinking: None,
+                            tool_calls: vec![ChatToolCall {
+                                id: format!("harness-goal-{}", forced.unwrap()),
+                                kind: "function".into(),
+                                function: magi_bridge_client::ChatToolFunction {
+                                    name: forced.unwrap().into(),
+                                    arguments: arguments.to_string(),
+                                },
+                            }],
+                            usage: None,
+                            finish_reason: Some("tool_calls".into()),
+                            provider_context: Vec::new(),
+                        });
+                    }
+                }
+                let current_messages = &messages[messages
+                    .iter()
+                    .rposition(|message| message.role == "user")
+                    .unwrap_or(0)..];
+                let spawn_count = current_messages
                     .iter()
                     .flat_map(|message| message.tool_calls.iter())
                     .filter(|call| call.function.name == "agent_spawn")
                     .count();
-                let wait_count = messages
+                let wait_count = current_messages
                     .iter()
                     .flat_map(|message| message.tool_calls.iter())
-                    .filter(|call| call.function.name == "agent_wait")
+                    .filter(|call| {
+                        matches!(call.function.name.as_str(), "agent_wait" | "agent_cancel")
+                    })
                     .count();
                 let coordinator_surface = request.tools.as_ref().is_some_and(|tools| {
                     tools.iter().any(|tool| tool.function.name == "agent_spawn")
@@ -541,26 +752,48 @@ impl HarnessModelClient {
                         false
                     }
                 };
+                let (agent_lifetime, resume_agent_task, repeat_spawn_task_name) = {
+                    let state = self.state.lock().expect("harness state");
+                    (
+                        state.agent_lifetime.clone(),
+                        state.resume_agent_task.clone(),
+                        state.repeat_spawn_task_name,
+                    )
+                };
                 if can_emit_agent_spawn {
                     let child_index = spawn_count + 1;
+                    let task_index = if repeat_spawn_task_name {
+                        1
+                    } else {
+                        child_index
+                    };
                     let tool_call = ChatToolCall {
                         id: format!("harness-agent-spawn-call-{child_index}"),
                         kind: "function".to_string(),
                         function: magi_bridge_client::ChatToolFunction {
                             name: "agent_spawn".to_string(),
-                            arguments: serde_json::json!({
-                                "task_name": format!("harness_child_{child_index}"),
-                                "display_name": format!("{display_name}{child_index}"),
-                                "role": role,
-                                "goal": "完成 harness 子任务并返回明确结果",
-                                "context_package": {
-                                    "summary": "harness 子代理上下文",
-                                    "constraints": ["只验证子代理链路"],
-                                    "expected_output": "子代理完成",
-                                    "references": []
+                            arguments: {
+                                let mut arguments = serde_json::json!({
+                                    "task_name": format!("harness_child_{task_index}"),
+                                    "delegation": {"purpose":"user_requested", "reason":"当前验收请求明确要求派发子代理并收集结果"},
+                                    "display_name": format!("{display_name}{task_index}"),
+                                    "role": role,
+                                    "goal": "完成 harness 子任务并返回明确结果",
+                                    "context_package": {
+                                        "summary": "harness 子代理上下文",
+                                        "constraints": ["只验证子代理链路"],
+                                        "expected_output": "子代理完成",
+                                        "references": []
+                                    }
+                                });
+                                if let Some(lifetime) = agent_lifetime {
+                                    arguments["lifetime"] = lifetime.into();
                                 }
-                            })
-                            .to_string(),
+                                if let Some(task) = resume_agent_task {
+                                    arguments["resume_task_id"] = task.into();
+                                }
+                                arguments.to_string()
+                            },
                         },
                     };
                     self.record_delta(
@@ -583,8 +816,16 @@ impl HarnessModelClient {
                         provider_context: Vec::new(),
                     });
                 }
-                if !classifier_request && coordinator_surface && wait_count == 0 {
-                    let child_task_ids = messages
+                let wait_pending = current_messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == "tool")
+                    .filter_map(|message| message.content.as_deref())
+                    .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                    .find(|payload| payload["tool"] == "agent_wait")
+                    .is_some_and(|payload| payload["all_terminal"] == false);
+                if !classifier_request && coordinator_surface && (wait_count == 0 || wait_pending) {
+                    let mut child_task_ids = current_messages
                         .iter()
                         .filter(|message| message.role == "tool")
                         .filter_map(|message| message.content.as_deref())
@@ -598,17 +839,40 @@ impl HarnessModelClient {
                                 .map(str::to_string)
                         })
                         .collect::<Vec<_>>();
-                    if child_task_ids.len() >= child_count {
+                    if repeat_spawn_task_name {
+                        // 丢掉第一次成功回执，验证仅凭冲突回执也能回到原代理。
+                        child_task_ids = current_messages
+                            .iter()
+                            .filter(|message| message.role == "tool")
+                            .filter_map(|message| message.content.as_deref())
+                            .filter_map(|content| {
+                                serde_json::from_str::<serde_json::Value>(content).ok()
+                            })
+                            .filter_map(|payload| {
+                                payload["existing_task_id"].as_str().map(str::to_string)
+                            })
+                            .collect();
+                    }
+                    let expected_children = if repeat_spawn_task_name {
+                        1
+                    } else {
+                        child_count
+                    };
+                    if child_task_ids.len() >= expected_children {
+                        let cancel_ready = self.state.lock().unwrap().agent_cancel_ready.clone();
+                        if let Some(ready) = &cancel_ready {
+                            ready();
+                        }
                         let tool_call = ChatToolCall {
-                            id: "harness-agent-wait-call".to_string(),
+                            id: format!("harness-agent-wait-call-{wait_count}"),
                             kind: "function".to_string(),
                             function: magi_bridge_client::ChatToolFunction {
-                                name: "agent_wait".to_string(),
-                                arguments: serde_json::json!({
-                                    "task_ids": child_task_ids,
-                                    "timeout_ms": 60_000
-                                })
-                                .to_string(),
+                                name: if cancel_ready.is_some() { "agent_cancel" } else { "agent_wait" }.into(),
+                                arguments: if cancel_ready.is_some() {
+                                    serde_json::json!({"task_id": child_task_ids[0], "reason":"工作方向已变更，停止原代理"})
+                                } else {
+                                    serde_json::json!({"task_ids": child_task_ids, "timeout_ms": 60_000})
+                                }.to_string(),
                             },
                         };
                         self.record_delta(
@@ -628,6 +892,40 @@ impl HarnessModelClient {
                             tool_calls: vec![tool_call],
                             usage: None,
                             finish_reason: Some("tool_calls".to_string()),
+                            provider_context: Vec::new(),
+                        });
+                    }
+                }
+                if !classifier_request && !coordinator_surface {
+                    let executed = messages
+                        .iter()
+                        .flat_map(|message| &message.tool_calls)
+                        .filter(|call| call.id.starts_with("harness-child-tool-"))
+                        .count();
+                    if let Some((name, arguments)) = child_steps.get(executed) {
+                        let tool_call = ChatToolCall {
+                            id: format!("harness-child-tool-{executed}"),
+                            kind: "function".into(),
+                            function: magi_bridge_client::ChatToolFunction {
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            },
+                        };
+                        self.record_delta(
+                            &ModelStreamingDelta {
+                                tool_calls: vec![tool_call.clone()],
+                                ..Default::default()
+                            },
+                            on_delta,
+                            track_timing,
+                        );
+                        return Ok(ModelResponse {
+                            status: ModelResponseStatus::RequiresToolExecution,
+                            content: None,
+                            thinking: None,
+                            tool_calls: vec![tool_call],
+                            usage: None,
+                            finish_reason: Some("tool_calls".into()),
                             provider_context: Vec::new(),
                         });
                     }
@@ -767,6 +1065,29 @@ impl HarnessModelClient {
                     }
                 };
                 if let Some((tool_name, arguments)) = next_tool {
+                    let arguments = if arguments.contains("$last_job_id") {
+                        let job_id = request
+                            .messages
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .rev()
+                            .filter(|message| message.role == "tool")
+                            .filter_map(|message| message.content.as_deref())
+                            .filter_map(|content| {
+                                serde_json::from_str::<serde_json::Value>(content).ok()
+                            })
+                            .find_map(|result| {
+                                result
+                                    .get("job_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .expect("Job 等待测试必须先收到真实启动回执");
+                        arguments.replace("$last_job_id", &job_id)
+                    } else {
+                        arguments
+                    };
                     let tool_call = ChatToolCall {
                         id: format!(
                             "harness-tool-call-{}",
@@ -844,6 +1165,18 @@ impl HarnessModelClient {
 }
 
 impl ModelBridgeClient for HarnessModelClient {
+    fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+        magi_bridge_client::native_executor_capabilities()
+    }
+
+    fn bind_execution_scope(
+        &self,
+        scope: magi_bridge_client::ModelExecutionScope,
+    ) -> Result<Option<Arc<dyn ModelBridgeClient>>, BridgeClientError> {
+        self.state.lock().unwrap().execution_scopes.push(scope);
+        Ok(None)
+    }
+
     fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming_inner(request, &|_| {})
     }
@@ -920,6 +1253,47 @@ pub struct MagiTurnHarness {
     pub provider: HarnessModelClient,
     external_mcp_catalog: Option<ExternalToolCatalogSnapshot>,
     external_mcp_executor: Option<ExternalMcpToolExecutor>,
+    runtime_directory: Arc<tempfile::TempDir>,
+}
+
+impl Drop for MagiTurnHarness {
+    fn drop(&mut self) {
+        // 断言失败或测试有意留下运行中的调用时，先撤下交互和任务，避免 Tokio
+        // shutdown 等待一个再也收不到用户答复的 blocking worker。
+        if let Some(store) = self.state.task_store() {
+            let roots = store
+                .all_tasks()
+                .into_iter()
+                .filter(|task| {
+                    task.parent_task_id.is_none()
+                        && matches!(
+                            task.status,
+                            magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                        )
+                })
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>();
+            if let Some(manager) = self.state.runner_manager() {
+                for root in roots {
+                    let _ = manager.kill_tree(root.as_str());
+                }
+            }
+        }
+        for session in self.state.session_store.sessions() {
+            self.state
+                .turn_coordinator()
+                .tool_approvals()
+                .remove_session(&session.session_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct HarnessExecutionOptions {
+    settings: Option<Arc<magi_settings_store::SettingsStore>>,
+    skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    persist_session_state:
+        Option<Arc<magi_conversation_runtime::session_writeback::SessionStatePersistCallback>>,
 }
 
 impl MagiTurnHarness {
@@ -945,7 +1319,14 @@ impl MagiTurnHarness {
         provider: HarnessModelClient,
         with_task_runtime: bool,
     ) -> Self {
-        Self::from_parts_with_external_mcp(session_store, provider, with_task_runtime, None, None)
+        Self::from_parts_with_external_mcp(
+            session_store,
+            provider,
+            with_task_runtime,
+            None,
+            None,
+            HarnessExecutionOptions::default(),
+        )
     }
 
     /// 装配带真实外部 MCP 执行器的 Task harness。
@@ -964,6 +1345,7 @@ impl MagiTurnHarness {
             true,
             Some(catalog),
             Some(executor),
+            HarnessExecutionOptions::default(),
         )
     }
 
@@ -973,7 +1355,13 @@ impl MagiTurnHarness {
         with_task_runtime: bool,
         external_mcp_catalog: Option<ExternalToolCatalogSnapshot>,
         external_mcp_executor: Option<ExternalMcpToolExecutor>,
+        options: HarnessExecutionOptions,
     ) -> Self {
+        let HarnessExecutionOptions {
+            settings,
+            skill_runtime,
+            persist_session_state,
+        } = options;
         let event_bus = Arc::new(InMemoryEventBus::new(512));
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
@@ -982,23 +1370,24 @@ impl MagiTurnHarness {
         let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
         let snapshot_manager = Arc::new(magi_snapshot::SnapshotManager::new());
         let knowledge_store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
-        static HARNESS_RUNTIME_SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
-        let runtime_sequence = HARNESS_RUNTIME_SEQUENCE
-            .get_or_init(|| AtomicU64::new(0))
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let runtime_state_root = std::env::temp_dir().join(format!(
-            "magi-turn-harness-runtime-{}-{}-{}",
-            std::process::id(),
-            UtcMillis::now().0,
-            runtime_sequence
-        ));
+        let runtime_directory = Arc::new(
+            tempfile::Builder::new()
+                .prefix("magi-turn-harness-")
+                .tempdir()
+                .expect("Turn harness runtime directory should create"),
+        );
+        let runtime_state_root = runtime_directory.path();
         let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
-            runtime_state_root.clone(),
+            runtime_state_root.to_path_buf(),
             runtime_state_root.join("workspaces.json"),
             runtime_state_root.join("knowledge.json"),
         ));
+        // 普通 Conversation harness 不创建 TaskStore；这与生产 profile 边界一致，
+        // 不能只是不把已经创建的 TaskStore 挂到 ApiState 上。
+        let task_store = with_task_runtime.then(|| Arc::new(TaskStore::new()));
         let git_tool_executor = crate::git_tool_runtime::build_git_tool_executor(
             crate::git_tool_runtime::GitToolRuntimeDependencies {
+                task_store: task_store.clone(),
                 git_service: git_service.clone(),
                 session_code_contexts: session_code_contexts.clone(),
                 workspace_git_coordinator: workspace_git_coordinator.clone(),
@@ -1009,10 +1398,10 @@ impl MagiTurnHarness {
                 managed_worktree_root: runtime_state_root.join("worktrees"),
             },
         );
-        // 普通 Conversation harness 不创建 TaskStore；这与生产 profile 边界一致，
-        // 不能只是不把已经创建的 TaskStore 挂到 ApiState 上。
-        let task_store = with_task_runtime.then(|| Arc::new(TaskStore::new()));
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
+            .with_background_job_journal(
+                session_store.background_job_journal(runtime_state_root.join("job-output")),
+            )
             .with_git_tool_executor(git_tool_executor);
         if let Some(catalog) = external_mcp_catalog.clone() {
             tool_registry = tool_registry
@@ -1026,7 +1415,6 @@ impl MagiTurnHarness {
         if let Some(task_store) = task_store.as_ref() {
             execution_runtime = execution_runtime.with_task_store(Arc::clone(task_store));
         }
-        let result_receiver = Arc::new(EventBasedResultReceiver::new());
         let completion_notifier = task_store
             .as_ref()
             .map(|task_store| Arc::new(TaskCompletionNotifier::new(Arc::clone(task_store))));
@@ -1057,18 +1445,30 @@ impl MagiTurnHarness {
         .with_knowledge_store(knowledge_store.clone())
         .with_runtime_persistence(runtime_persistence.clone())
         .with_tool_registry(tool_registry.clone());
+        if let Some(settings) = settings.as_ref() {
+            state = state.with_settings_store(settings.clone());
+        }
+        if let Some(runtime) = skill_runtime.as_ref() {
+            state = state.with_skill_runtime(runtime.clone());
+        }
         if let Some(task_store) = task_store.as_ref() {
             state = state.with_task_store(Arc::clone(task_store));
             state
                 .task_execution_registry()
                 .clone()
                 .with_agent_spawn_preflight_runtime(AgentSpawnPreflightRuntime {
+                    settings_store: settings.clone(),
                     default_model_client: Some(Arc::new(provider.clone())),
                     session_code_contexts: Some(session_code_contexts.clone()),
                     git_service_configured: true,
+                    skill_runtime: skill_runtime.clone(),
                     ..AgentSpawnPreflightRuntime::default()
                 });
         }
+        let completion_sink: Arc<dyn TaskCompletionSink> = match completion_notifier.as_ref() {
+            Some(notifier) => notifier.clone(),
+            None => Arc::new(|_| -> () { panic!("无任务运行时不能派发 Task 终态") }),
+        };
         let mut dispatcher_builder = LlmTaskDispatcher::new(
             Arc::clone(&event_bus),
             ExecutionPipeline {
@@ -1078,21 +1478,29 @@ impl MagiTurnHarness {
             LlmTaskDispatcherDependencies {
                 session_store: Arc::clone(&session_store),
                 execution_registry: state.task_execution_registry().clone(),
-                result_receiver: Arc::clone(&result_receiver),
+                completion_sink,
                 conversation_registry: Arc::clone(&state.conversation_registry),
                 agent_role_registry: Arc::clone(&state.agent_role_registry),
             },
-            std::env::temp_dir().join(format!(
-                "magi-turn-harness-{}-{}",
-                std::process::id(),
-                UtcMillis::now().0
-            )),
+            runtime_state_root.join("missions"),
         )
         .with_model_bridge_client(Arc::new(provider.clone()))
         .with_workspace_registry(Arc::clone(&state.workspace_registry))
         .with_git_context_runtime(git_service, session_code_contexts)
         .with_workspace_git_coordinator(workspace_git_coordinator)
-        .with_snapshot_manager(snapshot_manager);
+        .with_snapshot_manager(snapshot_manager)
+        .with_workspace_execution_preparer(
+            crate::task_dispatch::workspace_execution_preparer(&state),
+        );
+        if let Some(settings) = settings {
+            dispatcher_builder = dispatcher_builder.with_settings_store(settings);
+        }
+        if let Some(runtime) = skill_runtime {
+            dispatcher_builder = dispatcher_builder.with_skill_runtime(runtime);
+        }
+        if let Some(persist) = persist_session_state {
+            dispatcher_builder = dispatcher_builder.with_session_state_persist_callback(persist);
+        }
         if let Some(notifier) = completion_notifier.as_ref() {
             dispatcher_builder = dispatcher_builder.with_completion_notifier(notifier.clone());
         }
@@ -1101,8 +1509,6 @@ impl MagiTurnHarness {
             .with_session_turn_dispatcher(Arc::clone(&dispatcher))
             .with_model_bridge_client(Arc::new(provider.clone()));
         if let Some(notifier) = completion_notifier {
-            let result_receiver_for_runner = Arc::clone(&result_receiver);
-            result_receiver_for_runner.set_completion_sink(notifier.clone());
             let state_for_workers = state.clone();
             let task_store = task_store
                 .as_ref()
@@ -1122,6 +1528,15 @@ impl MagiTurnHarness {
                 let Some(session_id) = notification.session_id.as_ref() else {
                     return;
                 };
+                if matches!(
+                    notification.status,
+                    magi_core::TaskStatus::Completed
+                        | magi_core::TaskStatus::Failed
+                        | magi_core::TaskStatus::Killed
+                ) {
+                    completion_state
+                        .release_finished_task_resources(session_id, &notification.task_id);
+                }
                 let Some(turn_id) = notification.turn_id.as_deref() else {
                     return;
                 };
@@ -1131,15 +1546,13 @@ impl MagiTurnHarness {
                     magi_core::TaskStatus::Killed => "killed",
                     _ => return,
                 };
-                if let Err(error) = crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal_for_turn(
-                    &completion_state,
-                    session_id,
-                    &notification.root_task_id,
+                crate::task_turn_finalize::schedule_background_session_task_turn_finalize(
+                    completion_state.clone(),
+                    session_id.clone(),
+                    notification.root_task_id,
                     runner_status,
-                    Some(turn_id),
-                ) {
-                    panic!("harness Task terminal 收口失败: {error}");
-                }
+                    turn_id.to_string(),
+                );
             });
         }
         let harness = Self {
@@ -1147,6 +1560,7 @@ impl MagiTurnHarness {
             provider,
             external_mcp_catalog,
             external_mcp_executor,
+            runtime_directory,
         };
         harness.state.restore_turn_coordinator_from_session_store();
         harness
@@ -1161,6 +1575,10 @@ impl MagiTurnHarness {
             self.state.runner_manager().is_some(),
             self.external_mcp_catalog.clone(),
             self.external_mcp_executor.clone(),
+            HarnessExecutionOptions {
+                skill_runtime: self.state.skill_runtime.clone(),
+                ..Default::default()
+            },
         )
     }
 
@@ -1220,6 +1638,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -1302,6 +1721,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -1350,6 +1770,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -1396,6 +1817,7 @@ impl MagiTurnHarness {
                 steer_current_turn: false,
                 expected_turn_id: None,
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -1436,6 +1858,7 @@ impl MagiTurnHarness {
                 steer_current_turn: true,
                 expected_turn_id: Some(expected_turn_id.to_string()),
                 replace_turn_id: None,
+                interrupt_turn_id: None,
                 command: None,
                 workflow_id: None,
                 plugin_command_id: None,
@@ -1554,8 +1977,11 @@ fn git_fixture_command(path: &Path, args: &[&str]) {
         .expect("Git harness fixture command should start");
     assert!(
         output.status.success(),
-        "Git harness fixture command {:?} failed: {}",
+        "Git harness fixture command {:?} at {} failed ({}): stdout={}; stderr={}",
         args,
+        path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -1581,12 +2007,10 @@ fn register_git_workspace(harness: &MagiTurnHarness) -> (magi_core::WorkspaceId,
     let sequence = GIT_FIXTURE_SEQUENCE
         .get_or_init(|| AtomicU64::new(0))
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "magi-turn-harness-git-{}-{}-{}",
-        std::process::id(),
-        UtcMillis::now().0,
-        sequence
-    ));
+    let root = harness
+        .runtime_directory
+        .path()
+        .join(format!("git-workspace-{sequence}"));
     fs::create_dir_all(&root).expect("Git harness workspace should create");
     git_fixture_command(&root, &["init", "-b", "main"]);
     git_fixture_command(&root, &["config", "user.name", "Magi Harness"]);
@@ -1660,7 +2084,11 @@ mod tests {
         harness: &MagiTurnHarness,
         session_id: &SessionId,
     ) -> magi_conversation_runtime::PendingToolApproval {
-        for _ in 0..200 {
+        // 先订阅再读取快照，观察真实审批发布；不要把并发 Git 准备耗时算成
+        // 固定 200 次轮询的业务失败，也不靠 sleep 推测注册是否已经完成。
+        let mut events = harness.state.event_bus.subscribe();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
             if let Some(pending) = harness
                 .state
                 .turn_coordinator()
@@ -1671,17 +2099,42 @@ mod tests {
             {
                 // Pending 状态先于事件总线发布；等待两者同时可见，避免测试在
                 // 审批注册完成但 `tool.approval.requested` 尚未发布的窄窗口读取。
-                if harness
-                    .events_for(session_id)
-                    .iter()
-                    .any(|event| event.event_type == "tool.approval.requested")
-                {
+                if harness.events_for(session_id).iter().any(|event| {
+                    event.event_type == "tool.approval.requested"
+                        && event
+                            .payload
+                            .get("approval_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(pending.approval_id.as_str())
+                }) {
                     return pending;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                _ => break,
+            }
         }
-        panic!("Turn {session_id} 未在测试窗口内产生工具审批请求");
+        let turns = harness
+            .state
+            .session_store
+            .canonical_turns_for_session(session_id)
+            .into_iter()
+            .map(|turn| {
+                serde_json::json!({
+                    "id":turn.turn_id, "status":turn.status, "tools":turn.items.into_iter()
+                        .filter_map(|item| item.tool).collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let tasks = harness.state.task_store().map(|store| {
+            store.all_tasks().into_iter().map(|task|
+            serde_json::json!({"id":task.task_id,"status":task.status,"output":task.output_refs})
+        ).collect::<Vec<_>>()
+        });
+        panic!(
+            "Turn {session_id} 未在测试窗口内产生工具审批请求；turns={turns:?}; tasks={tasks:?}"
+        );
     }
 
     async fn submit_restricted_external_mcp_turn(
@@ -2286,6 +2739,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn harness_cleans_only_its_owned_directory_after_the_last_clone() {
+        let evidence = tempfile::Builder::new()
+            .prefix("magi-model-evidence-")
+            .tempfile()
+            .unwrap();
+        evidence
+            .as_file()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+            )
+            .unwrap();
+        let harness = MagiTurnHarness::new("owned directory");
+        let root = harness.runtime_directory.path().to_path_buf();
+        let (_, workspace) = register_git_workspace(&harness);
+        assert!(workspace.starts_with(&root));
+        assert!(evidence.path().exists(), "不能按通用前缀删除其他验收证据");
+        let cloned = harness.clone();
+        drop(harness);
+        assert!(workspace.exists(), "仍有夹具引用时必须保留工作区");
+        drop(cloned);
+        assert!(
+            !root.exists(),
+            "最后一个夹具释放后应清理自己的 runtime 目录"
+        );
+        assert!(evidence.path().exists());
+    }
+
+    #[tokio::test]
     #[ignore = "本地性能基准需显式运行，避免占用常规单元测试"]
     async fn local_mock_provider_five_scenario_p50_p95_baseline() {
         const SAMPLE_COUNT: usize = 20;
@@ -2807,10 +3289,132 @@ mod tests {
             .get_task(&magi_core::TaskId::new(root_task_id))
             .expect("root task 应持久化");
         assert_eq!(root_task.status, magi_core::TaskStatus::Completed);
+        assert!(
+            task_store.get_children(&root_task.task_id).is_empty(),
+            "接纳 Task 或创建 root coordinator 不应自动创建子代理"
+        );
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::AssistantText
                 && item.content.as_deref() == Some("任务执行成功")
         }));
+    }
+
+    #[tokio::test]
+    async fn invalid_agent_spawn_returns_to_mainline_without_creating_a_child() {
+        let harness = MagiTurnHarness::new_task("主线直接完成检查");
+        let mut arguments = serde_json::json!({
+            "task_name":"unnecessary_child", "role":"executor", "display_name":"不应创建的代理",
+            "goal":"读取一个配置文件",
+            "context_package":{"summary":"普通配置检查", "constraints":[],
+                "expected_output":"配置结论", "references":[]}
+        });
+        let mut invalid_calls = vec![arguments.clone()];
+        arguments["delegation"] =
+            serde_json::json!({"purpose":"parallel_work", "reason":"工作独立"});
+        invalid_calls.push(arguments.clone());
+        arguments["delegation"] =
+            serde_json::json!({"purpose":"independent_review", "reason":"独立检查配置解析边界"});
+        let mut encoded = arguments.clone();
+        encoded["context_package"] = serde_json::json!(arguments["context_package"].to_string());
+        invalid_calls.push(encoded);
+        let mut unknown = arguments.clone();
+        unknown["context_package"]["extra"] = serde_json::json!(true);
+        invalid_calls.push(unknown);
+        let mut null = arguments.clone();
+        null["allow_delegation"] = serde_json::Value::Null;
+        invalid_calls.push(null);
+        for (index, arguments) in invalid_calls.into_iter().enumerate() {
+            harness.provider.set_tool_then_completed(
+                "agent_spawn",
+                arguments.to_string(),
+                "主线直接完成检查",
+            );
+            let accepted = harness
+                .submit_task(
+                    "请检查配置，普通检查直接完成即可",
+                    &format!("invalid-delegation-request-{index}"),
+                    &format!("invalid-delegation-user-{index}"),
+                )
+                .await
+                .unwrap();
+            let session = SessionId::new(accepted.session_id.clone());
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            let root = harness
+                .wait_for_task_terminal(&magi_core::TaskId::new(accepted.root_task_id.unwrap()))
+                .await;
+            assert_eq!(root.status, magi_core::TaskStatus::Completed);
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+            assert!(
+                harness
+                    .state
+                    .task_store()
+                    .unwrap()
+                    .get_children(&root.task_id)
+                    .is_empty()
+            );
+            assert!(
+                !harness
+                    .events_for(&session)
+                    .iter()
+                    .any(|event| event.event_type == "task.coordinator.agent_spawn")
+            );
+            assert!(
+                harness
+                    .state
+                    .session_code_contexts
+                    .get(session.as_str())
+                    .is_none_or(|context| context.agent_worktrees.is_empty())
+            );
+            let feedback = turn
+                .items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .find(|tool| tool.name == "agent_spawn")
+                .expect("拒绝调用必须进入 canonical 工具记录");
+            assert!(
+                feedback.result.as_ref().is_some_and(|result| {
+                    result["stage"] == "tool_call_validation"
+                        && result["status"] == "rejected"
+                        && result["instruction"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("主线直接完成"))
+                }),
+                "{feedback:?}"
+            );
+            assert!(
+                turn.items
+                    .iter()
+                    .any(|item| item.kind == CanonicalTurnItemKind::AssistantText
+                        && item.content.as_deref() == Some("主线直接完成检查"))
+            );
+            let persisted =
+                serde_json::to_vec(&harness.state.session_store.durable_state()).unwrap();
+            let restored = SessionStore::from_persisted_parts(
+                serde_json::from_slice(&persisted).unwrap(),
+                harness.state.session_store.execution_sidecar_store_state(),
+            )
+            .unwrap();
+            let threads = restored.thread_registry_snapshot(&session);
+            for thread in &threads {
+                restored
+                    .rebuild_thread_message_projection(&thread.thread_id, UtcMillis::now())
+                    .unwrap();
+            }
+            assert!(
+                restored
+                    .thread_registry_snapshot(&session)
+                    .iter()
+                    .flat_map(|thread| &thread.message_history)
+                    .filter(|message| message.role == "tool"
+                        && message.tool_call_id.as_deref() == Some(feedback.call_id.as_str()))
+                    .filter_map(|message| message.content.as_deref())
+                    .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                    .any(|result| Some(&result) == feedback.result.as_ref()),
+                "序列化恢复并重建 Thread 后仍必须保留原拒绝，不能变成未知副作用"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2841,6 +3445,15 @@ mod tests {
             .await;
         assert_eq!(root_task.status, magi_core::TaskStatus::Completed);
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        assert!(
+            harness
+                .state
+                .task_store()
+                .unwrap()
+                .get_children(&root_task.task_id)
+                .is_empty(),
+            "普通工具回合由主线直接完成，不应隐式派发代理"
+        );
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
                 && item
@@ -2852,7 +3465,58 @@ mod tests {
             item.kind == CanonicalTurnItemKind::AssistantText
                 && item.content.as_deref() == Some("工具调用完成")
         }));
+        assert_eq!(
+            turn.model_steps.len(),
+            2,
+            "每次模型请求都必须有 Step，工具后续请求没有新输入也不能省略"
+        );
+        let tool_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::ToolCall)
+            .unwrap();
+        assert_eq!(
+            tool_item
+                .metadata
+                .get("modelStepId")
+                .and_then(serde_json::Value::as_str),
+            Some(turn.model_steps[0].step_id.as_str())
+        );
+        assert!(
+            turn.model_steps
+                .iter()
+                .all(|step| step.task_id.as_ref() == Some(&root_task.task_id)
+                    && step.status == magi_session_store::ModelStepStatus::ResponseReceived
+                    && step.binding.is_some())
+        );
         let requests = harness.provider.requests();
+        for request in &requests {
+            assert!(
+                !request
+                    .tool_choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.function.name == "agent_spawn"),
+                "运行时不能因使用 Task profile 而强制 agent_spawn"
+            );
+            let messages = request.messages.as_ref().unwrap();
+            let modes = messages
+                .iter()
+                .filter(|message| {
+                    message.content.as_deref().is_some_and(|text| {
+                        text.starts_with("<magi-developer-fragment id=\"current_agent_mode\"")
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(modes.len(), 1, "每次主线请求使用唯一的当前派发规则");
+            assert_eq!(modes[0].role, "developer");
+            assert!(
+                modes[0]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("默认由当前代理直接完成")
+            );
+        }
         assert!(
             requests.len() >= 2,
             "工具调用后必须再次请求模型完成最终答复"
@@ -3604,12 +4268,11 @@ done
             "allow_once",
         )
         .await;
-        let second_turn = tokio::time::timeout(
-            Duration::from_secs(3),
-            harness.wait_for_terminal(&session_id, &second_turn_id),
-        )
-        .await
-        .expect("MCP approved Turn did not settle");
+        // 复用统一的有界终态观察；本用例验证审批隔离与副作用一次执行，
+        // 不另外把并发调度/工作区准备的三秒耗时当作产品合同。
+        let second_turn = harness
+            .wait_for_terminal(&session_id, &second_turn_id)
+            .await;
         let second_task = harness
             .wait_for_task_terminal(&magi_core::TaskId::new(second_task_id))
             .await;
@@ -3995,6 +4658,646 @@ done
             "turn_id": turn_id,
             "execution_profile": "task",
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_wait_uses_terminal_event_and_real_output_without_model_polling() {
+        for (exit_code, expected_status) in [(0, "completed"), (7, "failed")] {
+            let harness = MagiTurnHarness::new_task("Job 已完成");
+            let (workspace, root) = register_git_workspace(&harness);
+            let session = create_workspace_session(&harness, &workspace, "job-event-wait");
+            harness.provider.set_tool_sequence_then_completed(vec![
+            ("shell_exec", serde_json::json!({"command":format!("sleep 1; printf event-output; printf done > job-wait.txt; exit {exit_code}"), "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":5000}).to_string()),
+        ], "Job 已完成");
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace,
+                    &root,
+                    "启动后台工作并等待真实完成后汇报",
+                    "job-wait-request",
+                    "job-wait-user",
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+            assert_eq!(
+                non_classifier_provider_request_count(&harness),
+                3,
+                "启动、等待、最终答复各请求一次，等待期间不请求模型"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("job-wait.txt")).unwrap(),
+                "done"
+            );
+            let result = turn
+                .items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .filter_map(|tool| tool.result.as_ref())
+                .find(|result| result["mode"] == "background_wait")
+                .expect("canonical 等待结果");
+            assert_eq!(result["wait_timed_out"], false);
+            assert_eq!(result["running"], false);
+            assert_eq!(result["job"]["status"], expected_status);
+            assert_eq!(result["exit_code"], exit_code);
+            assert_eq!(
+                result["status"],
+                if exit_code == 0 {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
+            if exit_code != 0 {
+                assert_eq!(result["error_code"], "shell_exec_job_failed");
+            }
+            assert_eq!(result["stdout"], "event-output");
+            let requests = harness.provider.requests();
+            assert!(
+                requests.iter().any(|request| request
+                    .messages
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|message| {
+                        message.role == "tool"
+                            && message.content.as_deref().is_some_and(|text| {
+                                text.contains("event-output") && text.contains("background_wait")
+                            })
+                    })),
+                "模型收到真实已提交的终态与输出"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn start_background_job_wait(
+        harness: &MagiTurnHarness,
+        scenario: &str,
+    ) -> (
+        magi_core::WorkspaceId,
+        PathBuf,
+        SessionId,
+        SessionTurnResponseDto,
+    ) {
+        let (workspace, root) = register_git_workspace(harness);
+        let session = create_workspace_session(harness, &workspace, scenario);
+        harness.provider.set_tool_sequence_then_completed(vec![
+            ("shell_exec", serde_json::json!({"command":"sleep 30; printf orphan > must-not-exist.txt", "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":60000}).to_string()),
+        ], "Job 等待结束");
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "等待后台命令",
+                "job-wait-request",
+                "job-wait-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while non_classifier_provider_request_count(harness) < 2 {
+            assert!(Instant::now() < deadline, "必须进入 Job 等待");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (workspace, root, session, accepted)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_wait_cancel_stops_waiter_and_settles_original_process() {
+        let harness = MagiTurnHarness::new_task("不得产生取消后的答复");
+        let (workspace, root, session, accepted) =
+            start_background_job_wait(&harness, "job-event-cancel").await;
+        let started = Instant::now();
+        harness
+            .cancel_with_workspace(&session, Some(&workspace))
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "取消不能等待 60 秒超时"
+        );
+        let task = harness
+            .wait_for_task_terminal(&magi_core::TaskId::new(accepted.root_task_id.unwrap()))
+            .await;
+        assert!(matches!(
+            task.status,
+            magi_core::TaskStatus::Failed | magi_core::TaskStatus::Killed
+        ));
+        assert_eq!(non_classifier_provider_request_count(&harness), 2);
+        assert!(!root.join("must-not-exist.txt").exists());
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .background_jobs_for_session(&session)
+                .unwrap()[0]
+                .status,
+            magi_tool_runtime::BackgroundJobStatus::Cancelled
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_cancel_during_start_journal_cannot_spawn_an_orphan() {
+        struct CancelStartingJob;
+        impl magi_session_store::SessionEventWriter for CancelStartingJob {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                turns: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(
+                    &magi_session_store::SessionAcceptanceRecord,
+                    Option<&magi_core::Task>,
+                )>,
+            ) -> magi_core::DomainResult<()> {
+                for item in turns.iter().flat_map(|turn| &turn.next.items) {
+                    if let Some(job) = item.background_job()?
+                        && job.status == magi_tool_runtime::BackgroundJobStatus::Starting
+                    {
+                        let registry = magi_tool_runtime::ToolRegistry::new(
+                            Arc::new(magi_governance::GovernanceService::default()),
+                            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+                        );
+                        registry.cancel_active_executions(
+                            &magi_tool_runtime::ToolExecutionContextQuery {
+                                session_id: Some(job.session_id),
+                                task_id: Some(job.task_id),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        let harness = MagiTurnHarness::new_task("启动期间取消");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace_id, "job-start-cancel");
+        harness
+            .state
+            .session_store
+            .install_session_event_writer(Arc::new(CancelStartingJob));
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command":"printf must-not-run > job-effect.txt", "background":true,
+            })
+            .to_string(),
+            "启动期间取消",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "执行后台命令",
+                "job-start-cancel-request",
+                "job-start-cancel-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert!(!root.join("job-effect.txt").exists());
+        let jobs = harness
+            .state
+            .session_store
+            .background_jobs_for_session(&session)
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].status,
+            magi_tool_runtime::BackgroundJobStatus::Cancelled
+        );
+        assert!(
+            turn.items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| {
+                    tool.result.as_ref().is_some_and(|result| {
+                        result["execution_started"] == false && result["status"] == "cancelled"
+                    })
+                }),
+            "{turn:?}"
+        );
+        fs::remove_dir_all(jobs[0].stdout_path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_cancel_commit_failure_remains_retryable() {
+        use magi_tool_runtime::{
+            BackgroundJobStatus, ToolExecutionContext, ToolExecutionContextQuery,
+            ToolExecutionInput, ToolExecutionPolicy,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RejectCancellation {
+            reject: Arc<AtomicBool>,
+            settlement_visible: Arc<AtomicBool>,
+        }
+        impl magi_session_store::SessionEventWriter for RejectCancellation {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                turns: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(
+                    &magi_session_store::SessionAcceptanceRecord,
+                    Option<&magi_core::Task>,
+                )>,
+            ) -> magi_core::DomainResult<()> {
+                if self.reject.load(Ordering::SeqCst) {
+                    for item in turns.iter().flat_map(|turn| &turn.next.items) {
+                        if let Some(job) = item.background_job()?
+                            && job.status == BackgroundJobStatus::Cancelled
+                        {
+                            let tools = magi_tool_runtime::ToolRegistry::new(
+                                Arc::new(magi_governance::GovernanceService::default()),
+                                Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+                            );
+                            self.settlement_visible.store(
+                                tools.has_active_executions(&ToolExecutionContextQuery {
+                                    session_id: Some(job.session_id),
+                                    task_id: Some(job.task_id),
+                                    ..Default::default()
+                                }),
+                                Ordering::SeqCst,
+                            );
+                            return Err(magi_core::DomainError::InvalidState {
+                                message: "Job cancellation disk unavailable".into(),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let harness = MagiTurnHarness::new_task("Job 取消结算");
+        let reject = Arc::new(AtomicBool::new(true));
+        let settlement_visible = Arc::new(AtomicBool::new(false));
+        harness
+            .state
+            .session_store
+            .install_session_event_writer(Arc::new(RejectCancellation {
+                reject: reject.clone(),
+                settlement_visible: settlement_visible.clone(),
+            }));
+        let (workspace, root, session, accepted) =
+            start_background_job_wait(&harness, "job-cancel-commit").await;
+        let job = harness
+            .state
+            .session_store
+            .background_jobs_for_session(&session)
+            .unwrap()
+            .remove(0);
+        let registry = harness.state.tool_registry().unwrap();
+        let context = ToolExecutionContext {
+            session_id: Some(session.clone()),
+            workspace_id: Some(workspace.clone()),
+            task_id: Some(job.task_id.clone()),
+            working_directory: Some(root.clone()),
+            ..Default::default()
+        };
+        let kill = || {
+            registry.execute_with_policy(
+                ToolExecutionInput::for_builtin_invocation(
+                    magi_core::ToolCallId::new("kill-job-commit"),
+                    "shell_exec",
+                    serde_json::json!({"action":"kill", "job_id":job.job_id}).to_string(),
+                ),
+                context.clone(),
+                &ToolExecutionPolicy {
+                    access_profile: AccessProfile::FullAccess,
+                    ..Default::default()
+                },
+            )
+        };
+        let first = kill();
+        let query = ToolExecutionContextQuery {
+            session_id: Some(session.clone()),
+            task_id: Some(job.task_id.clone()),
+            ..Default::default()
+        };
+        // 同一取消入口还须结束等待者；写盘仍失败时，物理进程退出不能抹掉结算屏障。
+        registry.cancel_active_executions(&query);
+        let settlement_pending = registry.has_active_executions(&query);
+        let uncommitted = harness
+            .state
+            .session_store
+            .background_jobs_for_session(&session)
+            .unwrap()
+            .remove(0);
+        reject.store(false, Ordering::SeqCst);
+        let second = kill();
+        harness
+            .cancel_with_workspace(&session, Some(&workspace))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.status,
+            magi_core::ExecutionResultStatus::Failed,
+            "{}",
+            first.payload
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.payload).unwrap()["error_code"],
+            "shell_exec_job_persist_failed"
+        );
+        assert_eq!(
+            uncommitted.status,
+            BackgroundJobStatus::Running,
+            "未提交的取消不能覆盖原事实"
+        );
+        assert!(settlement_pending, "取消终态未提交前必须保留资源结算屏障");
+        assert!(
+            settlement_visible.load(Ordering::SeqCst),
+            "写盘期间进程不在表中，也必须保留在途结算屏障"
+        );
+        assert_eq!(
+            second.status,
+            magi_core::ExecutionResultStatus::Succeeded,
+            "{}",
+            second.payload
+        );
+        harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        let settled = harness
+            .state
+            .session_store
+            .background_jobs_for_session(&session)
+            .unwrap()
+            .remove(0);
+        assert_eq!(settled.job_id, job.job_id);
+        assert_eq!(settled.status, BackgroundJobStatus::Cancelled);
+        assert!(!registry.has_active_executions(&query));
+        assert!(!root.join("must-not-exist.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_persistence_failure_prevents_process_side_effects() {
+        struct RejectJobWriter;
+        impl magi_session_store::SessionEventWriter for RejectJobWriter {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                turns: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(
+                    &magi_session_store::SessionAcceptanceRecord,
+                    Option<&magi_core::Task>,
+                )>,
+            ) -> magi_core::DomainResult<()> {
+                if turns.iter().any(|turn| {
+                    turn.next.items.iter().any(|item| {
+                        item.metadata
+                            .contains_key(magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY)
+                    })
+                }) {
+                    return Err(magi_core::DomainError::InvalidState {
+                        message: "Job disk unavailable".into(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        let harness = MagiTurnHarness::new_task("调用已拒绝");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace_id, "job-persist-failure");
+        harness
+            .state
+            .session_store
+            .install_session_event_writer(Arc::new(RejectJobWriter));
+        harness.provider.set_tool_then_completed(
+            "shell_exec",
+            serde_json::json!({
+                "command":"printf must-not-run > job-effect.txt", "background":true,
+            })
+            .to_string(),
+            "调用已拒绝",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "执行后台命令",
+                "job-persist-failure-request",
+                "job-persist-failure-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert!(!root.join("job-effect.txt").exists());
+        assert!(
+            harness
+                .state
+                .session_store
+                .background_jobs_for_session(&session)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            turn.items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| {
+                    tool.result.as_ref().is_some_and(|result| {
+                        result["error_code"] == "shell_exec_job_persist_failed"
+                            && result["execution_started"] == false
+                    })
+                }),
+            "{turn:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_outputs_and_terminal_facts_survive_new_turns_and_reload() {
+        for (index, command, expected) in [
+            (
+                0,
+                "printf durable-output; printf durable-error >&2",
+                magi_tool_runtime::BackgroundJobStatus::Completed,
+            ),
+            (
+                1,
+                "printf durable-output; sleep 30",
+                magi_tool_runtime::BackgroundJobStatus::Cancelled,
+            ),
+        ] {
+            let harness = MagiTurnHarness::new_task("后台调用已返回");
+            let (workspace_id, root) = register_git_workspace(&harness);
+            let session =
+                create_workspace_session(&harness, &workspace_id, &format!("durable-job-{index}"));
+            harness.provider.set_tool_then_completed(
+                "shell_exec",
+                serde_json::json!({
+                    "command":command, "background":true,
+                })
+                .to_string(),
+                "后台调用已返回",
+            );
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace_id,
+                    &root,
+                    "执行后台命令并返回启动状态",
+                    "durable-job-request",
+                    "durable-job-user",
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let record = loop {
+                let jobs = harness
+                    .state
+                    .session_store
+                    .background_jobs_for_session(&session)
+                    .unwrap();
+                if jobs.first().is_some_and(|job| job.status.is_terminal()) {
+                    break jobs[0].clone();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Job 必须由 Task 终态回收：{jobs:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(record.status, expected);
+            assert_eq!(
+                fs::read_to_string(&record.stdout_path).unwrap(),
+                "durable-output"
+            );
+            // Job 提交与提交后事件发布是相邻步骤；读到终态不表示观察器已发布完成。
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !harness.events_for(&session).iter().any(|event| {
+                event.event_type == "session.turn.item"
+                    && event
+                        .payload
+                        .get("canonical_item")
+                        .and_then(|item| item.get("metadata"))
+                        .and_then(|meta| meta.get("backgroundJob"))
+                        .and_then(|job| job.get("status"))
+                        .and_then(|status| status.as_str())
+                        == Some(if index == 0 { "completed" } else { "cancelled" })
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "Job 终态提交后必须发布 canonical item 事件"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let context = magi_tool_runtime::ToolExecutionContext {
+                session_id: Some(session.clone()),
+                workspace_id: Some(workspace_id.clone()),
+                task_id: Some(magi_core::TaskId::new("later-root-task")),
+                working_directory: Some(root.clone()),
+                ..Default::default()
+            };
+            let read = |registry: &magi_tool_runtime::ToolRegistry| {
+                registry.execute_with_policy(
+                    magi_tool_runtime::ToolExecutionInput {
+                        tool_call_id: magi_core::ToolCallId::new("read-durable-job"),
+                        tool_name: "shell_exec".into(),
+                        tool_kind: magi_governance::ToolKind::Builtin,
+                        input: serde_json::json!({"action":"read", "job_id":record.job_id})
+                            .to_string(),
+                        approval_requirement: magi_core::ApprovalRequirement::None,
+                        risk_level: magi_core::RiskLevel::Low,
+                    },
+                    context.clone(),
+                    &magi_tool_runtime::ToolExecutionPolicy {
+                        access_profile: AccessProfile::FullAccess,
+                        ..Default::default()
+                    },
+                )
+            };
+            let output = read(harness.state.tool_registry().unwrap());
+            assert_eq!(
+                output.status,
+                magi_core::ExecutionResultStatus::Succeeded,
+                "{}",
+                output.payload
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output.payload).unwrap()["stdout"],
+                "durable-output"
+            );
+            let restored = Arc::new(SessionStore::from_state(
+                harness.state.session_store.export_state(),
+            ));
+            assert_eq!(
+                restored.reconcile_background_jobs_after_restart().unwrap(),
+                0
+            );
+            assert_eq!(
+                restored.background_jobs_for_session(&session).unwrap(),
+                vec![record.clone()]
+            );
+            let mut registry = magi_tool_runtime::ToolRegistry::new(
+                Arc::new(magi_governance::GovernanceService::default()),
+                Arc::new(magi_event_bus::InMemoryEventBus::new(16)),
+            )
+            .with_background_job_journal(
+                restored.background_job_journal(
+                    record
+                        .stdout_path
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .to_path_buf(),
+                ),
+            );
+            registry.register_default_builtins();
+            let output = read(&registry);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output.payload).unwrap()["stdout"],
+                "durable-output"
+            );
+            harness
+                .state
+                .delete_session_and_resources_after_lifecycle_lock(&session, None)
+                .await
+                .unwrap();
+            assert!(
+                !record.stdout_path.parent().unwrap().exists(),
+                "删除会话后回收其输出 artifact"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8679,7 +9982,11 @@ done
         harness: &MagiTurnHarness,
         session_id: &SessionId,
     ) -> magi_conversation_runtime::PendingUserQuestion {
-        for _ in 0..300 {
+        // 与工具审批共用十秒就绪窗口，先订阅后读事实；并发 Git 准备期间
+        // 的三秒固定轮询既不能诊断卡在哪一步，也会把宿主负载误当成提问丢失。
+        let mut events = harness.state.event_bus.subscribe();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
             if let Some(pending) = harness
                 .state
                 .conversation_registry
@@ -8687,16 +9994,28 @@ done
                 .pending_for_session(session_id)
                 .into_iter()
                 .next()
-                && harness
-                    .events_for(session_id)
-                    .iter()
-                    .any(|event| event.event_type == "user.question.requested")
+                && harness.events_for(session_id).iter().any(|event| {
+                    event.event_type == "user.question.requested"
+                        && event
+                            .payload
+                            .get("question_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(pending.question_id.as_str())
+                })
             {
                 return pending;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                _ => break,
+            }
         }
-        panic!("Turn {session_id} 未在测试窗口内产生向用户的提问");
+        panic!(
+            "Turn {session_id} 未在测试窗口内产生向用户的提问；tasks={:?}; admission={:?}; requests={:?}",
+            harness.state.task_store().map(|store| store.all_tasks()),
+            harness.state.execution_admission_snapshot(),
+            harness.provider.requests(),
+        );
     }
 
     fn ask_user_question_arguments() -> String {
@@ -8780,9 +10099,21 @@ done
      {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("ask-user-lease", "向用户提问期间让出仓库租约");
-        harness.provider.set_tool_then_completed(
-            "ask_user_question",
-            ask_user_question_arguments(),
+        // 先执行本地写入建立租约；纯提问不再准备工作区或取得仓库租约。
+        harness.provider.set_tool_sequence_then_completed(
+            vec![
+                (
+                    "file_write".to_string(),
+                    serde_json::json!({
+                        "path": workspace_root.join("before-question.txt"), "content": "prepared"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "ask_user_question".to_string(),
+                    ask_user_question_arguments(),
+                ),
+            ],
             "已按你的选择继续",
         );
         let accepted = harness
@@ -8895,7 +10226,13 @@ done
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "目标起始轮应在退避后自动重提"
+                "目标起始轮应在退避后自动重提；queue failure={:?}",
+                harness
+                    .events_for(&session_id)
+                    .into_iter()
+                    .filter(|event| event.event_type.contains("queue")
+                        || event.event_type.contains("failed"))
+                    .collect::<Vec<_>>(),
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
@@ -8958,12 +10295,20 @@ done
     async fn turn_waits_for_a_repository_busy_with_another_session_instead_of_failing() {
         let (harness, workspace_id, workspace_root, session_id) =
             prepare_git_approval_case("repo-busy", "仓库被其它会话占用时排队");
-        harness.provider.set_completed_response("轮到我了");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({
+                "path": workspace_root.join("waited.txt"), "content": "轮到我了"
+            })
+            .to_string(),
+            "轮到我了",
+        );
         let git_common_dir = workspace_root.join(".git");
         let coordinator = harness.state.workspace_git_coordinator.clone();
         coordinator
             .begin_execution("other-session", &git_common_dir)
             .expect("其它会话先占用仓库");
+        let mut events = harness.state.event_bus.subscribe();
 
         let accepted = harness
             .submit_workspace_task_with_access_profile(
@@ -8973,14 +10318,28 @@ done
                 "读一下项目说明",
                 "harness-repo-busy",
                 "harness-repo-busy-user",
-                Some(AccessProfile::Restricted),
+                Some(AccessProfile::FullAccess),
             )
             .await
             .expect("Turn 应被接纳");
         let turn_id = accepted.turn_id.clone().expect("应有 Turn");
 
+        // 等到真实资源等待事件后再检查；固定 sleep 会把并发调度延迟误判为缺失。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let waiting = loop {
+            if let Some(waiting) = harness
+                .events_for(&session_id)
+                .into_iter()
+                .find(|event| event.event_type == "session.workspace.waiting")
+            {
+                break waiting;
+            }
+            tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .expect("开始排队时应发布 session.workspace.waiting")
+                .expect("工作区等待事件通道应保持有效");
+        };
         // 仓库被占用期间这一轮排队等待，不能变成失败的 Turn。
-        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(
             harness
                 .state
@@ -8990,11 +10349,19 @@ done
             "仓库被其它会话占用时，新一轮应排队等待而不是直接失败"
         );
         // 等待期间界面要能说明「正在等谁」。
-        let waiting = harness
-            .events_for(&session_id)
-            .into_iter()
-            .find(|event| event.event_type == "session.workspace.waiting")
-            .expect("开始排队时应发布 session.workspace.waiting");
+        assert!(
+            harness
+                .state
+                .snapshot_manager
+                .get_session(session_id.as_str())
+                .is_none(),
+            "取得首次执行租约前不得把其它会话的中间状态冻结为快照基线"
+        );
+        assert_eq!(
+            harness.provider.requests().len(),
+            1,
+            "模型先运行，首次写工具等待资源"
+        );
         assert_eq!(
             waiting.payload["blocking_session_ids"],
             serde_json::json!(["other-session"])
@@ -9032,6 +10399,82 @@ done
             "拿到仓库后应发布 session.workspace.ready"
         );
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn cancelling_first_workspace_preparation_releases_the_waiter_without_writing() {
+        let (harness, workspace_id, root, session) =
+            prepare_git_approval_case("cancel-lazy-preparation", "取消首次工作区准备");
+        let target = root.join("cancelled-before-execution.txt");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({
+                "path": target, "content": "must not execute",
+            })
+            .to_string(),
+            "不应执行",
+        );
+        let coordinator = harness.state.workspace_git_coordinator.clone();
+        coordinator
+            .begin_execution("busy-other", &root.join(".git"))
+            .unwrap();
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "写入项目文件",
+                "lazy-cancel",
+                "lazy-cancel-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let mut waiting = false;
+        for _ in 0..300 {
+            waiting = harness
+                .events_for(&session)
+                .iter()
+                .any(|event| event.event_type == "session.workspace.waiting");
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(waiting, "首次写入必须等待执行租约");
+        assert!(
+            harness
+                .state
+                .snapshot_manager
+                .get_session(session.as_str())
+                .is_none()
+        );
+        harness
+            .cancel_with_workspace(&session, Some(&workspace_id))
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
+        coordinator.end_execution("busy-other");
+        assert!(!target.exists(), "取消后不得恢复并执行原工具");
+        assert!(!coordinator.session_holds_execution(session.as_str(), &root.join(".git")));
+        assert!(
+            harness
+                .state
+                .session_workspace_waits
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            harness
+                .state
+                .snapshot_manager
+                .get_session(session.as_str())
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -9249,6 +10692,1274 @@ done
             workspace_root.path().join("b.txt").exists(),
             "丢弃副本不影响已合并的主工作区"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_contention_does_not_copy_or_scan_for_chat_and_reads() {
+        for read in [false, true] {
+            let harness = MagiTurnHarness::new_task("共享读取完成");
+            let (workspace_id, root) = register_git_workspace(&harness);
+            let busy = create_workspace_session(&harness, &workspace_id, "lazy-busy");
+            let session = create_workspace_session(&harness, &workspace_id, "lazy-reader");
+            crate::routes::test_turn_fixtures::seed_conversation_turn(
+                &harness.state.session_store,
+                harness.state.turn_coordinator(),
+                &busy,
+                "busy-turn",
+                1,
+                UtcMillis::now(),
+                "running",
+                "占用工作区",
+            );
+            harness
+                .state
+                .workspace_git_coordinator
+                .begin_execution(busy.as_str(), &root.join(".git"))
+                .unwrap();
+            if read {
+                harness.provider.set_tool_then_completed(
+                    "file_read",
+                    serde_json::json!({"path":"README.md"}).to_string(),
+                    "共享读取完成",
+                );
+            }
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace_id,
+                    &root,
+                    "查询并回答",
+                    "lazy-reader",
+                    "lazy-reader-user",
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+            assert!(harness.state.session_isolation(&session).is_none());
+            assert!(
+                harness
+                    .state
+                    .snapshot_manager
+                    .get_session(session.as_str())
+                    .is_none()
+            );
+            assert!(
+                harness
+                    .state
+                    .session_code_contexts
+                    .get(session.as_str())
+                    .is_none()
+            );
+            assert!(
+                harness
+                    .state
+                    .workspace_git_coordinator
+                    .session_holds_execution(busy.as_str(), &root.join(".git"))
+            );
+            harness.state.release_session_git_execution_lease(&busy);
+        }
+    }
+
+    #[tokio::test]
+    async fn contention_is_observed_at_the_first_tool_and_old_absolute_paths_are_not_executed() {
+        let harness = MagiTurnHarness::new_task("隔离后完成");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let busy = create_workspace_session(&harness, &workspace_id, "late-busy");
+        let session = create_workspace_session(&harness, &workspace_id, "late-writer");
+        let state = harness.state.clone();
+        let busy_for_hook = busy.clone();
+        let root_for_hook = root.clone();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = entered.clone();
+        harness.provider.state.lock().unwrap().before_response = Some(Arc::new(move || {
+            if !seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    state.session_isolation(&session).is_none(),
+                    "模型开始前不得复制工作区"
+                );
+                crate::routes::test_turn_fixtures::seed_conversation_turn(
+                    &state.session_store,
+                    state.turn_coordinator(),
+                    &busy_for_hook,
+                    "late-busy-turn",
+                    1,
+                    UtcMillis::now(),
+                    "running",
+                    "模型请求后才出现的占用",
+                );
+                state
+                    .workspace_git_coordinator
+                    .begin_execution(busy_for_hook.as_str(), &root_for_hook.join(".git"))
+                    .unwrap();
+            }
+        }));
+        harness.provider.set_tool_sequence_then_completed(vec![
+            ("file_write", serde_json::json!({"path":root.join("late.txt"),"content":"must not write main"}).to_string()),
+            ("file_write", serde_json::json!({"path":"late.txt","content":"isolated"}).to_string()),
+        ], "隔离后完成");
+        let session = SessionId::new("late-writer");
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "完成文件写入",
+                "late-writer-request",
+                "late-writer-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        let isolation = harness
+            .state
+            .session_isolation(&session)
+            .expect("首次工具前检测到占用");
+        assert!(!root.join("late.txt").exists());
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("late.txt")).unwrap(),
+            "isolated"
+        );
+        assert!(
+            turn.items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| tool
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["error_code"]
+                        == "workspace_execution_root_changed"
+                        && result["execution_started"] == false))
+        );
+        assert!(harness.provider.requests().iter().any(|request| {
+            request.messages.as_ref().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.role == "developer"
+                        && message.content.as_deref().is_some_and(|content| {
+                            content.contains(&isolation.root.display().to_string())
+                        })
+                })
+            })
+        }));
+        harness.state.release_session_git_execution_lease(&busy);
+        let _ = fs::remove_dir_all(isolation.root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_agent_reactivation_crosses_turns_with_new_task_and_current_authority() {
+        let harness = MagiTurnHarness::new_task("子代理完成");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace_id, "persistent-agent-session");
+        let mut previous: Option<magi_core::TaskId> = None;
+        let mut stable_agent = None;
+        for generation in 1..=3 {
+            harness.provider.set_agent_spawn_then_wait("子代理完成");
+            {
+                let mut provider = harness.provider.state.lock().unwrap();
+                provider.agent_lifetime = Some("session".into());
+                provider.resume_agent_task = previous.as_ref().map(ToString::to_string);
+                if let Some(prior) = previous.as_ref()
+                    && let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                        &mut provider.behavior
+                {
+                    child_steps.push(("context_read".into(), serde_json::json!({
+                        "reference_ids": [format!("task:{prior}:output:0"), format!("task:{prior}:transcript")]
+                    }).to_string()));
+                }
+            }
+            let access = if generation == 1 {
+                AccessProfile::FullAccess
+            } else {
+                AccessProfile::ReadOnly
+            };
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace_id,
+                    &root,
+                    &format!("第 {generation} 次委派并等待"),
+                    &format!("activation-request-{generation}"),
+                    &format!("activation-user-{generation}"),
+                    Some(access),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+            // canonical 终态先于 Coordinator 释放；下一代要修改访问模式，
+            // 必须等待原活动轮次退出，不能把这个提交窗口误判为恢复失败。
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while harness
+                    .state
+                    .turn_coordinator()
+                    .active_turn_id(&session)
+                    .as_deref()
+                    == Some(turn.turn_id.as_str())
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("完成的主线必须释放 Coordinator 后才能切换下一代权限");
+            let task_store = harness.state.task_store().unwrap();
+            let children =
+                task_store.get_children(&magi_core::TaskId::new(accepted.root_task_id.unwrap()));
+            assert_eq!(children.len(), 1, "每次必须创建新的 activation：{turn:?}");
+            let child = &children[0];
+            assert_eq!(
+                child.status,
+                magi_core::TaskStatus::Completed,
+                "generation={generation}; child={child:?}; mainline={turn:?}"
+            );
+            let owned_turn = harness
+                .state
+                .session_store
+                .agent_turn_for_task(&session, &child.task_id)
+                .unwrap()
+                .expect("Session Agent 必须拥有独立 canonical Turn");
+            assert_ne!(owned_turn.turn_id, turn.turn_id);
+            assert_eq!(owned_turn.status, CanonicalTurnStatus::Completed);
+            assert!(owned_turn.items.iter().all(|item| {
+                item.worker
+                    .as_ref()
+                    .and_then(|worker| worker.task_id.as_ref())
+                    == Some(&child.task_id)
+            }));
+            assert!(owned_turn.model_steps.iter().all(|step| {
+                step.task_id.as_ref() == Some(&child.task_id) && step.input_request_ids.is_empty()
+            }));
+            assert!(!owned_turn.model_steps.is_empty());
+            assert!(
+                turn.model_steps
+                    .iter()
+                    .all(|step| step.task_id.as_ref() != Some(&child.task_id))
+            );
+            let binding = child.agent_activation().unwrap();
+            assert_eq!(binding.generation, generation);
+            assert_eq!(binding.previous_task_id, previous);
+            assert_eq!(binding.lifetime, magi_core::AgentLifetime::Session);
+            assert_eq!(
+                child.policy_snapshot.as_ref().unwrap().access_profile,
+                access,
+                "新 activation 使用当前父任务授权，不能继承旧 FullAccess"
+            );
+            assert!(
+                child.recovery_checkpoint.is_none(),
+                "前序 activation 不是本次工具恢复授权"
+            );
+            let agent_id = stable_agent.get_or_insert(binding.agent_id.clone());
+            assert_eq!(&binding.agent_id, agent_id);
+            assert_ne!(previous.as_ref(), Some(&child.task_id));
+            let threads = harness
+                .state
+                .session_store
+                .thread_registry_snapshot(&session);
+            let thread = threads
+                .iter()
+                .find(|thread| thread.handled_task_ids.contains(&child.task_id))
+                .unwrap();
+            if let Some(prior) = &previous {
+                let prior_thread = threads
+                    .iter()
+                    .find(|thread| thread.handled_task_ids.contains(prior))
+                    .unwrap();
+                assert_ne!(thread.thread_id, prior_thread.thread_id);
+                let historical_read = owned_turn
+                    .items
+                    .iter()
+                    .find_map(|item| {
+                        item.tool
+                            .as_ref()
+                            .filter(|tool| tool.name == "context_read")
+                    })
+                    .expect("新 activation 必须实际按引用读取旧记录");
+                assert!(
+                    historical_read.result.as_ref().is_some_and(|result| {
+                        result.to_string().contains("子代理完成")
+                            && result
+                                .to_string()
+                                .contains(&format!("task:{prior}:transcript"))
+                    }),
+                    "{historical_read:?}"
+                );
+                assert!(
+                    !prior_thread.message_history.is_empty(),
+                    "旧 transcript 仍保留"
+                );
+                let requests = harness.provider.requests();
+                assert!(requests.iter().any(|request| {
+                    request
+                        .messages
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|message| {
+                            message.content.as_deref().is_some_and(|content| {
+                                content.contains("[previous-agent-activation]")
+                                    && content.contains(&format!("task:{prior}:transcript"))
+                            })
+                        })
+                }));
+            }
+            let heads = task_store.agent_heads_for_session(&session);
+            assert_eq!(heads.len(), 1);
+            assert_eq!(heads[0].task_id, child.task_id);
+            assert!(
+                harness
+                    .state
+                    .session_code_contexts
+                    .get(session.as_str())
+                    .is_none_or(|context| context.agent_worktrees.is_empty()),
+                "纯文本 activation 不应分配 worktree"
+            );
+            previous = Some(child.task_id.clone());
+        }
+        let store = harness.state.task_store().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        store
+            .checkpoint_to_projection_directory(dir.path())
+            .unwrap();
+        let restored =
+            magi_orchestrator::task_store::TaskStore::restore_from_projection_directory(dir.path())
+                .unwrap()
+                .unwrap();
+        let heads = restored.agent_heads_for_session(&session);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].agent_activation().unwrap().generation, 3);
+        assert_eq!(heads[0].task_id, previous.clone().unwrap());
+        for (index, source, target) in [
+            (0, stable_agent.unwrap(), session.clone()),
+            (
+                1,
+                previous.unwrap(),
+                create_workspace_session(&harness, &workspace_id, "other-agent-session"),
+            ),
+        ] {
+            harness
+                .provider
+                .set_agent_spawn_then_wait("拒绝无效来源后继续");
+            {
+                let mut provider = harness.provider.state.lock().unwrap();
+                provider.agent_lifetime = Some("session".into());
+                provider.resume_agent_task = Some(source.to_string());
+            }
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &target,
+                    &workspace_id,
+                    &root,
+                    "检查代理来源",
+                    &format!("invalid-source-{index}"),
+                    &format!("invalid-source-user-{index}"),
+                    Some(AccessProfile::ReadOnly),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&target, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert!(
+                store
+                    .get_children(&magi_core::TaskId::new(accepted.root_task_id.unwrap()))
+                    .is_empty()
+            );
+            assert!(
+                turn.items
+                    .iter()
+                    .filter_map(|item| item.tool.as_ref())
+                    .any(|tool| {
+                        tool.name == "agent_spawn"
+                            && tool.result.as_ref().is_some_and(|result| {
+                                result["error_code"] == "agent_activation_rejected"
+                            })
+                    }),
+                "{turn:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_agent_interactions_target_its_turn_and_preserve_workspace_authority() {
+        let harness = MagiTurnHarness::new_task("持续代理交互完成");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "retained-interactions");
+        harness
+            .provider
+            .set_agent_spawn_then_wait("持续代理交互完成");
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            provider.agent_lifetime = Some("session".into());
+            if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                &mut provider.behavior
+            {
+                *child_steps = vec![
+                    ("ask_user_question".into(), ask_user_question_arguments()),
+                    (
+                        "shell_exec".into(),
+                        serde_json::json!({"command":"printf approved > retained.txt"}).to_string(),
+                    ),
+                ];
+            }
+        }
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "派发代理提问并审批执行",
+                "retained-interactions",
+                "retained-interactions-user",
+                Some(AccessProfile::Restricted),
+            )
+            .await
+            .unwrap();
+        let root_turn_id = accepted.turn_id.unwrap();
+        let question = wait_for_pending_user_question(&harness, &session).await;
+        let child_id = question.task_id.clone().unwrap();
+        let child_turn = harness
+            .state
+            .session_store
+            .agent_turn_for_task(&session, &child_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(question.turn_id, child_turn.turn_id);
+        assert_ne!(question.turn_id, root_turn_id);
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .runtime_sidecar(&session)
+                .unwrap()
+                .current_turn
+                .unwrap()
+                .turn_id,
+            root_turn_id
+        );
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()[0]
+                .question_id,
+            question.question_id
+        );
+        crate::interaction_service::resolve_question(
+            &harness.state,
+            &session,
+            &question.question_id,
+            magi_conversation_runtime::UserQuestionResponse::Answered {
+                answers: vec![magi_conversation_runtime::UserQuestionAnswer {
+                    selected: vec!["Postgres".into()],
+                    other: None,
+                }],
+            },
+        )
+        .unwrap();
+        let approval = wait_for_pending_tool_approval(&harness, &session).await;
+        assert_eq!(approval.task_id, child_id);
+        assert_eq!(approval.turn_id, child_turn.turn_id);
+        assert!(!root.join("retained.txt").exists());
+        resolve_tool_approval_via_http(
+            &harness,
+            &session,
+            &workspace,
+            &root,
+            &approval.approval_id,
+            "allow_once",
+        )
+        .await;
+        let main = harness.wait_for_terminal(&session, &root_turn_id).await;
+        assert_eq!(main.status, CanonicalTurnStatus::Completed, "{main:?}");
+        let owned = harness
+            .state
+            .session_store
+            .agent_turn_for_task(&session, &child_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.status, CanonicalTurnStatus::Completed, "{owned:?}");
+        assert!(
+            owned
+                .items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| tool.name == "ask_user_question"
+                    && tool
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.to_string().contains("Postgres")))
+        );
+        assert!(
+            owned
+                .items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| tool.name == "shell_exec"
+                    && tool
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["status"] == "succeeded"))
+        );
+        assert!(
+            main.model_steps
+                .iter()
+                .all(|step| step.task_id.as_ref() != Some(&child_id))
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .pending_tool_approvals(&session)
+                .unwrap()
+                .is_empty()
+        );
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session.as_str())
+            .unwrap();
+        let allocation = context
+            .agent_worktrees
+            .iter()
+            .find(|tree| tree.task_id == child_id.as_str())
+            .unwrap();
+        assert!(!allocation.active && !allocation.path.exists());
+        assert_eq!(allocation.changed_paths, vec!["retained.txt"]);
+        assert!(
+            !root.join("retained.txt").exists(),
+            "审批没有授予主工作树写入权"
+        );
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "show",
+                &format!("{}:retained.txt", allocation.result_head.as_ref().unwrap()),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "approved");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_cancel_receipt_waits_for_child_process_and_worktree_exit() {
+        let harness = MagiTurnHarness::new_task("主线已核对取消结果");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "agent-cancel-settlement");
+        harness
+            .provider
+            .set_agent_spawn_then_wait("主线已核对取消结果");
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            provider.agent_lifetime = Some("session".into());
+            if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                &mut provider.behavior
+            {
+                *child_steps = vec![
+                    (
+                        "shell_exec".into(),
+                        serde_json::json!({
+                            "command":"sleep 30; printf orphan > orphan.txt", "background":true
+                        })
+                        .to_string(),
+                    ),
+                    (
+                        "shell_exec".into(),
+                        serde_json::json!({"command":"sleep 30"}).to_string(),
+                    ),
+                ];
+            }
+            let store = harness.state.session_store.clone();
+            let session = session.clone();
+            // 在真实进程进入 Running 后才让主线发出取消，不靠固定延时猜测阶段。
+            provider.agent_cancel_ready = Some(Arc::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if store
+                        .background_jobs_for_session(&session)
+                        .unwrap()
+                        .iter()
+                        .any(|job| job.status == magi_tool_runtime::BackgroundJobStatus::Running)
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "子代理应先启动真实进程");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }));
+        }
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checked = observed.clone();
+        let store = harness.state.session_store.clone();
+        let contexts = harness.state.session_code_contexts.clone();
+        let tools = harness.state.tool_registry().unwrap().clone();
+        let scoped_session = session.clone();
+        harness.provider.state.lock().unwrap().before_response = Some(Arc::new(move || {
+            let turns = store.canonical_turns_for_session(&scoped_session);
+            let result = turns
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .filter_map(|item| item.tool.as_ref())
+                .find(|tool| tool.name == "agent_cancel")
+                .and_then(|tool| tool.result.as_ref());
+            let Some(result) = result else {
+                return;
+            };
+            assert_eq!(result["status"], "cancelled", "{result}");
+            assert_eq!(result["resources_settled"], true, "{result}");
+            assert_eq!(result["results"][0]["child_status"], "killed", "{result}");
+            let child = magi_core::TaskId::new(result["child_task_id"].as_str().unwrap());
+            assert!(
+                !tools.has_active_executions(&magi_tool_runtime::ToolExecutionContextQuery {
+                    session_id: Some(scoped_session.clone()),
+                    task_id: Some(child),
+                    ..Default::default()
+                })
+            );
+            let jobs = store.background_jobs_for_session(&scoped_session).unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(
+                jobs[0].status,
+                magi_tool_runtime::BackgroundJobStatus::Cancelled
+            );
+            let context = contexts.get(scoped_session.as_str()).unwrap();
+            assert_eq!(context.agent_worktrees.len(), 1);
+            assert!(
+                context
+                    .agent_worktrees
+                    .iter()
+                    .all(|tree| !tree.active && !tree.path.exists())
+            );
+            checked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "派发后取消不再需要的代理",
+                "agent-cancel-settlement",
+                "agent-cancel-settlement-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        assert!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            "主线恢复调用前应已退出子代理资源"
+        );
+        assert!(!root.join("orphan.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_session_agent_settles_its_turn_and_pending_interactions() {
+        for tool in ["ask_user_question", "shell_exec"] {
+            let harness = MagiTurnHarness::new_task("不应继续");
+            let (workspace, root) = register_git_workspace(&harness);
+            let session = create_workspace_session(&harness, &workspace, "retained-cancel");
+            harness.provider.set_agent_spawn_then_wait("不应继续");
+            {
+                let mut provider = harness.provider.state.lock().unwrap();
+                provider.agent_lifetime = Some("session".into());
+                if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                    &mut provider.behavior
+                {
+                    child_steps.push((
+                        tool.into(),
+                        if tool == "ask_user_question" {
+                            ask_user_question_arguments()
+                        } else {
+                            serde_json::json!({"command":"printf forbidden > retained.txt"})
+                                .to_string()
+                        },
+                    ));
+                }
+            }
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace,
+                    &root,
+                    "派发代理等待交互",
+                    "retained-cancel",
+                    "retained-cancel-user",
+                    Some(AccessProfile::Restricted),
+                )
+                .await
+                .unwrap();
+            let (child, interaction_turn) = if tool == "ask_user_question" {
+                let pending = wait_for_pending_user_question(&harness, &session).await;
+                (pending.task_id.unwrap(), pending.turn_id)
+            } else {
+                let pending = wait_for_pending_tool_approval(&harness, &session).await;
+                (pending.task_id, pending.turn_id)
+            };
+            // 子代理挂起时，父任务仍可能合法发出 agent_wait 模型请求；
+            // 以原交互 Turn 的 canonical Step 核对子调用，避免全局计数竞争。
+            let child_steps_before = harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session, &interaction_turn)
+                .unwrap()
+                .model_steps;
+            harness
+                .cancel_with_workspace(&session, Some(&workspace))
+                .await
+                .unwrap();
+            let main = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(main.status, CanonicalTurnStatus::Cancelled);
+            harness.wait_for_task_terminal(&child).await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let owned = harness
+                    .state
+                    .session_store
+                    .agent_turn_for_task(&session, &child)
+                    .unwrap()
+                    .unwrap();
+                if owned.status.is_terminal() {
+                    assert_eq!(owned.status, CanonicalTurnStatus::Cancelled, "{owned:?}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "子 Task 结束后必须结算独立 Turn: {owned:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !harness
+                    .state
+                    .session_store
+                    .turn_execution_is_active(&session, &interaction_turn)
+            );
+            assert!(
+                harness
+                    .state
+                    .session_store
+                    .pending_user_questions(&session)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                harness
+                    .state
+                    .session_store
+                    .pending_tool_approvals(&session)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                harness
+                    .state
+                    .session_store
+                    .canonical_turn_for_session_turn_id(&session, &interaction_turn)
+                    .unwrap()
+                    .model_steps
+                    .len(),
+                child_steps_before.len(),
+                "取消交互不能为原子代理继续创建模型 Step"
+            );
+            assert!(!root.join("retained.txt").exists());
+            assert!(
+                harness
+                    .state
+                    .task_store()
+                    .unwrap()
+                    .get_active_lease(&child)
+                    .is_none()
+            );
+            if let Some(context) = harness.state.session_code_contexts.get(session.as_str()) {
+                assert!(
+                    context
+                        .agent_worktrees
+                        .iter()
+                        .all(|tree| !tree.active && !tree.path.exists())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_agents_snapshot_direct_parent_and_apply_outputs_up_the_tree() {
+        for retained in [false, true] {
+            run_nested_agents_snapshot_case(retained).await;
+        }
+    }
+
+    async fn run_nested_agents_snapshot_case(retained: bool) {
+        let harness = MagiTurnHarness::new_task("嵌套代理完成");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace_id, "nested-agents");
+        harness.provider.state.lock().unwrap().behavior =
+            Some(ProviderBehavior::NestedAgents { hold_leaf: false });
+        if retained {
+            harness.provider.state.lock().unwrap().agent_lifetime = Some("session".into());
+        }
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "逐级委派并采用产出",
+                "nested-request",
+                "nested-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        let store = harness.state.task_store().unwrap();
+        let parents = store.get_children(&magi_core::TaskId::new(accepted.root_task_id.unwrap()));
+        assert_eq!(parents.len(), 1, "{parents:?}");
+        assert!(parents[0].delegation_allowed());
+        let leaves = store.get_children(&parents[0].task_id);
+        assert_eq!(leaves.len(), 1, "{leaves:?}");
+        assert!(!leaves[0].delegation_allowed());
+        for agent in [&parents[0], &leaves[0]] {
+            assert_eq!(agent.status, magi_core::TaskStatus::Completed, "{agent:?}");
+            if retained {
+                let owned = harness
+                    .state
+                    .session_store
+                    .agent_turn_for_task(&session, &agent.task_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(owned.status, CanonicalTurnStatus::Completed, "{owned:?}");
+            }
+        }
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session.as_str())
+            .unwrap();
+        assert_eq!(context.agent_worktrees.len(), 2);
+        for allocation in &context.agent_worktrees {
+            assert!(!allocation.active);
+            assert!(!allocation.path.exists());
+            assert!(allocation.applied, "{allocation:?}");
+        }
+        let leaf = context
+            .agent_worktrees
+            .iter()
+            .find(|value| value.task_id == leaves[0].task_id.as_str())
+            .unwrap();
+        assert_eq!(leaf.changed_paths, vec!["leaf.txt"], "父改动不算孙代理产出");
+        assert_eq!(
+            fs::read_to_string(root.join("parent.txt")).unwrap(),
+            "parent uncommitted"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("leaf.txt")).unwrap(),
+            "leaf output"
+        );
+        let turns = harness
+            .state
+            .session_store
+            .canonical_turns_for_session(&session);
+        let reads = turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .filter(|item| {
+                item.tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "file_read")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        for read in reads {
+            assert_eq!(
+                read.status,
+                magi_session_store::CanonicalTurnItemStatus::Completed,
+                "{read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelling_nested_agents_settles_leaf_job_and_reclaims_worktrees() {
+        let harness = MagiTurnHarness::new_task("嵌套取消");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "nested-cancel");
+        harness.provider.state.lock().unwrap().behavior =
+            Some(ProviderBehavior::NestedAgents { hold_leaf: true });
+        harness.provider.state.lock().unwrap().agent_lifetime = Some("session".into());
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "启动嵌套后台工作",
+                "nested-cancel-request",
+                "nested-cancel-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let jobs = harness
+                .state
+                .session_store
+                .background_jobs_for_session(&session)
+                .unwrap();
+            if jobs
+                .iter()
+                .any(|job| job.status == magi_tool_runtime::BackgroundJobStatus::Running)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "必须启动孙代理后台进程: {:?}",
+                harness.provider.requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        harness
+            .cancel_with_workspace(&session, Some(&workspace))
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
+        let store = harness.state.task_store().unwrap();
+        let root_id = magi_core::TaskId::new(accepted.root_task_id.unwrap());
+        assert_eq!(store.collect_subtree_ids(&root_id).len(), 3);
+        loop {
+            let context = harness
+                .state
+                .session_code_contexts
+                .get(session.as_str())
+                .unwrap();
+            let jobs = harness
+                .state
+                .session_store
+                .background_jobs_for_session(&session)
+                .unwrap();
+            if context
+                .agent_worktrees
+                .iter()
+                .all(|tree| !tree.active && !tree.path.exists())
+                && jobs
+                    .iter()
+                    .all(|job| job.status == magi_tool_runtime::BackgroundJobStatus::Cancelled)
+            {
+                assert_eq!(jobs.len(), 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "取消后必须结算资源: {context:?}, {jobs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for id in store.collect_subtree_ids(&root_id) {
+            assert!(!matches!(
+                store.get_task(&id).unwrap().status,
+                magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+            ));
+            assert!(store.get_active_lease(&id).is_none());
+        }
+        assert!(!root.join("orphan.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn text_only_child_does_not_allocate_a_git_worktree() {
+        let harness = MagiTurnHarness::new_task("子代理完成");
+        let (workspace_id, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace_id, "lazy-child-session");
+        harness.provider.set_agent_spawn_then_wait("子代理完成");
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                &root,
+                "派发子代理并等待",
+                "lazy-child-request",
+                "lazy-child-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        let context = harness
+            .state
+            .session_code_contexts
+            .get(session.as_str())
+            .unwrap();
+        assert!(
+            context.agent_worktrees.is_empty(),
+            "只返回文本的子代理不应创建或删除 worktree"
+        );
+        assert!(
+            !harness
+                .events_for(&session)
+                .iter()
+                .any(|event| event.event_type == "agent.git.worktree.allocated")
+        );
+    }
+
+    #[tokio::test]
+    async fn child_local_tools_allocate_once_and_keep_changes_on_the_agent_branch() {
+        for (write, retained) in [(false, false), (true, false), (false, true), (true, true)] {
+            let harness = MagiTurnHarness::new_task("子代理完成");
+            let (workspace_id, root) = register_git_workspace(&harness);
+            let session = create_workspace_session(&harness, &workspace_id, "lazy-local-child");
+            harness.provider.set_agent_spawn_then_wait("子代理完成");
+            if retained {
+                harness.provider.state.lock().unwrap().agent_lifetime = Some("session".into());
+            }
+            if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                &mut harness.provider.state.lock().unwrap().behavior
+            {
+                *child_steps = vec![
+                    (
+                        "file_read".into(),
+                        serde_json::json!({"path": root.join("README.md")}).to_string(),
+                    ),
+                    (
+                        "file_read".into(),
+                        serde_json::json!({"path": "README.md"}).to_string(),
+                    ),
+                ];
+                if write {
+                    child_steps.push((
+                        "file_write".into(),
+                        serde_json::json!({
+                            "path": "agent-output.txt", "content": "agent only"
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace_id,
+                    &root,
+                    "派发子代理并等待",
+                    "lazy-local-child-request",
+                    "lazy-local-child-user",
+                    Some(if write {
+                        AccessProfile::FullAccess
+                    } else {
+                        AccessProfile::ReadOnly
+                    }),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+            let context = harness
+                .state
+                .session_code_contexts
+                .get(session.as_str())
+                .unwrap();
+            assert_eq!(
+                context.agent_worktrees.len(),
+                1,
+                "write={write}, retained={retained}; {context:?}; {turn:?}"
+            );
+            let allocation = &context.agent_worktrees[0];
+            assert!(!allocation.active);
+            assert!(!allocation.path.exists(), "完成后回收代理目录");
+            assert!(!root.join("agent-output.txt").exists());
+            assert_eq!(
+                harness
+                    .events_for(&session)
+                    .iter()
+                    .filter(|event| event.event_type == "agent.git.worktree.allocated")
+                    .count(),
+                1
+            );
+            let children = harness
+                .state
+                .task_store()
+                .unwrap()
+                .get_children(&magi_core::TaskId::new(accepted.root_task_id.unwrap()));
+            assert_eq!(children.len(), 1);
+            let child_turn = if retained {
+                harness
+                    .state
+                    .session_store
+                    .agent_turn_for_task(&session, &children[0].task_id)
+                    .unwrap()
+                    .expect("保留身份的代理使用独立 Turn")
+            } else {
+                turn.clone()
+            };
+            assert_eq!(child_turn.status, CanonicalTurnStatus::Completed);
+            let child_steps = child_turn
+                .model_steps
+                .iter()
+                .filter(|step| {
+                    step.task_id
+                        .as_ref()
+                        .is_some_and(|task| task.as_str() == allocation.task_id)
+                })
+                .collect::<Vec<_>>();
+            assert!(child_steps.len() >= 3, "读取失败后按新目录重新调用");
+            assert_eq!(
+                children[0].status,
+                magi_core::TaskStatus::Completed,
+                "{:?}",
+                children[0]
+            );
+            let history = harness.provider.requests();
+            assert!(
+                history
+                    .iter()
+                    .filter_map(|request| request.messages.as_ref())
+                    .flatten()
+                    .filter_map(|message| message.content.as_deref())
+                    .any(|content| content.contains("workspace_execution_root_changed")),
+                "write={write}; tool history={:?}",
+                history
+                    .iter()
+                    .filter_map(|request| request.messages.as_ref())
+                    .flatten()
+                    .filter(|message| message.role == "tool")
+                    .collect::<Vec<_>>()
+            );
+            if write {
+                assert_eq!(allocation.changed_paths, vec!["agent-output.txt"]);
+                let head = allocation.result_head.as_ref().unwrap();
+                let output = magi_process::std_command("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["show", &format!("{head}:agent-output.txt")])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "agent only");
+            } else {
+                assert!(allocation.changed_paths.is_empty());
+            }
+            assert!(
+                harness
+                    .state
+                    .snapshot_manager
+                    .get_session(session.as_str())
+                    .unwrap()
+                    .pending_changes()
+                    .unwrap()
+                    .is_empty(),
+                "代理改动不能记到主目录账本"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatically_isolated_parent_delegates_in_the_current_copy() {
+        let harness = MagiTurnHarness::new_task("子代理完成");
+        let (root, workspace_id) =
+            register_plain_workspace(&harness, "isolated-child", &[("a.txt", "base")]);
+        let busy = create_workspace_session(&harness, &workspace_id, "isolated-child-busy");
+        let session = create_workspace_session(&harness, &workspace_id, "isolated-child-parent");
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &harness.state.session_store,
+            harness.state.turn_coordinator(),
+            &busy,
+            "isolated-child-busy-turn",
+            1,
+            UtcMillis::now(),
+            "running",
+            "占用主目录",
+        );
+        harness.provider.set_agent_spawn_then_wait("子代理完成");
+        if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+            &mut harness.provider.state.lock().unwrap().behavior
+        {
+            *child_steps = vec![(
+                "file_write".into(),
+                serde_json::json!({
+                    "path": "child.txt", "content": "isolated child"
+                })
+                .to_string(),
+            )];
+        }
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace_id,
+                root.path(),
+                "派发子代理写入文件并等待",
+                "isolated-child-request",
+                "isolated-child-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        let isolation = harness.state.session_isolation(&session).unwrap();
+        assert!(!root.path().join("child.txt").exists());
+        assert_eq!(
+            fs::read_to_string(isolation.root.join("child.txt")).unwrap(),
+            "isolated child"
+        );
+        let changes = harness
+            .state
+            .snapshot_manager
+            .get_session(session.as_str())
+            .unwrap()
+            .pending_changes()
+            .unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.path.ends_with("child.txt"))
+        );
+        assert!(
+            harness
+                .state
+                .session_code_contexts
+                .get(session.as_str())
+                .is_none()
+        );
+        harness
+            .state
+            .discard_session_isolation(&session)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -12044,8 +14755,1533 @@ done
     }
 
     #[tokio::test]
+    async fn pausing_goal_during_response_stops_tool_execution_before_workspace_preparation() {
+        let harness = MagiTurnHarness::new_task("不得执行写入");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "pause-in-flight");
+        harness.provider.set_tool_sequence_then_completed(
+            vec![(
+                "file_write",
+                serde_json::json!({"path":"must-not-exist.txt","content":"forbidden"}).to_string(),
+            )],
+            "不得交付",
+        );
+        let state = harness.state.clone();
+        let session_for_hook = session.clone();
+        harness.provider.state.lock().unwrap().before_response = Some(Arc::new(move || {
+            let store = &state.session_store;
+            let turn = store
+                .runtime_sidecar(&session_for_hook)
+                .unwrap()
+                .current_turn
+                .unwrap();
+            let (_, thread) =
+                store.ensure_session_mission(&session_for_hook, UtcMillis::now(), || {
+                    magi_core::MissionId::new("pause-in-flight-mission")
+                });
+            let goal = store
+                .create_goal(
+                    session_for_hook.clone(),
+                    thread,
+                    turn.turn_id,
+                    "在途暂停必须停止执行",
+                    AccessProfile::FullAccess,
+                )
+                .unwrap();
+            store
+                .pause_goal_with_plan(
+                    &session_for_hook,
+                    &goal.goal_id,
+                    goal.control_revision,
+                    None,
+                )
+                .unwrap();
+        }));
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "先写入文件",
+                "pause-in-flight-request",
+                "pause-in-flight-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Failed, "{turn:?}");
+        assert!(!root.join("must-not-exist.txt").exists());
+        assert!(
+            harness
+                .state
+                .snapshot_manager
+                .get_session(session.as_str())
+                .is_none()
+        );
+        assert!(
+            harness
+                .state
+                .session_code_contexts
+                .get(session.as_str())
+                .is_none()
+        );
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .current_goal(&session)
+                .unwrap()
+                .status,
+            magi_session_store::GoalStatus::Paused
+        );
+        assert_eq!(non_classifier_provider_request_count(&harness), 1);
+        assert_eq!(turn.model_steps.len(), 1);
+        assert_eq!(
+            turn.model_steps[0].status,
+            magi_session_store::ModelStepStatus::ResponseReceived,
+            "停止交付仍须结算在途响应"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pausing_active_task_goal_preserves_another_task_in_the_same_session() {
+        run_task_control_preserves_other_task_resources("pause").await;
+    }
+
+    #[tokio::test]
+    async fn stopping_mainline_preserves_transferred_agent_and_its_pending_question() {
+        run_transferred_agent_control("stop").await;
+    }
+
+    #[tokio::test]
+    async fn agent_run_root_actions_reject_child_targets_without_restarting_or_archiving_mainline()
+    {
+        run_transferred_agent_control("root_action_guard").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_completion_preserves_detached_session_ownership() {
+        run_transferred_agent_control("detach").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_completion_preserves_the_next_mainline_turn() {
+        run_transferred_agent_control("next_turn").await;
+    }
+
+    #[tokio::test]
+    async fn mainline_skill_flush_precedes_success_and_failure_stops_followup() {
+        for fail in [false, true] {
+            let sessions = Arc::new(SessionStore::default());
+            let skills = magi_skill_runtime::SkillRegistry::new();
+            skills.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "mainline-restricted-skill".into(),
+                title: "限制恢复验收".into(),
+                instruction: "检查现有证据并返回。".into(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "test".into(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: true,
+                allowed_tools: vec!["file_read".into()],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            let artifacts = tempfile::tempdir().unwrap();
+            let snapshot_path = artifacts.path().join("skill-checkpoint.json");
+            let checkpoint_count = Arc::new(AtomicU64::new(0));
+            let persist_sessions = sessions.clone();
+            let persist_path = snapshot_path.clone();
+            let observed_count = checkpoint_count.clone();
+            let harness = MagiTurnHarness::from_parts_with_external_mcp(
+                sessions.clone(),
+                HarnessModelClient::new("主线完成"),
+                true,
+                None,
+                None,
+                HarnessExecutionOptions {
+                    skill_runtime: Some(Arc::new(magi_skill_runtime::SkillRuntime::new(skills))),
+                    persist_session_state: Some(Arc::new(move |checkpoint| {
+                        if checkpoint != "task_skill_activated" {
+                            return Ok(());
+                        }
+                        observed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if fail {
+                            return Err("injected synchronous Skill flush failure".into());
+                        }
+                        persist_sessions.persist_projection_with(|durable, sidecars| {
+                            fs::write(
+                                &persist_path,
+                                serde_json::to_vec(&(durable, sidecars)).unwrap(),
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                    })),
+                    ..Default::default()
+                },
+            );
+            struct ObserveSkillReceipt {
+                snapshot: PathBuf,
+                seen: Arc<AtomicU64>,
+            }
+            impl magi_session_store::SessionEventWriter for ObserveSkillReceipt {
+                fn append_session_transaction(
+                    &self,
+                    _: &SessionId,
+                    turns: &[magi_session_store::CanonicalTurnMutation],
+                    _: &[magi_session_store::SessionInputMutation],
+                    _: Option<(
+                        &magi_session_store::SessionAcceptanceRecord,
+                        Option<&magi_core::Task>,
+                    )>,
+                ) -> magi_core::DomainResult<()> {
+                    if turns.iter().any(|change| {
+                        change
+                            .next
+                            .items
+                            .iter()
+                            .filter_map(|item| item.tool.as_ref())
+                            .any(|tool| {
+                                tool.name == "skill_apply"
+                                    && tool
+                                        .result
+                                        .as_ref()
+                                        .is_some_and(|result| result["status"] == "succeeded")
+                            })
+                    }) {
+                        assert!(self.snapshot.exists(), "成功结果提交前必须已经保存限制快照");
+                        self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            }
+            let successful_receipts = Arc::new(AtomicU64::new(0));
+            sessions.install_session_event_writer(Arc::new(ObserveSkillReceipt {
+                snapshot: snapshot_path.clone(),
+                seen: successful_receipts.clone(),
+            }));
+            harness.provider.set_tool_sequence_then_completed(
+                vec![(
+                    "skill_apply",
+                    serde_json::json!({
+                        "skill_name":"mainline-restricted-skill"
+                    })
+                    .to_string(),
+                )],
+                "主线完成",
+            );
+            let accepted = harness
+                .submit_task(
+                    "应用 Skill 后完成核对",
+                    &format!("skill-flush-{fail}"),
+                    &format!("skill-flush-user-{fail}"),
+                )
+                .await
+                .unwrap();
+            let session = SessionId::new(accepted.session_id);
+            let turn = harness
+                .wait_for_terminal(&session, &accepted.turn_id.unwrap())
+                .await;
+            assert_eq!(
+                checkpoint_count.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                turn.status,
+                if fail {
+                    CanonicalTurnStatus::Failed
+                } else {
+                    CanonicalTurnStatus::Completed
+                },
+                "{turn:?}"
+            );
+            assert_eq!(
+                turn.model_steps.len(),
+                if fail { 1 } else { 2 },
+                "保存失败必须阻止下一次模型调用"
+            );
+            assert_eq!(
+                harness.state.task_store().unwrap().snapshot().tasks.len(),
+                1,
+                "普通任务不能隐式创建代理"
+            );
+            if fail {
+                assert_eq!(
+                    successful_receipts.load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                assert!(!snapshot_path.exists());
+            } else {
+                assert!(successful_receipts.load(std::sync::atomic::Ordering::SeqCst) > 0);
+                let (durable, sidecars) =
+                    serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+                let restored = SessionStore::from_persisted_parts(durable, sidecars).unwrap();
+                let chain = restored.active_execution_chain(&session).unwrap();
+                assert_eq!(
+                    chain.dispatch_context.skill_name.as_deref(),
+                    Some("mainline-restricted-skill")
+                );
+                assert_eq!(
+                    chain.branches[0].skill_name.as_deref(),
+                    Some("mainline-restricted-skill")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_skill_state_updates_its_own_turn_after_mainline_replacement() {
+        run_transferred_agent_control("skill_after_next_turn").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_skill_persistence_failure_stops_before_success_or_next_step() {
+        run_transferred_agent_control("skill_failure_after_next_turn").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_skill_restriction_survives_tool_receipt_commit_failure() {
+        run_transferred_agent_control("skill_result_failure_after_next_turn").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_prepares_local_resources_after_parent_stops() {
+        run_transferred_agent_control("local_after_transfer").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_first_local_write_preserves_the_next_mainline_turn() {
+        run_transferred_agent_control("local_after_next_turn").await;
+    }
+
+    #[tokio::test]
+    async fn projected_agent_transfer_command_is_stable_and_executes_with_current_authority() {
+        run_transferred_agent_control("project_transfer").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_goal_replay_after_pause_reads_original_receipt_without_restart() {
+        run_transferred_agent_control("goal_pause_replay").await;
+    }
+
+    #[tokio::test]
+    async fn transferred_agent_goal_replay_after_clear_keeps_receipt_without_restoring_goal() {
+        run_transferred_agent_control("goal_clear_replay").await;
+    }
+
+    #[tokio::test]
+    async fn closing_session_settles_transferred_agent_and_its_pending_question() {
+        run_transferred_agent_control("close").await;
+    }
+
+    #[tokio::test]
+    async fn deleting_session_settles_transferred_agent_before_removing_its_facts() {
+        run_transferred_agent_control("delete").await;
+    }
+
+    async fn run_transferred_agent_control(action: &str) {
+        let goal_replay = matches!(action, "goal_pause_replay" | "goal_clear_replay");
+        let skill_case = matches!(
+            action,
+            "skill_after_next_turn"
+                | "skill_failure_after_next_turn"
+                | "skill_result_failure_after_next_turn"
+        );
+        let skill_failure = skill_case && action != "skill_after_next_turn";
+        let skill_runtime = skill_case.then(|| {
+            let skills = magi_skill_runtime::SkillRegistry::new();
+            skills.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "retained-review-skill".into(),
+                title: "独立代理只读核对".into(),
+                instruction: "只读取 README.md，返回证据。".into(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "test".into(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: true,
+                allowed_tools: vec!["file_read".into()],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            Arc::new(magi_skill_runtime::SkillRuntime::new(skills))
+        });
+        let harness = MagiTurnHarness::from_parts_with_external_mcp(
+            Arc::new(SessionStore::default()),
+            HarnessModelClient::new("独立代理完成"),
+            true,
+            None,
+            None,
+            HarnessExecutionOptions {
+                skill_runtime,
+                ..Default::default()
+            },
+        );
+        let (workspace, root) = register_git_workspace(&harness);
+        let session =
+            create_workspace_session(&harness, &workspace, &format!("transferred-agent-{action}"));
+        harness.provider.set_agent_spawn_then_wait("独立代理完成");
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            provider.agent_lifetime = Some(if goal_replay {
+                "goal".into()
+            } else {
+                "session".into()
+            });
+            if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                &mut provider.behavior
+            {
+                child_steps.push(("ask_user_question".into(), ask_user_question_arguments()));
+                if skill_case {
+                    child_steps.push((
+                        "skill_apply".into(),
+                        serde_json::json!({"skill_name":"retained-review-skill"}).to_string(),
+                    ));
+                    child_steps.push((
+                        "file_read".into(),
+                        serde_json::json!({"path":"README.md"}).to_string(),
+                    ));
+                }
+                if matches!(action, "local_after_transfer" | "local_after_next_turn") {
+                    child_steps.push((
+                        "file_write".into(),
+                        serde_json::json!({
+                            "path":"transferred-result.txt", "content":"independent result"
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+        }
+        let accepted = if goal_replay {
+            harness
+                .submit_workspace_goal_start(
+                    &session,
+                    &workspace,
+                    &root,
+                    "创建 Goal，派发一个保留到目标的代理，等待它的问题",
+                    "transferred-goal-agent-request",
+                )
+                .await
+                .unwrap()
+        } else {
+            harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace,
+                    &root,
+                    "派发一个保留到会话的代理，等待它的问题",
+                    "transferred-agent-stop",
+                    "transferred-agent-stop-user",
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap()
+        };
+        let parent_turn = accepted.turn_id.unwrap();
+        let question = wait_for_pending_user_question(&harness, &session).await;
+        let child_id = question.task_id.clone().unwrap();
+        let parent_id = magi_core::TaskId::new(accepted.root_task_id.unwrap());
+        let store = harness.state.task_store().unwrap();
+        let child = store.get_task(&child_id).unwrap();
+        let original_activation = child.agent_activation().unwrap().clone();
+        let original_lease = store.get_active_lease(&child_id).unwrap().lease_id;
+        let projected_transfer = if action == "project_transfer" || goal_replay {
+            let mut observed = Vec::new();
+            // 父轮可能正在写入 agent_wait 的开始/等待 item；只核对本操作不得
+            // 改变的身份与拥有方，不能把并发的合法进度写回误当作投影副作用。
+            let task_ownership = || {
+                store
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .map(|task| {
+                        serde_json::json!({
+                            "taskId": task.task_id,
+                            "activation": task.agent_activation(),
+                            "transfer": task.agent_run_transfer(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let turn_ownership = || {
+                harness
+                    .state
+                    .session_store
+                    .canonical_turns_for_session(&session)
+                    .iter()
+                    .map(|turn| {
+                        serde_json::json!({
+                            "turnId": turn.turn_id,
+                            "status": turn.status,
+                            "metadata": turn.metadata,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let tasks_before = task_ownership();
+            let turns_before = turn_ownership();
+            for _ in 0..2 {
+                let response = crate::routes::build_router(harness.state.clone()).oneshot(
+                    Request::builder().uri(format!("/api/agent-runs/projection/{parent_id}?scope=workspace&workspaceId={workspace}&sessionId={session}"))
+                        .body(Body::empty()).unwrap()
+                ).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let value: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let agent = value["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|agent| agent["agentRunId"] == child_id.as_str())
+                    .unwrap();
+                observed.push(agent["transferRequest"].clone());
+                assert!(agent["executionOwner"].is_null());
+            }
+            assert_eq!(observed[0], observed[1], "投影重读必须提供同一幂等命令");
+            assert_eq!(observed[0]["taskId"], child_id.as_str());
+            assert_eq!(observed[0]["expectedParentTurnId"], parent_turn);
+            assert_eq!(
+                observed[0]["expectedGeneration"],
+                original_activation.generation
+            );
+            assert_eq!(
+                observed[0]["owner"],
+                if goal_replay { "goal" } else { "session" }
+            );
+            assert_eq!(task_ownership(), tasks_before, "读取不能转交或创建任务");
+            assert_eq!(
+                turn_ownership(),
+                turns_before,
+                "读取不能创建执行 Turn 或改变拥有方和状态"
+            );
+            Some(observed.remove(0))
+        } else {
+            None
+        };
+        if action == "root_action_guard" {
+            crate::turn_service::interrupt_session_turn_with_expected(
+                &harness.state,
+                &session,
+                Some(workspace.as_str()),
+                None,
+                Some(&parent_turn),
+            )
+            .await
+            .unwrap();
+            let before_tasks = serde_json::to_value(store.snapshot().tasks).unwrap();
+            let before_turns = serde_json::to_value(
+                harness
+                    .state
+                    .session_store
+                    .canonical_turns_for_session(&session),
+            )
+            .unwrap();
+            let before_chain =
+                serde_json::to_value(harness.state.session_store.active_execution_chain(&session))
+                    .unwrap();
+            let requests = harness.provider.requests().len();
+            for operation in ["restart", "archive", "continue"] {
+                let response = crate::routes::build_router(harness.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/agent-runs/action")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "operationId":format!("child-{operation}"), "sessionId":session,
+                                    "scope":"workspace", "workspaceId":workspace,
+                                    "taskId":child_id, "action":operation,
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "{operation}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                if operation == "restart" {
+                    assert!(String::from_utf8_lossy(&body).contains("根任务"));
+                }
+                assert_eq!(
+                    serde_json::to_value(store.snapshot().tasks).unwrap(),
+                    before_tasks
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        harness
+                            .state
+                            .session_store
+                            .canonical_turns_for_session(&session)
+                    )
+                    .unwrap(),
+                    before_turns
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        harness.state.session_store.active_execution_chain(&session)
+                    )
+                    .unwrap(),
+                    before_chain
+                );
+                assert_eq!(harness.provider.requests().len(), requests);
+            }
+            return;
+        }
+        let mut transfer_request = serde_json::json!({
+            "operationId":"transfer-stop-fixture", "sessionId":session,
+            "scope":"workspace", "workspaceId":workspace, "taskId":child_id,
+            "expectedParentTurnId":parent_turn,
+            "expectedGeneration":child.agent_activation().unwrap().generation,
+            "owner":"session",
+        });
+        if let Some(projected) = projected_transfer {
+            transfer_request = projected;
+        }
+        if goal_replay {
+            let goal = harness.state.session_store.current_goal(&session).unwrap();
+            transfer_request["owner"] = "goal".into();
+            transfer_request["goalId"] = serde_json::json!(goal.goal_id);
+            transfer_request["expectedGoalControlRevision"] = goal.control_revision.into();
+        }
+        if action == "stop" {
+            transfer_request["operationId"] = "转".repeat(200).into();
+            for (field, value) in [
+                ("operationId", serde_json::json!("x".repeat(201))),
+                // App Server 的 maxLength 按字符而不是 UTF-8 字节计数；超过 200
+                // 个多字节字符也必须在写入转交事实前拒绝。
+                ("operationId", serde_json::json!("转".repeat(201))),
+                ("expectedParentTurnId", serde_json::json!("another-turn")),
+                ("expectedGeneration", serde_json::json!(99)),
+                ("owner", serde_json::json!("goal")),
+                ("goalId", serde_json::json!("unexpected-goal")),
+            ] {
+                let before = serde_json::to_value(store.get_task(&child_id)).unwrap();
+                let mut rejected = transfer_request.clone();
+                rejected[field] = value;
+                let response = crate::routes::build_router(harness.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/agent-runs/transfer")
+                            .header("content-type", "application/json")
+                            .body(Body::from(rejected.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    response.status().is_client_error(),
+                    "{field}: {:?}",
+                    response.status()
+                );
+                assert!(
+                    store
+                        .get_task(&child_id)
+                        .unwrap()
+                        .agent_run_transfer()
+                        .is_none()
+                );
+                assert_eq!(
+                    serde_json::to_value(store.get_task(&child_id)).unwrap(),
+                    before
+                );
+            }
+        }
+        let mut first_result = None;
+        for _ in 0..2 {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::routes::build_router(harness.state.clone()).oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/agent-runs/transfer")
+                        .header("content-type", "application/json")
+                        .body(Body::from(transfer_request.to_string()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("转交不能等待正在提问的代理退出")
+            .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let result: magi_app_server_protocol::generated::AgentTransferResult =
+                serde_json::from_slice(&body).unwrap();
+            assert_eq!(result.source_turn_id, parent_turn);
+            assert_eq!(result.task_id, child_id.as_str());
+            assert!(result.runner_started);
+            if let Some(first) = first_result.as_ref() {
+                assert_eq!(first, &result, "重试必须读取同一份转交记录");
+            } else {
+                first_result = Some(result);
+            }
+        }
+        assert_eq!(store.get_children(&parent_id).len(), 1);
+        assert_eq!(
+            store.get_task(&child_id).unwrap().agent_activation(),
+            Some(&original_activation),
+            "转交与幂等重试不能生成新的 activation"
+        );
+        assert_eq!(
+            store.get_active_lease(&child_id).unwrap().lease_id,
+            original_lease,
+            "转交不能重启正在等待问题的执行"
+        );
+        if goal_replay {
+            let goal = harness.state.session_store.current_goal(&session).unwrap();
+            let plan = harness.state.session_store.plan(&session);
+            crate::goal_service::pause_current_goal(
+                &harness.state,
+                serde_json::from_value(serde_json::json!({
+                    "sessionId":session, "scope":"workspace", "workspaceId":workspace,
+                    "goalId":goal.goal_id, "expectedRevision":goal.control_revision,
+                    "expectedPlanRevision":plan.as_ref().map(|plan| plan.revision),
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if action == "goal_clear_replay" {
+                let paused = harness.state.session_store.current_goal(&session).unwrap();
+                let plan = harness.state.session_store.plan(&session);
+                crate::goal_service::clear_current_goal(
+                    &harness.state,
+                    serde_json::from_value(serde_json::json!({
+                        "sessionId":session, "scope":"workspace", "workspaceId":workspace,
+                        "goalId":paused.goal_id, "expectedRevision":paused.control_revision,
+                        "expectedPlanRevision":plan.as_ref().map(|plan| plan.revision),
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                assert!(harness.state.session_store.current_goal(&session).is_none());
+            }
+            let before = serde_json::to_value(store.get_task(&child_id).unwrap()).unwrap();
+            assert_eq!(before["status"], "killed");
+            let provider_calls = harness.provider.requests().len();
+            let replay = crate::routes::build_router(harness.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/agent-runs/transfer")
+                        .header("content-type", "application/json")
+                        .body(Body::from(transfer_request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = replay.status();
+            let body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let replay: magi_app_server_protocol::generated::AgentTransferResult =
+                serde_json::from_slice(&body).unwrap();
+            assert!(!replay.runner_started);
+            let mut original = first_result.unwrap();
+            original.runner_started = false;
+            assert_eq!(replay, original, "撤销执行权不应抹掉已提交的转交回执");
+            assert_eq!(
+                serde_json::to_value(store.get_task(&child_id).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(harness.provider.requests().len(), provider_calls);
+            for (field, value) in [
+                ("operationId", serde_json::json!("different-operation")),
+                (
+                    "expectedGoalControlRevision",
+                    serde_json::json!(goal.control_revision + 1),
+                ),
+                ("goalId", serde_json::json!("another-goal")),
+                ("owner", serde_json::json!("session")),
+            ] {
+                let mut conflicting = transfer_request.clone();
+                conflicting[field] = value;
+                let rejected = crate::routes::build_router(harness.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/agent-runs/transfer")
+                            .header("content-type", "application/json")
+                            .body(Body::from(conflicting.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(rejected.status().is_client_error(), "{field}");
+                assert_eq!(
+                    serde_json::to_value(store.get_task(&child_id).unwrap()).unwrap(),
+                    before
+                );
+            }
+            if action == "goal_clear_replay" {
+                assert!(harness.state.session_store.current_goal(&session).is_none());
+            } else {
+                assert_eq!(
+                    harness
+                        .state
+                        .session_store
+                        .current_goal(&session)
+                        .unwrap()
+                        .status,
+                    magi_session_store::GoalStatus::Paused
+                );
+            }
+            assert!(store.get_active_lease(&child_id).is_none());
+            assert!(
+                harness
+                    .state
+                    .session_store
+                    .pending_user_questions(&session)
+                    .unwrap()
+                    .is_empty()
+            );
+            return;
+        }
+        if action == "close" || action == "delete" {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::routes::build_router(harness.state.clone()).oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/session/{action}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "sessionId":session, "workspaceId":workspace
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("Session 销毁不能等待转交代理的问题")
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert!(
+                !harness
+                    .state
+                    .session_store
+                    .turn_execution_is_active(&session, &question.turn_id)
+            );
+            assert!(
+                !harness
+                    .state
+                    .session_store
+                    .pending_user_questions(&session)
+                    .unwrap()
+                    .iter()
+                    .any(|pending| pending.question_id == question.question_id)
+            );
+            assert!(
+                !store
+                    .collect_all_active_leases()
+                    .iter()
+                    .any(|(id, _)| id == &parent_id || id == &child_id)
+            );
+            if action == "delete" {
+                assert!(store.get_task(&child_id).is_none());
+                assert!(harness.state.session_store.session(&session).is_none());
+            } else {
+                assert_eq!(
+                    store.get_task(&child_id).unwrap().status,
+                    magi_core::TaskStatus::Killed
+                );
+            }
+            return;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::turn_service::interrupt_session_turn_with_expected(
+                &harness.state,
+                &session,
+                Some(workspace.as_str()),
+                None,
+                Some(&parent_turn),
+            ),
+        )
+        .await
+        .expect("主线停止不能等待转交代理回答问题")
+        .unwrap();
+        assert_eq!(
+            store.get_task(&parent_id).unwrap().status,
+            magi_core::TaskStatus::Killed
+        );
+        assert_eq!(
+            store.get_task(&child_id).unwrap().status,
+            magi_core::TaskStatus::Running
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .turn_execution_is_active(&session, &question.turn_id)
+        );
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .pending_user_questions(&session)
+                .unwrap()
+                .len(),
+            1
+        );
+        if (matches!(action, "detach" | "next_turn" | "local_after_next_turn") || skill_case)
+            && harness
+                .state
+                .session_store
+                .active_execution_chain(&session)
+                .is_some()
+        {
+            harness
+                .state
+                .session_store
+                .archive_active_execution_chain(&session, &parent_id)
+                .unwrap();
+        }
+        let expected_mainline =
+            if matches!(action, "next_turn" | "local_after_next_turn") || skill_case {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while harness
+                    .state
+                    .turn_coordinator()
+                    .active_turn_id(&session)
+                    .is_some()
+                {
+                    assert!(Instant::now() < deadline, "原主线停止后必须释放接纳身份");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // 主线和后台代理共享测试 Provider；只临时替换下一轮主线响应，
+                // 不能把仍在等待问题的代理后续工具步骤一起清掉。
+                let agent_behavior = harness.provider.state.lock().unwrap().behavior.clone();
+                harness
+                    .provider
+                    .set_completed_response("下一轮主线直接完成");
+                let next = harness
+                    .submit_workspace_task(
+                        &session,
+                        &workspace,
+                        &root,
+                        "主线直接完成下一项工作，不启动新代理",
+                        "transferred-agent-next-request",
+                        "transferred-agent-next-user",
+                    )
+                    .await
+                    .unwrap();
+                let next_turn = next.turn_id.unwrap();
+                let turn = harness.wait_for_terminal(&session, &next_turn).await;
+                assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+                assert_eq!(
+                    harness
+                        .wait_for_task_terminal(&magi_core::TaskId::new(next.root_task_id.unwrap()))
+                        .await
+                        .status,
+                    magi_core::TaskStatus::Completed
+                );
+                // durable 终态先于归档和终态事件；先等主线完成发布，再核对
+                // 后台代理是否改变它的执行归属，避免把正常归档误判成代理污染。
+                let mut events = harness.state.event_bus.subscribe();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if harness.events_for(&session).iter().any(|event| {
+                            event.event_type == "session.turn.item"
+                                && event.payload["turn_id"] == next_turn
+                                && event.payload["canonical_turn"]["status"] == "completed"
+                        }) {
+                            break;
+                        }
+                        match events.recv().await {
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(error) => panic!("主线终态事件通道提前关闭: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("下一轮主线必须完成归档并发布终态");
+                harness.provider.state.lock().unwrap().behavior = agent_behavior;
+                (next_turn, "completed")
+            } else {
+                (parent_turn.clone(), "cancelled")
+            };
+        let failed_skill_commits = Arc::new(AtomicU64::new(0));
+        if skill_case {
+            let before = serde_json::to_value(harness.state.session_store.durable_state()).unwrap();
+            assert!(
+                harness
+                    .state
+                    .task_execution_registry()
+                    .update_active_skill(
+                        &child_id,
+                        &harness.state.session_store,
+                        &session,
+                        "stale-agent-turn",
+                        "retained-review-skill".into(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(harness.state.session_store.durable_state()).unwrap(),
+                before,
+                "旧执行的激活通知不能写入当前 Turn",
+            );
+        }
+        if skill_failure {
+            struct RejectSkillActivation {
+                failures: Arc<AtomicU64>,
+                reject_result: bool,
+            }
+            impl magi_session_store::SessionEventWriter for RejectSkillActivation {
+                fn append_session_transaction(
+                    &self,
+                    _: &SessionId,
+                    turns: &[magi_session_store::CanonicalTurnMutation],
+                    _: &[magi_session_store::SessionInputMutation],
+                    _: Option<(
+                        &magi_session_store::SessionAcceptanceRecord,
+                        Option<&magi_core::Task>,
+                    )>,
+                ) -> magi_core::DomainResult<()> {
+                    if turns.iter().any(|change| {
+                        if self.reject_result {
+                            change
+                                .next
+                                .items
+                                .iter()
+                                .filter_map(|item| item.tool.as_ref())
+                                .any(|call| {
+                                    call.name == "skill_apply"
+                                        && call
+                                            .result
+                                            .as_ref()
+                                            .is_some_and(|result| result["status"] == "succeeded")
+                                })
+                        } else {
+                            change.next.agent_active_skill_id().unwrap().as_deref()
+                                == Some("retained-review-skill")
+                        }
+                    }) {
+                        self.failures
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Err(magi_core::DomainError::Persistence {
+                            message: "injected agent Skill commit failure".into(),
+                        });
+                    }
+                    Ok(())
+                }
+            }
+            harness
+                .state
+                .session_store
+                .install_session_event_writer(Arc::new(RejectSkillActivation {
+                    failures: failed_skill_commits.clone(),
+                    reject_result: action == "skill_result_failure_after_next_turn",
+                }));
+        }
+        let ownership_before_completion = harness.state.session_store.execution_ownership(&session);
+        crate::interaction_service::resolve_question(
+            &harness.state,
+            &session,
+            &question.question_id,
+            magi_conversation_runtime::UserQuestionResponse::Answered {
+                answers: vec![magi_conversation_runtime::UserQuestionAnswer {
+                    selected: vec!["Postgres".into()],
+                    other: None,
+                }],
+            },
+        )
+        .unwrap();
+        harness.wait_for_task_terminal(&child_id).await;
+        assert_eq!(
+            store.get_task(&child_id).unwrap().status,
+            if skill_failure {
+                magi_core::TaskStatus::Failed
+            } else {
+                magi_core::TaskStatus::Completed
+            },
+            "{:?}",
+            store.get_task(&child_id).unwrap().output_refs,
+        );
+        if matches!(action, "local_after_transfer" | "local_after_next_turn") {
+            assert!(
+                !root.join("transferred-result.txt").exists(),
+                "代理改动不能未经采用进入主线"
+            );
+            let child = store.get_task(&child_id).unwrap();
+            assert!(
+                child.output_refs.iter().any(|output| {
+                    serde_json::from_str::<serde_json::Value>(output)
+                        .ok()
+                        .is_some_and(|output| {
+                            output["agent_workspace"]["changed_paths"]
+                                .as_array()
+                                .is_some_and(|paths| {
+                                    paths.iter().any(|path| path == "transferred-result.txt")
+                                })
+                        })
+                }),
+                "必须产生可核对的代理分支产物: {:?}",
+                child.output_refs
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let owned = harness
+                .state
+                .session_store
+                .agent_turn_for_task(&session, &child_id)
+                .unwrap()
+                .unwrap();
+            if owned.status.is_terminal() {
+                assert_eq!(
+                    owned.status,
+                    if skill_failure {
+                        CanonicalTurnStatus::Failed
+                    } else {
+                        CanonicalTurnStatus::Completed
+                    }
+                );
+                assert_eq!(owned.turn_id, question.turn_id);
+                if skill_failure {
+                    assert_eq!(
+                        failed_skill_commits.load(std::sync::atomic::Ordering::SeqCst),
+                        1
+                    );
+                    let expected_skill = (action == "skill_result_failure_after_next_turn")
+                        .then_some("retained-review-skill");
+                    assert_eq!(
+                        owned.agent_active_skill_id().unwrap().as_deref(),
+                        expected_skill
+                    );
+                    let restored = SessionStore::from_persisted_parts(
+                        harness.state.session_store.durable_state(),
+                        harness.state.session_store.execution_sidecar_store_state(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        restored
+                            .agent_turn_for_task(&session, &child_id)
+                            .unwrap()
+                            .unwrap()
+                            .agent_active_skill_id()
+                            .unwrap()
+                            .as_deref(),
+                        expected_skill
+                    );
+                    assert_eq!(owned.model_steps.len(), 2, "写盘失败后不能再请求模型");
+                    let calls = owned
+                        .items
+                        .iter()
+                        .filter_map(|item| item.tool.as_ref())
+                        .collect::<Vec<_>>();
+                    assert!(!calls.iter().any(|call| call.name == "file_read"));
+                    assert!(calls.iter().any(|call| call.name == "skill_apply"));
+                    assert!(
+                        !calls.iter().any(|call| call.name == "skill_apply"
+                            && call
+                                .result
+                                .as_ref()
+                                .is_some_and(|result| result["status"] == "succeeded")),
+                        "激活事实未提交时不能持久保存成功回执"
+                    );
+                }
+                if action == "skill_after_next_turn" {
+                    assert_eq!(
+                        owned.model_steps.len(),
+                        4,
+                        "提问、激活、读取和最终答复均须真实执行"
+                    );
+                    let requests = harness.provider.requests();
+                    let narrowed = requests
+                        .iter()
+                        .filter(|request| {
+                            request.tools.as_ref().is_some_and(|tools| {
+                                tools.len() == 1 && tools[0].function.name == "file_read"
+                            })
+                        })
+                        .count();
+                    assert_eq!(narrowed, 2, "激活后的读取与最终答复必须使用收紧的工具面");
+                    assert!(
+                        owned
+                            .items
+                            .iter()
+                            .filter_map(|item| item.tool.as_ref())
+                            .any(|call| call.name == "file_read"
+                                && call
+                                    .result
+                                    .as_ref()
+                                    .is_some_and(|result| result["status"] == "succeeded"))
+                    );
+                    assert_eq!(
+                        owned.agent_active_skill_id().unwrap().as_deref(),
+                        Some("retained-review-skill")
+                    );
+                    let restored = magi_session_store::SessionStore::from_persisted_parts(
+                        harness.state.session_store.durable_state(),
+                        harness.state.session_store.execution_sidecar_store_state(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        restored
+                            .agent_turn_for_task(&session, &child_id)
+                            .unwrap()
+                            .unwrap()
+                            .agent_active_skill_id()
+                            .unwrap()
+                            .as_deref(),
+                        Some("retained-review-skill")
+                    );
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "独立代理 Task 完成后必须结算原 Turn"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mainline = harness
+            .state
+            .session_store
+            .runtime_sidecar(&session)
+            .unwrap()
+            .current_turn
+            .unwrap();
+        assert_eq!(mainline.turn_id, expected_mainline.0);
+        assert_eq!(mainline.status, expected_mainline.1);
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .canonical_turn_for_session_turn_id(&session, &parent_turn)
+                .unwrap()
+                .status,
+            CanonicalTurnStatus::Cancelled,
+            "子代理完成不能复活已停止的原主线"
+        );
+        assert_eq!(
+            harness.state.session_store.execution_ownership(&session),
+            ownership_before_completion,
+            "独立代理完成不能改写主会话的执行归属"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_active_task_preserves_another_task_in_the_same_session() {
+        run_task_control_preserves_other_task_resources("stop").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_stopping_active_task_does_not_wait_for_another_task_resources() {
+        run_task_control_preserves_other_task_resources("targeted_stop").await;
+    }
+
+    #[cfg(unix)]
+    async fn run_task_control_preserves_other_task_resources(action: &str) {
+        use magi_core::{ExecutionResultStatus, TaskId, ToolCallId};
+        use magi_tool_runtime::{
+            BuiltinToolName, ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput,
+            ToolExecutionPolicy,
+        };
+        let harness = MagiTurnHarness::new_task("暂停目标");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "pause-task-goal-scope");
+        harness.provider.set_tool_then_completed(
+            "ask_user_question",
+            ask_user_question_arguments(),
+            "不应继续",
+        );
+        let accepted = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "先等待用户答复",
+                "pause-task-goal-scope-request",
+                "pause-task-goal-scope-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        wait_for_pending_user_question(&harness, &session).await;
+        let turn_id = accepted.turn_id.unwrap();
+        let (_, thread) =
+            harness
+                .state
+                .session_store
+                .ensure_session_mission(&session, UtcMillis::now(), || {
+                    magi_core::MissionId::new("pause-goal-scope-mission")
+                });
+        let goal = harness
+            .state
+            .session_store
+            .create_goal(
+                session.clone(),
+                thread,
+                turn_id.clone(),
+                "暂停本目标",
+                AccessProfile::FullAccess,
+            )
+            .unwrap();
+        let registry = harness.state.tool_registry().unwrap().clone();
+        let cwd = tempfile::tempdir().unwrap();
+        let context = ToolExecutionContext {
+            task_id: Some(TaskId::new("independent-resource-for-goal-scope")),
+            session_id: Some(session.clone()),
+            workspace_id: Some(workspace.clone()),
+            working_directory: Some(cwd.path().to_owned()),
+            access_profile: AccessProfile::FullAccess,
+            ..Default::default()
+        };
+        let query = ToolExecutionContextQuery {
+            task_id: context.task_id.clone(),
+            session_id: Some(session.clone()),
+            ..Default::default()
+        };
+        let runner_registry = registry.clone();
+        let runner = std::thread::spawn(move || {
+            runner_registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(ToolCallId::new("pause-goal-independent-shell"), BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({"command":"while [ ! -f release-shell ]; do sleep 0.02; done; printf survives", "timeout_ms":10000}).to_string()),
+            context, &ToolExecutionPolicy { access_profile: AccessProfile::FullAccess, ..Default::default() },
+        )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry.has_active_executions(&query) {
+            if Instant::now() >= deadline || runner.is_finished() {
+                fs::write(cwd.path().join("release-shell"), "release").unwrap();
+                panic!("独立 Shell 未启动: {:?}", runner.join().unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let controlled = if action == "pause" {
+            let request = serde_json::from_value(
+                serde_json::json!({"sessionId":session, "scope":"workspace", "workspaceId":workspace,
+                "goalId":goal.goal_id, "expectedRevision":goal.control_revision}),
+            ).unwrap();
+            crate::goal_service::pause_current_goal(&harness.state, request)
+                .await
+                .map(|_| ())
+        } else {
+            crate::turn_service::interrupt_session_turn_with_expected(
+                &harness.state,
+                &session,
+                Some(workspace.as_str()),
+                None,
+                (action == "targeted_stop").then_some(turn_id.as_str()),
+            )
+            .await
+            .map(|_| ())
+        };
+        let retained = registry.has_active_executions(&query);
+        fs::write(cwd.path().join("release-shell"), "release").unwrap();
+        let result = tokio::task::spawn_blocking(move || runner.join().unwrap())
+            .await
+            .unwrap();
+        controlled.unwrap();
+        assert!(retained, "控制 {action} 不能按整个 Session 取消独立任务");
+        assert_eq!(
+            result.status,
+            ExecutionResultStatus::Succeeded,
+            "{result:?}"
+        );
+        let turn = harness.wait_for_terminal(&session, &turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Cancelled);
+        assert_eq!(
+            harness
+                .state
+                .session_store
+                .current_goal(&session)
+                .unwrap()
+                .status,
+            magi_session_store::GoalStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn high_goal_usage_does_not_stop_the_real_task_loop() {
+        let harness = MagiTurnHarness::new_task("large usage still completes the task");
+        harness.provider.set_tool_then_completed_twice(
+            "tool_catalog",
+            r#"{"include_external":false}"#,
+            "completed after large usage",
+        );
+        let store = harness.state.session_store.clone();
+        let responses = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            provider.reported_usage =
+                Some(serde_json::json!({"input_tokens":5,"output_tokens":999995}));
+            provider.before_response = Some(Arc::new(move || {
+                let call = responses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let session = store.current_session_id().unwrap();
+                if store.current_goal(&session).is_none() {
+                    let (_, thread) =
+                        store.ensure_session_mission(&session, UtcMillis::now(), || {
+                            magi_core::MissionId::new("mission-usage-statistics")
+                        });
+                    let turn = store
+                        .runtime_sidecar(&session)
+                        .unwrap()
+                        .current_turn
+                        .unwrap();
+                    store
+                        .create_goal(
+                            session.clone(),
+                            thread,
+                            turn.turn_id,
+                            "验证用量只做统计",
+                            AccessProfile::Restricted,
+                        )
+                        .unwrap();
+                }
+                if call == 2 {
+                    let goal = store.current_goal(&session).unwrap();
+                    store
+                        .complete_goal(
+                            &session,
+                            &goal.goal_id,
+                            magi_session_store::GoalRevisionExpectation::new(
+                                goal.control_revision,
+                                None,
+                            ),
+                            store
+                                .runtime_sidecar(&session)
+                                .unwrap()
+                                .current_turn
+                                .unwrap()
+                                .turn_id,
+                            "已核对大用量继续执行",
+                            Vec::new(),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        let response = harness
+            .submit_task(
+                "执行并检查目标",
+                "usage-statistics",
+                "usage-statistics-user",
+            )
+            .await
+            .unwrap();
+        let session = SessionId::new(response.session_id);
+        let turn = harness
+            .wait_for_terminal(&session, &response.turn_id.unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let goal = harness.state.session_store.current_goal(&session).unwrap();
+        assert_eq!(
+            goal.status,
+            magi_session_store::GoalStatus::Complete,
+            "goal={goal:?} turn={turn:?}"
+        );
+        assert!(goal.tokens_used >= 1_000_000);
+        assert_eq!(non_classifier_provider_request_count(&harness), 3);
+        assert_eq!(turn.model_steps.len(), 3);
+        let root = magi_core::TaskId::new(response.root_task_id.unwrap());
+        assert!(
+            harness
+                .state
+                .task_store()
+                .unwrap()
+                .get_children(&root)
+                .is_empty(),
+            "持有活跃 Goal 和持续调用工具不会隐式启动代理"
+        );
+    }
+
+    #[tokio::test]
     async fn task_profile_spawns_child_and_waits_for_child_result() {
         let harness = MagiTurnHarness::new_task("验收子代理1：子代理完成");
+        let store = harness.state.session_store.clone();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            provider.reported_usage =
+                Some(serde_json::json!({"prompt_tokens":5,"completion_tokens":8}));
+            provider.before_response = Some(Arc::new(move || {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let session = store.current_session_id().unwrap();
+                if store.current_goal(&session).is_none() {
+                    let (_, thread) =
+                        store.ensure_session_mission(&session, UtcMillis::now(), || {
+                            magi_core::MissionId::new("mission-shared-usage")
+                        });
+                    let turn = store
+                        .runtime_sidecar(&session)
+                        .unwrap()
+                        .current_turn
+                        .unwrap();
+                    store
+                        .create_goal(
+                            session.clone(),
+                            thread,
+                            turn.turn_id,
+                            "验证主子代理共享记账",
+                            AccessProfile::Restricted,
+                        )
+                        .unwrap();
+                }
+                // 最后一轮模型发送后完成 Goal，验证在途响应仍结算到原目标。
+                if call == 3 {
+                    let goal = store.current_goal(&session).unwrap();
+                    store
+                        .complete_goal(
+                            &session,
+                            &goal.goal_id,
+                            magi_session_store::GoalRevisionExpectation::new(
+                                goal.control_revision,
+                                None,
+                            ),
+                            store
+                                .runtime_sidecar(&session)
+                                .unwrap()
+                                .current_turn
+                                .unwrap()
+                                .turn_id,
+                            "已核对主子代理用量",
+                            Vec::new(),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
         harness
             .provider
             .set_agent_spawn_then_wait("验收子代理1：子代理完成");
@@ -12067,7 +16303,11 @@ done
             .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id.clone()))
             .await;
         let turn = harness.wait_for_terminal(&session_id, &turn_id).await;
-        assert_eq!(root_task.status, magi_core::TaskStatus::Completed);
+        assert_eq!(
+            root_task.status,
+            magi_core::TaskStatus::Completed,
+            "root={root_task:?}; turn={turn:?}"
+        );
         assert_eq!(turn.status, CanonicalTurnStatus::Completed);
         let children = harness
             .state
@@ -12076,6 +16316,53 @@ done
             .get_children(&magi_core::TaskId::new(root_task_id));
         assert_eq!(children.len(), 1, "应真实创建一个子代理任务");
         assert_eq!(children[0].status, magi_core::TaskStatus::Completed);
+        assert!(
+            turn.model_steps
+                .iter()
+                .any(|step| step.task_id.as_ref() == Some(&children[0].task_id)),
+            "子代理必须使用与主线相同的持久 Step 合同"
+        );
+        assert!(
+            turn.model_steps
+                .iter()
+                .any(|step| step.task_id.as_ref() == Some(&root_task.task_id))
+        );
+        assert!(
+            turn.model_steps
+                .iter()
+                .all(|step| step.status == magi_session_store::ModelStepStatus::ResponseReceived)
+        );
+
+        let goal = harness
+            .state
+            .session_store
+            .current_goal(&session_id)
+            .unwrap();
+        let charged = turn
+            .model_steps
+            .iter()
+            .filter(|step| step.goal_id.as_ref() == Some(&goal.goal_id))
+            .collect::<Vec<_>>();
+        assert!(
+            charged
+                .iter()
+                .any(|step| step.task_id.as_ref() == Some(&children[0].task_id)),
+            "子代理调用必须冻结原 Goal 归属"
+        );
+        assert!(
+            charged
+                .iter()
+                .any(|step| step.task_id.as_ref() == Some(&root_task.task_id))
+        );
+        assert_eq!(
+            goal.tokens_used,
+            charged
+                .iter()
+                .map(|step| step.usage_tokens.unwrap())
+                .sum::<u64>()
+        );
+        assert!(goal.tokens_used > 0);
+
         assert!(turn.items.iter().any(|item| {
             item.kind == CanonicalTurnItemKind::ToolCall
                 && item
@@ -12091,6 +16378,40 @@ done
                     .is_some_and(|content| content.contains("验收子代理"))
         }));
         let requests = harness.provider.requests();
+        for request in &requests {
+            let messages = request.messages.as_ref().unwrap();
+            let modes = messages
+                .iter()
+                .filter(|message| {
+                    message.content.as_deref().is_some_and(|text| {
+                        text.starts_with("<magi-developer-fragment id=\"current_agent_mode\"")
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(modes.len(), 1, "主子每次请求必须各有一份运行时规则");
+            assert_eq!(modes[0].role, "developer");
+            let content = modes[0].content.as_deref().unwrap();
+            let can_spawn = request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == "agent_spawn"));
+            assert_eq!(
+                content.contains("多代理协作（root coordinator 必须遵守）"),
+                can_spawn
+            );
+            assert_eq!(content.contains("不要继续创建代理"), !can_spawn);
+            let mode_position = messages
+                .iter()
+                .position(|message| std::ptr::eq(message, modes[0]))
+                .unwrap();
+            assert!(
+                messages[..mode_position]
+                    .iter()
+                    .all(|message| { matches!(message.role.as_str(), "system" | "developer") }),
+                "规则必须位于 transcript 前，不能作为旧任务引用混入历史"
+            );
+        }
+
         assert!(
             requests.iter().any(|request| {
                 request.messages.as_ref().is_some_and(|messages| {
@@ -12156,6 +16477,253 @@ done
         assert_eq!(children[0].executor_binding_target_role(), Some("reviewer"));
         assert_eq!(children[0].title, "自定义审查代理1");
         assert_eq!(children[0].status, magi_core::TaskStatus::Completed);
+        let spawn = turn
+            .items
+            .iter()
+            .filter_map(|item| item.tool.as_ref())
+            .find(|tool| tool.name == "agent_spawn")
+            .unwrap();
+        let decision = &spawn.arguments.as_ref().unwrap()["delegation"];
+        assert_eq!(decision["purpose"], "user_requested");
+        assert_eq!(
+            spawn.result.as_ref().unwrap()["delegation"],
+            *decision,
+            "派发依据须跟随 canonical 参数和成功回执保存"
+        );
+        let event = harness
+            .events_for(&session_id)
+            .into_iter()
+            .find(|event| event.event_type == "task.coordinator.agent_spawn")
+            .unwrap();
+        assert_eq!(event.payload["delegation"], *decision);
+    }
+
+    #[tokio::test]
+    async fn duplicate_agent_spawn_recovers_existing_child_and_waits_without_renaming() {
+        let harness = MagiTurnHarness::new_task("原代理完成，重复调用未创建新代理");
+        harness
+            .provider
+            .set_multiple_agent_spawn_then_wait("原代理完成，重复调用未创建新代理");
+        harness
+            .provider
+            .state
+            .lock()
+            .unwrap()
+            .repeat_spawn_task_name = true;
+        let accepted = harness
+            .submit_task(
+                "派发一个子代理核对独立模块，重复调用时等待原代理的结果",
+                "duplicate-agent-request",
+                "duplicate-agent-user",
+            )
+            .await
+            .unwrap();
+        let session = SessionId::new(accepted.session_id);
+        let turn = harness
+            .wait_for_terminal(&session, &accepted.turn_id.unwrap())
+            .await;
+        let root_id = magi_core::TaskId::new(accepted.root_task_id.unwrap());
+        let root = harness.wait_for_task_terminal(&root_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        assert_eq!(root.status, magi_core::TaskStatus::Completed);
+        let children = harness.state.task_store().unwrap().get_children(&root_id);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, magi_core::TaskStatus::Completed);
+        let tools = turn
+            .items
+            .iter()
+            .filter_map(|item| item.tool.as_ref())
+            .collect::<Vec<_>>();
+        let spawns = tools
+            .iter()
+            .filter(|tool| tool.name == "agent_spawn")
+            .collect::<Vec<_>>();
+        assert_eq!(spawns.len(), 2);
+        let rejection = spawns
+            .iter()
+            .filter_map(|tool| tool.result.as_ref())
+            .find(|result| result["error_code"] == "duplicate_task_name")
+            .expect("应保留重复派发诊断");
+        assert_eq!(rejection["existing_task_id"], children[0].task_id.as_str());
+        assert_eq!(rejection["retryable"], false);
+        assert!(rejection["child_task_id"].is_null());
+        assert!(
+            tools
+                .iter()
+                .filter(|tool| tool.name == "agent_wait")
+                .filter_map(|tool| tool.result.as_ref())
+                .any(|result| result["all_terminal"] == true)
+        );
+        assert_eq!(
+            harness
+                .events_for(&session)
+                .iter()
+                .filter(|event| event.event_type == "task.coordinator.agent_spawn")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness.state.conversation_registry.len(),
+            0,
+            "主线和代理完成后不保留运行时输入通道"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_commit_failure_discards_prepared_context_and_keeps_mainline_running() {
+        let harness = MagiTurnHarness::new_task("主线接管完成");
+        harness.provider.set_tool_then_completed("agent_spawn", serde_json::json!({
+            "task_name":"publication_failure", "role":"executor", "display_name":"发布故障验收",
+            "goal":"独立验收", "delegation":{"purpose":"user_requested", "reason":"验收明确要求创建代理以注入注册故障"},
+            "context_package":{"summary":"发布故障", "constraints":[], "expected_output":"验收结果", "references":[]}
+        }).to_string(), "主线接管完成");
+        let rejected_child = Arc::new(Mutex::new(None));
+        let observed = rejected_child.clone();
+        harness
+            .state
+            .task_store()
+            .unwrap()
+            .set_checkpoint_callback(Box::new(move |snapshot| {
+                if let Some(child) = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.parent_task_id.is_some())
+                {
+                    *observed.lock().unwrap() = Some(child.task_id.clone());
+                    return Err(magi_core::DomainError::Persistence {
+                        message: "injected child publication failure".into(),
+                    });
+                }
+                Ok(())
+            }));
+        let accepted = harness
+            .submit_task(
+                "创建代理，无法创建时由主线接管",
+                "publication-failure",
+                "publication-failure-user",
+            )
+            .await
+            .unwrap();
+        let session = SessionId::new(accepted.session_id);
+        let turn = harness
+            .wait_for_terminal(&session, &accepted.turn_id.unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        let child = rejected_child
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("必须到达真实 Task 发布写盘边界");
+        assert!(
+            harness
+                .state
+                .task_store()
+                .unwrap()
+                .get_task(&child)
+                .is_none()
+        );
+        assert!(
+            harness
+                .state
+                .task_execution_registry()
+                .get(&child)
+                .is_none()
+        );
+        assert!(
+            !harness
+                .state
+                .session_store
+                .thread_registry_snapshot(&session)
+                .iter()
+                .any(|thread| thread.handled_task_ids.contains(&child))
+        );
+        assert_eq!(
+            harness.state.conversation_registry.len(),
+            0,
+            "主线完成后通道关闭，不能留下未发布代理的初始消息"
+        );
+        let admission = harness
+            .state
+            .task_execution_registry()
+            .execution_admission()
+            .snapshot();
+        assert!(!admission.active_task_ids.contains(&child.to_string()));
+        assert!(
+            !admission
+                .queued
+                .iter()
+                .any(|entry| entry.task_id == child.as_str())
+        );
+        assert!(
+            !harness
+                .events_for(&session)
+                .iter()
+                .any(|event| event.event_type == "task.coordinator.agent_spawn")
+        );
+        assert!(
+            turn.items
+                .iter()
+                .filter_map(|item| item.tool.as_ref())
+                .any(|tool| tool.name == "agent_spawn"
+                    && tool
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["status"] == "failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_turns_keep_child_completion_and_parent_results() {
+        let mut runs = tokio::task::JoinSet::new();
+        for index in 0..12 {
+            runs.spawn(async move {
+                let harness = MagiTurnHarness::new_task("并发代理完成");
+                harness.provider.set_agent_spawn_then_wait("并发代理完成");
+                let accepted = harness
+                    .submit_task(
+                        "派发一个独立代理并等待真实完成",
+                        &format!("concurrent-agent-{index}"),
+                        &format!("concurrent-agent-user-{index}"),
+                    )
+                    .await
+                    .unwrap();
+                let session = SessionId::new(accepted.session_id);
+                let root = harness
+                    .wait_for_task_terminal(&magi_core::TaskId::new(accepted.root_task_id.unwrap()))
+                    .await;
+                let turn = harness
+                    .wait_for_terminal(&session, &accepted.turn_id.unwrap())
+                    .await;
+                let children = harness
+                    .state
+                    .task_store()
+                    .unwrap()
+                    .get_children(&root.task_id);
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "index={index}; root={root:?}; turn={turn:?}"
+                );
+                assert_eq!(
+                    root.status,
+                    magi_core::TaskStatus::Completed,
+                    "index={index}; root={root:?}; children={children:?}; turn={turn:?}"
+                );
+                assert_eq!(
+                    children[0].status,
+                    magi_core::TaskStatus::Completed,
+                    "index={index}; children={children:?}; turn={turn:?}"
+                );
+                assert_eq!(
+                    turn.status,
+                    CanonicalTurnStatus::Completed,
+                    "index={index}; {turn:?}"
+                );
+            });
+        }
+        while let Some(result) = runs.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -12212,7 +16780,8 @@ done
         assert!(
             children
                 .iter()
-                .all(|child| child.status == magi_core::TaskStatus::Completed)
+                .all(|child| child.status == magi_core::TaskStatus::Completed),
+            "children={children:?}; mainline={turn:?}"
         );
         let requests = harness.provider.requests();
         let spawn_calls = requests
@@ -12663,6 +17232,427 @@ done
     }
 
     #[tokio::test]
+    async fn interrupt_replacement_commit_failure_retains_input_and_revision_checked_retry_settles_it()
+     {
+        struct FailCancellation(std::sync::atomic::AtomicBool);
+        impl magi_session_store::SessionEventWriter for FailCancellation {
+            fn append_session_transaction(
+                &self,
+                _: &SessionId,
+                mutations: &[magi_session_store::CanonicalTurnMutation],
+                _: &[magi_session_store::SessionInputMutation],
+                _: Option<(
+                    &magi_session_store::SessionAcceptanceRecord,
+                    Option<&magi_core::Task>,
+                )>,
+            ) -> magi_core::DomainResult<()> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) && !mutations.is_empty() {
+                    return Err(magi_core::DomainError::Persistence {
+                        message: "injected cancellation commit failure".into(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        for (delete_replacement, complete_original) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let harness = MagiTurnHarness::new_task("replacement");
+            harness.provider.set_hold_for_cancellation();
+            let original = harness
+                .submit(None, "original", "retry-original", "retry-original-user")
+                .await
+                .unwrap();
+            let session = SessionId::new(&original.session_id);
+            for _ in 0..200 {
+                if !harness.provider.requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!harness.provider.requests().is_empty());
+            let writer = Arc::new(FailCancellation(std::sync::atomic::AtomicBool::new(true)));
+            harness
+                .state
+                .session_store
+                .install_session_event_writer(writer.clone());
+            let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "sessionId":session, "scope":"personal", "interruptTurnId":original.turn_id,
+            "text":"replacement", "requestId":"retry-replacement", "userMessageId":"retry-replacement-user",
+        })).unwrap();
+            let queued = TurnService::new(harness.state.clone())
+                .submit(request)
+                .await
+                .unwrap();
+            assert!(queued.queued);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let input = loop {
+                assert!(Instant::now() < deadline, "取消写盘失败必须保留错误回执");
+                let input = harness
+                    .state
+                    .session_store
+                    .input_for_request("retry-replacement")
+                    .unwrap();
+                if input.interruption.as_ref().unwrap().error.is_some() {
+                    break input;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(input.state, magi_session_store::SessionInputState::Pending);
+            assert!(input.interruption.as_ref().unwrap().settled_at.is_none());
+            let app = crate::routes::build_router(harness.state.clone());
+            let retry = |revision| {
+                let path = if delete_replacement {
+                    "/api/session/queue/remove"
+                } else {
+                    "/api/session/queue/retry"
+                };
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "sessionId": session, "queueId": input.input_id, "expectedRevision":revision,
+                    }).to_string()))
+                    .unwrap()
+            };
+            assert_eq!(
+                app.clone().oneshot(retry(1)).await.unwrap().status(),
+                StatusCode::CONFLICT
+            );
+            let remove = Request::builder().method("POST").uri("/api/session/queue/remove")
+            .header("content-type", "application/json").body(Body::from(serde_json::json!({
+                "sessionId": session, "queueId": input.input_id, "expectedRevision": input.revision,
+            }).to_string())).unwrap();
+            assert_eq!(
+                app.clone().oneshot(remove).await.unwrap().status(),
+                StatusCode::CONFLICT,
+                "未结算时删除必须保留屏障，不能让普通输入抢跑"
+            );
+            let revision = harness
+                .state
+                .session_store
+                .input_for_request("retry-replacement")
+                .unwrap()
+                .revision;
+            let repeated_remove = Request::builder().method("POST").uri("/api/session/queue/remove")
+                .header("content-type", "application/json").body(Body::from(serde_json::json!({
+                    "sessionId": session, "queueId": input.input_id, "expectedRevision": revision,
+                }).to_string())).unwrap();
+            assert_eq!(
+                app.clone().oneshot(repeated_remove).await.unwrap().status(),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                harness
+                    .state
+                    .session_store
+                    .input_for_request("retry-replacement")
+                    .unwrap()
+                    .revision,
+                revision,
+                "同一结算失败的重复观察不能推进 Input revision，否则客户端看到的最新版本仍会无故失效"
+            );
+            writer.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            harness.provider.set_completed_response("replacement done");
+            if complete_original {
+                // 原 Turn 先完成、其 active chain 归档后，finalizer 才唤醒
+                // 队列；持久停止意图仍须定位原 root 并完成资源核对。
+                harness
+                    .wait_for_terminal(&session, original.turn_id.as_deref().unwrap())
+                    .await;
+            } else {
+                let retried = app.oneshot(retry(revision)).await.unwrap();
+                let status = retried.status();
+                let body = axum::body::to_bytes(retried.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            }
+            if delete_replacement {
+                let cancelled = harness
+                    .state
+                    .session_store
+                    .input_for_request("retry-replacement")
+                    .unwrap();
+                assert_eq!(
+                    cancelled.state,
+                    magi_session_store::SessionInputState::Cancelled
+                );
+                assert!(cancelled.interruption.unwrap().settled_at.is_some());
+                assert_eq!(harness.state.queued_regular_session_turn_count(&session), 0);
+                assert_eq!(
+                    harness
+                        .state
+                        .session_store
+                        .canonical_turns_for_session(&session)
+                        .len(),
+                    1
+                );
+                continue;
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let turn_id = loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "重试必须沿原输入完成接纳: input={:?}; sidecar={:?}; tasks={:?}",
+                    harness
+                        .state
+                        .session_store
+                        .input_for_request("retry-replacement"),
+                    harness.state.session_store.runtime_sidecar(&session),
+                    harness.state.task_store().map(|store| store.snapshot())
+                );
+                let input = harness
+                    .state
+                    .session_store
+                    .input_for_request("retry-replacement")
+                    .unwrap();
+                if let Some(id) = input.attached_turn_id {
+                    assert!(input.interruption.as_ref().unwrap().settled_at.is_some());
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            harness.wait_for_terminal(&session, &turn_id).await;
+            assert_eq!(harness.state.queued_regular_session_turn_count(&session), 0);
+            assert_eq!(
+                harness
+                    .state
+                    .session_store
+                    .canonical_turns_for_session(&session)
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_and_replace_settles_real_background_job_before_new_workspace_writes() {
+        let harness = MagiTurnHarness::new_task("replacement workspace done");
+        let (workspace, root) = register_git_workspace(&harness);
+        let session = create_workspace_session(&harness, &workspace, "replacement-process");
+        harness.provider.set_tool_sequence_then_completed(vec![
+            ("shell_exec", serde_json::json!({"command":"sleep 30; printf orphan > must-not-exist.txt", "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":60000}).to_string()),
+        ], "old output must not complete");
+        let original = harness
+            .submit_workspace_task_with_access_profile(
+                &session,
+                &workspace,
+                &root,
+                "run background job",
+                "replace-process-root",
+                "replace-process-root-user",
+                Some(AccessProfile::FullAccess),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while non_classifier_provider_request_count(&harness) < 2 {
+            assert!(Instant::now() < deadline, "必须进入真实 Job 等待");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({"path":"replacement.txt", "content":"new workspace result"})
+                .to_string(),
+            "replacement workspace done",
+        );
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "sessionId":session, "scope":"workspace", "workspaceId":workspace,
+            "interruptTurnId":original.turn_id, "accessProfile":"full_access",
+            "text":"replace with workspace write", "requestId":"replace-process-input", "userMessageId":"replace-process-user",
+        })).unwrap();
+        assert!(
+            TurnService::new(harness.state.clone())
+                .submit(request)
+                .await
+                .unwrap()
+                .queued
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let replacement_turn = loop {
+            assert!(Instant::now() < deadline, "原进程停止后应接纳替代输入");
+            let input = harness
+                .state
+                .session_store
+                .input_for_request("replace-process-input")
+                .unwrap();
+            if let Some(turn) = input.attached_turn_id {
+                assert!(input.interruption.unwrap().settled_at.is_some());
+                assert_eq!(
+                    harness
+                        .state
+                        .session_store
+                        .background_jobs_for_session(&session)
+                        .unwrap()[0]
+                        .status,
+                    magi_tool_runtime::BackgroundJobStatus::Cancelled
+                );
+                break turn;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let turn = harness.wait_for_terminal(&session, &replacement_turn).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("replacement.txt")).unwrap(),
+            "new workspace result"
+        );
+        assert!(!root.join("must-not-exist.txt").exists());
+        let original_task = harness
+            .state
+            .task_store()
+            .unwrap()
+            .get_task(&magi_core::TaskId::new(original.root_task_id.unwrap()))
+            .unwrap();
+        assert_eq!(original_task.status, magi_core::TaskStatus::Killed);
+        assert_eq!(harness.state.queued_regular_session_turn_count(&session), 0);
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_replace_is_durable_prioritized_and_waits_for_old_execution() {
+        let harness = MagiTurnHarness::new_task("replacement done");
+        harness.provider.set_hold_for_cancellation();
+        let initial = harness
+            .submit(None, "原任务等待停止", "replace-root", "replace-root-user")
+            .await
+            .unwrap();
+        let session_id = SessionId::new(&initial.session_id);
+        let old_turn_id = initial.turn_id.clone().unwrap();
+        for _ in 0..200 {
+            if !harness.provider.requests().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!harness.provider.requests().is_empty());
+        let next = harness
+            .submit(
+                Some(&session_id),
+                "保留普通下一轮",
+                "replace-next",
+                "replace-next-user",
+            )
+            .await
+            .unwrap();
+        assert!(next.queued);
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope":"personal", "sessionId": session_id, "text":"立即改做新任务", "interruptTurnId": old_turn_id,
+            "requestId":"replacement", "userMessageId":"replacement-user",
+        })).unwrap();
+        let replacement = TurnService::new(harness.state.clone())
+            .submit(request.clone())
+            .await
+            .unwrap();
+        assert!(replacement.queued);
+        assert_eq!(replacement.queue_position, Some(1));
+        // 接纳回执之后已存在持久 Input，尚未结算不允许直接绑定。
+        let input = harness
+            .state
+            .session_store
+            .input_for_request("replacement")
+            .unwrap();
+        assert_eq!(input.interruption.as_ref().unwrap().turn_id, old_turn_id);
+        let mut replacement_turn = None;
+        for _ in 0..300 {
+            let input = harness
+                .state
+                .session_store
+                .input_for_request("replacement")
+                .unwrap();
+            if let Some(turn) = input.attached_turn_id {
+                assert!(input.interruption.unwrap().settled_at.is_some());
+                replacement_turn = Some(turn);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let replacement_turn = replacement_turn.expect("原执行退出后才绑定替代输入");
+        assert_ne!(replacement_turn, old_turn_id);
+        let old = harness
+            .state
+            .session_store
+            .canonical_turn_for_session_turn_id(&session_id, &old_turn_id)
+            .unwrap();
+        assert_eq!(old.status, CanonicalTurnStatus::Cancelled);
+        let store = harness.state.task_store().unwrap();
+        assert_eq!(
+            store
+                .get_task(&magi_core::TaskId::new(initial.root_task_id.unwrap()))
+                .unwrap()
+                .status,
+            magi_core::TaskStatus::Killed
+        );
+        assert!(
+            harness
+                .state
+                .session_store
+                .input_for_request("replace-next")
+                .unwrap()
+                .attached_turn_id
+                .is_none()
+        );
+        let replay = TurnService::new(harness.state.clone())
+            .submit(request)
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        harness
+            .provider
+            .set_completed_response("改做和普通队列均已完成");
+        harness
+            .wait_for_terminal(&session_id, &replacement_turn)
+            .await;
+        let mut last_turn = None;
+        for _ in 0..300 {
+            last_turn = harness
+                .state
+                .session_store
+                .input_for_request("replace-next")
+                .unwrap()
+                .attached_turn_id;
+            if last_turn.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        harness
+            .wait_for_terminal(&session_id, &last_turn.unwrap())
+            .await;
+        assert_eq!(
+            harness.state.queued_regular_session_turn_count(&session_id),
+            0
+        );
+        let turns = harness
+            .state
+            .session_store
+            .canonical_turns_for_session(&session_id);
+        let mut turns = turns.iter().collect::<Vec<_>>();
+        turns.sort_by_key(|turn| turn.turn_seq);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[1].turn_id, replacement_turn);
+        for id in ["replace-root", "replace-next", "replacement"] {
+            assert_eq!(
+                turns
+                    .iter()
+                    .flat_map(|turn| &turn.items)
+                    .filter(|item| item.kind
+                        == magi_session_store::CanonicalTurnItemKind::UserMessage
+                        && item
+                            .metadata
+                            .get("requestId")
+                            .and_then(|value| value.as_str())
+                            == Some(id))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn task_profile_consumes_queued_guidance_without_replacing_the_active_turn() {
         let harness = MagiTurnHarness::new_task("不会先完成");
         harness.provider.set_hold_for_cancellation();
@@ -12716,8 +17706,8 @@ done
         )
         .unwrap();
         assert_eq!(
-            queue["queuedTurns"][0]["canGuide"], true,
-            "task 轮次必须允许纯文字引导"
+            queue["queuedTurns"][0]["guide"]["status"], "ready",
+            "task 轮次必须允许纯文字补充"
         );
         let guided = app
             .oneshot(
@@ -12726,7 +17716,7 @@ done
                     .uri("/api/session/queue/guide")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({ "sessionId": session_id, "queueId": queued.queue_id })
+                        serde_json::json!({ "sessionId": session_id, "queueId": queued.queue_id, "expectedTurnId": turn_id })
                             .to_string(),
                     ))
                     .unwrap(),
@@ -12765,6 +17755,107 @@ done
                     && message.content.as_deref() == Some("优先收口当前响应")),
             "引导必须作为真实用户输入送到 Provider"
         );
+        let inputs = harness.state.session_store.inputs_for_session(&session_id);
+        let root_input = inputs
+            .iter()
+            .find(|input| input.request_id == "harness-steer-root-request")
+            .unwrap();
+        let guidance = inputs
+            .iter()
+            .find(|input| input.request_id == "harness-steer-request")
+            .unwrap();
+        assert_eq!(
+            root_input.state,
+            magi_session_store::SessionInputState::Consumed
+        );
+        assert_eq!(
+            guidance.state,
+            magi_session_store::SessionInputState::Consumed
+        );
+        let root_step = root_input.consumption.as_ref().unwrap();
+        let steer_step = guidance.consumption.as_ref().unwrap();
+        assert_ne!(
+            root_step.step_id, steer_step.step_id,
+            "迟到引导不能被领取进已经冻结的首个请求"
+        );
+        let root_task = harness
+            .state
+            .task_store()
+            .unwrap()
+            .get_task(&magi_core::TaskId::new(initial.root_task_id.unwrap()))
+            .unwrap();
+        let scopes = harness
+            .provider
+            .state
+            .lock()
+            .unwrap()
+            .execution_scopes
+            .clone();
+        assert_eq!(scopes.len(), requests.len());
+        let scope_values = scopes
+            .iter()
+            .map(|scope| {
+                assert_eq!(
+                    serde_json::to_value(&scope.policy).unwrap(),
+                    serde_json::to_value(root_task.policy_snapshot.as_ref().unwrap()).unwrap()
+                );
+                serde_json::json!({
+                    "workingDir": scope.working_dir,
+                    "policy": scope.policy,
+                    "requiresNativeTools": scope.requires_native_tools,
+                    "closedSkillScope": scope.closed_skill_scope,
+                })
+            })
+            .collect::<Vec<_>>();
+        use sha2::Digest;
+        let first_request_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&serde_json::json!({
+                    "request": requests[0], "maxOutputTokens": null,
+                    "executorCapabilities": harness.provider.executor_capabilities(),
+                    "purpose": magi_session_store::ModelStepPurpose::Execution,
+                    "executionScope": scope_values[0],
+                }))
+                .unwrap()
+            )
+        );
+        let second_request_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&serde_json::json!({
+                    "request": requests[1], "maxOutputTokens": null,
+                    "executorCapabilities": harness.provider.executor_capabilities(),
+                    "purpose": magi_session_store::ModelStepPurpose::Execution,
+                    "executionScope": scope_values[1],
+                }))
+                .unwrap()
+            )
+        );
+        assert_eq!(root_step.request_fingerprint, first_request_hash);
+        assert_eq!(steer_step.request_fingerprint, second_request_hash);
+        assert_eq!(terminal.model_steps.len(), requests.len());
+        assert!(
+            terminal
+                .model_steps
+                .iter()
+                .all(|step| step.status == magi_session_store::ModelStepStatus::ResponseReceived)
+        );
+        assert_eq!(
+            terminal.model_steps[0].request_fingerprint,
+            first_request_hash
+        );
+        assert_eq!(
+            terminal.model_steps[1].request_fingerprint,
+            second_request_hash
+        );
+        assert!(
+            terminal.model_steps[1]
+                .input_request_ids
+                .iter()
+                .any(|id| id == "harness-steer-request")
+        );
+
         assert_eq!(
             terminal
                 .items
@@ -13128,6 +18219,45 @@ done
             "失败 Turn 终态完成后不得继续占用 Coordinator 当前槽位"
         );
 
+        let before_turns = serde_json::to_value(
+            harness
+                .state
+                .session_store
+                .canonical_turns_for_session(&session_id),
+        )
+        .unwrap();
+        let before_requests = harness.provider.requests().len();
+        let wrong_root = magi_core::TaskId::new("stale-agent-center-root");
+        let stale = crate::turn_service::continue_session_with_expected_root(
+            &harness.state,
+            crate::dto::ContinueSessionRequest {
+                session_id: session_id.to_string(),
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
+                prompt_text: None,
+                requested_agent_ids: Vec::new(),
+                request_id: Some("stale-root-continue".into()),
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+            Some(&wrong_root),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(stale, crate::errors::ApiError::Conflict(_)));
+        assert_eq!(
+            serde_json::to_value(
+                harness
+                    .state
+                    .session_store
+                    .canonical_turns_for_session(&session_id),
+            )
+            .unwrap(),
+            before_turns,
+            "旧卡片请求不能接纳另一个根任务的恢复 Turn"
+        );
+        assert_eq!(harness.provider.requests().len(), before_requests);
+
         harness.provider.set_completed_response("继续后完成");
         let response = crate::routes::build_router(harness.state.clone())
             .oneshot(
@@ -13213,6 +18343,95 @@ done
             1,
             "调用层放弃后不应再重跑同一请求"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_task_without_client_item_id_preserves_creation_identity_through_consumption_and_replay()
+     {
+        let harness = MagiTurnHarness::new_task("完成");
+        harness.provider.set_hold_for_cancellation();
+        let first = harness
+            .submit_task("先执行这一条", "queue-no-item-first", "queue-first-user")
+            .await
+            .unwrap();
+        let session = SessionId::new(&first.session_id);
+        // 使用原始 HTTP DTO，故意省略 userMessageId，与真实客户端和 Goal 重提相同。
+        let body = serde_json::json!({
+            "sessionId": session, "scope": "personal", "text": "再执行这一条",
+            "requestId": "queue-no-item-next",
+        });
+        let submit = || {
+            crate::routes::build_router(harness.state.clone()).oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/turn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let response = submit().await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued["queued"], true);
+        let original = harness
+            .state
+            .session_store
+            .input_for_request("queue-no-item-next")
+            .unwrap();
+        harness.provider.set_completed_response("完成");
+        harness
+            .wait_for_terminal(&session, first.turn_id.as_deref().unwrap())
+            .await;
+        let mut next = None;
+        for _ in 0..1000 {
+            next = harness
+                .state
+                .session_store
+                .canonical_turn_for_request_id("queue-no-item-next");
+            if next.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let next = next.expect("省略 item ID 的排队消息必须启动");
+        let turn = harness.wait_for_terminal(&session, &next.turn_id).await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed);
+        let consumed = harness
+            .state
+            .session_store
+            .input_for_request("queue-no-item-next")
+            .unwrap();
+        assert_eq!(
+            consumed.state,
+            magi_session_store::SessionInputState::Consumed
+        );
+        assert_eq!(consumed.request_fingerprint, original.request_fingerprint);
+        assert_eq!(consumed.user_message_id, original.user_message_id);
+        assert_eq!(harness.state.queued_regular_session_turn_count(&session), 0);
+        assert_eq!(
+            turn.items
+                .iter()
+                .filter(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+                .count(),
+            1
+        );
+        let calls = harness.provider.requests().len();
+        let replay = submit().await.unwrap();
+        assert_eq!(replay.status(), axum::http::StatusCode::OK);
+        let replay: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["turnId"], turn.turn_id);
+        assert_eq!(harness.provider.requests().len(), calls);
     }
 
     #[tokio::test]
@@ -13348,7 +18567,108 @@ done
     }
 
     #[tokio::test]
-    async fn workspace_task_with_external_git_branch_drift_fails_before_provider_dispatch() {
+    async fn workspace_resources_are_prepared_only_for_execution_and_first_write_is_tracked() {
+        for mode in ["chat", "read", "write"] {
+            let harness = MagiTurnHarness::new_task("完成");
+            harness.state.install_snapshot_lifecycle_observer();
+            let (workspace_id, root) = register_git_workspace(&harness);
+            let session = SessionId::new(format!("harness-lazy-{mode}"));
+            harness
+                .state
+                .session_store
+                .create_session_for_workspace(
+                    session.clone(),
+                    "按需工作区",
+                    Some(workspace_id.to_string()),
+                )
+                .unwrap();
+            let target = root.join("first-write.txt");
+            match mode {
+                "read" => harness.provider.set_tool_then_completed(
+                    "file_read",
+                    serde_json::json!({"path": root.join("README.md")}).to_string(),
+                    "完成",
+                ),
+                "write" => harness.provider.set_tool_then_completed(
+                    "file_write",
+                    serde_json::json!({"path": target, "content": "tracked"}).to_string(),
+                    "完成",
+                ),
+                _ => {}
+            }
+            let accepted = harness
+                .submit_workspace_task_with_access_profile(
+                    &session,
+                    &workspace_id,
+                    &root,
+                    "按实际提供的工具完成任务",
+                    &format!("lazy-{mode}"),
+                    &format!("lazy-user-{mode}"),
+                    Some(AccessProfile::FullAccess),
+                )
+                .await
+                .unwrap();
+            let turn = harness
+                .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+                .await;
+            assert_eq!(
+                turn.status,
+                CanonicalTurnStatus::Completed,
+                "{mode}: {turn:?}"
+            );
+            assert!(!harness.provider.requests().is_empty());
+            if mode == "write" {
+                assert_eq!(fs::read_to_string(&target).unwrap(), "tracked");
+                let snapshot = harness
+                    .state
+                    .snapshot_manager
+                    .get_session(session.as_str())
+                    .unwrap();
+                assert!(
+                    snapshot
+                        .pending_changes()
+                        .unwrap()
+                        .iter()
+                        .any(|change| change.path.ends_with("first-write.txt")),
+                    "第一次写入必须进入变更账本"
+                );
+                assert!(
+                    harness
+                        .state
+                        .session_code_contexts
+                        .get(session.as_str())
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    harness
+                        .state
+                        .snapshot_manager
+                        .get_session(session.as_str())
+                        .is_none(),
+                    "{mode}"
+                );
+                assert!(
+                    harness
+                        .state
+                        .session_code_contexts
+                        .get(session.as_str())
+                        .is_none(),
+                    "{mode}"
+                );
+            }
+            assert!(
+                !harness
+                    .state
+                    .workspace_git_coordinator
+                    .session_holds_execution(session.as_str(), &root.join(".git")),
+                "完成后不能遗留执行租约"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_task_with_external_git_branch_drift_blocks_first_workspace_execution() {
         let harness = MagiTurnHarness::new_task("不会在漂移 workspace 中执行");
         let (workspace_id, workspace_root) = register_git_workspace(&harness);
         let session_id = SessionId::new("harness-git-drift-session");
@@ -13372,6 +18692,12 @@ done
             .release_session_git_execution_lease(&session_id);
         git_fixture_command(&workspace_root, &["switch", "-c", "external/drift"]);
 
+        let target = workspace_root.join("must-not-write.txt");
+        harness.provider.set_tool_then_completed(
+            "file_write",
+            serde_json::json!({"path": target, "content": "must not execute"}).to_string(),
+            "不会执行到这里",
+        );
         let response = harness
             .submit_workspace_task(
                 &session_id,
@@ -13409,8 +18735,8 @@ done
             "Git 漂移必须保留可诊断的 task 阻塞事实: {task:?}"
         );
         assert!(
-            harness.provider.requests().is_empty(),
-            "Git 前置检查失败时不得向 Provider 派发请求"
+            !harness.provider.requests().is_empty(),
+            "Git 校验由模型选择本地执行后触发，不能阻塞首个模型请求"
         );
         let context = harness
             .state
@@ -13418,6 +18744,29 @@ done
             .get(session_id.as_str())
             .expect("Git 漂移后 context 仍应可恢复");
         assert!(context.has_external_drift());
+        assert!(!target.exists(), "准备失败不得产生写入副作用");
+        assert!(turn.items.iter().any(|item| {
+            serde_json::to_string(item)
+                .unwrap()
+                .contains("workspace_preparation_failed")
+        }));
+        let thread_id = &turn.model_steps.first().unwrap().thread_id;
+        let history = harness
+            .state
+            .session_store
+            .thread_message_history(thread_id);
+        assert!(
+            history
+                .iter()
+                .filter(|message| message.role == "tool")
+                .filter_map(|message| message.content.as_deref())
+                .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                .any(
+                    |result| result["error_code"] == "workspace_preparation_failed"
+                        && result["execution_started"] == false
+                ),
+            "恢复线程必须保留明确未执行回执，不能变成未知副作用"
+        );
 
         let _ = fs::remove_dir_all(workspace_root);
     }
@@ -13447,6 +18796,9 @@ done
         fs::write(workspace_root.join("README.md"), "dirty change\n")
             .expect("Git dirty file should write");
 
+        harness
+            .provider
+            .set_tool_then_completed("git_status", "{}", "dirty workspace 完成");
         let response = harness
             .submit_workspace_task(
                 &session_id,
@@ -13477,7 +18829,7 @@ done
     }
 
     #[tokio::test]
-    async fn workspace_task_with_git_merge_conflict_fails_before_provider_dispatch() {
+    async fn workspace_task_with_git_merge_conflict_blocks_first_workspace_execution() {
         let harness = MagiTurnHarness::new_task("不会在冲突 workspace 中执行");
         let (workspace_id, workspace_root) = register_git_workspace(&harness);
         let session_id = SessionId::new("harness-git-conflict-session");
@@ -13511,6 +18863,9 @@ done
         git_fixture_command(&workspace_root, &["commit", "-m", "main change"]);
         git_fixture_command_expect_failure(&workspace_root, &["merge", "conflicting"]);
 
+        harness
+            .provider
+            .set_tool_then_completed("git_status", "{}", "不会执行到这里");
         let response = harness
             .submit_workspace_task(
                 &session_id,
@@ -13542,8 +18897,8 @@ done
                 .any(|message| { message.contains("未解决的 Git merge conflict") })
         );
         assert!(
-            harness.provider.requests().is_empty(),
-            "Git 冲突前置检查失败时不得向 Provider 派发请求"
+            !harness.provider.requests().is_empty(),
+            "工作区冲突不能阻止模型接收输入，必须在实际工作区执行前拒绝"
         );
         let context = harness
             .state

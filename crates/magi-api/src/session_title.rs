@@ -314,6 +314,10 @@ mod tests {
     }
 
     impl ModelBridgeClient for StubAuxiliaryClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,

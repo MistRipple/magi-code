@@ -88,18 +88,27 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .and_then(|tv| tv["budget_tokens"].as_u64())
             .map(|n| n as u32);
 
-        let max_tokens = match (thinking_value.as_ref(), thinking_budget_floor) {
-            (Some(_), Some(budget)) => {
-                let floor = budget
-                    .saturating_add(4096)
-                    .max(MIN_MAX_TOKENS_WITH_THINKING);
-                params.max_tokens.unwrap_or(floor).max(floor)
-            }
-            (Some(_), None) => params
-                .max_tokens
-                .unwrap_or(MIN_MAX_TOKENS_WITH_THINKING)
+        if params.max_tokens == Some(0) {
+            return Err("executor_output_limit_incompatible: 输出上限必须大于零".into());
+        }
+        if params
+            .max_tokens
+            .zip(thinking_budget_floor)
+            .is_some_and(|(limit, budget)| limit <= budget)
+        {
+            return Err("executor_output_limit_incompatible: 单次输出上限必须大于当前 Anthropic thinking 预算，请提高上限或调整推理强度".into());
+        }
+        let max_tokens = match (
+            params.max_tokens,
+            thinking_value.as_ref(),
+            thinking_budget_floor,
+        ) {
+            (Some(limit), _, _) => limit,
+            (None, Some(_), Some(budget)) => budget
+                .saturating_add(4096)
                 .max(MIN_MAX_TOKENS_WITH_THINKING),
-            (None, _) => params.max_tokens.unwrap_or(4096),
+            (None, Some(_), None) => MIN_MAX_TOKENS_WITH_THINKING,
+            (None, None, _) => 4096,
         };
 
         let mut body = json!({
@@ -577,6 +586,33 @@ mod tests {
         assert_eq!(adapted.body["thinking"]["type"], "adaptive");
         assert_eq!(adapted.body["output_config"]["effort"], "high");
         assert!(adapted.body["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn explicit_output_limit_is_never_raised_to_the_thinking_default() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".into(),
+            content: LlmMessageContent::Text("bounded".into()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::High);
+        params.max_tokens = Some(1024);
+        assert!(
+            AnthropicMessagesAdapter
+                .build_request(&params, "claude-opus-4-5-20250930")
+                .unwrap_err()
+                .contains("executor_output_limit_incompatible")
+        );
+        params.max_tokens = Some(17_000);
+        let request = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-5-20250930")
+            .unwrap();
+        assert_eq!(request.body["max_tokens"], 17_000);
+        assert_eq!(request.body["thinking"]["budget_tokens"], 16_384);
+        params.max_tokens = Some(1024);
+        let request = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-8-20260815")
+            .unwrap();
+        assert_eq!(request.body["max_tokens"], 1024);
     }
 
     #[test]

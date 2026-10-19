@@ -91,6 +91,7 @@ export async function resolvePendingUserQuestion(
     bindingOverride(normalizedSessionId),
   );
   if (userQuestionState.sessionId === normalizedSessionId) {
+    ++syncRevision;
     userQuestionState.pending = userQuestionState.pending.filter(
       (question) => question.questionId !== questionId.trim(),
     );

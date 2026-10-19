@@ -266,9 +266,150 @@ impl CanonicalTurnItemStatus {
     }
 }
 
+/// 输入与 Turn 共用 session 事件日志；payload 保存接纳时冻结的业务请求。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInput {
+    pub input_id: String,
+    pub session_id: SessionId,
+    pub request_id: String,
+    pub user_message_id: String,
+    pub request_fingerprint: String,
+    pub accepted_at: UtcMillis,
+    pub revision: u64,
+    pub state: SessionInputState,
+    pub attached_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumption: Option<InputConsumption>,
+    /// 停止并改做的持久结算屏障；保留原 Turn/Task 来源，不复制执行状态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<InputInterruption>,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputInterruption {
+    pub turn_id: String,
+    pub root_task_id: Option<TaskId>,
+    pub settled_at: Option<UtcMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// consumed 表示已包含于这份冻结请求；发送前后崩溃都不能据此猜测供应商是否收到。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputConsumption {
+    pub step_id: String,
+    pub request_fingerprint: String,
+    pub provider: String,
+    pub message_count: usize,
+    pub tool_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInputState {
+    Pending,
+    Attached,
+    Consumed,
+    Cancelled,
+}
+
+impl SessionInput {
+    pub fn validate_snapshot(&self) -> DomainResult<()> {
+        if self.revision == 0
+            || self.session_id.as_str().trim().is_empty()
+            || self.input_id.trim().is_empty()
+            || self.request_id.trim().is_empty()
+            || self.user_message_id.trim().is_empty()
+            || self.request_fingerprint.is_empty()
+            || matches!(
+                self.state,
+                SessionInputState::Attached | SessionInputState::Consumed
+            ) != self.attached_turn_id.is_some()
+            || (self.state == SessionInputState::Consumed) != self.consumption.is_some()
+            || self
+                .consumption
+                .as_ref()
+                .is_some_and(|step| step.step_id.is_empty() || step.request_fingerprint.is_empty())
+            || self.interruption.as_ref().is_some_and(|interruption| {
+                interruption.turn_id.trim().is_empty()
+                    || interruption
+                        .root_task_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str().trim().is_empty())
+                    || interruption
+                        .settled_at
+                        .is_some_and(|at| at < self.accepted_at)
+                    || (matches!(
+                        self.state,
+                        SessionInputState::Attached | SessionInputState::Consumed
+                    ) && interruption.settled_at.is_none())
+            })
+        {
+            return Err(DomainError::Validation {
+                message: "输入身份或绑定状态无效".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_update_from(&self, previous: Option<&Self>) -> DomainResult<()> {
+        self.validate_snapshot()?;
+        let valid = match previous {
+            None => {
+                self.revision == 1
+                    && self
+                        .interruption
+                        .as_ref()
+                        .is_none_or(|value| value.settled_at.is_none())
+            }
+            Some(old) => {
+                ((old.state == SessionInputState::Pending
+                    && self.state != SessionInputState::Consumed)
+                    || (old.state == SessionInputState::Attached
+                        && self.state == SessionInputState::Consumed
+                        && self.attached_turn_id == old.attached_turn_id
+                        && self.payload == old.payload))
+                    && self.revision == old.revision.checked_add(1).unwrap_or(0)
+                    && self.input_id == old.input_id
+                    && self.session_id == old.session_id
+                    && self.request_id == old.request_id
+                    && self.user_message_id == old.user_message_id
+                    && self.request_fingerprint == old.request_fingerprint
+                    && self.accepted_at == old.accepted_at
+                    && match (&old.interruption, &self.interruption) {
+                        (None, None) => true,
+                        (Some(previous), Some(next)) => {
+                            previous.turn_id == next.turn_id
+                                && previous.root_task_id == next.root_task_id
+                                && (previous == next
+                                    || (previous.settled_at.is_none()
+                                        && old.state == SessionInputState::Pending
+                                        && self.state == SessionInputState::Pending
+                                        && self.payload == old.payload))
+                        }
+                        _ => false,
+                    }
+            }
+        };
+        if !valid {
+            return Err(DomainError::InvalidState {
+                message: "输入 revision 冲突或已经绑定/撤销".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalTurnEventKind {
+    ModelStepUpdated,
+    InputUpdated,
+    InputImported,
     TurnStarted,
     TurnItemUpsert,
     TurnUpdated,
@@ -295,6 +436,10 @@ pub struct CanonicalTurnEvent {
     pub turn: Option<CanonicalTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<CanonicalTurnItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<SessionInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_step: Option<crate::ModelStep>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -374,7 +519,103 @@ pub struct CanonicalTurnItem {
 }
 
 impl CanonicalTurnItem {
+    pub fn background_job(&self) -> DomainResult<Option<magi_tool_runtime::BackgroundJob>> {
+        let job: Option<magi_tool_runtime::BackgroundJob> = self
+            .metadata
+            .get(magi_tool_runtime::BACKGROUND_JOB_METADATA_KEY)
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| DomainError::Validation {
+                message: error.to_string(),
+            })?;
+        if let Some(job) = &job {
+            job.validate_snapshot()
+                .map_err(|message| DomainError::Validation { message })?;
+            if job.item_id != self.item_id
+                || job.turn_id != self.turn_id
+                || job.session_id != self.session_id
+                || self
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.task_id.as_ref())
+                    != Some(&job.task_id)
+                || self.tool.as_ref().is_none_or(|tool| {
+                    tool.name != "shell_exec" || tool.call_id != job.tool_call_id
+                })
+            {
+                return Err(DomainError::InvalidState {
+                    message: "后台 Job 与 canonical item 来源不匹配".into(),
+                });
+            }
+        }
+        Ok(job)
+    }
+
     pub fn validate_update_from(&self, existing: &Self) -> DomainResult<()> {
+        if existing.metadata.contains_key("executorFailure") {
+            reject_changed_field(
+                "executorFailure",
+                self.metadata == existing.metadata,
+                &self.item_id,
+            )?;
+        }
+        reject_changed_field(
+            "recoverySourceTurnId",
+            self.metadata.get("recoverySourceTurnId")
+                == existing.metadata.get("recoverySourceTurnId"),
+            &self.item_id,
+        )?;
+        let old_question = existing.user_question()?;
+        let next_question = self.user_question()?;
+        if let Some(old) = old_question {
+            let next = next_question.ok_or_else(|| DomainError::InvalidState {
+                message: "不能删除提问事实".into(),
+            })?;
+            if next.request != old.request
+                || (old.response.is_some() && next.response != old.response)
+                || (old.cancelled_at.is_some() && next.cancelled_at != old.cancelled_at)
+            {
+                return Err(DomainError::InvalidState {
+                    message: "不能改写提问身份或已确认答复".into(),
+                });
+            }
+        }
+        if let Some(source) = existing.metadata.get("approvalSource")
+            && self.metadata.get("approvalSource") != Some(source)
+        {
+            return Err(DomainError::InvalidState {
+                message: "不能更改审批执行来源".into(),
+            });
+        }
+        let old_approval = existing.tool_approval()?;
+        let next_approval = self.tool_approval()?;
+        if let Some(old) = old_approval {
+            let next = next_approval.ok_or_else(|| DomainError::InvalidState {
+                message: "不能删除审批事实".into(),
+            })?;
+            if next.request != old.request
+                || next.normalized_arguments != old.normalized_arguments
+                || next.execution_root != old.execution_root
+                || next.policy_snapshot != old.policy_snapshot
+                || old.decision.is_some()
+                    && (next.decision != old.decision || next.decided_at != old.decided_at)
+                || old.cancelled_at.is_some() && next.cancelled_at != old.cancelled_at
+                || old.execution.is_some() && next.execution != old.execution
+            {
+                return Err(DomainError::InvalidState {
+                    message: "不能改写审批范围、决定或执行领取".into(),
+                });
+            }
+        }
+        let old_job = existing.background_job()?;
+        let next_job = self.background_job()?;
+        if next_job != old_job {
+            let next = next_job.ok_or_else(|| DomainError::InvalidState {
+                message: "不能删除后台 Job 事实".into(),
+            })?;
+            next.validate_update_from(old_job.as_ref())
+                .map_err(|message| DomainError::InvalidState { message })?;
+        }
         reject_changed_field(
             "sessionId",
             self.session_id == existing.session_id,
@@ -426,11 +667,86 @@ pub struct CanonicalTurn {
     pub usage: Option<Value>,
     #[serde(default)]
     pub items: Vec<CanonicalTurnItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_steps: Vec<crate::ModelStep>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, Value>,
 }
 
 impl CanonicalTurn {
+    pub fn validate_model_steps(&self) -> DomainResult<()> {
+        self.agent_turn_binding()?;
+        let mut job_ids = std::collections::HashSet::new();
+        let mut questions = std::collections::HashSet::new();
+        let mut approvals = std::collections::HashSet::new();
+        for item in &self.items {
+            if let Some(value) = item.metadata.get("executorFailure") {
+                let evidence: magi_core::ExecutorFailureEvidence =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        DomainError::Validation {
+                            message: error.to_string(),
+                        }
+                    })?;
+                evidence
+                    .validate()
+                    .map_err(|message| DomainError::Validation { message })?;
+                let source = item
+                    .metadata
+                    .get("modelStepId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.model_steps.iter().find(|step| step.step_id == id));
+                if source.is_none_or(|step| {
+                    step.status != crate::ModelStepStatus::OutcomeUnknown
+                        || step.thread_id != item.source_thread_id
+                        || step.task_id.as_ref()
+                            != item
+                                .worker
+                                .as_ref()
+                                .and_then(|worker| worker.task_id.as_ref())
+                        || step.executor_capabilities.as_ref().is_none_or(|caps| {
+                            caps.tools != magi_app_server_protocol::ExecutorToolMode::ExecutorOwned
+                        })
+                }) || item.kind != CanonicalTurnItemKind::SystemNotice
+                {
+                    return Err(DomainError::InvalidState {
+                        message: "执行器失败证据与原 Step/Task/Thread 不匹配".into(),
+                    });
+                }
+            }
+            if let Some(approval) = item.tool_approval()?
+                && !approvals.insert(approval.request.approval_id)
+            {
+                return Err(DomainError::InvalidState {
+                    message: "审批身份重复".into(),
+                });
+            }
+            if let Some(question) = item.user_question()?
+                && !questions.insert(question.request.question_id)
+            {
+                return Err(DomainError::InvalidState {
+                    message: "提问身份重复".into(),
+                });
+            }
+            if let Some(job) = item.background_job()?
+                && !job_ids.insert(job.job_id)
+            {
+                return Err(DomainError::InvalidState {
+                    message: "后台 Job 身份重复".into(),
+                });
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for step in &self.model_steps {
+            step.validate_snapshot()?;
+            if !ids.insert(&step.step_id) {
+                return Err(DomainError::InvalidState {
+                    message: "模型 Step 身份重复".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// 该轮是否为用户显式发起的会话命令。
     pub fn is_session_command(&self) -> bool {
         self.items.iter().any(|item| {
@@ -448,6 +764,34 @@ impl CanonicalTurn {
     }
 
     pub fn validate_update_from(&self, existing: &Self) -> DomainResult<()> {
+        self.validate_model_steps()?;
+        reject_changed_field(
+            "agentExecution",
+            self.agent_turn_binding()? == existing.agent_turn_binding()?,
+            &self.turn_id,
+        )?;
+        if self.model_steps.len() < existing.model_steps.len() {
+            return Err(DomainError::InvalidState {
+                message: "不能删除模型 Step".into(),
+            });
+        }
+        for (old, next) in existing.model_steps.iter().zip(&self.model_steps) {
+            next.validate_update_from(old)?;
+        }
+        if (existing.status.is_terminal() || existing.completed_at.is_some())
+            && self.model_steps != existing.model_steps
+        {
+            if self.model_steps.len() != existing.model_steps.len() {
+                return Err(DomainError::InvalidState {
+                    message: "终态 Turn 不能接纳新模型 Step".into(),
+                });
+            }
+            for (old, next) in existing.model_steps.iter().zip(&self.model_steps) {
+                if old != next {
+                    next.validate_terminal_settlement_from(old)?;
+                }
+            }
+        }
         reject_changed_field(
             "sessionId",
             self.session_id == existing.session_id,
@@ -979,19 +1323,15 @@ impl NotificationRecord {
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
     Active,
+    #[serde(alias = "budget_limited", alias = "usage_limited")]
     Paused,
     Blocked,
-    UsageLimited,
-    BudgetLimited,
     Complete,
 }
 
 impl GoalStatus {
     pub fn is_unfinished(self) -> bool {
-        matches!(
-            self,
-            Self::Active | Self::Paused | Self::Blocked | Self::UsageLimited | Self::BudgetLimited
-        )
+        matches!(self, Self::Active | Self::Paused | Self::Blocked)
     }
 }
 
@@ -1036,9 +1376,7 @@ pub struct GoalCompletionRecord {
     pub completed_at: UtcMillis,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionGoal {
+persisted_without_task_budget!(SessionGoal, "SessionGoal", ["tokenBudget", "tokensReserved", "budgetRequiredTokens", "runBudget", "budgetActiveMillis"], {
     pub goal_id: GoalId,
     pub session_id: SessionId,
     pub thread_id: ThreadId,
@@ -1050,10 +1388,11 @@ pub struct SessionGoal {
     pub control_revision: u64,
     #[serde(default)]
     pub access_profile: AccessProfile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<u64>,
     #[serde(default)]
     pub tokens_used: u64,
+    /// 从 Step journal 派生，包含失败或结果未知的 transport 尝试。
+    #[serde(default)]
+    pub model_attempts_used: u64,
     #[serde(default)]
     pub time_used_seconds: u64,
     #[serde(default)]
@@ -1070,7 +1409,7 @@ pub struct SessionGoal {
     pub completion: Option<GoalCompletionRecord>,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
-}
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GoalRevisionExpectation {
@@ -1149,6 +1488,8 @@ pub struct SessionStoreState {
     pub timeline: Vec<TimelineEntry>,
     #[serde(default)]
     pub canonical_turns: Vec<CanonicalTurn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<SessionInput>,
     pub notifications: Vec<NotificationRecord>,
     #[serde(default)]
     pub goals: Vec<SessionGoal>,
@@ -1171,6 +1512,8 @@ pub struct SessionDurableState {
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
     pub canonical_turns: Vec<CanonicalTurn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<SessionInput>,
     pub notifications: Vec<NotificationRecord>,
     pub goals: Vec<SessionGoal>,
     pub plans: Vec<SessionPlan>,
@@ -1184,6 +1527,7 @@ fn durable_state_for_session_parts(
     sessions: &[SessionRecord],
     timeline: &[TimelineEntry],
     canonical_turns: &[CanonicalTurn],
+    inputs: &[SessionInput],
     notifications: &[NotificationRecord],
     goals: &[SessionGoal],
     plans: &[SessionPlan],
@@ -1209,6 +1553,11 @@ fn durable_state_for_session_parts(
         canonical_turns: canonical_turns
             .iter()
             .filter(|turn| &turn.session_id == session_id)
+            .cloned()
+            .collect(),
+        inputs: inputs
+            .iter()
+            .filter(|input| &input.session_id == session_id)
             .cloned()
             .collect(),
         notifications: notifications
@@ -1254,6 +1603,7 @@ impl SessionDurableState {
             && self.sessions.is_empty()
             && self.timeline.is_empty()
             && self.canonical_turns.is_empty()
+            && self.inputs.is_empty()
             && self.notifications.is_empty()
             && self.goals.is_empty()
             && self.plans.is_empty()
@@ -1272,6 +1622,7 @@ impl SessionDurableState {
         self.sessions.extend(other.sessions);
         self.timeline.extend(other.timeline);
         self.canonical_turns.extend(other.canonical_turns);
+        self.inputs.extend(other.inputs);
         self.notifications.extend(other.notifications);
         self.goals.extend(other.goals);
         self.plans.extend(other.plans);
@@ -1290,6 +1641,7 @@ impl SessionDurableState {
             &self.sessions,
             &self.timeline,
             &self.canonical_turns,
+            &self.inputs,
             &self.notifications,
             &self.goals,
             &self.plans,
@@ -1307,6 +1659,7 @@ impl SessionStoreState {
             &self.sessions,
             &self.timeline,
             &self.canonical_turns,
+            &self.inputs,
             &self.notifications,
             &self.goals,
             &self.plans,
@@ -1360,6 +1713,7 @@ impl SessionStoreState {
             sessions: durable_state.sessions,
             timeline,
             canonical_turns,
+            inputs: durable_state.inputs,
             notifications,
             goals,
             plans,
@@ -1375,6 +1729,7 @@ impl SessionStoreState {
             sessions: self.sessions.clone(),
             timeline: self.timeline.clone(),
             canonical_turns: self.canonical_turns.clone(),
+            inputs: self.inputs.clone(),
             notifications: self.notifications.clone(),
             goals: self.goals.clone(),
             plans: self.plans.clone(),
@@ -1565,6 +1920,9 @@ pub struct ThreadFileFactVersion {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadChatMessage {
+    /// canonical 用户 item 的 requestId；历史投影携带身份，不以正文猜测输入消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_request_id: Option<String>,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,

@@ -372,6 +372,24 @@ fn published_session_turn_item_from_sidecar(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return Ok(None);
     };
+    published_session_turn_item_from_turn(
+        session_store,
+        &sidecar.session_id,
+        turn,
+        chain_for_turn_summary(&sidecar, turn),
+        item_id,
+        task_store,
+    )
+}
+
+fn published_session_turn_item_from_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    chain: Option<&ActiveExecutionChain>,
+    item_id: &str,
+    task_store: Option<&TaskStore>,
+) -> Result<Option<PublishedSessionTurnItem>, String> {
     let item = turn
         .items
         .iter()
@@ -379,23 +397,22 @@ fn published_session_turn_item_from_sidecar(
         .ok_or_else(|| {
             format!(
                 "会话 {} 的 Turn {} 已写入 item {}，但无法从当前 Turn 生成发布快照",
-                sidecar.session_id, turn.turn_id, item_id
+                session_id, turn.turn_id, item_id
             )
         })
         .cloned()?;
-    let chain = chain_for_turn_summary(&sidecar, turn);
     let response_duration_ms = turn
         .completed_at
         .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
     let canonical_turn = session_store
-        .canonical_turns_for_session(&sidecar.session_id)
+        .canonical_turns_for_session(session_id)
         .into_iter()
         .find(|canonical| canonical.turn_id == turn.turn_id)
-        .or_else(|| to_canonical_turn(&sidecar.session_id, turn))
+        .or_else(|| to_canonical_turn(session_id, turn))
         .ok_or_else(|| {
             format!(
                 "会话 {} 的 Turn {} 无法转换为 canonical 发布快照",
-                sidecar.session_id, turn.turn_id
+                session_id, turn.turn_id
             )
         })?;
     let canonical_item = canonical_turn
@@ -403,11 +420,11 @@ fn published_session_turn_item_from_sidecar(
         .iter()
         .find(|candidate| candidate.item_id == item.item_id)
         .cloned()
-        .or_else(|| to_canonical_turn_item(&sidecar.session_id, turn, &item))
+        .or_else(|| to_canonical_turn_item(session_id, turn, &item))
         .ok_or_else(|| {
             format!(
                 "会话 {} 的 Turn {} item {} 无法转换为 canonical item",
-                sidecar.session_id, turn.turn_id, item_id
+                session_id, turn.turn_id, item_id
             )
         })?;
     Ok(Some(PublishedSessionTurnItem {
@@ -684,6 +701,7 @@ fn to_canonical_turn(session_id: &SessionId, turn: &ActiveExecutionTurn) -> Opti
         metadata.insert("requestId".to_string(), Value::String(request_id));
     }
     let mut canonical_turn = CanonicalTurn {
+        model_steps: Vec::new(),
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
@@ -1147,6 +1165,26 @@ fn append_session_turn_item_for_turn_raw(
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Result<Option<PublishedSessionTurnItem>, String> {
+    if let Some(turn_id) = expected_turn_id
+        && let Some(owned) = session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
+        && let Some(binding) = owned
+            .agent_turn_binding()
+            .map_err(|error| error.to_string())?
+    {
+        let item_id = item.item_id.clone();
+        let turn = session_store
+            .upsert_agent_turn_item(session_id, &binding.task_id, turn_id, item)
+            .map_err(|error| error.to_string())?;
+        let projected = session_store.project_canonical_execution_turn(&turn);
+        return published_session_turn_item_from_turn(
+            session_store,
+            session_id,
+            &projected,
+            None,
+            &item_id,
+            task_store,
+        );
+    }
     let item_id = item.item_id.clone();
     let sidecar = session_store
         .append_current_turn_item_for_turn(session_id, expected_turn_id, item)
@@ -1164,6 +1202,26 @@ fn upsert_session_turn_item_for_turn_raw(
     item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Result<Option<PublishedSessionTurnItem>, String> {
+    if let Some(turn_id) = expected_turn_id
+        && let Some(owned) = session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
+        && let Some(binding) = owned
+            .agent_turn_binding()
+            .map_err(|error| error.to_string())?
+    {
+        let item_id = item.item_id.clone();
+        let turn = session_store
+            .upsert_agent_turn_item(session_id, &binding.task_id, turn_id, item)
+            .map_err(|error| error.to_string())?;
+        let projected = session_store.project_canonical_execution_turn(&turn);
+        return published_session_turn_item_from_turn(
+            session_store,
+            session_id,
+            &projected,
+            None,
+            &item_id,
+            task_store,
+        );
+    }
     let item_id = item.item_id.clone();
     let sidecar = session_store
         .upsert_current_turn_item_for_turn(session_id, expected_turn_id, item)
@@ -1186,6 +1244,23 @@ pub fn publish_session_turn_item_event(
         published,
     );
     record_event_bus_item_timing(session_id, published, event_sequence);
+}
+
+/// 工具已返回后更新 Job 资源事实时仍使用原 item/Turn；不能把更新冒充新的 Turn 终态。
+pub fn publish_committed_canonical_item_event(
+    event_bus: &InMemoryEventBus,
+    notice: magi_session_store::CanonicalItemCommitNotice,
+) {
+    let session_id = notice.turn.session_id.clone();
+    let workspace_id = notice.workspace_id.map(WorkspaceId::new);
+    let payload = serde_json::json!({
+        "session_id":session_id, "workspace_id":workspace_id,
+        "turn_id":notice.turn.turn_id, "turn_seq":notice.turn.turn_seq,
+        "canonical_schema_version":CANONICAL_TURN_SCHEMA_VERSION,
+        "canonical_event_kind":CanonicalTurnEventKind::TurnItemUpsert,
+        "canonical_turn":notice.turn, "canonical_item":notice.item,
+    });
+    publish_session_turn_item_payload(event_bus, &session_id, &workspace_id, payload, None);
 }
 
 fn publish_session_turn_item_event_raw(

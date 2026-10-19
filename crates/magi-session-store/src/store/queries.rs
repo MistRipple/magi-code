@@ -348,6 +348,87 @@ impl SessionStore {
         Some(turn)
     }
 
+    /// 恢复能力来自已发送请求的合同，不能根据当前切换后的模型推断。
+    pub fn canonical_model_steps_for_task(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        thread_id: &magi_core::ThreadId,
+    ) -> Vec<crate::ModelStep> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .flat_map(|turn| &turn.model_steps)
+            .filter(|step| step.task_id.as_ref() == Some(task_id) && &step.thread_id == thread_id)
+            .cloned()
+            .collect()
+    }
+
+    /// 失败或取消后的原执行器证据；归属来自 canonical Step，不从 Task 摘要猜测。
+    pub fn executor_failures_for_task(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Vec<(String, magi_core::ExecutorFailureEvidence)> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .flat_map(|turn| &turn.items)
+            .filter(|item| {
+                item.worker
+                    .as_ref()
+                    .and_then(|worker| worker.task_id.as_ref())
+                    == Some(task_id)
+            })
+            .filter_map(|item| {
+                let step = item.metadata.get("modelStepId")?.as_str()?.to_owned();
+                let evidence =
+                    serde_json::from_value(item.metadata.get("executorFailure")?.clone()).ok()?;
+                Some((step, evidence))
+            })
+            .collect()
+    }
+
+    /// 执行恢复直接读取未压缩的工具事实，不能从模型摘要猜测副作用是否发生。
+    /// task 与 thread 同时匹配，避免同一主线程内的另一轮任务或兄弟代理污染账本。
+    pub fn canonical_tool_calls_for_task(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        thread_id: &magi_core::ThreadId,
+    ) -> Vec<crate::models::CanonicalTurnItem> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut calls = state
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .flat_map(|turn| &turn.items)
+            .filter(|item| {
+                item.kind == crate::models::CanonicalTurnItemKind::ToolCall
+                    && &item.source_thread_id == thread_id
+                    && item
+                        .worker
+                        .as_ref()
+                        .and_then(|worker| worker.task_id.as_ref())
+                        == Some(task_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        calls.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then(left.item_seq.cmp(&right.item_seq))
+                .then(left.item_id.cmp(&right.item_id))
+        });
+        calls
+    }
+
     /// 按协议 requestId 找回已经持久化的 canonical Turn。
     ///
     /// App Server 客户端可能在服务端已经接受请求、但响应尚未送达时重试同一个
@@ -599,6 +680,10 @@ impl SessionStore {
                                     .active_branch_task_ids
                                     .iter()
                                     .any(|active_task_id| active_task_id == task_id)
+                                || chain
+                                    .branches
+                                    .iter()
+                                    .any(|branch| &branch.task_id == task_id)
                         });
                 let turn_matches = sidecar.current_turn.as_ref().is_some_and(|turn| {
                     turn.items

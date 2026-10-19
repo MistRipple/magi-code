@@ -112,7 +112,7 @@
   const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
   const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
-  const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
+  const inputDelivery = $derived(message.metadata?.inputDelivery);
   const messageTurnId = $derived(
     typeof message.metadata?.turnId === 'string' ? message.metadata.turnId.trim() : '',
   );
@@ -481,7 +481,7 @@
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
-  <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
+  <div class="message-item user" class:sending={sendingAnimation} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
     {#if messageContextReferences.length > 0}
       <div class="user-context-references">
         {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
@@ -568,8 +568,13 @@
         </div>
       </div>
     {/if}
+    {#if inputDelivery}
+      <span class="input-delivery" data-input-delivery={inputDelivery}
+        title={i18n.t(`messageItem.inputDelivery.${inputDelivery}.detail`)}>
+        {i18n.t(`messageItem.inputDelivery.${inputDelivery}`)}
+      </span>
+    {/if}
     <div class="user-time">
-      {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
       <span class="user-timestamp">{formatTraceableTime(message.timestamp)}</span>
       <div class="user-actions">
         {#if canEdit}
@@ -844,6 +849,12 @@
       visibility 0s linear 140ms;
   }
 
+  .input-delivery {
+    margin-top: 4px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+
   .message-item.user:hover .user-time,
   .message-item.user:focus-within .user-time {
     opacity: 1;
@@ -887,20 +898,6 @@
   .message-action:focus-visible {
     background: var(--background-hover);
     color: var(--foreground);
-  }
-
-  /* ===== 补充指令标签 ===== */
-  .supplementary-tag {
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: var(--radius-sm);
-    background: var(--foreground-muted);
-    color: var(--background);
-    opacity: 0.7;
-  }
-  .message-item.user.supplementary .user-content {
-    background: var(--primary);
-    opacity: 0.85;
   }
 
   /* ===== 助手消息基础样式：默认纯正文，不带卡片壳 ===== */

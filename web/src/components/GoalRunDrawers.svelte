@@ -39,8 +39,6 @@
   let observedActivePlanItemId = '';
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
-  let goalBudgetDraft = $state('');
-  let observedBudgetGoalRevision = '';
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
   let planClearLoading = $state(false);
   let goalNoteEl = $state<HTMLElement | null>(null);
@@ -111,10 +109,6 @@
       isEditingGoal = false;
     }
   });
-  const goalBudgetPct = $derived(
-    currentGoal ? goalBudgetPercent(currentGoal.tokensUsed, currentGoal.tokenBudget) : null,
-  );
-
   // 折叠状态下检测说明是否被截断，只有真被截断才显示“展开全文”。
   $effect(() => {
     const el = goalNoteEl;
@@ -153,16 +147,7 @@
     if (!isEditingGoal) {
       goalObjectiveDraft = currentGoal?.objective ?? '';
     }
-    if (currentGoal?.status === 'budget_limited') {
-      const revisionKey = `${currentGoal.goalId}:${currentGoal.controlRevision}`;
-      if (observedBudgetGoalRevision !== revisionKey) {
-        observedBudgetGoalRevision = revisionKey;
-        goalBudgetDraft = String(suggestedGoalBudget(currentGoal.tokensUsed));
-      }
-    } else {
-      observedBudgetGoalRevision = '';
-      goalBudgetDraft = '';
-    }
+
   });
 
   $effect(() => {
@@ -301,8 +286,6 @@
       case 'active': return i18n.t('goalPanel.goal.statusActive');
       case 'paused': return i18n.t('goalPanel.goal.statusPaused');
       case 'blocked': return i18n.t('goalPanel.goal.statusBlocked');
-      case 'usage_limited': return i18n.t('goalPanel.goal.statusUsageLimited');
-      case 'budget_limited': return i18n.t('goalPanel.goal.statusBudgetLimited');
       case 'complete': return i18n.t('goalPanel.goal.statusComplete');
       default: return goal.status;
     }
@@ -313,9 +296,7 @@
     switch (goal.status) {
       case 'complete': return 'check-circle';
       case 'paused': return 'pause';
-      case 'blocked':
-      case 'usage_limited':
-      case 'budget_limited': return 'alert-triangle';
+      case 'blocked': return 'alert-triangle';
       default: return 'target';
     }
   }
@@ -352,10 +333,6 @@
           evidence: goal.completion?.evidenceRefs ?? [],
         };
       }
-      case 'usage_limited':
-        return { text: i18n.t('goalPanel.note.usageLimited'), collapsible: false, meta: null, evidence: [] };
-      case 'budget_limited':
-        return { text: i18n.t('goalPanel.note.budgetLimited'), collapsible: false, meta: null, evidence: [] };
       case 'active':
         if (goal.continuation.phase !== 'waiting') return null;
         return {
@@ -381,30 +358,6 @@
 
   function goalCanResume(goal: SessionGoalDto): boolean {
     return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canResume === true;
-  }
-
-  /** 预算耗尽后继续所需的新预算建议值：已用量的 2 倍，向上取整到千，用户可直接修改。 */
-  function suggestedGoalBudget(tokensUsed: number): number {
-    const used = Number.isFinite(tokensUsed) ? Math.max(0, Math.round(tokensUsed)) : 0;
-    return Math.max(1000, Math.ceil((used * 2) / 1000) * 1000);
-  }
-
-  function goalResumeBudgetValid(goal: SessionGoalDto): boolean {
-    return goal.status !== 'budget_limited'
-      || Number.parseInt(goalBudgetDraft, 10) > goal.tokensUsed;
-  }
-
-  function goalBudgetLabel(tokensUsed: number, tokenBudget?: number | null): string {
-    const used = Number.isFinite(tokensUsed) ? Math.max(0, Math.round(tokensUsed)) : 0;
-    if (!tokenBudget || tokenBudget <= 0) {
-      return used.toLocaleString();
-    }
-    return `${used.toLocaleString()} / ${Math.round(tokenBudget).toLocaleString()}`;
-  }
-
-  function goalBudgetPercent(tokensUsed: number, tokenBudget?: number | null): number | null {
-    if (!tokenBudget || tokenBudget <= 0 || !Number.isFinite(tokensUsed)) return null;
-    return Math.min(100, Math.max(0, Math.round((tokensUsed / tokenBudget) * 100)));
   }
 
   function goalTimeLabel(seconds: number): string {
@@ -437,9 +390,6 @@
   }
 
   function goalActionRequest() {
-    const newTokenBudget = currentGoal?.status === 'budget_limited'
-      ? Number.parseInt(goalBudgetDraft, 10)
-      : undefined;
     const workspaceId = currentWorkspaceIdValue();
     const workspacePath = currentWorkspacePathValue();
     const workspaceScoped = Boolean(workspaceId || workspacePath);
@@ -451,7 +401,6 @@
       goalId: currentGoal?.goalId ?? '',
       expectedRevision: currentGoal?.controlRevision ?? 0,
       ...(currentPlan ? { expectedPlanRevision: currentPlan.revision } : {}),
-      ...(Number.isFinite(newTokenBudget) ? { newTokenBudget } : {}),
     };
   }
 
@@ -544,7 +493,6 @@
 
   async function resumeGoal(): Promise<void> {
     if (!currentGoal || !goalCanResume(currentGoal)) return;
-    if (!goalResumeBudgetValid(currentGoal)) return;
     await runGoalAction('resume', async () => {
       await createClient().resumeCurrentGoal({
         ...goalActionRequest(),
@@ -621,7 +569,7 @@
             <button
               type="button"
               class="plan-resume-action dock-btn dock-btn--warn"
-              disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
+              disabled={goalActionLoading !== null}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeBlockedPlan')}
             >
@@ -720,7 +668,7 @@
             <button
               type="button"
               class="icon-action dock-icon-btn"
-              disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
+              disabled={goalActionLoading !== null}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeGoalTitle')}
               aria-label={i18n.t('goalPanel.action.resumeGoalTitle')}
@@ -829,22 +777,11 @@
               {/if}
             </div>
           {/if}
-          {#if currentGoal.status === 'budget_limited'}
-            <label class="goal-budget-resume-field">
-              <span class="goal-budget-resume-copy">
-                <span>{i18n.t('goalPanel.goal.newBudget')}</span>
-                <span class="goal-budget-resume-hint">{i18n.t('goalPanel.goal.newBudgetHint')}</span>
-              </span>
-              <input
-                type="number"
-                min={currentGoal.tokensUsed + 1}
-                step="1000"
-                bind:value={goalBudgetDraft}
-                aria-invalid={!goalResumeBudgetValid(currentGoal)}
-              />
-            </label>
-          {/if}
           <div class="goal-metrics">
+            <span class="goal-metric">
+              <span class="goal-detail-label">{i18n.t('goalPanel.goal.attemptsUsed')}</span>
+              <strong>{(currentGoal.modelAttemptsUsed ?? 0).toLocaleString()}</strong>
+            </span>
             <span class="goal-metric">
               <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
               <strong>{goalTimeLabel(currentGoalTimeSeconds)}</strong>
@@ -853,19 +790,9 @@
               <span class="goal-detail-label">{i18n.t('goalPanel.goal.createdAt')}</span>
               <strong>{formatGoalDateTime(currentGoal.createdAt)}</strong>
             </span>
-            <span class="goal-metric goal-metric--budget">
-              <span class="goal-detail-label">{i18n.t('goalPanel.goal.budget')}</span>
-              <strong>{goalBudgetLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
-              {#if goalBudgetPct !== null}
-                <span
-                  class="goal-budget-bar"
-                  class:warn={goalBudgetPct >= 90}
-                  role="progressbar"
-                  aria-valuemin="0"
-                  aria-valuemax="100"
-                  aria-valuenow={goalBudgetPct}
-                ><span style="width: {goalBudgetPct}%"></span></span>
-              {/if}
+            <span class="goal-metric">
+              <span class="goal-detail-label">{i18n.t('goalPanel.goal.tokensUsed')}</span>
+              <strong>{currentGoal.tokensUsed.toLocaleString()}</strong>
             </span>
           </div>
         </div>
@@ -899,9 +826,7 @@
     --goal-tone: var(--foreground-muted);
   }
 
-  .goal-panel--blocked,
-  .goal-panel--usage_limited,
-  .goal-panel--budget_limited {
+  .goal-panel--blocked {
     --goal-tone: var(--warning);
   }
 
@@ -944,44 +869,6 @@
     outline-offset: 2px;
   }
 
-  .goal-budget-resume-field {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
-    align-items: center;
-    gap: 10px;
-    color: var(--foreground-muted);
-    font-size: 12px;
-  }
-
-  .goal-budget-resume-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    min-width: 0;
-  }
-
-  .goal-budget-resume-hint {
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    opacity: 0.85;
-  }
-
-  .goal-budget-resume-field input {
-    min-width: 0;
-    height: 28px;
-    padding: 0 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--vscode-input-background);
-    color: var(--foreground);
-    font: inherit;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .goal-budget-resume-field input[aria-invalid='true'] {
-    border-color: var(--error);
-  }
-
   .run-drawer-toggle:focus-visible {
     border-radius: 4px;
   }
@@ -991,11 +878,9 @@
     color: var(--foreground-muted);
   }
 
-
   .drawer-leading-icon :global(svg) {
     color: inherit;
   }
-
 
   .run-drawer-title {
     flex: 0 0 auto;
@@ -1004,7 +889,6 @@
   .goal-drawer-toggle {
     min-height: 28px;
   }
-
 
   .goal-heading {
     display: grid;
@@ -1060,13 +944,6 @@
     gap: 2px;
     flex: 0 0 auto;
   }
-
-
-
-
-
-
-
 
   .goal-edit-form {
     display: flex;
@@ -1203,34 +1080,6 @@
     font-variant-numeric: tabular-nums;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  /* Token 数值可能很长（已用 / 预算），窄屏下允许换行而不是省略。 */
-  .goal-metric--budget strong {
-    overflow-wrap: anywhere;
-    text-overflow: clip;
-    white-space: normal;
-  }
-
-  .goal-budget-bar {
-    display: block;
-    align-self: stretch;
-    height: 3px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--foreground) 10%, transparent);
-  }
-
-  .goal-budget-bar > span {
-    display: block;
-    height: 100%;
-    border-radius: inherit;
-    background: var(--primary);
-    transition: width var(--transition-fast);
-  }
-
-  .goal-budget-bar.warn > span {
-    background: var(--warning);
   }
 
   .goal-edit-input {

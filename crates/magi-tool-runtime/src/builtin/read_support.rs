@@ -1,44 +1,23 @@
 //! 文件查找、文本搜索与范围读取共用的权限、预算和取消边界。
 use super::{
+    cancellation::OperationCancellation,
     failure::{filesystem_failure, invalid_input, path_resolution_failure},
-    process::ProcessExecutionScope,
     resolve_path_with_context,
 };
-use crate::{ToolExecutionContext, ToolExecutionContextQuery, ToolRuntimeResources};
+use crate::{ToolExecutionContext, ToolRuntimeResources};
 use magi_core::ToolFailure;
 use serde_json::{Map, Value};
 use std::{
-    collections::HashMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 pub(super) const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
-static NEXT_READ: AtomicU64 = AtomicU64::new(1);
-type ActiveRead = (ProcessExecutionScope, Arc<AtomicBool>);
-static ACTIVE_READS: LazyLock<Mutex<HashMap<u64, ActiveRead>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub(crate) fn cancel_reads(query: Option<&ToolExecutionContextQuery>) -> usize {
-    let table = ACTIVE_READS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    table
-        .values()
-        .filter(|(scope, cancelled)| {
-            query.is_none_or(|query| scope.matches_query(query))
-                && !cancelled.swap(true, Ordering::SeqCst)
-        })
-        .count()
-}
 
 pub(super) fn bounded_usize(
     request: &Map<String, Value>,
@@ -59,20 +38,11 @@ pub(super) fn bounded_usize(
 }
 
 pub(super) struct ReadOperation {
-    id: u64,
     tool: &'static str,
-    cancelled: Arc<AtomicBool>,
+    cancellation: OperationCancellation,
     deadline: Instant,
     policy: magi_permissions::PermissionPolicy,
     profile: magi_core::AccessProfile,
-}
-impl Drop for ReadOperation {
-    fn drop(&mut self) {
-        ACTIVE_READS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
-    }
 }
 impl ReadOperation {
     pub(super) fn new(
@@ -82,32 +52,17 @@ impl ReadOperation {
         resources: &ToolRuntimeResources,
     ) -> Result<Arc<Self>, String> {
         let timeout = bounded_usize(request, "timeout_ms", 10_000, 60_000, tool)?;
-        let id = NEXT_READ.fetch_add(1, Ordering::Relaxed);
-        let cancelled = resources
-            .cancellation
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        ACTIVE_READS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                id,
-                (
-                    ProcessExecutionScope::from_context(context),
-                    cancelled.clone(),
-                ),
-            );
+        let cancellation = OperationCancellation::new(context, resources);
         Ok(Arc::new(Self {
-            id,
             tool,
-            cancelled,
+            cancellation,
             deadline: Instant::now() + Duration::from_millis(timeout as u64),
             policy: resources.file_read_policy.clone(),
             profile: context.access_profile,
         }))
     }
     pub(super) fn check(&self) -> Result<(), String> {
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.cancellation.is_cancelled() {
             return Err(ToolFailure::new(self.tool, "cancelled", "读取已取消")
                 .with("status", "cancelled")
                 .into_payload());
@@ -402,7 +357,9 @@ pub(super) fn decode_text(mut bytes: Vec<u8>, truncated: bool) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolExecutionContextQuery;
     use crate::ToolRegistry;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn native_read_budget_distinguishes_deadline_and_scoped_cancellation() {
@@ -469,7 +426,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "magi-read-cancel-{}-{}",
             std::process::id(),
-            NEXT_READ.fetch_add(1, Ordering::Relaxed)
+            magi_core::EventId::unique("read")
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("large");

@@ -65,7 +65,7 @@
 
 - 前台命令未成功时必有 `error_code` 与 `instruction`：`shell_exec_timeout`（超时，建议后台启动或调大 `timeout_ms`）、
   `shell_exec_command_not_found`、`shell_exec_nonzero_exit`；用户取消是 `cancelled`，不是失败。
-  参数 `action` 只认 `run/read/write/kill/list`，不再从 `terminal_id` 推断动作。
+  参数 `action` 只认 `run/read/wait/write/kill/list`，不再从 `terminal_id` 推断动作。按动作选择执行入口：`run` 启动命令，`list` 枚举当前授权范围；附带的 `job_id` 不得把这两种动作改成历史 Job 查询。只有 `read/wait/write/kill` 使用原 Job 身份。模型预检接受 `read/write/kill` 的 `job_id` 或 `terminal_id`；`wait` 必须使用 `job_id`，省略动作仍按 `run` 要求 `command`，不能从身份字段猜测动作。
 - 前台与后台共用同一份工作目录、Shell 与缺命令预检（`resolve_shell_invocation` / `missing_executables_failure`）。
 - 后台启动会观察约 0.3 秒：立刻退出的命令（命令不存在、端口占用等）返回 `shell_exec_exited_early` 与输出，
   `startup_status` 为 `failed`；仍在运行为 `confirmed`。
@@ -73,6 +73,10 @@
   （stderr 同理），传 `stdout_offset` / `stderr_offset` 只读新增输出；被淘汰的输出明确报告，不静默丢弃。
 - 后台进程的错误分类：`not_found`、`not_owned`、`stdin_closed`、`timeout`（写入超时）、`io_failed`、`terminate_failed`
   （没停掉的进程仍留在进程表里，不变成孤儿）。失败指引里不再出现「请稍后重试」。
+- daemon 的后台启动先把持久 Job 写入原工具 item 再启动进程。`action=wait` 必须带 `job_id`，按 canonical 提交事件等待终态并返回输出；默认 60 秒，`timeout_ms` 仅接受 1000–60000。等待期间释放模型执行名额，后台进程仍可能写入，仓库租约保持原归属。超时返回 `wait_timed_out=true` 与当前状态，不终止或重启进程；取消等待不代表进程已停止，原 Task 取消入口负责结算资源。
+- `wait` 对失败/取消/结果未知分别返回 `failed / cancelled / indeterminate` 及 `shell_exec_job_failed / shell_exec_job_cancelled / shell_exec_job_outcome_unknown`；等待结束不能冒充命令成功。`read/list` 查询历史仍使用查询成功合同。重启保留输出并将未结算 Job 标为 `outcome_unknown`，不按旧 PID 重新连接或自动重放。
+- Job 启动、显式停止与作用域取消共用停止/持久结算入口。写盘失败返回 `job_persist_failed` 与 `resources_settled=false`，保留原句柄及完整待提交终态；相同 Job 的 `kill` 重试只补交原结果，不改写已完成的状态、退出码和完成时间。若原 Job 已经是 Completed/Failed/Cancelled，且资源已结算，重复 `kill` 直接返回原 Job 回执并标记 `resources_settled=true`；若读取 Running 快照后被另一操作先结算并移除句柄，按原作用域重读持久事实再决定回执，不从句柄缺失推断失联；`OutcomeUnknown` 不得伪造已停止事实，仍返回未确认错误。启动阶段也适用；进程尚未启动时明确 `execution_started=false`。
+- Shell 退出和输出管道关闭都不等于派生进程已释放；早退与异步完成均先回收原受管进程树，再发布 Job 终态。Unix 回收同时追踪原进程组成员，根 Shell 已退出、后代被 reparent 后也必须等待退出并在需要时强制停止。回收失败保留句柄与资源屏障；并发停止导致句柄正在移交时明确 `job_settlement_unconfirmed`，不提示重跑原命令。查询资源屏障不等待 journal IO，进程树回收与 Job 查询不持有全局进程表锁等待 IO。
 
 ## 索引与知识类工具
 

@@ -239,12 +239,13 @@ pub const TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT: &str = "任务运行失败，详�
 ///
 /// 任务输出可能包含 provider、URL、工作目录或线程错误等内部信息。公开投影不能
 /// 直接暴露这些内容，但必须保留足够的失败类别，供 `agent_wait`、API 和前端使用
-/// 同一套生命周期语义。文案刻意不包含内部标识、连接地址或敏感配置。
-const TASK_MODEL_INVOCATION_FAILURE_PUBLIC_OUTPUT: &str = "子代理模型调用失败，请改派或接管。";
-const TASK_GIT_PREFLIGHT_FAILURE_PUBLIC_OUTPUT: &str = "子代理 Git 工作区准备失败，请改派或接管。";
-const TASK_EXECUTION_ADMISSION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行租约已过期，请改派或接管。";
-const TASK_DISPATCH_FAILURE_PUBLIC_OUTPUT: &str = "子代理派发失败，请改派或接管。";
-const TASK_EXECUTION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行失败，请改派或接管。";
+/// 同一套生命周期语义。文案只描述失败事实，不包含内部标识、连接地址或敏感配置；
+/// 是否再次委派由运行时共享恢复规则决定。
+const TASK_MODEL_INVOCATION_FAILURE_PUBLIC_OUTPUT: &str = "子代理模型调用失败。";
+const TASK_GIT_PREFLIGHT_FAILURE_PUBLIC_OUTPUT: &str = "子代理 Git 工作区准备失败。";
+const TASK_EXECUTION_ADMISSION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行租约已过期。";
+const TASK_DISPATCH_FAILURE_PUBLIC_OUTPUT: &str = "子代理派发失败。";
+const TASK_EXECUTION_FAILURE_PUBLIC_OUTPUT: &str = "子代理执行失败。";
 
 /// 对外暴露的任务失败分类。分类只依赖已经脱敏的公开文本，供运行时、API 和
 /// 前端共同使用，避免每一层各自维护一套错误码映射。
@@ -371,7 +372,7 @@ pub fn public_task_output_refs(status: TaskStatus, output_refs: &[String]) -> Ve
     }
 }
 
-/// 判断公开失败信息是否表示代理不可用，需要由主线接管或改派。
+/// 判断公开失败信息是否表示代理不可用；不决定是否重新委派。
 pub fn public_task_failure_is_degraded(error: &str) -> bool {
     let normalized = error.trim().to_ascii_lowercase();
     [
@@ -463,7 +464,7 @@ impl std::str::FromStr for AccessProfile {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskPolicy {
     pub autonomy_level: String,
     #[serde(default)]
@@ -522,6 +523,9 @@ pub enum TaskRuntimePayload {
     /// Worker 内存中，恢复必须使用任务持久化的这份事实。
     Workflow {
         workflow_id: String,
+        /// 接纳时由宿主固定的插件包；缺失的旧检查点不能交给当前包猜测恢复。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        package_digest: Option<String>,
         checkpoint_version: u32,
         #[serde(default = "default_workflow_stage")]
         stage: String,
@@ -573,6 +577,18 @@ impl TaskCompletionContract {
     }
 
     pub fn validate(&self, attempt: &TaskCompletionAttempt) -> Result<(), String> {
+        for evidence in &attempt.evidence {
+            if let TaskCompletionEvidence::ExternalExecutor {
+                model_step_id,
+                receipt,
+            } = evidence
+            {
+                if model_step_id.trim().is_empty() {
+                    return Err("执行器交付证据缺少模型 Step 身份".into());
+                }
+                receipt.validate()?;
+            }
+        }
         if self.requires_final_response
             && attempt
                 .final_response
@@ -671,6 +687,7 @@ impl TaskEvidenceRequirement {
                     tool_name: actual_tool_name,
                     ..
                 } => actual_tool_name == tool_name,
+                TaskCompletionEvidence::ExternalExecutor { .. } => false,
             })
             .count();
         Err(format!(
@@ -693,6 +710,11 @@ pub enum TaskCompletionEvidence {
         arguments: serde_json::Value,
         result: String,
     },
+    /// 只能由可信执行器响应构造；不会满足原生工具完成合同，也不是待执行命令。
+    ExternalExecutor {
+        model_step_id: String,
+        receipt: crate::ExecutorReceipt,
+    },
 }
 
 impl TaskCompletionEvidence {
@@ -707,7 +729,10 @@ impl TaskCompletionEvidence {
             arguments,
             result,
             ..
-        } = self;
+        } = self
+        else {
+            return false;
+        };
         tool_name == required_tool_name
             && argument_equals
                 .iter()
@@ -744,6 +769,13 @@ pub struct TaskRecoveryCheckpoint {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskExecutorBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_activation: Option<crate::AgentActivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_run_transfer: Option<crate::AgentRunTransfer>,
+    /// 由父任务在创建时显式授予，只授权管理自己的直接子任务。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegation_allowed: bool,
     pub target_role: Option<String>,
     /// 当前任务为目标角色激活的专业能力。能力 id 必须来自角色注册表，运行时只
     /// 注入这里显式记录的能力，避免根据提示词临时猜测形成隐藏路由。
@@ -895,6 +927,20 @@ pub struct Task {
 }
 
 impl Task {
+    pub fn delegation_allowed(&self) -> bool {
+        self.executor_binding
+            .as_ref()
+            .is_some_and(|binding| binding.delegation_allowed)
+    }
+
+    pub fn agent_activation(&self) -> Option<&crate::AgentActivation> {
+        self.executor_binding.as_ref()?.agent_activation.as_ref()
+    }
+
+    pub fn agent_run_transfer(&self) -> Option<&crate::AgentRunTransfer> {
+        self.executor_binding.as_ref()?.agent_run_transfer.as_ref()
+    }
+
     pub fn agent_context_package(&self) -> Option<&AgentContextPackage> {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { package, .. } => Some(package.as_ref()),
@@ -1068,6 +1114,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_executor_evidence_never_satisfies_native_tool_requirement() {
+        let receipt = crate::ExecutorReceipt {
+            executor: "fixture_executor".into(),
+            execution_id: "external-thread".into(),
+            commands: vec![crate::ExecutorCommandEvidence {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                status: crate::ExecutorCommandStatus::Succeeded,
+                output: "passed".into(),
+            }],
+        };
+        let mut attempt = TaskCompletionAttempt {
+            final_response: Some("external result".into()),
+            evidence: vec![TaskCompletionEvidence::ExternalExecutor {
+                model_step_id: "step".into(),
+                receipt,
+            }],
+            ..Default::default()
+        };
+        TaskCompletionContract::default()
+            .validate(&attempt)
+            .unwrap();
+        let required = TaskCompletionContract::default().with_evidence_requirements(vec![
+            TaskEvidenceRequirement::SuccessfulToolCall {
+                tool_name: "shell_exec".into(),
+                minimum_successes: 1,
+                argument_equals: BTreeMap::new(),
+                result_contains: vec![],
+            },
+        ]);
+        assert!(required.validate(&attempt).is_err());
+        let TaskCompletionEvidence::ExternalExecutor { receipt, .. } = &mut attempt.evidence[0]
+        else {
+            unreachable!()
+        };
+        receipt.commands[0].exit_code = None;
+        assert!(
+            TaskCompletionContract::default()
+                .validate(&attempt)
+                .is_err()
+        );
+        let TaskCompletionEvidence::ExternalExecutor {
+            model_step_id,
+            receipt,
+        } = &mut attempt.evidence[0]
+        else {
+            unreachable!()
+        };
+        receipt.commands[0].status = crate::ExecutorCommandStatus::OutcomeUnknown;
+        model_step_id.clear();
+        assert!(
+            TaskCompletionContract::default()
+                .validate(&attempt)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn public_task_output_refs_preserves_failure_category_without_internal_details() {
         let output_refs = vec![
             "LLM invocation failed (round 0): provider transport failed: timed out".to_string(),
@@ -1075,7 +1179,41 @@ mod tests {
 
         assert_eq!(
             public_task_output_refs(TaskStatus::Failed, &output_refs),
-            vec!["子代理模型调用失败，请改派或接管。".to_string()]
+            vec!["子代理模型调用失败。".to_string()]
+        );
+    }
+
+    #[test]
+    fn public_failure_messages_keep_categories_without_directing_reassignment() {
+        for (error, expected_code) in [
+            (
+                "model invocation failed: private endpoint",
+                "model_invocation_failed",
+            ),
+            (
+                "worktree preparation failed: private path",
+                "git_preflight_failed",
+            ),
+            ("lease expired: private lease", "lease_expired"),
+            ("dispatch failed: private worker", "dispatch_failed"),
+            ("execution failed: private detail", "task_execution_failed"),
+        ] {
+            let public = public_task_failure_output(error);
+            assert_eq!(
+                classify_public_task_failure(public).error_code,
+                expected_code
+            );
+            assert!(!public.contains("private"));
+            assert!(
+                !public.contains("改派"),
+                "错误事实不能成为重新唤起指令: {public}"
+            );
+        }
+        let legacy = vec!["子代理模型调用失败，请改派或接管。".to_string()];
+        assert_eq!(
+            public_task_output_refs(TaskStatus::Failed, &legacy),
+            legacy,
+            "清理新提示不能重写已保存的旧事实"
         );
     }
 
@@ -1085,10 +1223,7 @@ mod tests {
             TaskStatus::Failed,
             &["model bridge client 未配置".to_string()],
         );
-        assert_eq!(
-            model_failure,
-            vec!["子代理模型调用失败，请改派或接管。".to_string()]
-        );
+        assert_eq!(model_failure, vec!["子代理模型调用失败。".to_string()]);
         assert!(!public_task_failure_is_degraded(&model_failure[0]));
 
         let unavailable = "代理当前不可用，主线需要改派或接管。";

@@ -131,6 +131,29 @@ impl PluginSource {
 }
 
 impl PluginManager {
+    /// 工作流选择与工厂构造共用同一准入，版本从当前安装事实读取。
+    pub fn prepare_workflow(
+        &self,
+        selected: &crate::ContributionRef,
+    ) -> Result<Arc<PluginPackage>, PluginError> {
+        let id = selected.plugin_id.as_str();
+        self.ensure_scope_not_draining(id, crate::APPLICATION_SCOPE)?;
+        if !self.is_active_for_scope(id, crate::APPLICATION_SCOPE)? {
+            return Err(PluginError::NotAuthorized("插件工作流未激活".into()));
+        }
+        let package = self.package(id)?;
+        if !package
+            .manifest()
+            .contributions
+            .workflows
+            .iter()
+            .any(|workflow| workflow.id == selected.contribution_id)
+        {
+            return Err(PluginError::NotFound("插件工作流贡献不存在".into()));
+        }
+        Ok(package)
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PluginError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
@@ -750,6 +773,11 @@ impl PluginManager {
             .plugins
             .get(id)
             .ok_or_else(|| conflict("插件未安装"))?;
+        // 禁用/撤权只会发送取消信号；租约在调用真正结算前仍代表旧包正在被使用。
+        // 先删除包会让迟到的 Worker 失去可核对的版本事实，并把取消误报成资源释放。
+        if self.plugin_lease_count(id) > 0 {
+            return Err(conflict("插件仍有在途运行，必须完成资源结算后再卸载"));
+        }
         if !installed.active_scopes.is_empty() || !installed.enabled_scopes.is_empty() {
             return Err(conflict("插件仍有启用作用域或激活实例"));
         }

@@ -472,6 +472,57 @@ impl SessionCodeContextRegistry {
         Ok(context.clone())
     }
 
+    /// 恢复沿原 Task 的分配记录切换租约。文件和 index 保留，旧 dispatch 的
+    /// lease-scoped release 不得释放新执行；Git 来源检查由调用方在提交前完成。
+    pub fn reattach_agent_worktree(
+        &self,
+        session_id: &str,
+        expected: &AgentWorktreeContext,
+        lease_id: &str,
+        worker_id: &str,
+    ) -> Result<SessionCodeContext, SessionContextError> {
+        let mut contexts = self
+            .contexts
+            .write()
+            .expect("session code context write lock poisoned");
+        let context = contexts
+            .get_mut(session_id)
+            .ok_or_else(|| SessionContextError::Missing {
+                session_id: session_id.to_string(),
+            })?;
+        if lease_id.trim().is_empty()
+            || worker_id.trim().is_empty()
+            || expected.active
+            || expected.applied
+            || expected.lease_id.as_deref() == Some(lease_id)
+            || !expected.path.is_dir()
+            || context.agent_worktrees.iter().any(|worktree| {
+                worktree.active
+                    && (worktree.task_id == expected.task_id
+                        || same_path(&worktree.path, &expected.path))
+            })
+        {
+            return Err(SessionContextError::MissingAgentWorktree {
+                task_id: format!("{} (inactive recovery source required)", expected.task_id),
+            });
+        }
+        let allocation = context
+            .agent_worktrees
+            .iter_mut()
+            .find(|worktree| *worktree == expected)
+            .ok_or_else(|| SessionContextError::MissingAgentWorktree {
+                task_id: format!("{} (recovery source changed)", expected.task_id),
+            })?;
+        allocation.lease_id = Some(lease_id.to_string());
+        allocation.worker_id = worker_id.to_string();
+        allocation.active = true;
+        context.runtime_workspace_roots.push(expected.path.clone());
+        context.runtime_workspace_roots.sort();
+        context.runtime_workspace_roots.dedup();
+        context.context_revision = context.context_revision.saturating_add(1);
+        Ok(context.clone())
+    }
+
     fn upsert(
         &self,
         session_id: &str,
@@ -1560,6 +1611,92 @@ impl GitService {
     pub async fn worktree_list(&self, path: &Path) -> Result<Vec<GitWorktree>, GitError> {
         let observation = observe_unlocked(path).await?;
         worktree_list_unlocked(&observation.repository_root).await
+    }
+
+    /// 恢复代理只能使用原 worktree 或原分支的已记录结果，不从当前主线生成
+    /// 新快照。保留崩溃时的未提交文件/index；目录被替换、分支改名或基线漂移
+    /// 都拒绝。正常清理已移除目录时，只从持久结果 commit 重建。
+    pub async fn recover_agent_worktree(
+        &self,
+        repository: &Path,
+        expected_common_dir: &Path,
+        allocation: &AgentWorktreeContext,
+    ) -> Result<(), GitError> {
+        let (_guard, source) = self.lock_and_observe(repository).await?;
+        let invalid = |message: &str| GitError::InvalidInput {
+            message: message.into(),
+        };
+        if allocation.active
+            || allocation.applied
+            || !allocation.path.is_absolute()
+            || (allocation.mode == AgentWorktreeMode::Writable) != allocation.branch.is_some()
+            || allocation.base_head.trim().is_empty()
+            || !same_path(&source.git_common_dir, expected_common_dir)
+        {
+            return Err(invalid("代理恢复来源仍占用、已采用或 repository 已变化"));
+        }
+        if let Some(branch) = allocation.branch.as_deref() {
+            validate_branch_name(&source.worktree_path, branch).await?;
+        }
+        let base = resolve_revision(&source.worktree_path, &allocation.base_head).await?;
+        if !allocation.path.exists() {
+            let expected_head = allocation.result_head.as_deref().ok_or_else(|| {
+                invalid("原代理目录缺失且没有持久结果 commit，不能猜测已保留全部产出")
+            })?;
+            let head = if let Some(branch) = &allocation.branch {
+                resolve_revision(&source.worktree_path, &format!("refs/heads/{branch}")).await?
+            } else {
+                base.clone()
+            };
+            if head != expected_head {
+                return Err(invalid("代理原分支 HEAD 与持久结果不一致，拒绝重建"));
+            }
+            ensure_success(
+                "agent_worktree_recovery_ancestry",
+                run_git(
+                    &source.worktree_path,
+                    &["merge-base", "--is-ancestor", &base, &head],
+                )
+                .await?,
+            )?;
+            // 不用 --force，不删除残留路径；Git 自身继续拒绝被其他 worktree
+            // 占用的分支和未清理的注册记录。
+            let destination = allocation.path.to_string_lossy();
+            let mut args = vec!["worktree", "add"];
+            if allocation.branch.is_none() {
+                args.push("--detach");
+            }
+            args.push(destination.as_ref());
+            args.push(allocation.branch.as_deref().unwrap_or(&base));
+            ensure_success(
+                "agent_worktree_recover",
+                run_git(&source.worktree_path, &args).await?,
+            )?;
+        }
+        if std::fs::symlink_metadata(&allocation.path)
+            .map_err(|error| GitError::Io(error.to_string()))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(invalid("代理 worktree 目录被替换为符号链接，拒绝恢复"));
+        }
+        let observed = observe_unlocked(&allocation.path).await?;
+        if !same_path(&observed.git_common_dir, expected_common_dir)
+            || !same_path(&observed.worktree_path, &allocation.path)
+            || observed.branch != allocation.branch
+            || (allocation.branch.is_none() && observed.head.as_deref() != Some(base.as_str()))
+        {
+            return Err(invalid("代理原目录的 repository、worktree 或分支已变化"));
+        }
+        ensure_success(
+            "agent_worktree_recovery_ancestry",
+            run_git(
+                &allocation.path,
+                &["merge-base", "--is-ancestor", &base, "HEAD"],
+            )
+            .await?,
+        )?;
+        Ok(())
     }
 
     /// 把 worktree 的当前内容（含未提交和未忽略的未跟踪文件）写成以 `base` 为父的快照提交。
@@ -2663,6 +2800,247 @@ mod tests {
                 .any(|root| same_path(root, &agent_path))
         );
         assert_eq!(context.agent_worktrees[0].path, agent_path, "分配记录保留");
+    }
+
+    #[tokio::test]
+    async fn agent_worktree_recovery_preserves_dirty_files_and_rebinds_only_the_old_lease() {
+        let repo = repository();
+        let service = GitService::new();
+        let observation = service.observe(repo.path()).await.unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("agent");
+        service
+            .worktree_create(
+                repo.path(),
+                WorktreeCreateOptions {
+                    path: path.clone(),
+                    base: observation.head.clone().unwrap(),
+                    branch: Some("magi/agent/recovery".into()),
+                    create_branch: true,
+                    detached: false,
+                    precondition: GitPrecondition::default(),
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::write(path.join("staged.txt"), "staged before restart").unwrap();
+        ensure_success(
+            "stage_fixture",
+            run_git(&path, &["add", "staged.txt"]).await.unwrap(),
+        )
+        .unwrap();
+        std::fs::write(path.join("staged.txt"), "unstaged after staging").unwrap();
+        std::fs::write(path.join("untracked.txt"), "untracked before restart").unwrap();
+        let before_index = run_git(&path, &["diff", "--cached", "--binary"])
+            .await
+            .unwrap()
+            .stdout;
+        let before_worktree = run_git(&path, &["diff", "--binary"]).await.unwrap().stdout;
+        let registry = SessionCodeContextRegistry::default();
+        registry.accept("recovery", "workspace", vec![], &observation);
+        registry
+            .register_agent_worktree(
+                "recovery",
+                AgentWorktreeContext {
+                    task_id: "agent".into(),
+                    lease_id: Some("old-lease".into()),
+                    worker_id: "old-worker".into(),
+                    path: path.clone(),
+                    mode: AgentWorktreeMode::Writable,
+                    base_head: observation.head.clone().unwrap(),
+                    branch: Some("magi/agent/recovery".into()),
+                    active: true,
+                    result_head: None,
+                    changed_paths: vec![],
+                    applied: false,
+                },
+            )
+            .unwrap();
+        registry.restore_after_restart(registry.all());
+        let previous = registry.get("recovery").unwrap().agent_worktrees[0].clone();
+        service
+            .recover_agent_worktree(repo.path(), &observation.git_common_dir, &previous)
+            .await
+            .unwrap();
+        registry
+            .reattach_agent_worktree("recovery", &previous, "new-lease", "new-worker")
+            .unwrap();
+        assert_eq!(
+            run_git(&path, &["diff", "--cached", "--binary"])
+                .await
+                .unwrap()
+                .stdout,
+            before_index
+        );
+        assert_eq!(
+            run_git(&path, &["diff", "--binary"]).await.unwrap().stdout,
+            before_worktree
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("untracked.txt")).unwrap(),
+            "untracked before restart"
+        );
+        assert!(
+            registry
+                .reattach_agent_worktree("recovery", &previous, "another-lease", "another-worker")
+                .is_err()
+        );
+        assert!(
+            registry
+                .release_agent_worktree_for_lease("recovery", "agent", "old-lease")
+                .is_err()
+        );
+        let current = registry.get("recovery").unwrap();
+        assert_eq!(current.agent_worktrees.len(), 1);
+        assert_eq!(
+            current.agent_worktrees[0].lease_id.as_deref(),
+            Some("new-lease")
+        );
+        assert!(current.agent_worktrees[0].active);
+        assert!(current.runtime_workspace_roots.contains(&path));
+        assert!(!repo.path().join("untracked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn agent_worktree_recovery_rejects_changed_repository_branch_and_applied_results() {
+        let repo = repository();
+        let other = repository();
+        let service = GitService::new();
+        let observation = service.observe(repo.path()).await.unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("agent");
+        service
+            .worktree_create(
+                repo.path(),
+                WorktreeCreateOptions {
+                    path: path.clone(),
+                    base: observation.head.clone().unwrap(),
+                    branch: Some("magi/agent/original".into()),
+                    create_branch: true,
+                    detached: false,
+                    precondition: GitPrecondition::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let allocation = AgentWorktreeContext {
+            task_id: "agent".into(),
+            lease_id: Some("old".into()),
+            worker_id: "worker".into(),
+            path: path.clone(),
+            mode: AgentWorktreeMode::Writable,
+            base_head: observation.head.clone().unwrap(),
+            branch: Some("magi/agent/original".into()),
+            active: false,
+            result_head: None,
+            changed_paths: vec![],
+            applied: false,
+        };
+        for mutate in [
+            "active",
+            "applied",
+            "foreign_repo",
+            "branch",
+            "subdirectory",
+        ] {
+            let mut invalid = allocation.clone();
+            match mutate {
+                "active" => invalid.active = true,
+                "applied" => invalid.applied = true,
+                "foreign_repo" => invalid.path = other.path().to_path_buf(),
+                "branch" => invalid.branch = Some("another-branch".into()),
+                "subdirectory" => {
+                    invalid.path = path.join("subdir");
+                    std::fs::create_dir(&invalid.path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                service
+                    .recover_agent_worktree(repo.path(), &observation.git_common_dir, &invalid)
+                    .await
+                    .is_err(),
+                "{mutate}"
+            );
+        }
+        service
+            .recover_agent_worktree(repo.path(), &observation.git_common_dir, &allocation)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_worktree_recovery_rebuilds_only_the_recorded_branch_result() {
+        let repo = repository();
+        let service = GitService::new();
+        let observation = service.observe(repo.path()).await.unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("agent");
+        service
+            .worktree_create(
+                repo.path(),
+                WorktreeCreateOptions {
+                    path: path.clone(),
+                    base: observation.head.clone().unwrap(),
+                    branch: Some("magi/agent/result".into()),
+                    create_branch: true,
+                    detached: false,
+                    precondition: GitPrecondition::default(),
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::write(path.join("result.txt"), "agent result").unwrap();
+        service.commit_all(&path, "agent result").await.unwrap();
+        let result = service.observe_ref(&path).await.unwrap().head.unwrap();
+        service
+            .worktree_remove(
+                repo.path(),
+                WorktreeRemoveOptions {
+                    path: path.clone(),
+                    force: false,
+                    confirm_force: false,
+                    precondition: GitPrecondition::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut allocation = AgentWorktreeContext {
+            task_id: "agent".into(),
+            lease_id: Some("old".into()),
+            worker_id: "worker".into(),
+            path: path.clone(),
+            mode: AgentWorktreeMode::Writable,
+            base_head: observation.head.clone().unwrap(),
+            branch: Some("magi/agent/result".into()),
+            active: false,
+            result_head: None,
+            changed_paths: vec!["result.txt".into()],
+            applied: false,
+        };
+        assert!(
+            service
+                .recover_agent_worktree(repo.path(), &observation.git_common_dir, &allocation)
+                .await
+                .is_err()
+        );
+        assert!(
+            !path.exists(),
+            "缺少匹配的持久结果，不能静默改用分支当前 HEAD"
+        );
+        allocation.result_head = Some(result.clone());
+        service
+            .recover_agent_worktree(repo.path(), &observation.git_common_dir, &allocation)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.observe_ref(&path).await.unwrap().head.as_deref(),
+            Some(result.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("result.txt")).unwrap(),
+            "agent result"
+        );
     }
 
     #[tokio::test]

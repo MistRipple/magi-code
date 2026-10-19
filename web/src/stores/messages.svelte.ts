@@ -335,6 +335,7 @@ function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
 type QueuedMessageImageItem = NonNullable<QueuedMessage['images']>[number];
 type QueuedMessageContextReferenceItem = NonNullable<QueuedMessage['contextReferences']>[number];
 type QueuedMessageBrowserNodeSelectionItem = NonNullable<QueuedMessage['browserNodeSelections']>[number];
+type QueuedMessagePluginSelectionItem = NonNullable<QueuedMessage['pluginSelections']>[number];
 
 function normalizeQueuedMessageImage(image: unknown): QueuedMessageImageItem | null {
   if (!image || typeof image !== 'object') {
@@ -431,6 +432,29 @@ function normalizeQueuedMessageBrowserNodeSelection(
   };
 }
 
+function normalizeQueuedMessagePluginSelection(
+  selection: unknown,
+): QueuedMessagePluginSelectionItem | null {
+  if (!selection || typeof selection !== 'object' || Array.isArray(selection)) return null;
+  const item = selection as Record<string, unknown>;
+  const pluginId = typeof item.pluginId === 'string' ? item.pluginId.trim() : '';
+  const resourceId = typeof item.resourceId === 'string' ? item.resourceId.trim() : '';
+  const label = typeof item.label === 'string' ? item.label.trim() : '';
+  const summary = typeof item.summary === 'string' ? item.summary : '';
+  const version = Number.isSafeInteger(item.version) && Number(item.version) >= 0
+    ? Number(item.version)
+    : -1;
+  if (!pluginId || !resourceId || !label || version < 0) return null;
+  return {
+    pluginId,
+    resourceId,
+    version,
+    label,
+    summary,
+    selection: (selection as QueuedMessagePluginSelectionItem).selection ?? null,
+  };
+}
+
 function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
   const seen = new Set<string>();
   return ensureArray<QueuedMessage>(value)
@@ -451,6 +475,9 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
     })
     .map((item) => ({
       id: item.id.trim(),
+      revision: Number.isSafeInteger(item.revision) && Number(item.revision) >= 1
+        ? Number(item.revision)
+        : undefined,
       requestId: typeof item.requestId === 'string' && item.requestId.trim()
         ? item.requestId.trim()
         : undefined,
@@ -476,6 +503,10 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,
       command: item.command === 'compact' ? 'compact' : null,
+      workflowId: typeof item.workflowId === 'string' ? item.workflowId.trim() || null : null,
+      pluginCommandId: typeof item.pluginCommandId === 'string' ? item.pluginCommandId.trim() || null : null,
+      interruptTurnId: typeof item.interruptTurnId === 'string' ? item.interruptTurnId.trim() || null : null,
+      interruptionError: typeof item.interruptionError === 'string' ? item.interruptionError : null,
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,
@@ -498,7 +529,12 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       browserNodeSelections: ensureArray(item.browserNodeSelections)
         .map(normalizeQueuedMessageBrowserNodeSelection)
         .filter((selection): selection is QueuedMessageBrowserNodeSelectionItem => selection !== null),
-      canGuide: item.canGuide === true,
+      pluginSelections: ensureArray(item.pluginSelections)
+        .map(normalizeQueuedMessagePluginSelection)
+        .filter((selection): selection is QueuedMessagePluginSelectionItem => selection !== null),
+      guide: item.guide && ['ready', 'no_active_turn', 'input_closed', 'unsupported_input', 'unsupported_executor'].includes(item.guide.status)
+        ? { status: item.guide.status, targetTurnId: item.guide.targetTurnId?.trim() || null }
+        : undefined,
     }));
 }
 

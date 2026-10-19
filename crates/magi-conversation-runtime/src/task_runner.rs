@@ -4,8 +4,6 @@
 //! worker 匹配、租约、结果回收。
 
 use crate::execution_admission::ExecutionAdmissionController;
-#[cfg(test)]
-use crate::task_runner_bridge::EventBasedResultReceiver;
 use crate::task_runner_bridge::{
     RunCycleOutcome, TaskDispatchGate, TaskDispatchGateDecision, TaskDispatcher, TaskOutcome,
     TaskResult,
@@ -33,8 +31,6 @@ pub struct TaskRunner {
     /// WorkerInfo，因此角色编辑不会改变运行中的 Worker 快照。
     worker_catalog_provider: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     dispatcher: Arc<dyn TaskDispatcher>,
-    #[cfg(test)]
-    result_receiver: Option<Arc<EventBasedResultReceiver>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     execution_admission: Arc<ExecutionAdmissionController>,
     session_id: Option<SessionId>,
@@ -68,7 +64,7 @@ pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, 
                 tracing::warn!(
                     task_id = %result.task_id,
                     lease_id = %result.lease_id,
-                    "忽略非当前活跃租约的迟到任务结果"
+                    "忽略租约或父执行链已失效的迟到任务结果"
                 );
                 Ok(false)
             }
@@ -115,6 +111,15 @@ pub fn apply_task_result(store: &TaskStore, result: TaskResult) -> Result<bool, 
             }
             Ok(changed)
         }
+        TaskOutcome::Cancelled => store
+            .revoke_lease_and_set_task_terminal(
+                &result.task_id,
+                &root_task_id,
+                Some(&result.lease_id),
+                TaskStatus::Killed,
+                Vec::new(),
+            )
+            .map_err(|error| format!("任务 {} 取消状态持久化失败: {error}", result.task_id)),
         TaskOutcome::Yielded => {
             // 等待事实已由 TaskStore 原子提交；这份回执不再提交或通知任何状态。
             Ok(false)
@@ -132,8 +137,6 @@ impl TaskRunner {
             store,
             worker_catalog_provider,
             dispatcher,
-            #[cfg(test)]
-            result_receiver: None,
             dispatch_gate: None,
             execution_admission: Arc::new(ExecutionAdmissionController::default()),
             session_id: None,
@@ -155,18 +158,6 @@ impl TaskRunner {
             Arc::new(move || workers.clone()),
             dispatcher,
         )
-    }
-
-    #[cfg(test)]
-    pub fn with_test_result_receiver(
-        store: Arc<TaskStore>,
-        workers: Vec<WorkerInfo>,
-        dispatcher: Arc<dyn TaskDispatcher>,
-        result_receiver: Arc<EventBasedResultReceiver>,
-    ) -> Self {
-        let mut runner = Self::with_dispatcher(store, workers, dispatcher);
-        runner.result_receiver = Some(result_receiver);
-        runner
     }
 
     pub fn with_agent_role_registry(mut self, registry: AgentRoleRegistry) -> Self {
@@ -215,10 +206,6 @@ impl TaskRunner {
 
     pub fn run_cycle(&self, root_task_id: &TaskId) -> RunCycleOutcome {
         let cycle_started_at = Instant::now();
-        #[cfg(test)]
-        if let Err(error) = self.apply_results() {
-            return RunCycleOutcome::Error(error);
-        }
         if let Err(error) = self.expire_stale_leases(root_task_id) {
             return RunCycleOutcome::Error(error);
         }
@@ -228,7 +215,8 @@ impl TaskRunner {
 
         let active_leases = self.store.collect_active_leases(root_task_id);
         for (task_id, lease_id) in &active_leases {
-            self.store.heartbeat_lease(task_id, lease_id);
+            self.store
+                .heartbeat_lease_for_execution_scope(root_task_id, task_id, lease_id);
         }
 
         match self.terminal_state(root_task_id) {
@@ -295,7 +283,7 @@ impl TaskRunner {
             };
             let report_first_dispatch_timing =
                 !self.first_dispatch_reported.load(Ordering::Relaxed);
-            let lease = match self.store.grant_lease_and_start_task(
+            let lease = match self.store.claim_task_for_execution_scope(
                 &task.task_id,
                 root_task_id,
                 &worker.worker_id,
@@ -315,6 +303,11 @@ impl TaskRunner {
                     ));
                 }
             };
+            // 排队补充与 grant 共用 TaskStore mutation 锁；grant 之后重新读取，
+            // 不可把准入扫描时的旧任务快照交给模型。
+            let Some(task) = self.store.get_task(&task.task_id) else {
+                return RunCycleOutcome::Error("已获执行租约的任务记录缺失".into());
+            };
             if report_first_dispatch_timing {
                 tracing::info!(
                     target: "magi.performance",
@@ -333,7 +326,7 @@ impl TaskRunner {
                 let failure_message = format!("任务 {} 派发失败: {error}", task.task_id);
                 match self.store.revoke_lease_and_set_task_terminal(
                     &task.task_id,
-                    root_task_id,
+                    &task.root_task_id,
                     Some(&lease.lease_id),
                     TaskStatus::Failed,
                     vec![failure_message.clone()],
@@ -385,39 +378,37 @@ impl TaskRunner {
         }
     }
 
+    /// 扫描不是终态授权；返回 false 表示候选已失效，调用方必须继续观察，不能结束 Runner。
     pub fn finalize_unrunnable_outcome(
         &self,
         root_task_id: &TaskId,
         task_ids: &[TaskId],
-    ) -> Result<(), String> {
-        for task_id in task_ids {
-            if let Some(task) = self.store.get_task(task_id)
-                && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-            {
-                self.close_task(
-                    root_task_id,
-                    task_id,
-                    TaskStatus::Failed,
-                    vec![self.unrunnable_task_reason(&task)],
-                )?;
-            }
+    ) -> Result<bool, String> {
+        let mut reasons = task_ids
+            .iter()
+            .filter_map(|task_id| self.store.get_task(task_id))
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
+            .map(|task| self.unrunnable_task_reason(&task))
+            .collect::<Vec<_>>();
+        if reasons.is_empty() {
+            return Ok(false);
         }
-        // A root can remain Pending when only an unmatched leaf was supplied in
-        // `task_ids`.  Close it in the same terminal transition so the Task
-        // fact and the Turn completion notifier cannot be left waiting for a
-        // Runner observer that no longer exists.
-        if let Some(root_task) = self.store.get_task(root_task_id)
-            && matches!(root_task.status, TaskStatus::Pending | TaskStatus::Running)
-        {
-            self.close_task(
-                root_task_id,
-                root_task_id,
-                TaskStatus::Failed,
-                vec![self.unrunnable_task_reason(&root_task)],
-            )?;
+        reasons.sort();
+        reasons.dedup();
+        let result = self
+            .store
+            .fail_unrunnable_execution_scope(root_task_id, task_ids, reasons)
+            .map_err(|error| error.to_string());
+        release_terminal_admissions(
+            &self.store,
+            &self.execution_admission,
+            self.store.collect_execution_subtree_ids(root_task_id),
+        );
+        let changed = result?;
+        if changed {
+            self.set_checkpoint_signal();
         }
-        self.set_checkpoint_signal();
-        Ok(())
+        Ok(changed)
     }
 
     pub fn finalize_unexpected_failure(
@@ -425,23 +416,14 @@ impl TaskRunner {
         root_task_id: &TaskId,
         reason: &str,
     ) -> Result<(), String> {
-        let task_ids = self.store.collect_subtree_ids(root_task_id);
-        if task_ids.is_empty() {
-            return Err(format!("任务树不存在: {root_task_id}"));
-        }
-        for task_id in task_ids {
-            let Some(task) = self.store.get_task(&task_id) else {
-                continue;
-            };
-            if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-                self.close_task(
-                    root_task_id,
-                    &task_id,
-                    TaskStatus::Failed,
-                    vec![reason.to_string()],
-                )?;
-            }
-        }
+        settle_subtree_in_store(
+            &self.store,
+            &self.execution_admission,
+            root_task_id,
+            TaskStatus::Failed,
+            vec![reason.to_string()],
+            true,
+        )?;
         self.set_checkpoint_signal();
         Ok(())
     }
@@ -451,9 +433,7 @@ impl TaskRunner {
             .or_else(|| task.executor_binding_target_role())
             .unwrap_or("unknown");
         if task.parent_task_id.is_some() {
-            return format!(
-                "代理不可用：没有匹配角色 {role} 的可用执行器。父代理应改派其他可用角色，或由主线根据已有上下文继续完成。"
-            );
+            return format!("代理不可用：没有匹配角色 {role} 的可用执行器。");
         }
         format!("任务不可运行：没有匹配角色 {role} 的可用执行器。")
     }
@@ -480,32 +460,39 @@ impl TaskRunner {
         Ok(())
     }
 
+    /// 普通停止只终止当前拥有方的执行范围；完整会话销毁仍使用 kill_tree。
+    pub fn kill_execution_scope(&self, scope_root: &TaskId) -> Result<(), String> {
+        if settle_subtree_in_store(
+            &self.store,
+            &self.execution_admission,
+            scope_root,
+            TaskStatus::Killed,
+            Vec::new(),
+            true,
+        )? {
+            self.set_checkpoint_signal();
+        }
+        Ok(())
+    }
+
     /// 已结束任务下仍未结束的后代没有人会再收集结果，统一级联终止。
     ///
-    /// 根任务失败、被终止或在子代理仍运行时完成，都由这里收口整棵子树，
-    /// 不依赖各条结束路径分别记得清理子代理。
+    /// 根任务失败、被终止或在子代理仍运行时完成，都在 TaskStore 同一快照下收口
+    /// 当前执行范围，不能依赖逐项扫描再取消，也不能跨已提交的转交边界。
     fn kill_descendants_of_terminal_tasks(&self, root_task_id: &TaskId) -> Result<(), String> {
-        let mut errors = Vec::new();
-        for task_id in self.store.collect_subtree_ids(root_task_id) {
-            let Some(task) = self.store.get_task(&task_id) else {
-                continue;
-            };
-            if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-                continue;
-            }
-            for child in self.store.get_children(&task_id) {
-                if matches!(child.status, TaskStatus::Pending | TaskStatus::Running)
-                    && let Err(error) = self.kill_tree(&child.task_id)
-                {
-                    errors.push(error);
-                }
-            }
+        let result = self
+            .store
+            .revoke_orphaned_execution_descendants(root_task_id)
+            .map_err(|error| error.to_string());
+        release_terminal_admissions(
+            &self.store,
+            &self.execution_admission,
+            self.store.collect_execution_subtree_ids(root_task_id),
+        );
+        if result? {
+            self.set_checkpoint_signal();
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("；"))
-        }
+        Ok(())
     }
 
     pub fn resume_task(&self, task_id: &TaskId) -> Result<(), String> {
@@ -530,18 +517,6 @@ impl TaskRunner {
         }
     }
 
-    #[cfg(test)]
-    fn apply_results(&self) -> Result<(), String> {
-        let Some(result_receiver) = self.result_receiver.as_ref() else {
-            return Ok(());
-        };
-        for result in result_receiver.poll_results_for_test() {
-            let _ = apply_task_result(&self.store, result)?;
-            self.set_checkpoint_signal();
-        }
-        Ok(())
-    }
-
     fn expire_stale_leases(&self, root_task_id: &TaskId) -> Result<(), String> {
         for (task_id, lease_id) in self.store.collect_expired_leases(root_task_id) {
             if self.store.get_task(&task_id).is_some_and(|task| {
@@ -549,13 +524,7 @@ impl TaskRunner {
             }) {
                 let changed = self
                     .store
-                    .revoke_lease_and_set_task_terminal(
-                        &task_id,
-                        root_task_id,
-                        Some(&lease_id),
-                        TaskStatus::Failed,
-                        vec![format!("任务 {task_id} 租约已过期")],
-                    )
+                    .expire_lease_for_execution_scope(root_task_id, &task_id, &lease_id)
                     .map_err(|error| format!("任务 {task_id} 租约过期收口失败: {error}"))?;
                 if !changed {
                     continue;
@@ -564,28 +533,6 @@ impl TaskRunner {
             }
         }
         Ok(())
-    }
-
-    fn close_task(
-        &self,
-        root_task_id: &TaskId,
-        task_id: &TaskId,
-        status: TaskStatus,
-        output_refs: Vec<String>,
-    ) -> Result<bool, String> {
-        let lease_id = self
-            .store
-            .get_active_lease(task_id)
-            .map(|lease| lease.lease_id);
-        self.store
-            .revoke_lease_and_set_task_terminal(
-                task_id,
-                root_task_id,
-                lease_id.as_ref(),
-                status,
-                output_refs,
-            )
-            .map_err(|error| format!("任务 {task_id} 收口失败: {error}"))
     }
 
     fn match_worker(&self, task: &Task) -> Option<WorkerInfo> {
@@ -607,7 +554,7 @@ impl TaskRunner {
     }
 
     fn terminal_state(&self, root_task_id: &TaskId) -> TerminalState {
-        let task_ids = self.store.collect_subtree_ids(root_task_id);
+        let task_ids = self.store.collect_execution_subtree_ids(root_task_id);
         if task_ids.is_empty() {
             return TerminalState::NotTerminal;
         }
@@ -641,7 +588,7 @@ impl TaskRunner {
 
     fn collect_non_terminal_task_ids(&self, root_task_id: &TaskId) -> Vec<TaskId> {
         self.store
-            .collect_subtree_ids(root_task_id)
+            .collect_execution_subtree_ids(root_task_id)
             .into_iter()
             .filter(|task_id| {
                 self.store.get_task(task_id).is_some_and(|task| {
@@ -703,18 +650,57 @@ pub(crate) fn kill_subtree_in_store(
     root_task_id: &TaskId,
     output_refs: Vec<String>,
 ) -> Result<bool, String> {
-    let mut changed = false;
-    let mut errors = Vec::new();
-    for task_id in store.collect_subtree_ids(root_task_id) {
-        match kill_task_in_store(store, admission, &task_id, output_refs.clone()) {
-            Ok(task_changed) => changed |= task_changed,
-            Err(error) => errors.push(error),
-        }
-    }
-    if errors.is_empty() {
-        Ok(changed)
+    settle_subtree_in_store(
+        store,
+        admission,
+        root_task_id,
+        TaskStatus::Killed,
+        output_refs,
+        false,
+    )
+}
+
+pub(crate) fn settle_subtree_in_store(
+    store: &TaskStore,
+    admission: &ExecutionAdmissionController,
+    root_task_id: &TaskId,
+    status: TaskStatus,
+    output_refs: Vec<String>,
+    execution_only: bool,
+) -> Result<bool, String> {
+    let result = if execution_only {
+        store.revoke_active_leases_and_set_execution_subtree_terminal(
+            root_task_id,
+            status,
+            output_refs,
+        )
     } else {
-        Err(errors.join("；"))
+        store.revoke_active_leases_and_set_subtree_terminal(root_task_id, status, output_refs)
+    }
+    .map_err(|error| error.to_string());
+    // 仅释放已提交终态的预占/排队；checkpoint 失败或坏节点保留原资格，
+    // 不得把未持久化的取消当作已经完成。
+    let ids = if execution_only {
+        store.collect_execution_subtree_ids(root_task_id)
+    } else {
+        store.collect_subtree_ids(root_task_id)
+    };
+    release_terminal_admissions(store, admission, ids);
+    result
+}
+
+fn release_terminal_admissions(
+    store: &TaskStore,
+    admission: &ExecutionAdmissionController,
+    ids: Vec<TaskId>,
+) {
+    for task_id in ids {
+        if store
+            .get_task(&task_id)
+            .is_some_and(|task| task_status_is_finished(task.status))
+        {
+            admission.release_pending(&task_id);
+        }
     }
 }
 
@@ -730,7 +716,8 @@ mod tests {
     use super::*;
     use crate::{
         execution_admission::{ExecutionAdmissionLimits, ExecutionAdmissionPermit},
-        task_runner_bridge::{EventBasedResultReceiver, TaskResult},
+        task_execution_registry::TaskExecutionRegistry,
+        task_runner_bridge::TaskResult,
     };
     use magi_core::{
         DomainError, MissionId, TaskCompletionAttempt, TaskKind, TaskRuntimePayload, UtcMillis,
@@ -812,48 +799,88 @@ mod tests {
     }
 
     #[test]
-    fn kill_tree_keeps_terminating_remaining_tasks_after_one_failure() {
-        let store = Arc::new(TaskStore::new());
-        let mut root = test_task("task-root-kill", "task-root-kill", None);
-        root.status = TaskStatus::Running;
-        // 归属事实损坏的子任务会让它自己的收口失败；它下面的孙任务仍必须被终止。
-        let mut broken_child = test_task(
-            "task-broken-child",
-            "task-root-kill",
-            Some(root.task_id.clone()),
-        );
-        broken_child.status = TaskStatus::Running;
-        broken_child.mission_id = MissionId::new("mission-mismatched");
-        let mut grandchild = test_task(
-            "task-grandchild",
-            "task-root-kill",
-            Some(broken_child.task_id.clone()),
-        );
-        grandchild.status = TaskStatus::Running;
-        for task in [root.clone(), broken_child.clone(), grandchild.clone()] {
-            store.insert_task(task).expect("任务应插入");
-        }
-        let runner = TaskRunner::with_test_result_receiver(
-            Arc::clone(&store),
-            Vec::new(),
-            Arc::new(RejectingDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
-        );
-
-        let result = runner.kill_tree(&root.task_id);
-
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|error| error.contains("task-broken-child")),
-            "失败的子任务必须被报告：{result:?}"
-        );
-        for task_id in [&root.task_id, &grandchild.task_id] {
-            assert_eq!(
-                store.get_task(task_id).expect("任务应存在").status,
-                TaskStatus::Killed,
-                "{task_id} 必须被终止"
+    fn subtree_terminal_failure_keeps_entire_subtree_and_pending_admission() {
+        for mode in ["kill", "execution_kill", "unexpected_failure", "unrunnable"] {
+            let store = Arc::new(TaskStore::new());
+            let mut root = test_task("task-root-kill", "task-root-kill", None);
+            root.status = TaskStatus::Running;
+            let child = test_task(
+                "task-child-kill",
+                "task-root-kill",
+                Some(root.task_id.clone()),
             );
+            let grandchild = test_task(
+                "task-leaf-kill",
+                "task-root-kill",
+                Some(child.task_id.clone()),
+            );
+            for task in [root.clone(), child.clone(), grandchild.clone()] {
+                store.insert_task(task).unwrap();
+            }
+            let admission = Arc::new(ExecutionAdmissionController::new(
+                ExecutionAdmissionLimits {
+                    max_active_tasks: 1,
+                    max_active_tasks_per_session: 1,
+                    max_active_tasks_per_role: 1,
+                    min_available_memory_bytes: 0,
+                },
+            ));
+            assert!(
+                admission
+                    .reserve(root.task_id.clone(), None, "executor")
+                    .is_none()
+            );
+            assert!(
+                admission
+                    .reserve(child.task_id.clone(), None, "executor")
+                    .is_some()
+            );
+            let runner = TaskRunner::with_dispatcher(
+                Arc::clone(&store),
+                Vec::new(),
+                Arc::new(RejectingDispatcher),
+            )
+            .with_execution_admission(admission.clone(), None);
+            let before = serde_json::to_value(store.snapshot().tasks).unwrap();
+            store.set_checkpoint_callback(Box::new(|_| {
+                Err(DomainError::InvalidState {
+                    message: "disk failed".into(),
+                })
+            }));
+            let settle = || match mode {
+                "kill" => runner.kill_tree(&root.task_id),
+                "execution_kill" => runner.kill_execution_scope(&root.task_id),
+                "unexpected_failure" => {
+                    runner.finalize_unexpected_failure(&root.task_id, "worker failed")
+                }
+                _ => runner
+                    .finalize_unrunnable_outcome(
+                        &root.task_id,
+                        std::slice::from_ref(&child.task_id),
+                    )
+                    .map(|_| ()),
+            };
+            assert!(settle().is_err());
+            assert_eq!(
+                serde_json::to_value(store.snapshot().tasks).unwrap(),
+                before
+            );
+            assert_eq!(admission.snapshot().active_task_count, 1);
+            assert_eq!(admission.snapshot().queued_task_count, 1);
+            store.set_checkpoint_callback(Box::new(|_| Ok(())));
+            settle().unwrap();
+            for task in [root, child, grandchild] {
+                assert_eq!(
+                    store.get_task(&task.task_id).unwrap().status,
+                    if matches!(mode, "kill" | "execution_kill") {
+                        TaskStatus::Killed
+                    } else {
+                        TaskStatus::Failed
+                    }
+                );
+            }
+            assert_eq!(admission.snapshot().active_task_count, 0);
+            assert_eq!(admission.snapshot().queued_task_count, 0);
         }
     }
 
@@ -877,7 +904,7 @@ mod tests {
             store.insert_task(task).expect("任务应插入");
         }
         // 父任务已结束时排队中的子代理不能再被派发；RejectingDispatcher 被调用即报错。
-        let runner = TaskRunner::with_test_result_receiver(
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             vec![WorkerInfo {
                 worker_id: WorkerId::new("worker-orphan"),
@@ -887,7 +914,6 @@ mod tests {
                 system_prompt_template: None,
             }],
             Arc::new(RejectingDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
         );
 
         let outcome = runner.run_cycle(&root.task_id);
@@ -903,6 +929,355 @@ mod tests {
                 "{task_id} 必须随失败的根任务一起终止"
             );
         }
+    }
+
+    #[test]
+    fn transferred_subtree_has_its_own_runner_after_source_turn_task_finishes() {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let store = Arc::new(TaskStore::new());
+            let mut root = test_task("scope-root", "scope-root", None);
+            root.status = TaskStatus::Running;
+            root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+            store.insert_task(root.clone()).unwrap();
+            let mut child = test_task("scope-child", "scope-root", Some(root.task_id.clone()));
+            let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+            binding.delegation_allowed = true;
+            binding.agent_activation = Some(magi_core::AgentActivation {
+                agent_id: child.task_id.clone(),
+                session_id: magi_core::SessionId::new("scope-session"),
+                lifetime: magi_core::AgentLifetime::Session,
+                generation: 1,
+                previous_task_id: None,
+            });
+            child.executor_binding = Some(binding.clone());
+            let mut leaf = test_task("scope-leaf", "scope-root", Some(child.task_id.clone()));
+            binding.delegation_allowed = false;
+            binding.agent_activation.as_mut().unwrap().agent_id = leaf.task_id.clone();
+            leaf.executor_binding = Some(binding);
+            for task in [&child, &leaf] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            store
+                .transfer_agent_subtree(
+                    &root.task_id,
+                    &child.task_id,
+                    magi_core::AgentRunTransfer {
+                        operation_id: "runner-transfer".into(),
+                        session_id: magi_core::SessionId::new("scope-session"),
+                        source_turn_id: "source-turn".into(),
+                        transferred_by: root.task_id.clone(),
+                        activation_generation: 1,
+                        owner: magi_core::AgentRunOwner::Session,
+                        transferred_at: UtcMillis::now(),
+                    },
+                )
+                .unwrap();
+            if terminal == TaskStatus::Completed {
+                store
+                    .complete_task(
+                        &root.task_id,
+                        TaskCompletionAttempt {
+                            output_refs: vec![],
+                            final_response: Some("主线结束".into()),
+                            evidence: vec![],
+                        },
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &root.task_id,
+                        &root.task_id,
+                        terminal,
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let dispatcher = Arc::new(HoldingDispatcher {
+                permits: Mutex::new(vec![]),
+            });
+            let runner = TaskRunner::with_dispatcher(
+                store.clone(),
+                vec![WorkerInfo {
+                    worker_id: WorkerId::new("scope-worker"),
+                    role: "executor".into(),
+                    supported_kinds: vec![TaskKind::LocalAgent],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                }],
+                dispatcher.clone(),
+            );
+            // 原 Runner 可收口，不得级联杀死或等待已转交子树。
+            let source = runner.run_cycle(&root.task_id);
+            assert!(
+                match terminal {
+                    TaskStatus::Completed => source == RunCycleOutcome::AllComplete,
+                    _ => matches!(source, RunCycleOutcome::Error(_)),
+                },
+                "{source:?}"
+            );
+            assert_eq!(
+                store.get_task(&child.task_id).unwrap().status,
+                TaskStatus::Pending
+            );
+            assert_eq!(runner.run_cycle(&child.task_id), RunCycleOutcome::Continue);
+            let child_lease = store.get_active_lease(&child.task_id).unwrap();
+            assert_eq!(child_lease.root_task_id, root.task_id);
+            assert!(
+                !crate::task_execution_guard::TaskExecutionGuard::new(
+                    &store,
+                    &magi_session_store::SessionStore::new(),
+                    &TaskExecutionRegistry::default(),
+                    &magi_core::SessionId::new("scope-session"),
+                    &child.task_id,
+                    &child_lease.lease_id,
+                )
+                .is_active(),
+                "没有 canonical 拥有方装配时，领域转交不能单独授予执行权"
+            );
+            assert_eq!(runner.run_cycle(&child.task_id), RunCycleOutcome::Continue);
+            let leaf_lease = store.get_active_lease(&leaf.task_id).unwrap();
+            for (task, lease) in [(&leaf, &leaf_lease), (&child, &child_lease)] {
+                assert!(
+                    store
+                        .complete_lease_and_task(
+                            &task.task_id,
+                            &root.task_id,
+                            &lease.lease_id,
+                            TaskCompletionAttempt {
+                                output_refs: vec![],
+                                final_response: Some("独立拥有方完成".into()),
+                                evidence: vec![]
+                            }
+                        )
+                        .unwrap()
+                );
+            }
+            assert_eq!(
+                runner.run_cycle(&child.task_id),
+                RunCycleOutcome::AllComplete
+            );
+            assert_eq!(store.get_task(&root.task_id).unwrap().status, terminal);
+            dispatcher.release_all();
+        }
+    }
+
+    #[test]
+    fn old_runner_scan_cannot_claim_a_subtree_transferred_during_admission() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("claim-root", "claim-root", None);
+        root.status = TaskStatus::Running;
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        store.insert_task(root.clone()).unwrap();
+        let mut child = test_task("claim-child", "claim-root", Some(root.task_id.clone()));
+        let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+        binding.agent_activation = Some(magi_core::AgentActivation {
+            agent_id: child.task_id.clone(),
+            session_id: magi_core::SessionId::new("claim-session"),
+            lifetime: magi_core::AgentLifetime::Session,
+            generation: 1,
+            previous_task_id: None,
+        });
+        child.executor_binding = Some(binding);
+        store.insert_task(child.clone()).unwrap();
+        let runtime = store.clone();
+        let parent = root.clone();
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![WorkerInfo {
+                worker_id: WorkerId::new("claim-worker"),
+                role: "executor".into(),
+                supported_kinds: vec![TaskKind::LocalAgent],
+                parallelism_limit: None,
+                system_prompt_template: None,
+            }],
+            Arc::new(RejectingDispatcher),
+        )
+        .with_dispatch_gate(Arc::new(move |task| {
+            runtime
+                .transfer_agent_subtree(
+                    &parent.task_id,
+                    &task.task_id,
+                    magi_core::AgentRunTransfer {
+                        operation_id: "during-admission".into(),
+                        session_id: magi_core::SessionId::new("claim-session"),
+                        source_turn_id: "source-turn".into(),
+                        transferred_by: parent.task_id.clone(),
+                        activation_generation: 1,
+                        owner: magi_core::AgentRunOwner::Session,
+                        transferred_at: UtcMillis::now(),
+                    },
+                )
+                .unwrap();
+            Ok(TaskDispatchGateDecision::Allow)
+        }));
+        assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Waiting);
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert!(store.get_active_lease(&child.task_id).is_none());
+    }
+
+    #[test]
+    fn stale_unrunnable_child_does_not_fail_mainline_or_release_transferred_admission() {
+        for changed in ["transferred", "completed", "started", "active"] {
+            let store = Arc::new(TaskStore::new());
+            let mut root = test_task("unrunnable-root", "unrunnable-root", None);
+            root.status = TaskStatus::Running;
+            root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+            store.insert_task(root.clone()).unwrap();
+            let mut child = test_task(
+                "unrunnable-child",
+                "unrunnable-root",
+                Some(root.task_id.clone()),
+            );
+            let mut binding = magi_core::TaskExecutorBinding::for_role("executor");
+            binding.agent_activation = Some(magi_core::AgentActivation {
+                agent_id: child.task_id.clone(),
+                session_id: magi_core::SessionId::new("unrunnable-session"),
+                lifetime: magi_core::AgentLifetime::Session,
+                generation: 1,
+                previous_task_id: None,
+            });
+            child.executor_binding = Some(binding);
+            store.insert_task(child.clone()).unwrap();
+            let admission = Arc::new(ExecutionAdmissionController::default());
+            admission.reserve(child.task_id.clone(), None, "executor");
+            let runner =
+                TaskRunner::with_dispatcher(store.clone(), vec![], Arc::new(RejectingDispatcher))
+                    .with_execution_admission(admission.clone(), None);
+            let RunCycleOutcome::Unrunnable(candidates) = runner.run_cycle(&root.task_id) else {
+                panic!("missing worker must produce a candidate before the ownership change");
+            };
+            assert_eq!(candidates, [child.task_id.clone()]);
+            match changed {
+                "transferred" => {
+                    store
+                        .transfer_agent_subtree(
+                            &root.task_id,
+                            &child.task_id,
+                            magi_core::AgentRunTransfer {
+                                operation_id: "unrunnable-transfer".into(),
+                                session_id: magi_core::SessionId::new("unrunnable-session"),
+                                source_turn_id: "source-turn".into(),
+                                transferred_by: root.task_id.clone(),
+                                activation_generation: 1,
+                                owner: magi_core::AgentRunOwner::Session,
+                                transferred_at: UtcMillis::now(),
+                            },
+                        )
+                        .unwrap();
+                }
+                "completed" => {
+                    let lease = store
+                        .claim_task_for_execution_scope(
+                            &child.task_id,
+                            &root.task_id,
+                            &WorkerId::new("completion-worker"),
+                            "executor",
+                            60_000,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    store
+                        .complete_lease_and_task(
+                            &child.task_id,
+                            &root.task_id,
+                            &lease.lease_id,
+                            TaskCompletionAttempt {
+                                output_refs: vec![],
+                                final_response: Some("completed by another cycle".into()),
+                                evidence: vec![],
+                            },
+                        )
+                        .unwrap();
+                }
+                "started" => {
+                    assert!(
+                        store
+                            .claim_task_for_execution_scope(
+                                &child.task_id,
+                                &root.task_id,
+                                &WorkerId::new("late-worker"),
+                                "executor",
+                                60_000,
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                _ => {}
+            }
+            assert_eq!(
+                runner
+                    .finalize_unrunnable_outcome(&root.task_id, &candidates)
+                    .unwrap(),
+                changed == "active"
+            );
+            assert_eq!(
+                store.get_task(&root.task_id).unwrap().status,
+                if changed == "active" {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Running
+                }
+            );
+            if changed == "transferred" {
+                assert_eq!(
+                    store.get_task(&child.task_id).unwrap().status,
+                    TaskStatus::Pending
+                );
+                assert_eq!(admission.snapshot().active_task_count, 1);
+            } else if changed == "active" {
+                assert_eq!(admission.snapshot().active_task_count, 0);
+            } else if changed == "started" {
+                assert_eq!(
+                    store.get_task(&child.task_id).unwrap().status,
+                    TaskStatus::Running
+                );
+                assert_eq!(admission.snapshot().active_task_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn resumed_agent_parent_starts_before_its_pending_descendants() {
+        let store = Arc::new(TaskStore::new());
+        let root = test_task("resume-parent", "resume-parent", None);
+        let child = test_task("resume-child", "resume-parent", Some(root.task_id.clone()));
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let runnable = store.get_runnable_leaves(&root.task_id);
+        assert_eq!(
+            runnable
+                .iter()
+                .map(|task| &task.task_id)
+                .collect::<Vec<_>>(),
+            vec![&root.task_id]
+        );
+        store
+            .grant_lease_and_start_task(
+                &root.task_id,
+                &root.task_id,
+                &WorkerId::new("resume-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        let runnable = store.get_runnable_leaves(&root.task_id);
+        assert_eq!(
+            runnable
+                .iter()
+                .map(|task| &task.task_id)
+                .collect::<Vec<_>>(),
+            vec![&child.task_id]
+        );
     }
 
     #[test]
@@ -922,16 +1297,133 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_receives_updates_committed_after_runnable_scan_before_lease() {
+        struct SnapshotDispatcher;
+        impl TaskDispatcher for SnapshotDispatcher {
+            fn dispatch(
+                &self,
+                task: &Task,
+                _worker: &WorkerInfo,
+                _lease: &magi_orchestrator::task_store::TaskLease,
+                _permit: ExecutionAdmissionPermit,
+            ) -> Result<(), String> {
+                assert_eq!(task.goal, "updated before grant");
+                assert_eq!(task.status, TaskStatus::Running);
+                Ok(())
+            }
+        }
+        let store = Arc::new(TaskStore::new());
+        let root = test_task("fresh-dispatch-root", "fresh-dispatch-root", None);
+        store.insert_task(root.clone()).unwrap();
+        let gate_store = Arc::clone(&store);
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            vec![WorkerInfo {
+                worker_id: WorkerId::new("fresh-dispatch-worker"),
+                role: "executor".into(),
+                supported_kinds: vec![TaskKind::LocalAgent],
+                parallelism_limit: None,
+                system_prompt_template: None,
+            }],
+            Arc::new(SnapshotDispatcher),
+        )
+        .with_dispatch_gate(Arc::new(move |task| {
+            gate_store
+                .update_task_goal(&task.task_id, "updated before grant".into())
+                .unwrap();
+            Ok(TaskDispatchGateDecision::Allow)
+        }));
+        assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Continue);
+    }
+
+    #[test]
+    fn parent_closing_during_admission_does_not_fail_unrelated_branch() {
+        struct RecordingDispatcher(Arc<Mutex<Vec<TaskId>>>);
+        impl TaskDispatcher for RecordingDispatcher {
+            fn dispatch(
+                &self,
+                task: &Task,
+                _worker: &WorkerInfo,
+                _lease: &magi_orchestrator::task_store::TaskLease,
+                _permit: ExecutionAdmissionPermit,
+            ) -> Result<(), String> {
+                self.0.lock().unwrap().push(task.task_id.clone());
+                Ok(())
+            }
+        }
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("admission-root", "admission-root", None);
+        root.status = TaskStatus::Running;
+        let mut parent = test_task(
+            "admission-parent",
+            "admission-root",
+            Some(root.task_id.clone()),
+        );
+        parent.status = TaskStatus::Running;
+        let child = test_task(
+            "admission-child",
+            "admission-root",
+            Some(parent.task_id.clone()),
+        );
+        let sibling = test_task(
+            "admission-sibling",
+            "admission-root",
+            Some(root.task_id.clone()),
+        );
+        for task in [&root, &parent, &child, &sibling] {
+            store.insert_task(task.clone()).unwrap();
+        }
+        let gate_store = Arc::clone(&store);
+        let gate_child = child.task_id.clone();
+        let gate_parent = parent.task_id.clone();
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            vec![WorkerInfo {
+                worker_id: WorkerId::new("admission-worker"),
+                role: "executor".into(),
+                supported_kinds: vec![TaskKind::LocalAgent],
+                parallelism_limit: None,
+                system_prompt_template: None,
+            }],
+            Arc::new(RecordingDispatcher(Arc::clone(&dispatched))),
+        )
+        .with_dispatch_gate(Arc::new(move |task| {
+            if task.task_id == gate_child {
+                gate_store
+                    .complete_task(
+                        &gate_parent,
+                        TaskCompletionAttempt {
+                            final_response: Some("父任务已在接纳窗口完成".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            Ok(TaskDispatchGateDecision::Allow)
+        }));
+        assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Continue);
+        assert_eq!(*dispatched.lock().unwrap(), vec![sibling.task_id]);
+        assert!(store.get_active_lease(&child.task_id).is_none());
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
     fn dispatch_gate_blocks_without_lease_or_status_change() {
         let store = Arc::new(TaskStore::new());
         let root = test_task("task-root-gated", "task-root-gated", None);
         store.insert_task(root.clone()).expect("根任务应插入");
-        let receiver = Arc::new(EventBasedResultReceiver::new());
-        let runner = TaskRunner::with_test_result_receiver(
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
-            receiver,
         )
         .with_dispatch_gate(Arc::new(|task: &Task| {
             Ok(TaskDispatchGateDecision::Blocked(format!(
@@ -960,11 +1452,10 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let root = test_task("task-root-unmatched", "task-root-unmatched", None);
         store.insert_task(root.clone()).expect("根任务应插入");
-        let runner = TaskRunner::with_test_result_receiver(
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
         );
 
         assert_eq!(
@@ -997,11 +1488,10 @@ mod tests {
             parallelism_limit: None,
             system_prompt_template: None,
         };
-        let runner = TaskRunner::with_test_result_receiver(
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             vec![executor],
             Arc::new(RejectingDispatcher),
-            Arc::new(EventBasedResultReceiver::new()),
         );
 
         assert_eq!(
@@ -1037,14 +1527,9 @@ mod tests {
         let dispatcher = Arc::new(HoldingDispatcher {
             permits: Mutex::new(Vec::new()),
         });
-        let runner = TaskRunner::with_test_result_receiver(
-            Arc::clone(&store),
-            Vec::new(),
-            dispatcher,
-            Arc::new(EventBasedResultReceiver::new()),
-        )
-        .with_agent_role_registry(registry.clone())
-        .with_worker_catalog_provider(provider);
+        let runner = TaskRunner::with_dispatcher(Arc::clone(&store), Vec::new(), dispatcher)
+            .with_agent_role_registry(registry.clone())
+            .with_worker_catalog_provider(provider);
 
         let mut role = registry.get("executor").expect("内置 executor 应存在");
         role.id = "dynamic-role".to_string();
@@ -1065,6 +1550,82 @@ mod tests {
             .expect("任务应获得动态角色的活跃租约");
         assert_eq!(lease.role, "dynamic-role");
         assert_eq!(lease.worker_id.as_str(), "task-worker-dynamic-role");
+    }
+
+    #[test]
+    fn cancellation_receipt_is_lease_bound_idempotent_and_cannot_become_failure() {
+        let store = TaskStore::new();
+        let mut task = test_task("cancel-receipt", "cancel-receipt", None);
+        task.status = TaskStatus::Running;
+        store.insert_task(task.clone()).unwrap();
+        let worker = WorkerId::new("cancel-worker");
+        let old = store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker,
+                "executor",
+                DEFAULT_LEASE_DURATION_MS,
+            )
+            .unwrap();
+        assert!(store.revoke_lease(&task.task_id, &old.lease_id));
+        let current = store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker,
+                "executor",
+                DEFAULT_LEASE_DURATION_MS,
+            )
+            .unwrap();
+        assert!(
+            !apply_task_result(
+                &store,
+                TaskResult {
+                    task_id: task.task_id.clone(),
+                    lease_id: old.lease_id,
+                    outcome: TaskOutcome::Cancelled,
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            apply_task_result(
+                &store,
+                TaskResult {
+                    task_id: task.task_id.clone(),
+                    lease_id: current.lease_id.clone(),
+                    outcome: TaskOutcome::Cancelled,
+                }
+            )
+            .unwrap()
+        );
+        for outcome in [
+            TaskOutcome::Cancelled,
+            TaskOutcome::Failed {
+                error: "late failure".into(),
+            },
+        ] {
+            assert!(
+                !apply_task_result(
+                    &store,
+                    TaskResult {
+                        task_id: task.task_id.clone(),
+                        lease_id: current.lease_id.clone(),
+                        outcome,
+                    }
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
     }
 
     #[test]
@@ -1093,19 +1654,21 @@ mod tests {
                 DEFAULT_LEASE_DURATION_MS,
             )
             .expect("current lease should grant");
-        let receiver = Arc::new(EventBasedResultReceiver::new());
-        receiver.push_result(TaskResult {
-            task_id: root.task_id.clone(),
-            lease_id: stale_lease.lease_id,
-            outcome: TaskOutcome::Failed {
-                error: "旧执行轮迟到失败".to_string(),
+        let result = apply_task_result(
+            &store,
+            TaskResult {
+                task_id: root.task_id.clone(),
+                lease_id: stale_lease.lease_id,
+                outcome: TaskOutcome::Failed {
+                    error: "旧执行轮迟到失败".to_string(),
+                },
             },
-        });
-        let runner = TaskRunner::with_test_result_receiver(
+        );
+        assert!(!result.unwrap(), "迟到结果不能修改当前任务或租约");
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
-            receiver,
         );
 
         assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Continue);
@@ -1150,32 +1713,33 @@ mod tests {
             })
         }));
 
-        let receiver = Arc::new(EventBasedResultReceiver::new());
-        receiver.push_result(TaskResult {
-            task_id: root.task_id.clone(),
-            lease_id: lease.lease_id.clone(),
-            outcome: TaskOutcome::Completed {
-                attempt: TaskCompletionAttempt {
-                    output_refs: vec!["output://completion".to_string()],
-                    final_response: Some("完成".to_string()),
-                    evidence: Vec::new(),
+        let result = apply_task_result(
+            &store,
+            TaskResult {
+                task_id: root.task_id.clone(),
+                lease_id: lease.lease_id.clone(),
+                outcome: TaskOutcome::Completed {
+                    attempt: TaskCompletionAttempt {
+                        output_refs: vec!["output://completion".to_string()],
+                        final_response: Some("完成".to_string()),
+                        evidence: Vec::new(),
+                    },
                 },
             },
-        });
-        let runner = TaskRunner::with_test_result_receiver(
+        );
+        let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             Vec::new(),
             Arc::new(RejectingDispatcher),
-            receiver,
         );
 
-        let outcome = runner.run_cycle(&root.task_id);
-        assert!(matches!(
-            outcome,
-            RunCycleOutcome::Error(ref reason)
-                if reason.contains("完成事实持久化失败")
-                    && reason.contains("completion checkpoint unavailable")
-        ));
+        let error = result.unwrap_err();
+        assert!(error.contains("完成事实持久化失败"), "{error}");
+        assert!(
+            error.contains("completion checkpoint unavailable"),
+            "{error}"
+        );
+        assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Continue);
         assert_eq!(
             store
                 .get_task(&root.task_id)
@@ -1190,6 +1754,73 @@ mod tests {
                 .lease_id,
             lease.lease_id
         );
+    }
+
+    #[test]
+    fn concurrent_runners_claim_one_task_once_without_a_conversation_lock() {
+        let store = Arc::new(TaskStore::new());
+        let task = test_task("single-dispatch", "single-dispatch", None);
+        store.insert_task(task.clone()).unwrap();
+        let dispatcher = Arc::new(HoldingDispatcher {
+            permits: Mutex::new(Vec::new()),
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let outcomes = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let store = store.clone();
+                    let dispatcher = dispatcher.clone();
+                    let barrier = barrier.clone();
+                    let task_id = task.task_id.clone();
+                    scope.spawn(move || {
+                        TaskRunner::with_dispatcher(
+                            store,
+                            vec![WorkerInfo {
+                                worker_id: WorkerId::new("single-dispatch-worker"),
+                                role: "executor".into(),
+                                supported_kinds: vec![TaskKind::LocalAgent],
+                                parallelism_limit: None,
+                                system_prompt_template: None,
+                            }],
+                            dispatcher,
+                        )
+                        // 各 Runner 使用独立准入器，强制验证 TaskStore 的原子租约，
+                        // 不能由共享容量计数碰巧挡住重复派发。
+                        .with_execution_admission(
+                            Arc::new(ExecutionAdmissionController::new(
+                                ExecutionAdmissionLimits {
+                                    min_available_memory_bytes: 0,
+                                    ..Default::default()
+                                },
+                            )),
+                            None,
+                        )
+                        .with_dispatch_gate(Arc::new(move |_| {
+                            barrier.wait();
+                            Ok(TaskDispatchGateDecision::Allow)
+                        }))
+                        .run_cycle(&task_id)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|run| run.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RunCycleOutcome::Continue)
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(dispatcher.permits.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(store.get_active_lease(&task.task_id).is_some());
     }
 
     #[test]
@@ -1223,26 +1854,21 @@ mod tests {
         let dispatcher = Arc::new(HoldingDispatcher {
             permits: Mutex::new(Vec::new()),
         });
-        let first_runner = TaskRunner::with_test_result_receiver(
+        let first_runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             vec![worker.clone()],
             dispatcher.clone(),
-            Arc::new(EventBasedResultReceiver::new()),
         )
         .with_execution_admission(
             Arc::clone(&controller),
             Some(SessionId::new("session-admission-first")),
         );
-        let second_runner = TaskRunner::with_test_result_receiver(
-            Arc::clone(&store),
-            vec![worker],
-            dispatcher.clone(),
-            Arc::new(EventBasedResultReceiver::new()),
-        )
-        .with_execution_admission(
-            Arc::clone(&controller),
-            Some(SessionId::new("session-admission-second")),
-        );
+        let second_runner =
+            TaskRunner::with_dispatcher(Arc::clone(&store), vec![worker], dispatcher.clone())
+                .with_execution_admission(
+                    Arc::clone(&controller),
+                    Some(SessionId::new("session-admission-second")),
+                );
 
         assert_eq!(
             first_runner.run_cycle(&first_root.task_id),

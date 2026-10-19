@@ -15,31 +15,39 @@ use magi_core::{
     PlanItemStatus, PlanState, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
     ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 struct RejectingCanonicalWriter;
 
-impl crate::CanonicalTurnEventWriter for RejectingCanonicalWriter {
-    fn append_canonical_turn_transaction(
-        &self,
-        _session_id: &SessionId,
-        _mutations: &[crate::CanonicalTurnMutation],
-    ) -> magi_core::DomainResult<()> {
-        Err(DomainError::Persistence {
-            message: "test canonical writer failure".to_string(),
-        })
-    }
+#[derive(Default)]
+struct RecordingCanonicalWriter {
+    transactions: std::sync::Mutex<Vec<Vec<crate::CanonicalTurnMutation>>>,
+}
 
-    fn append_canonical_turn_transaction_with_acceptance(
+impl crate::SessionEventWriter for RecordingCanonicalWriter {
+    fn append_session_transaction(
         &self,
-        _session_id: &SessionId,
-        _mutations: &[crate::CanonicalTurnMutation],
-        _acceptance: &SessionAcceptanceRecord,
-        _task: Option<&magi_core::Task>,
+        _: &SessionId,
+        turns: &[crate::CanonicalTurnMutation],
+        _: &[crate::SessionInputMutation],
+        _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
+    ) -> magi_core::DomainResult<()> {
+        self.transactions.lock().unwrap().push(turns.to_vec());
+        Ok(())
+    }
+}
+
+impl crate::SessionEventWriter for RejectingCanonicalWriter {
+    fn append_session_transaction(
+        &self,
+        _: &SessionId,
+        _: &[crate::CanonicalTurnMutation],
+        _: &[crate::SessionInputMutation],
+        _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
     ) -> magi_core::DomainResult<()> {
         Err(DomainError::Persistence {
-            message: "test canonical writer failure".to_string(),
+            message: "test canonical writer failure".into(),
         })
     }
 }
@@ -49,11 +57,13 @@ struct BlockingCanonicalWriter {
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
-impl crate::CanonicalTurnEventWriter for BlockingCanonicalWriter {
-    fn append_canonical_turn_transaction(
+impl crate::SessionEventWriter for BlockingCanonicalWriter {
+    fn append_session_transaction(
         &self,
-        _session_id: &SessionId,
-        _mutations: &[crate::CanonicalTurnMutation],
+        _: &SessionId,
+        _: &[crate::CanonicalTurnMutation],
+        _: &[crate::SessionInputMutation],
+        _: Option<(&SessionAcceptanceRecord, Option<&magi_core::Task>)>,
     ) -> magi_core::DomainResult<()> {
         self.entered
             .send(())
@@ -64,16 +74,6 @@ impl crate::CanonicalTurnEventWriter for BlockingCanonicalWriter {
             .recv()
             .expect("blocking writer should be released");
         Ok(())
-    }
-
-    fn append_canonical_turn_transaction_with_acceptance(
-        &self,
-        session_id: &SessionId,
-        mutations: &[crate::CanonicalTurnMutation],
-        _acceptance: &SessionAcceptanceRecord,
-        _task: Option<&magi_core::Task>,
-    ) -> magi_core::DomainResult<()> {
-        self.append_canonical_turn_transaction(session_id, mutations)
     }
 }
 
@@ -112,7 +112,7 @@ fn assert_store_mutation_snapshot_unchanged(store: &SessionStore, before: &Store
 }
 
 fn reject_canonical_writes(store: &SessionStore) {
-    store.install_canonical_event_writer(Arc::new(RejectingCanonicalWriter));
+    store.install_session_event_writer(Arc::new(RejectingCanonicalWriter));
 }
 
 fn create_test_goal(
@@ -120,7 +120,6 @@ fn create_test_goal(
     session_id: &SessionId,
     turn_id: &str,
     objective: &str,
-    token_budget: Option<u64>,
 ) -> crate::models::SessionGoal {
     let (_, thread_id) = store.ensure_session_mission(session_id, UtcMillis::now(), || {
         MissionId::new(format!("mission-{session_id}"))
@@ -132,7 +131,6 @@ fn create_test_goal(
             turn_id,
             objective,
             AccessProfile::Restricted,
-            token_budget,
         )
         .expect("test goal should be creatable")
 }
@@ -880,7 +878,7 @@ fn persistence_waits_for_canonical_commit_before_capturing_projection() {
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    store.install_canonical_event_writer(Arc::new(BlockingCanonicalWriter {
+    store.install_session_event_writer(Arc::new(BlockingCanonicalWriter {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     }));
@@ -946,7 +944,7 @@ fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    store.install_canonical_event_writer(Arc::new(BlockingCanonicalWriter {
+    store.install_session_event_writer(Arc::new(BlockingCanonicalWriter {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     }));
@@ -966,7 +964,7 @@ fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
     let flush_store = store.clone();
     let flush = thread::spawn(move || {
         flush_store
-            .flush_execution_sidecars_with(|durable, _| {
+            .flush_execution_sidecar_snapshot_with(|durable, _, ids| {
                 let turn = durable
                     .canonical_turns
                     .iter()
@@ -975,7 +973,7 @@ fn sidecar_flush_waits_for_canonical_commit_before_capturing_projection() {
                 flush_entered_tx
                     .send(turn.status)
                     .expect("sidecar flush callback should signal entry");
-                Ok::<(), ()>(())
+                Ok::<_, ()>(ids.to_vec())
             })
             .expect("sidecar flush should succeed")
     });
@@ -1036,7 +1034,7 @@ fn canonical_event_commit_does_not_hold_state_lock_until_event_writer_finishes()
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    store.install_canonical_event_writer(Arc::new(BlockingCanonicalWriter {
+    store.install_session_event_writer(Arc::new(BlockingCanonicalWriter {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     }));
@@ -1098,7 +1096,6 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
         &session_id,
         "turn-goal-singleton-1",
         "完成项目级重构",
-        Some(1_000),
     );
     assert_eq!(first.status, GoalStatus::Active);
 
@@ -1109,7 +1106,6 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             "turn-goal-singleton-2",
             "另一个未结束目标",
             AccessProfile::Restricted,
-            None,
         )
         .expect_err("second unfinished goal must be rejected");
     assert!(matches!(
@@ -1138,7 +1134,6 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             "turn-goal-singleton-3",
             "完成下一阶段",
             AccessProfile::Restricted,
-            None,
         )
         .expect("new goal after terminal status should be allowed");
 }
@@ -1150,13 +1145,7 @@ fn persisted_goal_normalization_keeps_latest_goal_without_resurrecting_older_wor
     store
         .create_session(session_id.clone(), "goal latest restore")
         .expect("session should be creatable");
-    let older = create_test_goal(
-        &store,
-        &session_id,
-        "turn-goal-latest-restore",
-        "旧目标",
-        None,
-    );
+    let older = create_test_goal(&store, &session_id, "turn-goal-latest-restore", "旧目标");
     let mut latest = older.clone();
     latest.goal_id = magi_core::GoalId::new("goal-latest-terminal");
     latest.objective = "最新目标".to_string();
@@ -1265,36 +1254,6 @@ fn v2_store_rejects_legacy_todo_list_payload() {
     );
     serde_json::from_value::<SessionDurableState>(payload)
         .expect_err("持久化状态只接受当前格式，不得接受旧 todo_lists");
-}
-
-#[test]
-fn goal_accounting_budget_limits_active_goal_without_cross_session_leakage() {
-    let store = SessionStore::new();
-    let session_a = SessionId::new("session-goal-a");
-    let session_b = SessionId::new("session-goal-b");
-    store
-        .create_session(session_a.clone(), "goal a")
-        .expect("session a should be creatable");
-    store
-        .create_session(session_b.clone(), "goal b")
-        .expect("session b should be creatable");
-
-    let goal_a = create_test_goal(&store, &session_a, "turn-goal-a", "分析并修复 A", Some(10));
-    let goal_b = create_test_goal(&store, &session_b, "turn-goal-b", "分析并修复 B", Some(100));
-
-    let limited = store
-        .account_goal_token_usage(&session_a, &goal_a.goal_id, 11)
-        .expect("accounting should update goal a");
-    assert_eq!(limited.status, GoalStatus::BudgetLimited);
-    assert_eq!(limited.tokens_used, 11);
-    assert_eq!(limited.time_used_seconds, 0);
-
-    let untouched_b = store
-        .current_goal(&session_b)
-        .expect("session b goal should still exist");
-    assert_eq!(untouched_b.goal_id, goal_b.goal_id);
-    assert_eq!(untouched_b.status, GoalStatus::Active);
-    assert_eq!(untouched_b.tokens_used, 0);
 }
 
 #[test]
@@ -1861,7 +1820,6 @@ fn user_interruption_atomically_pauses_running_goal_and_plan() {
         &session_id,
         "turn-create-goal-user-interruption",
         "验证用户中断释放 Goal continuation",
-        None,
     );
     let chain = test_active_chain(
         &session_id,
@@ -1943,7 +1901,6 @@ fn daemon_restart_releases_running_goal_continuation() {
         &session_id,
         "turn-create-goal-daemon-interruption",
         "验证 daemon 重启释放 Goal continuation",
-        None,
     );
     let chain = test_active_chain(
         &session_id,
@@ -1997,7 +1954,6 @@ fn interrupted_execution_resume_restores_owned_goal_plan_and_live_timing() {
         &session_id,
         chain.root_task_id.as_str(),
         "验证异常中断恢复同步 Goal",
-        None,
     );
     let plan = store
         .upsert_plan(
@@ -2138,7 +2094,6 @@ fn interrupted_execution_does_not_resume_unrelated_paused_goal() {
         &session_id,
         "task-unrelated-goal-owner",
         "保持无关 Goal 暂停",
-        None,
     );
     let paused_goal = store
         .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
@@ -2194,7 +2149,6 @@ fn restore_reconciles_terminal_goal_continuation() {
         &session_id,
         "turn-create-goal-terminal-restore",
         "验证旧持久化 continuation 对账",
-        None,
     );
     let mut turn = test_turn("turn-goal-terminal-restore", "running", 10);
     let mut task_item = test_turn_item("item-goal-terminal-restore", "继续 Goal");
@@ -2564,7 +2518,6 @@ fn active_goal_terminal_turn_is_not_a_user_response_duration_boundary() {
         &session_id,
         turn_id,
         "验证 Goal 中间 Turn 不展示总耗时",
-        None,
     );
     accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 10));
     store
@@ -2621,7 +2574,6 @@ fn goal_time_uses_owned_canonical_turn_wall_clock_without_model_usage() {
         &session_id,
         turn_id,
         "验证 Goal 使用完整 Turn 墙钟时间",
-        None,
     );
     let mut turn = test_turn(turn_id, "completed", 1_000);
     turn.completed_at = Some(UtcMillis(5_250));
@@ -2682,7 +2634,7 @@ fn running_goal_turn_exposes_live_timing_until_terminal_settlement() {
     store
         .create_session(session_id.clone(), "Goal Live Time")
         .expect("session should be creatable");
-    create_test_goal(&store, &session_id, turn_id, "验证 Goal 运行中计时", None);
+    create_test_goal(&store, &session_id, turn_id, "验证 Goal 运行中计时");
     accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 1_000));
 
     let running = store
@@ -2732,7 +2684,7 @@ fn paused_goal_hides_live_timing_and_completed_goal_keeps_final_turn_running() {
     store
         .create_session(session_id.clone(), "Goal Timing Status")
         .expect("session should be creatable");
-    let goal = create_test_goal(&store, &session_id, turn_id, "验证 Goal 状态计时边界", None);
+    let goal = create_test_goal(&store, &session_id, turn_id, "验证 Goal 状态计时边界");
     accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 1_000));
 
     let (paused, _) = store
@@ -2746,7 +2698,6 @@ fn paused_goal_hides_live_timing_and_completed_goal_keeps_final_turn_running() {
             &session_id,
             &goal.goal_id,
             paused.control_revision,
-            None,
             None,
             None,
         )
@@ -2777,7 +2728,7 @@ fn blocked_goal_turn_with_completion_timestamp_is_settled() {
     store
         .create_session(session_id.clone(), "Goal Blocked Time")
         .expect("session should be creatable");
-    create_test_goal(&store, &session_id, turn_id, "验证阻塞 Turn 计时结算", None);
+    create_test_goal(&store, &session_id, turn_id, "验证阻塞 Turn 计时结算");
     let mut turn = test_turn(turn_id, "blocked", 1_000);
     turn.completed_at = Some(UtcMillis(5_250));
     accept_test_turn(&store, &session_id, turn);
@@ -2802,7 +2753,6 @@ fn completed_goal_terminal_turn_is_the_user_response_duration_boundary() {
         &session_id,
         turn_id,
         "验证 Goal 最终 Turn 展示总耗时",
-        None,
     );
     accept_test_turn(&store, &session_id, test_turn(turn_id, "running", 20));
     store
@@ -2886,7 +2836,6 @@ fn canonical_writer_failure_keeps_completion_goal_plan_and_flush_unchanged() {
         &session_id,
         turn_id,
         "canonical writer 失败时目标不应变化",
-        None,
     );
     store
         .upsert_plan(
@@ -2966,7 +2915,6 @@ fn canonical_writer_failure_keeps_cancelled_turn_and_goal_plan_unchanged() {
         &session_id,
         turn_id,
         "canonical writer 失败时取消不应暂停目标",
-        None,
     );
     store
         .upsert_plan(
@@ -3023,7 +2971,6 @@ fn canonical_writer_failure_keeps_daemon_restart_interruption_unchanged() {
         &session_id,
         goal_turn_id,
         "canonical writer 失败时重启中断不应释放目标",
-        None,
     );
     let chain = test_active_chain(
         &session_id,
@@ -4456,6 +4403,71 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
 }
 
 #[test]
+fn partial_sidecar_flush_keeps_uncommitted_and_concurrently_changed_sessions_dirty() {
+    let store = SessionStore::new();
+    let first = SessionId::new("checkpoint-first");
+    let second = SessionId::new("checkpoint-second");
+    for id in [&first, &second] {
+        store.create_session(id.clone(), "checkpoint").unwrap();
+        store.bind_execution_ownership(id.clone(), ExecutionOwnership::default());
+    }
+    let mut changed = store.runtime_sidecar(&second).unwrap();
+    changed.updated_at = UtcMillis(changed.updated_at.0 + 1);
+    assert!(
+        store
+            .flush_execution_sidecar_snapshot_with(|_, _, _| {
+                store.upsert_runtime_sidecar(changed.clone());
+                Ok::<_, ()>(vec![second.clone()])
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_execution_sidecar_session_ids(),
+        vec![first.clone(), second.clone()]
+    );
+    assert!(
+        store
+            .flush_execution_sidecar_snapshot_with(|_, _, _| Err::<Vec<SessionId>, _>(
+                "write failed"
+            ))
+            .is_err()
+    );
+    assert_eq!(
+        store.pending_execution_sidecar_session_ids(),
+        vec![first.clone(), second.clone()]
+    );
+    assert!(
+        store
+            .flush_execution_sidecar_snapshot_with(|_, _, _| Ok::<_, ()>(vec![second.clone()]))
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_execution_sidecar_session_ids(),
+        vec![first.clone()]
+    );
+    assert!(
+        !store
+            .flush_execution_sidecar_snapshot_with(|_, _, _| Ok::<_, ()>(Vec::new()))
+            .unwrap()
+    );
+    assert!(
+        store
+            .execution_sidecar_flush_metadata()
+            .next_flush_hint
+            .is_some()
+    );
+    assert!(
+        store
+            .flush_execution_sidecar_snapshot_with(|_, _, ids| Ok::<_, ()>(ids.to_vec()))
+            .unwrap()
+    );
+    assert!(store.pending_execution_sidecar_session_ids().is_empty());
+    let metadata = store.execution_sidecar_flush_metadata();
+    assert_eq!(metadata.current_version, metadata.flushed_version);
+    assert!(metadata.next_flush_hint.is_none());
+}
+
+#[test]
 fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-metadata");
@@ -4550,9 +4562,9 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     let mut flushes = Vec::new();
     assert!(
         store
-            .flush_execution_sidecars_with(|_, state| {
+            .flush_execution_sidecar_snapshot_with(|_, state, ids| {
                 flushes.push(state.runtime_sidecars.len());
-                Ok::<_, std::io::Error>(())
+                Ok::<_, std::io::Error>(ids.to_vec())
             })
             .expect("dirty sidecar flush should succeed")
     );
@@ -5170,7 +5182,7 @@ fn sidecar_flush_scheduling_with_intermediate_flushes() {
     assert!(m1.next_flush_hint.is_some());
 
     let flushed = store
-        .flush_execution_sidecars_with(|_, _| Ok::<_, std::io::Error>(()))
+        .flush_execution_sidecar_snapshot_with(|_, _, ids| Ok::<_, std::io::Error>(ids.to_vec()))
         .expect("flush should succeed");
     assert!(flushed);
     let m1f = store.execution_sidecar_flush_metadata();
@@ -5219,13 +5231,13 @@ fn sidecar_flush_scheduling_with_intermediate_flushes() {
     assert_eq!(m3.flushed_version, 1);
 
     let flushed = store
-        .flush_execution_sidecars_with(|_, state| {
+        .flush_execution_sidecar_snapshot_with(|_, state, ids| {
             assert_eq!(state.runtime_sidecars.len(), 1);
             assert_eq!(
                 state.runtime_sidecars[0].status,
                 SessionExecutionSidecarStatus::Resumed
             );
-            Ok::<_, std::io::Error>(())
+            Ok::<_, std::io::Error>(ids.to_vec())
         })
         .expect("flush should succeed");
     assert!(flushed);
@@ -5234,7 +5246,7 @@ fn sidecar_flush_scheduling_with_intermediate_flushes() {
     assert!(m3f.next_flush_hint.is_none());
 
     let flushed = store
-        .flush_execution_sidecars_with(|_, _| Ok::<_, std::io::Error>(()))
+        .flush_execution_sidecar_snapshot_with(|_, _, ids| Ok::<_, std::io::Error>(ids.to_vec()))
         .expect("no-op flush should succeed");
     assert!(!flushed);
 }
@@ -5353,7 +5365,7 @@ fn delete_session_cleans_up_sidecar_and_marks_dirty() {
         .expect("attach recovery should succeed");
 
     store
-        .flush_execution_sidecars_with(|_, _| Ok::<_, std::io::Error>(()))
+        .flush_execution_sidecar_snapshot_with(|_, _, ids| Ok::<_, std::io::Error>(ids.to_vec()))
         .expect("flush should succeed");
     let metadata_pre = store.execution_sidecar_flush_metadata();
     assert_eq!(metadata_pre.current_version, metadata_pre.flushed_version);
@@ -5514,9 +5526,9 @@ fn execution_sidecar_flush_hook_only_persists_dirty_sidecars() {
     let mut flushes = Vec::new();
     assert!(
         !store
-            .flush_execution_sidecars_with(|_, state| {
+            .flush_execution_sidecar_snapshot_with(|_, state, ids| {
                 flushes.push(state.runtime_sidecars.len());
-                Ok::<_, std::io::Error>(())
+                Ok::<_, std::io::Error>(ids.to_vec())
             })
             .expect("empty sidecar flush should succeed")
     );
@@ -5533,134 +5545,22 @@ fn execution_sidecar_flush_hook_only_persists_dirty_sidecars() {
     );
     assert!(
         store
-            .flush_execution_sidecars_with(|_, state| {
+            .flush_execution_sidecar_snapshot_with(|_, state, ids| {
                 flushes.push(state.runtime_sidecars.len());
-                Ok::<_, std::io::Error>(())
+                Ok::<_, std::io::Error>(ids.to_vec())
             })
             .expect("dirty sidecar flush should succeed")
     );
     assert_eq!(flushes, vec![1]);
     assert!(
         !store
-            .flush_execution_sidecars_with(|_, _| Ok::<_, std::io::Error>(()))
+            .flush_execution_sidecar_snapshot_with(|_, _, ids| Ok::<_, std::io::Error>(
+                ids.to_vec()
+            ))
             .expect("clean sidecar flush should be skipped")
     );
 }
 
-#[test]
-fn sidecar_flush_callback_holds_snapshot_until_write_finishes() {
-    let store = SessionStore::new();
-    let session_id = SessionId::new("session-sidecar-recapture");
-    store
-        .create_session(session_id.clone(), "Sidecar recapture")
-        .expect("session should be creatable");
-    store.bind_execution_ownership(
-        session_id.clone(),
-        ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(WorkspaceId::new("workspace-sidecar-before")),
-            execution_chain_ref: Some("chain-sidecar-recapture".to_string()),
-            ..ExecutionOwnership::default()
-        },
-    );
-
-    let observed_workspace_ids = Arc::new(Mutex::new(Vec::<String>::new()));
-    let callback_workspace_ids = Arc::clone(&observed_workspace_ids);
-    let (callback_entered_tx, callback_entered_rx) = std::sync::mpsc::channel();
-    let (release_callback_tx, release_callback_rx) = std::sync::mpsc::channel();
-    let flush_store = store.clone();
-    let flush = thread::spawn(move || {
-        flush_store.flush_execution_sidecars_with(|_, sidecars| {
-            callback_workspace_ids
-                .lock()
-                .expect("workspace observation lock should not be poisoned")
-                .push(
-                    sidecars.runtime_sidecars[0]
-                        .ownership
-                        .workspace_id
-                        .as_ref()
-                        .expect("sidecar should retain workspace ownership")
-                        .as_str()
-                        .to_string(),
-                );
-            callback_entered_tx
-                .send(())
-                .expect("sidecar callback should signal entry");
-            release_callback_rx
-                .recv()
-                .expect("sidecar callback should be released");
-            Ok::<_, std::io::Error>(())
-        })
-    });
-    callback_entered_rx
-        .recv()
-        .expect("sidecar callback should enter");
-
-    let mutation_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mutation_finished_flag = Arc::clone(&mutation_finished);
-    let mutation_store = store.clone();
-    let mutation_session_id = session_id.clone();
-    let mutation = thread::spawn(move || {
-        mutation_store.bind_execution_ownership(
-            mutation_session_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(mutation_session_id),
-                workspace_id: Some(WorkspaceId::new("workspace-sidecar-after")),
-                execution_chain_ref: Some("chain-sidecar-recapture".to_string()),
-                ..ExecutionOwnership::default()
-            },
-        );
-        mutation_finished_flag.store(true, std::sync::atomic::Ordering::Release);
-    });
-    thread::sleep(Duration::from_millis(20));
-    assert!(
-        !mutation_finished.load(std::sync::atomic::Ordering::Acquire),
-        "sidecar mutation must wait until the sidecar write finishes"
-    );
-
-    release_callback_tx
-        .send(())
-        .expect("sidecar callback should be released");
-    assert!(
-        flush
-            .join()
-            .expect("sidecar flush should join")
-            .expect("sidecar flush should succeed")
-    );
-    mutation.join().expect("sidecar mutation should join");
-
-    assert_eq!(
-        *observed_workspace_ids
-            .lock()
-            .expect("workspace observation lock should not be poisoned"),
-        vec!["workspace-sidecar-before".to_string()]
-    );
-    let metadata = store.execution_sidecar_flush_metadata();
-    assert_eq!(metadata.current_version, 2);
-    assert_eq!(metadata.flushed_version, 1);
-
-    assert!(
-        store
-            .flush_execution_sidecars_with(|_, sidecars| {
-                assert_eq!(
-                    sidecars.runtime_sidecars[0]
-                        .ownership
-                        .workspace_id
-                        .as_ref()
-                        .expect("updated sidecar should retain workspace ownership")
-                        .as_str(),
-                    "workspace-sidecar-after"
-                );
-                Ok::<_, std::io::Error>(())
-            })
-            .expect("updated sidecar should flush")
-    );
-    let final_metadata = store.execution_sidecar_flush_metadata();
-    assert_eq!(
-        final_metadata.current_version,
-        final_metadata.flushed_version
-    );
-}
 // --- P6a Thread registry tests
 
 fn sample_thread(
@@ -5718,6 +5618,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         &thread_id,
         vec![
             ThreadChatMessage {
+                input_request_id: None,
                 role: "assistant".to_string(),
                 content: None,
                 images: Vec::new(),
@@ -5741,6 +5642,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
                 }],
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "tool".to_string(),
                 content: Some("exit code 1: compilation failed".to_string()),
                 images: Vec::new(),
@@ -5749,6 +5651,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
                 provider_context: Vec::new(),
             },
             ThreadChatMessage {
+                input_request_id: None,
                 role: "user".to_string(),
                 content: Some("继续".to_string()),
                 images: Vec::new(),
@@ -5766,6 +5669,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
             checkpoint_id: "checkpoint-round-trip".to_string(),
             source_message_count: 2,
             summary_message: ThreadChatMessage {
+                input_request_id: None,
                 role: "system".to_string(),
                 content: Some("已执行测试，编译失败。".to_string()),
                 images: Vec::new(),
@@ -6094,6 +5998,7 @@ fn rebuilding_thread_projection_while_assistant_text_streams_does_not_duplicate_
 
 fn thread_message(role: &str, content: &str) -> ThreadChatMessage {
     ThreadChatMessage {
+        input_request_id: None,
         role: role.to_string(),
         content: Some(content.to_string()),
         images: Vec::new(),
@@ -6105,6 +6010,7 @@ fn thread_message(role: &str, content: &str) -> ThreadChatMessage {
 
 fn thread_tool_call(call_id: &str) -> ThreadChatMessage {
     ThreadChatMessage {
+        input_request_id: None,
         role: "assistant".to_string(),
         content: None,
         images: Vec::new(),
@@ -6123,6 +6029,7 @@ fn thread_tool_call(call_id: &str) -> ThreadChatMessage {
 
 fn thread_tool_result(call_id: &str, content: &str) -> ThreadChatMessage {
     ThreadChatMessage {
+        input_request_id: None,
         role: "tool".to_string(),
         content: Some(content.to_string()),
         images: Vec::new(),
@@ -6333,4 +6240,3607 @@ fn indeterminate_tool_result_can_be_written_and_restored_without_failing_the_tur
         .unwrap();
     assert_eq!(tool.status, "indeterminate");
     assert_eq!(tool.tool_status.as_deref(), Some("indeterminate"));
+}
+
+fn test_model_step(id: &str, input_request_ids: Vec<String>) -> crate::ModelStep {
+    crate::ModelStep {
+        attempts: vec![crate::ModelAttempt {
+            attempt_id: format!("{id}:attempt:1"),
+            started_at: UtcMillis(10),
+            settled_at: None,
+            status: crate::ModelStepStatus::Started,
+        }],
+        step_id: id.into(),
+        task_id: None,
+        thread_id: ThreadId::new("thread-step"),
+        goal_id: None,
+        usage_tokens: None,
+        goal_tokens_after: None,
+        checkpoint_generation: 2,
+        request_fingerprint: "a".repeat(64),
+        binding: None,
+        executor_capabilities: None,
+        purpose: None,
+        provider: "test".into(),
+        message_count: 1,
+        tool_count: 0,
+        max_output_tokens: None,
+        input_request_ids,
+        started_at: UtcMillis(10),
+        settled_at: None,
+        status: crate::ModelStepStatus::Started,
+        response_fingerprint: None,
+    }
+}
+
+#[test]
+fn model_steps_survive_stream_writes_and_restart_without_replaying_unknown_calls() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-model-step");
+    store.create_session(session.clone(), "step").unwrap();
+    accept_test_turn(&store, &session, test_turn("turn-step", "running", 10));
+    let step = test_model_step("call-1", vec![]);
+    store
+        .begin_model_step(&session, "turn-step", step.clone())
+        .unwrap();
+    // No new user input does not mean there was no model Step.
+    store
+        .append_current_turn_item_for_turn(
+            &session,
+            Some("turn-step"),
+            ActiveExecutionTurnItem {
+                item_id: "stream".into(),
+                item_seq: 0,
+                kind: "assistant_stream".into(),
+                status: "running".into(),
+                source: "orchestrator".into(),
+                title: None,
+                content: Some("partial".into()),
+                task_id: None,
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                metadata: HashMap::new(),
+                timeline_entry_id: None,
+                source_thread_id: ThreadId::new("thread-step"),
+            },
+        )
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .canonical_turn_for_session_turn_id(&session, "turn-step")
+            .unwrap()
+            .model_steps,
+        vec![step.clone()]
+    );
+    assert!(
+        restored
+            .begin_model_step(&session, "turn-step", step)
+            .is_err(),
+        "Started cannot authorize replay after a crash"
+    );
+    restored
+        .settle_model_step(
+            &session,
+            "turn-step",
+            "call-1",
+            Some("b".repeat(64)),
+            None,
+            None,
+        )
+        .unwrap();
+    let settled = restored
+        .canonical_turn_for_session_turn_id(&session, "turn-step")
+        .unwrap()
+        .model_steps
+        .remove(0);
+    assert_eq!(settled.status, crate::ModelStepStatus::ResponseReceived);
+    assert!(
+        restored
+            .settle_model_step(&session, "turn-step", "call-1", None, None, None,)
+            .is_err()
+    );
+}
+
+#[test]
+fn executor_failure_settles_with_original_step_and_survives_terminal_turn_reload() {
+    use magi_core::{
+        ExecutorCommandEvidence, ExecutorCommandStatus, ExecutorFailureEvidence, ExecutorReceipt,
+    };
+    for terminal in [false, true] {
+        let store = SessionStore::new();
+        let session = SessionId::new(format!("executor-failure-{terminal}"));
+        let task = magi_core::TaskId::new("executor-task");
+        store.create_session(session.clone(), "executor").unwrap();
+        accept_test_turn(&store, &session, test_turn("executor-turn", "running", 10));
+        let mut step = test_model_step("executor-call", vec![]);
+        step.task_id = Some(task.clone());
+        let caps: magi_app_server_protocol::ExecutorCapabilities =
+            serde_json::from_value(serde_json::json!({
+                "inputModalities":["text"],"steer":"none","resume":"none","tools":"executor_owned",
+                "approvals":"unavailable","cancellation":"settled","context":"executor_owned",
+                "structuredOutput":false,"background":false,"inspection":true,"outputLimit":false
+            }))
+            .unwrap();
+        step.executor_capabilities = Some(caps);
+        store
+            .begin_model_step(&session, "executor-turn", step.clone())
+            .unwrap();
+        if terminal {
+            store
+                .update_current_turn_status_for_turn_with_change(
+                    &session,
+                    Some("executor-turn"),
+                    "cancelled",
+                )
+                .unwrap();
+            accept_test_turn(
+                &store,
+                &session,
+                test_turn("next-current-turn", "running", 20),
+            );
+        }
+        let evidence = ExecutorFailureEvidence {
+            receipts: vec![ExecutorReceipt {
+                executor: "fixture".into(),
+                execution_id: "external-original".into(),
+                commands: vec![ExecutorCommandEvidence {
+                    command: "inspect".into(),
+                    exit_code: None,
+                    status: ExecutorCommandStatus::OutcomeUnknown,
+                    output: "partial observation".into(),
+                }],
+            }],
+            usage: Some(serde_json::json!({"input_tokens":3,"output_tokens":2})),
+            items: vec![serde_json::json!({"type":"command_execution","command":"inspect"})],
+            resources_settled: true,
+        };
+        let before = store_mutation_snapshot(&store);
+        reject_canonical_writes(&store);
+        assert!(
+            store
+                .settle_model_step(
+                    &session,
+                    "executor-turn",
+                    "executor-call",
+                    None,
+                    Some(5),
+                    Some(&evidence),
+                )
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        let writer = Arc::new(RecordingCanonicalWriter::default());
+        store.install_session_event_writer(writer.clone());
+        store
+            .settle_model_step(
+                &session,
+                "executor-turn",
+                "executor-call",
+                None,
+                Some(5),
+                Some(&evidence),
+            )
+            .unwrap();
+        {
+            let transactions = writer.transactions.lock().unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(transactions[0].len(), 1);
+            let next = &transactions[0][0].next;
+            assert_eq!(
+                next.model_steps[0].status,
+                crate::ModelStepStatus::OutcomeUnknown
+            );
+            assert!(
+                next.items
+                    .iter()
+                    .any(|item| item.metadata.contains_key("executorFailure"))
+            );
+        }
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.executor_failures_for_task(&session, &task),
+            vec![("executor-call".into(), evidence.clone())]
+        );
+        let turn = restored
+            .canonical_turn_for_session_turn_id(&session, "executor-turn")
+            .unwrap();
+        assert_eq!(turn.model_steps.len(), 1);
+        assert_eq!(
+            turn.model_steps[0].status,
+            crate::ModelStepStatus::OutcomeUnknown
+        );
+        assert_eq!(turn.model_steps[0].usage_tokens, Some(5));
+        assert_eq!(turn.status.is_terminal(), terminal);
+        if terminal {
+            assert_eq!(
+                restored
+                    .runtime_sidecar(&session)
+                    .unwrap()
+                    .current_turn
+                    .unwrap()
+                    .turn_id,
+                "next-current-turn"
+            );
+            assert!(
+                restored
+                    .canonical_turn_for_session_turn_id(&session, "next-current-turn")
+                    .unwrap()
+                    .model_steps
+                    .is_empty()
+            );
+        }
+        assert!(
+            restored
+                .begin_model_step(&session, "executor-turn", step)
+                .is_err()
+        );
+        assert!(
+            restored
+                .settle_model_step(
+                    &session,
+                    "executor-turn",
+                    "executor-call",
+                    None,
+                    Some(5),
+                    Some(&evidence)
+                )
+                .is_err()
+        );
+        assert!(
+            restored
+                .executor_failures_for_task(&SessionId::new("other-session"), &task)
+                .is_empty()
+        );
+        let mut tampered = turn.clone();
+        let failure = tampered
+            .items
+            .iter_mut()
+            .find(|item| item.metadata.contains_key("executorFailure"))
+            .unwrap();
+        failure.source_thread_id = ThreadId::new("wrong-thread");
+        assert!(tampered.validate_model_steps().is_err());
+        if !terminal {
+            restored
+                .update_current_turn_status_for_turn_with_change(
+                    &session,
+                    Some("executor-turn"),
+                    "failed",
+                )
+                .unwrap();
+            let settled_turn = restored
+                .canonical_turn_for_session_turn_id(&session, "executor-turn")
+                .unwrap();
+            let failure = settled_turn
+                .items
+                .iter()
+                .find(|item| item.metadata.contains_key("executorFailure"))
+                .unwrap();
+            assert!(!failure.visibility.renderable);
+            assert_eq!(
+                restored.executor_failures_for_task(&session, &task),
+                vec![("executor-call".into(), evidence)]
+            );
+        }
+    }
+}
+
+#[test]
+fn model_step_and_input_consumption_commit_atomically_and_reject_late_results() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-step-input");
+    store.create_session(session.clone(), "step input").unwrap();
+    let mut turn = test_turn("turn-step-input", "running", 10);
+    let mut item = crate::ActiveExecutionTurnItem {
+        item_id: "user-step".into(),
+        item_seq: 0,
+        kind: "user_message".into(),
+        status: "completed".into(),
+        source: "user".into(),
+        title: None,
+        content: Some("work".into()),
+        task_id: None,
+        worker_id: None,
+        role_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_status: None,
+        tool_arguments: None,
+        tool_result: None,
+        tool_error: None,
+        request_id: Some("request-step".into()),
+        user_message_id: Some("user-step".into()),
+        placeholder_message_id: None,
+        metadata: HashMap::new(),
+        timeline_entry_id: None,
+        source_thread_id: ThreadId::new("thread-step"),
+    };
+    item.metadata
+        .insert("requestId".into(), json!("request-step"));
+    item.metadata
+        .insert("userMessageId".into(), json!("user-step"));
+    item.metadata
+        .insert("requestFingerprint".into(), json!("original"));
+    turn.items.push(item);
+    accept_test_turn(&store, &session, turn);
+    let step = test_model_step("call-input", vec!["request-step".into()]);
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let notices = observed.clone();
+    store.install_model_step_commit_observer(Arc::new(move |_| {
+        notices.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .begin_model_step(&session, "turn-step-input", step.clone())
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    let read_store = store.clone();
+    let notices = observed.clone();
+    store.install_model_step_commit_observer(Arc::new(move |notice| {
+        assert_eq!(notice.turn.turn_id, "turn-step-input");
+        assert!(notice.step.goal_id.is_none(), "普通任务也发布消费回执");
+        assert_eq!(
+            read_store.input_for_request("request-step").unwrap().state,
+            crate::SessionInputState::Consumed
+        );
+        read_store
+            .persist_projection_with(|_, _| Ok::<_, ()>(()))
+            .unwrap();
+        notices.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    store
+        .begin_model_step(&session, "turn-step-input", step)
+        .unwrap();
+    let input = store.input_for_request("request-step").unwrap();
+    assert_eq!(input.state, crate::SessionInputState::Consumed);
+    assert_eq!(input.consumption.unwrap().step_id, "call-input");
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("turn-step-input"),
+            "cancelled",
+        )
+        .unwrap();
+    store
+        .settle_model_step(
+            &session,
+            "turn-step-input",
+            "call-input",
+            Some("b".repeat(64)),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        store
+            .begin_model_step(&session, "turn-step-input", test_model_step("late", vec![]))
+            .is_err()
+    );
+}
+
+#[test]
+fn goal_step_accounting_is_shared_durable_and_resumes_without_resetting_usage() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-shared-goal-budget");
+    store
+        .create_session(session.clone(), "shared budget")
+        .unwrap();
+    accept_test_turn(&store, &session, test_turn("turn-shared", "running", 10));
+    let goal = create_test_goal(&store, &session, "turn-shared", "shared");
+    let before_response = store.durable_state();
+    let mut child = test_model_step("child", vec![]);
+    child.task_id = Some(TaskId::new("child-task"));
+    child.thread_id = ThreadId::new("child-thread");
+    for step in [test_model_step("parent", vec![]), child] {
+        store
+            .begin_model_step(&session, "turn-shared", step)
+            .unwrap();
+    }
+    store
+        .settle_model_step(
+            &session,
+            "turn-shared",
+            "parent",
+            Some("b".repeat(64)),
+            Some(10),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store.current_goal(&session).unwrap().status,
+        GoalStatus::Active
+    );
+    // 用量只做统计；父子请求继续执行，不触发预算暂停。
+    store
+        .settle_model_step(
+            &session,
+            "turn-shared",
+            "child",
+            Some("c".repeat(64)),
+            Some(7),
+            None,
+        )
+        .unwrap();
+    assert!(
+        store
+            .begin_model_step(&session, "turn-shared", test_model_step("next", vec![]))
+            .is_ok()
+    );
+    let mut replayed = before_response;
+    replayed.canonical_turns = store.durable_state().canonical_turns;
+    let restored =
+        SessionStore::from_persisted_parts(replayed, store.execution_sidecar_store_state())
+            .unwrap();
+    let limited = restored.current_goal(&session).unwrap();
+    assert_eq!(limited.goal_id, goal.goal_id);
+    assert_eq!(limited.status, GoalStatus::Active);
+    assert_eq!(limited.tokens_used, 17);
+    assert!(
+        restored
+            .settle_model_step(
+                &session,
+                "turn-shared",
+                "parent",
+                Some("b".repeat(64)),
+                Some(10),
+                None,
+            )
+            .is_err()
+    );
+    let restored = SessionStore::from_persisted_parts(
+        restored.durable_state(),
+        restored.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 17);
+    assert!(
+        restored
+            .resume_goal_with_plan(
+                &session,
+                &goal.goal_id,
+                limited.control_revision,
+                None,
+                None
+            )
+            .is_err()
+    );
+    let paused = restored
+        .pause_goal_with_plan(&session, &goal.goal_id, limited.control_revision, None)
+        .unwrap()
+        .0;
+    assert!(!restored.turn_execution_is_active(&session, "turn-shared"));
+    restored
+        .resume_goal_with_plan(&session, &goal.goal_id, paused.control_revision, None, None)
+        .unwrap();
+    assert!(restored.turn_execution_is_active(&session, "turn-shared"));
+    restored
+        .begin_model_step(&session, "turn-shared", test_model_step("resumed", vec![]))
+        .unwrap();
+    restored
+        .settle_model_step(
+            &session,
+            "turn-shared",
+            "resumed",
+            Some("d".repeat(64)),
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 21);
+}
+
+#[test]
+fn failed_goal_step_settlement_cannot_publish_usage_or_release_result() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-goal-budget-write-failure");
+    store
+        .create_session(session.clone(), "budget failure")
+        .unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("turn-budget-failure", "running", 10),
+    );
+    create_test_goal(&store, &session, "turn-budget-failure", "budget");
+    store
+        .begin_model_step(
+            &session,
+            "turn-budget-failure",
+            test_model_step("call", vec![]),
+        )
+        .unwrap();
+    let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = notices.clone();
+    store.install_model_step_commit_observer(Arc::new(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .settle_model_step(
+                &session,
+                "turn-budget-failure",
+                "call",
+                Some("b".repeat(64)),
+                Some(11),
+                None,
+            )
+            .is_err()
+    );
+    assert_eq!(store.current_goal(&session).unwrap().tokens_used, 0);
+    assert_eq!(notices.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .canonical_turn_for_session_turn_id(&session, "turn-budget-failure")
+            .unwrap()
+            .model_steps[0]
+            .status,
+        crate::ModelStepStatus::Started
+    );
+}
+
+#[test]
+fn parallel_goal_settlements_serialize_watermarks_and_keep_legacy_usage_base() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-parallel-budget");
+    store.create_session(session.clone(), "parallel").unwrap();
+    accept_test_turn(&store, &session, test_turn("turn-parallel", "running", 10));
+    let goal = create_test_goal(&store, &session, "turn-parallel", "parallel");
+    // layout 4 迁移保留此前已经结算的用量基数。
+    store.state.write().unwrap().goals[0].tokens_used = 37;
+    for index in 0..8 {
+        store
+            .begin_model_step(
+                &session,
+                "turn-parallel",
+                test_model_step(&format!("parallel-{index}"), vec![]),
+            )
+            .unwrap();
+    }
+    let gate = Arc::new(std::sync::Barrier::new(8));
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            let gate = gate.clone();
+            let store = &store;
+            let session = &session;
+            scope.spawn(move || {
+                gate.wait();
+                store
+                    .settle_model_step(
+                        session,
+                        "turn-parallel",
+                        &format!("parallel-{index}"),
+                        Some("b".repeat(64)),
+                        Some(11),
+                        None,
+                    )
+                    .unwrap();
+            });
+        }
+    });
+    assert_eq!(store.current_goal(&session).unwrap().tokens_used, 125);
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    let limited = restored.current_goal(&session).unwrap();
+    assert_eq!(limited.goal_id, goal.goal_id);
+    assert_eq!(limited.tokens_used, 125);
+    assert_eq!(limited.status, GoalStatus::Active);
+}
+
+#[test]
+fn late_step_usage_cannot_charge_a_replacement_goal() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-replaced-budget");
+    store
+        .create_session(session.clone(), "replaced budget")
+        .unwrap();
+    accept_test_turn(&store, &session, test_turn("turn-old-goal", "running", 10));
+    let first = create_test_goal(&store, &session, "turn-old-goal", "first");
+    store
+        .begin_model_step(
+            &session,
+            "turn-old-goal",
+            test_model_step("late-old", vec![]),
+        )
+        .unwrap();
+    store
+        .complete_goal(
+            &session,
+            &first.goal_id,
+            crate::GoalRevisionExpectation::new(first.control_revision, None),
+            "turn-old-goal",
+            "done",
+            vec![],
+        )
+        .unwrap();
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("turn-old-goal"),
+            "completed",
+        )
+        .unwrap();
+    accept_test_turn(&store, &session, test_turn("turn-new-goal", "running", 20));
+    let second = create_test_goal(&store, &session, "turn-new-goal", "second");
+    store
+        .begin_model_step(
+            &session,
+            "turn-new-goal",
+            test_model_step("new-call", vec![]),
+        )
+        .unwrap();
+    store
+        .settle_model_step(
+            &session,
+            "turn-new-goal",
+            "new-call",
+            Some("b".repeat(64)),
+            Some(3),
+            None,
+        )
+        .unwrap();
+    store
+        .settle_model_step(
+            &session,
+            "turn-old-goal",
+            "late-old",
+            Some("c".repeat(64)),
+            Some(11),
+            None,
+        )
+        .unwrap();
+    let current = store.current_goal(&session).unwrap();
+    assert_eq!(current.goal_id, second.goal_id);
+    assert_eq!(current.status, GoalStatus::Active);
+    assert_eq!(current.tokens_used, 3);
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 3);
+}
+
+#[test]
+fn goal_usage_notification_follows_durable_commit_and_allows_reentrant_reads() {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-budget-notice");
+    store.create_session(session.clone(), "notice").unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("turn-budget-notice", "running", 10),
+    );
+    create_test_goal(&store, &session, "turn-budget-notice", "notice");
+    store
+        .begin_model_step(
+            &session,
+            "turn-budget-notice",
+            test_model_step("notice", vec![]),
+        )
+        .unwrap();
+    let read_store = store.clone();
+    let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = notices.clone();
+    store.install_model_step_commit_observer(Arc::new(move |notice| {
+        let goal = read_store.current_goal(&notice.session_id).unwrap();
+        assert_eq!(goal.tokens_used, 11);
+        assert_eq!(Some(goal.goal_id.clone()), notice.step.goal_id);
+        assert_eq!(notice.step.step_id, "notice");
+        assert_eq!(goal.status, GoalStatus::Active);
+        // 检查点获取写屏障；通知不能持有 canonical 提交锁。
+        read_store
+            .persist_projection_with(|_, _| Ok::<_, ()>(()))
+            .unwrap();
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    store
+        .settle_model_step(
+            &session,
+            "turn-budget-notice",
+            "notice",
+            Some("b".repeat(64)),
+            Some(11),
+            None,
+        )
+        .unwrap();
+    assert_eq!(notices.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn retired_task_budget_fields_restore_as_paused_without_losing_usage() {
+    let store = SessionStore::new();
+    let session = SessionId::new("retired-task-budget");
+    store
+        .create_session(session.clone(), "legacy goal")
+        .unwrap();
+    let goal = create_test_goal(&store, &session, "legacy-turn", "finish original objective");
+    for (retired_status, retired_reason) in [
+        ("budget_limited", "token_budget_exhausted"),
+        ("usage_limited", "system_usage_limit"),
+    ] {
+        let mut durable = serde_json::to_value(store.durable_state()).unwrap();
+        let old = &mut durable["goals"][0];
+        old["status"] = json!(retired_status);
+        old["tokensUsed"] = json!(1234);
+        old["tokenBudget"] = json!(1000);
+        old["tokensReserved"] = json!(500);
+        old["budgetRequiredTokens"] = json!(600);
+        old["budgetActiveMillis"] = json!(9999);
+        old["runBudget"] = json!({"maxModelAttempts":1,"maxActiveSeconds":1,"maxOutputTokens":1,"maxActiveAgents":1});
+        old["continuation"] = json!({"phase":"waiting","reason":retired_reason});
+        let decoded: crate::SessionDurableState = serde_json::from_value(durable).unwrap();
+        let restored =
+            SessionStore::from_persisted_parts(decoded, store.execution_sidecar_store_state())
+                .unwrap();
+        let paused = restored.current_goal(&session).unwrap();
+        assert_eq!(paused.status, GoalStatus::Paused);
+        assert_eq!(
+            serde_json::to_value(paused.status).unwrap(),
+            json!("paused")
+        );
+        assert_eq!(paused.tokens_used, 1234);
+        assert_eq!(paused.goal_id, goal.goal_id);
+        assert_eq!(paused.objective, goal.objective);
+        assert!(paused.continuation.reason.is_none());
+        let resumed = restored
+            .resume_goal_with_plan(&session, &goal.goal_id, paused.control_revision, None, None)
+            .unwrap()
+            .0;
+        assert_eq!(resumed.status, GoalStatus::Active);
+        assert_eq!(resumed.tokens_used, 1234);
+        let mut current = serde_json::to_value(&resumed).unwrap();
+        for field in [
+            "tokenBudget",
+            "tokensReserved",
+            "budgetRequiredTokens",
+            "budgetActiveMillis",
+            "runBudget",
+        ] {
+            assert!(current.get(field).is_none(), "{field}");
+        }
+        current["unexpectedField"] = json!(true);
+        assert!(serde_json::from_value::<crate::SessionGoal>(current).is_err());
+    }
+}
+
+#[test]
+fn retired_step_reservation_is_read_only_and_preserves_request_identity() {
+    let step = test_model_step("legacy-step", vec![]);
+    let mut old = serde_json::to_value(&step).unwrap();
+    old["reservationTokens"] = json!(10000);
+    let restored: crate::ModelStep = serde_json::from_value(old).unwrap();
+    restored.validate_snapshot().unwrap();
+    assert_eq!(restored, step);
+    let mut current = serde_json::to_value(&restored).unwrap();
+    assert!(current.get("reservationTokens").is_none());
+    current["unexpectedField"] = json!(true);
+    assert!(serde_json::from_value::<crate::ModelStep>(current).is_err());
+}
+
+#[test]
+fn shared_transport_safety_limit_blocks_new_steps_and_retries_after_restart() {
+    let store = SessionStore::new();
+    let session = SessionId::new("transport-safety");
+    store.create_session(session.clone(), "safety").unwrap();
+    accept_test_turn(&store, &session, test_turn("safety-turn", "running", 10));
+    let mut durable = store.durable_state();
+    let mut step = test_model_step("safety-step", vec![]);
+    step.attempts = (1..=10_000)
+        .map(|index| crate::ModelAttempt {
+            attempt_id: format!("safety-step:attempt:{index}"),
+            started_at: UtcMillis(10),
+            settled_at: (index < 10_000).then_some(UtcMillis(10)),
+            status: if index < 10_000 {
+                crate::ModelStepStatus::OutcomeUnknown
+            } else {
+                crate::ModelStepStatus::Started
+            },
+        })
+        .collect();
+    durable.canonical_turns[0].model_steps.push(step);
+    let restored =
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state()).unwrap();
+    assert!(matches!(
+        restored.begin_model_step(&session, "safety-turn", test_model_step("new", vec![])),
+        Err(magi_core::DomainError::RunSafetyLimit { .. })
+    ));
+    assert!(matches!(
+        restored.start_model_step_retry(&session, "safety-turn", "safety-step"),
+        Err(magi_core::DomainError::RunSafetyLimit { .. })
+    ));
+    assert_eq!(
+        restored
+            .canonical_turn_for_session_turn_id(&session, "safety-turn")
+            .unwrap()
+            .model_steps[0]
+            .attempts
+            .len(),
+        10_000
+    );
+}
+
+fn user_question_fixture() -> (SessionStore, crate::user_question::PendingUserQuestion) {
+    let store = SessionStore::new();
+    let session = SessionId::new("durable-question-session");
+    store.create_session(session.clone(), "交互恢复").unwrap();
+    let (_, thread) = store.ensure_session_mission(&session, UtcMillis(10), || {
+        MissionId::new("durable-question-mission")
+    });
+    let mut turn = test_turn("durable-question-turn", "running", 10);
+    let mut item = test_turn_item("durable-question-item", "");
+    item.kind = "tool_call_started".into();
+    item.status = "running".into();
+    item.source_thread_id = thread;
+    item.task_id = Some(TaskId::new("durable-question-task"));
+    item.tool_name = Some("ask_user_question".into());
+    item.tool_call_id = Some("durable-question-call".into());
+    item.tool_result =
+        Some(json!({"tool": "ask_user_question", "status": "awaiting_user_input"}).to_string());
+    turn.items.push(item);
+    accept_test_turn(&store, &session, turn.clone());
+    store
+        .upsert_active_execution_chain(
+            session.clone(),
+            test_active_chain(&session, "question-chain", Some(turn)),
+        )
+        .unwrap();
+    let request = crate::user_question::PendingUserQuestion {
+        question_id: "durable-question".into(), session_id: session,
+        task_id: Some(TaskId::new("durable-question-task")), turn_id: "durable-question-turn".into(),
+        tool_call_id: "durable-question-call".into(), requested_at: UtcMillis(10), can_skip: true,
+        questions: crate::user_question::parse_questions(&json!({"questions": [{
+            "header": "方案", "question": "选哪个？", "options": [{"label": "A"}, {"label": "B"}]
+        }]}).to_string()).unwrap(),
+    };
+    (store, request)
+}
+
+#[test]
+fn user_question_survives_restart_and_response_precedes_tool_completion() {
+    let (store, request) = user_question_fixture();
+    store.register_user_question(request.clone()).unwrap();
+    let stale_sidecar = store.runtime_sidecar(&request.session_id).unwrap();
+    // 工具进度的旧写回不能擦掉持久交互。
+    store
+        .upsert_active_execution_chain(
+            request.session_id.clone(),
+            test_active_chain(
+                &request.session_id,
+                "question-chain",
+                stale_sidecar.current_turn,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        store.pending_user_questions(&request.session_id).unwrap(),
+        vec![request.clone()]
+    );
+    store
+        .interrupt_current_turn_by_daemon_restart(&request.session_id)
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .pending_user_questions(&request.session_id)
+            .unwrap(),
+        vec![request.clone()]
+    );
+    let response = crate::user_question::UserQuestionResponse::Answered {
+        answers: vec![crate::user_question::UserQuestionAnswer {
+            selected: vec!["B".into()],
+            other: None,
+        }],
+    };
+    let committed = restored
+        .resolve_user_question(&request.session_id, &request.question_id, response.clone())
+        .unwrap();
+    assert_eq!(committed.response, Some(response));
+    let canonical = restored
+        .canonical_turn_for_session_turn_id(&request.session_id, &request.turn_id)
+        .unwrap();
+    assert_eq!(
+        canonical
+            .items
+            .iter()
+            .find(|item| item.item_id == "durable-question-item")
+            .unwrap()
+            .tool
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()["status"],
+        "answered"
+    );
+    let thread = restored.thread_registry_snapshot(&request.session_id)[0]
+        .thread_id
+        .clone();
+    restored
+        .rebuild_thread_message_projection(&thread, UtcMillis::now())
+        .unwrap();
+    assert!(
+        restored
+            .thread_message_history(&thread)
+            .iter()
+            .any(|message| message.role == "tool"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("B")))
+    );
+    assert_eq!(
+        committed.result_payload().unwrap()["answers"][0]["answer"],
+        json!(["B"])
+    );
+    assert!(
+        restored
+            .pending_user_questions(&request.session_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        restored
+            .resolve_user_question(
+                &request.session_id,
+                &request.question_id,
+                crate::user_question::UserQuestionResponse::Skipped
+            )
+            .is_err()
+    );
+    let reloaded = SessionStore::from_persisted_parts(
+        restored.durable_state(),
+        restored.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        reloaded
+            .user_question_state(&request.session_id, &request.question_id)
+            .unwrap(),
+        Some(committed)
+    );
+}
+
+#[test]
+fn user_question_registration_write_failure_is_atomic() {
+    let (store, request) = user_question_fixture();
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(store.register_user_question(request.clone()).is_err());
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+}
+
+#[test]
+fn user_question_response_write_failure_is_atomic() {
+    let (store, request) = user_question_fixture();
+    store.register_user_question(request.clone()).unwrap();
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .resolve_user_question(
+                &request.session_id,
+                &request.question_id,
+                crate::user_question::UserQuestionResponse::Skipped
+            )
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    assert_eq!(
+        store.pending_user_questions(&request.session_id).unwrap(),
+        vec![request]
+    );
+}
+
+#[test]
+fn user_question_cannot_be_answered_after_cancellation_or_recovery_claim() {
+    for claim in [false, true] {
+        let (store, request) = user_question_fixture();
+        store.register_user_question(request.clone()).unwrap();
+        assert!(
+            store
+                .resolve_user_question(
+                    &SessionId::new("other-session"),
+                    &request.question_id,
+                    crate::user_question::UserQuestionResponse::Skipped
+                )
+                .is_err()
+        );
+        if claim {
+            store
+                .interrupt_current_turn_by_daemon_restart(&request.session_id)
+                .unwrap();
+            assert!(
+                store
+                    .claim_interrupted_recovery(&request.session_id)
+                    .is_err()
+            );
+            store
+                .resolve_user_question(
+                    &request.session_id,
+                    &request.question_id,
+                    crate::user_question::UserQuestionResponse::Skipped,
+                )
+                .unwrap();
+            store
+                .claim_interrupted_recovery(&request.session_id)
+                .unwrap();
+        } else {
+            store
+                .update_current_turn_status_for_turn_with_change(
+                    &request.session_id,
+                    Some(&request.turn_id),
+                    "cancelled",
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .pending_user_questions(&request.session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .resolve_user_question(
+                    &request.session_id,
+                    &request.question_id,
+                    crate::user_question::UserQuestionResponse::Skipped
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cancelled_user_question_does_not_resurrect_after_restart_or_mutate_late_tool_result() {
+    let (store, request) = user_question_fixture();
+    store.register_user_question(request.clone()).unwrap();
+    let stale = store
+        .runtime_sidecar(&request.session_id)
+        .unwrap()
+        .current_turn
+        .unwrap();
+    store
+        .cancel_user_question(&request.session_id, &request.question_id)
+        .unwrap();
+    store
+        .upsert_active_execution_chain(
+            request.session_id.clone(),
+            test_active_chain(&request.session_id, "question-chain", Some(stale)),
+        )
+        .unwrap();
+    store
+        .interrupt_current_turn_by_daemon_restart(&request.session_id)
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert!(
+        restored
+            .pending_user_questions(&request.session_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        restored
+            .user_question_state(&request.session_id, &request.question_id)
+            .unwrap()
+            .unwrap()
+            .cancelled_at
+            .is_some()
+    );
+    assert!(
+        restored
+            .resolve_user_question(
+                &request.session_id,
+                &request.question_id,
+                crate::user_question::UserQuestionResponse::Skipped
+            )
+            .is_err()
+    );
+}
+
+fn durable_approval_fixture() -> (
+    SessionStore,
+    crate::tool_approval::PendingToolApproval,
+    std::path::PathBuf,
+) {
+    let store = SessionStore::new();
+    let session = SessionId::new("durable-approval-session");
+    store.create_session(session.clone(), "审批恢复").unwrap();
+    let now = UtcMillis::now();
+    let mut turn = test_turn("durable-approval-turn", "running", now.0);
+    let mut item = test_turn_item("durable-approval-item", "");
+    item.kind = "tool_call_started".into();
+    item.status = "running".into();
+    item.task_id = Some(TaskId::new("durable-approval-task"));
+    item.tool_call_id = Some("durable-approval-call".into());
+    item.tool_name = Some("shell_exec".into());
+    item.tool_arguments = Some(r#"{"command":"publish","background":false}"#.into());
+    turn.items.push(item);
+    accept_test_turn(&store, &session, turn.clone());
+    store
+        .upsert_active_execution_chain(
+            session.clone(),
+            test_active_chain(&session, "durable-approval-chain", Some(turn)),
+        )
+        .unwrap();
+    let request = crate::tool_approval::PendingToolApproval {
+        approval_id: "durable-approval".into(),
+        session_id: session,
+        task_id: TaskId::new("durable-approval-task"),
+        turn_id: "durable-approval-turn".into(),
+        tool_call_id: "durable-approval-call".into(),
+        tool_name: "shell_exec".into(),
+        reason: "发布需要审批".into(),
+        requested_at: now,
+        agent: None,
+    };
+    (store, request, std::env::temp_dir())
+}
+
+fn accept_approval_recovery_turn(store: &SessionStore, session: &SessionId) {
+    let mut turn = test_turn("resumed-approval-turn", "running", UtcMillis::now().0 + 1);
+    let mut item = test_turn_item("resumed-approval-item", "");
+    item.kind = "tool_call_started".into();
+    item.status = "running".into();
+    item.task_id = Some(TaskId::new("durable-approval-task"));
+    item.tool_call_id = Some("resumed-approval-call".into());
+    item.tool_name = Some("shell_exec".into());
+    item.tool_arguments = Some(r#"{"background":false,"command":"publish"}"#.into());
+    turn.items.push(item);
+    accept_test_turn(store, session, turn);
+}
+
+#[test]
+fn durable_approval_restores_waiting_and_claims_only_original_operation_once() {
+    use crate::tool_approval::ToolApprovalDecision;
+    let (store, request, root) = durable_approval_fixture();
+    let policy = json!({"scope":"original"});
+    store
+        .register_tool_approval(request.clone(), Some(root.clone()), policy.clone(), None)
+        .unwrap();
+    store
+        .interrupt_current_turn_by_daemon_restart(&request.session_id)
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .pending_tool_approvals(&request.session_id)
+            .unwrap(),
+        vec![request.clone()]
+    );
+    assert!(
+        restored
+            .claim_interrupted_recovery(&request.session_id)
+            .is_err()
+    );
+    restored
+        .resolve_tool_approvals(
+            &request.session_id,
+            std::slice::from_ref(&request.approval_id),
+            ToolApprovalDecision::AllowOnce,
+        )
+        .unwrap();
+    assert!(
+        restored
+            .resolve_tool_approvals(
+                &request.session_id,
+                std::slice::from_ref(&request.approval_id),
+                ToolApprovalDecision::AllowOnce
+            )
+            .is_err()
+    );
+    restored
+        .claim_interrupted_recovery(&request.session_id)
+        .unwrap();
+    accept_approval_recovery_turn(&restored, &request.session_id);
+    let claim = |path: &std::path::Path, policy: &Value, sources: &[TaskId], arguments: &str| {
+        restored
+            .claim_tool_approval(
+                &request.session_id,
+                &request.task_id,
+                "resumed-approval-call",
+                "shell_exec",
+                arguments,
+                Some(path),
+                policy,
+                sources,
+                None,
+            )
+            .map(|receipt| receipt.map(|receipt| receipt.decision))
+    };
+    assert_eq!(
+        claim(
+            &root,
+            &policy,
+            &[TaskId::new("sibling")],
+            r#"{"command":"publish","background":false}"#
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        claim(
+            &root,
+            &json!({"scope":"changed"}),
+            std::slice::from_ref(&request.task_id),
+            r#"{"command":"publish","background":false}"#
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        claim(
+            &root.join("other"),
+            &policy,
+            std::slice::from_ref(&request.task_id),
+            r#"{"command":"publish","background":false}"#
+        )
+        .unwrap(),
+        None
+    );
+    assert!(
+        claim(
+            &root,
+            &policy,
+            std::slice::from_ref(&request.task_id),
+            r#"{"command":"delete","background":false}"#
+        )
+        .is_err()
+    );
+    assert_eq!(
+        claim(
+            &root,
+            &policy,
+            std::slice::from_ref(&request.task_id),
+            r#"{ "background":false, "command":"publish" }"#
+        )
+        .unwrap(),
+        Some(ToolApprovalDecision::AllowOnce)
+    );
+    assert_eq!(
+        claim(
+            &root,
+            &policy,
+            std::slice::from_ref(&request.task_id),
+            r#"{"command":"publish","background":false}"#
+        )
+        .unwrap(),
+        None
+    );
+    let restored = SessionStore::from_persisted_parts(
+        restored.durable_state(),
+        restored.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    let source = restored
+        .canonical_turn_for_session_turn_id(&request.session_id, &request.turn_id)
+        .unwrap();
+    let approval = source.items[0].tool_approval().unwrap().unwrap();
+    assert_eq!(approval.execution.unwrap().item_id, "resumed-approval-item");
+    let mut broken = restored.durable_state();
+    broken
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == "resumed-approval-turn")
+        .unwrap()
+        .items[0]
+        .metadata
+        .remove("approvalSource");
+    assert!(
+        SessionStore::from_persisted_parts(broken, restored.execution_sidecar_store_state())
+            .is_err()
+    );
+    let target = restored
+        .canonical_turn_for_session_turn_id(&request.session_id, "resumed-approval-turn")
+        .unwrap();
+    assert_eq!(
+        target.items[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()["status"],
+        "running"
+    );
+}
+
+#[test]
+fn durable_approval_decision_and_execution_claim_fail_atomically() {
+    use crate::tool_approval::ToolApprovalDecision;
+    for fail_on_claim in [false, true] {
+        let (store, request, root) = durable_approval_fixture();
+        let policy = json!({"scope":"original"});
+        store
+            .register_tool_approval(request.clone(), Some(root.clone()), policy.clone(), None)
+            .unwrap();
+        if fail_on_claim {
+            store
+                .resolve_tool_approvals(
+                    &request.session_id,
+                    std::slice::from_ref(&request.approval_id),
+                    ToolApprovalDecision::AllowOnce,
+                )
+                .unwrap();
+        }
+        let before = store_mutation_snapshot(&store);
+        reject_canonical_writes(&store);
+        let failed = if fail_on_claim {
+            store
+                .claim_tool_approval(
+                    &request.session_id,
+                    &request.task_id,
+                    &request.tool_call_id,
+                    "shell_exec",
+                    r#"{"command":"publish","background":false}"#,
+                    Some(&root),
+                    &policy,
+                    std::slice::from_ref(&request.task_id),
+                    Some(&request.approval_id),
+                )
+                .map(|_| ())
+        } else {
+            store.resolve_tool_approvals(
+                &request.session_id,
+                std::slice::from_ref(&request.approval_id),
+                ToolApprovalDecision::AllowOnce,
+            )
+        };
+        assert!(failed.is_err());
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+    }
+}
+
+#[test]
+fn durable_approval_cancellation_expiry_and_refusal_never_grant_execution() {
+    use crate::tool_approval::ToolApprovalDecision;
+    for mode in ["cancelled", "expired", "denied"] {
+        let (store, mut request, root) = durable_approval_fixture();
+        if mode == "expired" {
+            request.requested_at = UtcMillis(1);
+        }
+        store
+            .register_tool_approval(request.clone(), Some(root.clone()), Value::Null, None)
+            .unwrap();
+        if mode == "cancelled" {
+            store
+                .cancel_tool_approval(&request.session_id, &request.approval_id)
+                .unwrap();
+        }
+        if mode == "denied" {
+            store
+                .resolve_tool_approvals(
+                    &request.session_id,
+                    std::slice::from_ref(&request.approval_id),
+                    ToolApprovalDecision::Deny,
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .pending_tool_approvals(&request.session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .resolve_tool_approvals(
+                    &request.session_id,
+                    std::slice::from_ref(&request.approval_id),
+                    ToolApprovalDecision::AllowOnce
+                )
+                .is_err()
+        );
+        let result = store
+            .claim_tool_approval(
+                &request.session_id,
+                &request.task_id,
+                &request.tool_call_id,
+                "shell_exec",
+                r#"{"command":"publish","background":false}"#,
+                Some(&root),
+                &Value::Null,
+                std::slice::from_ref(&request.task_id),
+                Some(&request.approval_id),
+            )
+            .unwrap()
+            .map(|receipt| receipt.decision);
+        assert_eq!(
+            result,
+            if mode == "denied" {
+                Some(ToolApprovalDecision::Deny)
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[test]
+fn approval_allow_for_turn_never_reuses_a_different_execution_root() {
+    use crate::tool_approval::ToolApprovalDecision;
+    let (store, request, root) = durable_approval_fixture();
+    store
+        .register_tool_approval(request.clone(), Some(root.clone()), Value::Null, None)
+        .unwrap();
+    let turn = store
+        .runtime_sidecar(&request.session_id)
+        .unwrap()
+        .current_turn
+        .unwrap();
+    let mut sibling = turn.items[0].clone();
+    sibling.item_id = "approval-other-root-item".into();
+    sibling.item_seq = 2;
+    sibling.tool_call_id = Some("approval-other-root-call".into());
+    sibling.metadata.clear();
+    store
+        .append_current_turn_item_for_turn(&request.session_id, Some(&request.turn_id), sibling)
+        .unwrap();
+    let mut other = request.clone();
+    other.approval_id = "approval-other-root".into();
+    other.tool_call_id = "approval-other-root-call".into();
+    store
+        .register_tool_approval(other.clone(), Some(root.join("other")), Value::Null, None)
+        .unwrap();
+    store
+        .resolve_tool_approvals(
+            &request.session_id,
+            std::slice::from_ref(&request.approval_id),
+            ToolApprovalDecision::AllowForTurn,
+        )
+        .unwrap();
+    assert_eq!(
+        store.pending_tool_approvals(&request.session_id).unwrap(),
+        vec![other]
+    );
+}
+
+#[test]
+fn durable_approval_concurrent_claims_choose_one_target() {
+    use crate::tool_approval::ToolApprovalDecision;
+    let (store, request, root) = durable_approval_fixture();
+    store
+        .register_tool_approval(request.clone(), Some(root.clone()), Value::Null, None)
+        .unwrap();
+    store
+        .resolve_tool_approvals(
+            &request.session_id,
+            std::slice::from_ref(&request.approval_id),
+            ToolApprovalDecision::AllowOnce,
+        )
+        .unwrap();
+    store
+        .interrupt_current_turn_by_daemon_restart(&request.session_id)
+        .unwrap();
+    accept_approval_recovery_turn(&store, &request.session_id);
+    let barrier = std::sync::Barrier::new(3);
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            handles.push(scope.spawn(|| {
+                barrier.wait();
+                store
+                    .claim_tool_approval(
+                        &request.session_id,
+                        &request.task_id,
+                        "resumed-approval-call",
+                        "shell_exec",
+                        r#"{"command":"publish","background":false}"#,
+                        Some(&root),
+                        &Value::Null,
+                        std::slice::from_ref(&request.task_id),
+                        None,
+                    )
+                    .unwrap()
+                    .is_some()
+            }));
+        }
+        barrier.wait();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.into_iter().filter(|claimed| *claimed).count(), 1);
+}
+
+#[test]
+fn interrupt_replacement_survives_reload_and_blocks_other_turns_until_atomic_attachment() {
+    use crate::{InputInterruption, SessionInput, SessionInputState};
+    let store = SessionStore::new();
+    let session = SessionId::new("replacement-barrier");
+    store
+        .create_session(session.clone(), "replacement")
+        .unwrap();
+    accept_test_turn(&store, &session, test_turn("original", "running", 10));
+    let pending = SessionInput {
+        input_id: "replacement-input".into(),
+        session_id: session.clone(),
+        request_id: "replacement-request".into(),
+        user_message_id: "replacement-user".into(),
+        request_fingerprint: "replacement-fingerprint".into(),
+        accepted_at: UtcMillis(20),
+        revision: 1,
+        state: SessionInputState::Pending,
+        attached_turn_id: None,
+        consumption: None,
+        interruption: Some(InputInterruption {
+            turn_id: "original".into(),
+            root_task_id: None,
+            settled_at: None,
+            error: None,
+        }),
+        payload: json!({"text":"replacement"}),
+    };
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(store.commit_input(pending.clone(), None).is_err());
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    store.commit_input(pending.clone(), None).unwrap();
+    // 崩溃发生在取消前；重载后原始来源与替代输入保持相同身份。
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.input_for_request("replacement-request"),
+        Some(pending.clone())
+    );
+    let mut settled = pending.clone();
+    settled.revision = 2;
+    settled.interruption.as_mut().unwrap().settled_at = Some(UtcMillis(21));
+    assert!(
+        store.commit_input(settled.clone(), Some(1)).is_err(),
+        "原轮仍运行时不得确认结算"
+    );
+    store.interrupt_current_turn_by_user(&session).unwrap();
+    let before = store_mutation_snapshot(&store);
+    assert!(
+        store
+            .accept_current_turn_with_timeline_entry(
+                session.clone(),
+                TimelineEntryInput::new(
+                    "unrelated",
+                    TimelineEntryKind::UserMessage,
+                    "unrelated",
+                    UtcMillis(30)
+                ),
+                test_turn("unrelated", "running", 30)
+            )
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    reject_canonical_writes(&store);
+    assert!(store.commit_input(settled.clone(), Some(1)).is_err());
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    // 崩溃发生在原轮结束、结算回执提交前。必须保留屏障直到回执提交。
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    store.commit_input(settled, Some(1)).unwrap();
+    let mut replacement = test_turn("replacement", "running", 30);
+    let mut user = test_turn_item("replacement-user", "replacement");
+    user.request_id = Some("replacement-request".into());
+    user.user_message_id = Some("replacement-user".into());
+    user.metadata
+        .insert("requestId".into(), json!("replacement-request"));
+    user.metadata
+        .insert("userMessageId".into(), json!("replacement-user"));
+    user.metadata.insert(
+        "requestFingerprint".into(),
+        json!("replacement-fingerprint"),
+    );
+    replacement.items.push(user);
+    assert!(
+        store
+            .accept_current_turn_with_timeline_entry(
+                session.clone(),
+                TimelineEntryInput::new(
+                    "unrelated",
+                    TimelineEntryKind::UserMessage,
+                    "unrelated",
+                    UtcMillis(30)
+                ),
+                test_turn("unrelated", "running", 30)
+            )
+            .is_err(),
+        "完成结算仍必须优先接纳替代输入"
+    );
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .accept_current_turn_with_timeline_entry(
+                session.clone(),
+                TimelineEntryInput::new(
+                    "replacement",
+                    TimelineEntryKind::UserMessage,
+                    "replacement",
+                    UtcMillis(30)
+                ),
+                replacement.clone()
+            )
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    accept_test_turn(&store, &session, replacement);
+    let attached = store.input_for_request("replacement-request").unwrap();
+    assert_eq!(attached.state, SessionInputState::Attached);
+    assert_eq!(attached.attached_turn_id.as_deref(), Some("replacement"));
+    assert!(store.commit_input(pending, None).is_err());
+    assert_eq!(store.canonical_turns_for_session(&session).len(), 2);
+}
+
+fn agent_turn_fixture() -> (SessionStore, SessionId, magi_core::Task, ThreadId) {
+    let store = SessionStore::new();
+    let session = SessionId::new("agent-turn-session");
+    store
+        .create_session(session.clone(), "agent execution")
+        .unwrap();
+    let mission = MissionId::new("agent-turn-mission");
+    store.ensure_session_mission(&session, UtcMillis(10), || mission.clone());
+    let mut parent = test_turn("agent-source-turn", "running", 10);
+    let mut item = test_turn_item("agent-source-user", "parent");
+    item.task_id = Some(TaskId::new("agent-root-task"));
+    item.item_seq = 1;
+    parent.items.push(item);
+    accept_test_turn(&store, &session, parent);
+    let child_id = TaskId::new("agent-child-task");
+    let child = magi_core::Task {
+        task_id: child_id.clone(),
+        mission_id: mission.clone(),
+        root_task_id: TaskId::new("agent-root-task"),
+        parent_task_id: Some(TaskId::new("agent-root-task")),
+        kind: magi_core::TaskKind::LocalAgent,
+        title: "child".into(),
+        goal: "child goal".into(),
+        status: magi_core::TaskStatus::Pending,
+        dependency_ids: vec![],
+        required_children: vec![],
+        policy_snapshot: None,
+        executor_binding: Some(magi_core::TaskExecutorBinding {
+            agent_activation: Some(magi_core::AgentActivation {
+                agent_id: child_id.clone(),
+                session_id: session.clone(),
+                lifetime: magi_core::AgentLifetime::Session,
+                generation: 1,
+                previous_task_id: None,
+            }),
+            ..Default::default()
+        }),
+        completion_contract: Default::default(),
+        recovery_checkpoint: None,
+        knowledge_refs: vec![],
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: vec![],
+        output_refs: vec![],
+        evidence_refs: vec![],
+        retry_count: 0,
+        runtime_payload: magi_core::TaskRuntimePayload::None,
+        created_at: UtcMillis(11),
+        updated_at: UtcMillis(11),
+    };
+    let mut thread = sample_thread(
+        "agent-owned-thread",
+        &session,
+        &mission,
+        "explorer",
+        UtcMillis(11),
+        ExecutionThreadStatus::Active,
+    );
+    thread.handled_task_ids.push(child_id);
+    let thread_id = thread.thread_id.clone();
+    store.register_thread(thread).unwrap();
+    (store, session, child, thread_id)
+}
+
+fn agent_turn_tool(task: &magi_core::Task, thread: &ThreadId) -> ActiveExecutionTurnItem {
+    let mut item = test_turn_item("agent-owned-tool", "start");
+    item.kind = "tool_call_started".into();
+    item.status = "running".into();
+    item.task_id = Some(task.task_id.clone());
+    item.source_thread_id = thread.clone();
+    item.role_id = Some("explorer".into());
+    item.tool_call_id = Some("agent-provider-call".into());
+    item.tool_name = Some("file_write".into());
+    item.tool_arguments = Some("{\"path\":\"result.txt\",\"content\":\"done\"}".into());
+    item
+}
+
+fn transferred_agent_task(task: &magi_core::Task) -> magi_core::Task {
+    let mut task = task.clone();
+    let transfer = magi_core::AgentRunTransfer {
+        operation_id: "agent-transfer".into(),
+        session_id: task.agent_activation().unwrap().session_id.clone(),
+        source_turn_id: "agent-source-turn".into(),
+        transferred_by: task.parent_task_id.clone().unwrap(),
+        activation_generation: task.agent_activation().unwrap().generation,
+        owner: magi_core::AgentRunOwner::Session,
+        transferred_at: UtcMillis::now(),
+    };
+    task.executor_binding.as_mut().unwrap().agent_run_transfer = Some(transfer);
+    task
+}
+
+fn install_agent_transfer(store: &SessionStore, task: magi_core::Task) {
+    store.set_agent_run_transfer_resolver(Arc::new(move |_| Ok(Some(task.clone()))));
+}
+
+#[test]
+fn transferred_agent_skill_state_survives_mainline_change_tool_writeback_and_reload() {
+    let (store, session, mut task, thread) = agent_turn_fixture();
+    task.executor_binding.as_mut().unwrap().active_skill_id = Some("initial-skill".into());
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    assert_eq!(
+        owned.agent_active_skill_id().unwrap().as_deref(),
+        Some("initial-skill")
+    );
+    install_agent_transfer(&store, transferred_agent_task(&task));
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "completed",
+        )
+        .unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("later-mainline", "running", UtcMillis::now().0 + 1),
+    );
+    let main_before = serde_json::to_value(store.execution_sidecar_store_state()).unwrap();
+    store
+        .update_agent_turn_active_skill(&session, &task.task_id, &owned.turn_id, "closed-skill")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(store.execution_sidecar_store_state()).unwrap(),
+        main_before
+    );
+    store
+        .upsert_agent_turn_item(
+            &session,
+            &task.task_id,
+            &owned.turn_id,
+            agent_turn_tool(&task, &thread),
+        )
+        .unwrap();
+    let updated = store
+        .agent_turn_for_task(&session, &task.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.agent_active_skill_id().unwrap().as_deref(),
+        Some("closed-skill")
+    );
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .agent_turn_for_task(&session, &task.task_id)
+            .unwrap()
+            .unwrap()
+            .agent_active_skill_id()
+            .unwrap()
+            .as_deref(),
+        Some("closed-skill")
+    );
+    let mut forged = store.durable_state();
+    forged
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == owned.turn_id)
+        .unwrap()
+        .metadata
+        .insert("agentActiveSkillId".into(), json!({"skill":"invalid"}));
+    assert!(
+        SessionStore::from_persisted_parts(forged, store.execution_sidecar_store_state()).is_err()
+    );
+}
+
+#[test]
+fn agent_skill_activation_failure_or_wrong_source_preserves_all_facts() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    for (target, turn, skill) in [
+        (task.task_id.clone(), "stale-turn", "skill"),
+        (TaskId::new("foreign-task"), owned.turn_id.as_str(), "skill"),
+        (task.task_id.clone(), owned.turn_id.as_str(), " "),
+    ] {
+        assert!(
+            store
+                .update_agent_turn_active_skill(&session, &target, turn, skill)
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+    }
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .update_agent_turn_active_skill(&session, &task.task_id, &owned.turn_id, "skill")
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+}
+
+fn agent_test_step(task: &magi_core::Task, thread: &ThreadId, id: &str) -> crate::ModelStep {
+    let mut step = test_model_step(id, vec![]);
+    step.task_id = Some(task.task_id.clone());
+    step.thread_id = thread.clone();
+    step
+}
+
+#[test]
+fn transferred_agent_session_admission_keeps_source_and_frozen_step_accounting() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let goal = create_test_goal(&store, &session, "agent-source-turn", "old goal");
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    store
+        .begin_model_step(
+            &session,
+            &owned.turn_id,
+            agent_test_step(&task, &thread, "before-transfer"),
+        )
+        .unwrap();
+    let transferred = transferred_agent_task(&task);
+    install_agent_transfer(&store, transferred.clone());
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "cancelled",
+        )
+        .unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("another-mainline", "running", UtcMillis::now().0 + 1),
+    );
+    let main_before = serde_json::to_value(store.execution_sidecar_store_state()).unwrap();
+    assert!(store.turn_execution_is_active(&session, &owned.turn_id));
+    assert!(!store.turn_execution_was_cancelled(&session, &owned.turn_id));
+    assert!(store.model_step_goal(&session, &owned.turn_id).is_none());
+    store
+        .begin_model_step(
+            &session,
+            &owned.turn_id,
+            agent_test_step(&task, &thread, "after-transfer"),
+        )
+        .unwrap();
+    store
+        .start_model_step_retry(&session, &owned.turn_id, "after-transfer")
+        .unwrap();
+    store
+        .upsert_agent_turn_item(
+            &session,
+            &task.task_id,
+            &owned.turn_id,
+            agent_turn_tool(&task, &thread),
+        )
+        .unwrap();
+    let approval = crate::tool_approval::PendingToolApproval {
+        approval_id: "transferred-session-approval".into(),
+        session_id: session.clone(),
+        task_id: task.task_id.clone(),
+        turn_id: owned.turn_id.clone(),
+        tool_call_id: "agent-provider-call".into(),
+        tool_name: "file_write".into(),
+        reason: "转交后的独立交互".into(),
+        requested_at: UtcMillis::now(),
+        agent: None,
+    };
+    store
+        .register_tool_approval(approval.clone(), None, json!({}), None)
+        .unwrap();
+    assert_eq!(
+        store.pending_tool_approvals(&session).unwrap(),
+        std::slice::from_ref(&approval)
+    );
+    store
+        .resolve_tool_approvals(
+            &session,
+            std::slice::from_ref(&approval.approval_id),
+            crate::tool_approval::ToolApprovalDecision::AllowOnce,
+        )
+        .unwrap();
+    assert!(
+        store
+            .claim_tool_approval(
+                &session,
+                &task.task_id,
+                "agent-provider-call",
+                "file_write",
+                r#"{"path":"result.txt","content":"done"}"#,
+                None,
+                &json!({}),
+                std::slice::from_ref(&task.task_id),
+                Some(&approval.approval_id),
+            )
+            .unwrap()
+            .is_some(),
+        "原父轮关闭和主轮切换不得把批准路由到其他 Task"
+    );
+    for (id, used) in [("before-transfer", 7), ("after-transfer", 11)] {
+        store
+            .settle_model_step(
+                &session,
+                &owned.turn_id,
+                id,
+                Some("b".repeat(64)),
+                Some(used),
+                None,
+            )
+            .unwrap();
+    }
+    let updated = store
+        .agent_turn_for_task(&session, &task.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.model_steps[0].goal_id.as_ref(), Some(&goal.goal_id));
+    assert!(updated.model_steps[1].goal_id.is_none());
+    assert_eq!(store.current_goal(&session).unwrap().tokens_used, 7);
+    assert_eq!(
+        updated.metadata, owned.metadata,
+        "转交不得改写 canonical 来源或复制拥有方"
+    );
+    assert_eq!(
+        serde_json::to_value(store.execution_sidecar_store_state()).unwrap(),
+        main_before
+    );
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert!(
+        !restored.turn_execution_is_active(&session, &owned.turn_id),
+        "未接线时不能推测转交权"
+    );
+    install_agent_transfer(&restored, transferred);
+    assert!(restored.turn_execution_is_active(&session, &owned.turn_id));
+}
+
+#[test]
+fn transferred_agent_rejects_missing_query_or_mismatched_task_without_mutation() {
+    for mutation in 0..13 {
+        let (store, session, task, thread) = agent_turn_fixture();
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        store
+            .begin_model_step(
+                &session,
+                &owned.turn_id,
+                agent_test_step(&task, &thread, "already-sent"),
+            )
+            .unwrap();
+        let mut transferred = transferred_agent_task(&task);
+        match mutation {
+            0 => {
+                store.set_agent_run_transfer_resolver(Arc::new(|_| {
+                    Err(magi_core::DomainError::NotFound {
+                        entity: "AgentTask",
+                    })
+                }));
+            }
+            1 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer = None
+            }
+            2 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_activation = None
+            }
+            3 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer
+                    .as_mut()
+                    .unwrap()
+                    .activation_generation += 1
+            }
+            4 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer
+                    .as_mut()
+                    .unwrap()
+                    .session_id = SessionId::new("foreign")
+            }
+            5 => transferred.root_task_id = TaskId::new("foreign-root"),
+            6 => transferred.mission_id = MissionId::new("foreign-mission"),
+            7 => transferred.parent_task_id = Some(TaskId::new("foreign-parent")),
+            8 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer
+                    .as_mut()
+                    .unwrap()
+                    .source_turn_id = "foreign-turn".into()
+            }
+            9 => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer
+                    .as_mut()
+                    .unwrap()
+                    .transferred_at = UtcMillis(1)
+            }
+            10 => transferred.kind = magi_core::TaskKind::LocalWorkflow,
+            11 => transferred.task_id = TaskId::new("foreign-agent"),
+            _ => {
+                transferred
+                    .executor_binding
+                    .as_mut()
+                    .unwrap()
+                    .agent_run_transfer
+                    .as_mut()
+                    .unwrap()
+                    .owner = magi_core::AgentRunOwner::Goal {
+                    goal_id: magi_core::GoalId::new("missing"),
+                    control_revision: 1,
+                }
+            }
+        }
+        if mutation != 0 {
+            install_agent_transfer(&store, transferred);
+        }
+        let before = store_mutation_snapshot(&store);
+        assert!(
+            !store.turn_execution_is_active(&session, &owned.turn_id),
+            "{mutation}"
+        );
+        assert!(
+            store
+                .begin_model_step(
+                    &session,
+                    &owned.turn_id,
+                    agent_test_step(&task, &thread, "must-not-send")
+                )
+                .is_err(),
+            "{mutation}"
+        );
+        assert!(
+            store
+                .start_model_step_retry(&session, &owned.turn_id, "already-sent")
+                .is_err(),
+            "{mutation}"
+        );
+        assert!(
+            store
+                .upsert_agent_turn_item(
+                    &session,
+                    &task.task_id,
+                    &owned.turn_id,
+                    agent_turn_tool(&task, &thread)
+                )
+                .is_err(),
+            "{mutation}"
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        // 查询失效阻止继续执行，不能阻止在途响应按原身份结算用量。
+        store
+            .settle_model_step(
+                &session,
+                &owned.turn_id,
+                "already-sent",
+                Some("c".repeat(64)),
+                Some(5),
+                None,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn transferred_agent_goal_revision_revokes_steps_tools_and_interaction_responses() {
+    use crate::tool_approval::{PendingToolApproval, ToolApprovalDecision};
+    use crate::user_question::{PendingUserQuestion, UserQuestionResponse};
+    for interaction in ["question", "approval"] {
+        let (store, session, mut task, thread) = agent_turn_fixture();
+        let goal = create_test_goal(&store, &session, "agent-source-turn", "owned goal");
+        task.executor_binding
+            .as_mut()
+            .unwrap()
+            .agent_activation
+            .as_mut()
+            .unwrap()
+            .lifetime = magi_core::AgentLifetime::Goal {
+            goal_id: goal.goal_id.clone(),
+        };
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        let mut transferred = transferred_agent_task(&task);
+        transferred
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .agent_run_transfer
+            .as_mut()
+            .unwrap()
+            .owner = magi_core::AgentRunOwner::Goal {
+            goal_id: goal.goal_id.clone(),
+            control_revision: goal.control_revision,
+        };
+        install_agent_transfer(&store, transferred.clone());
+        store
+            .begin_model_step(
+                &session,
+                &owned.turn_id,
+                agent_test_step(&task, &thread, "owned-step"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .model_step_goal(&session, &owned.turn_id)
+                .unwrap()
+                .goal_id,
+            goal.goal_id
+        );
+        let mut item = agent_turn_tool(&task, &thread);
+        if interaction == "question" {
+            item.tool_name = Some("ask_user_question".into());
+        }
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item)
+            .unwrap();
+        let question = PendingUserQuestion {
+            question_id: "transfer-question".into(), session_id: session.clone(), task_id: Some(task.task_id.clone()),
+            turn_id: owned.turn_id.clone(), tool_call_id: "agent-provider-call".into(), requested_at: UtcMillis::now(), can_skip: true,
+            questions: crate::user_question::parse_questions(&json!({"questions":[{"header":"选择","question":"继续？","options":[{"label":"A"},{"label":"B"}]}]}).to_string()).unwrap(),
+        };
+        let approval = PendingToolApproval {
+            approval_id: "transfer-approval".into(),
+            session_id: session.clone(),
+            task_id: task.task_id.clone(),
+            turn_id: owned.turn_id.clone(),
+            tool_call_id: "agent-provider-call".into(),
+            tool_name: "file_write".into(),
+            reason: "需要授权".into(),
+            requested_at: UtcMillis::now(),
+            agent: None,
+        };
+        if interaction == "question" {
+            store.register_user_question(question.clone()).unwrap();
+        } else {
+            store
+                .register_tool_approval(approval.clone(), None, json!({}), None)
+                .unwrap();
+        }
+        // 同一 Goal 仍是 Active，但控制版本变化已撤销旧转交。
+        store
+            .update_goal_objective_if_revision(
+                &session,
+                &goal.goal_id,
+                "changed goal",
+                Some(goal.control_revision),
+            )
+            .unwrap();
+        let before = store_mutation_snapshot(&store);
+        assert!(!store.turn_execution_is_active(&session, &owned.turn_id));
+        assert!(store.model_step_goal(&session, &owned.turn_id).is_none());
+        assert!(store.turn_execution_was_cancelled(&session, &owned.turn_id));
+        assert!(
+            store
+                .begin_model_step(
+                    &session,
+                    &owned.turn_id,
+                    agent_test_step(&task, &thread, "revoked")
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .start_model_step_retry(&session, &owned.turn_id, "owned-step")
+                .is_err()
+        );
+        assert!(
+            store
+                .upsert_agent_turn_item(
+                    &session,
+                    &task.task_id,
+                    &owned.turn_id,
+                    agent_turn_tool(&task, &thread)
+                )
+                .is_err()
+        );
+        if interaction == "question" {
+            assert!(
+                store
+                    .resolve_user_question(
+                        &session,
+                        &question.question_id,
+                        UserQuestionResponse::Skipped
+                    )
+                    .is_err()
+            );
+        } else {
+            assert!(
+                store
+                    .resolve_tool_approvals(
+                        &session,
+                        std::slice::from_ref(&approval.approval_id),
+                        ToolApprovalDecision::AllowOnce
+                    )
+                    .is_err()
+            );
+        }
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        store
+            .settle_model_step(
+                &session,
+                &owned.turn_id,
+                "owned-step",
+                Some("d".repeat(64)),
+                Some(9),
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.current_goal(&session).unwrap().tokens_used, 9);
+        // 重启的 Interrupted 交互也不能借原主轮 ready 标记越过已撤销的拥有方。
+        let parent = store.runtime_sidecar(&session).unwrap().current_turn;
+        let mut chain = test_active_chain(&session, "transfer-restart", parent);
+        chain.root_task_id = task.root_task_id.clone();
+        chain.mission_id = task.mission_id.clone();
+        store
+            .upsert_active_execution_chain(session.clone(), chain)
+            .unwrap();
+        store
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        install_agent_transfer(&restored, transferred);
+        assert!(
+            restored
+                .pending_user_questions(&session)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            restored
+                .pending_tool_approvals(&session)
+                .unwrap()
+                .is_empty()
+        );
+        if interaction == "question" {
+            assert!(
+                restored
+                    .resolve_user_question(
+                        &session,
+                        &question.question_id,
+                        UserQuestionResponse::Skipped
+                    )
+                    .is_err()
+            );
+        } else {
+            assert!(
+                restored
+                    .resolve_tool_approvals(
+                        &session,
+                        &[approval.approval_id],
+                        ToolApprovalDecision::AllowOnce
+                    )
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn independent_agent_restart_preserves_interactions_without_original_mainline_pointer() {
+    use crate::tool_approval::{PendingToolApproval, ToolApprovalDecision};
+    use crate::user_question::{PendingUserQuestion, UserQuestionResponse};
+    use magi_core::TaskStatus;
+    for (interaction, source_status) in [
+        ("question", "completed"),
+        ("approval", "completed"),
+        ("question", "interrupted"),
+        ("approval", "interrupted"),
+    ] {
+        let (store, session, mut task, thread) = agent_turn_fixture();
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        let mut item = agent_turn_tool(&task, &thread);
+        if interaction == "question" {
+            item.tool_name = Some("ask_user_question".into());
+        }
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item)
+            .unwrap();
+        let question = PendingUserQuestion {
+            question_id: "independent-restart-question".into(), session_id: session.clone(), task_id: Some(task.task_id.clone()),
+            turn_id: owned.turn_id.clone(), tool_call_id: "agent-provider-call".into(), requested_at: UtcMillis::now(), can_skip: true,
+            questions: crate::user_question::parse_questions(&json!({"questions":[{"header":"选择","question":"继续？","options":[{"label":"A"},{"label":"B"}]}]}).to_string()).unwrap(),
+        };
+        let approval = PendingToolApproval {
+            approval_id: "independent-restart-approval".into(),
+            session_id: session.clone(),
+            task_id: task.task_id.clone(),
+            turn_id: owned.turn_id.clone(),
+            tool_call_id: "agent-provider-call".into(),
+            tool_name: "file_write".into(),
+            reason: "授权".into(),
+            requested_at: UtcMillis::now(),
+            agent: None,
+        };
+        if interaction == "question" {
+            store.register_user_question(question.clone()).unwrap();
+        } else {
+            store
+                .register_tool_approval(approval.clone(), None, json!({}), None)
+                .unwrap();
+        }
+        let mut transferred = transferred_agent_task(&task);
+        install_agent_transfer(&store, transferred.clone());
+        if source_status == "interrupted" {
+            let parent = store.runtime_sidecar(&session).unwrap().current_turn;
+            let mut chain = test_active_chain(&session, "independent-restart", parent);
+            chain.root_task_id = task.root_task_id.clone();
+            chain.mission_id = task.mission_id.clone();
+            store
+                .upsert_active_execution_chain(session.clone(), chain)
+                .unwrap();
+            store
+                .interrupt_current_turn_by_daemon_restart(&session)
+                .unwrap();
+            assert_eq!(
+                store
+                    .agent_turn_for_task(&session, &task.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                CanonicalTurnStatus::Running,
+                "原主线的中断不结束已转交代理"
+            );
+        } else {
+            store
+                .update_current_turn_status_for_turn_with_change(
+                    &session,
+                    Some("agent-source-turn"),
+                    "completed",
+                )
+                .unwrap();
+        }
+        accept_test_turn(
+            &store,
+            &session,
+            test_turn(
+                "new-mainline-during-agent",
+                "running",
+                UtcMillis::now().0 + 1,
+            ),
+        );
+        let current_before = serde_json::to_value(store.execution_sidecar_store_state()).unwrap();
+        // Task/lease 先提交重启结算；canonical writer 失败不能先更新 Agent Turn。
+        task.status = TaskStatus::Failed;
+        let before = store_mutation_snapshot(&store);
+        reject_canonical_writes(&store);
+        assert!(
+            store
+                .reconcile_agent_turns_after_restart(&session, &[task.clone()])
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        let writer = Arc::new(RecordingCanonicalWriter::default());
+        store.install_session_event_writer(writer.clone());
+        assert_eq!(
+            store
+                .reconcile_agent_turns_after_restart(&session, &[task.clone()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .reconcile_agent_turns_after_restart(&session, &[task.clone()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(writer.transactions.lock().unwrap().len(), 1);
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.execution_sidecar_store_state()).unwrap(),
+            current_before
+        );
+        assert!(!restored.turn_execution_is_active(&session, &owned.turn_id));
+        assert!(
+            restored
+                .pending_user_questions(&session)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            restored
+                .pending_tool_approvals(&session)
+                .unwrap()
+                .is_empty()
+        );
+        transferred.status = TaskStatus::Failed;
+        install_agent_transfer(&restored, transferred.clone());
+        assert_eq!(
+            restored
+                .agent_turn_for_task(&session, &task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            CanonicalTurnStatus::Interrupted
+        );
+        if interaction == "question" {
+            assert_eq!(
+                restored.pending_user_questions(&session).unwrap(),
+                std::slice::from_ref(&question)
+            );
+            restored
+                .resolve_user_question(
+                    &session,
+                    &question.question_id,
+                    UserQuestionResponse::Skipped,
+                )
+                .unwrap();
+        } else {
+            assert_eq!(
+                restored.pending_tool_approvals(&session).unwrap(),
+                std::slice::from_ref(&approval)
+            );
+            restored
+                .resolve_tool_approvals(
+                    &session,
+                    &[approval.approval_id],
+                    ToolApprovalDecision::AllowOnce,
+                )
+                .unwrap();
+        }
+        assert!(
+            !restored.turn_execution_is_active(&session, &owned.turn_id),
+            "答复不是重新执行授权"
+        );
+        assert!(
+            restored
+                .begin_model_step(
+                    &session,
+                    &owned.turn_id,
+                    agent_test_step(&task, &thread, "must-not-restart")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(restored.execution_sidecar_store_state()).unwrap(),
+            current_before
+        );
+        let operation = "续".repeat(200);
+        let before_continuation = store_mutation_snapshot(&restored);
+        assert!(
+            restored
+                .prepare_transferred_agent_continuation(
+                    &session,
+                    std::slice::from_ref(&transferred),
+                    &owned.turn_id,
+                    &"x".repeat(201)
+                )
+                .is_err()
+        );
+        assert!(
+            restored
+                .prepare_transferred_agent_continuation(
+                    &session,
+                    std::slice::from_ref(&transferred),
+                    &owned.turn_id,
+                    &"续".repeat(201)
+                )
+                .is_err(),
+            "operationId 上限按字符计数，不能因 UTF-8 字节数误判"
+        );
+        assert_store_mutation_snapshot_unchanged(&restored, &before_continuation);
+        let continued = restored
+            .prepare_transferred_agent_continuation(
+                &session,
+                &[transferred.clone()],
+                &owned.turn_id,
+                &operation,
+            )
+            .unwrap();
+        assert_eq!(continued.len(), 1);
+        let binding = continued[0].agent_turn_binding().unwrap().unwrap();
+        assert_eq!(
+            binding.continuation_operation_id.as_deref(),
+            Some(operation.as_str())
+        );
+        assert_eq!(
+            binding.previous_turn_id.as_deref(),
+            Some(owned.turn_id.as_str())
+        );
+        assert_eq!(binding.thread_id, thread);
+        assert_eq!(continued[0].status, CanonicalTurnStatus::Running);
+        let after = store_mutation_snapshot(&restored);
+        assert!(
+            restored
+                .prepare_transferred_agent_continuation(
+                    &session,
+                    &[transferred],
+                    &owned.turn_id,
+                    "another-continue"
+                )
+                .is_err()
+        );
+        assert!(
+            restored
+                .finish_agent_turn(
+                    &session,
+                    &task.task_id,
+                    &owned.turn_id,
+                    CanonicalTurnStatus::Completed
+                )
+                .is_err(),
+            "旧执行的迟到结果不能重写中断记录"
+        );
+        assert_store_mutation_snapshot_unchanged(&restored, &after);
+        let reloaded = SessionStore::from_persisted_parts(
+            restored.durable_state(),
+            restored.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded
+                .agent_continuation_for_operation(&session, &task.task_id, &operation)
+                .unwrap()
+                .unwrap(),
+            continued[0]
+        );
+        assert_eq!(
+            serde_json::to_value(reloaded.execution_sidecar_store_state()).unwrap(),
+            current_before,
+            "独立继续不能改变新主线指针"
+        );
+    }
+}
+
+#[test]
+fn independent_agent_restart_requires_settled_matching_task_and_preserves_terminal_results() {
+    use magi_core::TaskStatus;
+    for status in [
+        TaskStatus::Pending,
+        TaskStatus::Running,
+        TaskStatus::Completed,
+        TaskStatus::Failed,
+        TaskStatus::Killed,
+    ] {
+        let (store, session, mut task, thread) = agent_turn_fixture();
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        task.status = status;
+        let before = store_mutation_snapshot(&store);
+        assert!(
+            store
+                .reconcile_agent_turns_after_restart(&session, &[])
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        let mut foreign = task.clone();
+        foreign.mission_id = MissionId::new("foreign");
+        assert!(
+            store
+                .reconcile_agent_turns_after_restart(&session, &[foreign])
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        let result = store.reconcile_agent_turns_after_restart(&session, &[task.clone()]);
+        if matches!(status, TaskStatus::Pending | TaskStatus::Running) {
+            assert!(result.is_err());
+            assert_store_mutation_snapshot_unchanged(&store, &before);
+        } else {
+            assert_eq!(result.unwrap(), 1);
+            let expected = match status {
+                TaskStatus::Completed => CanonicalTurnStatus::Completed,
+                TaskStatus::Killed => CanonicalTurnStatus::Cancelled,
+                _ => CanonicalTurnStatus::Interrupted,
+            };
+            assert_eq!(
+                store
+                    .canonical_turn_for_session_turn_id(&session, &owned.turn_id)
+                    .unwrap()
+                    .status,
+                expected
+            );
+            assert_eq!(
+                store
+                    .reconcile_agent_turns_after_restart(&session, &[task])
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn independent_agent_restart_retains_unknown_side_effect_and_original_step_usage() {
+    use crate::CanonicalTurnItemStatus;
+    let (store, session, mut task, thread) = agent_turn_fixture();
+    let goal = create_test_goal(&store, &session, "agent-source-turn", "original accounting");
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    store
+        .begin_model_step(
+            &session,
+            &owned.turn_id,
+            agent_test_step(&task, &thread, "sent-before-restart"),
+        )
+        .unwrap();
+    store
+        .upsert_agent_turn_item(
+            &session,
+            &task.task_id,
+            &owned.turn_id,
+            agent_turn_tool(&task, &thread),
+        )
+        .unwrap();
+    let transferred = transferred_agent_task(&task);
+    install_agent_transfer(&store, transferred.clone());
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "completed",
+        )
+        .unwrap();
+    task.status = magi_core::TaskStatus::Failed;
+    store
+        .reconcile_agent_turns_after_restart(&session, &[task.clone()])
+        .unwrap();
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    install_agent_transfer(&restored, transferred);
+    let interrupted = restored
+        .agent_turn_for_task(&session, &task.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        interrupted.items[0].status,
+        CanonicalTurnItemStatus::Indeterminate
+    );
+    assert_eq!(
+        interrupted.items[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()["status"],
+        "outcome_unknown"
+    );
+    assert_eq!(
+        interrupted.model_steps[0].status,
+        crate::ModelStepStatus::Started
+    );
+    assert!(
+        restored
+            .start_model_step_retry(&session, &owned.turn_id, "sent-before-restart")
+            .is_err()
+    );
+    assert!(
+        restored
+            .begin_model_step(
+                &session,
+                &owned.turn_id,
+                agent_test_step(&task, &thread, "must-not-resend")
+            )
+            .is_err()
+    );
+    restored
+        .settle_model_step(
+            &session,
+            &owned.turn_id,
+            "sent-before-restart",
+            Some("a".repeat(64)),
+            Some(13),
+            None,
+        )
+        .unwrap();
+    assert!(
+        restored
+            .settle_model_step(
+                &session,
+                &owned.turn_id,
+                "sent-before-restart",
+                Some("a".repeat(64)),
+                Some(13),
+                None,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        restored.current_goal(&session).unwrap().goal_id,
+        goal.goal_id
+    );
+    assert_eq!(restored.current_goal(&session).unwrap().tokens_used, 13);
+    assert_eq!(
+        restored
+            .agent_turn_for_task(&session, &task.task_id)
+            .unwrap()
+            .unwrap()
+            .model_steps
+            .len(),
+        1
+    );
+    assert!(!restored.turn_execution_is_active(&session, &owned.turn_id));
+}
+
+#[test]
+fn transferred_agent_boundary_preserves_nested_parent_and_job_admission() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let parent = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    let mut leaf = task.clone();
+    leaf.task_id = TaskId::new("transfer-leaf");
+    leaf.parent_task_id = Some(task.task_id.clone());
+    leaf.executor_binding
+        .as_mut()
+        .unwrap()
+        .agent_activation
+        .as_mut()
+        .unwrap()
+        .agent_id = leaf.task_id.clone();
+    let mut leaf_thread = sample_thread(
+        "transfer-leaf-thread",
+        &session,
+        &task.mission_id,
+        "explorer",
+        UtcMillis(12),
+        ExecutionThreadStatus::Active,
+    );
+    leaf_thread.handled_task_ids.push(leaf.task_id.clone());
+    let leaf_thread_id = leaf_thread.thread_id.clone();
+    store.register_thread(leaf_thread).unwrap();
+    let owned = store
+        .create_agent_turn(&leaf, &parent.turn_id, &leaf_thread_id)
+        .unwrap();
+    install_agent_transfer(&store, transferred_agent_task(&task));
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "completed",
+        )
+        .unwrap();
+    assert!(store.turn_execution_is_active(&session, &owned.turn_id));
+    let mut item = agent_turn_tool(&leaf, &leaf_thread_id);
+    item.tool_name = Some("shell_exec".into());
+    item.tool_arguments = Some(r#"{"command":"sleep 1","background":true}"#.into());
+    store
+        .upsert_agent_turn_item(&session, &leaf.task_id, &owned.turn_id, item)
+        .unwrap();
+    let store = Arc::new(store);
+    let journal =
+        store.background_job_journal(std::env::temp_dir().join("agent-transfer-job-test"));
+    let context = magi_tool_runtime::ToolExecutionContext {
+        session_id: Some(session.clone()),
+        task_id: Some(leaf.task_id.clone()),
+        caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
+        ..Default::default()
+    };
+    let mut job = journal
+        .begin(&context, "agent-provider-call", "sleep 1", "/workspace")
+        .unwrap();
+    store
+        .finish_agent_turn(
+            &session,
+            &task.task_id,
+            &parent.turn_id,
+            CanonicalTurnStatus::Failed,
+        )
+        .unwrap();
+    assert!(
+        !store.turn_execution_is_active(&session, &owned.turn_id),
+        "转交不得越过子树内父轮的关闭"
+    );
+    assert!(
+        store
+            .begin_model_step(
+                &session,
+                &owned.turn_id,
+                agent_test_step(&leaf, &leaf_thread_id, "late-leaf")
+            )
+            .is_err()
+    );
+    // 已有进程的停止结算保留原 Job；禁止借已有子树权继续创建工作。
+    job.revision += 1;
+    job.status = magi_tool_runtime::BackgroundJobStatus::Cancelled;
+    job.settled_at = Some(UtcMillis::now());
+    journal.commit(&job).unwrap();
+    assert_eq!(journal.list(&context).unwrap(), [job]);
+}
+
+#[test]
+fn agent_turn_writes_and_model_steps_use_owned_stream_without_changing_mainline() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let sidecar_before = serde_json::to_value(store.execution_sidecar_store_state()).unwrap();
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    assert_eq!(
+        store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap(),
+        owned
+    );
+    let item = agent_turn_tool(&task, &thread);
+    let started = store
+        .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item.clone())
+        .unwrap();
+    assert_eq!(started.items[0].item_seq, 1);
+    assert_eq!(
+        started.items[0].worker.as_ref().unwrap().task_id,
+        Some(task.task_id.clone())
+    );
+    let mut step = test_model_step("agent-step", vec![]);
+    step.task_id = Some(task.task_id.clone());
+    step.thread_id = thread.clone();
+    store
+        .begin_model_step(&session, &owned.turn_id, step)
+        .unwrap();
+    assert!(
+        store
+            .finish_agent_turn(
+                &session,
+                &task.task_id,
+                &owned.turn_id,
+                CanonicalTurnStatus::Completed
+            )
+            .is_err(),
+        "不能把未结算工具或请求报告完成"
+    );
+    store
+        .settle_model_step(
+            &session,
+            &owned.turn_id,
+            "agent-step",
+            Some("b".repeat(64)),
+            Some(12),
+            None,
+        )
+        .unwrap();
+    let mut result = item;
+    result.kind = "tool_call_result".into();
+    result.status = "completed".into();
+    result.tool_result = Some("{\"status\":\"succeeded\"}".into());
+    store
+        .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, result.clone())
+        .unwrap();
+    let (completed, changed) = store
+        .finish_agent_turn(
+            &session,
+            &task.task_id,
+            &owned.turn_id,
+            CanonicalTurnStatus::Completed,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(changed);
+    assert_eq!(
+        completed.items[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert_eq!(completed.model_steps.len(), 1);
+    assert_eq!(
+        serde_json::to_value(store.execution_sidecar_store_state()).unwrap(),
+        sidecar_before
+    );
+    assert!(
+        !store
+            .finish_agent_turn(
+                &session,
+                &task.task_id,
+                &owned.turn_id,
+                CanonicalTurnStatus::Completed
+            )
+            .unwrap()
+            .unwrap()
+            .1
+    );
+    assert!(
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, result)
+            .is_err()
+    );
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .agent_turn_for_task(&session, &task.task_id)
+            .unwrap(),
+        Some(completed)
+    );
+}
+
+#[test]
+fn agent_cancellation_follows_original_parent_after_session_moves_to_another_turn() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    assert!(!store.turn_execution_was_cancelled(&session, &owned.turn_id));
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "cancelled",
+        )
+        .unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("new-mainline-turn", "running", 100),
+    );
+    assert!(store.turn_execution_is_active(&session, "new-mainline-turn"));
+    assert!(!store.turn_execution_is_active(&session, &owned.turn_id));
+    assert!(store.turn_execution_was_cancelled(&session, &owned.turn_id));
+    assert!(!store.turn_execution_was_cancelled(&session, "new-mainline-turn"));
+    assert!(
+        !store.turn_execution_was_cancelled(&SessionId::new("foreign-session"), &owned.turn_id)
+    );
+}
+
+#[test]
+fn agent_turn_parent_close_blocks_requests_and_retries_but_allows_settlement() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    assert!(store.turn_execution_is_active(&session, &owned.turn_id));
+    let item = agent_turn_tool(&task, &thread);
+    store
+        .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item.clone())
+        .unwrap();
+    let mut step = test_model_step("in-flight-agent-step", vec![]);
+    step.task_id = Some(task.task_id.clone());
+    step.thread_id = thread.clone();
+    store
+        .begin_model_step(&session, &owned.turn_id, step.clone())
+        .unwrap();
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("agent-source-turn"),
+            "completed",
+        )
+        .unwrap();
+    assert!(!store.turn_execution_is_active(&session, &owned.turn_id));
+    assert!(
+        store
+            .start_model_step_retry(&session, &owned.turn_id, &step.step_id)
+            .is_err()
+    );
+    step.step_id = "must-not-send".into();
+    step.attempts[0].attempt_id = "must-not-send:attempt:1".into();
+    assert!(
+        store
+            .begin_model_step(&session, &owned.turn_id, step)
+            .is_err()
+    );
+    assert!(
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item)
+            .is_err()
+    );
+    store
+        .settle_model_step(
+            &session,
+            &owned.turn_id,
+            "in-flight-agent-step",
+            Some("c".repeat(64)),
+            Some(9),
+            None,
+        )
+        .unwrap();
+    let closed = store
+        .finish_agent_turn(
+            &session,
+            &task.task_id,
+            &owned.turn_id,
+            CanonicalTurnStatus::Cancelled,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        closed.items[0].status,
+        crate::CanonicalTurnItemStatus::Indeterminate
+    );
+    assert_eq!(
+        closed.items[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()["status"],
+        "outcome_unknown"
+    );
+    assert_eq!(closed.model_steps[0].usage_tokens, Some(9));
+    assert!(
+        store
+            .finish_agent_turn(
+                &session,
+                &task.task_id,
+                &owned.turn_id,
+                CanonicalTurnStatus::Completed
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn agent_job_parent_close_blocks_start_but_keeps_original_settlement() {
+    for already_started in [false, true] {
+        let (store, session, task, thread) = agent_turn_fixture();
+        let store = Arc::new(store);
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        let mut item = agent_turn_tool(&task, &thread);
+        item.tool_name = Some("shell_exec".into());
+        item.tool_arguments = Some(r#"{"command":"sleep 1","background":true}"#.into());
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item)
+            .unwrap();
+        let journal =
+            store.background_job_journal(std::env::temp_dir().join("agent-job-admission-test"));
+        let context = magi_tool_runtime::ToolExecutionContext {
+            session_id: Some(session.clone()),
+            task_id: Some(task.task_id.clone()),
+            caller_scope: magi_tool_runtime::ToolCallerScope::DelegatedTask,
+            ..Default::default()
+        };
+        let started = already_started.then(|| {
+            journal
+                .begin(&context, "agent-provider-call", "sleep 1", "/workspace")
+                .unwrap()
+        });
+        store
+            .update_current_turn_status_for_turn_with_change(
+                &session,
+                Some("agent-source-turn"),
+                "completed",
+            )
+            .unwrap();
+        assert!(!store.turn_execution_is_active(&session, &owned.turn_id));
+        if let Some(mut job) = started {
+            job.revision += 1;
+            job.status = magi_tool_runtime::BackgroundJobStatus::Cancelled;
+            job.settled_at = Some(UtcMillis::now());
+            journal.commit(&job).unwrap();
+            assert_eq!(journal.list(&context).unwrap(), vec![job]);
+        } else {
+            let before = store_mutation_snapshot(&store);
+            assert!(
+                journal
+                    .begin(&context, "agent-provider-call", "sleep 1", "/workspace")
+                    .is_err()
+            );
+            assert_store_mutation_snapshot_unchanged(&store, &before);
+            assert!(journal.list(&context).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn agent_turn_rejects_cross_task_thread_input_and_source_tampering_without_mutation() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let owned = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    let original = store_mutation_snapshot(&store);
+    let mut bad_task = task.clone();
+    bad_task.parent_task_id = Some(TaskId::new("other-parent"));
+    assert!(
+        store
+            .create_agent_turn(&bad_task, "agent-source-turn", &thread)
+            .is_err()
+    );
+    let mut wrong_item = agent_turn_tool(&task, &thread);
+    wrong_item.task_id = Some(TaskId::new("other-task"));
+    assert!(
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, wrong_item)
+            .is_err()
+    );
+    let mut step = test_model_step("cross-input", vec!["parent-user-request".into()]);
+    step.task_id = Some(task.task_id.clone());
+    step.thread_id = thread.clone();
+    assert!(
+        store
+            .begin_model_step(&session, &owned.turn_id, step)
+            .is_err()
+    );
+    let mut wrong_thread = test_model_step("cross-thread", vec![]);
+    wrong_thread.task_id = Some(task.task_id.clone());
+    assert!(
+        store
+            .begin_model_step(&session, &owned.turn_id, wrong_thread)
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &original);
+    let mut changed = owned.clone();
+    changed.metadata.get_mut("agentExecution").unwrap()["parentTaskId"] = json!("other-parent");
+    assert!(changed.validate_update_from(&owned).is_err());
+    let mut durable = store.durable_state();
+    durable
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == owned.turn_id)
+        .unwrap()
+        .metadata
+        .get_mut("agentExecution")
+        .unwrap()["parentTurnId"] = json!("missing-parent");
+    assert!(
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state()).is_err()
+    );
+}
+
+#[test]
+fn agent_turn_failed_commits_do_not_publish_creation_item_or_completion() {
+    for phase in ["create", "item", "finish"] {
+        let (store, session, task, thread) = agent_turn_fixture();
+        let owned = if phase != "create" {
+            Some(
+                store
+                    .create_agent_turn(&task, "agent-source-turn", &thread)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let before = store_mutation_snapshot(&store);
+        reject_canonical_writes(&store);
+        let failed = match phase {
+            "create" => store
+                .create_agent_turn(&task, "agent-source-turn", &thread)
+                .is_err(),
+            "item" => store
+                .upsert_agent_turn_item(
+                    &session,
+                    &task.task_id,
+                    &owned.unwrap().turn_id,
+                    agent_turn_tool(&task, &thread),
+                )
+                .is_err(),
+            _ => store
+                .finish_agent_turn(
+                    &session,
+                    &task.task_id,
+                    &owned.as_ref().unwrap().turn_id,
+                    CanonicalTurnStatus::Failed,
+                )
+                .is_err(),
+        };
+        assert!(failed, "{phase}");
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+    }
+}
+
+#[test]
+fn agent_turn_journal_identity_restores_missing_thread_and_rejects_conflicting_projection() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    let mut durable = store.durable_state();
+    durable
+        .thread_registry
+        .retain(|entry| entry.thread_id != thread);
+    let restored =
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state()).unwrap();
+    let restored_thread = restored
+        .thread_registry_snapshot(&session)
+        .into_iter()
+        .find(|entry| entry.thread_id == thread)
+        .unwrap();
+    assert_eq!(
+        restored_thread.handled_task_ids,
+        std::slice::from_ref(&task.task_id)
+    );
+    let mut bad = store.durable_state();
+    bad.thread_registry
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread)
+        .unwrap()
+        .handled_task_ids
+        .push(TaskId::new("sibling"));
+    assert!(
+        SessionStore::from_persisted_parts(bad, store.execution_sidecar_store_state()).is_err()
+    );
+}
+
+#[test]
+fn agent_turn_continue_creates_new_execution_without_reopening_history() {
+    let (store, session, task, thread) = agent_turn_fixture();
+    let parent = store.runtime_sidecar(&session).unwrap().current_turn;
+    let mut chain = test_active_chain(&session, "agent-recovery", parent);
+    chain.root_task_id = task.root_task_id.clone();
+    chain.mission_id = task.mission_id.clone();
+    store
+        .upsert_active_execution_chain(session.clone(), chain)
+        .unwrap();
+    let first = store
+        .create_agent_turn(&task, "agent-source-turn", &thread)
+        .unwrap();
+    store
+        .interrupt_current_turn_by_daemon_restart(&session)
+        .unwrap();
+    let first = store
+        .canonical_turn_for_session_turn_id(&session, &first.turn_id)
+        .unwrap();
+    let mut resumed_parent = test_turn("agent-resumed-parent", "running", UtcMillis::now().0);
+    let mut user = test_turn_item("agent-continue-user", "continue");
+    user.task_id = Some(task.root_task_id.clone());
+    user.metadata.insert("route".into(), json!("continue"));
+    resumed_parent.items.push(user);
+    let invalid = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    accept_test_turn(&invalid, &session, resumed_parent.clone());
+    assert!(
+        invalid
+            .create_agent_turn(&task, &resumed_parent.turn_id, &thread)
+            .is_err(),
+        "缺少原父 Turn 来源不得改绑"
+    );
+    resumed_parent.items[0]
+        .metadata
+        .insert("recoverySourceTurnId".into(), json!("agent-source-turn"));
+    accept_test_turn(&store, &session, resumed_parent.clone());
+    let mut stale = resumed_parent.items[0].clone();
+    stale.metadata.remove("recoverySourceTurnId");
+    let source_before = store_mutation_snapshot(&store);
+    assert!(
+        store
+            .upsert_current_turn_item_for_turn(&session, Some(&resumed_parent.turn_id), stale)
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &source_before);
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .create_agent_turn(&task, &resumed_parent.turn_id, &thread)
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+    let store = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    let resumed = store
+        .create_agent_turn(&task, &resumed_parent.turn_id, &thread)
+        .unwrap();
+    assert_ne!(resumed.turn_id, first.turn_id);
+    assert_eq!(
+        resumed
+            .agent_turn_binding()
+            .unwrap()
+            .unwrap()
+            .previous_turn_id,
+        Some(first.turn_id.clone())
+    );
+    assert_eq!(
+        store
+            .create_agent_turn(&task, &resumed_parent.turn_id, &thread)
+            .unwrap(),
+        resumed
+    );
+    assert_eq!(
+        store.agent_turn_for_task(&session, &task.task_id).unwrap(),
+        Some(resumed.clone())
+    );
+    assert_eq!(
+        store
+            .canonical_turn_for_session_turn_id(&session, &first.turn_id)
+            .unwrap(),
+        first
+    );
+    assert!(
+        store
+            .upsert_agent_turn_item(
+                &session,
+                &task.task_id,
+                &first.turn_id,
+                agent_turn_tool(&task, &thread)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .finish_agent_turn(
+                &session,
+                &task.task_id,
+                &first.turn_id,
+                CanonicalTurnStatus::Failed
+            )
+            .is_err(),
+        "迟到结算不能影响新轮"
+    );
+    assert!(store.turn_execution_is_active(&session, &resumed.turn_id));
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .agent_turn_for_task(&session, &task.task_id)
+            .unwrap(),
+        Some(resumed)
+    );
+    let mut bad = store.durable_state();
+    bad.canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == resumed_parent.turn_id)
+        .unwrap()
+        .items[0]
+        .metadata
+        .remove("recoverySourceTurnId");
+    assert!(
+        SessionStore::from_persisted_parts(bad, store.execution_sidecar_store_state()).is_err()
+    );
+}
+
+#[test]
+fn agent_turn_restart_commits_parent_and_child_atomically_and_restores_interactions() {
+    use crate::tool_approval::{PendingToolApproval, ToolApprovalDecision};
+    use crate::user_question::{PendingUserQuestion, UserQuestionResponse};
+    for interaction in ["question", "approval"] {
+        let (store, session, task, thread) = agent_turn_fixture();
+        let parent = store.runtime_sidecar(&session).unwrap().current_turn;
+        let mut chain = test_active_chain(&session, "agent-restart", parent);
+        chain.root_task_id = task.root_task_id.clone();
+        chain.mission_id = task.mission_id.clone();
+        store
+            .upsert_active_execution_chain(session.clone(), chain)
+            .unwrap();
+        let owned = store
+            .create_agent_turn(&task, "agent-source-turn", &thread)
+            .unwrap();
+        let mut item = agent_turn_tool(&task, &thread);
+        let call_id = item.tool_call_id.clone().unwrap();
+        if interaction == "question" {
+            item.tool_name = Some("ask_user_question".into());
+            item.tool_arguments = Some(json!({"questions":[{"header":"选择","question":"继续？","options":[{"label":"A"},{"label":"B"}]}]}).to_string());
+        }
+        store
+            .upsert_agent_turn_item(&session, &task.task_id, &owned.turn_id, item.clone())
+            .unwrap();
+        let question = PendingUserQuestion {
+            question_id: "agent-restart-question".into(), session_id: session.clone(),
+            task_id: Some(task.task_id.clone()), turn_id: owned.turn_id.clone(),
+            tool_call_id: call_id.clone(), requested_at: UtcMillis::now(), can_skip: true,
+            questions: crate::user_question::parse_questions(&json!({"questions":[{"header":"选择","question":"继续？","options":[{"label":"A"},{"label":"B"}]}]}).to_string()).unwrap(),
+        };
+        let approval = PendingToolApproval {
+            approval_id: "agent-restart-approval".into(),
+            session_id: session.clone(),
+            task_id: task.task_id.clone(),
+            turn_id: owned.turn_id.clone(),
+            tool_call_id: call_id,
+            tool_name: "file_write".into(),
+            reason: "需要授权".into(),
+            requested_at: UtcMillis::now(),
+            agent: None,
+        };
+        if interaction == "question" {
+            store.register_user_question(question.clone()).unwrap();
+            assert_eq!(
+                store.pending_user_questions(&session).unwrap(),
+                std::slice::from_ref(&question)
+            );
+        } else {
+            store
+                .register_tool_approval(approval.clone(), None, json!({}), None)
+                .unwrap();
+            assert_eq!(
+                store.pending_tool_approvals(&session).unwrap(),
+                std::slice::from_ref(&approval)
+            );
+        }
+        let before = store_mutation_snapshot(&store);
+        reject_canonical_writes(&store);
+        assert!(
+            store
+                .interrupt_current_turn_by_daemon_restart(&session)
+                .is_err()
+        );
+        assert_store_mutation_snapshot_unchanged(&store, &before);
+        let writer = Arc::new(RecordingCanonicalWriter::default());
+        store.install_session_event_writer(writer.clone());
+        store
+            .interrupt_current_turn_by_daemon_restart(&session)
+            .unwrap();
+        let transactions = writer.transactions.lock().unwrap();
+        assert_eq!(transactions.len(), 1, "父轮与子轮必须一次提交");
+        for turn_id in ["agent-source-turn", owned.turn_id.as_str()] {
+            assert!(
+                transactions[0]
+                    .iter()
+                    .any(|mutation| mutation.next.turn_id == turn_id
+                        && mutation.next.status == CanonicalTurnStatus::Interrupted)
+            );
+        }
+        let interrupted = store
+            .agent_turn_for_task(&session, &task.task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.status, CanonicalTurnStatus::Interrupted);
+        assert_eq!(
+            interrupted.items[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()["status"],
+            if interaction == "question" {
+                "awaiting_user_input"
+            } else {
+                "awaiting_approval"
+            }
+        );
+        assert!(!store.turn_execution_is_active(&session, &owned.turn_id));
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            store.execution_sidecar_store_state(),
+        )
+        .unwrap();
+        if interaction == "question" {
+            assert_eq!(
+                restored.pending_user_questions(&session).unwrap(),
+                std::slice::from_ref(&question)
+            );
+            restored
+                .resolve_user_question(
+                    &session,
+                    &question.question_id,
+                    UserQuestionResponse::Skipped,
+                )
+                .unwrap();
+            assert!(
+                restored
+                    .pending_user_questions(&session)
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(
+                restored.pending_tool_approvals(&session).unwrap(),
+                std::slice::from_ref(&approval)
+            );
+            restored
+                .resolve_tool_approvals(
+                    &session,
+                    &[approval.approval_id],
+                    ToolApprovalDecision::AllowOnce,
+                )
+                .unwrap();
+            assert!(
+                restored
+                    .pending_tool_approvals(&session)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            restored
+                .runtime_sidecar(&session)
+                .unwrap()
+                .current_turn
+                .unwrap()
+                .turn_id,
+            "agent-source-turn"
+        );
+    }
 }

@@ -16,6 +16,18 @@ use std::{
 
 const WRITE_CONFLICT_PUBLIC_ERROR: &str = "检测到并发写冲突，请稍后重试";
 
+/// MCP/插件声明的副作用与访问模式的共同判定；Task、Skill 和资源范围仍须分别校验。
+pub fn external_tool_access_decision(
+    read_only: bool,
+    access_profile: AccessProfile,
+) -> Option<ExecutionResultStatus> {
+    match (read_only, access_profile) {
+        (false, AccessProfile::ReadOnly) => Some(ExecutionResultStatus::Rejected),
+        (false, AccessProfile::Restricted) => Some(ExecutionResultStatus::NeedsApproval),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WriteProtectionClaim {
     pub(crate) tool_call_id: ToolCallId,
@@ -51,43 +63,10 @@ impl ToolRegistry {
         input: &ToolExecutionInput,
         policy: &ToolExecutionPolicy,
     ) -> Option<ToolExecutionOutput> {
-        let policy = normalize_execution_policy(policy);
-        if policy.source_skill_ids.is_empty()
-            && policy.allowed_tool_names.is_empty()
-            && policy.denied_tool_names.is_empty()
-        {
-            return None;
-        }
-        if !policy.denied_tool_names.is_empty()
-            && policy
-                .denied_tool_names
-                .iter()
-                .any(|tool_name| tool_name == &input.tool_name)
-        {
+        if let Some(rejection) = policy.tool_name_rejection(&input.tool_name) {
             return Some(self.build_policy_rejection(
                 input,
-                format!("skill runtime 已显式拒绝工具: {}", input.tool_name),
-                policy.effective_access_profile(),
-            ));
-        }
-
-        if !policy.allowed_tool_names.is_empty()
-            && !policy
-                .allowed_tool_names
-                .iter()
-                .any(|tool_name| tool_name == &input.tool_name)
-        {
-            return Some(self.build_policy_rejection(
-                input,
-                format!("skill runtime 未授权工具: {}", input.tool_name),
-                policy.effective_access_profile(),
-            ));
-        }
-
-        if policy.allowed_tool_names.is_empty() {
-            return Some(self.build_policy_rejection(
-                input,
-                format!("skill runtime 未授权工具: {}", input.tool_name),
+                format!("{}: {}", rejection.reason_code(), input.tool_name),
                 policy.effective_access_profile(),
             ));
         }
@@ -126,6 +105,9 @@ impl ToolRegistry {
             return BuiltinToolAccessMode::ReadOnly;
         };
         let default_access_mode = tool_name.default_access_mode();
+        if tool_name.is_background_process_observation(&input.input) {
+            return BuiltinToolAccessMode::ReadOnly;
+        }
         if default_access_mode == BuiltinToolAccessMode::MaybeWrite {
             let requested_access_mode = self
                 .parse_requested_access_mode(&input.input)
@@ -483,6 +465,8 @@ pub(crate) fn execution_permission_policy(
     magi_permissions::PermissionPolicy {
         allowed_tools: policy
             .allowed_tool_names
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .map(|tool_name| {
                 crate::canonical_builtin_tool_name(tool_name)
@@ -1537,8 +1521,10 @@ fn normalize_execution_policy(policy: &ToolExecutionPolicy) -> ToolExecutionPoli
     let mut normalized = policy.clone();
     normalized.source_skill_ids.sort();
     normalized.source_skill_ids.dedup();
-    normalized.allowed_tool_names.sort();
-    normalized.allowed_tool_names.dedup();
+    if let Some(allowed) = &mut normalized.allowed_tool_names {
+        allowed.sort();
+        allowed.dedup();
+    }
     normalized.denied_tool_names.sort();
     normalized.denied_tool_names.dedup();
     normalized.allowed_paths.sort();

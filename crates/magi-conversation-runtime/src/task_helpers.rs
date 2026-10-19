@@ -11,29 +11,6 @@ use magi_orchestrator::{task_store::TaskStore, task_worker_catalog::resolve_task
 use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
 use magi_tool_runtime::BuiltinToolName;
 
-pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
-    matches!(
-        tool,
-        BuiltinToolName::AgentSpawn
-            | BuiltinToolName::AgentSend
-            | BuiltinToolName::AgentCancel
-            | BuiltinToolName::UpdatePlan
-            | BuiltinToolName::MemoryWrite
-            | BuiltinToolName::AskUserQuestion
-            | BuiltinToolName::AgentWait
-            | BuiltinToolName::ContextSearch
-            | BuiltinToolName::ContextRead
-            | BuiltinToolName::ContextRequest
-    )
-}
-
-pub(crate) fn is_goal_builtin_tool(tool: BuiltinToolName) -> bool {
-    matches!(
-        tool,
-        BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
-    )
-}
-
 /// 目标模式的生命周期状态由执行器读取，不由模型提示词推断。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GoalModeLifecycleState {
@@ -98,25 +75,6 @@ pub fn goal_mode_requires_terminalization(
             .any(|item| item.status == PlanItemStatus::Blocked)
 }
 
-pub(crate) fn is_git_builtin_tool(tool: BuiltinToolName) -> bool {
-    matches!(
-        tool,
-        BuiltinToolName::GitStatus
-            | BuiltinToolName::GitBranchList
-            | BuiltinToolName::GitBranchCreate
-            | BuiltinToolName::GitBranchSwitch
-            | BuiltinToolName::GitPull
-            | BuiltinToolName::GitPush
-            | BuiltinToolName::GitMergePreview
-            | BuiltinToolName::GitMerge
-            | BuiltinToolName::GitBranchDelete
-            | BuiltinToolName::GitWorktreeList
-            | BuiltinToolName::GitWorktreeCreate
-            | BuiltinToolName::GitWorktreeRemove
-            | BuiltinToolName::AgentApply
-    )
-}
-
 pub(crate) fn task_role_id(task: Option<&Task>) -> Option<&str> {
     let task = task?;
     task.executor_binding_target_role()
@@ -130,9 +88,9 @@ pub(crate) fn task_is_coordinator(
     let Some(task) = task else {
         return false;
     };
-    // 编排工具只能由任务树根节点的 coordinator 使用。仅检查角色的
-    // coordinator_mode 会让任意 Worker 伪造角色绑定后再次创建子代理，
-    // 从而破坏“单根协调器”拓扑约束。
+    // 共享 Goal/计划/主分支控制只认任务树根 coordinator 身份。
+    // 显式授予 worker 的委派权由 task_can_delegate 单独判断，不能据此
+    // 取得根身份，也不能靠伪造 coordinator 角色绑定扩大共享控制范围。
     if task.parent_task_id.is_some() || task.root_task_id != task.task_id {
         return false;
     }
@@ -144,35 +102,29 @@ pub(crate) fn task_is_coordinator(
         .is_some_and(|role| role.coordinator_mode)
 }
 
+/// 委派能力独立于 root coordinator 身份；不会获得共享 Goal/计划/Git 权限。
+pub(crate) fn task_can_delegate(
+    task: Option<&Task>,
+    registry: Option<&magi_agent_role::AgentRoleRegistry>,
+) -> bool {
+    task_is_coordinator(task, registry)
+        || task.is_some_and(|task| {
+            task.parent_task_id.is_some()
+                && task.kind == TaskKind::LocalAgent
+                && task.delegation_allowed()
+        })
+}
+
 pub(crate) fn task_can_see_builtin_tool(
     task: Option<&Task>,
     registry: Option<&magi_agent_role::AgentRoleRegistry>,
     tool: BuiltinToolName,
 ) -> bool {
-    if is_goal_builtin_tool(tool) {
-        return task.is_none()
-            || task.is_some_and(|task| {
-                task.parent_task_id.is_none() && task_is_coordinator(Some(task), registry)
-            });
-    }
-    if is_git_builtin_tool(tool) {
-        return task.is_none() || task_is_coordinator(task, registry);
-    }
-    if matches!(tool, BuiltinToolName::UpdatePlan) && task.is_none() {
-        return true;
-    }
-    if matches!(
-        tool,
-        BuiltinToolName::ContextSearch
-            | BuiltinToolName::ContextRead
-            | BuiltinToolName::ContextRequest
-    ) {
-        return task.is_some() && !task_is_coordinator(task, registry);
-    }
-    if is_orchestration_builtin_tool(tool) {
-        return task_is_coordinator(task, registry);
-    }
-    true
+    tool.model_call_scope().allows(
+        task.is_some(),
+        task_is_coordinator(task, registry),
+        task_can_delegate(task, registry),
+    )
 }
 
 /// 单一可见性枚举：item 的归属由 `source_thread_id` 决定，本枚举仅承担
@@ -330,203 +282,6 @@ pub fn compact_validation_failure(content: &str) -> String {
     }
 }
 
-pub fn deterministic_task_final_content(task: &Task, task_store: &TaskStore) -> Option<String> {
-    if is_planning_no_tool_action(task) {
-        return Some(deterministic_planning_content(task));
-    }
-    if is_planning_text_validation(task) {
-        return deterministic_planning_validation_content(task, task_store);
-    }
-    if is_execution_tool_validation(task) {
-        return deterministic_execution_tool_validation_content(task, task_store);
-    }
-    None
-}
-
-pub fn is_planning_no_tool_action(task: &Task) -> bool {
-    task.kind == TaskKind::LocalAgent
-        && task.title.contains("梳理目标")
-        && task
-            .policy_snapshot
-            .as_ref()
-            .is_some_and(|policy| policy.command_mode.eq_ignore_ascii_case("no_tools"))
-        && task.dependency_ids.is_empty()
-}
-
-pub fn deterministic_planning_content(task: &Task) -> String {
-    let goal = extract_task_goal(&task.goal).unwrap_or_else(|| task.goal.trim().to_string());
-    format!(
-        "目标：{goal}\n\n边界：规划步骤只整理目标、边界、执行计划和验收标准，不调用工具，不执行文件、shell 或网络操作。\n\n执行计划：执行步骤负责按用户目标调用工具并产生可验证结果；交付步骤只基于执行产出总结，不重复调用工具。\n\n验收标准：规划文本必须包含目标、边界、执行计划、验收标准四部分；执行结果必须以真实工具结果为准，失败或阻塞不得伪装成功。"
-    )
-}
-
-pub fn is_planning_text_validation(task: &Task) -> bool {
-    task.kind == TaskKind::LocalAgent && task.goal.contains("只验证规划文本完整性")
-}
-
-pub fn deterministic_planning_validation_content(
-    task: &Task,
-    task_store: &TaskStore,
-) -> Option<String> {
-    let dependency_text = task
-        .dependency_ids
-        .iter()
-        .filter_map(|dependency_id| task_store.get_task(dependency_id))
-        .flat_map(|dependency| dependency.output_refs)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let has_required_sections = ["目标：", "边界：", "执行计划：", "验收标准："]
-        .iter()
-        .all(|section| dependency_text.contains(section));
-    has_required_sections.then(|| {
-        "通过。规划文本已包含目标、边界、执行计划和验收标准；本步骤未验证后续执行结果、文件内容或工作区变更。".to_string()
-    })
-}
-
-pub fn is_execution_tool_validation(task: &Task) -> bool {
-    task.kind == TaskKind::LocalAgent && task.goal.contains("实际执行和工具结果")
-}
-
-pub fn deterministic_execution_tool_validation_content(
-    task: &Task,
-    task_store: &TaskStore,
-) -> Option<String> {
-    let dependencies = task
-        .dependency_ids
-        .iter()
-        .filter_map(|dependency_id| task_store.get_task(dependency_id))
-        .collect::<Vec<_>>();
-    if dependencies.is_empty() {
-        return None;
-    }
-
-    let mut required_tools = Vec::new();
-    let mut observed_tools = Vec::new();
-    let mut failed_tools = Vec::new();
-    let mut has_final_text = false;
-
-    for dependency in dependencies {
-        for tool_name in task_required_tool_chain(&dependency) {
-            if !required_tools.iter().any(|existing| existing == &tool_name) {
-                required_tools.push(tool_name);
-            }
-        }
-        for output in dependency.output_refs {
-            collect_dependency_output_validation_facts(
-                &output,
-                &mut observed_tools,
-                &mut failed_tools,
-                &mut has_final_text,
-            );
-        }
-    }
-
-    let missing_tools = required_tools
-        .iter()
-        .filter(|tool_name| !observed_tools.iter().any(|observed| observed == *tool_name))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if !failed_tools.is_empty() || !missing_tools.is_empty() || !has_final_text {
-        return None;
-    }
-
-    let tools = if observed_tools.is_empty() {
-        "无工具调用".to_string()
-    } else {
-        observed_tools.join(", ")
-    };
-    Some(format!(
-        "通过。已基于依赖任务的结构化输出核验当前执行产物，工具调用均成功且最终回复已生成；已验证工具：{tools}。"
-    ))
-}
-
-pub fn collect_dependency_output_validation_facts(
-    output: &str,
-    observed_tools: &mut Vec<String>,
-    failed_tools: &mut Vec<String>,
-    has_final_text: &mut bool,
-) {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        *has_final_text = true;
-        return;
-    };
-    let Some(blocks) = value.get("blocks").and_then(serde_json::Value::as_array) else {
-        if !trimmed.is_empty() {
-            *has_final_text = true;
-        }
-        return;
-    };
-    for block in blocks {
-        match block.get("type").and_then(serde_json::Value::as_str) {
-            Some("tool_call") => {
-                let Some(tool_call) = block.get("toolCall") else {
-                    continue;
-                };
-                let Some(tool_name) = tool_call
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(canonical_tool_call_name)
-                else {
-                    continue;
-                };
-                if !observed_tools.iter().any(|observed| observed == &tool_name) {
-                    observed_tools.push(tool_name.clone());
-                }
-                let status = tool_call
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                if status != "success" {
-                    failed_tools.push(tool_name.clone());
-                    continue;
-                }
-                let result_status = tool_call
-                    .get("result")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|result| serde_json::from_str::<serde_json::Value>(result).ok())
-                    .and_then(|result| {
-                        result
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                if result_status
-                    .as_deref()
-                    .is_some_and(|status| status != "succeeded")
-                {
-                    failed_tools.push(tool_name);
-                }
-            }
-            Some("text")
-                if block
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|content| !content.trim().is_empty()) =>
-            {
-                *has_final_text = true;
-            }
-            _ => {}
-        }
-    }
-}
-
-pub fn extract_task_goal(value: &str) -> Option<String> {
-    let (_, rest) = value.split_once("<<<MAGI_TASK_GOAL>>>")?;
-    let (goal, _) = rest.split_once("<<<END_MAGI_TASK_GOAL>>>")?;
-    Some(
-        goal.trim()
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
 /// 任务必须完成的工具链只来自结构化声明（TaskPolicy/入口契约），不从目标文本推断。
 pub fn task_required_tool_chain(task: &Task) -> Vec<String> {
     if task.kind != TaskKind::LocalAgent {
@@ -620,6 +375,24 @@ pub fn strict_goal_mode_tool_definitions_for_round(
         .filter(|tool| tool.function.name == *required_tool_name)
         .cloned()
         .collect()
+}
+
+pub(crate) const AGENT_SPAWN_LIFECYCLE_TOOLS: [BuiltinToolName; 2] =
+    [BuiltinToolName::AgentWait, BuiltinToolName::AgentCancel];
+
+/// 创建能力依赖结果收集和取消能力。只收紧 spawn，不替 Task/Skill 开放缺失工具，
+/// 也不隐藏仍可用于管理已有代理的工具。应在阶段临时筛选前执行。
+pub(crate) fn enforce_agent_coordination_surface(
+    mut tools: Vec<ChatToolDefinition>,
+) -> Vec<ChatToolDefinition> {
+    if AGENT_SPAWN_LIFECYCLE_TOOLS.iter().any(|required| {
+        !tools
+            .iter()
+            .any(|tool| tool.function.name == required.as_str())
+    }) {
+        tools.retain(|tool| tool.function.name != "agent_spawn");
+    }
+    tools
 }
 
 /// 校验目标模式当前轮的工具调用批次。
@@ -757,7 +530,12 @@ mod tests {
 
     #[test]
     fn required_tool_surface_exposes_only_current_contract_step() {
-        let tools = vec![tool("file_read"), tool("agent_spawn"), tool("agent_wait")];
+        let tools = enforce_agent_coordination_surface(vec![
+            tool("file_read"),
+            tool("agent_spawn"),
+            tool("agent_wait"),
+            tool("agent_cancel"),
+        ]);
         let required = vec!["agent_spawn".to_string(), "agent_wait".to_string()];
 
         let first = required_tool_definitions_for_round(&tools, &required, &[]);

@@ -82,8 +82,52 @@ pub(crate) fn build_tool_catalog_value(
             };
         runtime_warning_count += runtime_status.warnings.len();
         let policy_view = tool_catalog_policy_view(tool, access_profile);
-        let model_call_scope = model_call_scope(tool);
+        let model_call_scope = tool.model_call_scope().as_str();
 
+        // Keep catalog visibility on the same caller-scope contract as the
+        // execution preflight. SessionMainline is the trusted root even when
+        // the conversation profile intentionally has no Task; delegation still
+        // requires a concrete Task, so a taskless mainline never gets agent_*.
+        let is_root_coordinator = context.caller_scope == crate::ToolCallerScope::SessionMainline;
+        let can_delegate = matches!(
+            context.caller_scope,
+            crate::ToolCallerScope::SessionMainline | crate::ToolCallerScope::DelegatingTask
+        ) && context.task_id.is_some();
+        let scope_allowed = tool.model_call_scope().allows(
+            context.task_id.is_some(),
+            is_root_coordinator,
+            can_delegate,
+        );
+        let policy_rejection = resources
+            .execution_policy
+            .as_ref()
+            .and_then(|policy| policy.tool_name_rejection(tool.as_str()));
+        let reason = if !scope_allowed {
+            Some("model_call_scope_mismatch")
+        } else if let Some(rejection) = policy_rejection {
+            Some(rejection.reason_code())
+        } else if access_profile == magi_core::AccessProfile::ReadOnly
+            && tool.is_access_profile_write_operation()
+        {
+            Some("read_only_access_profile")
+        } else if model_execution_without_workspace && tool.requires_workspace_context() {
+            Some("workspace_required")
+        } else if runtime_status.status != "ready" {
+            Some("runtime_unavailable")
+        } else {
+            None
+        };
+        let availability = match reason {
+            Some(
+                "model_call_scope_mismatch"
+                | "tool_explicitly_denied"
+                | "tool_not_in_allowed_scope"
+                | "read_only_access_profile",
+            ) => "denied",
+            Some(_) => "unavailable",
+            None if policy_view.effective_approval_policy == "required" => "needs_approval",
+            None => "available",
+        };
         let mut item = serde_json::json!({
             "name": tool.as_str(),
             "category": tool.category(),
@@ -94,8 +138,10 @@ pub(crate) fn build_tool_catalog_value(
             // BuiltinTool::execute。把可调用范围单独输出，避免模型把两者混为一谈。
             "model_call_scope": model_call_scope,
             "workspace_required": tool.requires_workspace_context(),
-            "model_available": !(model_execution_without_workspace
-                && tool.requires_workspace_context()),
+            "model_available": reason.is_none(),
+            "availability": availability,
+            "reason_code": reason,
+            "schema_included": include_schema,
             "access_mode": access_mode_for_tool(tool).as_str(),
             "policy_scope": policy_view.policy_scope,
             "input_sensitive_policy": policy_view.input_sensitive_policy,
@@ -173,19 +219,77 @@ pub(crate) fn build_tool_catalog_value(
     let builtin_total = builtin_categories.len();
     let public_count = public_categories.len();
     let internal_count = internal_categories.len();
-    let external_catalog_status =
-        if include_external && resources.external_tool_catalog_provider.is_some() {
-            "available"
-        } else if include_external {
-            "unavailable"
-        } else {
-            "disabled"
-        };
+    let external_catalog_status = if include_external
+        && (resources.external_tool_catalog_provider.is_some()
+            || resources.plugin_tool_catalog_provider.is_some())
+    {
+        "available"
+    } else if include_external {
+        "unavailable"
+    } else {
+        "disabled"
+    };
     let agent_role_catalog_status = if resources.agent_role_catalog_provider.is_some() {
         "available"
     } else {
         "unavailable"
     };
+    let plugin_tools = if include_external {
+        resources
+            .plugin_tool_catalog_provider
+            .as_ref()
+            .map(|provider| provider(context.workspace_id.as_ref()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let external_tool_value =
+        |tool: serde_json::Value, name: &str, read_only: bool, executor_available: bool| {
+            external_tool_catalog_value(
+                tool,
+                name,
+                read_only,
+                context,
+                resources,
+                executor_available,
+            )
+        };
+    let mcp_values = external_mcp_tools
+        .iter()
+        .map(|tool| {
+            external_tool_value(
+                serde_json::json!(tool),
+                &tool.model_tool_name,
+                tool.read_only,
+                resources.external_mcp_tool_executor.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let plugin_values = plugin_tools
+        .iter()
+        .map(|tool| {
+            external_tool_value(
+                serde_json::json!(tool),
+                &tool.model_tool_name,
+                tool.read_only,
+                resources.plugin_tool_executor.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut summary = tool_catalog_summary(ToolCatalogSummaryInput {
+        public_count,
+        instruction_skill_count,
+        skill_tool_count,
+        connected_mcp_server_count,
+        enabled_mcp_server_count,
+        spawnable_agent_role_count,
+        agent_role_count,
+        schema_warning_count,
+        runtime_warning_count,
+    });
+    if !plugin_tools.is_empty() {
+        summary.push_str(&format!("，{} 个插件工具", plugin_tools.len()));
+    }
 
     serde_json::json!({
         "tool": "tool_catalog",
@@ -194,18 +298,8 @@ pub(crate) fn build_tool_catalog_value(
         "current_access_profile": access_profile.as_str(),
         "workspace_bound": context.workspace_id.is_some(),
         "approval_policy_summary": approval_policy_summary(access_profile),
-        "summary": tool_catalog_summary(ToolCatalogSummaryInput {
-            public_count,
-            instruction_skill_count,
-            skill_tool_count,
-            connected_mcp_server_count,
-            enabled_mcp_server_count,
-            spawnable_agent_role_count,
-            agent_role_count,
-            schema_warning_count,
-            runtime_warning_count,
-        }),
-        "total": tools.len() + skill_tool_count + external_mcp_tools.len(),
+        "summary": summary,
+        "total": tools.len() + skill_tool_count + external_mcp_tools.len() + plugin_tools.len(),
         "builtin_total": builtin_total,
         "public_count": public_count,
         "internal_count": internal_count,
@@ -233,10 +327,11 @@ pub(crate) fn build_tool_catalog_value(
             serde_json::json!([])
         },
         "mcp_tools": if include_external && include_mcp_servers {
-            serde_json::to_value(external_mcp_tools).unwrap_or_else(|_| serde_json::json!([]))
+            mcp_values
         } else {
-            serde_json::json!([])
+            Vec::new()
         },
+        "plugin_tools": plugin_values,
         "agent_roles": if include_agent_roles {
             serde_json::to_value(agent_roles).unwrap_or_else(|_| serde_json::json!([]))
         } else {
@@ -584,36 +679,48 @@ fn effective_external_skill_tools_for_access_profile(
         .collect()
 }
 
+fn external_tool_catalog_value(
+    mut value: serde_json::Value,
+    name: &str,
+    read_only: bool,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+    executor_available: bool,
+) -> serde_json::Value {
+    let access_decision = crate::external_tool_access_decision(read_only, context.access_profile);
+    let rejection = resources
+        .execution_policy
+        .as_ref()
+        .and_then(|policy| policy.tool_name_rejection(name));
+    let reason = rejection
+        .map(|rejection| rejection.reason_code())
+        .or_else(|| {
+            (access_decision == Some(magi_core::ExecutionResultStatus::Rejected))
+                .then_some("read_only_access_profile")
+        })
+        .or_else(|| (!executor_available).then_some("runtime_unavailable"));
+    let availability = match reason {
+        Some("runtime_unavailable") => "unavailable",
+        Some(_) => "denied",
+        None if access_decision == Some(magi_core::ExecutionResultStatus::NeedsApproval) => {
+            "needs_approval"
+        }
+        None => "available",
+    };
+    value["model_available"] = serde_json::json!(reason.is_none());
+    value["availability"] = serde_json::json!(availability);
+    value["reason_code"] = serde_json::json!(reason);
+    // 条目携带原 input_schema，不代表它已进入本轮模型的 tools 定义。
+    value["schema_included"] = serde_json::json!(true);
+    value
+}
+
 fn external_skill_tool_is_mcp(tool: &ExternalToolCatalogEntry) -> bool {
     tool.bridge_kind.trim().eq_ignore_ascii_case("mcp")
 }
 
 fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
     tool.default_access_mode()
-}
-
-fn model_call_scope(tool: BuiltinToolName) -> &'static str {
-    match tool {
-        BuiltinToolName::AgentSpawn
-        | BuiltinToolName::AgentSend
-        | BuiltinToolName::AgentCancel
-        | BuiltinToolName::AgentApply
-        | BuiltinToolName::AgentWait => "coordinator_task_only",
-        BuiltinToolName::ContextSearch
-        | BuiltinToolName::ContextRead
-        | BuiltinToolName::ContextRequest => "worker_task_only",
-        BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal => {
-            "session_mainline_or_coordinator_task"
-        }
-        BuiltinToolName::UpdatePlan => "session_mainline_or_task",
-        BuiltinToolName::MemoryWrite => "coordinator_task_only",
-        BuiltinToolName::ProcessLaunch
-        | BuiltinToolName::ProcessRead
-        | BuiltinToolName::ProcessWrite
-        | BuiltinToolName::ProcessKill
-        | BuiltinToolName::ProcessList => "runtime_only_use_shell_exec",
-        _ => "session_or_task",
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,6 +866,191 @@ fn schema_warnings(schema: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_catalog_uses_execution_scope_and_policy_without_claiming_schema_loading() {
+        let context = ToolExecutionContext {
+            caller_scope: crate::ToolCallerScope::DelegatedTask,
+            task_id: Some(magi_core::TaskId::new("catalog-worker")),
+            workspace_id: Some(magi_core::WorkspaceId::new("catalog-workspace")),
+            ..Default::default()
+        };
+        let resources = ToolRuntimeResources {
+            execution_policy: Some(crate::ToolExecutionPolicy {
+                denied_tool_names: vec!["file_read".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let catalog = build_tool_catalog_value("{}", &context, &resources);
+        let tool = |name| {
+            catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(tool("git_status")["availability"], "available");
+        assert_eq!(
+            tool("git_branch_switch")["reason_code"],
+            "model_call_scope_mismatch"
+        );
+        assert_eq!(tool("file_read")["reason_code"], "tool_explicitly_denied");
+        assert_eq!(tool("file_read")["model_available"], false);
+        assert_eq!(tool("git_status")["schema_included"], false);
+        assert!(tool("git_status").get("schema_loaded").is_none());
+    }
+
+    #[test]
+    fn taskless_mainline_catalog_matches_execution_scope_for_root_tools() {
+        let catalog = build_tool_catalog_value(
+            r#"{"include_internal":true,"include_external":false}"#,
+            &ToolExecutionContext::default(),
+            &ToolRuntimeResources::default(),
+        );
+        let tool = |name| {
+            catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(tool("git_status")["availability"], "available");
+        assert_eq!(tool("git_branch_switch")["availability"], "needs_approval");
+        assert_eq!(tool("git_branch_switch")["model_available"], true);
+        assert_eq!(
+            tool("agent_spawn")["reason_code"],
+            "model_call_scope_mismatch"
+        );
+        assert_eq!(
+            tool("memory_write")["reason_code"],
+            "model_call_scope_mismatch"
+        );
+    }
+
+    #[test]
+    fn catalog_scope_reason_matches_execution_scope_for_every_caller_kind() {
+        let callers = [
+            (crate::ToolCallerScope::SessionMainline, None, true, false),
+            (
+                crate::ToolCallerScope::SessionMainline,
+                Some("root-task"),
+                true,
+                true,
+            ),
+            (
+                crate::ToolCallerScope::DelegatedTask,
+                Some("worker-task"),
+                false,
+                false,
+            ),
+            (
+                crate::ToolCallerScope::DelegatingTask,
+                Some("delegator-task"),
+                false,
+                true,
+            ),
+        ];
+        for (caller_scope, task_id, is_root, can_delegate) in callers {
+            let context = ToolExecutionContext {
+                caller_scope,
+                task_id: task_id.map(magi_core::TaskId::new),
+                ..Default::default()
+            };
+            let payload = build_tool_catalog_value(
+                r#"{"include_internal":true,"include_external":false}"#,
+                &context,
+                &ToolRuntimeResources::default(),
+            );
+            for builtin in BuiltinToolName::ALL {
+                let expected_allowed = builtin.model_call_scope().allows(
+                    context.task_id.is_some(),
+                    is_root,
+                    can_delegate,
+                );
+                let actual_mismatch = payload["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == builtin.as_str())
+                    .and_then(|tool| tool["reason_code"].as_str())
+                    == Some("model_call_scope_mismatch");
+                assert_eq!(
+                    actual_mismatch,
+                    !expected_allowed,
+                    "{} scope mismatch for {caller_scope:?}",
+                    builtin.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_scope_describes_task_owned_interactions_and_shared_state() {
+        assert_eq!(
+            BuiltinToolName::AskUserQuestion.model_call_scope().as_str(),
+            "task_only"
+        );
+        assert!(
+            BuiltinToolName::AskUserQuestion
+                .model_call_scope()
+                .allows(true, false, false)
+        );
+        assert!(
+            !BuiltinToolName::UpdatePlan
+                .model_call_scope()
+                .allows(true, false, false)
+        );
+        assert_eq!(
+            BuiltinToolName::GitStatus.model_call_scope().as_str(),
+            "session_or_task"
+        );
+        assert!(
+            BuiltinToolName::GitStatus
+                .model_call_scope()
+                .allows(true, false, false)
+        );
+        assert!(
+            !BuiltinToolName::AgentSpawn
+                .model_call_scope()
+                .allows(true, false, false)
+        );
+        assert!(
+            !BuiltinToolName::AgentSpawn
+                .model_call_scope()
+                .allows(false, false, false)
+        );
+        assert!(
+            BuiltinToolName::AgentSpawn
+                .model_call_scope()
+                .allows(true, true, true)
+        );
+    }
+    #[test]
+    fn delegator_catalog_keeps_shared_state_unavailable() {
+        let scope = BuiltinToolName::AgentSpawn.model_call_scope();
+        assert!(scope.allows(true, false, true));
+        assert!(
+            BuiltinToolName::AgentApply
+                .model_call_scope()
+                .allows(true, false, true)
+        );
+        for tool in [
+            BuiltinToolName::UpdatePlan,
+            BuiltinToolName::CreateGoal,
+            BuiltinToolName::MemoryWrite,
+            BuiltinToolName::GitBranchSwitch,
+        ] {
+            assert!(
+                !tool.model_call_scope().allows(true, false, true),
+                "{}",
+                tool.as_str()
+            );
+        }
+    }
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -890,7 +1182,7 @@ mod tests {
         assert_eq!(agent_spawn["public"], true);
         assert_eq!(agent_spawn["runtime_internal"], true);
         assert_eq!(
-            agent_spawn["model_call_scope"], "coordinator_task_only",
+            agent_spawn["model_call_scope"], "delegator_task_only",
             "runtime_internal 不能覆盖 agent_spawn 的模型可调用范围"
         );
         assert_eq!(agent_spawn["runtime_status"], "unavailable");
@@ -1610,7 +1902,7 @@ mod tests {
         assert_eq!(agent_spawn["runtime_status"], "ready");
         assert_eq!(agent_spawn["public"], true);
         assert_eq!(agent_spawn["runtime_internal"], true);
-        assert_eq!(agent_spawn["model_call_scope"], "coordinator_task_only");
+        assert_eq!(agent_spawn["model_call_scope"], "delegator_task_only");
         assert_eq!(agent_wait["runtime_status"], "ready");
         assert_eq!(payload["runtime_dependencies"][2]["status"], "ready");
         assert_eq!(payload["agent_roles"][0]["role_id"], "coordinator");

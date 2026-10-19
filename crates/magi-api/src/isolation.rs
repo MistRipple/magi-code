@@ -126,6 +126,70 @@ impl ApiState {
         workspace_id: &WorkspaceId,
         origin: IsolationOrigin,
     ) -> Result<SessionIsolation, ApiError> {
+        self.enable_session_isolation_at_boundary(session_id, workspace_id, origin, None)
+            .await
+    }
+
+    fn validate_isolation_boundary(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if let Some(turn_id) = expected_turn_id {
+            let turn = self
+                .session_store
+                .canonical_turn_for_session_turn_id(session_id, turn_id)
+                .filter(|turn| !turn.status.is_terminal())
+                .filter(|_| {
+                    self.session_store
+                        .runtime_sidecar(session_id)
+                        .and_then(|sidecar| sidecar.current_turn)
+                        .is_some_and(|current| current.turn_id == turn_id)
+                })
+                .ok_or_else(|| {
+                    ApiError::conflict("隔离准备的目标 Turn 已关闭或变化", session_id.as_str())
+                })?;
+            if turn.items.iter().any(|item| {
+                item.tool.as_ref().is_some_and(|tool| {
+                    magi_tool_runtime::BuiltinToolName::from_name(&tool.name).is_none_or(
+                        |builtin| {
+                            builtin.requires_workspace_execution_preparation(
+                                &tool
+                                    .arguments
+                                    .as_ref()
+                                    .map(serde_json::Value::to_string)
+                                    .unwrap_or_default(),
+                            )
+                        },
+                    )
+                })
+            }) {
+                return Err(ApiError::conflict(
+                    "本轮已开始使用工作区，不能中途切换执行目录",
+                    session_id.as_str(),
+                ));
+            }
+            Ok(())
+        } else {
+            self.session_store
+                .ensure_current_turn_acceptance_available(session_id)
+                .map_err(|error| match error {
+                    DomainError::CurrentTurnConflict { .. } => ApiError::conflict(
+                        "会话正在执行，结束后才能切换到隔离副本",
+                        session_id.as_str(),
+                    ),
+                    error => ApiError::internal_assembly("检查会话执行状态失败", error),
+                })
+        }
+    }
+
+    async fn enable_session_isolation_at_boundary(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        origin: IsolationOrigin,
+        expected_turn_id: Option<&str>,
+    ) -> Result<SessionIsolation, ApiError> {
         if let Some(existing) = self.session_isolation(session_id) {
             return Ok(existing);
         }
@@ -133,22 +197,12 @@ impl ApiState {
             .workspace_root_path(&Some(workspace_id.clone()))
             .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
         let source_root = std::fs::canonicalize(&source_root).unwrap_or(source_root);
-        match self
-            .session_store
-            .ensure_current_turn_acceptance_available(session_id)
-        {
-            Ok(()) => {}
-            Err(DomainError::CurrentTurnConflict { .. }) => {
-                return Err(ApiError::conflict(
-                    "会话正在执行，结束后才能切换到隔离副本",
-                    session_id.as_str(),
-                ));
-            }
-            Err(error) => {
-                return Err(ApiError::internal_assembly("检查会话执行状态失败", error));
-            }
-        }
+        self.validate_isolation_boundary(session_id, expected_turn_id)?;
         let _sync_guard = self.lock_session_change_sync(session_id).await;
+        self.validate_isolation_boundary(session_id, expected_turn_id)?;
+        if let Some(existing) = self.session_isolation(session_id) {
+            return Ok(existing);
+        }
         if let Some(snapshot) = self.snapshot_manager.get_session(session_id.as_str()) {
             let pending = snapshot
                 .pending_changes()
@@ -188,6 +242,31 @@ impl ApiState {
             let _ = std::fs::remove_dir_all(&destination);
             ApiError::internal_assembly("建立隔离副本失败", error)
         })?;
+
+        // 复制不占控制面锁，用户可随时取消；发布隔离与切换账本前再锁定并校验目标 Turn。
+        let turn_guard = self.lock_session_turn_commit(session_id);
+        tokio::pin!(turn_guard);
+        let _turn_guard = loop {
+            tokio::select! {
+                guard = &mut turn_guard => break guard,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    // 取消持有提交锁并等待 dispatcher 退出，准备路径不能反向等待它。
+                    let boundary = if expected_turn_id.is_some() {
+                        self.validate_isolation_boundary(session_id, expected_turn_id)
+                    } else {
+                        Err(ApiError::conflict("会话控制状态正在提交，请稍后重试隔离", session_id.as_str()))
+                    };
+                    if let Err(error) = boundary {
+                        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(destination)).await;
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if let Err(error) = self.validate_isolation_boundary(session_id, expected_turn_id) {
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(destination)).await;
+            return Err(error);
+        }
 
         let isolation = SessionIsolation {
             session_id: session_id.as_str().to_string(),
@@ -485,29 +564,27 @@ impl ApiState {
 
     /// 同一工作区里另一个会话正在主工作区执行时，让这一轮自动改在隔离副本里运行。
     ///
-    /// 只在这一轮要使用工具、会话本身还没有隔离、且切换的前置条件满足时才会发生；
+    /// 只在首次工作区工具的准备边界、会话本身还没有隔离、且切换的前置条件满足时才会发生；
     /// 任何一步不满足都返回 `None`，这一轮仍在主工作区运行（由执行租约排队），绝不因此失败。
     pub(crate) async fn isolate_on_workspace_contention(
         &self,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
-        will_use_tools: bool,
+        turn_id: &str,
     ) -> Option<SessionIsolation> {
         let workspace_id = workspace_id.as_ref()?;
-        if !will_use_tools {
-            return None;
-        }
         if let Some(existing) = self.session_isolation(session_id) {
             return Some(existing);
         }
         let blocking = self.session_blocking_shared_workspace(session_id, workspace_id)?;
         match self
-            .enable_session_isolation(
+            .enable_session_isolation_at_boundary(
                 session_id,
                 workspace_id,
                 IsolationOrigin::Contention {
                     blocking_session_id: blocking.as_str().to_string(),
                 },
+                Some(turn_id),
             )
             .await
         {
@@ -522,5 +599,76 @@ impl ApiState {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::turn_harness::MagiTurnHarness;
+
+    #[tokio::test]
+    async fn cancelled_isolation_preparation_exits_while_cancellation_holds_the_turn_lock() {
+        let harness = MagiTurnHarness::new_task("不会执行");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "base").unwrap();
+        let workspace = WorkspaceId::new("cancel-isolation-workspace");
+        harness
+            .state
+            .workspace_registry
+            .register_native_path(workspace.clone(), root.path().to_path_buf())
+            .unwrap();
+        let session = SessionId::new("cancel-isolation-session");
+        harness
+            .state
+            .session_store
+            .create_session_for_workspace(session.clone(), "取消隔离", Some(workspace.to_string()))
+            .unwrap();
+        crate::routes::test_turn_fixtures::seed_conversation_turn(
+            &harness.state.session_store,
+            harness.state.turn_coordinator(),
+            &session,
+            "cancel-isolation-turn",
+            1,
+            UtcMillis::now(),
+            "running",
+            "准备资源",
+        );
+        let guard = harness.state.lock_session_turn_commit(&session).await;
+        let destination = harness.state.isolation_copy_path(&session, root.path());
+        let state = harness.state.clone();
+        let target = session.clone();
+        let preparation = tokio::spawn(async move {
+            state
+                .enable_session_isolation_at_boundary(
+                    &target,
+                    &workspace,
+                    IsolationOrigin::Contention {
+                        blocking_session_id: "busy".into(),
+                    },
+                    Some("cancel-isolation-turn"),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !destination.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("隔离副本应已开始复制");
+        harness
+            .state
+            .turn_event_sink()
+            .interrupt_turn_by_user(&session)
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), preparation)
+            .await
+            .expect("取消持锁等待资源回收时，资源准备不能反向等待该锁")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(harness.state.session_isolation(&session).is_none());
+        assert!(!destination.exists());
+        drop(guard);
     }
 }

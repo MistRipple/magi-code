@@ -1,6 +1,13 @@
+mod agent_turns;
+mod background_jobs;
 mod goals;
+mod inputs;
+mod interactions;
+mod model_steps;
 mod queries;
 mod sidecar;
+mod tool_approvals;
+mod user_questions;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +35,40 @@ pub struct CanonicalTurnMutation {
     pub next: CanonicalTurn,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionInputMutation {
+    pub previous: Option<crate::SessionInput>,
+    pub next: crate::SessionInput,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionInputCommitNotice {
+    pub session_id: SessionId,
+    pub workspace_id: Option<String>,
+    pub epoch: String,
+    pub through_sequence: u64,
+}
+
+type InputCommitObserver = Arc<dyn Fn(SessionInputCommitNotice) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct ModelStepCommitNotice {
+    pub session_id: SessionId,
+    pub workspace_id: Option<String>,
+    pub turn: CanonicalTurn,
+    pub step: crate::ModelStep,
+}
+
+type ModelStepCommitObserver = Arc<dyn Fn(ModelStepCommitNotice) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct CanonicalItemCommitNotice {
+    pub turn: CanonicalTurn,
+    pub item: crate::CanonicalTurnItem,
+    pub workspace_id: Option<String>,
+}
+type CanonicalItemCommitObserver = Arc<dyn Fn(CanonicalItemCommitNotice) + Send + Sync>;
+
 /// Session 生命周期 mutation 事务的失败类型。
 ///
 /// durable projection 写入失败时，SessionStore 不提交候选状态，因此调用方可以安全地
@@ -38,23 +79,14 @@ pub enum SessionMutationTransactionError<E> {
     Persistence(E),
 }
 
-pub trait CanonicalTurnEventWriter: Send + Sync {
-    fn append_canonical_turn_transaction(
+/// Session Input、Turn/item 与派发接纳回执的唯一持久事务入口。
+pub trait SessionEventWriter: Send + Sync {
+    fn append_session_transaction(
         &self,
         session_id: &SessionId,
-        mutations: &[CanonicalTurnMutation],
-    ) -> DomainResult<()>;
-
-    /// 提交一次新的执行轮 accepted 事实。
-    ///
-    /// 该入口由持久化实现把 accepted 事实与 canonical event 写入同一个事务，
-    /// 让 event segment 成为一次提交的唯一 durable 边界。
-    fn append_canonical_turn_transaction_with_acceptance(
-        &self,
-        session_id: &SessionId,
-        mutations: &[CanonicalTurnMutation],
-        acceptance: &SessionAcceptanceRecord,
-        task: Option<&Task>,
+        turns: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
+        acceptance: Option<(&SessionAcceptanceRecord, Option<&Task>)>,
     ) -> DomainResult<()>;
 }
 
@@ -114,7 +146,13 @@ pub struct SessionStore {
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
     sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
-    canonical_event_writer: Arc<RwLock<Option<Arc<dyn CanonicalTurnEventWriter>>>>,
+    session_event_writer: Arc<RwLock<Option<Arc<dyn SessionEventWriter>>>>,
+    input_commit_observer: Arc<RwLock<Option<InputCommitObserver>>>,
+    model_step_commit_observer: Arc<RwLock<Option<ModelStepCommitObserver>>>,
+    canonical_item_commit_observer: Arc<RwLock<Option<CanonicalItemCommitObserver>>>,
+    agent_run_transfer_resolver: Arc<RwLock<Option<Arc<crate::AgentRunTransferResolver>>>>,
+    /// 仅唤醒进程内 Job 等待者；Job 状态仍只从 canonical item 读取。
+    background_job_signal: Arc<(Mutex<u64>, std::sync::Condvar)>,
     /// 每个 thread 连续主动压缩失败次数，仅作进程内熔断状态，不持久化。
     ///
     /// daemon 重启后重新允许尝试压缩；成功安装检查点即清零。
@@ -297,6 +335,7 @@ fn prepare_session_deletion(
     state
         .canonical_turns
         .retain(|turn| &turn.session_id != session_id);
+    state.inputs.retain(|input| &input.session_id != session_id);
     state.goals.retain(|goal| &goal.session_id != session_id);
     state.plans.retain(|plan| &plan.session_id != session_id);
     state
@@ -339,6 +378,7 @@ fn durable_slice_for_sessions(
         let slice = state.durable_state_for_session(session_id);
         durable.timeline.extend(slice.timeline);
         durable.canonical_turns.extend(slice.canonical_turns);
+        durable.inputs.extend(slice.inputs);
         durable.goals.extend(slice.goals);
         durable.plans.extend(slice.plans);
         durable.thread_registry.extend(slice.thread_registry);
@@ -404,7 +444,12 @@ impl Default for SessionStore {
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
-            canonical_event_writer: Arc::new(RwLock::new(None)),
+            session_event_writer: Arc::new(RwLock::new(None)),
+            input_commit_observer: Arc::new(RwLock::new(None)),
+            model_step_commit_observer: Arc::new(RwLock::new(None)),
+            canonical_item_commit_observer: Arc::new(RwLock::new(None)),
+            agent_run_transfer_resolver: Arc::new(RwLock::new(None)),
+            background_job_signal: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
             unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
         }
@@ -445,7 +490,9 @@ impl SessionStore {
             .remove(thread_id);
     }
 
-    pub fn from_state(state: SessionStoreState) -> Self {
+    pub fn from_state(mut state: SessionStoreState) -> Self {
+        goals::reconcile_goal_token_usage(&mut state);
+        sidecar::reconcile_goal_time_used(&mut state);
         Self {
             state: Arc::new(RwLock::new(state)),
             durable_persistence_lock: Arc::new(Mutex::new(())),
@@ -454,7 +501,12 @@ impl SessionStore {
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
-            canonical_event_writer: Arc::new(RwLock::new(None)),
+            session_event_writer: Arc::new(RwLock::new(None)),
+            input_commit_observer: Arc::new(RwLock::new(None)),
+            model_step_commit_observer: Arc::new(RwLock::new(None)),
+            canonical_item_commit_observer: Arc::new(RwLock::new(None)),
+            agent_run_transfer_resolver: Arc::new(RwLock::new(None)),
+            background_job_signal: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             context_compaction_failures: Arc::new(Mutex::new(HashMap::new())),
             unavailable_sessions: Arc::new(RwLock::new(Vec::new())),
         }
@@ -482,8 +534,45 @@ impl SessionStore {
         durable_state: SessionDurableState,
         execution_sidecar_store: SessionExecutionSidecarStoreState,
     ) -> DomainResult<Self> {
+        for turn in &durable_state.canonical_turns {
+            turn.validate_model_steps()?;
+        }
+        let mut request_ids = std::collections::HashSet::new();
+        let mut input_ids = std::collections::HashSet::new();
+        for input in &durable_state.inputs {
+            input.validate_snapshot()?;
+            if !request_ids.insert(input.request_id.as_str())
+                || !input_ids.insert((input.session_id.as_str(), input.input_id.as_str()))
+                || !durable_state
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == input.session_id)
+            {
+                return Err(DomainError::InvalidState {
+                    message: "持久输入身份重复或会话归属缺失".into(),
+                });
+            }
+        }
         let mut state =
             SessionStoreState::from_persisted_parts(durable_state, execution_sidecar_store);
+        agent_turns::restore_agent_turn_threads(&mut state)?;
+        agent_turns::validate_agent_turn_graph(&state)?;
+        for goal in &mut state.goals {
+            if matches!(
+                goal.continuation.reason.as_deref(),
+                Some(
+                    "token_budget_exhausted"
+                        | "system_usage_limit"
+                        | "model_attempt_budget_exhausted"
+                        | "active_time_budget_exhausted"
+                )
+            ) {
+                goal.continuation = crate::GoalContinuationState::default();
+            }
+        }
+        for session in &state.sessions {
+            tool_approvals::validate_execution_links(&state, &session.session_id)?;
+        }
         prune_incident_notifications(&mut state.notifications);
         sidecar::reconcile_sidecars_from_canonical(&mut state)?;
         sidecar::reconcile_terminal_goal_continuations(&mut state);
@@ -499,45 +588,27 @@ impl SessionStore {
     }
 
     /// 安装 canonical 权威事件 writer。daemon 恢复完成后、接受任何新 mutation 前安装。
-    pub fn install_canonical_event_writer(&self, writer: Arc<dyn CanonicalTurnEventWriter>) {
+    pub fn install_session_event_writer(&self, writer: Arc<dyn SessionEventWriter>) {
         *self
-            .canonical_event_writer
+            .session_event_writer
             .write()
             .expect("canonical event writer lock poisoned") = Some(writer);
     }
 
-    pub(super) fn persist_canonical_mutations(
+    pub(super) fn persist_session_transaction(
         &self,
         session_id: &SessionId,
         mutations: &[CanonicalTurnMutation],
+        inputs: &[SessionInputMutation],
+        acceptance: Option<(&SessionAcceptanceRecord, Option<&Task>)>,
     ) -> DomainResult<()> {
         let writer = self
-            .canonical_event_writer
+            .session_event_writer
             .read()
             .expect("canonical event writer lock poisoned")
             .clone();
         if let Some(writer) = writer {
-            writer.append_canonical_turn_transaction(session_id, mutations)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn persist_canonical_mutations_with_acceptance(
-        &self,
-        session_id: &SessionId,
-        mutations: &[CanonicalTurnMutation],
-        acceptance: &SessionAcceptanceRecord,
-        task: Option<&Task>,
-    ) -> DomainResult<()> {
-        let writer = self
-            .canonical_event_writer
-            .read()
-            .expect("canonical event writer lock poisoned")
-            .clone();
-        if let Some(writer) = writer {
-            writer.append_canonical_turn_transaction_with_acceptance(
-                session_id, mutations, acceptance, task,
-            )?;
+            writer.append_session_transaction(session_id, mutations, inputs, acceptance)?;
         }
         Ok(())
     }
@@ -661,7 +732,7 @@ impl SessionStore {
 
     fn mark_sidecar_dirty_for_session(
         &self,
-        session_id: Option<&SessionId>,
+        session_id: &SessionId,
         reason: SessionSidecarFlushReason,
     ) {
         let mut flush_state = self
@@ -670,11 +741,9 @@ impl SessionStore {
             .expect("session sidecar flush state write lock poisoned");
         flush_state.current_version = flush_state.current_version.saturating_add(1);
         let version = flush_state.current_version;
-        if let Some(session_id) = session_id {
-            flush_state
-                .dirty_session_versions
-                .insert(session_id.clone(), version);
-        }
+        flush_state
+            .dirty_session_versions
+            .insert(session_id.clone(), version);
         let now = UtcMillis::now();
         flush_state.last_dirty_at = Some(now);
         flush_state.last_dirty_reason = Some(reason);
@@ -1040,7 +1109,7 @@ impl SessionStore {
         drop(state);
         if removed_sidecar {
             self.mark_sidecar_dirty_for_session(
-                Some(session_id),
+                session_id,
                 SessionSidecarFlushReason::DeleteSession,
             );
         }
@@ -1248,10 +1317,7 @@ impl SessionStore {
             session.updated_at = now;
         }
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::UpdatePlan,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::UpdatePlan);
         Ok(plan)
     }
 
@@ -1290,10 +1356,7 @@ impl SessionStore {
         let changed = state.plans.len() != before;
         drop(state);
         if changed {
-            self.mark_sidecar_dirty_for_session(
-                Some(session_id),
-                SessionSidecarFlushReason::ClearPlan,
-            );
+            self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::ClearPlan);
         }
         Ok(changed)
     }
@@ -1346,10 +1409,7 @@ impl SessionStore {
             }
         }
         drop(state);
-        self.mark_sidecar_dirty_for_session(
-            Some(session_id),
-            SessionSidecarFlushReason::UpdatePlan,
-        );
+        self.mark_sidecar_dirty_for_session(session_id, SessionSidecarFlushReason::UpdatePlan);
         Ok(())
     }
 

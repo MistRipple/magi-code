@@ -236,6 +236,9 @@ pub struct SessionTurnRequestDto {
     /// 编辑最近一条用户消息时，必须携带被替换的 canonical Turn ID。
     #[serde(default)]
     pub replace_turn_id: Option<String>,
+    /// 停止明确的当前 Turn 并改做；输入先持久化，结算前不得创建新执行轮次。
+    #[serde(default)]
+    pub interrupt_turn_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -557,7 +560,7 @@ impl SessionTurnRequestDto {
                 })
             })
             .collect::<Vec<_>>();
-        let canonical_request = serde_json::json!({
+        let mut canonical_request = serde_json::json!({
             "sessionId": normalized.requested_session_id().map(|id| id.to_string()),
             "scope": normalized.scope,
             "workspaceId": normalized.requested_workspace_id(),
@@ -584,6 +587,10 @@ impl SessionTurnRequestDto {
             "expectedTurnId": normalized.expected_turn_id(),
             "replaceTurnId": normalized.replace_turn_id(),
         });
+        // 不改变历史普通/引导请求的指纹；只有新增投递意图才带此键。
+        if let Some(turn_id) = &normalized.interrupt_turn_id {
+            canonical_request["interruptTurnId"] = serde_json::json!(turn_id);
+        }
         let bytes = serde_json::to_vec(&canonical_request)
             .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
         let digest = Sha256::digest(bytes);
@@ -872,6 +879,7 @@ mod tests {
             steer_current_turn: false,
             expected_turn_id: None,
             replace_turn_id: None,
+            interrupt_turn_id: None,
             command: None,
             workflow_id: None,
             plugin_command_id: None,
@@ -1316,17 +1324,4 @@ pub(crate) struct ContinueSessionResponseDto {
     pub(crate) event_sequence: u64,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionInterruptResponseDto {
-    pub(crate) interrupted: bool,
-    pub(crate) session_id: String,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) turn_id: Option<String>,
-    pub(crate) event_id: String,
-    pub(crate) requested_at: UtcMillis,
-    pub(crate) cancelled_tool_process_count: usize,
-    pub(crate) remaining_queued_turn_count: usize,
-    pub(crate) next_queued_turn_started: bool,
-    pub(crate) removed_timeline_entry_ids: Vec<String>,
-}
+pub(crate) type SessionInterruptResponseDto = magi_app_server_protocol::TurnInterruptResult;

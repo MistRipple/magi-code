@@ -19,8 +19,8 @@ use magi_conversation_runtime::{
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{
-    ExecutionOwnership, SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus,
-    ThreadId, UtcMillis, WorkerId,
+    SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus, ThreadId, UtcMillis,
+    WorkerId,
 };
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{
@@ -133,35 +133,6 @@ impl Drop for InterruptedGoalResumeGuard {
             .rollback_interrupted_goal_resume(checkpoint)
         {
             tracing::error!(?error, "回滚异常中断关联 Goal 失败");
-        }
-    }
-}
-
-struct SessionGitExecutionLeaseGuard<'a> {
-    state: &'a ApiState,
-    session_id: &'a SessionId,
-    committed: bool,
-}
-
-impl<'a> SessionGitExecutionLeaseGuard<'a> {
-    fn new(state: &'a ApiState, session_id: &'a SessionId) -> Self {
-        Self {
-            state,
-            session_id,
-            committed: false,
-        }
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for SessionGitExecutionLeaseGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.state
-                .release_session_git_execution_lease(self.session_id);
         }
     }
 }
@@ -351,7 +322,7 @@ impl Drop for ContinueRecoveryAttempt<'_> {
 // 对 routes/sessions.rs 暴露继续会话所需的 runtime 数据载体与判定函数。
 pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
     SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
-    finalize_terminal_worker_branches, task_status_is_terminal,
+    task_status_is_terminal,
 };
 
 /// 新 Turn 已经写入后，如果 runner 启动失败，必须把它收口为失败态。
@@ -401,14 +372,6 @@ fn rebuild_dispatch_plan_for_branch(
     execution_root: Option<std::path::PathBuf>,
     execution_settings_snapshot: Option<Arc<SettingsStore>>,
 ) -> TaskExecutionPlan {
-    let ownership = ExecutionOwnership {
-        session_id: Some(chain.session_id.clone()),
-        workspace_id: chain.workspace_id.clone(),
-        mission_id: Some(chain.mission_id.clone()),
-        task_id: Some(branch.task_id.clone()),
-        worker_id: Some(branch.worker_id.clone()),
-        execution_chain_ref: Some(chain.execution_chain_ref.clone()),
-    };
     let writebacks = if branch.is_primary {
         ExecutionWritebackPlans::from_session_action_input(
             magi_orchestrator::DispatchMemoryExtractionInput {
@@ -440,7 +403,6 @@ fn rebuild_dispatch_plan_for_branch(
         turn_id: turn_id.to_string(),
         workspace_id: chain.workspace_id.clone(),
         execution_root,
-        ownership,
         writebacks,
         use_tools: branch.use_tools,
         skill_name: branch.skill_name.clone(),
@@ -459,7 +421,7 @@ fn canonical_value_text(value: &serde_json::Value) -> String {
 fn rebuild_thread_history_from_canonical(
     turns: &[CanonicalTurn],
     thread_id: &ThreadId,
-) -> Vec<ThreadChatMessage> {
+) -> Result<Vec<ThreadChatMessage>, ApiError> {
     let mut history = Vec::new();
     for item in turns
         .iter()
@@ -475,6 +437,7 @@ fn rebuild_thread_history_from_canonical(
                     .is_some_and(|content| !content.trim().is_empty())
                 {
                     history.push(ThreadChatMessage {
+                        input_request_id: None,
                         role: "user".to_string(),
                         content: item.content.clone(),
                         images: Vec::new(),
@@ -491,6 +454,7 @@ fn rebuild_thread_history_from_canonical(
                     .is_some_and(|content| !content.trim().is_empty())
                 {
                     history.push(ThreadChatMessage {
+                        input_request_id: None,
                         role: "assistant".to_string(),
                         content: item.content.clone(),
                         images: Vec::new(),
@@ -510,6 +474,7 @@ fn rebuild_thread_history_from_canonical(
                     .map(canonical_value_text)
                     .unwrap_or_else(|| "{}".to_string());
                 history.push(ThreadChatMessage {
+                    input_request_id: None,
                     role: "assistant".to_string(),
                     content: None,
                     images: Vec::new(),
@@ -524,9 +489,13 @@ fn rebuild_thread_history_from_canonical(
                     tool_call_id: None,
                     provider_context: Vec::new(),
                 });
-                let result = tool
-                    .result
+                let question_result = item
+                    .user_question()
+                    .map_err(|error| ApiError::internal_assembly("恢复提问失败", error))?
+                    .and_then(|question| question.result_payload());
+                let result = question_result
                     .as_ref()
+                    .or(tool.result.as_ref())
                     .map(canonical_value_text)
                     .or_else(|| {
                         tool.error.as_ref().map(|error| {
@@ -547,6 +516,7 @@ fn rebuild_thread_history_from_canonical(
                         .to_string()
                     });
                 history.push(ThreadChatMessage {
+                    input_request_id: None,
                     role: "tool".to_string(),
                     content: Some(result),
                     images: Vec::new(),
@@ -560,7 +530,7 @@ fn rebuild_thread_history_from_canonical(
             | CanonicalTurnItemKind::SystemNotice => {}
         }
     }
-    history
+    Ok(history)
 }
 
 pub(crate) fn restore_missing_resumed_branch_threads(
@@ -621,7 +591,7 @@ pub(crate) fn restore_missing_resumed_branch_threads(
             message_history: rebuild_thread_history_from_canonical(
                 &canonical_turns,
                 &branch.thread_id,
-            ),
+            )?,
         };
         if threads_to_register
             .iter()
@@ -826,6 +796,10 @@ where
         ));
     }
     let _restart_guard = manager.lock_for_restart(chain.root_task_id.as_str()).await;
+    // 领取时会校验原 Turn 的待审批/提问；必须早于任务恢复、检查点
+    // 改写和 Coordinator Continue 接纳。拒绝不能留下一个没有 canonical
+    // Turn 的新 Coordinator attempt，阻塞用户处理交互后的合法恢复。
+    let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
     manager
         .quiesce_for_restart(chain.root_task_id.as_str())
         .await;
@@ -849,23 +823,11 @@ where
     let worker_runtime_handle = state
         .execution_pipeline()
         .map(|pipeline| pipeline.execution_runtime.worker_runtime());
-    finalize_terminal_worker_branches(
-        &state.session_store,
-        Some(task_store),
-        worker_runtime_handle,
-        session_id,
-    )
-    .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
     let resumable_branches = chain
         .branches
         .iter()
         .filter(|&branch| {
-            active_execution_branch_is_continue_recoverable(
-                worker_runtime_handle,
-                state.task_store(),
-                &chain,
-                branch,
-            )
+            active_execution_branch_is_continue_recoverable(state.task_store(), &chain, branch)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -895,13 +857,6 @@ where
     } else {
         state.session_isolation_root(session_id)
     };
-    state
-        .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
-        .await?;
-    state
-        .ensure_session_code_context(session_id, &workspace_id)
-        .await?;
-    let git_execution_lease = SessionGitExecutionLeaseGuard::new(state, session_id);
 
     let primary_branch = branches_to_resume
         .iter()
@@ -1043,7 +998,6 @@ where
         );
     }
 
-    let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
     let mut recovery_attempt = ContinueRecoveryAttempt::new(
         state,
         session_id,
@@ -1208,7 +1162,6 @@ where
         runner_started: true,
     };
     recovery_claim.commit();
-    git_execution_lease.commit();
     recovery_attempt.commit();
     Ok((accepted, prepared_input, prepared_turn))
 }
@@ -1264,7 +1217,8 @@ mod tests {
         ];
         assert!(turns[1].is_session_command());
         let history =
-            rebuild_thread_history_from_canonical(&turns, &ThreadId::new("thread-orchestrator"));
+            rebuild_thread_history_from_canonical(&turns, &ThreadId::new("thread-orchestrator"))
+                .unwrap();
         let contents = history
             .iter()
             .filter_map(|message| message.content.as_deref())

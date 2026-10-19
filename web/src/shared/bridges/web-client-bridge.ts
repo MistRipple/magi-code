@@ -23,7 +23,7 @@ import {
 } from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
-import type { PluginSelection, SessionTurnCommand } from '../app-server-protocol.generated';
+import type { PluginSelection, SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
@@ -65,6 +65,8 @@ import {
   reindexAgentProjectKnowledge,
   removeAgentNotification,
   removeAgentSessionTurnQueueItem,
+  updateAgentSessionTurnQueueItem,
+  retryAgentSessionTurnQueueItem,
   resolveAgentNotification,
   removeAgentInstalledSkill,
   renameAgentSession,
@@ -227,6 +229,7 @@ type ProcessingRequestSnapshot = {
 const sessionTurnSubmissions = new Map<string, SessionTurnSubmissionContext>();
 const guidingQueuedMessageIds = new Set<string>();
 let sessionTurnQueueSyncVersion = 0;
+const sessionInboxCursors = new Map<string, { epoch: string; throughSequence: number }>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
@@ -1584,6 +1587,7 @@ function rustTaskEventRootTaskIds(event: RustEventEnvelope): string[] {
     rustEventPayloadString(event, 'root_task_id'),
     rustEventPayloadString(event, 'old_root_task_id'),
     rustEventPayloadString(event, 'new_root_task_id'),
+    rustEventPayloadString(event, 'rootTaskId'),
   ];
   return Array.from(new Set(candidates.filter((value) => value.length > 0)));
 }
@@ -2077,7 +2081,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
-  if (eventType === 'session.turn.queued') {
+  if (eventType === 'session.inbox.changed' || eventType === 'session.turn.queued') {
     void syncSessionTurnQueue().catch((error) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
@@ -2085,6 +2089,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         error,
       );
     });
+    return;
+  }
+
+  if (eventType === 'session.turn.step') {
+    emitCanonicalTurnEventFromRustEvent(event);
     return;
   }
 
@@ -2346,7 +2355,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   // (e.g. agent-run-store) can react without waiting for a full bootstrap refresh.
   const isAgentRunRelevantEvent = eventType.startsWith('task.')
     || eventType.startsWith('mission.')
-    || eventType.startsWith('assignment.');
+    || eventType.startsWith('assignment.')
+    || eventType === 'agent.run.transferred';
   if (isAgentRunRelevantEvent) {
     emitMessage({
       type: 'rustTaskEvent',
@@ -2372,7 +2382,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     }
   }
 
-  if (eventType.startsWith('session.turn.') || eventType === 'session.continue.executed') {
+  if (eventType.startsWith('session.turn.') || eventType === 'session.continue.executed' || eventType === 'session.goal.usage.changed') {
     const sessionId = rustEventSessionId(event) || currentSessionId;
     const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
     if (sessionId) {
@@ -3955,8 +3965,8 @@ interface ExecuteTaskInput {
   pluginCommandId?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
-  followUpMode?: 'queue';
   replaceTurnId?: string | null;
+  interruptTurnId?: string | null;
   images: Array<{
     name: string;
     dataUrl: string;
@@ -3986,10 +3996,11 @@ function bridgeRuntimeIsBusy(): boolean {
 function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
   return {
     id: turn.queueId,
+    revision: turn.revision,
     requestId: turn.requestId?.trim() || turn.queueId,
     content: turn.content,
     text: turn.text ?? null,
-    workspaceId: turn.workspaceId,
+    workspaceId: turn.workspaceId ?? undefined,
     workspacePath: turn.workspacePath?.trim() || undefined,
     sessionId: turn.sessionId,
     createdAt: turn.acceptedAt,
@@ -4000,15 +4011,24 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     goalMode: turn.goalMode === true,
     accessProfile: turn.accessProfile ?? null,
     images: turn.images,
-    contextReferences: turn.contextReferences,
+    contextReferences: turn.contextReferences.map(reference => ({ ...reference, pathRef: reference.pathRef ?? undefined })),
     browserAnnotationRefs: turn.browserAnnotationRefs,
     browserNodeSelections: turn.browserNodeSelections,
     pluginSelections: turn.pluginSelections ?? [],
-    canGuide: turn.canGuide,
+    guide: turn.guide,
+    interruptTurnId: turn.interruptTurnId,
+    interruptionError: turn.interruptionError,
   };
 }
 
-function applyServerQueuedTurns(sessionId: string, turns: QueuedSessionTurnDto[]): void {
+function applyServerQueuedTurns(sessionId: string, turns: QueuedSessionTurnDto[], cursor?: { epoch: string; throughSequence: number }): void {
+  const previous = sessionInboxCursors.get(sessionId);
+  if (cursor) {
+    if (previous?.epoch === cursor.epoch && cursor.throughSequence < previous.throughSequence) return;
+    sessionInboxCursors.set(sessionId, cursor);
+  } else if (previous) {
+    return;
+  }
   setQueuedMessages(turns.map(queuedMessageFromServer));
   adoptQueuedTurnSubmissions(
     sessionId,
@@ -4037,22 +4057,25 @@ async function syncSessionTurnQueue(
   if (snapshotSessionId !== normalizedSessionId) {
     throw new Error('排队消息快照 sessionId 与请求会话不一致');
   }
-  applyServerQueuedTurns(snapshotSessionId, snapshot.queuedTurns);
+  applyServerQueuedTurns(snapshotSessionId, snapshot.queuedTurns, snapshot.cursor);
 }
 
-async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
+async function removeQueuedMessageFromServer(queuedMessageId: string, expectedRevision: number): Promise<void> {
   const normalizedId = queuedMessageId.trim();
-  if (!normalizedId || !currentSessionId) return;
+  if (!normalizedId || !currentSessionId || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+    return;
+  }
   const syncVersion = ++sessionTurnQueueSyncVersion;
   try {
     const snapshot = await removeAgentSessionTurnQueueItem(
       currentSessionId,
       normalizedId,
+      expectedRevision,
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
       if (syncVersion === sessionTurnQueueSyncVersion) {
-        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns, snapshot.cursor);
       } else {
         // 操作期间又发生出队/引导时重新读取，不能用较早的变更快照覆盖新状态。
         await syncSessionTurnQueue();
@@ -4064,20 +4087,61 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
   }
 }
 
-async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
+async function updateQueuedMessageFromServer(
+  queuedMessageId: string,
+  request: TurnStartParams,
+  editRequestId?: string,
+  expectedRevision?: number,
+): Promise<void> {
   const normalizedId = queuedMessageId.trim();
-  if (!normalizedId || !currentSessionId || guidingQueuedMessageIds.has(normalizedId)) return;
+  const originSessionId = currentSessionId;
+  if (!normalizedId || !originSessionId || typeof expectedRevision !== 'number') {
+    if (editRequestId) window.dispatchEvent(new CustomEvent('magi:queuedMessageUpdated', { detail: { requestId: editRequestId, updated: false } }));
+    return;
+  }
+  const syncVersion = ++sessionTurnQueueSyncVersion;
+  let updated = false;
+  let errorMessage = '';
+  try {
+    const snapshot = await updateAgentSessionTurnQueueItem(
+      originSessionId,
+      normalizedId,
+      expectedRevision,
+      request,
+      currentSessionBindingOverride(),
+    );
+    updated = true;
+    if (snapshot.sessionId === currentSessionId) {
+      if (syncVersion === sessionTurnQueueSyncVersion) applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns, snapshot.cursor);
+      else await syncSessionTurnQueue();
+    }
+  } catch (error) {
+    errorMessage = normalizeErrorMessage(error) || '';
+    emitBridgeErrorToast(i18n.t('input.queue.edit'), error);
+    await syncSessionTurnQueue().catch(() => {});
+  } finally {
+    if (editRequestId) window.dispatchEvent(new CustomEvent('magi:queuedMessageUpdated', {
+      detail: { requestId: editRequestId, sessionId: originSessionId, updated, errorMessage },
+    }));
+  }
+}
+
+async function guideQueuedMessageFromServer(queuedMessageId: string, expectedTurnId: string, expectedRevision: number): Promise<void> {
+  const normalizedId = queuedMessageId.trim();
+  if (!normalizedId || !expectedTurnId.trim() || !currentSessionId || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || guidingQueuedMessageIds.has(normalizedId)) return;
   guidingQueuedMessageIds.add(normalizedId);
   const syncVersion = ++sessionTurnQueueSyncVersion;
   try {
     const snapshot = await guideAgentSessionTurnQueueItem(
       currentSessionId,
       normalizedId,
+      expectedTurnId,
+      expectedRevision,
       currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
       if (syncVersion === sessionTurnQueueSyncVersion) {
-        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns);
+        applyServerQueuedTurns(snapshot.sessionId, snapshot.queuedTurns, snapshot.cursor);
       } else {
         await syncSessionTurnQueue();
       }
@@ -4285,6 +4349,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       userMessageId,
       placeholderMessageId,
       replaceTurnId: replaceTurnId || null,
+      interruptTurnId: trimBridgeString(input.interruptTurnId) || null,
     }, targetScope === 'workspace' ? {
       scope: 'workspace',
       workspaceId: targetWorkspaceId,
@@ -5511,6 +5576,7 @@ export function createWebClientBridge(): ClientBridge {
             || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
             || (Array.isArray(message.browserNodeSelections) && message.browserNodeSelections.length > 0)
             || (Array.isArray(message.pluginSelections) && message.pluginSelections.length > 0)
+            || (typeof message.workflowId === 'string' && message.workflowId.trim())
             || (typeof message.pluginCommandId === 'string' && message.pluginCommandId.trim())
             || message.command === 'compact'
           ) {
@@ -5523,6 +5589,7 @@ export function createWebClientBridge(): ClientBridge {
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               goalMode: message.goalMode === true,
               command: message.command === 'compact' ? 'compact' : null,
+              workflowId: typeof message.workflowId === 'string' ? message.workflowId : null,
               pluginCommandId: typeof message.pluginCommandId === 'string' ? message.pluginCommandId : null,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
@@ -5534,8 +5601,8 @@ export function createWebClientBridge(): ClientBridge {
                 && !Array.isArray(message.orchestratorSessionConfig)
                 ? message.orchestratorSessionConfig as Record<string, unknown>
                 : null,
-              followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               replaceTurnId: typeof message.replaceTurnId === 'string' ? message.replaceTurnId : null,
+              interruptTurnId: typeof message.interruptTurnId === 'string' ? message.interruptTurnId : null,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],
@@ -5560,13 +5627,30 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'removeQueuedMessage':
-          if (typeof message.queuedMessageId === 'string') {
-            void removeQueuedMessageFromServer(message.queuedMessageId);
+          if (typeof message.queuedMessageId === 'string' && typeof message.expectedRevision === 'number') {
+            void removeQueuedMessageFromServer(message.queuedMessageId,
+              message.expectedRevision);
+          }
+          return;
+        case 'updateQueuedMessage':
+          if (typeof message.queuedMessageId === 'string' && message.request && typeof message.request === 'object') {
+            void updateQueuedMessageFromServer(message.queuedMessageId, message.request as TurnStartParams,
+              typeof message.editRequestId === 'string' ? message.editRequestId : undefined,
+              typeof message.expectedRevision === 'number' ? message.expectedRevision : undefined);
           }
           return;
         case 'guideQueuedMessage':
-          if (typeof message.queuedMessageId === 'string') {
-            void guideQueuedMessageFromServer(message.queuedMessageId);
+          if (typeof message.queuedMessageId === 'string' && typeof message.expectedTurnId === 'string' && typeof message.expectedRevision === 'number') {
+            void guideQueuedMessageFromServer(message.queuedMessageId, message.expectedTurnId, message.expectedRevision);
+          }
+          return;
+        case 'retryQueuedMessage':
+          if (typeof message.queuedMessageId === 'string' && currentSessionId && typeof message.expectedRevision === 'number') {
+            void retryAgentSessionTurnQueueItem(currentSessionId, message.queuedMessageId,
+              message.expectedRevision,
+              currentSessionBindingOverride())
+              .catch((error) => emitBridgeErrorToast(i18n.t('input.followUp.retry'), error))
+              .finally(() => syncSessionTurnQueue().catch(() => {}));
           }
           return;
         case 'interruptTask':

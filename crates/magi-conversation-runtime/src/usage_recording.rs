@@ -9,9 +9,7 @@ use crate::model_context_window::resolve_model_context_window;
 use magi_bridge_client::{
     BridgeClientError, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
 };
-use magi_core::{
-    EventId, GoalId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens,
-};
+use magi_core::{EventId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observation_for_session,
 };
@@ -652,27 +650,8 @@ fn publish_model_usage_record_internal(
     }
 }
 
-pub fn account_active_goal_usage(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    expected_goal_id: Option<&GoalId>,
-    usage: Option<&serde_json::Value>,
-) {
-    let Some(goal_id) = expected_goal_id else {
-        return;
-    };
-    let Some(tokens) = usage_tokens_from_payload(usage) else {
-        return;
-    };
-    let token_delta = context_window_tokens_from_usage(&tokens);
-    if let Err(error) = session_store.account_goal_token_usage(session_id, goal_id, token_delta) {
-        tracing::warn!(
-            error = %error,
-            session_id = %session_id,
-            goal_id = %goal_id,
-            "Goal 记账失败，已跳过本轮用量"
-        );
-    }
+pub(crate) fn model_usage_tokens(usage: Option<&serde_json::Value>) -> Option<u64> {
+    usage_tokens_from_payload(usage).map(|tokens| context_window_tokens_from_usage(&tokens))
 }
 
 pub(crate) fn current_turn_id(
@@ -874,9 +853,8 @@ fn usage_bool_field(usage: &serde_json::Value, keys: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::MissionId;
     use magi_event_bus::InMemoryEventBus;
-    use magi_session_store::{GoalStatus, SessionStore};
+    use magi_session_store::SessionStore;
     use magi_usage_authority::UsageCallStatus;
     use serde_json::json;
 
@@ -949,47 +927,6 @@ mod tests {
         );
         assert_eq!(events[1].payload["call_id"], json!("call-context-runtime"));
         assert_eq!(events[1].payload["turn_id"], json!("turn-context-runtime"));
-    }
-
-    #[test]
-    fn account_active_goal_usage_uses_usage_payload_and_budget_limits_goal() {
-        let session_store = SessionStore::new();
-        let session_id = SessionId::new("session-goal-accounting");
-        session_store
-            .create_session(session_id.clone(), "goal accounting")
-            .expect("session should be creatable");
-        let (_, thread_id) =
-            session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
-                MissionId::new("mission-goal-accounting")
-            });
-        let goal = session_store
-            .create_goal(
-                session_id.clone(),
-                thread_id,
-                "turn-goal-accounting",
-                "完成目标记账",
-                magi_core::AccessProfile::Restricted,
-                Some(12),
-            )
-            .expect("goal should be creatable");
-
-        account_active_goal_usage(
-            &session_store,
-            &session_id,
-            Some(&goal.goal_id),
-            Some(&json!({
-                "prompt_tokens": 5,
-                "completion_tokens": 8,
-            })),
-        );
-
-        let updated = session_store
-            .current_goal(&session_id)
-            .expect("goal should remain readable");
-        assert_eq!(updated.goal_id, goal.goal_id);
-        assert_eq!(updated.tokens_used, 13);
-        assert_eq!(updated.time_used_seconds, 0);
-        assert_eq!(updated.status, GoalStatus::BudgetLimited);
     }
 
     #[test]
@@ -1250,6 +1187,10 @@ mod tests {
     struct SuccessfulAuxiliaryClient;
 
     impl ModelBridgeClient for SuccessfulAuxiliaryClient {
+        fn executor_capabilities(&self) -> magi_bridge_client::ExecutorCapabilities {
+            magi_bridge_client::native_executor_capabilities()
+        }
+
         fn invoke(
             &self,
             _request: ModelInvocationRequest,

@@ -49,6 +49,13 @@ pub enum TaskLeaseState {
     Revoked,
 }
 
+enum SubtreeTerminalSelection<'a> {
+    Audit,
+    Execution,
+    OrphanedExecution,
+    ExecutionIfActive(&'a [TaskId]),
+}
+
 #[derive(Debug, Default)]
 struct TaskStoreCheckpoint {
     tasks: Vec<Task>,
@@ -140,6 +147,7 @@ pub struct TaskStore {
     /// snapshot may observe a cross-map intermediate state.
     mutation_lock: Mutex<()>,
     status_change_version: Mutex<u64>,
+    runtime_change_notify: tokio::sync::Notify,
     status_change_signal: Condvar,
     /// 生产 daemon 设为 true，把可能触发跨模块 IO 的回调移出 mutation guard；
     /// 默认 false 供同步嵌入测试保持确定的 callback 观察语义。
@@ -191,6 +199,15 @@ fn child_index_from_tasks(tasks: &HashMap<TaskId, Task>) -> HashMap<TaskId, Vec<
 }
 
 fn collect_subtree_ids_from_tasks(tasks: &HashMap<TaskId, Task>, root_id: &TaskId) -> Vec<TaskId> {
+    collect_subtree_ids_in_scope(tasks, root_id, false)
+}
+
+// 审计父子关系永不改写；执行范围在已持久转交的直接子树根处停止。
+fn collect_subtree_ids_in_scope(
+    tasks: &HashMap<TaskId, Task>,
+    root_id: &TaskId,
+    execution_only: bool,
+) -> Vec<TaskId> {
     let children = child_index_from_tasks(tasks);
     let mut all_ids = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -198,6 +215,14 @@ fn collect_subtree_ids_from_tasks(tasks: &HashMap<TaskId, Task>, root_id: &TaskI
     while let Some(current) = queue.pop() {
         // 持久化数据损坏时 parent_task_id 可能成环；遍历必须有界。
         if !tasks.contains_key(&current) || !visited.insert(current.clone()) {
+            continue;
+        }
+        if execution_only
+            && &current != root_id
+            && tasks
+                .get(&current)
+                .is_some_and(|task| task.agent_run_transfer().is_some())
+        {
             continue;
         }
         all_ids.push(current.clone());
@@ -218,6 +243,7 @@ impl TaskStore {
             on_checkpoint: Mutex::new(None),
             mutation_lock: Mutex::new(()),
             status_change_version: Mutex::new(0),
+            runtime_change_notify: tokio::sync::Notify::new(),
             status_change_signal: Condvar::new(),
             status_change_callback_async: AtomicBool::new(false),
         }
@@ -234,6 +260,7 @@ impl TaskStore {
             on_checkpoint: Mutex::new(None),
             mutation_lock: Mutex::new(()),
             status_change_version: Mutex::new(0),
+            runtime_change_notify: tokio::sync::Notify::new(),
             status_change_signal: Condvar::new(),
             status_change_callback_async: AtomicBool::new(false),
         }
@@ -463,6 +490,7 @@ impl TaskStore {
             .expect("status_change_version lock poisoned");
         *version = version.saturating_add(1);
         self.status_change_signal.notify_all();
+        self.runtime_change_notify.notify_waiters();
     }
 
     pub fn status_change_version(&self) -> u64 {
@@ -470,6 +498,12 @@ impl TaskStore {
             .status_change_version
             .lock()
             .expect("status_change_version lock poisoned")
+    }
+
+    /// 异步宿主复用相同的提交后通知；先取 future 再读事实，避免查询期间丢失唤醒。
+    /// 不复制 Task/转交状态，也不需要轮询或为每个等待者启动阻塞线程。
+    pub fn runtime_change_notification(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.runtime_change_notify.notified()
     }
 
     /// 唤醒等待任务运行态变化的协调器。用于非状态字段但会改变编排决策的事件，
@@ -506,6 +540,226 @@ impl TaskStore {
         self.insert_task_inner(task, false)
     }
 
+    /// 根据 Task 中的不可变 activation 来源读取会话拥有的代理，不另存身份注册表。
+    pub fn agent_heads_for_session(&self, session_id: &magi_core::SessionId) -> Vec<Task> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        let mut heads = std::collections::BTreeMap::<String, &Task>::new();
+        for task in tasks.values() {
+            let Some(activation) = task
+                .agent_activation()
+                .filter(|binding| &binding.session_id == session_id)
+            else {
+                continue;
+            };
+            let entry = heads.entry(activation.agent_id.to_string()).or_insert(task);
+            if activation.generation > entry.agent_activation().expect("agent task").generation {
+                *entry = task;
+            }
+        }
+        heads.into_values().cloned().collect()
+    }
+
+    /// 两层代理试点以真实父链校验，不从展示名称推断深度。
+    pub fn validate_agent_delegation(&self, parent: &Task) -> DomainResult<()> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        Self::validate_agent_delegation_inner(&tasks, parent)
+    }
+
+    /// 根代理可随会话进入新的主线 Turn；嵌套代理只能由同一父 Agent 的新 activation 继续。
+    pub fn agent_resume_parent_matches(&self, source: &Task, parent: &Task) -> bool {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        Self::same_agent_owner(
+            source.parent_task_id.as_ref().and_then(|id| tasks.get(id)),
+            parent,
+        )
+    }
+
+    fn same_agent_owner(previous_parent: Option<&Task>, parent: &Task) -> bool {
+        let Some(previous) = previous_parent else {
+            return false;
+        };
+        if previous.parent_task_id.is_none() || parent.parent_task_id.is_none() {
+            return previous.parent_task_id.is_none() && parent.parent_task_id.is_none();
+        }
+        match (previous.agent_activation(), parent.agent_activation()) {
+            (Some(previous), Some(current)) => {
+                previous.agent_id == current.agent_id && previous.session_id == current.session_id
+            }
+            _ => false,
+        }
+    }
+
+    fn validate_agent_delegation_inner(
+        tasks: &HashMap<TaskId, Task>,
+        parent: &Task,
+    ) -> DomainResult<()> {
+        let latest = tasks
+            .get(&parent.task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if !matches!(latest.status, TaskStatus::Pending | TaskStatus::Running)
+            || latest.parent_task_id != parent.parent_task_id
+            || latest.root_task_id != parent.root_task_id
+            || latest.mission_id != parent.mission_id
+            || latest.delegation_allowed() != parent.delegation_allowed()
+        {
+            return Err(DomainError::InvalidState {
+                message: "派发父任务已失效或委派授权已变化".into(),
+            });
+        }
+        if parent.parent_task_id.is_none() && parent.root_task_id == parent.task_id {
+            return Ok(());
+        }
+        let root = tasks
+            .get(&parent.root_task_id)
+            .ok_or(DomainError::NotFound { entity: "RootTask" })?;
+        if !parent.delegation_allowed()
+            || parent.parent_task_id.as_ref() != Some(&root.task_id)
+            || root.parent_task_id.is_some()
+            || root.task_id != root.root_task_id
+            || root.mission_id != parent.mission_id
+            || (root.status != TaskStatus::Running && latest.agent_run_transfer().is_none())
+            || root.executor_binding_target_role() != Some("coordinator")
+            || !Self::ancestor_chain_is_active(latest, tasks, false)
+        {
+            return Err(DomainError::InvalidState {
+                message: "嵌套派发需要主线显式委派，且最多两层代理".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_agent_activation_insert(
+        tasks: &HashMap<TaskId, Task>,
+        task: &Task,
+    ) -> DomainResult<()> {
+        if task.agent_run_transfer().is_some() {
+            return Err(DomainError::InvalidState {
+                message: "创建任务不能携带已转交状态，必须从显式转交事务接纳".into(),
+            });
+        }
+        let owner = task
+            .parent_task_id
+            .as_ref()
+            .map(|parent| Self::agent_run_transfer_in_tasks(tasks, parent))
+            .transpose()?
+            .flatten()
+            .map(|(root, _)| &root.task_id);
+        // 转交后创建的新任务同样不能重新建立跨拥有方依赖。
+        for dependency in task.dependency_ids.iter().chain(&task.required_children) {
+            let dependency_owner = Self::agent_run_transfer_in_tasks(tasks, dependency)?
+                .map(|(root, _)| &root.task_id);
+            if owner != dependency_owner {
+                return Err(DomainError::InvalidState {
+                    message: "新任务不能建立跨转交子树的调度或完成依赖".into(),
+                });
+            }
+        }
+        for candidate in tasks.values() {
+            if candidate
+                .dependency_ids
+                .iter()
+                .chain(&candidate.required_children)
+                .any(|id| id == &task.task_id)
+                && Self::agent_run_transfer_in_tasks(tasks, &candidate.task_id)?
+                    .map(|(root, _)| &root.task_id)
+                    != owner
+            {
+                return Err(DomainError::InvalidState {
+                    message: "任务身份被另一拥有方预留为调度或完成依赖".into(),
+                });
+            }
+        }
+        let Some(binding) = task.agent_activation() else {
+            if task.delegation_allowed() || owner.is_some() {
+                return Err(DomainError::InvalidState {
+                    message: "受委派或已转交子树中的代理必须有持久 activation 身份".into(),
+                });
+            }
+            return Ok(());
+        };
+        binding.validate(&task.task_id)?;
+        let parent = task
+            .parent_task_id
+            .as_ref()
+            .and_then(|id| tasks.get(id))
+            .ok_or_else(|| DomainError::InvalidState {
+                message: "Agent activation 缺少父任务".into(),
+            })?;
+        if !matches!(parent.status, TaskStatus::Pending | TaskStatus::Running)
+            || parent.root_task_id != task.root_task_id
+            || parent.mission_id != task.mission_id
+        {
+            return Err(DomainError::InvalidState {
+                message: "Agent activation 父任务已失效或作用域不匹配".into(),
+            });
+        }
+        if parent.parent_task_id.is_some() || task.delegation_allowed() {
+            Self::validate_agent_delegation_inner(tasks, parent)?;
+            if (task.delegation_allowed()
+                && (parent.parent_task_id.is_some()
+                    || parent.executor_binding_target_role() != Some("coordinator")))
+                || task.workspace_scope != parent.workspace_scope
+                || task.write_scope != parent.write_scope
+                || task.policy_snapshot != parent.policy_snapshot
+            {
+                return Err(DomainError::InvalidState {
+                    message: "嵌套任务不能增加委派深度或改变父任务授权边界".into(),
+                });
+            }
+        }
+        if let Some((root, transfer)) = Self::agent_run_transfer_in_tasks(tasks, &parent.task_id)? {
+            Self::validate_agent_transfer_subtree(
+                tasks.values().chain(std::iter::once(task)),
+                root,
+                transfer,
+            )?;
+        }
+        let prior = tasks
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .agent_activation()
+                    .is_some_and(|source| source.agent_id == binding.agent_id)
+            })
+            .max_by_key(|candidate| candidate.agent_activation().expect("agent task").generation);
+        match (prior, &binding.previous_task_id) {
+            (None, None) if binding.generation == 1 => Ok(()),
+            (Some(prior), Some(previous)) => {
+                let source = prior.agent_activation().expect("agent task");
+                if prior.task_id != *previous
+                    || prior.status != TaskStatus::Completed
+                    || source.generation.checked_add(1) != Some(binding.generation)
+                    || source.session_id != binding.session_id
+                    || source.lifetime != binding.lifetime
+                    || matches!(source.lifetime, magi_core::AgentLifetime::Turn)
+                    || (task.delegation_allowed() && !prior.delegation_allowed())
+                    || prior.mission_id != task.mission_id
+                    || !Self::same_agent_owner(
+                        prior.parent_task_id.as_ref().and_then(|id| tasks.get(id)),
+                        parent,
+                    )
+                    || prior.workspace_scope != task.workspace_scope
+                    || prior.write_scope != task.write_scope
+                    || prior.executor_binding_target_role() != task.executor_binding_target_role()
+                    || task
+                        .executor_binding_capability_ids()
+                        .iter()
+                        .any(|capability| {
+                            !prior.executor_binding_capability_ids().contains(capability)
+                        })
+                {
+                    return Err(DomainError::InvalidState {
+                        message: "Agent 已有更新/活动 activation 或来源作用域冲突".into(),
+                    });
+                }
+                Ok(())
+            }
+            _ => Err(DomainError::InvalidState {
+                message: "Agent activation 来源缺失或代际冲突".into(),
+            }),
+        }
+    }
+
     fn insert_task_inner(&self, task: Task, checkpoint: bool) -> DomainResult<()> {
         let _mutation_guard = self
             .mutation_lock
@@ -521,6 +775,7 @@ impl TaskStore {
                     message: format!("任务 {task_id} 已存在，禁止覆盖任务事实"),
                 });
             }
+            Self::validate_agent_activation_insert(&tasks, &task)?;
             tasks.insert(task_id.clone(), task);
             drop(tasks);
 
@@ -544,6 +799,7 @@ impl TaskStore {
                 message: format!("任务 {task_id} 已存在，禁止覆盖任务事实"),
             });
         }
+        Self::validate_agent_activation_insert(&tasks, &task)?;
         tasks.insert(task_id.clone(), task);
         mission_index
             .entry(mission_id)
@@ -573,6 +829,205 @@ impl TaskStore {
             .expect("tasks read lock poisoned")
             .get(task_id)
             .cloned()
+    }
+
+    /// 显式转交只改变直接子树根的拥有方，不迁移 Task/lease 或复制后代状态。
+    /// API 还须在会话提交锁下校验来源 Turn、Goal 控制版本及资源可独立运行。
+    pub fn transfer_agent_subtree(
+        &self,
+        parent_id: &TaskId,
+        child_id: &TaskId,
+        transfer: magi_core::AgentRunTransfer,
+    ) -> DomainResult<bool> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
+        let parent = tasks.get(parent_id).ok_or(DomainError::NotFound {
+            entity: "ParentTask",
+        })?;
+        let child = tasks.get(child_id).ok_or(DomainError::NotFound {
+            entity: "AgentTask",
+        })?;
+        Self::validate_agent_transfer_binding(parent, child, &transfer)?;
+        if let Some(existing) = child.agent_run_transfer() {
+            if existing == &transfer {
+                return Ok(false);
+            }
+            return Err(DomainError::InvalidState {
+                message: "子树已经转交，不能改写原拥有方或来源".into(),
+            });
+        }
+        if parent.status != TaskStatus::Running
+            || !matches!(child.status, TaskStatus::Pending | TaskStatus::Running)
+            || transfer.transferred_at < child.created_at
+        {
+            return Err(DomainError::InvalidState {
+                message: "转交需要父任务仍在运行、子树根尚未结束".into(),
+            });
+        }
+        if tasks.values().any(|candidate| {
+            candidate
+                .agent_run_transfer()
+                .is_some_and(|existing| existing.operation_id == transfer.operation_id)
+        }) {
+            return Err(DomainError::InvalidState {
+                message: "转交 operation_id 已用于其他子树".into(),
+            });
+        }
+        Self::validate_agent_transfer_subtree(tasks.values(), child, &transfer)?;
+        let root_id = parent.root_task_id.clone();
+        let child = tasks.get_mut(child_id).expect("child checked");
+        child
+            .executor_binding
+            .as_mut()
+            .expect("activation binding checked")
+            .agent_run_transfer = Some(transfer);
+        child.updated_at = UtcMillis::now();
+        let leases = self
+            .leases
+            .read()
+            .expect("leases read lock poisoned")
+            .clone();
+        let index = self
+            .mission_index
+            .read()
+            .expect("mission index read lock poisoned")
+            .clone();
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![root_id]);
+        self.fire_checkpoint(&snapshot)?;
+        self.commit_maps(tasks, leases, index);
+        self.notify_status_change();
+        Ok(true)
+    }
+
+    fn validate_agent_transfer_binding(
+        parent: &Task,
+        child: &Task,
+        transfer: &magi_core::AgentRunTransfer,
+    ) -> DomainResult<()> {
+        let activation = child
+            .agent_activation()
+            .ok_or_else(|| DomainError::InvalidState {
+                message: "转交子树需要持久 Agent 身份".into(),
+            })?;
+        transfer.validate(activation)?;
+        if parent.parent_task_id.is_some()
+            || parent.root_task_id != parent.task_id
+            || parent.executor_binding_target_role() != Some("coordinator")
+            || child.parent_task_id.as_ref() != Some(&parent.task_id)
+            || child.root_task_id != parent.root_task_id
+            || child.mission_id != parent.mission_id
+            || transfer.transferred_by != parent.task_id
+            || child.kind != magi_core::TaskKind::LocalAgent
+        {
+            return Err(DomainError::InvalidState {
+                message: "只有主线能转交自己的直接子代理，不能改变任务树归属".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 创建与重载读取相同的转交合同。共享计划和跨拥有方的调度依赖不能随子树留在后台。
+    fn validate_agent_transfer_subtree<'a>(
+        tasks: impl Iterator<Item = &'a Task>,
+        child: &Task,
+        transfer: &magi_core::AgentRunTransfer,
+    ) -> DomainResult<()> {
+        let tasks = tasks.collect::<Vec<_>>();
+        let mut children = HashMap::<&TaskId, Vec<&Task>>::new();
+        for task in &tasks {
+            if let Some(parent) = &task.parent_task_id {
+                children.entry(parent).or_default().push(task);
+            }
+        }
+        let mut subtree = vec![child];
+        let mut ids = HashSet::new();
+        let mut cursor = 0;
+        while cursor < subtree.len() {
+            let task = subtree[cursor];
+            if !ids.insert(task.task_id.clone())
+                || task.root_task_id != child.root_task_id
+                || task.mission_id != child.mission_id
+                || task.kind != magi_core::TaskKind::LocalAgent
+                || task.workspace_scope != child.workspace_scope
+                || task.write_scope != child.write_scope
+                || task
+                    .agent_activation()
+                    .is_none_or(|activation| activation.session_id != transfer.session_id)
+                || task
+                    .executor_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.plan_item_id.is_some())
+                || (task.task_id != child.task_id && task.agent_run_transfer().is_some())
+            {
+                return Err(DomainError::InvalidState {
+                    message: "子树存在循环、异域任务、共享计划或重复转交，不能独立运行".into(),
+                });
+            }
+            if let Some(descendants) = children.get(&task.task_id) {
+                subtree.extend(descendants.iter().copied());
+            }
+            cursor += 1;
+        }
+        if transfer.transferred_at < child.created_at
+            || tasks.iter().any(|task| {
+                task.dependency_ids
+                    .iter()
+                    .chain(&task.required_children)
+                    .any(|dependency| ids.contains(&task.task_id) != ids.contains(dependency))
+            })
+        {
+            return Err(DomainError::InvalidState {
+                message: "子树转交时间无效或存在跨拥有方的调度/完成依赖，必须先结算依赖".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 只读返回现有父链上的转交根 Task，包含原 activation 与唯一转交记录。
+    /// 无转交与缺失/损坏的查询来源分开返回，调用方不得将查询失败当作原父轮授权。
+    pub fn agent_run_transfer_for_task(&self, task_id: &TaskId) -> DomainResult<Option<Task>> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        if !tasks.contains_key(task_id) {
+            return Err(DomainError::NotFound {
+                entity: "AgentTask",
+            });
+        }
+        Self::agent_run_transfer_in_tasks(&tasks, task_id)
+            .map(|boundary| boundary.map(|(root, _)| root.clone()))
+    }
+
+    fn agent_run_transfer_in_tasks<'a>(
+        tasks: &'a HashMap<TaskId, Task>,
+        task_id: &TaskId,
+    ) -> DomainResult<Option<(&'a Task, &'a magi_core::AgentRunTransfer)>> {
+        // 未创建的依赖项可以没有拥有方；公开执行查询另外要求来源 Task 存在。
+        let Some(original) = tasks.get(task_id) else {
+            return Ok(None);
+        };
+        let mut current = original;
+        let mut seen = HashSet::new();
+        loop {
+            if current.root_task_id != original.root_task_id
+                || current.mission_id != original.mission_id
+                || !seen.insert(current.task_id.clone())
+            {
+                return Err(DomainError::InvalidState {
+                    message: "Agent 转交查询的父链循环或作用域不匹配".into(),
+                });
+            }
+            if let Some(transfer) = current.agent_run_transfer() {
+                return Ok(Some((current, transfer)));
+            }
+            let Some(parent) = &current.parent_task_id else {
+                return Ok(None);
+            };
+            current = tasks.get(parent).ok_or_else(|| DomainError::InvalidState {
+                message: "Agent 转交查询的来源父任务缺失".into(),
+            })?;
+        }
     }
 
     /// 返回当前任务快照。用于从持久化 Task.parent_task_id 重建运行期拓扑。
@@ -681,6 +1136,16 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        // 主线 Continue 与独立代理继续使用同一恢复代际。毫秒时间可能相同，
+        // 旧终态回调不能仅靠 updated_at 被判定为本次执行的结果。
+        if matches!(new_status, TaskStatus::Pending | TaskStatus::Running) {
+            task.retry_count =
+                task.retry_count
+                    .checked_add(1)
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "恢复代际溢出".into(),
+                    })?;
+        }
         task.status = new_status;
         task.updated_at = UtcMillis::now();
         let cloned_task = task.clone();
@@ -704,6 +1169,92 @@ impl TaskStore {
     /// 将失败任务重新置为 Pending，供恢复入口重新派发。
     pub fn reopen_failed_task_for_recovery(&self, task_id: &TaskId) -> DomainResult<()> {
         self.transition_recovery_status(task_id, TaskStatus::Failed, TaskStatus::Pending, false)
+    }
+
+    /// 显式继续同一转交范围；只重开调用方已核对的中断任务，不改写原父链或完成结果。
+    pub fn reopen_transferred_agent_scope(
+        &self,
+        root: &TaskId,
+        expected: &[Task],
+    ) -> DomainResult<()> {
+        let guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let mut tasks = self.tasks.read().expect("tasks lock poisoned").clone();
+        let leases = self.leases.read().expect("leases lock poisoned").clone();
+        if expected.first().is_none_or(|task| &task.task_id != root)
+            || tasks
+                .get(root)
+                .is_none_or(|task| task.agent_run_transfer().is_none())
+        {
+            return Err(DomainError::InvalidState {
+                message: "独立继续需要原转交子树根".into(),
+            });
+        }
+        let ids = collect_subtree_ids_in_scope(&tasks, root, true);
+        if ids.iter().any(|id| {
+            tasks.get(id).is_some_and(|task| {
+                matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+            }) || leases
+                .values()
+                .any(|lease| &lease.task_id == id && lease.lease_status == TaskLeaseState::Active)
+        }) {
+            return Err(DomainError::InvalidState {
+                message: "代理子树仍有活动任务或租约，不能继续".into(),
+            });
+        }
+        let mut changed = Vec::new();
+        for source in expected {
+            let task = tasks.get(&source.task_id).ok_or(DomainError::NotFound {
+                entity: "AgentTask",
+            })?;
+            if !ids.contains(&source.task_id)
+                || task.status != TaskStatus::Failed
+                || task.updated_at != source.updated_at
+                || task.retry_count != source.retry_count
+                || task.agent_activation() != source.agent_activation()
+            {
+                return Err(DomainError::InvalidState {
+                    message: "代理恢复来源已变化".into(),
+                });
+            }
+            let task = tasks.get_mut(&source.task_id).expect("validated task");
+            task.retry_count =
+                task.retry_count
+                    .checked_add(1)
+                    .ok_or_else(|| DomainError::InvalidState {
+                        message: "恢复代际溢出".into(),
+                    })?;
+            task.status = TaskStatus::Pending;
+            task.updated_at = UtcMillis(
+                UtcMillis::now()
+                    .0
+                    .max(source.updated_at.0.saturating_add(1)),
+            );
+            changed.push(task.clone());
+        }
+        let index = self
+            .mission_index
+            .read()
+            .expect("mission index lock poisoned")
+            .clone();
+        self.fire_checkpoint(&Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![expected[0].root_task_id.clone()],
+        ))?;
+        self.commit_maps(tasks, leases, index);
+        drop(guard);
+        for task in changed {
+            self.emit_status_change(
+                &task.task_id.clone(),
+                TaskStatus::Failed,
+                TaskStatus::Pending,
+                task,
+            );
+        }
+        Ok(())
     }
 
     /// 将失败的 root task 置为 Running，供指定 branch 的恢复入口启动执行树。
@@ -850,11 +1401,14 @@ impl TaskStore {
         Ok(())
     }
 
-    /// 把主线补充写回目标代理的权威上下文包并递增 revision。
-    pub fn append_agent_context_supplement(
+    /// 原子提交补充、访问回执与 revision，并在同一锁内复查接纳状态。
+    /// Pending -> Running 与关闭边界不能把“已接纳”补充遗落在旧启动快照里。
+    pub fn deliver_agent_context_supplement(
         &self,
         task_id: &TaskId,
+        expected_status: TaskStatus,
         supplement: AgentContextSupplement,
+        access: AgentContextAccessRecord,
     ) -> DomainResult<AgentContextPackage> {
         let _mutation_guard = self
             .mutation_lock
@@ -862,17 +1416,56 @@ impl TaskStore {
             .expect("task mutation lock poisoned");
         let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
         let task = tasks
-            .get_mut(task_id)
+            .get(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let parent = tasks
+            .get(&supplement.author_task_id)
+            .ok_or(DomainError::NotFound {
+                entity: "parent Task",
+            })?;
+        if !matches!(expected_status, TaskStatus::Pending | TaskStatus::Running)
+            || task.status != expected_status
+            || !matches!(parent.status, TaskStatus::Pending | TaskStatus::Running)
+            || task.parent_task_id.as_ref() != Some(&parent.task_id)
+            || task.root_task_id != parent.root_task_id
+            || task.mission_id != parent.mission_id
+            || task.workspace_scope != parent.workspace_scope
+            || task.write_scope != parent.write_scope
+        {
+            return Err(DomainError::InvalidState {
+                message: "代理接纳状态或父任务作用域已变化，请刷新后重新投递".into(),
+            });
+        }
+        let task = tasks.get_mut(task_id).expect("validated task exists");
         let dirty_root_id = task.root_task_id.clone();
-        let TaskRuntimePayload::AgentContext { package, .. } = &mut task.runtime_payload else {
+        let TaskRuntimePayload::AgentContext { package, accesses } = &mut task.runtime_payload
+        else {
             return Err(DomainError::InvalidState {
                 message: format!("任务 {task_id} 没有 agent context package"),
             });
         };
-        package.revision = package.revision.saturating_add(1);
+        if package.parent_task_id != supplement.author_task_id
+            || access.operation != magi_core::AgentContextAccessOperation::Send
+            || access.query.as_deref() != Some(supplement.message.as_str())
+            || package
+                .supplements
+                .iter()
+                .any(|entry| entry.supplement_id == supplement.supplement_id)
+        {
+            return Err(DomainError::InvalidState {
+                message: "代理补充身份或发送回执冲突".into(),
+            });
+        }
+        package.revision =
+            package
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| DomainError::InvalidState {
+                    message: "代理上下文 revision 溢出".into(),
+                })?;
         package.updated_at = supplement.created_at;
         package.supplements.push(supplement);
+        accesses.push(access);
         task.updated_at = package.updated_at;
         let package = package.as_ref().clone();
         let leases = self.leases.read().expect("leases read lock poisoned");
@@ -947,6 +1540,7 @@ impl TaskStore {
             checkpoint: current_checkpoint,
             pending_action: current_pending_action,
             last_result: current_last_result,
+            ..
         } = &mut task.runtime_payload
         else {
             return Err(DomainError::InvalidState {
@@ -1063,6 +1657,7 @@ impl TaskStore {
             checkpoint: current_checkpoint,
             pending_action,
             last_result,
+            ..
         } = &mut task.runtime_payload
         else {
             return Err(DomainError::InvalidState {
@@ -1196,10 +1791,46 @@ impl TaskStore {
         collect_subtree_ids_from_tasks(&tasks, root_id)
     }
 
+    /// 当前拥有方负责的执行子树；显式以转交根查询时包含该转交根及其后代。
+    /// 历史、上下文、删除与持久化仍使用 collect_subtree_ids 的完整审计树。
+    pub fn collect_execution_subtree_ids(&self, root_id: &TaskId) -> Vec<TaskId> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        collect_subtree_ids_in_scope(&tasks, root_id, true)
+    }
+
+    /// 调度身份与审计 root 分离；转交不生成新 Task/root/lease 或另一棵任务树。
+    pub fn execution_scope_root(&self, task_id: &TaskId) -> DomainResult<TaskId> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        Self::execution_scope_root_in_tasks(&tasks, task_id)
+    }
+
+    fn execution_scope_root_in_tasks(
+        tasks: &HashMap<TaskId, Task>,
+        task_id: &TaskId,
+    ) -> DomainResult<TaskId> {
+        let task = tasks
+            .get(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if let Some((root, transfer)) = Self::agent_run_transfer_in_tasks(tasks, task_id)? {
+            let parent = root
+                .parent_task_id
+                .as_ref()
+                .and_then(|id| tasks.get(id))
+                .ok_or(DomainError::NotFound {
+                    entity: "ParentTask",
+                })?;
+            Self::validate_agent_transfer_binding(parent, root, transfer)?;
+            Ok(root.task_id.clone())
+        } else {
+            Self::validate_task_root(tasks, task_id, &task.root_task_id)?;
+            Ok(task.root_task_id.clone())
+        }
+    }
+
     /// 返回任务树是否存在等待用户回答的工作流节点。
     pub fn has_pending_user_input(&self, root_id: &TaskId) -> bool {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
-        collect_subtree_ids_from_tasks(&tasks, root_id)
+        collect_subtree_ids_in_scope(&tasks, root_id, true)
             .into_iter()
             .filter_map(|task_id| tasks.get(&task_id))
             .any(|task| {
@@ -1233,25 +1864,15 @@ impl TaskStore {
         children
     }
 
-    /// 获取根任务下所有处于 Pending 状态且依赖已满足的叶子任务。
+    /// 获取当前执行范围中处于 Pending 且依赖已满足的任务，已转交子树归新 Runner。
     pub fn get_runnable_leaves(&self, root_task_id: &TaskId) -> Vec<Task> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         let children = child_index_from_tasks(&tasks);
 
-        // Collect all task_ids that belong to this root
-        let mut all_ids: Vec<TaskId> = Vec::new();
-        let mut queue: Vec<TaskId> = vec![root_task_id.clone()];
-        while let Some(current) = queue.pop() {
-            all_ids.push(current.clone());
-            if !tasks.contains_key(&current) {
-                continue;
-            }
-            if let Some(child_ids) = children.get(&current) {
-                queue.extend(child_ids.iter().cloned());
-            }
-        }
+        let all_ids = collect_subtree_ids_in_scope(&tasks, root_task_id, true);
 
-        // A leaf is a task with no children, or whose children are all terminal.
+        // LocalAgent 的父模型拥有编排循环，恢复时必须先重新派发父任务，
+        // 才能让 Pending 子任务获得 Running 祖先。工作流仍等其分派动作的子任务结束。
         let leaves: Vec<&Task> = all_ids
             .iter()
             .filter_map(|id| tasks.get(id))
@@ -1259,9 +1880,14 @@ impl TaskStore {
                 children
                     .get(&task.task_id)
                     .map(|child_ids| {
-                        child_ids
-                            .iter()
-                            .all(|cid| tasks.get(cid).is_some_and(|c| is_terminal_status(c.status)))
+                        child_ids.iter().all(|cid| {
+                            tasks.get(cid).is_some_and(|child| {
+                                child.agent_run_transfer().is_some()
+                                    || is_terminal_status(child.status)
+                                    || task.kind == magi_core::TaskKind::LocalAgent
+                                        && child.status == TaskStatus::Pending
+                            })
+                        })
                     })
                     .unwrap_or(true)
             })
@@ -1292,15 +1918,37 @@ impl TaskStore {
     }
 
     fn ancestor_chain_allows_dispatch_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
-        // 父任务调用 agent_spawn 后保持 Running，子任务由后台 runner 独立推进。
-        // 只有整条祖先链都处于 Running 时子任务才可调度：Pending 祖先说明尚未开始，
-        // 已结束（Completed/Failed/Killed）的祖先说明没有人会再收集这个子任务的结果。
-        let mut current = task.parent_task_id.as_ref();
-        while let Some(pid) = current {
-            let Some(parent) = tasks.get(pid) else {
+        Self::ancestor_chain_is_active(task, tasks, true)
+    }
+
+    /// 调度、持有租约及成功提交共用完整父链检查。新派发还要求父任务已经启动；
+    /// 已持有租约的执行允许父工作流暂存 Pending，等待其子任务返回。
+    fn ancestor_chain_is_active(
+        task: &Task,
+        tasks: &HashMap<TaskId, Task>,
+        require_started: bool,
+    ) -> bool {
+        let mut current = task;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(&current.task_id)
+                || current.root_task_id != task.root_task_id
+                || current.mission_id != task.mission_id
+                || is_terminal_status(current.status)
+            {
+                return false;
+            }
+            if current.task_id == task.root_task_id {
+                return current.parent_task_id.is_none();
+            }
+            if current.agent_run_transfer().is_some() {
+                return Self::execution_scope_root_in_tasks(tasks, &current.task_id)
+                    .is_ok_and(|root| root == current.task_id);
+            }
+            let Some(parent) = current.parent_task_id.as_ref().and_then(|id| tasks.get(id)) else {
                 return false;
             };
-            if parent.status != TaskStatus::Running {
+            if require_started && parent.status != TaskStatus::Running {
                 let workflow_waiting_for_child = parent.status == TaskStatus::Pending
                     && matches!(
                         &parent.runtime_payload,
@@ -1314,9 +1962,8 @@ impl TaskStore {
                     return false;
                 }
             }
-            current = parent.parent_task_id.as_ref();
+            current = parent;
         }
-        true
     }
 
     /// 删除单个任务并清理所有关联的索引和租约。
@@ -1336,6 +1983,16 @@ impl TaskStore {
             .read()
             .expect("mission_index read lock poisoned")
             .clone();
+        if tasks.values().any(|task| {
+            task.agent_activation()
+                .is_some_and(|binding| binding.previous_task_id.as_ref() == Some(task_id))
+                || (task.agent_activation().is_some()
+                    && task.parent_task_id.as_ref() == Some(task_id))
+        }) {
+            return Err(DomainError::InvalidState {
+                message: "任务仍被 Agent activation 来源或父子链引用，不能单独删除".into(),
+            });
+        }
         let removed = tasks.remove(task_id);
 
         if let Some(ref task) = removed {
@@ -1632,6 +2289,25 @@ impl TaskStore {
             .cloned()
     }
 
+    /// 执行资格同时属于本次租约和仍活跃的父链。父任务终态的级联清理可能尚未
+    /// 运行，不能仅凭子任务仍持有 Active lease 继续执行。已转交子树只检查到
+    /// 已验证的转交根；Session/Goal 与 canonical Turn 准入继续由运行时检查。
+    pub fn execution_lease_is_current(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        let leases = self.leases.read().expect("leases read lock poisoned");
+        let Some(lease) = leases.get(lease_id).filter(|lease| {
+            &lease.task_id == task_id && lease.lease_status == TaskLeaseState::Active
+        }) else {
+            return false;
+        };
+        let Some(task) = tasks.get(task_id).filter(|task| {
+            task.status == TaskStatus::Running && task.root_task_id == lease.root_task_id
+        }) else {
+            return false;
+        };
+        Self::ancestor_chain_is_active(task, &tasks, false)
+    }
+
     /// 获取租约历史，用于恢复审计和终态断言。
     pub fn get_lease(&self, lease_id: &LeaseId) -> Option<TaskLease> {
         self.leases
@@ -1688,12 +2364,54 @@ impl TaskStore {
 
     /// 在一个 TaskStore 事务中授予租约并把任务推进到 `Running`。
     ///
-    /// 返回 `Ok(None)` 表示任务已经被其他执行轮持有活跃租约；任何归属错误或
-    /// checkpoint 错误都会返回错误，并且任务与租约都保持原状。
+    /// 返回 `Ok(None)` 表示扫描后任务已被领取、已结束或父链已不可调度。
+    /// 这些竞争不应使其他可运行分支失败；归属错误或 checkpoint 错误仍返回错误。
     pub fn grant_lease_and_start_task(
         &self,
         task_id: &TaskId,
         root_task_id: &TaskId,
+        worker_id: &WorkerId,
+        role: &str,
+        duration_ms: u64,
+    ) -> DomainResult<Option<TaskLease>> {
+        self.grant_lease_and_start_task_inner(
+            task_id,
+            root_task_id,
+            None,
+            worker_id,
+            role,
+            duration_ms,
+        )
+    }
+
+    /// Runner 按执行拥有方领取，扫描与转交/取消竞争时在同一 mutation 锁下复核。
+    /// Lease 的 root_task_id 始终保留原审计 root，不能改成当前执行拥有方。
+    pub fn claim_task_for_execution_scope(
+        &self,
+        task_id: &TaskId,
+        scope_root: &TaskId,
+        worker_id: &WorkerId,
+        role: &str,
+        duration_ms: u64,
+    ) -> DomainResult<Option<TaskLease>> {
+        let task = self
+            .get_task(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        self.grant_lease_and_start_task_inner(
+            task_id,
+            &task.root_task_id,
+            Some(scope_root),
+            worker_id,
+            role,
+            duration_ms,
+        )
+    }
+
+    fn grant_lease_and_start_task_inner(
+        &self,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        scope_root: Option<&TaskId>,
         worker_id: &WorkerId,
         role: &str,
         duration_ms: u64,
@@ -1705,16 +2423,20 @@ impl TaskStore {
             .expect("task mutation lock poisoned");
         let mut tasks = self.tasks.read().expect("tasks read lock poisoned").clone();
         Self::validate_task_root(&tasks, task_id, root_task_id)?;
+        if let Some(scope) = scope_root
+            && Self::execution_scope_root_in_tasks(&tasks, task_id)? != *scope
+        {
+            return Ok(None);
+        }
         let task = tasks
             .get(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         if task.status != TaskStatus::Pending {
-            return Err(DomainError::InvalidState {
-                message: format!(
-                    "任务 {} 只能从 Pending 获得执行租约，当前状态为 {:?}",
-                    task_id, task.status
-                ),
-            });
+            return Ok(None);
+        }
+        // Runner 扫描与这里的事务之间父任务可能已结束，必须在授予前重新检查。
+        if !Self::ancestor_chain_allows_dispatch_inner(task, &tasks) {
+            return Ok(None);
         }
 
         let mut leases = self
@@ -1804,7 +2526,7 @@ impl TaskStore {
 
     /// 在一个 TaskStore 事务中完成指定租约和任务。
     ///
-    /// 只有不存在或已经失效的租约会返回 `Ok(false)`，用于丢弃迟到结果。合同校验
+    /// 不存在、已经失效的租约或已关闭的父链返回 `Ok(false)`，用于丢弃迟到结果。合同校验
     /// 与 checkpoint 错误会原样返回，绝不能通过读取任务内存状态猜测错误类型。
     pub fn complete_lease_and_task(
         &self,
@@ -1841,6 +2563,14 @@ impl TaskStore {
         }
         Self::validate_task_root(&tasks, task_id, root_task_id)?;
         Self::validate_lease_contract(&tasks, &lease)?;
+        // 执行循环的检查与结果提交不是同一事务；父任务可能在结果返回途中结束。
+        // 原 Task/lease 留给既有级联终止入口结算，不能把迟到成功写成新的终态。
+        if tasks
+            .get(task_id)
+            .is_none_or(|task| !Self::ancestor_chain_is_active(task, &tasks, false))
+        {
+            return Ok(false);
+        }
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
@@ -1887,6 +2617,7 @@ impl TaskStore {
             status,
             output_refs,
             false,
+            None,
         )
     }
 
@@ -1906,9 +2637,201 @@ impl TaskStore {
             status,
             output_refs,
             true,
+            None,
         )
     }
 
+    /// 过期扫描与转交/续租竞争时，只有仍属于本执行范围且确实过期的原租约可失败。
+    pub fn expire_lease_for_execution_scope(
+        &self,
+        scope_root: &TaskId,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+    ) -> DomainResult<bool> {
+        let task = self
+            .get_task(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        self.revoke_lease_and_set_task_terminal_inner(
+            task_id,
+            &task.root_task_id,
+            Some(lease_id),
+            TaskStatus::Failed,
+            vec![format!("任务 {task_id} 租约已过期")],
+            false,
+            Some(scope_root),
+        )
+    }
+
+    /// 在一次 TaskStore mutation 内收口整棵任务树。子任务列表、租约和终态使用同一
+    /// 快照，避免调用方先扫描再逐项取消期间新任务/租约穿过取消屏障。损坏的单个
+    /// 节点会被报告，但不会阻止其余合法节点在同一 checkpoint 中结算。
+    pub fn revoke_active_leases_and_set_subtree_terminal(
+        &self,
+        root_task_id: &TaskId,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+    ) -> DomainResult<bool> {
+        self.set_subtree_terminal(
+            root_task_id,
+            status,
+            output_refs,
+            SubtreeTerminalSelection::Audit,
+        )
+    }
+
+    /// 终止当前拥有方的执行范围，不跨越已提交的转交边界。会话关闭等整体销毁
+    /// 仍使用完整子树入口，以免留下已转交执行。
+    pub fn revoke_active_leases_and_set_execution_subtree_terminal(
+        &self,
+        root_task_id: &TaskId,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+    ) -> DomainResult<bool> {
+        self.set_subtree_terminal(
+            root_task_id,
+            status,
+            output_refs,
+            SubtreeTerminalSelection::Execution,
+        )
+    }
+
+    /// 父终态、执行拥有方和后代结算在同一 mutation 中检查；不使用 Runner 的旧扫描
+    /// 结果决定取消范围，也不跨过已提交的转交边界。
+    pub fn revoke_orphaned_execution_descendants(&self, scope_root: &TaskId) -> DomainResult<bool> {
+        self.set_subtree_terminal(
+            scope_root,
+            TaskStatus::Killed,
+            Vec::new(),
+            SubtreeTerminalSelection::OrphanedExecution,
+        )
+    }
+
+    /// Runner 报告不可运行后，候选可能已完成或转交。只有仍属于该拥有方的活跃
+    /// 且尚未取得执行租约的候选才能触发失败；检查与终态提交不能分开，否则会
+    /// 误停仍正常执行的主线。
+    pub fn fail_unrunnable_execution_scope(
+        &self,
+        scope_root: &TaskId,
+        candidates: &[TaskId],
+        output_refs: Vec<String>,
+    ) -> DomainResult<bool> {
+        self.set_subtree_terminal(
+            scope_root,
+            TaskStatus::Failed,
+            output_refs,
+            SubtreeTerminalSelection::ExecutionIfActive(candidates),
+        )
+    }
+
+    fn set_subtree_terminal(
+        &self,
+        root_task_id: &TaskId,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+        selection: SubtreeTerminalSelection<'_>,
+    ) -> DomainResult<bool> {
+        if !matches!(status, TaskStatus::Failed | TaskStatus::Killed) {
+            return Err(DomainError::InvalidState {
+                message: "子树批量结算只能写入 Failed 或 Killed 终态".into(),
+            });
+        }
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .expect("task mutation lock poisoned");
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        let audit_root_id = tasks
+            .get(root_task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?
+            .root_task_id
+            .clone();
+        let execution_only = !matches!(selection, SubtreeTerminalSelection::Audit);
+        let mut task_ids = collect_subtree_ids_in_scope(&tasks, root_task_id, execution_only);
+        let leases = self.leases.read().expect("leases read lock poisoned");
+        match selection {
+            SubtreeTerminalSelection::ExecutionIfActive(candidates) => {
+                if !task_ids.iter().any(|id| {
+                    candidates.contains(id)
+                        && tasks
+                            .get(id)
+                            .is_some_and(|task| !is_terminal_status(task.status))
+                        && !leases.values().any(|lease| {
+                            lease.task_id == *id && lease.lease_status == TaskLeaseState::Active
+                        })
+                }) {
+                    return Ok(false);
+                }
+            }
+            SubtreeTerminalSelection::OrphanedExecution => {
+                // 遍历保证父节点先于后代；一次扫描传播终态祖先，不反复扫描每棵子树。
+                // 已转交节点及其后代不在当前 scope 中，不能被原 Runner 清理。
+                let mut closed_branches = HashSet::new();
+                task_ids.retain(|id| {
+                    let task = &tasks[id];
+                    let orphaned = task
+                        .parent_task_id
+                        .as_ref()
+                        .is_some_and(|parent| closed_branches.contains(parent));
+                    if orphaned || is_terminal_status(task.status) {
+                        closed_branches.insert(id.clone());
+                    }
+                    orphaned
+                });
+            }
+            SubtreeTerminalSelection::Audit | SubtreeTerminalSelection::Execution => {}
+        }
+        if task_ids.is_empty() {
+            return Ok(false);
+        }
+        let candidate_tasks = tasks.clone();
+        drop(tasks);
+        let mut tasks = candidate_tasks;
+        let candidate_leases = leases.clone();
+        drop(leases);
+        let mut leases = candidate_leases;
+        let mut errors = Vec::new();
+        let mut changes = Vec::new();
+        for task_id in task_ids {
+            match Self::prepare_task_terminal_in_maps(
+                &mut tasks,
+                &mut leases,
+                &task_id,
+                &audit_root_id,
+                None,
+                status,
+                output_refs.clone(),
+                true,
+            ) {
+                Ok(Some((old_status, task))) => changes.push((task_id, old_status, task)),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("任务 {task_id}: {error}")),
+            }
+        }
+        if !changes.is_empty() {
+            let mission_index = self
+                .mission_index
+                .read()
+                .expect("mission index lock poisoned")
+                .clone();
+            let snapshot =
+                Self::snapshot_from_maps_with_dirty_roots(&tasks, &leases, vec![audit_root_id]);
+            self.fire_checkpoint(&snapshot)?;
+            self.commit_maps(tasks, leases, mission_index);
+        }
+        drop(_mutation_guard);
+        for (task_id, old_status, task) in &changes {
+            self.emit_status_change(task_id, *old_status, status, task.clone());
+        }
+        if errors.is_empty() {
+            Ok(!changes.is_empty())
+        } else {
+            Err(DomainError::InvalidState {
+                message: errors.join("；"),
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn revoke_lease_and_set_task_terminal_inner(
         &self,
         task_id: &TaskId,
@@ -1917,6 +2840,7 @@ impl TaskStore {
         status: TaskStatus,
         output_refs: Vec<String>,
         discover_active_lease: bool,
+        expiry_scope: Option<&TaskId>,
     ) -> DomainResult<bool> {
         if !matches!(status, TaskStatus::Failed | TaskStatus::Killed) {
             return Err(DomainError::InvalidState {
@@ -1933,7 +2857,58 @@ impl TaskStore {
             .read()
             .expect("leases read lock poisoned")
             .clone();
-        Self::validate_task_root(&tasks, task_id, root_task_id)?;
+        if let Some(scope) = expiry_scope
+            && (Self::execution_scope_root_in_tasks(&tasks, task_id)? != *scope
+                || lease_id.and_then(|id| leases.get(id)).is_none_or(|lease| {
+                    lease.lease_status != TaskLeaseState::Active
+                        || lease.expires_at >= UtcMillis::now()
+                }))
+        {
+            return Ok(false);
+        }
+        let Some((old_status, cloned_task)) = Self::prepare_task_terminal_in_maps(
+            &mut tasks,
+            &mut leases,
+            task_id,
+            root_task_id,
+            lease_id,
+            status,
+            output_refs,
+            discover_active_lease,
+        )?
+        else {
+            return Ok(false);
+        };
+        let mission_index = self
+            .mission_index
+            .read()
+            .expect("mission_index read lock poisoned")
+            .clone();
+        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
+            &tasks,
+            &leases,
+            vec![cloned_task.root_task_id.clone()],
+        );
+        self.fire_checkpoint(&snapshot)?;
+        self.commit_maps(tasks, leases, mission_index);
+        drop(_mutation_guard);
+        self.emit_status_change(task_id, old_status, status, cloned_task);
+        Ok(true)
+    }
+
+    /// 只在候选 maps 中准备终态；单任务与整子树取消共用同一租约/状态校验。
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_task_terminal_in_maps(
+        tasks: &mut HashMap<TaskId, Task>,
+        leases: &mut HashMap<LeaseId, TaskLease>,
+        task_id: &TaskId,
+        root_task_id: &TaskId,
+        lease_id: Option<&LeaseId>,
+        status: TaskStatus,
+        output_refs: Vec<String>,
+        discover_active_lease: bool,
+    ) -> DomainResult<Option<(TaskStatus, Task)>> {
+        Self::validate_task_root(tasks, task_id, root_task_id)?;
         let active_leases = leases
             .values()
             .filter(|lease| {
@@ -1942,7 +2917,7 @@ impl TaskStore {
             .cloned()
             .collect::<Vec<_>>();
         for active_lease in &active_leases {
-            Self::validate_lease_contract(&tasks, active_lease)?;
+            Self::validate_lease_contract(tasks, active_lease)?;
             if active_lease.root_task_id != *root_task_id {
                 return Err(DomainError::InvalidState {
                     message: format!(
@@ -1966,7 +2941,7 @@ impl TaskStore {
                     message: format!("终态任务 {} 不能拥有活跃租约，必须先修复任务投影", task_id),
                 });
             }
-            return Ok(false);
+            return Ok(None);
         }
         let requested_lease = if discover_active_lease {
             active_leases.first().cloned()
@@ -1974,21 +2949,21 @@ impl TaskStore {
             match lease_id {
                 Some(expected) => {
                     let Some(lease) = leases.get(expected).cloned() else {
-                        return Ok(false);
+                        return Ok(None);
                     };
                     if lease.task_id != *task_id {
                         return Err(DomainError::InvalidState {
                             message: format!("租约 {} 不属于任务 {}", expected, task_id),
                         });
                     }
-                    Self::validate_lease_contract(&tasks, &lease)?;
+                    Self::validate_lease_contract(tasks, &lease)?;
                     if lease.root_task_id != *root_task_id {
                         return Err(DomainError::InvalidState {
                             message: format!("租约 {} 不属于 root task {}", expected, root_task_id),
                         });
                     }
                     if lease.lease_status != TaskLeaseState::Active {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     Some(lease)
                 }
@@ -2000,7 +2975,7 @@ impl TaskStore {
             .as_ref()
             .and_then(|active_id| leases.get(active_id))
         {
-            Self::validate_lease_contract(&tasks, active_lease)?;
+            Self::validate_lease_contract(tasks, active_lease)?;
             if active_lease.root_task_id != *root_task_id {
                 return Err(DomainError::InvalidState {
                     message: format!(
@@ -2012,10 +2987,10 @@ impl TaskStore {
         }
         match (requested_lease.as_ref(), active_lease_id.as_ref()) {
             (Some(expected), Some(actual)) if expected.lease_id != *actual => {
-                return Ok(false);
+                return Ok(None);
             }
             (Some(_), None) => {
-                return Ok(false);
+                return Ok(None);
             }
             (None, Some(_)) => {
                 return Err(DomainError::InvalidState {
@@ -2047,30 +3022,40 @@ impl TaskStore {
                 .ok_or(DomainError::NotFound { entity: "Lease" })?
                 .lease_status = TaskLeaseState::Revoked;
         }
-        let mission_index = self
-            .mission_index
-            .read()
-            .expect("mission_index read lock poisoned")
-            .clone();
-        let snapshot = Self::snapshot_from_maps_with_dirty_roots(
-            &tasks,
-            &leases,
-            vec![cloned_task.root_task_id.clone()],
-        );
-        self.fire_checkpoint(&snapshot)?;
-        self.commit_maps(tasks, leases, mission_index);
-        drop(_mutation_guard);
-        self.emit_status_change(task_id, old_status, status, cloned_task);
-        Ok(true)
+        Ok(Some((old_status, cloned_task)))
     }
 
     /// 更新活跃租约的心跳时间。
     pub fn heartbeat_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
+        self.heartbeat_lease_inner(task_id, lease_id, None)
+    }
+
+    pub fn heartbeat_lease_for_execution_scope(
+        &self,
+        scope_root: &TaskId,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+    ) -> bool {
+        self.heartbeat_lease_inner(task_id, lease_id, Some(scope_root))
+    }
+
+    fn heartbeat_lease_inner(
+        &self,
+        task_id: &TaskId,
+        lease_id: &LeaseId,
+        scope_root: Option<&TaskId>,
+    ) -> bool {
         let _mutation_guard = self
             .mutation_lock
             .lock()
             .expect("task mutation lock poisoned");
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        if let Some(scope) = scope_root
+            && !Self::execution_scope_root_in_tasks(&tasks, task_id)
+                .is_ok_and(|root| root == *scope)
+        {
+            return false;
+        }
         let Some(lease) = self
             .leases
             .read()
@@ -2101,34 +3086,36 @@ impl TaskStore {
         true
     }
 
-    /// 扫描指定 root_task_id 下的租约，返回已过期（Active 且 expires_at < now）的租约。
-    /// 不修改其状态，由调用方决定恢复策略后处理。
-    pub fn collect_expired_leases(&self, root_task_id: &TaskId) -> Vec<(TaskId, LeaseId)> {
-        let now = UtcMillis::now();
-        let leases = self.leases.read().expect("leases read lock poisoned");
-        leases
-            .values()
-            .filter(|l| {
-                l.lease_status == TaskLeaseState::Active
-                    && l.expires_at < now
-                    && l.root_task_id == *root_task_id
-            })
-            .map(|l| (l.task_id.clone(), l.lease_id.clone()))
-            .collect()
+    /// 扫描当前执行范围中已过期的活跃租约，不修改状态。
+    pub fn collect_expired_leases(&self, scope_root: &TaskId) -> Vec<(TaskId, LeaseId)> {
+        self.collect_leases_for_execution_scope(scope_root, true)
     }
 
-    /// 获取指定 root_task_id 下所有未过期的活跃租约（Active 且 expires_at >= now）。
-    pub fn collect_active_leases(&self, root_task_id: &TaskId) -> Vec<(TaskId, LeaseId)> {
+    /// 获取当前执行范围中未过期的活跃租约。
+    pub fn collect_active_leases(&self, scope_root: &TaskId) -> Vec<(TaskId, LeaseId)> {
+        self.collect_leases_for_execution_scope(scope_root, false)
+    }
+
+    /// 仅为当前调度拥有方收集租约，原 root 不能再为已转交执行续租或报告过期。
+    fn collect_leases_for_execution_scope(
+        &self,
+        scope_root: &TaskId,
+        expired: bool,
+    ) -> Vec<(TaskId, LeaseId)> {
         let now = UtcMillis::now();
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        let ids = collect_subtree_ids_in_scope(&tasks, scope_root, true)
+            .into_iter()
+            .collect::<HashSet<_>>();
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
             .values()
-            .filter(|l| {
-                l.lease_status == TaskLeaseState::Active
-                    && l.expires_at >= now
-                    && l.root_task_id == *root_task_id
+            .filter(|lease| {
+                lease.lease_status == TaskLeaseState::Active
+                    && (lease.expires_at < now) == expired
+                    && ids.contains(&lease.task_id)
             })
-            .map(|l| (l.task_id.clone(), l.lease_id.clone()))
+            .map(|lease| (lease.task_id.clone(), lease.lease_id.clone()))
             .collect()
     }
 
@@ -2170,7 +3157,7 @@ impl TaskStore {
             .filter(|lease| lease.lease_status == TaskLeaseState::Active)
             .map(|lease| (lease.task_id.clone(), lease.lease_id.clone()))
             .collect::<Vec<_>>();
-        let recoverable_branch_task_ids = worker_snapshot
+        let interrupted_task_ids = worker_snapshot
             .branches
             .iter()
             .filter_map(|branch| {
@@ -2181,16 +3168,36 @@ impl TaskStore {
                 )
                 .then(|| branch.task_id.clone())
             })
+            // Agent 的创建已持久化，但排队期间还可能没有 worker/lease。
+            // 转交后的原主线也可能已结束，不能只靠主线 sidecar 或 Worker
+            // 快照发现这些遗留 activation。重启不自动执行旧委派。
+            .chain(
+                tasks
+                    .values()
+                    .filter(|task| {
+                        task.parent_task_id.is_some()
+                            && task.agent_activation().is_some()
+                            && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                    })
+                    .map(|task| task.task_id.clone()),
+            )
             .collect::<Vec<_>>();
-        if active_leases.is_empty() && recoverable_branch_task_ids.is_empty() {
+        if active_leases.is_empty() && interrupted_task_ids.is_empty() {
             return Ok((0, 0));
         }
 
         let mut affected_roots = HashSet::new();
+        let mut affected_scopes = HashSet::new();
+        for task_id in active_leases
+            .iter()
+            .map(|(task_id, _)| task_id)
+            .chain(interrupted_task_ids.iter())
+        {
+            let scope = Self::execution_scope_root_in_tasks(&tasks, task_id)?;
+            affected_roots.insert(tasks[task_id].root_task_id.clone());
+            affected_scopes.insert(scope);
+        }
         for (task_id, lease_id) in &active_leases {
-            if let Some(task) = tasks.get(task_id) {
-                affected_roots.insert(task.root_task_id.clone());
-            }
             if let Some(lease) = leases.get_mut(lease_id)
                 && lease.task_id == *task_id
                 && lease.lease_status == TaskLeaseState::Active
@@ -2198,16 +3205,10 @@ impl TaskStore {
                 lease.lease_status = TaskLeaseState::Revoked;
             }
         }
-        for task_id in &recoverable_branch_task_ids {
-            if let Some(task) = tasks.get(task_id) {
-                affected_roots.insert(task.root_task_id.clone());
-            }
-        }
-
         let now = UtcMillis::now();
         let mut failed_count = 0usize;
-        for root_task_id in &affected_roots {
-            for task_id in collect_subtree_ids_from_tasks(&tasks, root_task_id) {
+        for scope in &affected_scopes {
+            for task_id in collect_subtree_ids_in_scope(&tasks, scope, true) {
                 if let Some(task) = tasks.get_mut(&task_id)
                     && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
                 {
@@ -2620,6 +3621,7 @@ impl TaskStore {
 
     fn restore_checked(checkpoint: TaskStoreCheckpoint) -> io::Result<Self> {
         Self::validate_checkpoint(&checkpoint)?;
+        Self::validate_agent_history(&checkpoint)?;
         let store = Self::new();
         {
             let mut tasks = store.tasks.write().expect("tasks write lock poisoned");
@@ -2721,7 +3723,131 @@ impl TaskStore {
             .leases
             .sort_by(|left, right| left.lease_id.as_str().cmp(right.lease_id.as_str()));
         Self::validate_checkpoint(&checkpoint)?;
+        Self::validate_agent_history(&checkpoint)?;
         Ok(checkpoint)
+    }
+
+    /// Activation 可跨 root；只在完整恢复集合上校验来源，不能用单 root 增量快照裁决。
+    fn validate_agent_history(checkpoint: &TaskStoreCheckpoint) -> io::Result<()> {
+        let mut generations = HashSet::new();
+        let mut transfer_operations = HashSet::new();
+        let all = checkpoint
+            .tasks
+            .iter()
+            .map(|task| (&task.task_id, task))
+            .collect::<HashMap<_, _>>();
+        for task in &checkpoint.tasks {
+            if task.delegation_allowed() && task.agent_activation().is_none() {
+                return Err(Self::invalid_projection(
+                    "受委派代理缺少持久 activation 身份",
+                ));
+            }
+            let Some(binding) = task.agent_activation() else {
+                if task.agent_run_transfer().is_some() {
+                    return Err(Self::invalid_projection("转交子树缺少 Agent activation"));
+                }
+                continue;
+            };
+            if let Some(transfer) = task.agent_run_transfer() {
+                let parent = task
+                    .parent_task_id
+                    .as_ref()
+                    .and_then(|id| all.get(id))
+                    .ok_or_else(|| Self::invalid_projection("转交子树缺少原父任务"))?;
+                Self::validate_agent_transfer_binding(parent, task, transfer)
+                    .map_err(|error| Self::invalid_projection(error.to_string()))?;
+                Self::validate_agent_transfer_subtree(checkpoint.tasks.iter(), task, transfer)
+                    .map_err(|error| Self::invalid_projection(error.to_string()))?;
+                if !transfer_operations.insert(transfer.operation_id.clone()) {
+                    return Err(Self::invalid_projection("子树转交 operation_id 重复"));
+                }
+            }
+            if task
+                .parent_task_id
+                .as_ref()
+                .and_then(|id| all.get(id))
+                .is_none_or(|parent| {
+                    parent.root_task_id != task.root_task_id || parent.mission_id != task.mission_id
+                })
+            {
+                return Err(Self::invalid_projection(
+                    "Agent activation 父任务归属不匹配",
+                ));
+            }
+            if let Some(parent) = task.parent_task_id.as_ref().and_then(|id| all.get(id)) {
+                if task.delegation_allowed()
+                    && (parent.parent_task_id.is_some()
+                        || parent.executor_binding_target_role() != Some("coordinator")
+                        || parent.root_task_id != parent.task_id
+                        || task.policy_snapshot != parent.policy_snapshot
+                        || task.workspace_scope != parent.workspace_scope
+                        || task.write_scope != parent.write_scope)
+                {
+                    return Err(Self::invalid_projection("代理委派来源无效"));
+                }
+                if parent.parent_task_id.is_some() {
+                    let root = all
+                        .get(&task.root_task_id)
+                        .ok_or_else(|| Self::invalid_projection("嵌套代理 root 缺失"))?;
+                    if !parent.delegation_allowed()
+                        || task.delegation_allowed()
+                        || parent.parent_task_id.as_ref() != Some(&root.task_id)
+                        || root.parent_task_id.is_some()
+                        || root.root_task_id != root.task_id
+                        || root.executor_binding_target_role() != Some("coordinator")
+                        || task.policy_snapshot != parent.policy_snapshot
+                        || task.workspace_scope != parent.workspace_scope
+                        || task.write_scope != parent.write_scope
+                    {
+                        return Err(Self::invalid_projection("嵌套代理授权或深度无效"));
+                    }
+                }
+            }
+            if !generations.insert((binding.agent_id.clone(), binding.generation)) {
+                return Err(Self::invalid_projection("Agent activation generation 重复"));
+            }
+            if let Some(previous_id) = &binding.previous_task_id {
+                let previous = all
+                    .get(previous_id)
+                    .ok_or_else(|| Self::invalid_projection("Agent activation 来源缺失"))?;
+                let source = previous
+                    .agent_activation()
+                    .ok_or_else(|| Self::invalid_projection("Agent activation 来源无身份"))?;
+                if source.agent_id != binding.agent_id
+                    || source.session_id != binding.session_id
+                    || source.lifetime != binding.lifetime
+                    || source.generation.checked_add(1) != Some(binding.generation)
+                    || (task.delegation_allowed() && !previous.delegation_allowed())
+                    || previous.mission_id != task.mission_id
+                    || !Self::same_agent_owner(
+                        previous
+                            .parent_task_id
+                            .as_ref()
+                            .and_then(|id| all.get(id))
+                            .copied(),
+                        all.get(task.parent_task_id.as_ref().expect("validated parent"))
+                            .expect("validated parent"),
+                    )
+                    || previous.status != TaskStatus::Completed
+                    || matches!(source.lifetime, magi_core::AgentLifetime::Turn)
+                    || previous.workspace_scope != task.workspace_scope
+                    || previous.write_scope != task.write_scope
+                    || previous.executor_binding_target_role()
+                        != task.executor_binding_target_role()
+                    || task
+                        .executor_binding_capability_ids()
+                        .iter()
+                        .any(|capability| {
+                            !previous
+                                .executor_binding_capability_ids()
+                                .contains(capability)
+                        })
+                {
+                    return Err(Self::invalid_projection("Agent activation 来源不匹配"));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_checkpoint(checkpoint: &TaskStoreCheckpoint) -> io::Result<()> {
@@ -2735,6 +3861,11 @@ impl TaskStore {
                 return Err(Self::invalid_projection(
                     "taskId/rootTaskId 为空或 taskId 重复",
                 ));
+            }
+            if let Some(binding) = task.agent_activation() {
+                binding
+                    .validate(&task.task_id)
+                    .map_err(|error| Self::invalid_projection(error.to_string()))?;
             }
             tasks_by_id.insert(task.task_id.clone(), task);
         }
@@ -2989,6 +4120,127 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_context_delivery_is_one_atomic_checkpoint_and_rejects_stale_acceptance() {
+        let store = TaskStore::new();
+        let root = rooted_task("delivery-root", "delivery-root");
+        let mut child = rooted_task("delivery-root", "delivery-child");
+        child.status = TaskStatus::Pending;
+        child.parent_task_id = Some(root.task_id.clone());
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "delivery-package".into(),
+                revision: 1,
+                parent_task_id: root.task_id.clone(),
+                summary: "inspect".into(),
+                constraints: Vec::new(),
+                expected_output: "evidence".into(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let supplement = AgentContextSupplement {
+            supplement_id: "delivery-input".into(),
+            author_task_id: root.task_id.clone(),
+            message: "inspect auth".into(),
+            references: Vec::new(),
+            estimated_tokens: 3,
+            created_at: UtcMillis(2),
+        };
+        let access = AgentContextAccessRecord {
+            record_id: "delivery-access".into(),
+            operation: magi_core::AgentContextAccessOperation::Send,
+            query: Some(supplement.message.clone()),
+            reference_ids: Vec::new(),
+            estimated_tokens: 3,
+            occurred_at: UtcMillis(2),
+        };
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::Persistence {
+                message: "injected".into(),
+            })
+        }));
+        assert!(
+            store
+                .deliver_agent_context_supplement(
+                    &child.task_id,
+                    TaskStatus::Pending,
+                    supplement.clone(),
+                    access.clone()
+                )
+                .is_err()
+        );
+        let failed = store.get_task(&child.task_id).unwrap();
+        assert_eq!(failed.agent_context_package().unwrap().revision, 1);
+        assert!(
+            failed
+                .agent_context_package()
+                .unwrap()
+                .supplements
+                .is_empty()
+        );
+        assert!(failed.agent_context_accesses().is_empty());
+        let checkpoints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::clone(&checkpoints);
+        store.set_checkpoint_callback(Box::new(move |snapshot| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            let child = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_str() == "delivery-child")
+                .unwrap();
+            assert_eq!(child.agent_context_package().unwrap().revision, 2);
+            assert_eq!(child.agent_context_package().unwrap().supplements.len(), 1);
+            assert_eq!(child.agent_context_accesses().len(), 1);
+            Ok(())
+        }));
+        assert!(
+            store
+                .deliver_agent_context_supplement(
+                    &child.task_id,
+                    TaskStatus::Running,
+                    supplement.clone(),
+                    access.clone()
+                )
+                .is_err(),
+            "过期的接纳状态不能写入"
+        );
+        store
+            .deliver_agent_context_supplement(
+                &child.task_id,
+                TaskStatus::Pending,
+                supplement.clone(),
+                access.clone(),
+            )
+            .unwrap();
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .deliver_agent_context_supplement(
+                    &child.task_id,
+                    TaskStatus::Pending,
+                    supplement,
+                    access
+                )
+                .is_err(),
+            "重复身份不能再增加 revision"
+        );
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
+        let dir = tempfile::tempdir().unwrap();
+        store
+            .checkpoint_to_projection_directory(dir.path())
+            .unwrap();
+        let restored = TaskStore::restore_from_projection_directory(dir.path()).unwrap();
+        let child = restored.unwrap().get_task(&child.task_id).unwrap();
+        assert_eq!(child.agent_context_package().unwrap().supplements.len(), 1);
+        assert_eq!(child.agent_context_accesses().len(), 1);
+    }
+
     fn successful_attempt() -> TaskCompletionAttempt {
         TaskCompletionAttempt {
             output_refs: vec!["output://task-store".to_string()],
@@ -3074,6 +4326,7 @@ mod tests {
         task.kind = TaskKind::LocalWorkflow;
         task.runtime_payload = TaskRuntimePayload::Workflow {
             workflow_id: "plugin/example/flow".into(),
+            package_digest: Some("workflow-package-digest".into()),
             checkpoint_version: 1,
             stage: "start".into(),
             checkpoint: serde_json::json!({"step": 0}),
@@ -3128,10 +4381,11 @@ mod tests {
             updated.runtime_payload,
             TaskRuntimePayload::Workflow {
                 checkpoint_version: 2,
+                package_digest: Some(digest),
                 stage,
                 checkpoint,
                 ..
-            } if stage == "execute" && checkpoint == serde_json::json!({"step": 1})
+            } if stage == "execute" && checkpoint == serde_json::json!({"step": 1}) && digest == "workflow-package-digest"
         ));
     }
 
@@ -3144,6 +4398,7 @@ mod tests {
         task.kind = TaskKind::LocalWorkflow;
         task.runtime_payload = TaskRuntimePayload::Workflow {
             workflow_id: "plugin/example/flow".into(),
+            package_digest: Some("workflow-package-digest".into()),
             checkpoint_version: 1,
             stage: "start".into(),
             checkpoint: serde_json::Value::Null,
@@ -3651,7 +4906,7 @@ mod tests {
                     TaskLeaseState::Revoked,
                     "if lease handoff wins the race, cancellation must revoke that exact active lease"
                 ),
-                Err(DomainError::InvalidState { .. }) => {}
+                Ok(None) => {}
                 other => {
                     panic!("cancellation and lease handoff had an invalid race result: {other:?}")
                 }
@@ -3764,6 +5019,55 @@ mod tests {
     }
 
     #[test]
+    fn recovery_generation_is_durable_and_failed_checkpoint_does_not_advance_it() {
+        for start_root in [false, true] {
+            let store = TaskStore::new();
+            let id = TaskId::new("recovery-generation");
+            let mut root = rooted_task(id.as_str(), id.as_str());
+            root.status = TaskStatus::Failed;
+            store.insert_task(root.clone()).unwrap();
+            let recover = || {
+                if start_root {
+                    store.start_failed_root_for_recovery(&id)
+                } else {
+                    store.reopen_failed_task_for_recovery(&id)
+                }
+            };
+            store.set_checkpoint_callback(Box::new(|_| {
+                Err(DomainError::InvalidState {
+                    message: "checkpoint failure".into(),
+                })
+            }));
+            assert!(recover().is_err());
+            assert_eq!(
+                serde_json::to_value(store.get_task(&id).unwrap()).unwrap(),
+                serde_json::to_value(root).unwrap()
+            );
+            let checkpoint = Arc::new(Mutex::new(None));
+            let observed = checkpoint.clone();
+            store.set_checkpoint_callback(Box::new(move |snapshot| {
+                *observed.lock().unwrap() = Some(snapshot.clone());
+                Ok(())
+            }));
+            recover().unwrap();
+            let recovered = store.get_task(&id).unwrap();
+            assert_eq!(recovered.retry_count, 1);
+            assert_eq!(
+                recovered.status,
+                if start_root {
+                    TaskStatus::Running
+                } else {
+                    TaskStatus::Pending
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(&checkpoint.lock().unwrap().as_ref().unwrap().tasks).unwrap(),
+                serde_json::to_value(vec![recovered]).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn completion_gate_rejects_missing_final_response_without_mutating_task() {
         let store = TaskStore::new();
         let task_id = TaskId::new("task-final-response-required");
@@ -3833,6 +5137,1828 @@ mod tests {
         value.root_task_id = TaskId::new(root_task_id);
         value.parent_task_id = (task_id != root_task_id).then(|| TaskId::new(root_task_id));
         value
+    }
+
+    #[test]
+    fn execution_lease_rejects_terminal_ancestors_before_cascade_cleanup() {
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let store = TaskStore::new();
+            let root = rooted_task("guard-root", "guard-root");
+            let parent = rooted_task("guard-root", "guard-parent");
+            let mut child = rooted_task("guard-root", "guard-child");
+            child.parent_task_id = Some(parent.task_id.clone());
+            for task in [&root, &parent, &child] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            let lease = store
+                .grant_lease(
+                    &child.task_id,
+                    &root.task_id,
+                    &WorkerId::new("guard-worker"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap();
+            assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+            if status == TaskStatus::Completed {
+                store
+                    .complete_task(&parent.task_id, successful_attempt())
+                    .unwrap();
+            } else {
+                store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &parent.task_id,
+                        &root.task_id,
+                        status,
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                store.get_active_lease(&child.task_id).is_some(),
+                "不依赖 Runner 已经级联清理子任务"
+            );
+            assert!(!store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        }
+    }
+
+    #[test]
+    fn lease_admission_rechecks_parent_after_runnable_scan() {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let store = TaskStore::new();
+            let root = rooted_task("admission-race-root", "admission-race-root");
+            let parent = rooted_task("admission-race-root", "admission-race-parent");
+            let mut child = rooted_task("admission-race-root", "admission-race-child");
+            child.parent_task_id = Some(parent.task_id.clone());
+            child.status = TaskStatus::Pending;
+            for task in [&root, &parent, &child] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            assert!(
+                store
+                    .get_runnable_leaves(&root.task_id)
+                    .iter()
+                    .any(|task| task.task_id == child.task_id)
+            );
+            if terminal == TaskStatus::Completed {
+                store
+                    .complete_task(&parent.task_id, successful_attempt())
+                    .unwrap();
+            } else {
+                store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &parent.task_id,
+                        &root.task_id,
+                        terminal,
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let before = store.snapshot();
+            assert!(
+                store
+                    .grant_lease_and_start_task(
+                        &child.task_id,
+                        &root.task_id,
+                        &WorkerId::new("race-worker"),
+                        "executor",
+                        60_000
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let after = store.snapshot();
+            assert_eq!(
+                serde_json::to_value(&after.tasks).unwrap(),
+                serde_json::to_value(&before.tasks).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&after.leases).unwrap(),
+                serde_json::to_value(&before.leases).unwrap()
+            );
+            assert!(store.get_active_lease(&child.task_id).is_none());
+        }
+    }
+
+    #[test]
+    fn lease_handoff_loser_does_not_change_winning_execution() {
+        let store = TaskStore::new();
+        let root = rooted_task("handoff-root", "handoff-root");
+        let mut child = rooted_task("handoff-root", "handoff-child");
+        child.status = TaskStatus::Pending;
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let winner = store
+            .grant_lease_and_start_task(
+                &child.task_id,
+                &root.task_id,
+                &WorkerId::new("winner"),
+                "executor",
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        store.set_checkpoint_callback(Box::new(|_| panic!("losing admission must not checkpoint")));
+        assert!(
+            store
+                .grant_lease_and_start_task(
+                    &child.task_id,
+                    &root.task_id,
+                    &WorkerId::new("loser"),
+                    "executor",
+                    60_000
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get_active_lease(&child.task_id).unwrap().lease_id,
+            winner.lease_id
+        );
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn runnable_and_lease_admission_reject_broken_ancestor_lineage() {
+        for invalid in ["cycle", "missing", "mission", "root"] {
+            let store = TaskStore::new();
+            let root = rooted_task("lineage-root", "lineage-root");
+            let parent = rooted_task("lineage-root", "lineage-parent");
+            let mut child = rooted_task("lineage-root", "lineage-child");
+            child.parent_task_id = Some(parent.task_id.clone());
+            child.status = TaskStatus::Pending;
+            for task in [&root, &parent, &child] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            let mut tasks = store.tasks.write().unwrap();
+            let parent = tasks.get_mut(&parent.task_id).unwrap();
+            match invalid {
+                "cycle" => parent.parent_task_id = Some(parent.task_id.clone()),
+                "missing" => parent.parent_task_id = Some(TaskId::new("missing")),
+                "mission" => parent.mission_id = MissionId::new("other-mission"),
+                "root" => parent.root_task_id = TaskId::new("other-root"),
+                _ => unreachable!(),
+            }
+            drop(tasks);
+            assert!(
+                store.get_runnable_leaves(&root.task_id).is_empty(),
+                "{invalid}"
+            );
+            assert!(
+                store
+                    .grant_lease_and_start_task(
+                        &child.task_id,
+                        &root.task_id,
+                        &WorkerId::new("lineage-worker"),
+                        "executor",
+                        60_000
+                    )
+                    .unwrap()
+                    .is_none(),
+                "{invalid}"
+            );
+            assert!(store.get_active_lease(&child.task_id).is_none());
+        }
+    }
+
+    #[test]
+    fn lease_completion_drops_result_after_ancestor_closed_before_commit() {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let store = TaskStore::new();
+            let root = rooted_task("completion-race-root", "completion-race-root");
+            let parent = rooted_task("completion-race-root", "completion-race-parent");
+            let mut child = rooted_task("completion-race-root", "completion-race-child");
+            child.parent_task_id = Some(parent.task_id.clone());
+            child.status = TaskStatus::Pending;
+            for task in [&root, &parent, &child] {
+                store.insert_task(task.clone()).unwrap();
+            }
+            let lease = store
+                .grant_lease_and_start_task(
+                    &child.task_id,
+                    &root.task_id,
+                    &WorkerId::new("race-worker"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+            if terminal == TaskStatus::Completed {
+                store
+                    .complete_task(&parent.task_id, successful_attempt())
+                    .unwrap();
+            } else {
+                store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &parent.task_id,
+                        &root.task_id,
+                        terminal,
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let before = store.snapshot();
+            assert!(
+                !store
+                    .complete_lease_and_task(
+                        &child.task_id,
+                        &root.task_id,
+                        &lease.lease_id,
+                        successful_attempt()
+                    )
+                    .unwrap()
+            );
+            let after = store.snapshot();
+            assert_eq!(
+                serde_json::to_value(&after.tasks).unwrap(),
+                serde_json::to_value(&before.tasks).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&after.leases).unwrap(),
+                serde_json::to_value(&before.leases).unwrap()
+            );
+            assert_eq!(
+                store.get_task(&child.task_id).unwrap().status,
+                TaskStatus::Running
+            );
+            assert_eq!(
+                store.get_active_lease(&child.task_id).unwrap().lease_id,
+                lease.lease_id
+            );
+        }
+    }
+
+    #[test]
+    fn execution_lease_rejects_old_generation_and_keeps_pending_workflow_parent_live() {
+        let store = TaskStore::new();
+        let mut parent = rooted_task("guard-workflow", "guard-workflow");
+        parent.kind = magi_core::TaskKind::LocalWorkflow;
+        parent.status = TaskStatus::Pending;
+        let child = rooted_task("guard-workflow", "guard-workflow-child");
+        store.insert_task(parent.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let lease = store
+            .grant_lease(
+                &child.task_id,
+                &parent.task_id,
+                &WorkerId::new("guard-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap();
+        assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        assert!(store.revoke_lease(&child.task_id, &lease.lease_id));
+        let next = store
+            .grant_lease(
+                &child.task_id,
+                &parent.task_id,
+                &WorkerId::new("guard-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap();
+        assert!(!store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        assert!(store.execution_lease_is_current(&child.task_id, &next.lease_id));
+        assert!(!store.execution_lease_is_current(&parent.task_id, &next.lease_id));
+    }
+
+    #[test]
+    fn execution_lease_rejects_missing_or_cyclic_parent_chain() {
+        let store = TaskStore::new();
+        let root = rooted_task("guard-lineage", "guard-lineage");
+        let child = rooted_task("guard-lineage", "guard-lineage-child");
+        store.insert_task(root.clone()).unwrap();
+        store.insert_task(child.clone()).unwrap();
+        let lease = store
+            .grant_lease(
+                &child.task_id,
+                &root.task_id,
+                &WorkerId::new("guard-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap();
+        for parent in ["missing-parent", child.task_id.as_str()] {
+            store
+                .tasks
+                .write()
+                .unwrap()
+                .get_mut(&child.task_id)
+                .unwrap()
+                .parent_task_id = Some(TaskId::new(parent));
+            assert!(!store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        }
+    }
+
+    fn activation_task(root: &str, id: &str, previous: Option<&Task>) -> Task {
+        let mut value = rooted_task(root, id);
+        value.status = TaskStatus::Pending;
+        let source = previous.and_then(Task::agent_activation);
+        let mut binding = magi_core::TaskExecutorBinding::for_role("executor")
+            .with_capability_ids(vec!["general_engineering".into()]);
+        binding.agent_activation = Some(magi_core::AgentActivation {
+            agent_id: source
+                .map_or_else(|| value.task_id.clone(), |source| source.agent_id.clone()),
+            session_id: magi_core::SessionId::new("activation-session"),
+            lifetime: magi_core::AgentLifetime::Session,
+            generation: source.map_or(1, |source| source.generation + 1),
+            previous_task_id: previous.map(|task| task.task_id.clone()),
+        });
+        value.executor_binding = Some(binding);
+        value
+    }
+
+    fn transfer_fixture() -> (TaskStore, Task, Task, Task, magi_core::AgentRunTransfer) {
+        let store = TaskStore::new();
+        let mut root = rooted_task("transfer-root", "transfer-root");
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        let mut child = activation_task("transfer-root", "transfer-agent", None);
+        child.executor_binding.as_mut().unwrap().delegation_allowed = true;
+        let mut leaf = activation_task("transfer-root", "transfer-leaf", None);
+        leaf.parent_task_id = Some(child.task_id.clone());
+        for task in [&root, &child, &leaf] {
+            store.insert_task(task.clone()).unwrap();
+        }
+        let transfer = magi_core::AgentRunTransfer {
+            operation_id: "handoff-operation".into(),
+            session_id: magi_core::SessionId::new("activation-session"),
+            source_turn_id: "turn-transfer-source".into(),
+            transferred_by: root.task_id.clone(),
+            activation_generation: 1,
+            owner: magi_core::AgentRunOwner::Session,
+            transferred_at: UtcMillis::now(),
+        };
+        (store, root, child, leaf, transfer)
+    }
+
+    #[test]
+    fn restart_reconciles_queued_agent_scope_without_worker_snapshot_or_mainline() {
+        let (store, root, child, leaf, transfer) = transfer_fixture();
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+            .unwrap();
+        let sibling = rooted_task(root.task_id.as_str(), "untransferred-pending-sibling");
+        store.insert_task(sibling.clone()).unwrap();
+        let snapshot = store.snapshot();
+        let restored = TaskStore::restore_checked(TaskStoreCheckpoint {
+            tasks: snapshot.tasks,
+            leases: snapshot.leases,
+        })
+        .unwrap();
+        let before = restored.snapshot();
+        restored.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::Persistence {
+                message: "restart checkpoint failed".into(),
+            })
+        }));
+        assert!(
+            restored
+                .reconcile_volatile_runtime_after_restore(&Default::default())
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(restored.snapshot().tasks).unwrap(),
+            serde_json::to_value(before.tasks).unwrap()
+        );
+        restored.set_checkpoint_callback(Box::new(|_| Ok(())));
+        assert_eq!(
+            restored
+                .reconcile_volatile_runtime_after_restore(&Default::default())
+                .unwrap(),
+            (0, 2)
+        );
+        for task in [child, leaf] {
+            assert_eq!(
+                restored.get_task(&task.task_id).unwrap().status,
+                TaskStatus::Failed
+            );
+        }
+        for task in [root, sibling] {
+            assert_eq!(
+                restored.get_task(&task.task_id).unwrap().status,
+                task.status
+            );
+        }
+        assert_eq!(
+            restored
+                .reconcile_volatile_runtime_after_restore(&Default::default())
+                .unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn orphaned_execution_cleanup_is_atomic_and_preserves_transferred_agents() {
+        let (store, root, child, leaf, transfer) = transfer_fixture();
+        let sibling = activation_task(root.task_id.as_str(), "orphan-sibling", None);
+        store.insert_task(sibling.clone()).unwrap();
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+            .unwrap();
+        store
+            .revoke_active_lease_and_set_task_terminal(
+                &root.task_id,
+                &root.task_id,
+                TaskStatus::Failed,
+                vec!["source failed".into()],
+            )
+            .unwrap();
+        let before = {
+            let snapshot = store.snapshot();
+            serde_json::to_value((&snapshot.tasks, &snapshot.leases)).unwrap()
+        };
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "orphan checkpoint failed".into(),
+            })
+        }));
+        assert!(
+            store
+                .revoke_orphaned_execution_descendants(&root.task_id)
+                .is_err()
+        );
+        assert_eq!(
+            {
+                let snapshot = store.snapshot();
+                serde_json::to_value((&snapshot.tasks, &snapshot.leases)).unwrap()
+            },
+            before
+        );
+        store.set_checkpoint_callback(Box::new(|_| Ok(())));
+        assert!(
+            store
+                .revoke_orphaned_execution_descendants(&root.task_id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .revoke_orphaned_execution_descendants(&root.task_id)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&sibling.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+        for original in [&child, &leaf] {
+            assert_eq!(
+                store.get_task(&original.task_id).unwrap().status,
+                original.status
+            );
+        }
+        // 转交根自己结束后，由它的拥有方收口内部后代，不能沿原 root 清理。
+        store
+            .revoke_active_lease_and_set_task_terminal(
+                &child.task_id,
+                &root.task_id,
+                TaskStatus::Failed,
+                vec![],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .revoke_orphaned_execution_descendants(&root.task_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .revoke_orphaned_execution_descendants(&child.task_id)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&leaf.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+    }
+
+    #[test]
+    fn unrunnable_execution_failure_rechecks_candidates_and_rolls_back_failed_commit() {
+        for changed in ["transferred", "completed", "started", "active"] {
+            let (store, root, child, _, transfer) = transfer_fixture();
+            match changed {
+                "transferred" => {
+                    store
+                        .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                        .unwrap();
+                }
+                "completed" => {
+                    let lease = store
+                        .claim_task_for_execution_scope(
+                            &child.task_id,
+                            &root.task_id,
+                            &WorkerId::new("completion-worker"),
+                            "executor",
+                            60_000,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    store
+                        .complete_lease_and_task(
+                            &child.task_id,
+                            &root.task_id,
+                            &lease.lease_id,
+                            TaskCompletionAttempt {
+                                output_refs: vec![],
+                                final_response: Some("completed while runner scanned".into()),
+                                evidence: vec![],
+                            },
+                        )
+                        .unwrap();
+                }
+                "started" => {
+                    assert!(
+                        store
+                            .claim_task_for_execution_scope(
+                                &child.task_id,
+                                &root.task_id,
+                                &WorkerId::new("late-worker"),
+                                "executor",
+                                60_000,
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                _ => {}
+            }
+            let before = {
+                let snapshot = store.snapshot();
+                serde_json::to_value((&snapshot.tasks, &snapshot.leases)).unwrap()
+            };
+            store.set_checkpoint_callback(Box::new(|_| {
+                Err(DomainError::InvalidState {
+                    message: "failure checkpoint failed".into(),
+                })
+            }));
+            let result = store.fail_unrunnable_execution_scope(
+                &root.task_id,
+                std::slice::from_ref(&child.task_id),
+                vec!["old scan".into()],
+            );
+            if changed == "active" {
+                assert!(result.is_err());
+            } else {
+                assert!(
+                    !result.unwrap(),
+                    "stale {changed} candidate must not fail the source"
+                );
+            }
+            assert_eq!(
+                {
+                    let snapshot = store.snapshot();
+                    serde_json::to_value((&snapshot.tasks, &snapshot.leases)).unwrap()
+                },
+                before
+            );
+            store.set_checkpoint_callback(Box::new(|_| Ok(())));
+            assert_eq!(
+                store
+                    .fail_unrunnable_execution_scope(
+                        &root.task_id,
+                        std::slice::from_ref(&child.task_id),
+                        vec!["confirmed unavailable".into()],
+                    )
+                    .unwrap(),
+                changed == "active"
+            );
+            assert_eq!(
+                store.get_task(&root.task_id).unwrap().status,
+                if changed == "active" {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Running
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unrunnable_execution_failure_serializes_with_agent_transfer() {
+        for _ in 0..24 {
+            let (store, root, child, leaf, transfer) = transfer_fixture();
+            let store = Arc::new(store);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let failure_store = store.clone();
+            let failure_barrier = barrier.clone();
+            let root_id = root.task_id.clone();
+            let child_id = child.task_id.clone();
+            let failure = std::thread::spawn(move || {
+                failure_barrier.wait();
+                failure_store
+                    .fail_unrunnable_execution_scope(&root_id, &[child_id], vec![])
+                    .unwrap()
+            });
+            barrier.wait();
+            let transferred = store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                .is_ok();
+            assert_ne!(failure.join().unwrap(), transferred);
+            for task in [&root, &child, &leaf] {
+                assert_eq!(
+                    store.get_task(&task.task_id).unwrap().status,
+                    if transferred {
+                        task.status
+                    } else {
+                        TaskStatus::Failed
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transferred_execution_scope_survives_parent_terminal_and_keeps_audit_leases() {
+        for terminal in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Killed,
+        ] {
+            let (store, root, child, leaf, transfer) = transfer_fixture();
+            store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                .unwrap();
+            assert_eq!(store.collect_subtree_ids(&root.task_id).len(), 3);
+            assert_eq!(
+                store.collect_execution_subtree_ids(&root.task_id),
+                vec![root.task_id.clone()]
+            );
+            assert_eq!(
+                store.execution_scope_root(&leaf.task_id).unwrap(),
+                child.task_id
+            );
+            // 原 Runner 的旧扫描不能在转交提交后领取子任务。
+            assert!(
+                store
+                    .claim_task_for_execution_scope(
+                        &child.task_id,
+                        &root.task_id,
+                        &WorkerId::new("stale-parent-runner"),
+                        "executor",
+                        60_000
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let lease = store
+                .claim_task_for_execution_scope(
+                    &child.task_id,
+                    &child.task_id,
+                    &WorkerId::new("owner-runner"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.root_task_id, root.task_id, "租约保留原审计 root");
+            if terminal == TaskStatus::Completed {
+                store
+                    .complete_task(&root.task_id, successful_attempt())
+                    .unwrap();
+            } else {
+                store
+                    .revoke_active_leases_and_set_execution_subtree_terminal(
+                        &root.task_id,
+                        terminal,
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+            assert!(
+                store
+                    .collect_leases_for_execution_scope(&root.task_id, false)
+                    .is_empty()
+            );
+            assert_eq!(
+                store.collect_active_leases(&child.task_id),
+                vec![(child.task_id.clone(), lease.lease_id.clone())]
+            );
+            assert!(!store.heartbeat_lease_for_execution_scope(
+                &root.task_id,
+                &child.task_id,
+                &lease.lease_id
+            ));
+            assert!(store.heartbeat_lease_for_execution_scope(
+                &child.task_id,
+                &child.task_id,
+                &lease.lease_id
+            ));
+            store
+                .validate_agent_delegation(&store.get_task(&child.task_id).unwrap())
+                .unwrap();
+            let leaf_lease = store
+                .claim_task_for_execution_scope(
+                    &leaf.task_id,
+                    &child.task_id,
+                    &WorkerId::new("leaf-runner"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .complete_lease_and_task(
+                        &leaf.task_id,
+                        &root.task_id,
+                        &leaf_lease.lease_id,
+                        successful_attempt()
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .complete_lease_and_task(
+                        &child.task_id,
+                        &root.task_id,
+                        &lease.lease_id,
+                        successful_attempt()
+                    )
+                    .unwrap()
+            );
+            let restored = TaskStore::restore_checked(TaskStoreCheckpoint {
+                tasks: store.snapshot().tasks,
+                leases: store.snapshot().leases,
+            })
+            .unwrap();
+            assert_eq!(
+                restored.execution_scope_root(&leaf.task_id).unwrap(),
+                child.task_id
+            );
+            assert_eq!(restored.get_task(&root.task_id).unwrap().status, terminal);
+        }
+    }
+
+    #[test]
+    fn transferred_execution_scope_cancel_is_atomic_and_full_shutdown_crosses_boundaries() {
+        let (store, root, child, leaf, transfer) = transfer_fixture();
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+            .unwrap();
+        let lease = store
+            .claim_task_for_execution_scope(
+                &child.task_id,
+                &child.task_id,
+                &WorkerId::new("owner-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        let before = store.snapshot();
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "disk unavailable".into(),
+            })
+        }));
+        assert!(
+            store
+                .revoke_active_leases_and_set_execution_subtree_terminal(
+                    &child.task_id,
+                    TaskStatus::Killed,
+                    vec![]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.snapshot().tasks).unwrap(),
+            serde_json::to_value(before.tasks).unwrap()
+        );
+        assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        store.set_checkpoint_callback(Box::new(|_| Ok(())));
+        store
+            .revoke_active_leases_and_set_execution_subtree_terminal(
+                &root.task_id,
+                TaskStatus::Killed,
+                vec![],
+            )
+            .unwrap();
+        assert!(store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+        // 关闭 Session/整个任务树必须仍能停止所有已转交执行，不能只结束原拥有方。
+        store
+            .revoke_active_leases_and_set_subtree_terminal(
+                &root.task_id,
+                TaskStatus::Killed,
+                vec![],
+            )
+            .unwrap();
+        for task in [&root, &child, &leaf] {
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().status,
+                TaskStatus::Killed
+            );
+            assert!(store.get_active_lease(&task.task_id).is_none());
+        }
+        assert!(!store.execution_lease_is_current(&child.task_id, &lease.lease_id));
+    }
+
+    #[test]
+    fn transferred_execution_scope_rechecks_expiry_after_scan_and_before_commit() {
+        let (store, root, child, _, transfer) = transfer_fixture();
+        let lease = store
+            .claim_task_for_execution_scope(
+                &child.task_id,
+                &root.task_id,
+                &WorkerId::new("old-scope"),
+                "executor",
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        // 固定旧租约的过期事实，不用真实 sleep 制造竞争窗口。
+        let mut checkpoint = store.snapshot();
+        let observed = checkpoint
+            .leases
+            .iter_mut()
+            .find(|item| item.lease_id == lease.lease_id)
+            .unwrap();
+        observed.granted_at = UtcMillis(1);
+        observed.heartbeat_at = UtcMillis(1);
+        observed.expires_at = UtcMillis(2);
+        let store = TaskStore::restore_checked(TaskStoreCheckpoint {
+            tasks: checkpoint.tasks,
+            leases: checkpoint.leases,
+        })
+        .unwrap();
+        assert_eq!(
+            store.collect_expired_leases(&root.task_id),
+            vec![(child.task_id.clone(), lease.lease_id.clone())]
+        );
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+            .unwrap();
+        assert!(
+            !store
+                .expire_lease_for_execution_scope(&root.task_id, &child.task_id, &lease.lease_id)
+                .unwrap(),
+            "旧扫描不能结束转交后的执行"
+        );
+        assert!(
+            store
+                .expire_lease_for_execution_scope(&child.task_id, &child.task_id, &lease.lease_id)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&child.task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            store.get_lease(&lease.lease_id).unwrap().root_task_id,
+            root.task_id
+        );
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn transferred_execution_scope_claim_and_source_cancel_serialize_with_handoff() {
+        for _ in 0..16 {
+            let (store, root, child, _, transfer) = transfer_fixture();
+            let store = Arc::new(store);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let cancel = std::thread::spawn({
+                let store = store.clone();
+                let barrier = barrier.clone();
+                let root = root.task_id.clone();
+                move || {
+                    barrier.wait();
+                    store
+                        .revoke_active_leases_and_set_execution_subtree_terminal(
+                            &root,
+                            TaskStatus::Killed,
+                            vec![],
+                        )
+                        .unwrap();
+                }
+            });
+            barrier.wait();
+            let transferred = store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                .is_ok();
+            cancel.join().unwrap();
+            let result = store
+                .claim_task_for_execution_scope(
+                    &child.task_id,
+                    &child.task_id,
+                    &WorkerId::new("owner"),
+                    "executor",
+                    60_000,
+                )
+                .unwrap();
+            assert_eq!(result.is_some(), transferred);
+            assert!(
+                store
+                    .claim_task_for_execution_scope(
+                        &child.task_id,
+                        &root.task_id,
+                        &WorkerId::new("old-owner"),
+                        "executor",
+                        60_000
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn subtree_terminal_commit_is_atomic_durable_and_notifies_after_all_nodes_settle() {
+        use std::sync::atomic::AtomicUsize;
+        let (store, root, child, leaf, _) = transfer_fixture();
+        let store = Arc::new(store);
+        let lease = store
+            .grant_lease_and_start_task(
+                &child.task_id,
+                &root.task_id,
+                &WorkerId::new("atomic-cancel-worker"),
+                "executor",
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        let before = store.snapshot();
+        let notices = Arc::new(AtomicUsize::new(0));
+        let received = notices.clone();
+        let source = Arc::downgrade(&store);
+        store.set_status_change_callback(Box::new(move |_, _, _, _| {
+            let snapshot = source.upgrade().unwrap().snapshot();
+            assert!(
+                snapshot
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == TaskStatus::Killed)
+            );
+            assert!(
+                snapshot
+                    .leases
+                    .iter()
+                    .all(|lease| lease.lease_status != TaskLeaseState::Active)
+            );
+            received.fetch_add(1, Ordering::SeqCst);
+        }));
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "disk failed".into(),
+            })
+        }));
+        assert!(
+            store
+                .revoke_active_leases_and_set_subtree_terminal(
+                    &root.task_id,
+                    TaskStatus::Killed,
+                    vec![]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.snapshot().tasks).unwrap(),
+            serde_json::to_value(before.tasks).unwrap()
+        );
+        assert_eq!(
+            store.get_lease(&lease.lease_id).unwrap().lease_status,
+            TaskLeaseState::Active
+        );
+        assert_eq!(notices.load(Ordering::SeqCst), 0);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let recorded = commits.clone();
+        store.set_checkpoint_callback(Box::new(move |snapshot| {
+            assert_eq!(snapshot.changed_root_ids, [TaskId::new("transfer-root")]);
+            assert!(
+                snapshot
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == TaskStatus::Killed)
+            );
+            assert!(
+                snapshot
+                    .leases
+                    .iter()
+                    .all(|lease| lease.lease_status != TaskLeaseState::Active)
+            );
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(
+            store
+                .revoke_active_leases_and_set_subtree_terminal(
+                    &root.task_id,
+                    TaskStatus::Killed,
+                    vec!["cancelled".into()]
+                )
+                .unwrap()
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(notices.load(Ordering::SeqCst), 3);
+        assert!(
+            !store
+                .revoke_active_leases_and_set_subtree_terminal(
+                    &root.task_id,
+                    TaskStatus::Killed,
+                    vec![]
+                )
+                .unwrap()
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        let directory = tempfile::tempdir().unwrap();
+        store
+            .checkpoint_to_projection_directory(directory.path())
+            .unwrap();
+        let restored = TaskStore::restore_from_projection_directory(directory.path())
+            .unwrap()
+            .unwrap();
+        for task in [root, child, leaf] {
+            assert_eq!(
+                restored.get_task(&task.task_id).unwrap().status,
+                TaskStatus::Killed
+            );
+        }
+        assert_eq!(
+            restored.get_lease(&lease.lease_id).unwrap().lease_status,
+            TaskLeaseState::Revoked
+        );
+    }
+
+    #[test]
+    fn subtree_terminal_commit_supports_direct_agent_scope_and_preserves_siblings() {
+        let (store, root, child, leaf, _) = transfer_fixture();
+        let sibling = activation_task(root.task_id.as_str(), "cancel-sibling", None);
+        store.insert_task(sibling.clone()).unwrap();
+        store
+            .revoke_active_leases_and_set_subtree_terminal(
+                &child.task_id,
+                TaskStatus::Killed,
+                vec![],
+            )
+            .unwrap();
+        for task in [&child, &leaf] {
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().status,
+                TaskStatus::Killed
+            );
+        }
+        assert_eq!(store.get_task(&root.task_id).unwrap().status, root.status);
+        assert_eq!(
+            store.get_task(&sibling.task_id).unwrap().status,
+            sibling.status
+        );
+    }
+
+    #[test]
+    fn subtree_terminal_commit_reports_bad_node_without_leaving_valid_descendants_running() {
+        let (store, root, child, leaf, _) = transfer_fixture();
+        store
+            .tasks
+            .write()
+            .unwrap()
+            .get_mut(&child.task_id)
+            .unwrap()
+            .mission_id = MissionId::new("corrupt-mission");
+        let error = store
+            .revoke_active_leases_and_set_subtree_terminal(
+                &root.task_id,
+                TaskStatus::Killed,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(child.task_id.as_str()));
+        assert_eq!(
+            store.get_task(&root.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+        assert_eq!(
+            store.get_task(&leaf.task_id).unwrap().status,
+            TaskStatus::Killed
+        );
+        assert_eq!(store.get_task(&child.task_id).unwrap().status, child.status);
+    }
+
+    #[test]
+    fn subtree_terminal_commit_serializes_with_new_activation_and_runner_lease() {
+        for attempt in 0..24 {
+            let (store, root, child, _, _) = transfer_fixture();
+            let store = Arc::new(store);
+            let barrier = Arc::new(Barrier::new(3));
+            let insert_store = store.clone();
+            let insert_barrier = barrier.clone();
+            let mut late = activation_task(
+                root.task_id.as_str(),
+                &format!("late-agent-{attempt}"),
+                None,
+            );
+            late.parent_task_id = Some(child.task_id.clone());
+            let insertion = std::thread::spawn(move || {
+                insert_barrier.wait();
+                insert_store.insert_task(late)
+            });
+            let lease_store = store.clone();
+            let lease_barrier = barrier.clone();
+            let lease_task = child.clone();
+            let leasing = std::thread::spawn(move || {
+                lease_barrier.wait();
+                lease_store.grant_lease_and_start_task(
+                    &lease_task.task_id,
+                    &lease_task.root_task_id,
+                    &WorkerId::new("racing-worker"),
+                    "executor",
+                    60_000,
+                )
+            });
+            barrier.wait();
+            store
+                .revoke_active_leases_and_set_subtree_terminal(
+                    &root.task_id,
+                    TaskStatus::Killed,
+                    vec![],
+                )
+                .unwrap();
+            let _ = insertion.join().unwrap();
+            let _ = leasing.join().unwrap().unwrap();
+            assert!(
+                store
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == TaskStatus::Killed)
+            );
+            assert!(store.collect_all_active_leases().is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_transfer_query_distinguishes_untransferred_missing_and_broken_source() {
+        let (store, root, child, _, _) = transfer_fixture();
+        assert!(
+            store
+                .agent_run_transfer_for_task(&child.task_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store.agent_run_transfer_for_task(&TaskId::new("missing")),
+            Err(DomainError::NotFound { .. })
+        ));
+        for mutation in 0..3 {
+            let (store, root, child, _, _) = transfer_fixture();
+            {
+                let mut tasks = store.tasks.write().unwrap();
+                match mutation {
+                    0 => {
+                        tasks.remove(&root.task_id);
+                    }
+                    1 => {
+                        tasks.get_mut(&root.task_id).unwrap().mission_id =
+                            MissionId::new("foreign");
+                    }
+                    _ => {
+                        tasks.get_mut(&root.task_id).unwrap().parent_task_id =
+                            Some(child.task_id.clone());
+                    }
+                }
+            }
+            assert!(
+                store.agent_run_transfer_for_task(&child.task_id).is_err(),
+                "{mutation}"
+            );
+        }
+        assert!(
+            store
+                .agent_run_transfer_for_task(&root.task_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_subtree_transfer_is_durable_atomic_and_keeps_task_parentage() {
+        let (store, root, child, leaf, transfer) = transfer_fixture();
+        let before = store.snapshot();
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "disk failed".into(),
+            })
+        }));
+        assert!(
+            store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_run_transfer_for_task(&child.task_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .agent_run_transfer_for_task(&leaf.task_id)
+                .unwrap()
+                .is_none()
+        );
+        store.set_checkpoint_callback(Box::new(|_| Ok(())));
+        assert!(
+            store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+                .unwrap()
+        );
+        let temp = tempfile::tempdir().unwrap();
+        store
+            .checkpoint_to_projection_directory(temp.path())
+            .unwrap();
+        let restored = TaskStore::restore_from_projection_directory(temp.path())
+            .unwrap()
+            .unwrap();
+        let inherited = restored
+            .agent_run_transfer_for_task(&leaf.task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited.task_id, child.task_id);
+        assert_eq!(inherited.agent_run_transfer(), Some(&transfer));
+        assert!(
+            restored
+                .agent_run_transfer_for_task(&root.task_id)
+                .unwrap()
+                .is_none()
+        );
+        let after = restored.snapshot();
+        assert_eq!(before.tasks.len(), after.tasks.len());
+        for original in before.tasks {
+            let current = restored.get_task(&original.task_id).unwrap();
+            assert_eq!(current.parent_task_id, original.parent_task_id);
+            assert_eq!(current.root_task_id, original.root_task_id);
+            assert_eq!(current.policy_snapshot, original.policy_snapshot);
+            assert_eq!(current.agent_activation(), original.agent_activation());
+        }
+        let mut changed = transfer;
+        changed.source_turn_id = "different-turn".into();
+        assert!(
+            restored
+                .transfer_agent_subtree(&root.task_id, &child.task_id, changed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_subtree_transfer_rejects_cross_owner_dependencies_on_commit_and_restore() {
+        for mutation in 0..5 {
+            let (store, root, child, leaf, transfer) = transfer_fixture();
+            let mut checkpoint = store.snapshot();
+            let target = if mutation < 2 {
+                &root.task_id
+            } else {
+                &leaf.task_id
+            };
+            let task = checkpoint
+                .tasks
+                .iter_mut()
+                .find(|task| &task.task_id == target)
+                .unwrap();
+            match mutation {
+                0 => task.required_children.push(child.task_id.clone()),
+                1 => task.dependency_ids.push(child.task_id.clone()),
+                2 => task.dependency_ids.push(root.task_id.clone()),
+                3 => task.required_children.push(root.task_id.clone()),
+                _ => {
+                    task.executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .agent_activation
+                        .as_mut()
+                        .unwrap()
+                        .session_id = magi_core::SessionId::new("foreign-session")
+                }
+            }
+            let forged = TaskStoreCheckpoint {
+                tasks: checkpoint.tasks.clone(),
+                leases: checkpoint.leases.clone(),
+            };
+            let store = TaskStore::restore_checked(TaskStoreCheckpoint {
+                tasks: checkpoint.tasks,
+                leases: checkpoint.leases,
+            })
+            .unwrap();
+            assert!(
+                store
+                    .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+                    .is_err(),
+                "commit mutation {mutation}"
+            );
+            assert!(
+                store
+                    .agent_run_transfer_for_task(&leaf.task_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let mut forged = forged;
+            forged
+                .tasks
+                .iter_mut()
+                .find(|task| task.task_id == child.task_id)
+                .unwrap()
+                .executor_binding
+                .as_mut()
+                .unwrap()
+                .agent_run_transfer = Some(transfer);
+            assert!(
+                TaskStore::restore_checked(forged).is_err(),
+                "restore mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_subtree_transfer_serializes_with_parent_cancellation() {
+        for _ in 0..16 {
+            let (store, root, child, _, transfer) = transfer_fixture();
+            let store = Arc::new(store);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let task = root.clone();
+            let cancel_store = Arc::clone(&store);
+            let cancel_barrier = Arc::clone(&barrier);
+            let cancel = std::thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_store
+                    .revoke_active_lease_and_set_task_terminal(
+                        &task.task_id,
+                        &task.task_id,
+                        TaskStatus::Killed,
+                        Vec::new(),
+                    )
+                    .unwrap();
+            });
+            barrier.wait();
+            let result =
+                store.transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone());
+            cancel.join().unwrap();
+            assert_eq!(
+                store.get_task(&root.task_id).unwrap().status,
+                TaskStatus::Killed
+            );
+            match result {
+                Ok(true) => {
+                    assert_eq!(
+                        store
+                            .agent_run_transfer_for_task(&child.task_id)
+                            .unwrap()
+                            .unwrap()
+                            .agent_run_transfer(),
+                        Some(&transfer)
+                    );
+                    // 已提交操作在父任务终态后仍能幂等核对，不能创造第二个拥有方。
+                    assert!(
+                        !store
+                            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+                            .unwrap()
+                    );
+                }
+                Err(_) => assert!(
+                    store
+                        .agent_run_transfer_for_task(&child.task_id)
+                        .unwrap()
+                        .is_none()
+                ),
+                Ok(false) => panic!("首次转交不能为重放"),
+            }
+        }
+    }
+
+    #[test]
+    fn agent_subtree_transfer_preserves_lineage_and_validates_later_children() {
+        let (store, root, child, _, transfer) = transfer_fixture();
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+            .unwrap();
+        let before = store.snapshot();
+        assert!(store.remove_task(&root.task_id).is_err());
+        assert!(store.remove_task(&child.task_id).is_err());
+        assert_eq!(
+            serde_json::to_value(store.snapshot().tasks).unwrap(),
+            serde_json::to_value(before.tasks).unwrap()
+        );
+        for mutation in 0..4 {
+            let mut leaf = activation_task(
+                root.task_id.as_str(),
+                &format!("later-leaf-{mutation}"),
+                None,
+            );
+            leaf.parent_task_id = Some(child.task_id.clone());
+            match mutation {
+                0 => {
+                    leaf.executor_binding.as_mut().unwrap().plan_item_id =
+                        Some(magi_core::PlanItemId::new("mainline-plan"))
+                }
+                1 => leaf.dependency_ids.push(root.task_id.clone()),
+                2 => {
+                    leaf.executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .agent_activation
+                        .as_mut()
+                        .unwrap()
+                        .session_id = magi_core::SessionId::new("different-session")
+                }
+                _ => {
+                    leaf.parent_task_id = Some(root.task_id.clone());
+                    leaf.required_children.push(child.task_id.clone());
+                }
+            }
+            assert!(
+                store.insert_task(leaf).is_err(),
+                "insert mutation {mutation}"
+            );
+        }
+        let mut leaf = activation_task(root.task_id.as_str(), "later-leaf", None);
+        leaf.parent_task_id = Some(child.task_id.clone());
+        store.insert_task(leaf.clone()).unwrap();
+        assert_eq!(
+            store
+                .agent_run_transfer_for_task(&leaf.task_id)
+                .unwrap()
+                .unwrap()
+                .agent_run_transfer(),
+            Some(&transfer)
+        );
+        let snapshot = store.snapshot();
+        TaskStore::restore_checked(TaskStoreCheckpoint {
+            tasks: snapshot.tasks,
+            leases: snapshot.leases,
+        })
+        .unwrap();
+        // 会话/mission 删除仍是整域结算；不能把来源保护变成无法删除的历史。
+        assert_eq!(
+            store
+                .remove_tasks_by_mission(&root.mission_id)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(store.agent_run_transfer_for_task(&leaf.task_id).is_err());
+    }
+
+    #[test]
+    fn agent_subtree_transfer_rejects_invalid_owner_plan_terminal_and_forged_restore() {
+        for mutation in 0..8 {
+            let (store, root, child, leaf, mut transfer) = transfer_fixture();
+            let target = if mutation == 0 {
+                leaf.task_id.clone()
+            } else {
+                child.task_id.clone()
+            };
+            match mutation {
+                1 => transfer.session_id = magi_core::SessionId::new("foreign-session"),
+                2 => transfer.activation_generation += 1,
+                3 => {
+                    transfer.owner = magi_core::AgentRunOwner::Goal {
+                        goal_id: magi_core::GoalId::new("goal"),
+                        control_revision: 1,
+                    }
+                }
+                4 => transfer.transferred_by = TaskId::new("someone-else"),
+                5 => {
+                    store
+                        .revoke_active_lease_and_set_task_terminal(
+                            &root.task_id,
+                            &root.task_id,
+                            TaskStatus::Killed,
+                            Vec::new(),
+                        )
+                        .unwrap();
+                }
+                6 => {
+                    store
+                        .revoke_active_lease_and_set_task_terminal(
+                            &child.task_id,
+                            &root.task_id,
+                            TaskStatus::Killed,
+                            Vec::new(),
+                        )
+                        .unwrap();
+                }
+                7 => transfer.source_turn_id.clear(),
+                _ => {}
+            }
+            assert!(
+                store
+                    .transfer_agent_subtree(&root.task_id, &target, transfer)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            assert!(
+                store
+                    .agent_run_transfer_for_task(&child.task_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (store, root, child, _, transfer) = transfer_fixture();
+        let mut snapshot = store.snapshot();
+        let index = snapshot
+            .tasks
+            .iter()
+            .position(|task| task.task_id == child.task_id)
+            .unwrap();
+        snapshot.tasks[index]
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .plan_item_id = Some(magi_core::PlanItemId::new("shared"));
+        let store = TaskStore::restore_checked(TaskStoreCheckpoint {
+            tasks: snapshot.tasks,
+            leases: snapshot.leases,
+        })
+        .unwrap();
+        assert!(
+            store
+                .transfer_agent_subtree(&root.task_id, &child.task_id, transfer.clone())
+                .is_err()
+        );
+        // 恢复不接受绕过转交事务、与原父任务或生命周期不匹配的记录。
+        let (store, root, child, _, transfer) = transfer_fixture();
+        store
+            .transfer_agent_subtree(&root.task_id, &child.task_id, transfer)
+            .unwrap();
+        for mutation in 0..4 {
+            let mut snapshot = store.snapshot();
+            let binding = snapshot
+                .tasks
+                .iter_mut()
+                .find(|task| task.task_id == child.task_id)
+                .unwrap()
+                .executor_binding
+                .as_mut()
+                .unwrap();
+            match mutation {
+                0 => {
+                    binding
+                        .agent_run_transfer
+                        .as_mut()
+                        .unwrap()
+                        .activation_generation += 1
+                }
+                1 => {
+                    binding.agent_run_transfer.as_mut().unwrap().transferred_by =
+                        child.task_id.clone()
+                }
+                2 => binding.agent_activation = None,
+                _ => binding.plan_item_id = Some(magi_core::PlanItemId::new("shared")),
+            }
+            assert!(
+                TaskStore::restore_checked(TaskStoreCheckpoint {
+                    tasks: snapshot.tasks,
+                    leases: snapshot.leases
+                })
+                .is_err(),
+                "restore mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_agent_delegation_preserves_policy_depth_and_parent_lineage() {
+        let store = TaskStore::new();
+        let mut root = rooted_task("nested-root", "nested-root");
+        root.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        store.insert_task(root.clone()).unwrap();
+        let mut parent = activation_task("nested-root", "parent-agent", None);
+        parent.executor_binding.as_mut().unwrap().delegation_allowed = true;
+        store.insert_task(parent.clone()).unwrap();
+        let mut leaf = activation_task("nested-root", "leaf-agent", None);
+        leaf.parent_task_id = Some(parent.task_id.clone());
+        assert!(store.insert_task(leaf.clone()).is_ok());
+        let snapshot = store.snapshot();
+        let checkpoint = TaskStoreCheckpoint {
+            tasks: snapshot.tasks,
+            leases: snapshot.leases,
+        };
+        TaskStore::restore_checked(TaskStoreCheckpoint {
+            tasks: checkpoint.tasks.clone(),
+            leases: checkpoint.leases.clone(),
+        })
+        .unwrap();
+        assert!(store.validate_agent_delegation(&leaf).is_err());
+        let mut forged = leaf.clone();
+        forged.task_id = TaskId::new("forged-leaf");
+        forged
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .agent_activation
+            .as_mut()
+            .unwrap()
+            .agent_id = forged.task_id.clone();
+        forged.executor_binding.as_mut().unwrap().delegation_allowed = true;
+        assert!(store.insert_task(forged).is_err());
+        for mutation in 0..4 {
+            let mut copy = TaskStoreCheckpoint {
+                tasks: checkpoint.tasks.clone(),
+                leases: checkpoint.leases.clone(),
+            };
+            let index = copy
+                .tasks
+                .iter()
+                .position(|task| task.task_id == leaf.task_id)
+                .unwrap();
+            let parent_index = copy
+                .tasks
+                .iter()
+                .position(|task| task.task_id == parent.task_id)
+                .unwrap();
+            match mutation {
+                0 => {
+                    copy.tasks[index]
+                        .executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .delegation_allowed = true
+                }
+                1 => copy.tasks[index].workspace_scope = Some("foreign".into()),
+                2 => {
+                    copy.tasks[parent_index]
+                        .executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .delegation_allowed = false
+                }
+                _ => {
+                    copy.tasks[parent_index]
+                        .executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .agent_activation = None
+                }
+            }
+            assert!(
+                TaskStore::restore_checked(copy).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let sibling = activation_task("nested-root", "sibling-agent", None);
+        store.insert_task(sibling.clone()).unwrap();
+        assert!(store.agent_resume_parent_matches(&leaf, &parent));
+        assert!(!store.agent_resume_parent_matches(&leaf, &sibling));
+        assert!(!store.agent_resume_parent_matches(&leaf, &root));
+        // 数据来自持久事实，checkpoint 失败不能偷偷放入已派发代理。
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "disk unavailable".into(),
+            })
+        }));
+        let mut next = leaf.clone();
+        next.task_id = TaskId::new("uncommitted-leaf");
+        next.executor_binding
+            .as_mut()
+            .unwrap()
+            .agent_activation
+            .as_mut()
+            .unwrap()
+            .agent_id = next.task_id.clone();
+        assert!(store.insert_task(next.clone()).is_err());
+        assert!(store.get_task(&next.task_id).is_none());
+    }
+
+    #[test]
+    fn agent_activation_concurrent_resume_accepts_only_one_successor() {
+        let store = Arc::new(TaskStore::new());
+        store
+            .insert_task(rooted_task("old-root", "old-root"))
+            .unwrap();
+        store
+            .insert_task(rooted_task("new-root", "new-root"))
+            .unwrap();
+        let mut source = activation_task("old-root", "agent-first", None);
+        source.status = TaskStatus::Completed;
+        store.insert_task(source.clone()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                let child = activation_task("new-root", &format!("next-{index}"), Some(&source));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.insert_task(child)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+        let heads = store.agent_heads_for_session(&magi_core::SessionId::new("activation-session"));
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].agent_activation().unwrap().generation, 2);
+        assert!(store.remove_task(&source.task_id).is_err());
+    }
+
+    #[test]
+    fn agent_activation_failed_checkpoint_does_not_advance_identity() {
+        let store = TaskStore::new();
+        store.insert_task(rooted_task("root", "root")).unwrap();
+        let mut source = activation_task("root", "first", None);
+        source.status = TaskStatus::Completed;
+        store.insert_task(source.clone()).unwrap();
+        store.set_checkpoint_callback(Box::new(|_| {
+            Err(DomainError::InvalidState {
+                message: "disk unavailable".into(),
+            })
+        }));
+        let next = activation_task("root", "second", Some(&source));
+        assert!(store.insert_task(next.clone()).is_err());
+        assert!(store.get_task(&next.task_id).is_none());
+        assert_eq!(
+            store.agent_heads_for_session(&magi_core::SessionId::new("activation-session"))[0]
+                .task_id,
+            source.task_id
+        );
+        store.set_checkpoint_callback(Box::new(|_| Ok(())));
+        store.insert_task(next).unwrap();
+    }
+
+    #[test]
+    fn agent_activation_restore_rejects_cross_scope_and_duplicate_lineage() {
+        let root1 = rooted_task("root1", "root1");
+        let root2 = rooted_task("root2", "root2");
+        let mut first = activation_task("root1", "first", None);
+        first.status = TaskStatus::Completed;
+        let next = activation_task("root2", "second", Some(&first));
+        let valid = TaskStoreCheckpoint {
+            tasks: vec![root1, root2, first, next],
+            leases: Vec::new(),
+        };
+        let copy = || TaskStoreCheckpoint {
+            tasks: valid.tasks.clone(),
+            leases: valid.leases.clone(),
+        };
+        TaskStore::restore_checked(copy()).unwrap();
+        for mutation in 0..7 {
+            let mut checkpoint = copy();
+            match mutation {
+                0 => {
+                    checkpoint.tasks.remove(2);
+                }
+                1 => {
+                    checkpoint.tasks[3].workspace_scope = Some("other workspace".into());
+                }
+                2 => {
+                    checkpoint.tasks[3].write_scope = Some("other scope".into());
+                }
+                3 => {
+                    checkpoint.tasks[2].status = TaskStatus::Running;
+                }
+                4 => {
+                    checkpoint.tasks[3]
+                        .executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .agent_activation
+                        .as_mut()
+                        .unwrap()
+                        .session_id = magi_core::SessionId::new("other session");
+                }
+                5 => {
+                    checkpoint.tasks[3]
+                        .executor_binding
+                        .as_mut()
+                        .unwrap()
+                        .capability_ids
+                        .push("extra".into());
+                }
+                _ => {
+                    let mut duplicate = checkpoint.tasks[3].clone();
+                    duplicate.task_id = TaskId::new("duplicate");
+                    checkpoint.tasks.push(duplicate);
+                }
+            }
+            assert!(
+                TaskStore::restore_checked(checkpoint).is_err(),
+                "mutation {mutation}"
+            );
+        }
     }
 
     fn projection_fixture(dir: &Path, generation: u64, projections: &[TaskRootProjection]) {

@@ -1349,6 +1349,7 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let git_executor = crate::git_tool_runtime::build_git_tool_executor(
             crate::git_tool_runtime::GitToolRuntimeDependencies {
+                task_store: None,
                 git_service: base.git_service.clone(),
                 session_code_contexts: base.session_code_contexts.clone(),
                 workspace_git_coordinator: base.workspace_git_coordinator.clone(),

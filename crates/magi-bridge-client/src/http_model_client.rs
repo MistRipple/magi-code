@@ -321,6 +321,7 @@ impl HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
+        max_output_tokens: Option<u32>,
     ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -330,7 +331,8 @@ impl HttpModelBridgeClient {
             });
         }
 
-        let http_request = self.build_http_request(&request, true)?;
+        let http_request =
+            self.build_http_request_with_output_limit(&request, true, max_output_tokens)?;
         let provider_family = self.provider_family();
         let mut current_request = http_request;
         let mut fallback_capability = None;
@@ -369,6 +371,12 @@ impl HttpModelBridgeClient {
                     else {
                         return Err(error);
                     };
+                    on_retry(&ModelRetryRuntimeEvent {
+                        phase: ModelRetryRuntimePhase::AttemptStarted,
+                        attempt: 1,
+                        max_attempts: 2,
+                        delay_ms: None,
+                    });
                     fallback_capability = Some(capability);
                     current_request = next_request;
                 }
@@ -976,10 +984,14 @@ fn execute_cancellable_http_post_with_retries(
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
+    on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     is_cancelled: &dyn Fn() -> bool,
 ) -> HttpPostResult {
     let mut retries = 0usize;
     loop {
+        if is_cancelled() {
+            return Err(model_invocation_cancelled_error());
+        }
         let result = execute_cancellable_http_post(
             provider_key.clone(),
             url.clone(),
@@ -987,28 +999,45 @@ fn execute_cancellable_http_post_with_retries(
             headers.clone(),
             is_cancelled,
         );
-        match result {
+        let delay = match &result {
             Ok((status, response_body, retry_after))
-                if retryable_http_response(status, &response_body)
+                if retryable_http_response(*status, response_body)
                     && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
-                retries += 1;
-                let delay = provider_retry_delay(retries, retry_after);
-                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
-                    return Err(model_invocation_cancelled_error());
-                }
+                Some(provider_retry_delay(retries + 1, *retry_after))
             }
-            Err(error)
-                if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
-            {
-                retries += 1;
-                if !sleep_retry_delay_cancellable(provider_retry_delay(retries, None), is_cancelled)
-                {
-                    return Err(model_invocation_cancelled_error());
-                }
+            Err(error) if retryable_bridge_error(error) && retries < MODEL_PROVIDER_MAX_RETRIES => {
+                Some(provider_retry_delay(retries + 1, None))
             }
-            other => return other,
+            _ => None,
+        };
+        let Some(delay) = delay else {
+            if retries > 0 {
+                on_retry(&ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::Settled,
+                    attempt: retries,
+                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    delay_ms: None,
+                });
+            }
+            return result;
+        };
+        retries += 1;
+        on_retry(&ModelRetryRuntimeEvent {
+            phase: ModelRetryRuntimePhase::Scheduled,
+            attempt: retries,
+            max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+            delay_ms: Some(delay.as_millis() as u64),
+        });
+        if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+            return Err(model_invocation_cancelled_error());
         }
+        on_retry(&ModelRetryRuntimeEvent {
+            phase: ModelRetryRuntimePhase::AttemptStarted,
+            attempt: retries,
+            max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+            delay_ms: None,
+        });
     }
 }
 
@@ -1320,6 +1349,9 @@ fn execute_streaming_http_post_with_retries(
     let mut retries = 0usize;
     let mut timeout_retries = 0usize;
     loop {
+        if is_cancelled() {
+            return Err(model_invocation_cancelled_error());
+        }
         let emitted_delta = AtomicBool::new(false);
         let guarded_chunk = |delta: &ModelStreamingDelta| {
             if !delta.content.is_empty() || !delta.thinking.is_empty() {
@@ -1660,6 +1692,10 @@ async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResu
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
+    fn executor_capabilities(&self) -> crate::ExecutorCapabilities {
+        crate::native_executor_capabilities()
+    }
+
     fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -1705,7 +1741,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_cancellable_with_output_limit(request, None, is_cancelled)
+        self.invoke_cancellable_with_output_limit(request, None, &|_| {}, is_cancelled)
+    }
+
+    fn invoke_with_retry_events_and_cancellation(
+        &self,
+        request: ModelInvocationRequest,
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        self.invoke_cancellable_with_output_limit(request, None, on_retry, is_cancelled)
     }
 
     fn invoke_with_cancellation_and_output_limit(
@@ -1714,7 +1759,27 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         max_output_tokens: u32,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_cancellable_with_output_limit(request, Some(max_output_tokens), is_cancelled)
+        self.invoke_cancellable_with_output_limit(
+            request,
+            Some(max_output_tokens),
+            &|_| {},
+            is_cancelled,
+        )
+    }
+
+    fn invoke_with_retry_events_cancellation_and_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: u32,
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        self.invoke_cancellable_with_output_limit(
+            request,
+            Some(max_output_tokens),
+            on_retry,
+            is_cancelled,
+        )
     }
 
     fn invoke_streaming(
@@ -1722,7 +1787,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false)
+        self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false, None)
     }
 
     fn invoke_streaming_with_retry_events(
@@ -1731,7 +1796,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, on_retry, &|| false)
+        self.invoke_streaming_observed(request, on_delta, on_retry, &|| false, None)
     }
 
     fn invoke_streaming_with_cancellation(
@@ -1741,7 +1806,24 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled)
+        self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled, None)
+    }
+
+    fn invoke_streaming_with_output_limit(
+        &self,
+        request: ModelInvocationRequest,
+        max_output_tokens: u32,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        self.invoke_streaming_observed(
+            request,
+            on_delta,
+            on_retry,
+            is_cancelled,
+            Some(max_output_tokens),
+        )
     }
 }
 
@@ -1750,6 +1832,7 @@ impl HttpModelBridgeClient {
         &self,
         request: ModelInvocationRequest,
         max_output_tokens: Option<u32>,
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
@@ -1761,13 +1844,25 @@ impl HttpModelBridgeClient {
         }
         let http_request =
             self.build_http_request_with_output_limit(&request, false, max_output_tokens)?;
+        let fallback_attempts = std::cell::Cell::new(0usize);
         let (accepted_request, status, response_body, retry_after, fallback_capability) =
             execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
+                let fallback = fallback_attempts.get();
+                if fallback > 0 {
+                    on_retry(&ModelRetryRuntimeEvent {
+                        phase: ModelRetryRuntimePhase::AttemptStarted,
+                        attempt: fallback,
+                        max_attempts: 2,
+                        delay_ms: None,
+                    });
+                }
+                fallback_attempts.set(fallback + 1);
                 execute_cancellable_http_post_with_retries(
                     self.provider_request_key(),
                     request.url,
                     request.body,
                     request.headers,
+                    on_retry,
                     is_cancelled,
                 )
             })?;
@@ -2485,6 +2580,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some(tool_result.to_string()),
@@ -2512,6 +2608,7 @@ mod tests {
         let duplicate_id = "call_duplicate";
         let normalized = normalize_chat_tool_call_history(&[
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
@@ -2525,6 +2622,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("package contents".to_string()),
@@ -2534,6 +2632,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("reused package contents".to_string()),
@@ -2543,6 +2642,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("tsconfig contents".to_string()),
@@ -2565,6 +2665,7 @@ mod tests {
         let duplicate_id = "call_duplicate";
         let normalized = normalize_chat_tool_call_history(&[
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
@@ -2577,6 +2678,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("package contents".to_string()),
@@ -2586,6 +2688,7 @@ mod tests {
                 provider_context: Vec::new(),
             },
             crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "tool".to_string(),
                 content: Some("tsconfig contents".to_string()),
@@ -2619,6 +2722,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "user".to_string(),
                 content: Some("识别这张图片".to_string()),
@@ -2693,6 +2797,7 @@ mod tests {
             provider: "openai".to_string(),
             prompt: "搜索最新消息".to_string(),
             messages: Some(vec![crate::types::ChatMessage {
+                input_request_id: None,
                 context_origin: Default::default(),
                 role: "assistant".to_string(),
                 content: None,
@@ -3127,6 +3232,7 @@ mod tests {
             prompt: "ignored when messages exist".to_string(),
             messages: Some(vec![
                 crate::types::ChatMessage {
+                    input_request_id: None,
                     context_origin: Default::default(),
                     role: "system".to_string(),
                     content: Some("系统约束".to_string()),
@@ -3136,6 +3242,7 @@ mod tests {
                     provider_context: Vec::new(),
                 },
                 crate::types::ChatMessage {
+                    input_request_id: None,
                     context_origin: Default::default(),
                     role: "user".to_string(),
                     content: Some("你好".to_string()),
@@ -3236,44 +3343,46 @@ mod tests {
             tools: None,
             tool_choice: None,
         };
-        let chat = HttpModelBridgeClient::new_with_protocol(
-            "https://api.example.com/v1".to_string(),
-            Some("test-key".to_string()),
-            "gpt-test".to_string(),
-            HttpModelBridgeProtocol::ChatCompletions,
-            None,
-        );
-        let chat_body = chat
-            .build_http_request_with_output_limit(&request, false, Some(1_024))
-            .expect("chat request should build")
-            .body;
-        assert_eq!(chat_body["max_tokens"], 1_024);
+        for stream in [false, true] {
+            let chat = HttpModelBridgeClient::new_with_protocol(
+                "https://api.example.com/v1".to_string(),
+                Some("test-key".to_string()),
+                "gpt-test".to_string(),
+                HttpModelBridgeProtocol::ChatCompletions,
+                None,
+            );
+            let chat_body = chat
+                .build_http_request_with_output_limit(&request, stream, Some(1_024))
+                .expect("chat request should build")
+                .body;
+            assert_eq!(chat_body["max_tokens"], 1_024);
 
-        let responses = HttpModelBridgeClient::new_with_protocol(
-            "https://api.example.com/v1".to_string(),
-            Some("test-key".to_string()),
-            "gpt-test".to_string(),
-            HttpModelBridgeProtocol::Responses,
-            None,
-        );
-        let responses_body = responses
-            .build_http_request_with_output_limit(&request, false, Some(1_024))
-            .expect("responses request should build")
-            .body;
-        assert_eq!(responses_body["max_output_tokens"], 1_024);
+            let responses = HttpModelBridgeClient::new_with_protocol(
+                "https://api.example.com/v1".to_string(),
+                Some("test-key".to_string()),
+                "gpt-test".to_string(),
+                HttpModelBridgeProtocol::Responses,
+                None,
+            );
+            let responses_body = responses
+                .build_http_request_with_output_limit(&request, stream, Some(1_024))
+                .expect("responses request should build")
+                .body;
+            assert_eq!(responses_body["max_output_tokens"], 1_024);
 
-        let anthropic = HttpModelBridgeClient::new_with_protocol(
-            "https://api.example.com/v1".to_string(),
-            Some("test-key".to_string()),
-            "anthropic-test".to_string(),
-            HttpModelBridgeProtocol::AnthropicMessages,
-            None,
-        );
-        let anthropic_body = anthropic
-            .build_http_request_with_output_limit(&request, false, Some(1_024))
-            .expect("anthropic request should build")
-            .body;
-        assert_eq!(anthropic_body["max_tokens"], 1_024);
+            let anthropic = HttpModelBridgeClient::new_with_protocol(
+                "https://api.example.com/v1".to_string(),
+                Some("test-key".to_string()),
+                "anthropic-test".to_string(),
+                HttpModelBridgeProtocol::AnthropicMessages,
+                None,
+            );
+            let anthropic_body = anthropic
+                .build_http_request_with_output_limit(&request, stream, Some(1_024))
+                .expect("anthropic request should build")
+                .body;
+            assert_eq!(anthropic_body["max_tokens"], 1_024);
+        }
     }
 
     #[test]
@@ -4958,17 +5067,31 @@ mod tests {
             "gpt-4.1-mini".to_string(),
         );
 
+        let events = std::cell::RefCell::new(Vec::new());
         let response = client
-            .invoke(ModelInvocationRequest {
-                provider: "openai-compatible".to_string(),
-                prompt: "hello".to_string(),
-                messages: None,
-                tools: None,
-                tool_choice: None,
-            })
+            .invoke_with_retry_events_and_cancellation(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|event| events.borrow_mut().push(event.phase),
+                &|| false,
+            )
             .expect("retryable rejection should recover on the next attempt");
 
         assert_eq!(response.content.as_deref(), Some("retry recovered"));
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                ModelRetryRuntimePhase::Scheduled,
+                ModelRetryRuntimePhase::AttemptStarted,
+                ModelRetryRuntimePhase::Settled
+            ]
+        );
+
         for _ in 0..2 {
             let recorded = server
                 .request_receiver

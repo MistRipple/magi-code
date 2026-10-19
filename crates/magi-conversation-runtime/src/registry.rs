@@ -4,26 +4,15 @@ use std::time::Duration;
 
 use magi_core::{SessionId, TaskId};
 
-use crate::conversation::Conversation;
 use crate::mailbox::{RuntimeSignal, UserSignal};
 use crate::session_turn_coordinator::SessionTurnCoordinator;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-enum ConversationKey {
-    Task {
-        session_id: SessionId,
-        task_id: TaskId,
-    },
-}
-
-/// 按任务身份持有 Conversation 实例。Session 级 Turn 不再创建第二个
-/// Conversation 生命周期；只有 Task profile 的 worker 需要独立 mailbox 和
-/// TurnDriver 状态。
+/// 运行时输入和交互的投递入口。Task/lease 与 canonical Turn 的生命周期
+/// 分别由 TaskStore 和 SessionStore 拥有，这里不再保存另一份 Turn 状态。
 #[derive(Debug, Default)]
 pub struct ConversationRegistry {
-    inner: Mutex<HashMap<ConversationKey, Arc<Mutex<Conversation>>>>,
     /// Session Turn 的 steer 队列和工具授权由 Coordinator 持有；Registry 只管理
-    /// task/worker Conversation 与运行时信号通道。
+    /// 任务信号通道和交互等待。
     turn_coordinator: Arc<SessionTurnCoordinator>,
     task_signal_channels: Mutex<HashMap<(SessionId, TaskId), VecDeque<RuntimeSignal>>>,
     task_signal_ready: Condvar,
@@ -53,7 +42,6 @@ impl ConversationRegistry {
 
     pub fn with_turn_coordinator(turn_coordinator: Arc<SessionTurnCoordinator>) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
             turn_coordinator,
             task_signal_channels: Mutex::new(HashMap::new()),
             task_signal_ready: Condvar::new(),
@@ -62,39 +50,10 @@ impl ConversationRegistry {
         }
     }
 
-    pub fn conversation_for_task(
-        &self,
-        session_id: &SessionId,
-        task_id: &TaskId,
-    ) -> Arc<Mutex<Conversation>> {
-        self.conversation_for_key(
-            ConversationKey::Task {
-                session_id: session_id.clone(),
-                task_id: task_id.clone(),
-            },
-            session_id,
-        )
-    }
-
-    fn conversation_for_key(
-        &self,
-        key: ConversationKey,
-        session_id: &SessionId,
-    ) -> Arc<Mutex<Conversation>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("ConversationRegistry mutex poisoned");
-        guard
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(Conversation::new(session_id.clone()))))
-            .clone()
-    }
-
     pub fn len(&self) -> usize {
-        self.inner
+        self.task_signal_channels
             .lock()
-            .expect("ConversationRegistry mutex poisoned")
+            .expect("task signal channel mutex poisoned")
             .len()
     }
 
@@ -128,8 +87,8 @@ impl ConversationRegistry {
             .or_default();
     }
 
-    /// 向已注册且尚未关闭的任务通道投递运行时信号。该入口不获取 Conversation
-    /// mutex，因此可以在目标代理正执行模型或工具轮次时立即送达。
+    /// 向已注册且尚未关闭的任务通道投递运行时信号。
+    /// 模型或工具 IO 不持有该锁，运行中补充可立即送达。
     pub fn enqueue_task_signal(
         &self,
         session_id: &SessionId,
@@ -184,19 +143,20 @@ impl ConversationRegistry {
             .unwrap_or_default()
     }
 
+    /// `None` 表示通道已关闭；`Some([])` 仅表示等待超时，不能混为同一状态。
     pub fn wait_for_task_signals(
         &self,
         session_id: &SessionId,
         task_id: &TaskId,
         timeout: Duration,
-    ) -> Vec<RuntimeSignal> {
+    ) -> Option<Vec<RuntimeSignal>> {
         let key = (session_id.clone(), task_id.clone());
         let channels = self
             .task_signal_channels
             .lock()
             .expect("task signal channel mutex poisoned");
         if !channels.contains_key(&key) {
-            return Vec::new();
+            return None;
         }
         let (mut channels, _) = self
             .task_signal_ready
@@ -207,17 +167,6 @@ impl ConversationRegistry {
         channels
             .get_mut(&key)
             .map(|channel| channel.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// 模型准备结束任务 Turn 时原子读取待处理信号；没有信号时关闭通道，保证迟到
-    /// agent_send/context_request 明确失败，不会写入已完成任务。
-    pub fn take_task_signals_or_close(
-        &self,
-        session_id: &SessionId,
-        task_id: &TaskId,
-    ) -> TaskSignalBoundary {
-        self.take_task_inputs_or_close(session_id, task_id, None)
     }
 
     /// 主线任务同时检查会话引导和代理信号，再关闭输入。持有 task channel 锁
@@ -247,6 +196,7 @@ impl ConversationRegistry {
             channels.remove(&key);
             drop(channels);
             self.tool_approvals().remove_task(session_id, task_id);
+            self.task_signal_ready.notify_all();
             TaskSignalBoundary::Closed
         } else {
             TaskSignalBoundary::Pending(channel.drain(..).collect())
@@ -262,31 +212,24 @@ impl ConversationRegistry {
             .is_some();
         if removed {
             self.tool_approvals().remove_task(session_id, task_id);
+            self.task_signal_ready.notify_all();
         }
         removed
     }
 
-    /// 删除 session 主对话及其全部 task 对话。会话删除后这些内存态不能继续存活，
-    /// 否则 Mailbox 与 Turn 状态会成为无法再访问的孤儿。
+    /// 删除会话全部任务信号。会话删除后不能保留无法投递的输入。
     pub fn remove_session(&self, session_id: &SessionId) -> usize {
         let mut guard = self
-            .inner
+            .task_signal_channels
             .lock()
-            .expect("ConversationRegistry mutex poisoned");
+            .expect("task signal channel mutex poisoned");
         let before = guard.len();
-        guard.retain(|key, _| match key {
-            ConversationKey::Task {
-                session_id: candidate,
-                ..
-            } => candidate != session_id,
-        });
+        guard.retain(|(candidate, _), _| candidate != session_id);
         let removed = before.saturating_sub(guard.len());
         drop(guard);
-        self.task_signal_channels
-            .lock()
-            .expect("task signal channel mutex poisoned")
-            .retain(|(candidate, _), _| candidate != session_id);
+        self.task_signal_ready.notify_all();
         self.turn_coordinator.clear_session(session_id);
+        self.user_questions.remove_session(session_id);
         removed
     }
 }
@@ -299,23 +242,57 @@ mod tests {
     use magi_core::UtcMillis;
 
     #[test]
-    fn task_conversations_are_isolated_by_task_identity() {
+    fn task_signals_are_isolated_and_initial_messages_remain_fifo() {
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-a");
-        let task_a = registry.conversation_for_task(&session_id, &TaskId::new("task-a"));
-        let task_b = registry.conversation_for_task(&session_id, &TaskId::new("task-b"));
-
-        assert!(!Arc::ptr_eq(&task_a, &task_b));
+        let task_a = TaskId::new("task-a");
+        let task_b = TaskId::new("task-b");
+        registry.open_task_signal_channel(&session_id, &task_a);
+        registry.open_task_signal_channel(&session_id, &task_b);
+        for (task, text) in [
+            (&task_a, "assignment"),
+            (&task_b, "other"),
+            (&task_a, "supplement"),
+        ] {
+            registry
+                .enqueue_task_signal(
+                    &session_id,
+                    task,
+                    RuntimeSignal {
+                        author: crate::MailboxAuthor::System,
+                        kind: crate::MailboxKind::Message,
+                        trigger_turn: true,
+                        payload: serde_json::json!({"text": text}),
+                        enqueued_at: UtcMillis(1),
+                    },
+                )
+                .unwrap();
+        }
+        // Runner 进入循环时重开同一通道，不覆盖注册前已投递的 assignment。
+        registry.open_task_signal_channel(&session_id, &task_a);
+        let signals = registry.drain_task_signals(&session_id, &task_a);
+        assert_eq!(
+            signals
+                .iter()
+                .map(|signal| signal.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assignment", "supplement"]
+        );
+        assert!(registry.drain_task_signals(&session_id, &task_a).is_empty());
+        assert_eq!(
+            registry.drain_task_signals(&session_id, &task_b)[0].payload["text"],
+            "other"
+        );
         assert_eq!(registry.len(), 2);
     }
 
     #[test]
-    fn remove_session_drops_task_conversations() {
+    fn remove_session_drops_only_its_task_channels() {
         let registry = ConversationRegistry::new();
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
-        registry.conversation_for_task(&session_a, &TaskId::new("task-a"));
-        registry.conversation_for_task(&session_b, &TaskId::new("task-b"));
+        registry.open_task_signal_channel(&session_a, &TaskId::new("task-a"));
+        registry.open_task_signal_channel(&session_b, &TaskId::new("task-b"));
 
         assert_eq!(registry.remove_session(&session_a), 1);
         assert_eq!(registry.len(), 1);
@@ -336,6 +313,7 @@ mod tests {
                 &session_id,
                 "turn-steer",
                 UserSignal {
+                    images: Vec::new(),
                     text: Some("first".to_string()),
                     request_id: Some("request-first".to_string()),
                     user_message_id: Some("user-first".to_string()),
@@ -350,6 +328,7 @@ mod tests {
                 &session_id,
                 "turn-steer",
                 UserSignal {
+                    images: Vec::new(),
                     text: Some("second".to_string()),
                     request_id: Some("request-second".to_string()),
                     user_message_id: Some("user-second".to_string()),
@@ -372,6 +351,7 @@ mod tests {
                     &session_id,
                     "turn-other",
                     UserSignal {
+                        images: Vec::new(),
                         text: Some("stale".to_string()),
                         request_id: None,
                         user_message_id: None,
@@ -404,6 +384,7 @@ mod tests {
                 &session_id,
                 "turn-steer-close",
                 UserSignal {
+                    images: Vec::new(),
                     text: Some("too late".to_string()),
                     request_id: None,
                     user_message_id: None,
@@ -433,6 +414,7 @@ mod tests {
                 &session_id,
                 turn_id,
                 UserSignal {
+                    images: Vec::new(),
                     text: Some("先检查当前状态".to_string()),
                     request_id: Some("request-guidance".to_string()),
                     user_message_id: None,
@@ -479,6 +461,11 @@ mod tests {
         let session_id = SessionId::new("session-task-signal");
         let task_id = TaskId::new("task-signal");
         registry.open_task_signal_channel(&session_id, &task_id);
+        assert_eq!(
+            registry.wait_for_task_signals(&session_id, &task_id, Duration::ZERO),
+            Some(Vec::new()),
+            "通道开放但没有信号时只表示超时"
+        );
         registry
             .enqueue_task_signal(
                 &session_id,
@@ -493,12 +480,19 @@ mod tests {
             )
             .expect("打开的任务通道应接受信号");
 
-        let drained = registry.drain_task_signals(&session_id, &task_id);
+        let drained = registry
+            .wait_for_task_signals(&session_id, &task_id, Duration::ZERO)
+            .expect("已有消息的通道仍开放");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].payload["message"], "补充事实");
         assert_eq!(
-            registry.take_task_signals_or_close(&session_id, &task_id),
+            registry.take_task_inputs_or_close(&session_id, &task_id, None),
             TaskSignalBoundary::Closed
+        );
+        assert_eq!(
+            registry.wait_for_task_signals(&session_id, &task_id, Duration::ZERO),
+            None,
+            "已关闭的通道不能被误认为一次超时"
         );
         assert!(
             registry

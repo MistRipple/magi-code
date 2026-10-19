@@ -15,11 +15,27 @@ pub const APP_SERVER_METHODS: &[&str] = &[
     "session/list",
     "session/read",
     "turn/start",
+    "turn/interrupt",
+    "session/interactions",
+    "session/approval/resolve",
+    "session/question/resolve",
+    "goal/read",
+    "goal/pause",
+    "goal/resume",
+    "goal/clear",
+    "goal/update",
     "events/subscribe",
     "browser/tools/list",
     "browser/tool",
     "approval/request",
     "$/cancelRequest",
+    "session/queue/read",
+    "session/queue/remove",
+    "session/queue/update",
+    "session/queue/retry",
+    "session/queue/guide",
+    "agent/transfer",
+    "agent/continue",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +97,69 @@ pub const APP_SERVER_METHOD_SIGNATURES: &[AppServerMethodSignature] = &[
         server_request: false,
     },
     AppServerMethodSignature {
+        method: "turn/interrupt",
+        kind: AppServerMethodKind::Request,
+        params: "TurnInterruptParams",
+        result: Some("TurnInterruptResult"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/interactions",
+        kind: AppServerMethodKind::Request,
+        params: "SessionInteractionScope",
+        result: Some("SessionInteractionsResult"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/approval/resolve",
+        kind: AppServerMethodKind::Request,
+        params: "ResolveToolApprovalParams",
+        result: Some("ResolveToolApprovalResult"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/question/resolve",
+        kind: AppServerMethodKind::Request,
+        params: "ResolveUserQuestionParams",
+        result: Some("ResolveUserQuestionResult"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "goal/read",
+        kind: AppServerMethodKind::Request,
+        params: "GoalReadParams",
+        result: Some("GoalSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "goal/pause",
+        kind: AppServerMethodKind::Request,
+        params: "GoalActionParams",
+        result: Some("GoalSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "goal/resume",
+        kind: AppServerMethodKind::Request,
+        params: "GoalActionParams",
+        result: Some("GoalSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "goal/clear",
+        kind: AppServerMethodKind::Request,
+        params: "GoalActionParams",
+        result: Some("GoalSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "goal/update",
+        kind: AppServerMethodKind::Request,
+        params: "GoalUpdateParams",
+        result: Some("GoalSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
         method: "events/subscribe",
         kind: AppServerMethodKind::Request,
         params: "EventSubscribeParams",
@@ -115,6 +194,55 @@ pub const APP_SERVER_METHOD_SIGNATURES: &[AppServerMethodSignature] = &[
         result: None,
         server_request: false,
     },
+    AppServerMethodSignature {
+        method: "session/queue/read",
+        kind: AppServerMethodKind::Request,
+        params: "SessionInteractionScope",
+        result: Some("SessionQueueSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/queue/remove",
+        kind: AppServerMethodKind::Request,
+        params: "SessionQueueItemParams",
+        result: Some("SessionQueueSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/queue/update",
+        kind: AppServerMethodKind::Request,
+        params: "SessionQueueUpdateParams",
+        result: Some("SessionQueueSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/queue/retry",
+        kind: AppServerMethodKind::Request,
+        params: "SessionQueueItemParams",
+        result: Some("SessionQueueSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "session/queue/guide",
+        kind: AppServerMethodKind::Request,
+        params: "SessionQueueGuideParams",
+        result: Some("SessionQueueSnapshot"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "agent/transfer",
+        kind: AppServerMethodKind::Request,
+        params: "AgentTransferParams",
+        result: Some("AgentTransferResult"),
+        server_request: false,
+    },
+    AppServerMethodSignature {
+        method: "agent/continue",
+        kind: AppServerMethodKind::Request,
+        params: "AgentContinueParams",
+        result: Some("AgentContinueResult"),
+        server_request: false,
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,10 +252,26 @@ pub enum AppServerRequestMethod {
     SessionList,
     SessionRead,
     TurnStart,
+    TurnInterrupt,
+    SessionInteractions,
+    SessionApprovalResolve,
+    SessionQuestionResolve,
+    GoalRead,
+    GoalPause,
+    GoalResume,
+    GoalClear,
+    GoalUpdate,
     EventsSubscribe,
     BrowserToolsList,
     BrowserTool,
     ApprovalRequest,
+    SessionQueueRead,
+    SessionQueueRemove,
+    SessionQueueUpdate,
+    SessionQueueRetry,
+    SessionQueueGuide,
+    AgentTransfer,
+    AgentContinue,
 }
 
 impl AppServerRequestMethod {
@@ -137,10 +281,26 @@ impl AppServerRequestMethod {
         Self::SessionList,
         Self::SessionRead,
         Self::TurnStart,
+        Self::TurnInterrupt,
+        Self::SessionInteractions,
+        Self::SessionApprovalResolve,
+        Self::SessionQuestionResolve,
+        Self::GoalRead,
+        Self::GoalPause,
+        Self::GoalResume,
+        Self::GoalClear,
+        Self::GoalUpdate,
         Self::EventsSubscribe,
         Self::BrowserToolsList,
         Self::BrowserTool,
         Self::ApprovalRequest,
+        Self::SessionQueueRead,
+        Self::SessionQueueRemove,
+        Self::SessionQueueUpdate,
+        Self::SessionQueueRetry,
+        Self::SessionQueueGuide,
+        Self::AgentTransfer,
+        Self::AgentContinue,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -150,10 +310,26 @@ impl AppServerRequestMethod {
             Self::SessionList => "session/list",
             Self::SessionRead => "session/read",
             Self::TurnStart => "turn/start",
+            Self::TurnInterrupt => "turn/interrupt",
+            Self::SessionInteractions => "session/interactions",
+            Self::SessionApprovalResolve => "session/approval/resolve",
+            Self::SessionQuestionResolve => "session/question/resolve",
+            Self::GoalRead => "goal/read",
+            Self::GoalPause => "goal/pause",
+            Self::GoalResume => "goal/resume",
+            Self::GoalClear => "goal/clear",
+            Self::GoalUpdate => "goal/update",
             Self::EventsSubscribe => "events/subscribe",
             Self::BrowserToolsList => "browser/tools/list",
             Self::BrowserTool => "browser/tool",
             Self::ApprovalRequest => "approval/request",
+            Self::SessionQueueRead => "session/queue/read",
+            Self::SessionQueueRemove => "session/queue/remove",
+            Self::SessionQueueUpdate => "session/queue/update",
+            Self::SessionQueueRetry => "session/queue/retry",
+            Self::SessionQueueGuide => "session/queue/guide",
+            Self::AgentTransfer => "agent/transfer",
+            Self::AgentContinue => "agent/continue",
         }
     }
 }
@@ -183,10 +359,26 @@ pub enum AppServerRequestParams {
     SessionList(SessionListParams),
     SessionRead(SessionReadParams),
     TurnStart(TurnStartParams),
+    TurnInterrupt(TurnInterruptParams),
+    SessionInteractions(SessionInteractionScope),
+    SessionApprovalResolve(ResolveToolApprovalParams),
+    SessionQuestionResolve(ResolveUserQuestionParams),
+    GoalRead(GoalReadParams),
+    GoalPause(GoalActionParams),
+    GoalResume(GoalActionParams),
+    GoalClear(GoalActionParams),
+    GoalUpdate(GoalUpdateParams),
     EventsSubscribe(EventSubscribeParams),
     BrowserToolsList(EmptyParams),
     BrowserTool(BrowserToolParams),
     ApprovalRequest(ApprovalRequestParams),
+    SessionQueueRead(SessionInteractionScope),
+    SessionQueueRemove(SessionQueueItemParams),
+    SessionQueueUpdate(SessionQueueUpdateParams),
+    SessionQueueRetry(SessionQueueItemParams),
+    SessionQueueGuide(SessionQueueGuideParams),
+    AgentTransfer(AgentTransferParams),
+    AgentContinue(AgentContinueParams),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,10 +395,26 @@ pub enum AppServerResult {
     SessionList(SessionListResult),
     SessionRead(SessionReadResult),
     TurnStart(TurnStartResult),
+    TurnInterrupt(TurnInterruptResult),
+    SessionInteractions(SessionInteractionsResult),
+    SessionApprovalResolve(ResolveToolApprovalResult),
+    SessionQuestionResolve(ResolveUserQuestionResult),
+    GoalRead(GoalSnapshot),
+    GoalPause(GoalSnapshot),
+    GoalResume(GoalSnapshot),
+    GoalClear(GoalSnapshot),
+    GoalUpdate(GoalSnapshot),
     EventsSubscribe(EventSubscribeResult),
     BrowserToolsList(BrowserToolsListResult),
     BrowserTool(BrowserToolResult),
     ApprovalRequest(ApprovalDecision),
+    SessionQueueRead(SessionQueueSnapshot),
+    SessionQueueRemove(SessionQueueSnapshot),
+    SessionQueueUpdate(SessionQueueSnapshot),
+    SessionQueueRetry(SessionQueueSnapshot),
+    SessionQueueGuide(SessionQueueSnapshot),
+    AgentTransfer(AgentTransferResult),
+    AgentContinue(AgentContinueResult),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,6 +548,21 @@ pub struct ServerCapabilities {
     pub approvals: bool,
     #[serde(rename = "browserTools")]
     pub browser_tools: bool,
+    #[serde(default)]
+    #[serde(rename = "turnInterrupt")]
+    pub turn_interrupt: bool,
+    #[serde(default)]
+    #[serde(rename = "sessionInteractions")]
+    pub session_interactions: bool,
+    #[serde(default)]
+    #[serde(rename = "goalControl")]
+    pub goal_control: bool,
+    #[serde(default)]
+    #[serde(rename = "sessionQueue")]
+    pub session_queue: bool,
+    #[serde(default)]
+    #[serde(rename = "agentTransfer")]
+    pub agent_transfer: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -603,6 +826,10 @@ pub struct TurnStartParams {
     #[serde(default)]
     #[serde(rename = "pluginSelections")]
     pub plugin_selections: Vec<PluginSelection>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "interruptTurnId")]
+    pub interrupt_turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -833,6 +1060,9 @@ pub struct CanonicalTurn {
     pub items: Vec<CanonicalTurnItem>,
     #[serde(default)]
     pub metadata: std::collections::HashMap<String, Value>,
+    #[serde(default)]
+    #[serde(rename = "modelSteps")]
+    pub model_steps: Vec<ModelStep>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1674,4 +1904,1018 @@ pub struct PluginResourceWriteRequest {
     #[serde(rename = "expectedVersion")]
     pub expected_version: u64,
     pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionTurnGuideStatus {
+    #[serde(rename = "ready")]
+    Ready,
+    #[serde(rename = "no_active_turn")]
+    NoActiveTurn,
+    #[serde(rename = "input_closed")]
+    InputClosed,
+    #[serde(rename = "unsupported_input")]
+    UnsupportedInput,
+    #[serde(rename = "unsupported_executor")]
+    UnsupportedExecutor,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionTurnGuideEffectiveAt {
+    #[serde(rename = "next_model_step")]
+    NextModelStep,
+    #[serde(rename = "unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionTurnGuideInputSupport {
+    pub text: bool,
+    pub images: bool,
+    #[serde(rename = "contextReferences")]
+    pub context_references: bool,
+    #[serde(rename = "browserAnnotationRefs")]
+    pub browser_annotation_refs: bool,
+    #[serde(rename = "pluginSelections")]
+    pub plugin_selections: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionTurnGuideCapability {
+    pub status: SessionTurnGuideStatus,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "targetTurnId")]
+    pub target_turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: Option<SessionTurnGuideEffectiveAt>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "inputSupport")]
+    pub input_support: Option<SessionTurnGuideInputSupport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInboxCursor {
+    pub epoch: String,
+    #[serde(rename = "throughSequence")]
+    pub through_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelStepStatus {
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "response_received")]
+    ResponseReceived,
+    #[serde(rename = "outcome_unknown")]
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelStep {
+    #[serde(rename = "stepId")]
+    pub step_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: Option<String>,
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "checkpointGeneration")]
+    pub checkpoint_generation: u64,
+    #[serde(rename = "requestFingerprint")]
+    pub request_fingerprint: String,
+    pub provider: String,
+    #[serde(rename = "messageCount")]
+    pub message_count: usize,
+    #[serde(rename = "toolCount")]
+    pub tool_count: usize,
+    #[serde(rename = "inputRequestIds")]
+    pub input_request_ids: Vec<String>,
+    #[serde(rename = "startedAt")]
+    pub started_at: i64,
+    #[serde(rename = "settledAt")]
+    pub settled_at: Option<i64>,
+    pub status: ModelStepStatus,
+    #[serde(rename = "responseFingerprint")]
+    pub response_fingerprint: Option<String>,
+    pub attempts: Vec<ModelAttempt>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<ModelStepBinding>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "maxOutputTokens")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalId")]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "usageTokens")]
+    pub usage_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalTokensAfter")]
+    pub goal_tokens_after: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "executorCapabilities")]
+    pub executor_capabilities: Option<ExecutorCapabilities>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<ModelStepPurpose>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAttempt {
+    #[serde(rename = "attemptId")]
+    pub attempt_id: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: i64,
+    #[serde(rename = "settledAt")]
+    pub settled_at: Option<i64>,
+    pub status: ModelStepStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelStepBinding {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    #[serde(rename = "bindingRevision")]
+    pub binding_revision: u32,
+    #[serde(rename = "settingsRevision")]
+    pub settings_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionGoalUsageChanged {
+    #[serde(rename = "goal_id")]
+    pub goal_id: String,
+    #[serde(rename = "step_id")]
+    pub step_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorInputModality {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "image")]
+    Image,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorSteerMode {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "between_steps")]
+    BetweenSteps,
+    #[serde(rename = "interruptible")]
+    Interruptible,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorResumeMode {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "checkpoint")]
+    Checkpoint,
+    #[serde(rename = "native_session")]
+    NativeSession,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorToolMode {
+    #[serde(rename = "native_calls")]
+    NativeCalls,
+    #[serde(rename = "magi_gateway")]
+    MagiGateway,
+    #[serde(rename = "executor_owned")]
+    ExecutorOwned,
+    #[serde(rename = "none")]
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorApprovalMode {
+    #[serde(rename = "interactive")]
+    Interactive,
+    #[serde(rename = "delegated")]
+    Delegated,
+    #[serde(rename = "unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorCancellationMode {
+    #[serde(rename = "signal")]
+    Signal,
+    #[serde(rename = "settled")]
+    Settled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutorContextOwnership {
+    #[serde(rename = "magi_owned")]
+    MagiOwned,
+    #[serde(rename = "executor_owned")]
+    ExecutorOwned,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutorCapabilities {
+    #[serde(rename = "inputModalities")]
+    pub input_modalities: Vec<ExecutorInputModality>,
+    pub steer: ExecutorSteerMode,
+    pub resume: ExecutorResumeMode,
+    pub tools: ExecutorToolMode,
+    pub approvals: ExecutorApprovalMode,
+    pub cancellation: ExecutorCancellationMode,
+    pub context: ExecutorContextOwnership,
+    #[serde(rename = "structuredOutput")]
+    pub structured_output: bool,
+    pub background: bool,
+    pub inspection: bool,
+    #[serde(rename = "outputLimit")]
+    pub output_limit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelStepPurpose {
+    #[serde(rename = "execution")]
+    Execution,
+    #[serde(rename = "context_compaction")]
+    ContextCompaction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnInterruptParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "expectedTurnId")]
+    pub expected_turn_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnInterruptResult {
+    pub interrupted: bool,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(rename = "turnId")]
+    pub turn_id: Option<String>,
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "requestedAt")]
+    pub requested_at: u64,
+    #[serde(rename = "cancelledToolProcessCount")]
+    pub cancelled_tool_process_count: usize,
+    #[serde(rename = "remainingQueuedTurnCount")]
+    pub remaining_queued_turn_count: usize,
+    #[serde(rename = "nextQueuedTurnStarted")]
+    pub next_queued_turn_started: bool,
+    #[serde(rename = "removedTimelineEntryIds")]
+    pub removed_timeline_entry_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInteractionScope {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolApprovalDecision {
+    #[serde(rename = "allow_once")]
+    AllowOnce,
+    #[serde(rename = "allow_for_turn")]
+    AllowForTurn,
+    #[serde(rename = "deny")]
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalRequestAgent {
+    pub role: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingToolApproval {
+    #[serde(rename = "approvalId")]
+    pub approval_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub reason: String,
+    #[serde(rename = "requestedAt")]
+    pub requested_at: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ApprovalRequestAgent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserQuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserQuestion {
+    pub question: String,
+    pub header: String,
+    #[serde(rename = "multiSelect")]
+    pub multi_select: bool,
+    #[serde(rename = "allowOther")]
+    pub allow_other: bool,
+    pub options: Vec<UserQuestionOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingUserQuestion {
+    #[serde(rename = "questionId")]
+    pub question_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "taskId")]
+    pub task_id: Option<String>,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    pub questions: Vec<UserQuestion>,
+    #[serde(rename = "requestedAt")]
+    pub requested_at: u64,
+    #[serde(rename = "canSkip")]
+    pub can_skip: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserQuestionAnswer {
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AnsweredQuestionKind {
+    #[serde(rename = "answered")]
+    Answered,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SkippedQuestionKind {
+    #[serde(rename = "skipped")]
+    Skipped,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnsweredQuestionResponse {
+    pub kind: AnsweredQuestionKind,
+    pub answers: Vec<UserQuestionAnswer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkippedQuestionResponse {
+    pub kind: SkippedQuestionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserQuestionResponse {
+    AnsweredQuestion(AnsweredQuestionResponse),
+    SkippedQuestion(SkippedQuestionResponse),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInteractionsResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "pendingApprovals")]
+    pub pending_approvals: Vec<PendingToolApproval>,
+    #[serde(rename = "pendingQuestions")]
+    pub pending_questions: Vec<PendingUserQuestion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveToolApprovalParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "approvalId")]
+    pub approval_id: String,
+    pub decision: ToolApprovalDecision,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveToolApprovalResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "approvalId")]
+    pub approval_id: String,
+    pub decision: ToolApprovalDecision,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveUserQuestionParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "questionId")]
+    pub question_id: String,
+    pub response: UserQuestionResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveUserQuestionResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "questionId")]
+    pub question_id: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalStatus {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "paused")]
+    Paused,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "complete")]
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalContinuationPhase {
+    #[serde(rename = "idle")]
+    Idle,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "waiting")]
+    Waiting,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalBlocker {
+    #[serde(rename = "blockerKey")]
+    pub blocker_key: String,
+    pub reason: String,
+    #[serde(rename = "consecutiveTurns")]
+    pub consecutive_turns: u32,
+    #[serde(rename = "lastObservedTurnId")]
+    pub last_observed_turn_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalContinuation {
+    pub phase: GoalContinuationPhase,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "turnId")]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalCompletion {
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub summary: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "planRevision")]
+    pub plan_revision: Option<u64>,
+    #[serde(rename = "evidenceRefs")]
+    pub evidence_refs: Vec<String>,
+    #[serde(rename = "completedAt")]
+    pub completed_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionGoal {
+    #[serde(rename = "goalId")]
+    pub goal_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "createdByTurnId")]
+    pub created_by_turn_id: Option<String>,
+    pub objective: String,
+    pub status: GoalStatus,
+    #[serde(rename = "controlRevision")]
+    pub control_revision: u64,
+    #[serde(rename = "accessProfile")]
+    pub access_profile: AccessProfile,
+    #[serde(rename = "tokensUsed")]
+    pub tokens_used: u64,
+    #[serde(rename = "modelAttemptsUsed")]
+    pub model_attempts_used: u64,
+    #[serde(rename = "timeUsedSeconds")]
+    pub time_used_seconds: u64,
+    #[serde(rename = "timeUsedMillis")]
+    pub time_used_millis: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timingStartedAt")]
+    pub timing_started_at: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timingTurnId")]
+    pub timing_turn_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<GoalBlocker>,
+    pub continuation: GoalContinuation,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<GoalCompletion>,
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanItemStatus {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "in_progress")]
+    InProgress,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "canceled")]
+    Canceled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanState {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "paused")]
+    Paused,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "canceled")]
+    Canceled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanItem {
+    #[serde(rename = "itemId")]
+    pub item_id: String,
+    pub title: String,
+    pub status: PlanItemStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionPlan {
+    #[serde(rename = "planId")]
+    pub plan_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalId")]
+    pub goal_id: Option<String>,
+    pub revision: u64,
+    pub language: String,
+    pub state: PlanState,
+    pub items: Vec<PlanItem>,
+    #[serde(rename = "taskBindings")]
+    pub task_bindings: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalAllowedActions {
+    #[serde(rename = "canEdit")]
+    pub can_edit: bool,
+    #[serde(rename = "canPause")]
+    pub can_pause: bool,
+    #[serde(rename = "canResume")]
+    pub can_resume: bool,
+    #[serde(rename = "canClear")]
+    pub can_clear: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalSnapshot {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "observedAt")]
+    pub observed_at: u64,
+    pub goal: Option<SessionGoal>,
+    pub plan: Option<SessionPlan>,
+    #[serde(rename = "allowedActions")]
+    pub allowed_actions: GoalAllowedActions,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalReadParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    pub scope: SessionScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalActionParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    pub scope: SessionScope,
+    #[serde(rename = "goalId")]
+    pub goal_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedPlanRevision")]
+    pub expected_plan_revision: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "accessProfile")]
+    pub access_profile: Option<AccessProfile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalUpdateParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    pub scope: SessionScope,
+    #[serde(rename = "goalId")]
+    pub goal_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedPlanRevision")]
+    pub expected_plan_revision: Option<u64>,
+    pub objective: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionQueueItemParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "queueId")]
+    pub queue_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionQueueUpdateParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "queueId")]
+    pub queue_id: String,
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: u64,
+    pub request: TurnStartParams,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionQueueGuideParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "queueId")]
+    pub queue_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "expectedTurnId")]
+    pub expected_turn_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueuedSessionTurn {
+    pub revision: u64,
+    #[serde(rename = "queueId")]
+    pub queue_id: String,
+    #[serde(rename = "queuePosition")]
+    pub queue_position: u64,
+    #[serde(rename = "requestId")]
+    pub request_id: Option<String>,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "acceptedAt")]
+    pub accepted_at: u64,
+    pub content: String,
+    pub text: Option<String>,
+    pub command: Option<SessionTurnCommand>,
+    #[serde(rename = "workflowId")]
+    pub workflow_id: Option<String>,
+    #[serde(rename = "pluginCommandId")]
+    pub plugin_command_id: Option<String>,
+    #[serde(rename = "skillName")]
+    pub skill_name: Option<String>,
+    #[serde(rename = "goalMode")]
+    pub goal_mode: bool,
+    #[serde(rename = "accessProfile")]
+    pub access_profile: Option<AccessProfile>,
+    pub images: Vec<SessionTurnImage>,
+    #[serde(rename = "contextReferences")]
+    pub context_references: Vec<SessionContextReference>,
+    #[serde(rename = "browserAnnotationRefs")]
+    pub browser_annotation_refs: Vec<String>,
+    #[serde(rename = "browserNodeSelections")]
+    pub browser_node_selections: Vec<BrowserNodeSelection>,
+    #[serde(rename = "pluginSelections")]
+    pub plugin_selections: Vec<PluginSelection>,
+    pub guide: SessionTurnGuideCapability,
+    #[serde(rename = "retryCount")]
+    pub retry_count: u8,
+    #[serde(rename = "interruptTurnId")]
+    pub interrupt_turn_id: Option<String>,
+    #[serde(rename = "interruptionError")]
+    pub interruption_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionQueueSnapshot {
+    pub cursor: SessionInboxCursor,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "queuedTurns")]
+    pub queued_turns: Vec<QueuedSessionTurn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentTransferTarget {
+    #[serde(rename = "session")]
+    Session,
+    #[serde(rename = "goal")]
+    Goal,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTransferParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub scope: SessionScope,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "expectedParentTurnId")]
+    pub expected_parent_turn_id: String,
+    #[serde(rename = "expectedGeneration")]
+    pub expected_generation: u64,
+    pub owner: AgentTransferTarget,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalId")]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expectedGoalControlRevision")]
+    pub expected_goal_control_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTransferResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "sourceTurnId")]
+    pub source_turn_id: String,
+    #[serde(rename = "activationGeneration")]
+    pub activation_generation: u64,
+    pub owner: AgentTransferTarget,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalId")]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "goalControlRevision")]
+    pub goal_control_revision: Option<u64>,
+    #[serde(rename = "transferredAt")]
+    pub transferred_at: u64,
+    #[serde(rename = "runnerStarted")]
+    pub runner_started: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContinueParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub scope: SessionScope,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: Option<String>,
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "expectedGeneration")]
+    pub expected_generation: u64,
+    #[serde(rename = "expectedTurnId")]
+    pub expected_turn_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContinueResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    #[serde(rename = "sourceTurnId")]
+    pub source_turn_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub replayed: bool,
 }

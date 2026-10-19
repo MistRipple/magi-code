@@ -36,6 +36,13 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub fn with_background_job_journal(
+        mut self,
+        journal: Arc<dyn crate::BackgroundJobJournal>,
+    ) -> Self {
+        self.runtime_resources.background_job_journal = Some(journal);
+        self
+    }
     pub fn new(governance: Arc<GovernanceService>, event_bus: Arc<InMemoryEventBus>) -> Self {
         Self {
             governance,
@@ -67,6 +74,12 @@ impl ToolRegistry {
     pub fn with_external_mcp_tool_executor(mut self, executor: ExternalMcpToolExecutor) -> Self {
         self.runtime_resources.external_mcp_tool_executor = Some(executor);
         self
+    }
+
+    /// 模型工具面只应发布有实际执行入口的 MCP 工具。目录 provider 可以在连接
+    /// 尚未完成时提前返回 schema，因此不能把“有目录”误当成“可执行”。
+    pub fn external_mcp_tool_executor_available(&self) -> bool {
+        self.runtime_resources.external_mcp_tool_executor.is_some()
     }
 
     pub fn with_plugin_tools(
@@ -101,38 +114,14 @@ impl ToolRegistry {
             .plugin_tool_catalog(context.workspace_id.as_ref())
             .into_iter()
             .find(|entry| entry.model_tool_name == model_tool_name)?;
-        if !entry.read_only {
-            match access_profile {
-                AccessProfile::ReadOnly => {
-                    return Some((
-                        serde_json::json!({
-                            "tool": model_tool_name,
-                            "status": "rejected",
-                            "error_code": "plugin_blocked_in_read_only",
-                            "error": "只读访问模式不允许调用有外部副作用的插件工具",
-                            "access_profile": "read_only",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Rejected,
-                    ));
-                }
-                AccessProfile::Restricted => {
-                    // 与 MCP 副作用工具使用同一审批续跑合同：授权后由调用方以完整访问重放。
-                    return Some((
-                        serde_json::json!({
-                            "tool": model_tool_name,
-                            "status": "needs_approval",
-                            "error_code": "plugin_requires_full_access",
-                            "error": "该插件工具需要你的确认，授权后将继续当前调用",
-                            "access_profile": "restricted",
-                            "approval_resume_safe": true,
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::NeedsApproval,
-                    ));
-                }
-                AccessProfile::FullAccess => {}
-            }
+        if let Some(result) = external_tool_access_rejection(
+            model_tool_name,
+            entry.read_only,
+            access_profile,
+            "plugin",
+            "插件",
+        ) {
+            return Some(result);
         }
         self.runtime_resources
             .plugin_tool_executor
@@ -175,37 +164,14 @@ impl ToolRegistry {
             .mcp_tools
             .into_iter()
             .find(|tool| tool.model_tool_name == model_tool_name)?;
-        if !binding.read_only {
-            match access_profile {
-                AccessProfile::ReadOnly => {
-                    return Some((
-                        serde_json::json!({
-                            "tool": model_tool_name,
-                            "status": "rejected",
-                            "error_code": "mcp_blocked_in_read_only",
-                            "error": "只读访问模式不允许调用有外部副作用的 MCP 工具",
-                            "access_profile": "read_only",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Rejected,
-                    ));
-                }
-                AccessProfile::Restricted => {
-                    return Some((
-                        serde_json::json!({
-                            "tool": model_tool_name,
-                            "status": "needs_approval",
-                            "error_code": "mcp_requires_full_access",
-                            "error": "该 MCP 工具需要你的确认，授权后将继续当前调用",
-                            "access_profile": "restricted",
-                            "approval_resume_safe": true,
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::NeedsApproval,
-                    ));
-                }
-                AccessProfile::FullAccess => {}
-            }
+        if let Some(result) = external_tool_access_rejection(
+            model_tool_name,
+            binding.read_only,
+            access_profile,
+            "mcp",
+            " MCP ",
+        ) {
+            return Some(result);
         }
         let executor = self.runtime_resources.external_mcp_tool_executor.as_ref()?;
         Some(executor(&binding.server_id, &binding.tool_name, arguments))
@@ -374,11 +340,16 @@ impl ToolRegistry {
     }
 
     pub fn cancel_active_executions(&self, query: &ToolExecutionContextQuery) -> usize {
-        builtin::read_support::cancel_reads(Some(query)) + builtin::cancel_active_processes(query)
+        builtin::cancellation::cancel_operations(Some(query))
+            + builtin::cancel_active_processes(query)
+    }
+
+    pub fn has_active_executions(&self, query: &ToolExecutionContextQuery) -> bool {
+        builtin::cancellation::has_active_operations(query) || builtin::has_active_processes(query)
     }
 
     pub fn cancel_all_active_executions() -> usize {
-        builtin::read_support::cancel_reads(None) + builtin::cancel_all_active_processes()
+        builtin::cancellation::cancel_operations(None) + builtin::cancel_all_active_processes()
     }
 
     #[cfg(test)]
@@ -495,9 +466,16 @@ impl ToolRegistry {
                             return output;
                         }
                     };
-                    let before_changes = capture_tool_workspace_snapshot(&input, &context);
+                    let before_changes = if BuiltinToolName::from_name(&input.tool_name)
+                        .is_some_and(|tool| tool.is_background_process_observation(&input.input))
+                    {
+                        None
+                    } else {
+                        capture_tool_workspace_snapshot(&input, &context)
+                    };
                     let mut resources = self.runtime_resources.clone();
                     resources.cancellation = cancellation.clone();
+                    resources.execution_policy = Some(policy.clone());
                     // 读工具只做读取：与权限预检同一规则，读取不受默认的工作区范围约束。
                     let execution_policy = crate::policy::execution_permission_policy(
                         policy,
@@ -623,6 +601,7 @@ impl ToolRegistry {
             .read()
             .expect("tool invocation read lock poisoned")
             .iter()
+            .filter(|record| !query.taskless_only || record.context.task_id.is_none())
             .filter(|record| {
                 query
                     .worker_id
@@ -750,6 +729,32 @@ impl ToolRegistry {
             }),
         );
     }
+}
+
+fn external_tool_access_rejection(
+    name: &str,
+    read_only: bool,
+    access_profile: AccessProfile,
+    source: &str,
+    label: &str,
+) -> Option<(String, ExecutionResultStatus)> {
+    let status = crate::external_tool_access_decision(read_only, access_profile)?;
+    let approval = status == ExecutionResultStatus::NeedsApproval;
+    let mut payload = serde_json::json!({
+        "tool": name,
+        "status": status.wire_label(),
+        "error_code": format!("{source}_{}", if approval { "requires_full_access" } else { "blocked_in_read_only" }),
+        "error": if approval {
+            format!("该{label}工具需要你的确认，授权后将继续当前调用")
+        } else {
+            format!("只读访问模式不允许调用有外部副作用的{label}工具")
+        },
+        "access_profile": access_profile.as_str(),
+    });
+    if approval {
+        payload["approval_resume_safe"] = serde_json::Value::Bool(true);
+    }
+    Some((payload.to_string(), status))
 }
 
 impl ToolRegistry {
