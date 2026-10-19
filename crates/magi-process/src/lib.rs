@@ -1150,10 +1150,19 @@ mod tests {
 
     #[cfg(windows)]
     fn process_alive(pid: u32) -> bool {
-        let pid = sysinfo::Pid::from_u32(pid);
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        system.process(pid).is_some()
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_TIMEOUT},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+
+        // Windows 在 Child 句柄关闭前仍可枚举已退出进程；可枚举不等于仍运行。
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let state = unsafe { WaitForSingleObject(process, 0) };
+        unsafe { CloseHandle(process) };
+        state == WAIT_TIMEOUT
     }
 
     #[cfg(unix)]

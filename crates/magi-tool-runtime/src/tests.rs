@@ -1788,7 +1788,7 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     };
 
     let shell_command = if cfg!(windows) {
-        "if exist marker.txt echo workspace-ok"
+        "if (Test-Path -LiteralPath marker.txt) { Write-Output workspace-ok }"
     } else {
         "test -f marker.txt && printf workspace-ok"
     };
@@ -1810,7 +1810,11 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     );
     let shell_payload: Value =
         serde_json::from_str(&shell_output.payload).expect("shell payload should parse");
-    assert_eq!(shell_output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(
+        shell_output.status,
+        ExecutionResultStatus::Succeeded,
+        "{shell_payload}"
+    );
     assert_eq!(
         shell_payload["stdout"].as_str().map(str::trim),
         Some("workspace-ok")

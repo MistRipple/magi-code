@@ -498,7 +498,25 @@ fn reopening_cleans_unreferenced_package_versions_after_lifecycle_commit() {
     )
     .unwrap();
     assert!(!old_path.exists());
-    assert!(PluginManager::open(root.path()).is_ok());
+    let reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(
+        reopened
+            .package("acme.lifecycle")
+            .unwrap()
+            .manifest()
+            .version,
+        "1.1.0",
+        "升级和启动清理都必须保留当前安装包"
+    );
+    let reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(
+        reopened
+            .package("acme.lifecycle")
+            .unwrap()
+            .manifest()
+            .version,
+        "1.1.0"
+    );
 }
 
 #[test]

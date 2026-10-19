@@ -874,7 +874,7 @@ fn cleanup_unreferenced_packages(
     let referenced = state
         .plugins
         .values()
-        .map(|plugin| plugin.package_path.as_str())
+        .map(|plugin| Path::new(&plugin.package_path))
         .collect::<BTreeSet<_>>();
     let entries = match fs::read_dir(&versions) {
         Ok(entries) => entries,
@@ -889,10 +889,9 @@ fn cleanup_unreferenced_packages(
         for file in fs::read_dir(entry.path())? {
             let file = file?;
             let path = file.path();
-            let relative = path
-                .strip_prefix(root)
-                .ok()
-                .and_then(|value| value.to_str());
+            // 安装记录使用 `/`；Windows read_dir 返回 `\`。按宿主路径比较，
+            // 不能把分隔符不同的当前版本误当成未引用包删除。
+            let relative = path.strip_prefix(root).ok();
             if file.file_type()?.is_file()
                 && relative.is_some_and(|value| !referenced.contains(value))
             {

@@ -74,6 +74,7 @@ jobs:
 
       - name: 安装依赖并验证 Electron Desktop
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run release:guard
           npm run check --workspace @magi/desktop
@@ -89,6 +90,7 @@ jobs:
 
       - name: 验证 Windows 子进程与桌面宿主
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p magi-core --test host_path --locked
           cargo test -p magi-workspace native_workspace_registration_keeps_authoritative_path_ref --locked
           cargo test -p magi-process --all-targets --locked
