@@ -783,12 +783,18 @@ impl WindowsJobHandle {
     }
 
     fn terminate(&self) -> io::Result<()> {
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::{JobObjects::TerminateJobObject, Threading::WaitForSingleObject},
+        };
 
+        let processes = self.process_wait_handles();
         let terminated = unsafe { TerminateJobObject(self.0 as _, 1) };
         if terminated == 0 {
             return Err(io::Error::last_os_error());
         }
+        // 枚举失败也先提交终止请求，再返回结算失败；不能因此让原命令继续运行。
+        let processes = processes?;
         // TerminateJobObject 是异步终止请求；根进程退出不能证明 Job 的后代已退出。
         // 沿原 Job 核对结算，调用方才能安全发布完成或启动下一次写入。
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
@@ -801,7 +807,94 @@ impl WindowsJobHandle {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        // Job 的记账清零早于进程对象变为 signaled；仍持有 Child 的调用方
+        // 或已退出根进程的后代可能尚未完成退出。等待原 Job 成员，不能仅用
+        // 计数或 PID 可枚举性推断完成，也不能等待其他 owner 的进程。
+        for process in processes {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = unsafe {
+                WaitForSingleObject(process.as_raw_handle() as _, remaining.as_millis() as u32)
+            };
+            match result {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "受管 Windows 进程未在终止期限内完成退出",
+                    ));
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
         Ok(())
+    }
+
+    fn process_wait_handles(&self) -> io::Result<Vec<std::os::windows::io::OwnedHandle>> {
+        use std::{mem::size_of, os::windows::io::FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA},
+            System::{
+                JobObjects::{
+                    JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList,
+                    QueryInformationJobObject,
+                },
+                Threading::{OpenProcess, PROCESS_SYNCHRONIZE},
+            },
+        };
+
+        let mut capacity = self.active_process_count()? as usize + 1;
+        loop {
+            // usize 保证 Win32 变长结构的对齐；header 之外为 ProcessIdList 留空间。
+            let mut buffer = vec![
+                0usize;
+                size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() / size_of::<usize>()
+                    + capacity
+            ];
+            let length = u32::try_from(std::mem::size_of_val(buffer.as_slice()))
+                .map_err(|_| io::Error::other("Windows Job 进程列表过大"))?;
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.0 as _,
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    std::ptr::null_mut(),
+                )
+            };
+            let information =
+                unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+            if queried == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_MORE_DATA as i32) {
+                    capacity = capacity
+                        .saturating_mul(2)
+                        .max(information.NumberOfAssignedProcesses as usize);
+                    continue;
+                }
+                return Err(error);
+            }
+            let ids = unsafe {
+                std::slice::from_raw_parts(
+                    information.ProcessIdList.as_ptr(),
+                    information.NumberOfProcessIdsInList as usize,
+                )
+            };
+            let mut handles = Vec::with_capacity(ids.len());
+            for &pid in ids {
+                let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32) };
+                if process.is_null() {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                        continue; // 查询之后自然退出且已回收。
+                    }
+                    return Err(error);
+                }
+                handles.push(unsafe {
+                    std::os::windows::io::OwnedHandle::from_raw_handle(process as _)
+                });
+            }
+            return Ok(handles);
+        }
     }
 
     fn active_process_count(&self) -> io::Result<u32> {
