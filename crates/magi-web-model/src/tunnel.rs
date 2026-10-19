@@ -197,6 +197,7 @@ fn parse_launch_result(output: &str) -> Result<LaunchStatus, String> {
 ///
 /// 必须同时满足：命令里有本通道的客户端二进制路径、`run` 子命令、同一个 `--profile-dir`
 /// 与 `--profile` 名称；排除自身。任何一项对不上都不动，避免误杀别的隧道客户端。
+#[cfg(any(unix, test))]
 fn leaked_client_pids(
     listing: &str,
     client_binary: &Path,

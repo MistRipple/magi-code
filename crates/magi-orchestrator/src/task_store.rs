@@ -7,7 +7,7 @@ use magi_core::{
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -4033,7 +4033,7 @@ impl TaskStore {
 
     #[cfg(unix)]
     fn sync_directory(path: &Path) -> io::Result<()> {
-        File::open(path)?.sync_all()
+        fs::File::open(path)?.sync_all()
     }
 
     #[cfg(not(unix))]

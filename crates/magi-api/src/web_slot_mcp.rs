@@ -240,20 +240,33 @@ mod tests {
 
     // ── 端到端：槽位端点 + 槽位表 + 会话 canonical ───────────────────────────────
 
+    #[cfg(unix)]
     use crate::mcp_runtime::McpServiceRuntime;
+    #[cfg(unix)]
     use magi_conversation_runtime::ToolApprovalDecision;
+    #[cfg(unix)]
     use magi_core::{AbsolutePath, SessionId, UtcMillis, WorkspaceId};
+    #[cfg(unix)]
     use magi_event_bus::InMemoryEventBus;
+    #[cfg(unix)]
     use magi_governance::GovernanceService;
+    #[cfg(unix)]
     use magi_session_store::SessionStore;
+    #[cfg(unix)]
     use magi_tool_runtime::ToolRegistry;
+    #[cfg(unix)]
     use magi_workspace::WorkspaceStore;
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    #[cfg(unix)]
     use crate::state::ApiState;
 
+    #[cfg(unix)]
     struct Fixture {
         state: ApiState,
         table: Arc<WebSlotTable>,
@@ -264,6 +277,7 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    #[cfg(unix)]
     async fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let event_bus = Arc::new(InMemoryEventBus::new(64));
@@ -335,9 +349,11 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     trait CanonicalizeOrCreate {
         fn canonicalize_or_create(self) -> PathBuf;
     }
+    #[cfg(unix)]
     impl CanonicalizeOrCreate for PathBuf {
         fn canonicalize_or_create(self) -> PathBuf {
             std::fs::create_dir_all(&self).unwrap();
@@ -345,6 +361,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Fixture {
         /// 槽位拥有者开始一个 Web turn：会话里有进行中的 Turn，槽位表里有对应租约。
         fn begin_web_turn(&self) -> magi_web_model::WebTurnLease {
@@ -372,6 +389,7 @@ mod tests {
     }
 
     /// 像 `magi-mcp --stdio --slot` 一样：连接槽位端点（无握手）并发一条 JSON-RPC。
+    #[cfg(unix)]
     async fn slot_call(
         endpoint: &PathBuf,
         method: &str,
@@ -396,14 +414,17 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
+    #[cfg(unix)]
     fn is_error(reply: &serde_json::Value) -> bool {
         reply["error"].is_object() || reply["result"]["isError"].as_bool().unwrap_or(false)
     }
 
+    #[cfg(unix)]
     fn read_call() -> serde_json::Value {
         serde_json::json!({"name": "magi.fs.read", "arguments": {"path": "a.txt"}})
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn catalog_is_readable_before_any_slot_but_calls_need_the_owners_active_turn() {
         let f = fixture().await;
@@ -432,6 +453,7 @@ mod tests {
         assert!(is_error(&after), "turn 结束后必须拒绝: {after}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn slot_calls_are_written_inline_into_the_active_turn_as_tool_items() {
         let f = fixture().await;
@@ -463,6 +485,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn slot_write_asks_in_the_owner_session_and_lands_in_the_owner_ledger() {
         let f = fixture().await;
@@ -521,6 +544,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ending_the_turn_cancels_a_waiting_approval_without_writing() {
         let f = fixture().await;
@@ -558,6 +582,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn releasing_the_slot_makes_the_next_call_fail_and_never_exposes_exec() {
         let f = fixture().await;

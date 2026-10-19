@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use magi_bridge_client::{
     HttpMcpServerConfig, McpBridgeClient, McpServerClient, McpServerConfig,
     McpServerConnectionConfig, McpToolCallRequest,
