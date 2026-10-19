@@ -4,6 +4,8 @@
 
 ## 项目定位
 
+- Magi 只提供 Electron 桌面 GUI 与 Web 工作台，不提供 Magi CLI 或独立移动端应用；手机和平板通过同一 Web 工作台的响应式布局访问。
+- 外部 Agent Executor 当前只预留通用扩展接口，不提供具体执行器、设置入口或试点交付；现有原生模型、GPT Web 与插件运行能力继续维护。
 - Rust 后端已完成重构与协议冻结，当前处于正式运行阶段
 - 前端基于现有 `magi` 产品方案迁移完成，持续完善产品体验
 - 后端重构历史文档已归档清理，当前以代码和真实运行链路为唯一事实源
@@ -46,18 +48,23 @@ npm run desktop:dev
 
 ## 目标与代理运行设计
 
+- [子代理唤起设计与改造](subagent-delegation-design.md)：默认主线执行、四种委派目的、派发前决策合同、唯一预检和验收边界。
+- [运行时改造收敛审计](runtime-consolidation-audit.md)：当前变更范围、移除项、冻结项和继续修改门槛。
+
+- [Magi 产品与 Agent 运行时演进方案](./magi-agent-runtime-evolution-plan.md)：2026-10-16 起分阶段实施，基于当前源码与 Claude Code、Codex CLI、DeepSeek Harness、ZCode 的一手资料，涵盖输入/队列/引导、主子代理工具权限、统一运行时和分阶段迁移。方案保留目标与退出条件；当前保留、移除和未验收范围见收敛审计。
+
 - 简单事走会话流和工具证据，不生成额外抽屉
 - 多步骤工作进入目标模式，目标抽屉承载目标内容、状态与操作
 - 执行计划来自会话级 `SessionPlan`，通过稳定 ID、revision 与真实执行任务绑定，只在存在计划项时展示
 - 代理协作保留内部 root task 作为编排锚点，用户主视图通过代理运行抽屉展示实际代理任务
-- 跨轮恢复由 canonical Turn 日志、TaskStore 检查点和变更账本承载；审批沿用 daemon 权限入口
+- 跨轮恢复由 canonical Turn 日志、TaskStore 检查点和变更账本承载；原生审批和提问/答复持久化到原工具 item，重启后先处理原交互再显式 Continue；批准领取须匹配恢复链、参数、目录与权限并先提交 running，重启不自动重放副作用
+- 已转交的独立代理从详情页显式继续；daemon 只重开原转交子树，沿原 Task/Thread 接纳新 Turn，保持原 Skill、执行目录与交互来源。主线继续不代替独立代理继续；重试读取原回执，旧终态回调不能释放新执行的资源。
 
 后续设计说明从当前代码和产品形态反向整理。
 
 ## 架构与维护文档
 
 - [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：统一安装、授权、生命周期、版本化资源、插件工具与工作流、会话引擎路由、隔离视图、第一方 GPT Web/MCP 服务插件壳及插件中心已接入；平台验证、取消结算与通用 Browser surface 的限制见 §10.1。作者合同见[插件作者指南](./plugin-authoring.md)。
-- [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。
 - [对话展示：完整模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
