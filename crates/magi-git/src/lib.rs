@@ -6,6 +6,7 @@
 
 use magi_process::tokio_command;
 use serde::{Deserialize, Serialize};
+use std::process::Stdio;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -2366,6 +2367,7 @@ async fn run_git(path: &Path, args: &[&str]) -> Result<CommandOutput, GitError> 
         .arg("-C")
         .arg(path)
         .args(args)
+        .stdin(Stdio::null())
         .output()
         .await
         .map_err(|error| GitError::Io(error.to_string()))?;
@@ -2401,7 +2403,7 @@ async fn run_git_with_env(
     envs: &[(&str, &std::ffi::OsStr)],
 ) -> Result<CommandOutput, GitError> {
     let mut command = tokio_command("git");
-    command.arg("-C").arg(path).args(args);
+    command.arg("-C").arg(path).args(args).stdin(Stdio::null());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2446,6 +2448,7 @@ async fn run_git_bytes(path: &Path, args: &[&str]) -> Result<BinaryCommandOutput
         .arg("-C")
         .arg(path)
         .args(args)
+        .stdin(Stdio::null())
         .output()
         .await
         .map_err(|error| GitError::Io(error.to_string()))?;
@@ -2581,6 +2584,60 @@ mod tests {
     use super::*;
     use std::{collections::BTreeSet, fs};
     use tempfile::TempDir;
+
+    #[test]
+    fn git_commands_do_not_inherit_parent_stdin() {
+        const CHILD: &str = "MAGI_GIT_STDIN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let repo = repository();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let args = ["hash-object", "--stdin"];
+                    let empty = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+                    assert_eq!(run_git(repo.path(), &args).await.unwrap().stdout, empty);
+                    assert_eq!(
+                        run_git_with_env(repo.path(), &args, &[])
+                            .await
+                            .unwrap()
+                            .stdout,
+                        empty
+                    );
+                    assert_eq!(
+                        run_git_bytes(repo.path(), &args).await.unwrap().stdout,
+                        format!("{empty}\n").as_bytes()
+                    );
+                });
+            return;
+        }
+        // 模拟 Desktop 保持开放的 owner pipe；Git 不能读取它或等待其 EOF。
+        let mut command = magi_process::std_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::git_commands_do_not_inherit_parent_stdin",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        let mut child = magi_process::spawn_managed(&mut command).unwrap();
+        let _owner_pipe = child.take_stdin().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "Git stdin 隔离子进程失败：{status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.terminate().unwrap();
+                panic!("Git 等待宿主 stdin 关闭，没有独立的空输入");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     fn git(path: &Path, args: &[&str]) -> String {
         let output = magi_process::std_command("git")
