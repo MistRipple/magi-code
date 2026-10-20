@@ -53,6 +53,15 @@ pub fn workspace_execution_preparer(
             .as_ref()
             .ok_or_else(|| "工作区执行准备缺少异步运行时".to_string())?;
         runtime.block_on(async {
+            let started = std::time::Instant::now();
+            let record_stage = |stage: &str| {
+                tracing::info!(
+                    %session_id, %turn_id, stage,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "workspace execution preparation"
+                );
+            };
+            record_stage("started");
             let still_active = || {
                 state
                     .session_store
@@ -72,6 +81,7 @@ pub fn workspace_execution_preparer(
             state
                 .isolate_on_workspace_contention(session_id, workspace_id, turn_id)
                 .await;
+            record_stage("isolation_checked");
             if !still_active() {
                 return Err("隔离目录准备期间 Turn 已关闭或变化".to_string());
             }
@@ -79,10 +89,12 @@ pub fn workspace_execution_preparer(
                 .ensure_session_code_context(session_id, workspace_id)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
+            record_stage("git_context_ready");
             let snapshot = state
                 .ensure_snapshot_session_for_workspace_id(session_id, workspace_id)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
+            record_stage("snapshot_ready");
             if !still_active() {
                 return Err("工作区准备期间 Turn 已关闭或变化".to_string());
             }

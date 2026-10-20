@@ -4147,6 +4147,7 @@ impl ApiState {
             .workspace_root_path(&Some(workspace_id.clone()))
             .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
         let _change_sync_guard = self.lock_session_change_sync(session_id).await;
+        tracing::info!(%session_id, stage = "change_sync_acquired", "workspace execution preparation");
         let session_key = session_id.as_str();
         let existing_context = self.session_code_contexts.get(session_key);
         if let Some(existing_context) = existing_context.as_ref() {
@@ -4166,11 +4167,13 @@ impl ApiState {
                 )));
             }
         };
+        tracing::info!(%session_id, stage = "git_observed", "workspace execution preparation");
         if existing_context.is_none() {
             // 首次观测只用于确定需要哪把 repository lease。等到执行权后重新观测，
             // 再建立快照基线，不能记录另一个会话尚未完成写入的中间状态。
             self.begin_session_git_execution(session_id, &observation.git_common_dir)
                 .await?;
+            tracing::info!(%session_id, stage = "git_lease_acquired", "workspace execution preparation");
             let leased_common_dir = observation.git_common_dir.clone();
             observation = match self.git_service.observe(&workspace_root).await {
                 Ok(observation) if observation.git_common_dir == leased_common_dir => observation,
@@ -4198,6 +4201,7 @@ impl ApiState {
                     return Err(error);
                 }
             };
+            tracing::info!(%session_id, stage = "git_snapshot_loaded", "workspace execution preparation");
             if let Err(error) = self
                 .align_snapshot_baseline_to_observation_head(
                     &observation.worktree_path,

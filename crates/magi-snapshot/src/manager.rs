@@ -91,6 +91,7 @@ impl SnapshotManager {
         }
 
         let _start_guard = self.start_lock.lock().await;
+        tracing::info!(%session_id, stage = "start_lock_acquired", "snapshot preparation");
         if let Some(session) = self.get_session(&session_id) {
             ensure_same_workspace(&session_id, &workspace_root, session.workspace_root())?;
             return Ok(session);
@@ -151,6 +152,7 @@ impl SnapshotManager {
         let watcher_events = self
             .workspace_watcher(&workspace_root, respect_gitignore)?
             .subscribe();
+        tracing::info!(%session_id, stage = "watcher_ready", "snapshot preparation");
         let session = SnapshotSession::start(
             session_id.clone(),
             workspace_root,
