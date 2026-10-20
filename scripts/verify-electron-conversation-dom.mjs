@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
-import { promisify } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { connectTarget } from "./lib/electron-harness.mjs";
@@ -263,13 +263,14 @@ function inspectDesktopIpcLine(line) {
 function consumeElectronLogChunk(stream, chunk) {
   const text = chunk.toString();
   electronLogText.push(`[${stream}] ${text}`);
-  process.stdout.write(`[electron] ${text}`);
+  (stream === "stderr" ? process.stderr : process.stdout).write(`[electron] ${text}`);
   const combined = electronLogBuffers[stream] + text;
   const lines = combined.split(/\r?\n/u);
   electronLogBuffers[stream] = lines.pop() || "";
   for (const line of lines) {
-    inspectDesktopIpcLine(line);
-    parseBackendTimingLine(line);
+    const normalized = stripVTControlCharacters(line);
+    inspectDesktopIpcLine(normalized);
+    parseBackendTimingLine(normalized);
   }
 }
 
@@ -277,8 +278,9 @@ function flushElectronLogBuffers() {
   for (const stream of Object.keys(electronLogBuffers)) {
     const line = electronLogBuffers[stream];
     if (line) {
-      inspectDesktopIpcLine(line);
-      parseBackendTimingLine(line);
+      const normalized = stripVTControlCharacters(line);
+      inspectDesktopIpcLine(normalized);
+      parseBackendTimingLine(normalized);
     }
     electronLogBuffers[stream] = "";
   }
@@ -2781,22 +2783,19 @@ const stateRoot = await mkdtemp(join(tmpdir(), "magi-electron-conversation-dom-"
 const sourceIdentityBefore = await collectSourceIdentity();
 function attachElectronLogs(child) {
   child.stdout.on("data", (chunk) => consumeElectronLogChunk("stdout", chunk));
-  child.stderr.on("data", (chunk) => {
-    process.stderr.write(`[electron] ${chunk}`);
-    const text = chunk.toString();
-    electronLogText.push(`[stderr] ${text}`);
-    const combined = electronLogBuffers.stderr + text;
-    const lines = combined.split(/\r?\n/u);
-    electronLogBuffers.stderr = lines.pop() || "";
-    for (const line of lines) {
-      inspectDesktopIpcLine(line);
-      parseBackendTimingLine(line);
-    }
-  });
+  child.stderr.on("data", (chunk) => consumeElectronLogChunk("stderr", chunk));
 }
 
 function spawnElectron(port) {
-  const child = spawn(appExecutable, [`--remote-debugging-port=${port}`, `--inspect=127.0.0.1:${port + 2}`, "--disable-gpu"], {
+  const child = spawn(appExecutable, [
+    `--remote-debugging-port=${port}`,
+    `--inspect=127.0.0.1:${port + 2}`,
+    "--disable-gpu",
+    // 验收仍读取真实 Renderer 的 RAF；CI/锁屏遮挡不应暂停该窗口的帧回调。
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+  ], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
