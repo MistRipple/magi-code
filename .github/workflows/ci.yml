@@ -60,7 +60,7 @@ jobs:
   windows-desktop:
     name: Windows 桌面与进程策略
     runs-on: windows-2022
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
@@ -108,6 +108,32 @@ jobs:
           cargo test -p magi-api file_reveal_target --locked
           cargo test -p magi-api background_job --locked
           cargo check -p magi-daemon --all-targets --locked
+
+      - name: 构建 Windows Desktop 目录包
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm run desktop:package -- --dir
+
+      - name: 验收打包 Windows 对话与恢复
+        env:
+          MAGI_ELECTRON_DOM_EVIDENCE_PATH: ${{ runner.temp }}/magi-electron-dom.json
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          try {
+            node scripts/verify-electron-conversation-dom.mjs *> "$env:RUNNER_TEMP/magi-electron-dom.log"
+          } finally {
+            Get-Content "$env:RUNNER_TEMP/magi-electron-dom.log" -Tail 80
+          }
+
+      - name: 保留 Windows GUI 验收证据
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-electron-dom-evidence
+          path: ${{ runner.temp }}/magi-electron-dom.*
+          if-no-files-found: ignore
 
   macos-desktop:
     name: macOS 桌面与更新策略

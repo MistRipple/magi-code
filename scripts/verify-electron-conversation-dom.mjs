@@ -6,7 +6,9 @@ import { dirname, join } from "node:path";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { connectTarget } from "./lib/electron-harness.mjs";
 
 /**
  * 打包 Electron 消息链路 DOM 验收。
@@ -16,14 +18,14 @@ import WebSocket from "ws";
  * 裸 HTTP 请求替代桌面入口。
  */
 
-const repositoryRoot = new URL("..", import.meta.url).pathname.replace(/\/$/u, "");
-const defaultAppExecutable = join(
-  repositoryRoot,
-  "target/electron-dist/mac-arm64/Magi.app/Contents/MacOS/Magi",
-);
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const defaultAppExecutable = defaultDesktopExecutable();
 const appExecutable = process.env.MAGI_ELECTRON_DOM_APP_EXECUTABLE?.trim() || defaultAppExecutable;
 const appBundlePath = process.env.MAGI_ELECTRON_DOM_APP_BUNDLE?.trim()
-  || dirname(dirname(dirname(appExecutable)));
+  || packagedAppRoot(appExecutable);
+const appResourcesPath = process.platform === "darwin"
+  ? join(appBundlePath, "Contents", "Resources")
+  : join(appBundlePath, "resources");
 const cdpPort = Number.parseInt(process.env.MAGI_ELECTRON_DOM_CDP_PORT || "9257", 10);
 const appRestartCdpPort = cdpPort + 1;
 const daemonPort = Number.parseInt(
@@ -73,6 +75,7 @@ const approvalResponseText = "ELECTRON_DOM_APPROVAL_OK";
 const approvalDeniedResponseText = "ELECTRON_DOM_APPROVAL_DENIED";
 const approvalExpiredResponseText = "ELECTRON_DOM_APPROVAL_EXPIRED";
 const fullAccessResponseText = "ELECTRON_DOM_FULL_ACCESS_OK";
+const backgroundJobResponseText = "ELECTRON_DOM_BACKGROUND_JOB_OK";
 const agentFailureResponseText = "ELECTRON_DOM_AGENT_FAILURE_OK";
 const gitMutationResponseText = "ELECTRON_DOM_GIT_MUTATION_OK";
 const evidencePath = process.env.MAGI_ELECTRON_DOM_EVIDENCE_PATH?.trim() || "";
@@ -106,6 +109,7 @@ let gitDirtyRoot = "";
 let gitDriftRoot = "";
 let gitConflictRoot = "";
 let gitMutationRoot = "";
+let backgroundJobTarget = "";
 
 const backendTimingByTurn = new Map();
 const traceToTurn = new Map();
@@ -115,6 +119,52 @@ const electronLogText = [];
 const desktopIpcValidationErrors = [];
 let daemonShutdownSettlementEvents = 0;
 let daemonShutdownSettledTurnCount = 0;
+
+function defaultDesktopExecutable() {
+  const root = join(repositoryRoot, "target", "electron-dist");
+  switch (process.platform) {
+    case "darwin":
+      return join(
+        root,
+        process.arch === "arm64" ? "mac-arm64" : "mac",
+        "Magi.app",
+        "Contents",
+        "MacOS",
+        "Magi",
+      );
+    case "win32":
+      return join(root, process.arch === "arm64" ? "win-arm64-unpacked" : "win-unpacked", "Magi.exe");
+    case "linux":
+      return join(root, process.arch === "arm64" ? "linux-arm64-unpacked" : "linux-unpacked", "Magi");
+    default:
+      throw new Error(`不支持的 Electron DOM 验收平台: ${process.platform}`);
+  }
+}
+
+function packagedAppRoot(executable) {
+  return process.platform === "darwin"
+    ? dirname(dirname(dirname(executable)))
+    : dirname(executable);
+}
+
+function shellQuote(value) {
+  if (process.platform === "win32") return `'${String(value).replaceAll("'", "''")}'`;
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function shellWriteCommand(value, path) {
+  if (process.platform === "win32") {
+    return `Set-Content -LiteralPath ${shellQuote(path)} -Value ${shellQuote(value)} -NoNewline`;
+  }
+  return `printf '%s' ${shellQuote(value)} > ${shellQuote(path)}`;
+}
+
+function backgroundJobCommand(path) {
+  if (process.platform === "win32") {
+    return `Start-Sleep -Seconds 1; Set-Content -LiteralPath ${shellQuote(path)} -Value 'background_job' -NoNewline; exit 0`;
+  }
+  return `sleep 1; printf '%s' background_job > ${shellQuote(path)}; exit 0`;
+}
 
 function logField(line, key) {
   const match = line.match(new RegExp(`${key}=(?:"([^"]*)"|([^\\s]+))`, "u"));
@@ -234,7 +284,7 @@ function flushElectronLogBuffers() {
   }
 }
 
-if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
+if (!Number.isInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65532) {
   throw new Error(`无效 CDP 端口: ${cdpPort}`);
 }
 if (!Number.isInteger(compactionPrefillTurnCount) || compactionPrefillTurnCount < 1 || compactionPrefillTurnCount > 40) {
@@ -294,9 +344,9 @@ async function collectSourceIdentity() {
     .update(await readFile(appExecutable))
     .digest("hex");
   const appIdentityPaths = [
-    join(appBundlePath, "Contents/Resources/app.asar"),
-    join(appBundlePath, "Contents/Resources/web/dist"),
-    join(appBundlePath, "Contents/Resources/daemon"),
+    join(appResourcesPath, "app.asar"),
+    join(appResourcesPath, "web", "dist"),
+    join(appResourcesPath, "daemon"),
   ];
   const appIdentityFiles = [];
   const pendingDirectories = [];
@@ -538,13 +588,13 @@ function providerResponse(body) {
       return openAiStream(approvalDeniedResponseText);
     }
     return toolCallStream("shell_exec", {
-      command: `printf denied > ${approvalDenyTarget}`,
+      command: shellWriteCommand("denied", approvalDenyTarget),
       access_mode: "maybe_write",
     });
   }
   if (promptText.includes("审批取消 DOM 验收")) {
     return toolCallStream("shell_exec", {
-      command: `printf cancelled > ${approvalCancelTarget}`,
+      command: shellWriteCommand("cancelled", approvalCancelTarget),
       access_mode: "maybe_write",
     });
   }
@@ -563,7 +613,7 @@ function providerResponse(body) {
       return openAiStream(fullAccessResponseText);
     }
     return toolCallStream("shell_exec", {
-      command: `printf full_access > ${fullAccessTarget}`,
+      command: shellWriteCommand("full_access", fullAccessTarget),
       access_mode: "maybe_write",
     });
       }
@@ -572,7 +622,7 @@ function providerResponse(body) {
       return openAiStream(approvalResponseText);
     }
     return toolCallStream("shell_exec", {
-      command: `printf approval > ${approvalTarget}`,
+      command: shellWriteCommand("approval", approvalTarget),
       access_mode: "maybe_write",
     });
   }
@@ -636,6 +686,7 @@ function createProvider() {
       const isDomToolPrompt = currentUserText.includes("DOM 工具卡片验收");
       const isGoalPrompt = currentUserText.includes("目标 DOM 验收");
       const isGoalFailurePrompt = currentUserText.includes("目标失败 DOM 验收");
+      const isBackgroundJobPrompt = currentUserText.includes("后台 Job DOM 验收");
       const isAgentFailurePrompt = currentUserText.includes("子代理失败 DOM 验收");
       const isAgentMultiStatusPrompt = currentUserText.includes("子代理多状态 DOM 验收");
       const isAgentMultiStatusChildFailurePrompt = currentUserText.includes("Electron DOM 多状态失败子代理");
@@ -654,6 +705,37 @@ function createProvider() {
         approvalState.completed = true;
         approvalStates.set("approval", approvalState);
         payload = openAiStream(approvalResponseText);
+      } else if (isBackgroundJobPrompt) {
+        const jobResults = messages
+          .filter((message) => message?.role === "tool")
+          .flatMap((message) => {
+            try {
+              const payload = JSON.parse(message.content);
+              return payload?.tool === "shell_exec" ? [payload] : [];
+            } catch {
+              return [];
+            }
+          });
+        const launch = jobResults.find((result) => result.job_id && result.mode !== "background_wait");
+        const wait = jobResults.find((result) => result.mode === "background_wait");
+        if (jobResults.length > 0 && !launch) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "electron_background_job_launch_failed", jobResults }));
+          return;
+        } else if (!launch) {
+          payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+            command: backgroundJobCommand(backgroundJobTarget),
+            background: true,
+          }, "electron-dom-background-job-run-1");
+        } else if (!wait) {
+          payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
+            action: "wait",
+            job_id: launch.job_id,
+            timeout_ms: 10_000,
+          }, "electron-dom-background-job-wait-1");
+        } else {
+          payload = openAiStream(backgroundJobResponseText);
+        }
       } else if (isGoalFailurePrompt) {
         // 验证确定性失败与手动恢复；5xx 属于暂态故障，会触发生产退避重试。
         response.writeHead(400, { "content-type": "application/json" });
@@ -925,7 +1007,7 @@ function createProvider() {
             nextApprovalState.emitted = true;
             approvalStates.set("approval-deny", nextApprovalState);
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf denied > ${approvalDenyTarget}`,
+              command: shellWriteCommand("denied", approvalDenyTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-deny-shell-exec-1");
           } else if (hasToolResult) {
@@ -934,7 +1016,7 @@ function createProvider() {
             payload = openAiStream(approvalDeniedResponseText);
           } else {
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf denied > ${approvalDenyTarget}`,
+              command: shellWriteCommand("denied", approvalDenyTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-deny-shell-exec-1");
           }
@@ -944,12 +1026,12 @@ function createProvider() {
             nextApprovalState.emitted = true;
             approvalStates.set("approval-cancel", nextApprovalState);
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf cancelled > ${approvalCancelTarget}`,
+              command: shellWriteCommand("cancelled", approvalCancelTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-cancel-shell-exec-1");
           } else {
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf cancelled > ${approvalCancelTarget}`,
+              command: shellWriteCommand("cancelled", approvalCancelTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-cancel-shell-exec-1");
           }
@@ -960,7 +1042,7 @@ function createProvider() {
             nextApprovalState.emitted = true;
             approvalStates.set("approval-expiry", nextApprovalState);
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf expired > ${approvalExpiryTarget}`,
+              command: shellWriteCommand("expired", approvalExpiryTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-expiry-shell-exec-1");
           } else if (hasToolResult) {
@@ -969,7 +1051,7 @@ function createProvider() {
             payload = openAiStream(approvalExpiredResponseText);
           } else {
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf expired > ${approvalExpiryTarget}`,
+              command: shellWriteCommand("expired", approvalExpiryTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-expiry-shell-exec-1");
           }
@@ -979,14 +1061,14 @@ function createProvider() {
             nextApprovalState.emitted = true;
             approvalStates.set("approval", nextApprovalState);
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf approval > ${approvalTarget}`,
+              command: shellWriteCommand("approval", approvalTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-shell-exec-1");
           } else if (hasToolResult) {
             payload = openAiStream(approvalResponseText);
           } else {
             payload = toolCallStream(requestToolName(parsed, "shell_exec"), {
-              command: `printf approval > ${approvalTarget}`,
+              command: shellWriteCommand("approval", approvalTarget),
               access_mode: "maybe_write",
             }, "electron-dom-approval-shell-exec-1");
           }
@@ -2558,9 +2640,23 @@ async function waitForProcessExit(child, timeoutMs = 15_000) {
   ]);
 }
 
-async function ownedDescendants(rootPid) {
+async function hostProcesses(pid = null) {
+  if (process.platform === "win32") {
+    const filter = Number.isInteger(pid) ? ` -Filter 'ProcessId = ${pid}'` : "";
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); @(Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,ParentProcessId,CommandLine) | ConvertTo-Json -Compress`,
+    ], { timeout: 10_000, maxBuffer: 10 * 1024 * 1024 });
+    const parsed = stdout.trim() ? JSON.parse(stdout) : [];
+    const rows = parsed == null ? [] : parsed;
+    return (Array.isArray(rows) ? rows : [rows]).map((row) => ({
+      pid: row.ProcessId,
+      ppid: row.ParentProcessId,
+      command: row.CommandLine || "",
+    }));
+  }
   const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,command="]);
-  const processes = stdout
+  return stdout
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
@@ -2569,7 +2665,12 @@ async function ownedDescendants(rootPid) {
       if (!match) return null;
       return { pid: Number(match[1]), ppid: Number(match[2]), command: match[3] };
     })
-    .filter(Boolean);
+    .filter((row) => row && (pid === null || row.pid === pid));
+}
+
+async function ownedDescendants(rootPid) {
+  if (!Number.isInteger(rootPid)) return [];
+  const processes = await hostProcesses();
   const descendants = [];
   const queue = [rootPid];
   while (queue.length > 0) {
@@ -2591,26 +2692,22 @@ async function ownedDaemonPid(electronPid) {
 
 async function stopOwnedDaemon(pid) {
   if (!Number.isInteger(pid)) return;
-  let command = "";
+  const command = (await hostProcesses(pid)).find((row) => row.pid === pid)?.command || "";
+  const daemonPath = join(appResourcesPath, "daemon", process.platform === "win32" ? "magi-daemon-app.exe" : "magi-daemon-app");
+  if (process.platform === "win32"
+    ? !command.toLowerCase().includes(daemonPath.toLowerCase())
+    : !command.includes(daemonPath)) return;
   try {
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
-    command = stdout.trim();
-  } catch {
-    return;
-  }
-  if (!command.includes("magi-daemon-app") || !command.includes("target/electron-dist")) return;
-  try {
-    process.kill(pid, "SIGKILL");
+    if (process.platform === "win32") {
+      await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"]);
+    } else {
+      process.kill(pid, "SIGKILL");
+    }
   } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
+    if (error?.code !== "ESRCH" && (await hostProcesses(pid)).some((row) => row.pid === pid)) throw error;
   }
   await waitFor(async () => {
-    try {
-      await execFileAsync("ps", ["-p", String(pid), "-o", "pid="]);
-      return false;
-    } catch {
-      return true;
-    }
+    return !(await hostProcesses(pid)).some((row) => row.pid === pid);
   }, `脚本自有 daemon ${pid} 退出`, 5_000, 100).catch(() => undefined);
 }
 
@@ -2620,17 +2717,15 @@ async function healthSnapshot() {
   return response.json();
 }
 
-async function requestGracefulElectronQuit(_port) {
-  if (process.platform !== "darwin") {
-    throw new Error("打包 Electron GUI 关闭闸门目前只支持 macOS 应用退出事件");
+async function requestGracefulElectronQuit(port) {
+  // Browser.close 只关闭托盘窗口；通过本脚本启动的 Main inspector 调用
+  // 与托盘菜单相同的 app.quit，不增加产品 IPC，也不触及用户已有实例。
+  const main = await connectTarget(port + 2, () => true, "脚本自有 Electron Main inspector");
+  try {
+    await main.evaluate("setImmediate(() => process.getBuiltinModule('module')._load('electron').app.quit()); true");
+  } finally {
+    main.close();
   }
-  // Browser.close 只关闭 Chromium 窗口；Magi 默认有托盘，窗口关闭不会
-  // 进入 app.before-quit。使用 macOS 的显式 Quit AppleEvent，才能复现
-  // 托盘菜单“退出 Magi”和系统退出动作所共用的 Main shutdown 事务。
-  await execFileAsync("osascript", [
-    "-e",
-    'tell application id "com.mistripple.magi" to quit',
-  ]);
 }
 
 async function stopOwnedProcess(child, cdpPortForQuit = null) {
@@ -2698,7 +2793,7 @@ function attachElectronLogs(child) {
 }
 
 function spawnElectron(port) {
-  const child = spawn(appExecutable, [`--remote-debugging-port=${port}`, "--disable-gpu"], {
+  const child = spawn(appExecutable, [`--remote-debugging-port=${port}`, `--inspect=127.0.0.1:${port + 2}`, "--disable-gpu"], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
@@ -3671,6 +3766,33 @@ try {
     fullAccessFileExists = false;
   }
   check("FullAccess 工具任务真实文件副作用存在", fullAccessFileExists);
+
+  await openSessionDraft(page);
+  await chooseAccessProfile(page, "full_access");
+  backgroundJobTarget = join(workspaceRoot, ".magi-electron-dom-job.txt");
+  const requestsBeforeJob = provider.requests.length;
+  await setComposerText(page, "后台 Job DOM 验收：启动后台命令，等待持久 Job 完成后汇报");
+  await clickSend(page);
+  const jobResult = await waitForAssistant(page, backgroundJobResponseText, "后台 Job 最终消息");
+  const jobTurnId = assistantTurnId(jobResult, backgroundJobResponseText);
+  const jobItems = await page.evaluate(`(async () => {
+    const route = new URLSearchParams(location.search);
+    const query = new URLSearchParams({ scope: 'workspace', workspaceId: route.get('workspaceId'), sessionId: route.get('sessionId') });
+    const response = await fetch('/bootstrap?' + query.toString());
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    return payload.canonicalTurns?.find(turn => turn.turnId === ${JSON.stringify(jobTurnId)})?.items || [];
+  })()`);
+  const jobWait = jobItems.map((item) => item.tool?.result)
+    .find((result) => result?.mode === "background_wait");
+  check("后台 Job 最终回复进入真实 DOM", jobResult.text.includes(backgroundJobResponseText));
+  check("后台 Job 等待返回原持久身份和真实终态", jobWait?.job_id
+    && jobWait.job?.jobId === jobWait.job_id
+    && jobWait.job.status === "completed"
+    && jobWait.running === false && jobWait.exit_code === 0 && jobWait.wait_timed_out === false,
+  JSON.stringify(jobWait));
+  check("后台 Job 完成后实际文件已写入", await readFile(backgroundJobTarget, "utf8") === "background_job");
+  check("后台 Job 等待期间没有模型轮询", provider.requests.length - requestsBeforeJob === 3);
 
   await waitFor(async () => {
     const state = await rendererState(page);
