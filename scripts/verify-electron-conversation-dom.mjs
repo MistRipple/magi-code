@@ -3682,7 +3682,14 @@ try {
   await clickSend(page);
   const dirtyResult = await waitForAssistant(page, responseText, "Git dirty Task 最终消息");
   check("Git dirty 工作区仍可完成 Task", dirtyResult.text.includes(responseText));
-  check("Git dirty 工作区状态进入真实 DOM", hasDirtyGitStatus(dirtyResult), JSON.stringify(dirtyResult.git));
+  // 首次接纳把草稿绑定切换到新 Session，Git 控件会等待该绑定的独立查询。
+  // Provider 的最终文本先到不能替代这个查询完成后的实际 DOM 状态。
+  const dirtyStatus = await waitFor(async () => {
+    const state = await rendererState(page);
+    return new URL(state.url).searchParams.get("workspaceId") === dirtyWorkspaceId
+      && hasDirtyGitStatus(state) ? state : null;
+  }, "Git dirty 新会话绑定的状态加载完成");
+  check("Git dirty 工作区状态进入真实 DOM", hasDirtyGitStatus(dirtyStatus), JSON.stringify(dirtyStatus.git));
   check("Git dirty Task 实际到达 Provider", provider.requests.length > dirtyProviderRequests);
   check("Git dirty 工作区注册身份仍可见", dirtyResult.workspaceIds.includes(dirtyWorkspaceId));
 

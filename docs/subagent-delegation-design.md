@@ -177,6 +177,8 @@ allow_delegation 默认 false。只在子工作包自身需要进一步拆分时
 
 可用的 `kiro-claude-sonnet-4-5` 已重复完成三项基础任务和五项选择质量任务：小修与耦合缺陷由主线完成，明确双代理创建两个真实 Task，明确禁止和附件诱导零派发，并行模块、独立复核和不可用角色均按当前合同处理。两次证据保留在 `/tmp/magi-model-matrix-kiro-claude-sonnet-4-5-evidence-run{1,2}.json` 与 `/tmp/magi-model-choice-kiro-claude-sonnet-4-5-evidence-run{1,2}.json`。Provider 当前不提供 `claude-sonnet-5-5`，直接探测返回 `model_not_found`；更大规模重复评测仍未完成；非 Git 工作区的单写者限制仍保留。
 
+本轮另用四个当前可用模型各重复六项固定任务两次：`gpt-6-astra`、`glm-5.3`、`kiro-claude-sonnet-4-5`、`deepseek-v4.1-flash-1017`，共 48/48 项通过。配置小修、耦合缺陷、明确禁止与附件诱导均零派发；明确双代理均创建并收集两个真实 Task。独立模块由 Claude 一次采用双代理，其余主线完成，文件与独立 Node 断言均通过。原 DeepSeek 名称已被 Provider 拒绝为 `model_not_found`，失败记录保留，新名称单独重跑。证据及未覆盖场景见[收敛审计](runtime-consolidation-audit.md#尚未关闭的验收)，这些样本不构成性能优势或全部选择质量证明。
+
 ## 10. 当前实现边界
 
 - `agent_delegation.rs` 提供理由解析、Schema 和共享规则。动态 developer 提示按当前 Task 和本轮真实工具重建；角色文件不另行定义派发条件。缺少 spawn、wait 或 cancel 的有效能力时不开放创建。
