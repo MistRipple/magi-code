@@ -58,6 +58,7 @@ impl SnapshotSession {
         mut watcher_events: broadcast::Receiver<DebouncedEvent>,
     ) -> SnapshotResult<Arc<Self>> {
         let session = tokio::task::spawn_blocking(move || {
+            tracing::info!(%session_id, stage = "initializing", "snapshot preparation");
             Self::start_sync(
                 session_id,
                 workspace_root,
@@ -72,6 +73,7 @@ impl SnapshotSession {
                 "snapshot session initialization task failed: {error}"
             ))
         })??;
+        tracing::info!(session_id = %session.session_id, stage = "initialized", "snapshot preparation");
 
         let weak = Arc::downgrade(&session);
         let watcher_task = tokio::spawn(async move {
@@ -194,7 +196,9 @@ impl SnapshotSession {
     }
 
     fn run_initial_scan(&self, respect_gitignore: bool) -> SnapshotResult<()> {
+        tracing::info!(session_id = %self.session_id, stage = "scan_started", "snapshot preparation");
         let paths = walk_workspace(&self.workspace_root, respect_gitignore)?;
+        tracing::info!(session_id = %self.session_id, stage = "scan_enumerated", files = paths.len(), "snapshot preparation");
         let mut baseline = BaselineIndex::default();
         for abs in paths {
             match read_file_meta(&self.workspace_root, &abs, &self.blobs) {

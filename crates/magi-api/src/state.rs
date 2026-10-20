@@ -2458,12 +2458,14 @@ impl ApiState {
         let snapshot = self
             .ensure_snapshot_session(session_id, workspace_root)
             .await?;
+        tracing::info!(%session_id, stage = "changes_snapshot_ready", "workspace execution preparation");
         if force_reconcile {
             snapshot
                 .reconcile_async()
                 .await
                 .map_err(|error| ApiError::internal_assembly("刷新磁盘变更状态失败", error))?;
         }
+        tracing::info!(%session_id, stage = "changes_reconciled", "workspace execution preparation");
         // 隔离副本有自己独立的 Git 状态，不与主工作区的 branch/HEAD 对齐。
         if self.session_isolations.contains(session_id.as_str()) {
             return Ok(snapshot);
@@ -2472,12 +2474,14 @@ impl ApiState {
         let Some(existing_context) = self.session_code_contexts.get(session_id.as_str()) else {
             match self.git_service.observe(workspace_root).await {
                 Ok(observation) => {
+                    tracing::info!(%session_id, stage = "changes_git_observed", "workspace execution preparation");
                     self.align_snapshot_baseline_to_observation_head(
                         workspace_root,
                         &observation,
                         &snapshot,
                     )
                     .await?;
+                    tracing::info!(%session_id, stage = "changes_baseline_aligned", "workspace execution preparation");
                     self.session_code_contexts.accept(
                         session_id.as_str(),
                         workspace_id.as_str(),
