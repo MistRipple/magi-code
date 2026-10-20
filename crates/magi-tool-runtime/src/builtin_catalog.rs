@@ -1894,6 +1894,10 @@ impl BuiltinToolName {
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "delegation": crate::agent_delegation::AgentDelegationDecision::parameters_schema(),
+                    "context_mode": {
+                        "type": "string", "enum": ["fresh", "fork"],
+                        "description": "默认 fresh，只交接结构化摘要与引用。显式 fork 时运行时冻结父任务当前派发 Step 之前的 canonical 历史；仅作背景证据，不复制隐藏思考、Provider 私有上下文、审批或资源执行权，也不重放旧工具。仅当子任务确需父历史时选择 fork。不能指定其他会话或代理作为来源。"
+                    },
                     "context_package": {
                         "type": "object",
                         "additionalProperties": false,

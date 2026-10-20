@@ -2563,6 +2563,19 @@ impl LlmTaskDispatcher {
                 task_facts.join("\n"),
             ));
         }
+        if let Some(snapshot) = task
+            .agent_context_package()
+            .and_then(|package| package.fork.as_ref())
+        {
+            context_messages.push(runtime_context_message(
+                PromptFragmentKind::ContextReferences,
+                format!(
+                    "{}\n{}",
+                    REFERENCE_CONTEXT_PRIORITY_NOTE,
+                    snapshot.render_for_prompt()
+                ),
+            ));
+        }
         let (Some(ctx_runtime), Some(ws_id)) = (&self.context_runtime, workspace_id.clone()) else {
             return (base_prompt, context_messages, None);
         };
@@ -5417,6 +5430,7 @@ mod tests {
                 constraints: vec!["不得自动读取主对话".to_string()],
                 expected_output: "输出检查结论".to_string(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(1),
                 updated_at: UtcMillis(1),

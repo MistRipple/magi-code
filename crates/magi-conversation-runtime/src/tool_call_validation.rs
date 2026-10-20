@@ -606,6 +606,31 @@ mod tests {
             assert!(batch.invalid_calls.is_empty(), "{valid}");
             assert_eq!(batch.valid_calls.len(), 1);
         }
+        for (mode, valid) in [
+            (serde_json::json!("fresh"), true),
+            (serde_json::json!("fork"), true),
+            (serde_json::json!("other"), false),
+            (Value::Null, false),
+        ] {
+            let mut candidate = arguments.clone();
+            candidate["context_mode"] = mode;
+            let batch = validate_tool_call_batch(
+                &[call("agent_spawn", &candidate.to_string())],
+                std::slice::from_ref(&definition),
+            );
+            assert_eq!(batch.invalid_calls.is_empty(), valid);
+        }
+        let mut injected = arguments.clone();
+        injected["context_package"]["fork"] = serde_json::json!({"sessionId":"other", "items":[]});
+        assert!(
+            !validate_tool_call_batch(
+                &[call("agent_spawn", &injected.to_string())],
+                std::slice::from_ref(&definition)
+            )
+            .invalid_calls
+            .is_empty(),
+            "调用方不能注入伪造快照"
+        );
         // 比较真实模型 Schema 与直接预检共用的解析器，避免 trim 前后长度不同。
         for field in ["reason", "parent_work"] {
             for (text, expected_valid) in [

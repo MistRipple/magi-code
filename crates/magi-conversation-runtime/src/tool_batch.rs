@@ -681,6 +681,7 @@ fn execute_agent_spawn(
     let sequence = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
     let preflight = match preflight_agent_spawn(AgentSpawnPreflightInput {
         parsed,
+        tool_call_id: &tool_call.id,
         parent_task: task,
         task_store,
         session_store,
@@ -747,6 +748,18 @@ fn execute_agent_spawn(
     };
     let context_package_id = preflight.context_package.package_id.clone();
     let context_revision = preflight.context_package.revision;
+    let context_mode = if preflight.context_package.fork.is_some() {
+        "fork"
+    } else {
+        "fresh"
+    };
+    let context_source = preflight.context_package.fork.as_ref().map(|snapshot| {
+        serde_json::json!({
+            "task_id": snapshot.source_task_id, "thread_id": snapshot.source_thread_id,
+            "turn_id": snapshot.source_turn_id, "step_id": snapshot.source_step_id,
+            "before_item_id": snapshot.before_item_id, "item_count": snapshot.items.len(),
+        })
+    });
     let plan_item_id = preflight.plan_item_id.clone();
     let child = magi_core::Task {
         task_id: child_task_id.clone(),
@@ -934,6 +947,8 @@ fn execute_agent_spawn(
             "goal": preflight.goal,
             "context_package_id": context_package_id,
             "context_revision": context_revision,
+            "context_mode": context_mode,
+            "context_source": context_source,
             "task_kind": "local_agent",
             "worker_id": registered_execution.worker_id.to_string(),
             "thread_id": registered_execution.thread_id.to_string(),
@@ -975,6 +990,8 @@ fn execute_agent_spawn(
                 "access_profile": preflight.child_access_profile.as_str(),
                 "context_package_id": context_package_id,
                 "context_revision": context_revision,
+                "context_mode": context_mode,
+                "context_source": context_source,
             },
             "worker_id": registered_execution.worker_id.to_string(),
             "thread_id": registered_execution.thread_id.to_string(),
@@ -9512,6 +9529,7 @@ mod tests {
                 constraints: vec!["不得修改文件".to_string()],
                 expected_output: "返回目录清单".to_string(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(42),
                 updated_at: UtcMillis(42),
@@ -9580,6 +9598,7 @@ mod tests {
                 constraints: Vec::new(),
                 expected_output: "返回检查结果".to_string(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(1),
                 updated_at: UtcMillis(1),
@@ -9922,6 +9941,7 @@ mod tests {
                 constraints: Vec::new(),
                 expected_output: "完成检查".to_string(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(1),
                 updated_at: UtcMillis(1),
@@ -10025,6 +10045,7 @@ mod tests {
                 constraints: Vec::new(),
                 expected_output: "完成检查".to_string(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(1),
                 updated_at: UtcMillis(1),
@@ -10149,6 +10170,7 @@ mod tests {
                     constraints: Vec::new(),
                     expected_output: "完成检查".to_string(),
                     references: Vec::new(),
+                    fork: None,
                     supplements: Vec::new(),
                     created_at: UtcMillis(1),
                     updated_at: UtcMillis(1),

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChildProcess, spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { test } from "node:test";
 import { ProcessSupervisor } from "./process-supervisor.js";
 
@@ -410,6 +410,49 @@ test("managed daemon startup failure keeps daemon output in the log file and rec
     assert.match(readFileSync(logFilePath, "utf8"), /会话存储无法打开/);
   } finally {
     rmSync(logRoot, { recursive: true, force: true });
+  }
+});
+
+test("managed daemon finishes its owner-pipe shutdown before signal termination", async () => {
+  let startupNonce = "";
+  let child: ChildProcess | undefined;
+  let output = "";
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(healthPayload({ startupNonce }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const supervisor = new ProcessSupervisor({
+    daemonPath: process.execPath,
+    agentOrigin: `http://127.0.0.1:${address.port}`,
+    environment: {},
+    daemonIdentity: DAEMON_IDENTITY,
+    spawnDaemon: ((_path, _args, options) => {
+      startupNonce = String(options?.env?.MAGI_DAEMON_START_NONCE);
+      assert.equal(options?.env?.MAGI_DAEMON_OWNER_PIPE, "1");
+      assert.deepEqual(options?.stdio, ["pipe", "pipe", "pipe"]);
+      child = spawn(process.execPath, ["-e", `
+        process.stdin.resume();
+        process.stdin.on('end', () => {
+          process.stdout.write('owner settled', () => process.exit(0));
+        });
+      `], options);
+      child.stdout?.on("data", (chunk) => { output += chunk; });
+      return child;
+    }) as typeof spawn,
+  });
+  try {
+    await supervisor.start();
+    await supervisor.stop();
+    assert.equal(child?.exitCode, 0);
+    assert.equal(child?.signalCode, null);
+    assert.equal(output, "owner settled");
+  } finally {
+    await supervisor.stop();
+    child?.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 

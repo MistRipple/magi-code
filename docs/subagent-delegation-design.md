@@ -183,6 +183,7 @@ allow_delegation 默认 false。只在子工作包自身需要进一步拆分时
 
 - `agent_delegation.rs` 提供理由解析、Schema 和共享规则。动态 developer 提示按当前 Task 和本轮真实工具重建；角色文件不另行定义派发条件。缺少 spawn、wait 或 cancel 的有效能力时不开放创建。
 - `agent_spawn_preflight.rs` 校验角色、Skill、父链与深度；`task_execution_registry.rs` 在准备计划/Thread/初始消息后最后发布 Task。模型参数不构成授权凭证。
+- `context_mode` 默认 fresh；显式 fork 从父 Task 当前 canonical 派发 Step 之前的合法历史边界冻结证据。运行时校验 Session、Mission、Task、Thread 与 Step 来源，调用方不能提供快照正文或替换来源。快照存在原 TaskStore 上下文包内，模型装配沿 `reference_data`，不复制隐藏思考、Provider 私有上下文、审批或资源执行权，也不进入工具重放账本。已授委派的子代理只能 fork 自己的历史；后续转交/继续仍读取同一冻结包。
 - TaskStore 保存 Task/activation/转交与租约；SessionStore 保存独立 Agent Turn、Step、工具/交互。Thread 和 UI 从原事实投影。终态回调优先读取 Agent 的 canonical Task/Turn 绑定，不能由当前主线覆盖；跨主线状态事件沿 activation 定位原会话。
 - `agent_service.rs` 供 HTTP/App Server 共用显式转交。读取投影不准备资源；提交必须重查来源 Turn、activation 代际和 Goal 控制版本。Web 使用服务端给出的命令及稳定 operation。
 - 未转交子树受父轮生命周期约束；转交后普通停止只结算原执行范围，Session 关闭/删除结算全树，Goal 撤销只结算对应 Goal 拥有的分支。

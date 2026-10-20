@@ -102,6 +102,7 @@ pub(crate) struct AgentSpawnPreflight {
 
 pub(crate) struct AgentSpawnPreflightInput<'a> {
     pub(crate) parsed: &'a serde_json::Value,
+    pub(crate) tool_call_id: &'a str,
     pub(crate) parent_task: &'a Task,
     pub(crate) task_store: &'a TaskStore,
     pub(crate) session_store: &'a SessionStore,
@@ -167,6 +168,7 @@ pub(crate) fn preflight_agent_spawn(
 ) -> Result<AgentSpawnPreflight, AgentSpawnPreflightError> {
     let AgentSpawnPreflightInput {
         parsed,
+        tool_call_id,
         parent_task,
         task_store,
         session_store,
@@ -204,6 +206,10 @@ pub(crate) fn preflight_agent_spawn(
             "请按当前 agent_spawn Schema 提供结构化参数；不能说明委派收益时由当前任务直接完成。",
         )
     })?;
+    let fork = object
+        .get("context_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("fork");
     let task_name = required_string(object, "task_name")?;
     if !valid_agent_task_name(&task_name) {
         return Err(AgentSpawnPreflightError::input(
@@ -411,6 +417,36 @@ pub(crate) fn preflight_agent_spawn(
         now,
         sequence,
     );
+    if fork {
+        let Some(TaskExecutionPlan::Dispatch {
+            thread_id,
+            turn_id,
+            session_id: source_session,
+            ..
+        }) = execution_registry.get(&parent_task.task_id)
+        else {
+            return Err(AgentSpawnPreflightError::runtime(
+                "context_fork_unavailable",
+                "context",
+                "fork 缺少父任务当前执行来源",
+                "仅能从当前运行的父任务历史边界 fork；不要提交旧 Task/Turn 身份。",
+            ));
+        };
+        if source_session != *session_id {
+            return Err(AgentSpawnPreflightError::runtime(
+                "context_fork_unavailable",
+                "context",
+                "fork 来源不属于当前会话",
+                "仅能 fork 当前父任务的历史，不能选择其他会话或代理。",
+            ));
+        }
+        context_package.fork = Some(crate::agent_context_fork::freeze_parent_history(
+            session_store, parent_task, session_id, &thread_id, &turn_id, tool_call_id,
+        ).map_err(|message| AgentSpawnPreflightError::runtime(
+            "context_fork_unavailable", "context", message,
+            "fork 需要当前派发 Step 之前完整的 canonical 历史；保留任务并检查来源，不得伪造历史或重复派发。",
+        ))?);
+    }
 
     // TaskStore 保存逻辑路径授权；执行时才投影到各自 worktree，不能继承父 worktree 的物理白名单。
     let persisted_parent = task_store.get_task(&parent_task.task_id);
@@ -1136,6 +1172,7 @@ pub(crate) fn parse_agent_context_package(
         constraints,
         expected_output,
         references,
+        fork: None,
         supplements: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -1438,6 +1475,7 @@ mod tests {
 
         let error = preflight_agent_spawn(AgentSpawnPreflightInput {
             parsed: &parsed,
+            tool_call_id: "call-preflight",
             parent_task: &parent_task,
             task_store: &task_store,
             session_store: &session_store,
@@ -1476,6 +1514,7 @@ mod tests {
             }
             let error = preflight_agent_spawn(AgentSpawnPreflightInput {
                 parsed: &parsed,
+                tool_call_id: "call-preflight",
                 parent_task: &parent_task,
                 task_store: &task_store,
                 session_store: &session_store,

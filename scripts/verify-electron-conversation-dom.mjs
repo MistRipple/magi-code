@@ -1547,6 +1547,18 @@ async function runGitDriftConflictChecks(page) {
   await clickSend(page);
   await waitForAssistant(page, responseText, "Git drift 初始 Turn");
   await waitForComposerReady(page, "Git drift 初始 Turn 收口");
+  const driftBaseline = await page.evaluate(`(async () => {
+    const sessionId = new URL(location.href).searchParams.get('sessionId');
+    const response = await fetch('/api/workspace/vcs/branches', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspacePath: ${JSON.stringify(gitDriftRoot)}, sessionId, includeRemote: true }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  })()`);
+  check("Git drift 外部切换前原 Session 已记录 main 基线",
+    driftBaseline.sessionContext?.git?.desiredRef === "main"
+      && driftBaseline.observation?.branch === "main", JSON.stringify(driftBaseline));
   await gitFixtureCommand(gitDriftRoot, ["switch", "-c", "external/drift"]);
   await page.evaluate("window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', { detail: { reason: 'git-drift-fixture' } }))");
   await page.evaluate(`document.querySelector('.git-context-trigger')?.click()`);

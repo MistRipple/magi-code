@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 mod agent_activation;
+mod agent_context_fork;
 mod agent_receipt;
 mod agent_spawn_preflight;
 mod builtin_tool_schema;

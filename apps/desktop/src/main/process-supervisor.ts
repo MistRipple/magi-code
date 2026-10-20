@@ -266,10 +266,14 @@ export class ProcessSupervisor {
       env: {
         ...this.#environment,
         MAGI_DAEMON_START_NONCE: startupNonce,
+        MAGI_DAEMON_OWNER_PIPE: "1",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      // Windows SIGTERM 会强制终止；通过 owner pipe EOF 请求 daemon 优雅结算。
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    // daemon 可能先退出；管道错误不能在 Main 中成为未处理异常。
+    child.stdin?.on("error", () => undefined);
     const logStream = this.openLogStream();
     child.stdout?.on("data", (chunk) => {
       process.stdout.write(`[daemon] ${chunk}`);
@@ -613,7 +617,9 @@ export class ProcessSupervisor {
     this.#daemon = null;
     if (!child || hasExited(child)) return;
     const exit = waitForChildExit(child, 5_000);
-    child.kill("SIGTERM");
+    // 优先发送 EOF；管道不可用时沿用信号入口，超时后才强制终止。
+    if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+    else child.kill("SIGTERM");
     if (await exit) return;
     if (hasExited(child)) return;
     const killedExit = waitForChildExit(child, 5_000);

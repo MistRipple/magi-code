@@ -4136,6 +4136,7 @@ mod tests {
                 constraints: Vec::new(),
                 expected_output: "evidence".into(),
                 references: Vec::new(),
+                fork: None,
                 supplements: Vec::new(),
                 created_at: UtcMillis(1),
                 updated_at: UtcMillis(1),

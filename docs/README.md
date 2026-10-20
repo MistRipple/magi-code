@@ -23,6 +23,7 @@
 - `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 承载开发、无头部署及桌面包中的 daemon sidecar 入口；业务实现复用 `magi-daemon`，不复制 Electron 宿主逻辑。
+- 正式 Desktop 通过专属 stdin 管道托管 daemon（`MAGI_DAEMON_OWNER_PIPE=1`）：退出先关闭管道，daemon 收到 EOF 后沿原关闭入口结算 Turn、工具和持久化，宿主等待退出，超时才强制终止。开发/无头入口不设置此标记，stdin EOF 不影响其生命周期；系统信号仍走原关闭入口。
 
 开发模式仍使用 daemon 托管入口：
 

@@ -164,6 +164,34 @@ impl Drop for DaemonHandle {
 }
 
 async fn wait_for_process_shutdown_signal() -> Result<&'static str, DaemonError> {
+    tokio::select! {
+        result = wait_for_os_shutdown_signal() => result,
+        result = wait_for_owner_pipe_close() => result,
+    }
+}
+
+async fn wait_for_owner_pipe_close() -> Result<&'static str, DaemonError> {
+    if env::var("MAGI_DAEMON_OWNER_PIPE").as_deref() != Ok("1") {
+        return std::future::pending().await;
+    }
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    // 不使用 Tokio stdin/spawn_blocking：OS 信号先到时 stdin 仍可能阻塞，
+    // Tokio runtime 会等待不可取消的 blocking 读取，反而无法结束进程。
+    std::thread::Builder::new()
+        .name("daemon-owner-pipe".into())
+        .spawn(move || {
+            let result = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            let _ = closed_tx.send(result);
+        })
+        .map_err(|error| DaemonError::internal(format!("监听 daemon owner pipe 失败: {error}")))?;
+    closed_rx
+        .await
+        .map_err(|error| DaemonError::internal(format!("daemon owner pipe 监听中断: {error}")))?
+        .map_err(|error| DaemonError::internal(format!("读取 daemon owner pipe 失败: {error}")))?;
+    Ok("desktop owner pipe closed")
+}
+
+async fn wait_for_os_shutdown_signal() -> Result<&'static str, DaemonError> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

@@ -55,6 +55,42 @@ const provider = createServer(async (request, response) => {
     const messages = body.messages ?? [];
     const text = JSON.stringify(messages);
     const results = messages.filter(message => message.role === 'tool').flatMap(message => {try {return [JSON.parse(message.content)];} catch {return [];}});
+    if (text.includes('CONTROL_FORK_PARENT') || text.includes('CONTROL_FORK_CHILD')) {
+      const child = messages.some(message => message.role === 'user'
+        && typeof message.content === 'string' && message.content.includes('CONTROL_FORK_CHILD'));
+      if (child) {
+        const forked = text.includes('[agent-context-fork]');
+        const forkSection = text.match(/\[agent-context-fork\][\s\S]*?\[\/agent-context-fork\]/u)?.[0] ?? '';
+        assert.equal(forkSection.includes('FORK_PRIVATE_TOOL_EVIDENCE'), forked,
+          '只有显式 fork 才自动带入父工具读取的正文');
+        if (forked) {
+          const reference=messages.find(message=>typeof message.content==='string'
+            && message.content.includes('[agent-context-fork]'));
+          assert.match(reference.content,/trust="reference_data"/u,'父历史必须沿原参考资料边界装配');
+          assert.ok(!messages.some(message=>typeof message.content==='string'
+            && message.content.includes('id="task_context"')&&message.content.includes('[agent-context-fork]')));
+        }
+        assert.equal(messages.filter(message => message.role === 'tool').length, 0,
+          '父工具历史只作为交接证据，不成为子代理的可执行历史');
+        return writeResponse(response, null, null, forked ? 'CONTROL_FORK_CHILD_HAS_HISTORY' : 'CONTROL_FORK_CHILD_FRESH');
+      }
+      if (!results.some(result => result.tool === 'file_read')) {
+        return writeResponse(response, 'file_read', {path:join(workspace,'fork-source.txt')});
+      }
+      const spawned = results.find(result => result.tool === 'agent_spawn');
+      if (!spawned) return writeResponse(response, 'agent_spawn', {
+        task_name:'history_reader', role:'executor', display_name:'历史上下文核对',
+        goal:'CONTROL_FORK_CHILD 只核对已收到的历史，不调用工具',
+        ...(text.includes('CONTROL_FORK_PARENT_FORK') ? {context_mode:'fork'} : {}),
+        delegation:{purpose:'user_requested',reason:'控制验收明确要求一个真实代理核对父历史交接'},
+        context_package:{summary:'CONTROL_FORK_CHILD',constraints:['不调用工具'],expected_output:'历史交接结论',references:[]},
+      });
+      assert.ok(spawned.child_task_id, JSON.stringify(spawned));
+      if (!results.some(result => result.tool === 'agent_wait')) {
+        return writeResponse(response,'agent_wait',{task_ids:[spawned.child_task_id],timeout_ms:60000});
+      }
+      return writeResponse(response,null,null,'CONTROL_FORK_DONE');
+    }
     if (text.includes('CONTROL_LIVE_SKILL_STEP')) {
       const step = liveSkillRound++;
       const names = (body.tools ?? []).map(tool=>tool.function.name).sort();
@@ -136,7 +172,9 @@ const provider = createServer(async (request, response) => {
       const transferredApproval = text.includes('CONTROL_TRANSFERRED_APPROVAL');
       const dirtyRecovery = text.includes('CONTROL_SESSION_AGENT_DIRTY');
       if (!coordinator) {
-        if (text.includes('CONTROL_SESSION_AGENT_FAILED_DESCENDANT')) {
+        const assignment=messages.findLast(message=>message.role==='user'&&typeof message.content==='string'
+          && !message.content.startsWith('<magi-context-fragment'))?.content ?? '';
+        if (assignment.includes('CONTROL_SESSION_AGENT_FAILED_DESCENDANT')) {
           response.writeHead(400, {'content-type':'application/json'});
           return response.end(JSON.stringify({error:{type:'invalid_request_error',message:'controlled terminal descendant before restart'}}));
         }
@@ -175,6 +213,7 @@ const provider = createServer(async (request, response) => {
       }
       const child = spawned[terminalChild ? 1 : 0]?.child_task_id;
       if (!child) return writeResponse(response, 'agent_spawn', {task_name:'retained',delegation:{purpose:'user_requested',reason:'验收请求明确要求持续代理及直接/嵌套恢复'},display_name:'持续代理',role:'executor',lifetime:parentAgent?'turn':'session',
+        context_mode:parentAgent?'fork':'fresh',
         allow_delegation:text.includes('CONTROL_SESSION_AGENT_NESTED')&&!parentAgent,
         goal:dirtyRecovery?'CONTROL_SESSION_AGENT_DIRTY':text.includes('CONTROL_SESSION_AGENT_APPROVAL')?`CONTROL_SESSION_AGENT_APPROVAL${transferredApproval?' CONTROL_TRANSFERRED_APPROVAL':''}`:'CONTROL_SESSION_AGENT_QUESTION',
         context_package:{summary:text.includes('CONTROL_SESSION_AGENT_NESTED')?`CONTROL_SESSION_AGENT_NESTED${text.includes('CONTROL_TERMINAL_CHILD')?' CONTROL_TERMINAL_CHILD':''}`:dirtyRecovery?'CONTROL_SESSION_AGENT_DIRTY':text.includes('CONTROL_SESSION_AGENT_APPROVAL')?`CONTROL_SESSION_AGENT_APPROVAL${transferredApproval?' CONTROL_TRANSFERRED_APPROVAL':''}`:'CONTROL_SESSION_AGENT_QUESTION',constraints:[],expected_output:'CONTROL_SESSION_AGENT_CHILD_DONE',references:[]}});
@@ -210,7 +249,7 @@ const provider = createServer(async (request, response) => {
       return writeResponse(response, 'file_remove', {path:target});
     }
     writeResponse(response, null, null, 'CONTROL_CONTROL_READY');
-  } catch (error) { response.destroy(error); }
+  } catch (error) { console.error('control Provider fixture failed', error); response.destroy(error); }
 });
 async function unusedPort() {
   const server = createServer(); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -381,9 +420,37 @@ try {
   const reloadedGate = (await read(rejectedSpawn.sessionId)).turns.find(turn=>turn.turnId===rejectedSpawn.turnId);
   assert.deepEqual(reloadedGate.items.find(item=>item.tool?.name==='agent_spawn')?.tool?.result,gateResult);
   assert.equal(providerRequests,requestsAfterGate,'校验拒绝后的重载不重新请求模型或派发代理');
-  const partial = await submit({workspaceId:(await fetch(`${origin}/api/workspaces/register`, {
+  const fixtureWorkspaceId=(await fetch(`${origin}/api/workspaces/register`, {
     method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path:workspace}),
-  }).then(response=>response.json())).workspaceId,requestId:'native-partial',accessProfile:'full_access',
+  }).then(response=>response.json())).workspaceId;
+  await writeFile(join(workspace,'fork-source.txt'),'FORK_PRIVATE_TOOL_EVIDENCE');
+  for (const mode of ['FRESH','FORK']) {
+    const started=await submit({workspaceId:fixtureWorkspaceId,requestId:`context-${mode}`,accessProfile:'full_access',
+      text:`CONTROL_FORK_PARENT_${mode} 使用一个真实代理核对历史交接`});
+    const snapshot=await terminal(started.sessionId,'CONTROL_FORK_DONE');
+    const turn=snapshot.turns.find(turn=>turn.turnId===started.turnId);
+    const spawned=turn.items.find(item=>item.tool?.name==='agent_spawn').tool.result;
+    assert.equal(spawned.assignment.context_mode,mode.toLowerCase());
+    const collected=turn.items.find(item=>item.tool?.name==='agent_wait').tool.result;
+    assert.equal(collected.results[0].child_status,'completed');
+    const query=new URLSearchParams({scope:'workspace',workspaceId:fixtureWorkspaceId,sessionId:started.sessionId});
+    const projection=await fetch(`${origin}/api/agent-runs/projection/${spawned.child_task_id}?${query}`).then(r=>r.json());
+    const package_=projection.tasks.find(task=>task.task_id===spawned.child_task_id).runtime_payload.package;
+    assert.equal(Boolean(package_.fork),mode==='FORK');
+    if (mode==='FORK') {
+      assert.equal(package_.fork.sourceTurnId,started.turnId);
+      assert.equal(package_.fork.sourceStepId,turn.modelSteps[1].stepId,
+        'Provider 复用 call ID 时仍冻结当前派发 Step 的边界');
+      assert.equal(package_.fork.items.filter(item=>item.kind==='tool_result').length,1);
+      assert.ok(package_.fork.items.some(item=>item.content.includes('FORK_PRIVATE_TOOL_EVIDENCE')));
+    }
+    const beforeRestart=providerRequests;
+    await stopDaemon('SIGKILL');await startDaemon();
+    const restored=await fetch(`${origin}/api/agent-runs/projection/${spawned.child_task_id}?${query}`).then(r=>r.json());
+    assert.deepEqual(restored.tasks.find(task=>task.task_id===spawned.child_task_id).runtime_payload.package,package_);
+    assert.equal(providerRequests,beforeRestart,'历史快照重载不重放父工具或代理请求');
+  }
+  const partial = await submit({workspaceId:fixtureWorkspaceId,requestId:'native-partial',accessProfile:'full_access',
     text:'CONTROL_NATIVE_PARTIAL 使用一个真实子代理，检查失败前的工具事实，不重复写入或重新派发。'});
   const partialSnapshot = await terminal(partial.sessionId,'CONTROL_NATIVE_PARTIAL_DONE');
   const partialTurn = partialSnapshot.turns.find(turn=>turn.turnId===partial.turnId);
@@ -578,6 +645,13 @@ try {
     };
     const failedTask=nestedCase?(await projection()).tasks.find(task=>task.task_id===failedAgentTurn.metadata.agentExecution.taskId):null;
     if(nestedCase) assert.equal(failedTask?.status,'failed');
+    if(nestedCase) {
+      const nestedFork=(await projection()).tasks.find(task=>task.parent_task_id===independentTask
+        && task.runtime_payload?.package?.fork)?.runtime_payload.package.fork;
+      assert.ok(nestedFork,'获授委派的父 Agent 可从自己的 canonical Turn fork');
+      assert.equal(nestedFork.sourceTaskId,independentTask);
+      assert.equal(nestedFork.sourceTurnId,sourceAgentTurn.turnId);
+    }
     assert.ok(spawned?.activation?.generation,'转交版本必须来自服务端 activation');
     const transferParams={scope:'workspace',taskId:independentTask,expectedParentTurnId:started.turnId,
       expectedGeneration:spawned.activation.generation,operationId:scenario==='complete'?'转'.repeat(200):`transfer-${scenario}`,owner:'session'};
