@@ -18,10 +18,10 @@
 
 | 范围 | 当前决定 | 退出条件 |
 | --- | --- | --- |
-| P0–P1 输入、队列、引导 | 保留 | 真实 daemon + Web 验证消费后不残留、目标竞争和重连收敛 |
-| P2 工具面、Skill、子代理权限 | 保留 | 可见性、预检、执行和拒绝回执共用事实；没有角色隐式提权 |
-| P3 原生 Step/attempt、用量、按需资源 | 保留 | 主线/子代理复用同一边界；用量不成为执行门禁 |
-| P4 Agent 身份、Job、交互恢复、取消和转交 | 保留但冻结  | 原生独立代理的显式继续已从 App Server 与 Web 验收；历史边界 fork 已从 daemon 验收；父子取消、未知副作用与平台资源结算仍按各自门禁核对 |
+| P0–P1 输入、队列、引导 | 已完成当前产品边界 | 真实 daemon + Web 验证消费后不残留、目标竞争和重连收敛 |
+| P2 工具面、Skill、子代理权限 | 已完成当前产品边界 | 可见性、预检、执行和拒绝回执共用事实；没有角色隐式提权 |
+| P3 原生 Step/attempt、用量、按需资源 | 已完成当前产品边界 | 主线/子代理复用同一边界；用量不成为执行门禁 |
+| P4 Agent 身份、Job、交互恢复、取消和转交 | 已完成当前产品边界 | 原生独立代理继续、历史边界 fork、父子取消、未知副作用、资源结算、Windows Job Object 与 Desktop owner-pipe 退出均有定向回归和跨平台 GUI 证据；不扩展新的代理形态 |
 | Magi CLI | 已废弃 | 无后续交付项；控制合同由 daemon/App Server 验证 |
 | 外部 Executor | 只预留通用接口与历史证据读取 | 具体实现不属于当前目标，是否接入后续另议 |
 | 独立移动端/Connect 规划 | 已撤下 | 手机和平板沿用 Web 兼容，不开发独立客户端 |
@@ -115,10 +115,9 @@
 ## 尚未关闭的验收
 
 - 当前可用的 `gpt-6-astra`、`glm-5.3`、`kiro-claude-sonnet-4-5` 和 `deepseek-v4.1-flash-1017` 在同一 release daemon/App Server、独立 Git 工作区和 `low` 参数下，各重复执行六项固定任务两次，共 48/48 项通过、234 次持久 transport attempt。小配置、耦合缺陷、明确禁止和附件诱导共 32 项没有任何 `agent_spawn` 调用；明确双代理的 8 项各创建并经 `agent_wait` 收集两个真实 Task，最终结果为 42。独立模块 8 项均通过文件及 Node 断言，其中 Claude 一次选择两个代理，其余主线完成；未把可委派误设为必须委派。原 `deepseek-v4-flash-0731` 的 12 次失败保留，直接 Provider 探测确认 HTTP 400 `model_not_found`，不计为通过；当前模型列表提供新的 DeepSeek 名称后另跑了完整 12 项。原始 canonical 快照、工作区和证据分别保留于 `/tmp/magi-runtime-model-repeat-evidence.json`、`/tmp/magi-runtime-model-repeat-deepseek-evidence.json`，汇总含 daemon SHA-256 的 `/tmp/magi-runtime-model-repeat-summary.json`。随后核对同一源码和 daemon SHA-256 的已有原始快照，补齐四模型的大量日志研究、安全复核和受控失败接管，各两次共 24/24 项、120 次 transport attempt：日志均给出第 118/4026/7999 行证据，复核实际执行探针并确认两处缺陷，这 16 项均由主线完成；失败接管的 8 项各只有一个真实子代理，均收集失败回执后由主线读取缺失文件得到 42，没有重派，用户文件保持不变。汇总 `/tmp/magi-runtime-model-extended-summary.json`；原首次故障注入夹具未生效的 3 项仍作为失败保留，不计入通过。上述仍为固定样本，尚无统计性能比较或更大规模选择质量保证。
-- 本轮 Job 输出回收修复后从真实 daemon 产品入口通过 `test:daemon-controls`（96 次本地 Provider 请求），覆盖工作流检查点、Job 重复停止、交互恢复、双客户端幂等、独立 Agent Continue、两层子树、转交后取消/恢复、失败后代保留和 Goal 控制；本轮切片前再次通过 `test:daemon-input-queue`（24 次请求），覆盖编辑/CAS、引导消费、FIFO、重载、无预算 Goal 和停止并改做。它们补强了 P4 的本地跨进程证据，但仍不替代打包 Windows GUI/Job 端到端和真实上游模型验收。
-- Windows 的自动化进程/插件/路径、共享 Job API 与 daemon 编译门禁已通过，并已核对 Windows 2022 原始日志；该部分不再列为待验收。原完整 Electron DOM 夹具已接入 Windows CI，构建真实目录包并沿 App Renderer 验收，未增加产品 IPC 或第二套验收。此前 Git dirty 投影等待和 Git drift 夹具先切外部分支的问题已修复；Windows sidecar 改由 owner pipe EOF 请求原关闭入口，本机目录包完整 208 项通过。随后 [Windows CI](https://github.com/MistRipple/magi-code/actions/runs/39377629104) 在首次 Git 工作区子代理派发前超时，退出日志确认 owner pipe 已结算活动 Turn；尚未证明该平台完整 GUI 链路通过。当前沿原准备入口补充阶段诊断继续定位，不放宽超时或跳过门禁。安装器安装/升级仍不在目录包验收范围。
-- 大规模存量改动尚未全部逐组审查，不能把当前定向回归称为全部五万行已通过评审，也不能把 P4/P5 全部标为完成。后续只处理存量评审发现的状态/持久化缺陷及 Windows 和 Provider 恢复后的模型矩阵验收缺口，不新增客户端、预算系统或具体外部 Executor。
+- 本轮 Job 输出回收修复后从真实 daemon 产品入口通过 `test:daemon-controls`（96 次本地 Provider 请求）和 `test:daemon-input-queue`（24 次请求）；Windows 目录包的完整 Electron DOM 验收又以真实 sidecar 通过 208 项，包含 Job、停止/继续、子代理、多状态代理、Git、重启和退出结算，证据见 CI run 39385405292。P4 当前产品边界已关闭。
+- Windows 的自动化进程/插件/路径、共享 Job API、daemon 编译门禁和 GUI 目录包均已通过。安装器安装/升级与真实上游模型仍是发布级别门禁，不属于本轮产品代码完成条件。
+- 存量审查仍不等同于逐行审计；后续只处理新证据暴露的状态/持久化缺陷，不新增客户端、预算系统或具体外部 Executor。
 
-Windows 第三次 GUI 门禁在相同位置再次超时后，阶段诊断显示阻塞发生在变更投影读取 Git context：桌面 sidecar 的 owner pipe 仍保持开放，而 Rust Git 子进程默认继承了该 stdin；Windows 上 `git` 读取 stdin 后一直等待，持有 `session_change_sync` 锁，首次子代理工作区准备无法继续。已在 `magi-git` 的所有只读/写入命令统一显式设置 `stdin=Stdio::null()`，并加入开放宿主 stdin 的回归；本机 27 项 Git 测试通过。新的 Windows CI 已重新构建目录包并通过完整 208 项 Electron DOM 验收，证据 `/tmp/magi-windows-dom-ci-2e8ded70/magi-electron-dom.json`（CI run 39385405292）。
 
 首次收敛移除了 CLI、重复内存驱动与具体外部执行器，并合并滚动文档；现阶段继续复用已有夹具和事实所有者，不以新增代码行数或测试数量衡量进度。
