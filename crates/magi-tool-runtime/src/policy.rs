@@ -978,6 +978,10 @@ pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> 
         let command = words[command_index];
         let basename = shell_command_basename(command);
         if command.contains('$')
+            // PowerShell 的静态 .NET 成员调用由当前 Shell 求值，不是 PATH 依赖。
+            || (dialect == ShellDialect::PowerShell
+                && command.starts_with('[')
+                && command.contains("]::"))
             || declared_functions.contains(basename)
             || shell_word_is_builtin_or_keyword(basename, dialect)
         {
@@ -1629,7 +1633,7 @@ mod shell_path_parser_tests {
     fn shell_dependency_scan_understands_powershell_cmdlets() {
         assert_eq!(
             shell_command_required_executables(
-                "Get-ChildItem -Force | Where-Object Name -like '*.rs'; Write-Output ok; node --version",
+                "Get-ChildItem -Force | Where-Object Name -like '*.rs'; Write-Output ok; [Console]::Out.Write('ok'); node --version",
                 "pwsh"
             ),
             vec!["node".to_string()]
