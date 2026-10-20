@@ -105,6 +105,7 @@ jobs:
           cargo test -p magi-tool-runtime shell_exec_accepts_shell_program_with_arguments --locked
           cargo test -p magi-tool-runtime builtins_use_context_working_directory_for_relative_inputs --locked
           cargo test -p magi-api path_ref --locked
+          cargo test -p magi-api file_reveal_target --locked
           cargo check -p magi-daemon --all-targets --locked
 
   macos-desktop:

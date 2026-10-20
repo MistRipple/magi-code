@@ -2411,12 +2411,10 @@ mod tests {
         let decoded =
             magi_core::HostPath::from_path_ref(entry["pathRef"].as_str().expect("entry path ref"))
                 .expect("entry path ref should decode");
-        let canonical_file = file.canonicalize().expect("file should canonicalize");
+        let canonical_file =
+            magi_core::HostPath::canonicalize(&file).expect("file should canonicalize");
         assert_eq!(decoded.as_path(), canonical_file.as_path());
-        assert_eq!(
-            entry["displayPath"],
-            canonical_file.to_string_lossy().as_ref()
-        );
+        assert_eq!(entry["displayPath"], canonical_file.display_string());
     }
 
     #[tokio::test]
@@ -2471,11 +2469,15 @@ mod tests {
         .into_path_buf();
         assert_eq!(
             ancestor_path,
-            file.parent().unwrap().canonicalize().unwrap()
+            magi_core::HostPath::canonicalize(file.parent().unwrap())
+                .unwrap()
+                .into_path_buf()
         );
         assert_eq!(
             payload["displayPath"],
-            file.canonicalize().unwrap().to_string_lossy().as_ref()
+            magi_core::HostPath::canonicalize(&file)
+                .unwrap()
+                .display_string()
         );
     }
 
@@ -2603,11 +2605,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
-        let canonical_file = file.canonicalize().expect("file should canonicalize");
-        assert_eq!(
-            payload["displayPath"],
-            canonical_file.to_string_lossy().as_ref()
-        );
+        let canonical_file =
+            magi_core::HostPath::canonicalize(&file).expect("file should canonicalize");
+        assert_eq!(payload["displayPath"], canonical_file.display_string());
         assert_eq!(payload["kind"], "file");
         assert!(
             payload["pathRef"]

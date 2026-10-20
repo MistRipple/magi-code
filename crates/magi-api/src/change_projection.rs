@@ -876,7 +876,12 @@ mod tests {
             .to_string();
 
         let (resolved, relative) = safe_workspace_path(&root, &path_ref).expect("path ref");
-        assert_eq!(resolved, file.canonicalize().unwrap());
+        assert_eq!(
+            resolved,
+            magi_core::HostPath::canonicalize(&file)
+                .unwrap()
+                .into_path_buf()
+        );
         assert_eq!(relative, "path-ref.txt");
     }
 

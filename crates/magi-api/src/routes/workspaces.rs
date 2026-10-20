@@ -564,7 +564,12 @@ mod tests {
         let resolved =
             canonical_workspace_path(&path_ref).expect("workspace path ref should resolve");
 
-        assert_eq!(resolved, root.canonicalize().unwrap());
+        assert_eq!(
+            resolved,
+            magi_core::HostPath::canonicalize(&root)
+                .unwrap()
+                .into_path_buf()
+        );
     }
 
     #[tokio::test]

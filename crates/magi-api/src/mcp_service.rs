@@ -1324,6 +1324,7 @@ mod tests {
         state: ApiState,
         router: axum::Router,
         transport_session: tokio::sync::OnceCell<String>,
+        #[cfg(unix)]
         tokens: Arc<TokenStore>,
         secret: String,
         token_id: String,
@@ -1480,6 +1481,7 @@ mod tests {
                 tokens.clone(),
                 HttpConfig::default(),
             )),
+            #[cfg(unix)]
             tokens,
             secret: issued.secret,
             token_id: issued.record.token_id,
