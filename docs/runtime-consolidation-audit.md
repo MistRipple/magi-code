@@ -119,6 +119,6 @@
 - Windows 的自动化进程/插件/路径、共享 Job API 与 daemon 编译门禁已通过，并已核对 Windows 2022 原始日志；该部分不再列为待验收。原完整 Electron DOM 夹具已接入 Windows CI，构建真实目录包并沿 App Renderer 验收，未增加产品 IPC 或第二套验收。此前 Git dirty 投影等待和 Git drift 夹具先切外部分支的问题已修复；Windows sidecar 改由 owner pipe EOF 请求原关闭入口，本机目录包完整 208 项通过。随后 [Windows CI](https://github.com/MistRipple/magi-code/actions/runs/39377629104) 在首次 Git 工作区子代理派发前超时，退出日志确认 owner pipe 已结算活动 Turn；尚未证明该平台完整 GUI 链路通过。当前沿原准备入口补充阶段诊断继续定位，不放宽超时或跳过门禁。安装器安装/升级仍不在目录包验收范围。
 - 大规模存量改动尚未全部逐组审查，不能把当前定向回归称为全部五万行已通过评审，也不能把 P4/P5 全部标为完成。后续只处理存量评审发现的状态/持久化缺陷及 Windows 和 Provider 恢复后的模型矩阵验收缺口，不新增客户端、预算系统或具体外部 Executor。
 
-Windows 第三次 GUI 门禁在相同位置再次超时后，阶段诊断显示阻塞发生在变更投影读取 Git context：桌面 sidecar 的 owner pipe 仍保持开放，而 Rust Git 子进程默认继承了该 stdin；Windows 上 `git` 读取 stdin 后一直等待，持有 `session_change_sync` 锁，首次子代理工作区准备无法继续。已在 `magi-git` 的所有只读/写入命令统一显式设置 `stdin=Stdio::null()`，并加入开放宿主 stdin 的回归；本机 27 项 Git 测试通过。新的 Windows CI 需重新构建目录包验收该根因修复。
+Windows 第三次 GUI 门禁在相同位置再次超时后，阶段诊断显示阻塞发生在变更投影读取 Git context：桌面 sidecar 的 owner pipe 仍保持开放，而 Rust Git 子进程默认继承了该 stdin；Windows 上 `git` 读取 stdin 后一直等待，持有 `session_change_sync` 锁，首次子代理工作区准备无法继续。已在 `magi-git` 的所有只读/写入命令统一显式设置 `stdin=Stdio::null()`，并加入开放宿主 stdin 的回归；本机 27 项 Git 测试通过。新的 Windows CI 已重新构建目录包并通过完整 208 项 Electron DOM 验收，证据 `/tmp/magi-windows-dom-ci-2e8ded70/magi-electron-dom.json`（CI run 39385405292）。
 
 首次收敛移除了 CLI、重复内存驱动与具体外部执行器，并合并滚动文档；现阶段继续复用已有夹具和事实所有者，不以新增代码行数或测试数量衡量进度。
