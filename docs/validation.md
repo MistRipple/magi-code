@@ -193,7 +193,7 @@ Git 漂移/冲突场景现在允许先请求模型，实际写入/Shell/Git/代�
 - `cargo test -p magi-api session_agent_reactivation --lib`：跨三轮 Agent ID 稳定，新 Task/Thread/授权快照，实际读取前序输出/transcript，拒绝过时代际和跨会话来源，TaskStore 重载。
 - `cargo test -p magi-orchestrator agent_activation --lib`：并发激活 CAS、写盘失败回滚和非法来源恢复拒绝。
 - `cargo test -p magi-api background_job_outputs --lib`：真实受管 Shell、Task/Turn 结束后的完成/取消事实、事件发布、跨轮读取及重载输出。
-- `cargo test -p magi-api background_job --lib`：另含 Job 启动事务写盘失败不执行命令、启动期间取消不会留下孤儿进程和 Job metadata 的公开脱敏。
+- `cargo test -p magi-api background_job --lib`：另含 Job 启动事务写盘失败不执行命令、启动期间取消不会留下孤儿进程和 Job metadata 的公开脱敏。 这组现有回归使用宿主原生 Shell（Windows 为 PowerShell），已纳入 Windows CI；包含停止并改做先结算原 Job 再写入工作区，不新增独立 Windows 测试套件。输出恢复夹具等待实际输出及自然退出，不以 Shell 启动速度代替完成事实。
 - `cargo test -p magi-session-store background_job --lib`：Job 与 canonical 事务原子提交、重复启动拒绝、重启收敛、同会话子代理资源边界。进程树完成回归还覆盖启动期/异步退出/显式停止、继承/重定向 stdout/stderr、忽略 SIGTERM 与退出码 0/7 的组合，核对先回收后代再等待输出读取线程，真实完成/失败/取消、输出文件及无迟到写入同时成立；该夹具仅在 Unix 运行，不代替 Windows 原生门禁。
 - `cargo test -p magi-tool-runtime --lib builtin::process::output_buffer_tests`：用受控读取线程核对停止前等待输出；输出超时保留原句柄供重试，读取/写出失败在重复停止后仍不变成成功，不发布 `resources_settled`。
 - `cargo test -p magi-daemon background_job --lib`：原 Turn 终态后的 Job 事实可以从 canonical 事件日志恢复。
