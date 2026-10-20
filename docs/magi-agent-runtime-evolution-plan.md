@@ -412,7 +412,7 @@ Desktop GUI 与 Web 工作台使用同一个 daemon 接纳、事件和交互合�
 | P2：统一能力决策 | 目录/schema/执行同源；明确发现与授权；开放子代理合理的 Git 查询与提问；Skill 语义类型化 | ToolRegistry、permissions/governance、task_helpers、tool_surface_state、tool_batch、Skill runtime、Browser 能力 | 可见性与预检合同一致；所有拒绝可解释；权限收紧即时生效；角色不隐式提权；已有显式限制保留 |
 | P3：统一原生 Step Loop | 主/子代理相同输入与恢复内核；Step/attempt/request 固定；昂贵执行资源延迟准备；用量统计与部分结果 | conversation_loop、session_turn_execution、task_execution_dispatcher、context/usage、TaskStore/worker checkpoint | 相同场景通过同一测试合同；普通会话不被不必要 Git 准备阻塞；用户可暂停和继续；用量不控制执行；旧通用 loop 删除 |
 | P4：持续代理与后台 Job | 保留 Agent 身份、可继续 activation、明确子树转交、资源结算、受控嵌套试点 | TaskStore/Runner、agent_spawn/send/wait、process、BrowserAuthority、交互托盘 | 父子树取消无泄漏、无双计费、无运行保护绕过、无错误完成；后台审批和提问可恢复 |
-| P5：现有插件兼容性收尾 | 现有原生模型、GPT Web 与插件的能力声明及兼容性门禁；外部 Executor 只保留接口 | plugin/runtime、App Server、Desktop 与 Web | 不支持的功能明确拒绝；插件禁用/升级正确结算；没有 CLI、独立移动端或具体外部执行器的交付依赖 |
+| P5：现有插件兼容性收尾 | 已完成当前产品边界：现有原生模型、GPT Web 与插件能力声明及兼容性门禁；外部 Executor 只保留接口 | plugin/runtime、App Server、Desktop 与 Web | 不支持的功能明确拒绝；插件禁用/升级正确结算；没有 CLI、独立移动端或具体外部执行器的交付依赖 |
 
 P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策先统一。P3 依赖其合同稳定；P4 的嵌套开放依赖取消、权限和资源树完成。优先完成 P0–P2，直接改善当前用户问题，再扩展代理规模。
 
