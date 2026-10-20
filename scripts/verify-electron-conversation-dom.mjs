@@ -2717,11 +2717,14 @@ async function healthSnapshot() {
   return response.json();
 }
 
-async function requestGracefulElectronQuit(port) {
+async function requestGracefulElectronQuit(port, expectedPid) {
   // Browser.close 只关闭托盘窗口；通过本脚本启动的 Main inspector 调用
   // 与托盘菜单相同的 app.quit，不增加产品 IPC，也不触及用户已有实例。
   const main = await connectTarget(port + 2, () => true, "脚本自有 Electron Main inspector");
   try {
+    if (await main.evaluate("process.pid") !== expectedPid) {
+      throw new Error("Main inspector 不属于脚本启动的 Electron，拒绝退出其他实例");
+    }
     await main.evaluate("setImmediate(() => process.getBuiltinModule('module')._load('electron').app.quit()); true");
   } finally {
     main.close();
@@ -2732,7 +2735,7 @@ async function stopOwnedProcess(child, cdpPortForQuit = null) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   let gracefulQuitRequested = false;
   if (Number.isInteger(cdpPortForQuit)) {
-    gracefulQuitRequested = await requestGracefulElectronQuit(cdpPortForQuit)
+    gracefulQuitRequested = await requestGracefulElectronQuit(cdpPortForQuit, child.pid)
       .then(() => true)
       .catch(() => false);
   }
