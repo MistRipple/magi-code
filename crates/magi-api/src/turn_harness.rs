@@ -4660,15 +4660,23 @@ done
         }));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_wait_uses_terminal_event_and_real_output_without_model_polling() {
         for (exit_code, expected_status) in [(0, "completed"), (7, "failed")] {
             let harness = MagiTurnHarness::new_task("Job 已完成");
             let (workspace, root) = register_git_workspace(&harness);
             let session = create_workspace_session(&harness, &workspace, "job-event-wait");
+            let command = if cfg!(windows) {
+                format!(
+                    "Start-Sleep -Seconds 1; [Console]::Out.Write('event-output'); Set-Content -Path job-wait.txt -Value done -NoNewline; exit {exit_code}"
+                )
+            } else {
+                format!(
+                    "sleep 1; printf event-output; printf done > job-wait.txt; exit {exit_code}"
+                )
+            };
             harness.provider.set_tool_sequence_then_completed(vec![
-            ("shell_exec", serde_json::json!({"command":format!("sleep 1; printf event-output; printf done > job-wait.txt; exit {exit_code}"), "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"command":command, "background":true}).to_string()),
             ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":5000}).to_string()),
         ], "Job 已完成");
             let accepted = harness
@@ -4737,7 +4745,14 @@ done
         }
     }
 
-    #[cfg(unix)]
+    fn cancellable_job_command() -> &'static str {
+        if cfg!(windows) {
+            "Start-Sleep -Seconds 30; Set-Content -Path must-not-exist.txt -Value orphan -NoNewline"
+        } else {
+            "sleep 30; printf orphan > must-not-exist.txt"
+        }
+    }
+
     async fn start_background_job_wait(
         harness: &MagiTurnHarness,
         scenario: &str,
@@ -4750,7 +4765,7 @@ done
         let (workspace, root) = register_git_workspace(harness);
         let session = create_workspace_session(harness, &workspace, scenario);
         harness.provider.set_tool_sequence_then_completed(vec![
-            ("shell_exec", serde_json::json!({"command":"sleep 30; printf orphan > must-not-exist.txt", "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"command":cancellable_job_command(), "background":true}).to_string()),
             ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":60000}).to_string()),
         ], "Job 等待结束");
         let accepted = harness
@@ -4773,7 +4788,6 @@ done
         (workspace, root, session, accepted)
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_wait_cancel_stops_waiter_and_settles_original_process() {
         let harness = MagiTurnHarness::new_task("不得产生取消后的答复");
@@ -4812,7 +4826,14 @@ done
         );
     }
 
-    #[cfg(unix)]
+    fn job_side_effect_command() -> &'static str {
+        if cfg!(windows) {
+            "Set-Content -Path job-effect.txt -Value must-not-run -NoNewline"
+        } else {
+            "printf must-not-run > job-effect.txt"
+        }
+    }
+
     #[tokio::test]
     async fn background_job_cancel_during_start_journal_cannot_spawn_an_orphan() {
         struct CancelStartingJob;
@@ -4857,7 +4878,7 @@ done
         harness.provider.set_tool_then_completed(
             "shell_exec",
             serde_json::json!({
-                "command":"printf must-not-run > job-effect.txt", "background":true,
+                "command":job_side_effect_command(), "background":true,
             })
             .to_string(),
             "启动期间取消",
@@ -4902,7 +4923,6 @@ done
         fs::remove_dir_all(jobs[0].stdout_path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_cancel_commit_failure_remains_retryable() {
         use magi_tool_runtime::{
@@ -5056,7 +5076,6 @@ done
         assert!(!root.join("must-not-exist.txt").exists());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_persistence_failure_prevents_process_side_effects() {
         struct RejectJobWriter;
@@ -5094,7 +5113,7 @@ done
         harness.provider.set_tool_then_completed(
             "shell_exec",
             serde_json::json!({
-                "command":"printf must-not-run > job-effect.txt", "background":true,
+                "command":job_side_effect_command(), "background":true,
             })
             .to_string(),
             "调用已拒绝",
@@ -5137,18 +5156,25 @@ done
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_outputs_and_terminal_facts_survive_new_turns_and_reload() {
         for (index, command, expected) in [
             (
                 0,
-                "printf durable-output; printf durable-error >&2",
+                if cfg!(windows) {
+                    "[Console]::Out.Write('durable-output'); [Console]::Error.Write('durable-error')"
+                } else {
+                    "printf durable-output; printf durable-error >&2"
+                },
                 magi_tool_runtime::BackgroundJobStatus::Completed,
             ),
             (
                 1,
-                "printf durable-output; sleep 30",
+                if cfg!(windows) {
+                    "[Console]::Out.Write('durable-output'); Start-Sleep -Seconds 30"
+                } else {
+                    "printf durable-output; sleep 30"
+                },
                 magi_tool_runtime::BackgroundJobStatus::Cancelled,
             ),
         ] {
@@ -5156,6 +5182,28 @@ done
             let (workspace_id, root) = register_git_workspace(&harness);
             let session =
                 create_workspace_session(&harness, &workspace_id, &format!("durable-job-{index}"));
+            let store = harness.state.session_store.clone();
+            let job_session = session.clone();
+            // 回收前先确认命令确实写出了输出；自然完成场景还须等原 Job 退出，
+            // 不能让测试 Provider 的瞬时最终答复抢先取消较慢的宿主 Shell。
+            harness.provider.state.lock().unwrap().before_response = Some(Arc::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let jobs = store.background_jobs_for_session(&job_session).unwrap();
+                    let Some(job) = jobs.first() else { return };
+                    if fs::read_to_string(&job.stdout_path)
+                        .is_ok_and(|text| text == "durable-output")
+                        && (index != 0 || job.status.is_terminal())
+                    {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "命令必须先产生真实输出: {jobs:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }));
             harness.provider.set_tool_then_completed(
                 "shell_exec",
                 serde_json::json!({
@@ -17427,14 +17475,13 @@ done
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn interrupt_and_replace_settles_real_background_job_before_new_workspace_writes() {
         let harness = MagiTurnHarness::new_task("replacement workspace done");
         let (workspace, root) = register_git_workspace(&harness);
         let session = create_workspace_session(&harness, &workspace, "replacement-process");
         harness.provider.set_tool_sequence_then_completed(vec![
-            ("shell_exec", serde_json::json!({"command":"sleep 30; printf orphan > must-not-exist.txt", "background":true}).to_string()),
+            ("shell_exec", serde_json::json!({"command":cancellable_job_command(), "background":true}).to_string()),
             ("shell_exec", serde_json::json!({"action":"wait", "job_id":"$last_job_id", "timeout_ms":60000}).to_string()),
         ], "old output must not complete");
         let original = harness
