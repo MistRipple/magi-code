@@ -1451,6 +1451,12 @@ function assistantTurnId(state, expectedText) {
     || null;
 }
 
+function hasDirtyGitStatus(state) {
+  return state.git.some((item) => /未跟踪|未提交|未暂存|已暂存|脏|dirty|uncommitted|untracked/iu.test(
+    `${item.title} ${item.text} ${item.dirty}`,
+  ));
+}
+
 async function waitForBackendTiming(turnId, label, scenario = "") {
   return waitFor(() => {
     const evidence = backendTimingEvidence(turnId);
@@ -3669,16 +3675,14 @@ try {
   await waitForComposerReady(page, "Git dirty 工作区输入区就绪");
   await waitFor(async () => {
     const state = await rendererState(page);
-    return state.git.some((item) => /未跟踪|未提交|未暂存|已暂存|脏|dirty|uncommitted|untracked/iu.test(
-      `${item.title} ${item.text} ${item.dirty}`,
-    )) ? state : null;
+    return hasDirtyGitStatus(state) ? state : null;
   }, "Git dirty 状态进入真实 DOM");
   const dirtyProviderRequests = provider.requests.length;
   await setComposerText(page, "Git dirty DOM 验收：执行一个复杂任务，读取当前工作区并汇总结果");
   await clickSend(page);
   const dirtyResult = await waitForAssistant(page, responseText, "Git dirty Task 最终消息");
   check("Git dirty 工作区仍可完成 Task", dirtyResult.text.includes(responseText));
-  check("Git dirty 工作区状态进入真实 DOM", dirtyResult.git.some((item) => /未跟踪|未提交|未暂存|已暂存|脏/iu.test(`${item.title} ${item.text}`)));
+  check("Git dirty 工作区状态进入真实 DOM", hasDirtyGitStatus(dirtyResult), JSON.stringify(dirtyResult.git));
   check("Git dirty Task 实际到达 Provider", provider.requests.length > dirtyProviderRequests);
   check("Git dirty 工作区注册身份仍可见", dirtyResult.workspaceIds.includes(dirtyWorkspaceId));
 

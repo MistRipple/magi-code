@@ -86,7 +86,8 @@ jobs:
       - name: 缓存 Rust 构建产物
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-windows-2022-rust-1.97
+          shared-key: ci-windows-2022-rust-1.97-gui
+          cache-on-failure: true
 
       - name: 验证 Windows 子进程与桌面宿主
         run: |
