@@ -11,7 +11,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tracing.workspace = true
 url = "2"
 
