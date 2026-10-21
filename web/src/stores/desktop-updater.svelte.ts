@@ -197,8 +197,9 @@ export async function retryDesktopUpdate(): Promise<DesktopUpdateCheckResult> {
     return 'ignored';
   }
   if (desktopUpdaterState.errorStage === 'install') {
-    desktopUpdaterState.phase = 'ready';
-    await restartWithDesktopUpdate();
+    // Main 复核暂存包：仍可用则复用，被清理或损坏则重新下载准备。
+    await downloadDesktopUpdate();
+    if (desktopUpdaterState.phase === 'ready') await restartWithDesktopUpdate();
   }
   return 'ignored';
 }

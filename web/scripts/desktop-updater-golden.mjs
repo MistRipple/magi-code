@@ -333,5 +333,37 @@ await withGoldenViteServer(async (server) => {
     'stale update checks must run again',
   );
 
+  const previousWindow = globalThis.window;
+  let listener;
+  let unsubscribed = 0;
+  let completed = false;
+  const available = {
+    status: 'available', currentVersion: '3.0.56', availableVersion: '3.0.57',
+    downloadedBytes: 0, totalBytes: 100, percent: null, error: null, installable: true,
+  };
+  globalThis.window = { magiDesktop: {
+    runtime: 'electron',
+    checkForUpdates: async () => available,
+    onUpdate: (next) => { listener = next; return () => { unsubscribed++; }; },
+    downloadUpdate: async () => {
+      listener({ ...available, status: 'downloading', downloadedBytes: 100, percent: 99 });
+      return { ...available, status: completed ? 'downloaded' : 'failed', downloadedBytes: 100, error: completed ? null : 'extract failed' };
+    },
+  } };
+  try {
+    const update = await updater.checkDesktopUpdate();
+    const progress = [];
+    await assert.rejects(update.download((next) => progress.push(next)), /extract failed/);
+    assert.deepEqual(progress.map((next) => next.percent), [99], '字节已收齐时仍使用 Main 的校验/解包进度，不能提前显示完成');
+    assert.equal(unsubscribed, 1, '失败后释放进度订阅');
+    completed = true;
+    await update.download((next) => progress.push(next));
+    assert.equal(progress.at(-1).percent, 100, '只有 Main 返回 downloaded 才显示完成');
+    assert.equal(unsubscribed, 2);
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+
   console.log('desktop updater golden replay passed');
 });

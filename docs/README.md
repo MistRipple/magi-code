@@ -43,6 +43,8 @@ npm run desktop:dev
 
 发布统一由 Electron Builder 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 
+在线更新由 Electron Main 拥有状态。macOS 未签名发行包使用 ZIP 下载、SHA-512 校验、`ditto` 解包及安装助手替换；下载按连续无数据 60 秒超时，断流最多尝试三次，保留部分 ZIP 并通过 HTTP Range 续传。不支持 Range 时覆盖重下。界面在版本与可执行入口验证通过后才展示可重启，之前进度最多 99%。安装助手启动失败保留当前应用和可重试状态，暂存包丢失时重新下载准备；替换后系统拒绝打开新包则恢复旧包。Windows/Linux 沿用 electron-updater，安装错误须返回发起安装的 IPC 调用。
+
 ## 发布流程
 
 - [GitHub 新版本发布流程](./release-process.md)：发布前完整预检、main 与 CI 门禁、Tag 顺序及发布后交付物核对。

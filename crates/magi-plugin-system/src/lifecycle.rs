@@ -166,10 +166,18 @@ impl PluginManager {
         if state.schema_version != STATE_VERSION {
             return Err(PluginError::CorruptState("插件状态版本不受支持".into()));
         }
+        let mut missing = Vec::new();
         for plugin in state.plugins.values() {
-            validate_plugin_path(&root, plugin)?;
+            validate_plugin_path(plugin)?;
+            match fs::metadata(root.join(&plugin.package_path)) {
+                Ok(metadata) if metadata.is_file() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(plugin.id.clone());
+                }
+                Ok(_) => return Err(PluginError::CorruptState("安装包不是普通文件".into())),
+                Err(error) => return Err(error.into()),
+            }
         }
-        cleanup_unreferenced_packages(&root, &state)?;
         let resources =
             PluginResourceStore::open(root.join("resources.json")).map_err(PluginError::Storage)?;
         let mut manager = Self {
@@ -182,7 +190,33 @@ impl PluginManager {
             draining_scopes: BTreeMap::new(),
             pending_upgrade: None,
         };
+        // 先按原提交事实完成数据转换，不能把已提交升级误判成未提交并丢弃暂存数据。
         manager.recover_upgrade_operation()?;
+        if !missing.is_empty() {
+            // 旧版 Windows 曾误删仍被引用的 ZIP。隔离缺包记录，让其他功能正常启动；
+            // 原始记录和资源保留，重新安装须显式启用和授权。
+            let backup_path = manager.root.join(format!(
+                "{STATE_FILE}.missing-packages-{}-{}",
+                UtcMillis::now().0,
+                std::process::id()
+            ));
+            write_atomic(&backup_path, fs::read(manager.root.join(STATE_FILE))?)?;
+            let mut recovered = manager.state.clone();
+            for id in &missing {
+                let record = &manager.state.plugins[id];
+                let bytes = serde_json::to_vec_pretty(record)
+                    .map_err(|error| PluginError::CorruptState(error.to_string()))?;
+                write_atomic(&missing_package_record_path(&manager.root, id), bytes)?;
+                recovered.plugins.remove(id);
+            }
+            manager.commit(recovered)?;
+            eprintln!(
+                "插件安装包缺失，已隔离安装记录，请在插件中心重新安装：{}；原始记录备份：{}。插件资源数据已保留，重新安装后需重新启用和授权。",
+                missing.join(", "),
+                backup_path.display()
+            );
+        }
+        cleanup_unreferenced_packages(&manager.root, &manager.state)?;
         Ok(manager)
     }
 
@@ -373,6 +407,23 @@ impl PluginManager {
             }
             return Err(conflict("插件已有不同版本；必须先完成排空升级"));
         }
+        // 缺包恢复不能使新版本绕过已有数据的升级/迁移检查。先补回原包，再走升级。
+        if self.resources.has_data(&manifest.id) {
+            match fs::read(missing_package_record_path(&self.root, &manifest.id)) {
+                Ok(bytes) => {
+                    let previous: InstalledPlugin = serde_json::from_slice(&bytes)
+                        .map_err(|error| PluginError::CorruptState(error.to_string()))?;
+                    if previous.digest != package.digest() {
+                        return Err(conflict(format!(
+                            "插件原安装包缺失且保留了资源数据，请先重新安装原版本 {}，再执行升级",
+                            previous.version
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let relative = self.write_version(package)?;
         let mut next = self.state.clone();
         next.plugins.insert(
@@ -392,6 +443,7 @@ impl PluginManager {
             let _ = fs::remove_file(self.root.join(relative));
             return Err(error);
         }
+        let _ = fs::remove_file(missing_package_record_path(&self.root, &manifest.id));
         Ok(())
     }
 
@@ -839,7 +891,7 @@ fn ensure_builtin_source(id: &str, source: &PluginSource) -> Result<(), PluginEr
     Ok(())
 }
 
-fn validate_plugin_path(root: &Path, plugin: &InstalledPlugin) -> Result<(), PluginError> {
+fn validate_plugin_path(plugin: &InstalledPlugin) -> Result<(), PluginError> {
     let path = Path::new(&plugin.package_path);
     if path.is_absolute()
         || path
@@ -850,10 +902,13 @@ fn validate_plugin_path(root: &Path, plugin: &InstalledPlugin) -> Result<(), Plu
     {
         return Err(PluginError::CorruptState("安装包路径非法".into()));
     }
-    if !root.join(path).is_file() {
-        return Err(PluginError::CorruptState("安装包文件缺失".into()));
-    }
     Ok(())
+}
+
+fn missing_package_record_path(root: &Path, id: &str) -> PathBuf {
+    use sha2::Digest;
+    let key = sha2::Sha256::digest(id.as_bytes());
+    root.join(format!("missing-package-{key:x}.json"))
 }
 
 fn stage_package_for_removal(path: &Path) -> Result<PathBuf, PluginError> {

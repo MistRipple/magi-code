@@ -91,13 +91,17 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
     download: async (onProgress) => {
       const unsubscribe = desktop.onUpdate((next) => {
         if (next.status !== 'downloading' && next.status !== 'downloaded') return;
-        onProgress?.(formatUpdateProgress(
-          next.downloadedBytes,
-          next.totalBytes ?? undefined,
-        ));
+        onProgress?.({
+          ...formatUpdateProgress(next.downloadedBytes, next.totalBytes ?? undefined),
+          // Main 在校验与解包完成前保留 99%，不能由字节数反推“可安装”。
+          percent: next.percent ?? undefined,
+        });
       });
       try {
         const downloaded = await desktop.downloadUpdate();
+        if (downloaded.status !== 'downloaded') {
+          throw new Error(downloaded.error || '桌面更新尚未准备完成，请重试');
+        }
         onProgress?.(formatUpdateProgress(
           downloaded.downloadedBytes,
           downloaded.totalBytes ?? downloaded.downloadedBytes,

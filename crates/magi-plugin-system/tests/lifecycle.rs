@@ -1,7 +1,7 @@
 use magi_app_server_protocol::generated::PluginDrainPhase;
 use magi_plugin_system::{
     PluginError, PluginManager, PluginPackage, PluginPermission, PluginPermissionKind,
-    PluginScopeKind, PluginSource,
+    PluginResourceStore, PluginScopeKind, PluginSource,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1499,4 +1499,168 @@ mod data_migration {
         );
         assert!(!root.path().join("upgrade-operation.json").exists());
     }
+}
+
+#[test]
+fn missing_package_is_isolated_on_startup_without_losing_other_plugins_or_resources() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    let package = package(true);
+    let mut healthy_manifest = manifest(false);
+    healthy_manifest["id"] = json!("acme.healthy");
+    let healthy = package_from_manifest(healthy_manifest);
+    for package in [&package, &healthy] {
+        manager
+            .install(
+                package,
+                PluginSource::Local {
+                    name: "test.zip".into(),
+                },
+            )
+            .unwrap();
+    }
+    manager.enable("acme.lifecycle", "application").unwrap();
+    manager
+        .authorize(
+            "acme.lifecycle",
+            "application",
+            package.manifest().permissions.clone(),
+        )
+        .unwrap();
+    manager.activate("acme.lifecycle", "application").unwrap();
+    let missing_path = manager.state().plugins["acme.lifecycle"]
+        .package_path
+        .clone();
+    let original = std::fs::read(root.path().join("state.json")).unwrap();
+    // 模拟旧 Windows 版本清理了仍被 state.json 引用的 ZIP。
+    std::fs::remove_file(root.path().join(missing_path)).unwrap();
+    drop(manager);
+    let mut resources = PluginResourceStore::open(root.path().join("resources.json")).unwrap();
+    let retained = resources
+        .write(
+            "acme.lifecycle",
+            "application",
+            "cache",
+            0,
+            json!({"saved":true}),
+        )
+        .unwrap();
+    let resource_bytes = std::fs::read(root.path().join("resources.json")).unwrap();
+
+    let mut recovered = PluginManager::open(root.path()).unwrap();
+    assert!(!recovered.state().plugins.contains_key("acme.lifecycle"));
+    assert_eq!(recovered.projection().unwrap().plugins.len(), 1);
+    assert_eq!(
+        recovered.package("acme.healthy").unwrap().digest(),
+        healthy.digest()
+    );
+    let backup = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("state.json.missing-packages-")
+        })
+        .unwrap();
+    assert_eq!(std::fs::read(backup).unwrap(), original);
+    assert_eq!(
+        std::fs::read(root.path().join("resources.json")).unwrap(),
+        resource_bytes
+    );
+    let mut different = manifest(true);
+    different["version"] = json!("2.0.0");
+    assert!(matches!(
+        recovered.install(
+            &package_from_manifest(different),
+            PluginSource::Local {
+                name: "new.zip".into()
+            }
+        ),
+        Err(PluginError::Conflict(_))
+    ));
+    assert_eq!(
+        resources.read("acme.lifecycle", "application", "cache"),
+        Some(retained)
+    );
+    recovered
+        .install(
+            &package,
+            PluginSource::Local {
+                name: "reinstall.zip".into(),
+            },
+        )
+        .unwrap();
+    let reinstalled = &recovered.state().plugins["acme.lifecycle"];
+    assert!(reinstalled.enabled_scopes.is_empty());
+    assert!(reinstalled.active_scopes.is_empty());
+    assert!(reinstalled.grants.is_empty());
+    drop(recovered);
+    assert_eq!(
+        PluginManager::open(root.path())
+            .unwrap()
+            .projection()
+            .unwrap()
+            .plugins
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn startup_recovery_does_not_accept_illegal_package_paths_or_overwrite_state() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    manager
+        .install(
+            &package(false),
+            PluginSource::Local {
+                name: "test.zip".into(),
+            },
+        )
+        .unwrap();
+    let state_path = root.path().join("state.json");
+    let mut state = serde_json::to_value(manager.state()).unwrap();
+    state["plugins"]["acme.lifecycle"]["package_path"] = json!("../outside.zip");
+    let original = serde_json::to_vec(&state).unwrap();
+    std::fs::write(&state_path, &original).unwrap();
+    drop(manager);
+    assert!(matches!(
+        PluginManager::open(root.path()),
+        Err(PluginError::CorruptState(_))
+    ));
+    assert_eq!(std::fs::read(state_path).unwrap(), original);
+}
+
+#[test]
+fn repeated_reopen_and_uninstall_preserve_all_referenced_version_packages() {
+    let root = tempdir().unwrap();
+    let mut manager = PluginManager::open(root.path()).unwrap();
+    for id in ["acme.first", "acme.second"] {
+        let mut manifest = manifest(false);
+        manifest["id"] = json!(id);
+        let package = package_from_manifest(manifest);
+        manager
+            .install(
+                &package,
+                PluginSource::Local {
+                    name: "test.zip".into(),
+                },
+            )
+            .unwrap();
+    }
+    // Windows 的 read_dir 使用反斜线，持久化记录使用斜线；本测试在 Windows CI 同样运行。
+    for _ in 0..3 {
+        drop(manager);
+        manager = PluginManager::open(root.path()).unwrap();
+        assert_eq!(manager.projection().unwrap().plugins.len(), 2);
+        assert!(manager.package("acme.first").is_ok());
+        assert!(manager.package("acme.second").is_ok());
+    }
+    manager.uninstall("acme.first").unwrap();
+    drop(manager);
+    let reopened = PluginManager::open(root.path()).unwrap();
+    assert_eq!(reopened.projection().unwrap().plugins.len(), 1);
+    assert!(reopened.package("acme.second").is_ok());
 }
