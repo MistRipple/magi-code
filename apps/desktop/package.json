@@ -23,7 +23,7 @@
     "@magi/desktop-browser-contracts": "0.0.0",
     "@types/node": "22.15.30",
     "@types/ws": "8.18.1",
-    "electron": "43.4.0",
+    "electron": "44.9.0",
     "electron-builder": "26.15.3",
     "electron-updater": "6.8.9",
     "esbuild": "0.25.12",
