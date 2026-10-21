@@ -1,6 +1,7 @@
 import { bootstrapApp } from './bootstrap-app';
 import { initializeAppearanceRuntime } from './appearance/runtime';
 import { createWebClientBridge } from './shared/bridges/web-client-bridge';
+import { preloadMarkdownRenderer } from './lib/markdown-renderer-loader';
 import type { Component } from 'svelte';
 
 const desktopSurface = window.magiDesktop?.surface
@@ -24,5 +25,18 @@ const app = Promise.all([
   }),
   loadRootComponent(),
 ]).then(([, RootComponent]) => bootstrapApp(bridge, RootComponent));
+
+// Keep the parser and KaTeX out of the initial entry, but warm the shared
+// chunk once the shell has had a chance to paint so the first response does
+// not pay the full network/parse cost.
+app.then(() => {
+  const schedule = window.requestIdleCallback ?? ((callback: IdleRequestCallback) => {
+    window.setTimeout(() => callback({
+      didTimeout: false,
+      timeRemaining: () => 0,
+    } as IdleDeadline), 250);
+  });
+  schedule(() => preloadMarkdownRenderer());
+});
 
 export default app;

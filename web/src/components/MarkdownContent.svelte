@@ -7,7 +7,11 @@
   } from '../lib/file-reference';
   import { MARKDOWN_IMAGE_CONTEXT, type MarkdownImageContext } from '../lib/markdown-image';
   import { preprocessMarkdown, splitStreamingMarkdown } from '../lib/markdown-utils';
-  import MarkdownRenderer from './MarkdownRenderer.svelte';
+  import type { Component } from 'svelte';
+  import {
+    loadMarkdownRenderer,
+    type MarkdownRendererProps,
+  } from '../lib/markdown-renderer-loader';
 
   // Props — 保持既有调用方式兼容，并为文件预览补充图片基准路径。
   interface Props {
@@ -22,6 +26,19 @@
     filePreviewScope = undefined,
     baseFilePath = undefined,
   }: Props = $props();
+
+  let MarkdownRendererComponent = $state<Component<MarkdownRendererProps> | null>(null);
+  let markdownRendererLoadFailed = $state(false);
+
+  $effect(() => {
+    void loadMarkdownRenderer()
+      .then((module) => {
+        MarkdownRendererComponent = module.default;
+      })
+      .catch(() => {
+        markdownRendererLoadFailed = true;
+      });
+  });
 
   const readFilePreviewScope: FilePreviewScopeReader = () => filePreviewScope;
   setContext(FILE_PREVIEW_SCOPE_CONTEXT, readFilePreviewScope);
@@ -50,11 +67,15 @@
 </script>
 
 <div class="markdown-content">
-  {#if markdownParts.stable}
-    <MarkdownRenderer source={markdownParts.stable} isStreaming={false} />
-  {/if}
-  {#if markdownParts.volatile}
-    <MarkdownRenderer source={markdownParts.volatile} isStreaming={true} />
+  {#if MarkdownRendererComponent}
+    {#if markdownParts.stable}
+      <MarkdownRendererComponent source={markdownParts.stable} isStreaming={false} />
+    {/if}
+    {#if markdownParts.volatile}
+      <MarkdownRendererComponent source={markdownParts.volatile} isStreaming={true} />
+    {/if}
+  {:else if markdownRendererLoadFailed}
+    <pre class="markdown-fallback">{content}</pre>
   {/if}
 </div>
 
@@ -64,6 +85,13 @@
     max-width: 100%;
     overflow-wrap: anywhere;
     color: var(--foreground);
+  }
+
+  .markdown-fallback {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
   }
 
   /* Markdown 元素样式 */
