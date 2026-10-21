@@ -162,7 +162,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBlockedTurnRemainsRecoverable(canonicalProtocol);
   assertReducerIndexesStayConsistent(reducer);
   assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, canonicalProtocol);
-  assertWebModelToolOriginProjectsToToolCard(reducer, projection);
+  assertWebModelToolOriginProjectsToToolCard(reducer, projection, conversationPresentation);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertTruncatedToolResultCarriesHistoryRef(reducer, projection);
   assertCompactedAndFullItemsOfSameVersionAreCompatible(reducer);
@@ -409,17 +409,43 @@ function assertIndeterminateToolItemProjectsAsUnconfirmed(reducer, projection, c
   assert.equal(toolCall?.status, 'unconfirmed', 'indeterminate item must project as an unconfirmed tool card');
 }
 
-function assertWebModelToolOriginProjectsToToolCard(reducer, projection) {
+function assertWebModelToolOriginProjectsToToolCard(reducer, projection, conversationPresentation) {
   const c = baseCase('tool-origin', 'session-golden-tool-origin', 'turn-golden-tool-origin', 11_707);
   const own = tool(c, 1, 'tool-own', 'call-own', 'ls', 'completed', { status: 'ok' });
   const viaChatgpt = { ...tool(c, 2, 'tool-chatgpt', 'call-chatgpt', 'ls', 'completed', { status: 'ok' }), metadata: { toolOrigin: 'chatgpt_web' } };
-  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [own, viaChatgpt])]);
+  const generatedPath = 'pelican-bicycle-animation.html';
+  const generated = item(c, 3, 'tool-generated-file', 'tool_call', 'completed', {
+    title: 'file_write',
+    metadata: { toolOrigin: 'chatgpt_web' },
+    tool: {
+      callId: 'call-generated-file',
+      name: 'file_write',
+      arguments: { path: generatedPath, content: '<svg></svg>' },
+      result: {
+        tool: 'file_write',
+        status: 'succeeded',
+        path: generatedPath,
+        created: true,
+      },
+    },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [own, viaChatgpt, generated])]);
   const calls = projection.buildCanonicalTimelineProjection(state).artifacts
     .flatMap((artifact) => artifact.message.blocks ?? [])
     .filter((block) => block.type === 'tool_call')
     .map((block) => block.toolCall);
   assert.equal(calls.find((call) => call.id === 'call-own')?.origin, undefined, 'Magi 自己的 agent 发起的调用没有来源标记');
   assert.equal(calls.find((call) => call.id === 'call-chatgpt')?.origin, 'chatgpt_web', 'GPT Web 回调的工具带来源标记');
+  const generatedArtifact = projection.buildCanonicalTimelineProjection(state).artifacts.find((artifact) => (
+    artifact.message.metadata?.turnItemId === generated.itemId
+  ));
+  assert.equal(generatedArtifact?.message.blocks?.[0]?.type, 'file_change', 'GPT Web 写入成功后必须投影为文件卡片');
+  assert.equal(generatedArtifact?.message.blocks?.[0]?.fileChange?.filePath, generatedPath);
+  assert.equal(
+    conversationPresentation.inferConversationPresentationRole(generatedArtifact?.message || {}),
+    'artifact',
+    '文件卡片必须提升到折叠过程之外，确保用户可以直接点击',
+  );
 }
 
 function assertSingleThinkingProjectsAsGroup(reducer, projection) {

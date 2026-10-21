@@ -8,7 +8,6 @@
   import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
-  import { WEB_MODEL_SETUP_REQUEST } from '../web/web-model-setup';
   import ModelConfigForm from './ModelConfigForm.svelte';
 
   let {
@@ -21,7 +20,6 @@
     workerConfigs = $bindable(),
     modelConfigBaselines,
     workerModelTabs,
-    pluginEngines,
     modelStatuses,
     saveStatus,
     testStatus,
@@ -46,8 +44,7 @@
     getAgentColor,
     deleteEngine,
     openAddEngineDialog,
-    renameEngineDisplay,
-    openWebModelSettings
+    renameEngineDisplay
   } = $props<{
     modelConfigTab: string;
     orchConfig: any;
@@ -58,7 +55,6 @@
     workerConfigs: Record<string, any>;
     modelConfigBaselines: Record<string, any>;
     workerModelTabs: string[];
-    pluginEngines: Array<{ id: string; displayName: string; description?: string; pluginId?: string }>;
     modelStatuses: Record<string, { status?: string }>;
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
@@ -82,8 +78,6 @@
     getWorkerDisplayName: (workerId: string) => string;
     getAgentColor: (templateId: string, colorToken?: string) => any;
     deleteEngine: (engineId: string) => void;
-    /** 打开 GPT Web 的设置（登录、可用性、工具通道）。它依赖内置浏览器的会话，所以设置在「浏览器」页。 */
-    openWebModelSettings: () => void;
     openAddEngineDialog: () => void;
     renameEngineDisplay: (engineId: string, newName: string) => void;
   }>();
@@ -664,102 +658,10 @@
       </div>
     </div>
 
-    {#if pluginEngines.length > 0}
-      <div class="settings-section plugin-engine-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">插件会话引擎</div>
-          <div class="settings-section-subtitle">由已激活插件声明并托管，配置与权限请在对应插件设置中管理。</div>
-        </div>
-        <div class="plugin-engine-list">
-          {#each pluginEngines as engine (engine.id)}
-            <div class="plugin-engine-row">
-              <div class="engine-avatar engine-avatar--primary" aria-hidden="true"><Icon name="plug" size={15} /></div>
-              <div class="engine-identity">
-                <span class="engine-name">{engine.displayName || engine.id}</span>
-                <span class="engine-model-tag">{engine.id}</span>
-                {#if engine.description}<span class="plugin-engine-description">{engine.description}</span>{/if}
-              </div>
-              <span class="plugin-engine-readonly">只读注册</span>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-
-    <div class="settings-section" data-gpt-web-setup-entry><div class="settings-card"><div class="settings-row">
-      <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.setup.title')}</span><span class="settings-row-desc">{i18n.t('webModel.setup.entryHint')}</span></div>
-      <button class="btn btn--sm btn--secondary" onclick={() => window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST))}>{i18n.t('webModel.setup.start')}</button>
-    </div></div></div>
-    {#if pluginEngines.some((engine: { id: string }) => engine.id === 'plugin/openai.chatgpt-web/default')}
-    <div class="settings-section web-model-pointer">
-      <div class="settings-section-header">
-        <div class="settings-section-title">{i18n.t('settings.model.webModelTitle')}</div>
-        <div class="settings-section-subtitle">{i18n.t('settings.model.webModelSubtitle')}</div>
-      </div>
-      <button type="button" class="web-model-pointer-button" onclick={openWebModelSettings}>
-        <Icon name="globe" size={14} />
-        <span>{i18n.t('settings.model.webModelOpen')}</span>
-      </button>
-    </div>
-    {/if}
   </div>
 </div>
 
 <style>
-  .web-model-pointer {
-    margin-top: var(--space-4);
-  }
-
-  .plugin-engine-section {
-    margin-top: var(--space-4);
-  }
-  .plugin-engine-list {
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--ind-border-control, var(--border));
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .plugin-engine-row {
-    display: grid;
-    grid-template-columns: 34px minmax(0, 1fr) auto;
-    gap: 12px;
-    align-items: center;
-    padding: 10px 14px;
-  }
-  .plugin-engine-row + .plugin-engine-row {
-    border-top: 1px solid var(--ind-border-separator, var(--border-subtle, var(--border)));
-  }
-  .plugin-engine-description {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .plugin-engine-readonly {
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-  }
-
-  .web-model-pointer-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    height: 28px;
-    padding: 0 12px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--foreground);
-    cursor: pointer;
-    font-size: var(--text-xs);
-  }
-
-  .web-model-pointer-button:hover {
-    background: color-mix(in srgb, var(--foreground) 7%, transparent);
-  }
-
   .apple-manager {
     container: settings-model / inline-size;
   }

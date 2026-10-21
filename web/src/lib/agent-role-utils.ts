@@ -99,10 +99,11 @@ function resolveAgentRoleSource(
   const normalizedRoleId = resolveRuntimeAgentTemplateId(normalizedAgentId, registrySnapshot);
   const lookupAgentId = normalizedRoleId || normalizedAgentId;
 
+  // 角色身份只认 AgentProjection.role；引擎可被多个角色共用，也可能与角色同名，
+  // 不能用 engineId 反查角色。
   const matchedEnabledAgent = enabledAgents.find((agent) => {
     const templateId = normalizeAgentId(agent.templateId);
-    const engineId = normalizeAgentId(agent.engineId);
-    return templateId === lookupAgentId || engineId === lookupAgentId;
+    return templateId === lookupAgentId;
   });
   if (matchedEnabledAgent) {
     const templateMeta = resolveTemplateDisplayMeta(
@@ -122,8 +123,7 @@ function resolveAgentRoleSource(
     : [];
   const matchedBinding = registryAgents.find((binding) => {
     const templateId = normalizeAgentId(binding.templateId);
-    const engineId = normalizeAgentId(binding.engineId);
-    return templateId === lookupAgentId || engineId === lookupAgentId;
+    return templateId === lookupAgentId;
   });
   if (!matchedBinding) {
     const templateMeta = resolveTemplateDisplayMeta(lookupAgentId, registrySnapshot);

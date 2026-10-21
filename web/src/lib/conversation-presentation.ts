@@ -62,13 +62,20 @@ export function isApprovalAttentionMessage(message: Message): boolean {
 
 export function isUserVisibleArtifactMessage(message: Message): boolean {
   const toolNames = messageToolNames(message);
-  return toolNames.some((name) => ARTIFACT_TOOL_NAMES.has(name))
+  const hasFileChange = (message.blocks || []).some((block) => (
+    Boolean(block)
+      && typeof block === 'object'
+      && block.type === 'file_change'
+      && Boolean(block.fileChange?.filePath?.trim())
+  ));
+  return hasFileChange
+    || toolNames.some((name) => ARTIFACT_TOOL_NAMES.has(name))
     || (message.images?.length || 0) > 0;
 }
 
 /**
  * 子代理过程默认留在代理详情；只有必须由用户处理的授权，以及用户应直接看到的
- * 图表/图片，才投射回主对话。原始与摘要模式都读取同一份投影，避免两套状态。
+ * 文件、图表和图片产物，才投射回主对话。原始与摘要模式都读取同一份投影，避免两套状态。
  */
 export function isPromotedSidechainMessage(message: Message): boolean {
   const role = inferConversationPresentationRole(message);

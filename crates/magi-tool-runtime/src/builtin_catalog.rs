@@ -1189,7 +1189,7 @@ impl BuiltinToolName {
                 "更新当前会话 Goal 的终态。调用前必须用 get_goal 取得 goal_id、control_revision 与绑定计划 revision；没有绑定计划时 expected_plan_revision 传 null。complete 必须提供完成摘要；blocked 必须提供稳定 blocker_key 与原因，服务端只在同一阻塞连续三个 Goal Turn 出现后进入 blocked。"
             }
             Self::AgentSpawn => {
-                "【root coordinator 或显式获授委派权限的代理可调用】向已注册角色派发独立子任务。默认由主线直接完成；按运行时共享唤起规则判断用户明确要求、并行、上下文隔离或必要独立复核的价值。capabilities 可省略，省略时只激活 general_engineering；显式提供时必须属于该角色。必须提供 delegation 决策和结构化 context_package（直接 JSON 对象）；决策只说明收益，不授予权限。子代理不自动继承主对话历史。当前 Task/Skill 必须允许 agent_wait 和 agent_cancel，不能创建无法收集或取消的代理。立即返回 child_task_id；依赖结果时用 agent_wait，运行中补充用 agent_send。queued 表示已创建，不得重复派发；duplicate_task_name 应核对 existing_task_id 的原始目标和状态，不能仅换名重派。显式 lifetime=session/goal 可保留身份，新的委派确有价值时才用 resume_task_id 继续；普通后续步骤由当前代理完成。失败后按回执核对产物和副作用，再决定接管或重新委派。"
+                "【root coordinator 或显式获授委派权限的代理可调用】向已注册角色派发独立子任务。默认由主线直接完成；按运行时共享唤起规则判断用户明确要求、并行、上下文隔离或必要独立复核的价值。capabilities 可省略，省略时只激活 general_engineering；显式提供时必须属于该角色。必须提供 delegation 决策和结构化 context_package（直接 JSON 对象）；决策只说明收益，不授予权限。子代理不自动继承主对话历史。当前 Task/Skill 必须允许 agent_wait 和 agent_cancel，不能创建无法收集或取消的代理。立即返回 child_task_id；依赖结果时用 agent_wait，运行中补充用 agent_send。queued 表示已创建，不得重复派发；duplicate_task_name 或 duplicate_agent_work 应核对 existing_task_id 的原始目标和状态，不能仅换名重派。显式 lifetime=session/goal 可保留身份，新的委派确有价值时才用 resume_task_id 继续；普通后续步骤由当前代理完成。失败后按回执核对产物和副作用，再决定接管或重新委派。"
             }
             Self::AgentSend => {
                 "向当前任务直接派发、尚未结束的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增：运行中的代理在下一次模型轮次前收到；排队中的代理在开始执行时随上下文包一起收到。"

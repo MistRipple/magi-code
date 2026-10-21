@@ -829,6 +829,7 @@ fn execute_agent_spawn(
             session_id,
             workspace_id,
             role: &preflight.role,
+            delegation_purpose: preflight.delegation.purpose,
             role_parallelism_limit: agent_role_registry
                 .get(&preflight.role)
                 .and_then(|definition| definition.parallelism_limit),
@@ -891,6 +892,20 @@ fn execute_agent_spawn(
                                 "duplicate_task_name",
                                 "registration",
                                 "同一父任务下 task_name 已存在",
+                                AGENT_SPAWN_DUPLICATE_INSTRUCTION,
+                                Some(&existing_task_id),
+                            ),
+                            ExecutionResultStatus::Rejected,
+                        );
+                    }
+                    SpawnedChildExecutionError::DuplicateAgentWork { existing_task_id } => {
+                        return (
+                            agent_spawn_failure_payload_for_existing_task(
+                                tool_call,
+                                "rejected",
+                                "duplicate_agent_work",
+                                "registration",
+                                "相同工作包已有活跃代理，本次未创建新代理",
                                 AGENT_SPAWN_DUPLICATE_INSTRUCTION,
                                 Some(&existing_task_id),
                             ),
@@ -4459,6 +4474,11 @@ mod tests {
             ("/working_dir", serde_json::Value::Null),
             ("/lifetime", serde_json::Value::Null),
             ("/resume_task_id", serde_json::Value::Null),
+            ("/model", serde_json::json!("caller-selected-model")),
+            ("/engineId", serde_json::json!("caller-selected-engine")),
+            ("/provider", serde_json::json!("caller-selected-provider")),
+            ("/reasoning_effort", serde_json::json!("high")),
+            ("/model_source", serde_json::json!("role_engine")),
         ] {
             let mut arguments = valid.clone();
             let (parent_pointer, field) = pointer.rsplit_once('/').unwrap();

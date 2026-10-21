@@ -882,10 +882,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     return deriveWorkerModelTabs();
   });
 
-  const pluginEngines = $derived.by(() =>
-    registryEngines.filter((engine) => engine.source === 'plugin'),
-  );
-
   // 确保 workerConfigs 对每个 worker 都有初始值（副作用必须在 $effect 中执行）
   $effect(() => {
     for (const w of workerModelTabs) {
@@ -4051,9 +4047,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     },
     get registryEngines() {
       return registryEngines;
-    },
-    get pluginEngines() {
-      return pluginEngines;
     },
     get registryAgents() {
       return registryAgents;

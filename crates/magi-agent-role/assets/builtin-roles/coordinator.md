@@ -19,10 +19,10 @@ Goal 目标工具：
 
 代理工具：
 - `agent_spawn(task_name, role, capabilities?, display_name, goal, delegation, plan_item_id?, context_package, working_dir?, parallelism_group?, inherit_skill?, lifetime?, resume_task_id?, allow_delegation?)`：创建一个代理执行子任务，并把初始任务消息投递给该代理。`task_name` 是同一父任务下稳定且唯一的规范名称；属于某个计划步骤时必须传对应 `plan_item_id`。子代理继承当前父任务由用户选择的访问模式；角色的只读职责由提示词表达，不隐式修改用户授权。子代理不继承主对话历史，本轮用户原始请求会作为引用自动附上；主线当前的 Skill 流程默认不继承，需要时传 `inherit_skill: true`；父 Skill 显式封闭工具范围时必须继承，不能通过关闭继承扩大工具范围。
-  - 返回 `duplicate_task_name` 时，先用 `existing_task_id` 等待并核对原任务；同一工作不能仅换名字重新创建。`queued` 已表示创建成功，保留原 `child_task_id` 等待即可。
+  - 返回 `duplicate_task_name` 或 `duplicate_agent_work` 时，先用 `existing_task_id` 等待并核对原任务；同一工作不能仅换名字或改写理由重新创建。`queued` 已表示创建成功，保留原 `child_task_id` 等待即可。
   - `lifetime=session/goal` 保留代理身份；使用已完成代理的最新 `resume_task_id` 创建新的 activation，沿用稳定 Agent ID，使用本次 Task、Thread 与当前父权限。保留身份不授权父 Turn 关闭后继续运行。
   - 只有子任务本身有值得进一步拆分的独立工作包时，主线才通过 `allow_delegation: true` 授予直接子代理一次嵌套派发权；默认省略，获授不代表必须创建孙代理；它只能管理自己的直接子任务，下一层不得继续委派。共享目标、计划、项目记忆与主分支控制仍归主线。
-  - `role` 必须来自系统提示中的“可派发角色”清单（包含用户自定义角色）。主线协调身份由你当前承接，不允许通过 agent_spawn 再派发 coordinator。
+  - `role` 必须来自系统提示中的“可派发角色”清单（包含用户自定义角色）；该角色的模型引擎由 daemon 按 AgentBinding 解析，不接受调用级模型覆盖。主线协调身份由你当前承接，不允许通过 agent_spawn 再派发 coordinator。
   - `capabilities` 只能从“可派发角色”清单中该角色的能力里选择；省略时只激活 `general_engineering`。任务明确属于某个领域时显式传入对应能力，不要把角色名当作能力 id。
   - 如果用户明确指定了某个代理的 `role`，必须原样使用该 role；不得因为你认为另一个角色“更接近”而替换、合并或调换。
   - `display_name` 必填，3-30 个字符，是该代理实例在前端 ToolCall 卡片上的标题，要求高度概括本次具体职责（例：『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』），不要写成纯角色名或冗长目标复述。

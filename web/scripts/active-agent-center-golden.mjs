@@ -23,6 +23,35 @@ function agent(overrides = {}) {
 
 await withGoldenViteServer(async (server) => {
   const center = await server.ssrLoadModule('/src/lib/active-agent-center.ts');
+  const { resolveAgentDisplayName } = await server.ssrLoadModule('/src/lib/agent-role-utils.ts');
+  const roleTemplates = [
+    { templateId: 'reviewer', displayName: '复核代理' },
+    { templateId: 'executor', displayName: '执行代理' },
+  ];
+  for (const reviewerEngine of ['executor', 'shared-model']) {
+    const bindings = [
+      { templateId: 'reviewer', displayName: '复核代理', engineId: reviewerEngine, order: 0 },
+      { templateId: 'executor', displayName: '执行代理', engineId: 'shared-model', order: 1 },
+    ];
+    const snapshot = { roleTemplates, registryAgents: bindings };
+    for (const enabledAgents of [bindings, []]) {
+      assert.equal(
+        resolveAgentDisplayName('executor', enabledAgents, snapshot),
+        '执行代理',
+        '角色标签只按角色 ID 解析，不能被另一个代理绑定的同名引擎截获',
+      );
+      assert.equal(
+        resolveAgentDisplayName('reviewer', enabledAgents, snapshot),
+        '复核代理',
+        '多个代理共用一个模型引擎时仍保持各自身份',
+      );
+      assert.equal(
+        resolveAgentDisplayName('shared-model', enabledAgents, snapshot),
+        'Shared-model',
+        '仅有模型引擎 ID 时不能猜测为第一个绑定该引擎的代理',
+      );
+    }
+  }
 
   const grouped = center.groupActiveAgents([
     agent({ agentRunId: 'running', status: 'running', lifecycle: 'running' }),

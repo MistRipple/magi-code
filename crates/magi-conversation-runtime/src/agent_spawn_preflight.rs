@@ -385,7 +385,9 @@ pub(crate) fn preflight_agent_spawn(
                 "保留原任务与工具范围，使用 inherit_skill=true 重新派发。",
             )
         })?;
-    let model_source = preflight_model(
+    // role 已在上方完成身份与能力校验；这里只解析该角色的模型绑定，
+    // 不参与“是否派发”或“选哪个角色”的决策。
+    let model_source = preflight_agent_model(
         execution_registry,
         parent_task,
         &runtime.settings_store,
@@ -763,7 +765,9 @@ fn validate_execution_chain(
     Ok(())
 }
 
-fn preflight_model(
+/// 预检已选角色的模型来源：显式 AgentBinding 优先，否则继承编排模型。
+/// 该函数不能从模型或 engine id 反向选择角色，也不接受调用级覆盖。
+fn preflight_agent_model(
     execution_registry: &TaskExecutionRegistry,
     parent_task: &Task,
     runtime_settings: &Option<Arc<SettingsStore>>,
@@ -914,15 +918,27 @@ fn preflight_workspace_and_git(
                 "请使用当前 workspace 内已经存在的目录。",
             ));
         }
-        if let Some(root) = workspace_root.as_ref()
-            && !working_dir.starts_with(root)
-        {
-            return Err(AgentSpawnPreflightError::runtime(
-                "workspace_preflight_failed",
-                "workspace",
-                "agent_spawn working_dir 超出当前 workspace 边界",
-                "请使用当前 workspace 内的目录。",
-            ));
+        if let Some(root) = workspace_root.as_ref() {
+            // starts_with 只能比较路径分量，不能证明 ../ 或符号链接的真实归属。
+            // 目录已经存在，解析失败必须拒绝，不能退回未解析的前缀比较。
+            let resolve = |path: &PathBuf| {
+                std::fs::canonicalize(path).map_err(|_| {
+                    AgentSpawnPreflightError::runtime(
+                        "workspace_preflight_failed",
+                        "workspace",
+                        "无法解析 agent_spawn 工作目录或当前 workspace 的真实路径",
+                        "请检查目录是否存在且可访问后重试。",
+                    )
+                })
+            };
+            if !resolve(working_dir)?.starts_with(resolve(root)?) {
+                return Err(AgentSpawnPreflightError::runtime(
+                    "workspace_preflight_failed",
+                    "workspace",
+                    "agent_spawn working_dir 超出当前 workspace 边界",
+                    "请使用当前 workspace 内的目录。",
+                ));
+            }
         }
     }
     if let Some(context) = context {
@@ -1345,12 +1361,8 @@ mod tests {
         .expect("package should parse")
     }
 
-    #[test]
-    fn context_references_must_point_to_existing_facts() {
-        let session_id = SessionId::new("session-ref");
-        let session_store = SessionStore::default();
-        let task_store = TaskStore::new();
-        let root = Task {
+    fn reference_parent_task() -> Task {
+        Task {
             task_id: TaskId::new("task-root-ref"),
             mission_id: MissionId::new("mission-ref"),
             root_task_id: TaskId::new("task-root-ref"),
@@ -1375,7 +1387,80 @@ mod tests {
             runtime_payload: TaskRuntimePayload::None,
             created_at: UtcMillis(1),
             updated_at: UtcMillis(1),
+        }
+    }
+
+    #[test]
+    fn working_directory_preflight_checks_the_real_workspace_boundary() {
+        let dirs = tempfile::tempdir().unwrap();
+        let workspace = dirs.path().join("workspace");
+        let outside = dirs.path().join("outside");
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        let lookalike = dirs.path().join("workspace-other");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "not a directory").unwrap();
+        let registry = TaskExecutionRegistry::default();
+        let parent = reference_parent_task();
+        let session = SessionId::new("working-directory-boundary");
+        let runtime = crate::task_execution_registry::AgentSpawnPreflightRuntime::default();
+        let check = |root: &PathBuf, directory: &PathBuf| {
+            preflight_workspace_and_git(
+                &registry,
+                &parent,
+                &session,
+                &None,
+                Some(root),
+                Some(directory),
+                &runtime,
+            )
         };
+        check(&workspace, &workspace).expect("workspace root is allowed");
+        check(&workspace, &workspace.join("nested")).expect("nested directory is allowed");
+        check(&workspace, &workspace.join("nested/.."))
+            .expect("in-scope parent traversal is allowed");
+        for directory in [&outside, &workspace.join("../outside"), &lookalike] {
+            let error = check(&workspace, directory)
+                .expect_err("an existing outside directory must be rejected");
+            assert_eq!(error.error_code, "workspace_preflight_failed");
+            assert_eq!(error.failure_stage, "workspace");
+        }
+        check(&workspace, &file).expect_err("a file cannot be a working directory");
+        check(&workspace, &workspace.join("missing"))
+            .expect_err("the working directory must exist");
+        check(&workspace.join("missing"), &workspace)
+            .expect_err("an unresolved workspace boundary must fail closed");
+        #[cfg(unix)]
+        {
+            let escape = workspace.join("escape");
+            std::os::unix::fs::symlink(&outside, &escape).unwrap();
+            check(&workspace, &escape)
+                .expect_err("an in-workspace symlink must not authorize an outside cwd");
+            // 先按字符串消去 nested/.. 会错误地回到 workspace；实际应先解析链接。
+            let traversal = workspace.join("linked-nested");
+            std::os::unix::fs::symlink(outside.join("nested"), &traversal).unwrap();
+            check(&workspace, &traversal.join(".."))
+                .expect_err("symlink traversal must follow filesystem semantics");
+            let alias = dirs.path().join("workspace-alias");
+            std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+            check(&workspace, &alias.join("nested"))
+                .expect("an alias to an in-scope directory is valid");
+            check(&alias, &workspace.join("nested"))
+                .expect("the workspace root may itself be an alias");
+        }
+        assert!(
+            registry.get(&parent.task_id).is_none(),
+            "preflight is read-only"
+        );
+    }
+
+    #[test]
+    fn context_references_must_point_to_existing_facts() {
+        let session_id = SessionId::new("session-ref");
+        let session_store = SessionStore::default();
+        let task_store = TaskStore::new();
+        let root = reference_parent_task();
         task_store.insert_task(root.clone()).expect("root");
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::write(workspace.path().join("present.rs"), "fn a() {}").expect("file");

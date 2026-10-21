@@ -22,7 +22,7 @@ import { i18n } from '../stores/i18n.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import { SETTINGS_TABS } from '../lib/settings-tabs';
-import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection, loadedPluginProjection } from '../stores/plugin-registry.svelte';
 import {
   WEB_MODEL_SETTINGS_READY_EVENT,
   WEB_MODEL_SETTINGS_REQUEST_EVENT,
@@ -116,13 +116,13 @@ import {
     if (pluginProjection(APPLICATION_PLUGIN_SCOPE).loaded
       && SETTINGS_TABS.some((tab) => tab.requiresPlugin && tab.id === store.activeTab)
       && !visibleSettingsTabs.some((tab) => tab.id === store.activeTab)) {
-      store.activeTab = 'model';
+      store.activeTab = 'plugins';
     }
   });
   $effect(() => {
     if (pluginManifestsLoaded && store.activeTab.startsWith('plugin:')
       && !pluginSettingsTabs.some((item) => item.tabId === store.activeTab)) {
-      store.activeTab = 'model';
+      store.activeTab = 'plugins';
     }
   });
 
@@ -157,8 +157,13 @@ import {
   }
 
   /** 失败卡片动作可在设置页尚未挂载时到达，使用 actions 模块的 pending 请求接住。 */
-  function applyWebModelSettingsRequest(request: WebModelSettingsRequest | null): void {
+  async function applyWebModelSettingsRequest(request: WebModelSettingsRequest | null): Promise<void> {
     if (!request) return;
+    const projection = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
+    if (!projection.manifests.some((manifest) => manifest.id === 'openai.chatgpt-web')) {
+      store.activeTab = 'plugins';
+      return;
+    }
     store.activeTab = 'webModel';
     void tick().then(() => {
       window.dispatchEvent(new CustomEvent<WebModelSettingsRequest>(
@@ -295,8 +300,8 @@ import {
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} pluginEngines={store.pluginEngines} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
-          {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay} openWebModelSettings={() => { store.activeTab = 'webModel'; }}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
+          {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay}
         />
       {:else if store.activeTab === 'agents'}
         <!-- 角色管理 Tab -->
@@ -321,7 +326,7 @@ import {
         <SettingsBrowserTab />
       {:else if store.activeTab === 'plugins'}
         <SettingsPluginsTab />
-      {:else if store.activeTab === 'webModel'}
+      {:else if store.activeTab === 'webModel' && visibleSettingsTabs.some((tab) => tab.id === 'webModel')}
         <SettingsWebModelSection isDesktop={isDesktopRuntime} />
       {:else if store.activeTab === 'mcpServer'}
         <div class="apple-manager"><div class="apple-scroller-proxy"><div class="settings-section">
@@ -1417,14 +1422,14 @@ import {
       background: var(--magi-surface-main);
     }
 
-    /* 大窗口下表单不无限拉宽：内容限制在 960px 居中，页头与内容对齐。 */
+    /* 页头与共享设置内容列保持同一宽度和左右留白。 */
     .main-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: var(--space-4);
       flex-shrink: 0;
-      padding: 18px max(28px, calc((100% - 960px) / 2));
+      padding: 18px max(32px, calc((100% - 880px) / 2));
       border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
     }
 
@@ -1465,6 +1470,12 @@ import {
       gap: 0; /* 间隔由各分类组件内部控制 */
       min-width: 0;
       min-height: 0;
+    }
+
+    /* 共享页面框架自己管理留白，外壳不再叠加第二层 padding。 */
+    .scroll-content:has(> :global(.apple-manager > .apple-scroller-proxy)),
+    .scroll-content:has(> :global(.settings-frame)) {
+      padding: 0;
     }
 
   @keyframes settingsPageIn {
@@ -1541,9 +1552,8 @@ import {
     }
 
     .scroll-content {
-      padding: 16px !important;
-      padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)) !important;
-      gap: 24px !important;
+      padding: 16px;
+      padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
     }
   }
 
@@ -1551,7 +1561,7 @@ import {
     .main-header {
       align-items: flex-start;
       gap: 10px;
-      padding: 14px 12px 14px 20px;
+      padding: 14px 16px;
     }
     .header-title-group {
       align-items: flex-start;

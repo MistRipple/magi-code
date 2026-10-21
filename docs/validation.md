@@ -123,7 +123,9 @@ Git 漂移/冲突场景现在允许先请求模型，实际写入/Shell/Git/代�
 子代理唤起合同与拒绝恢复回归（设计见 [子代理唤起](subagent-delegation-design.md)）：
 
 - `cargo test -p magi-tool-runtime --lib agent_delegation`：四种目的、并行父任务工作、未知字段、空白/null/超长输入及规范化回执。
-- `cargo test -p magi-conversation-runtime --lib agent_spawn`：真实工具 Schema、直接入口复用预检与拒绝后无 Task/Thread/计划残留；决策不能恢复未授予的工具。
+- `cargo test -p magi-conversation-runtime --lib agent_spawn`：真实工具 Schema、直接入口复用预检与拒绝后无 Task/Thread/计划残留；决策不能恢复未授予的工具，调用方不能提交模型、Provider、引擎或推理强度覆盖。
+- `cargo test -p magi-conversation-runtime --lib role_engine_model_config`：按选定角色解析绑定；共用引擎与角色/引擎同名时不混淆身份，未绑定可继承，显式绑定失效返回错误。
+- `npm --prefix web run test:active-agent-center`：代理中心按服务端角色身份显示标签，不用引擎 ID 反查角色；覆盖共用模型、角色/引擎同名及 registry 展示路径。
 - `cargo test -p magi-conversation-runtime --lib agent_cancel`：取消只影响直接子树，终态与资源结算分开；结算失败保留原回执，再次核对不覆盖产物。
 - `cargo test -p magi-conversation-runtime --lib dispatch_quiesce`：按子树等待全部执行退出，不等待调用者或兄弟任务。
 - `cargo test -p magi-conversation-runtime --lib task_runner::tests`：执行范围隔离、旧扫描后的领取/失败拒绝、孤儿清理与准入名额；已转交子树不受原 Runner 的终态影响。
@@ -137,7 +139,7 @@ Git 漂移/冲突场景现在允许先请求模型，实际写入/Shell/Git/代�
 - `cargo test -p magi-api --lib agent -- --test-threads=4`：实际主子 Task/Turn 的派发、上下文、嵌套、权限、取消、产物与重建；无效决策由主线接管，拒绝回执序列化恢复后不变成未知副作用。
 - `cargo test -p magi-api --lib task_profile_ -- --test-threads=4`：普通工作不隐式创建代理、不强制 agent_spawn；成功派发的决策随 canonical 参数、成功回执和创建事件保留。
 
-这些测试不判断自然语言理由是否真实有益；支持模型的选择质量按设计文档 §9 固定任务矩阵评测，不用本地替身的成功派发率代替。
+这些测试不判断自然语言理由是否真实有益；主代理的委派与代理选择决策按设计文档 §9 固定任务矩阵评测，不用本地替身的成功派发率代替。比较主对话模型时固定子代理角色与模型绑定；继承主模型的场景单列，不能把代理派发评测理解为运行时先选模型再找代理。
 
 子代理动态 Skill 与恢复边界：
 

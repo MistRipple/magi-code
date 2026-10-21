@@ -262,13 +262,16 @@ export function normalizeInlineFileReferenceTarget(reference: string): string | 
 }
 
 /**
- * 隐式识别只能接受带确定基准的路径。裸文件名可能属于工作区、Skill 或工具目录，
- * 在没有明确目录时生成链接会打开错误文件，甚至把不存在的路径呈现为可用操作。
+ * 隐式识别接受工作区内的已知文件名和带目录的路径。
+ * 会话文件预览始终携带当前 session/workspace scope，裸文件名因此按工作区根目录解析；
+ * 仍然拒绝无扩展名的普通词语，避免把自然语言误当成文件。
  */
 export function normalizeImplicitFileReferenceTarget(reference: string): string | null {
   const target = normalizeInlineFileReferenceTarget(reference);
   if (!target) return null;
   return (
+    hasKnownFileBasename(target)
+    ||
     target.startsWith('./')
     || target.startsWith('../')
     || /^(?:[a-zA-Z]:[\\/]|[\\/])/u.test(target)

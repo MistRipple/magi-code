@@ -28,15 +28,14 @@
   }: Props = $props();
 
   let MarkdownRendererComponent = $state<Component<MarkdownRendererProps> | null>(null);
-  let markdownRendererLoadFailed = $state(false);
 
   $effect(() => {
     void loadMarkdownRenderer()
       .then((module) => {
         MarkdownRendererComponent = module.default;
       })
-      .catch(() => {
-        markdownRendererLoadFailed = true;
+      .catch((error) => {
+        console.error('[markdown] 渲染器加载失败', error);
       });
   });
 
@@ -74,7 +73,7 @@
     {#if markdownParts.volatile}
       <MarkdownRendererComponent source={markdownParts.volatile} isStreaming={true} />
     {/if}
-  {:else if markdownRendererLoadFailed}
+  {:else}
     <pre class="markdown-fallback">{content}</pre>
   {/if}
 </div>

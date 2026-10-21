@@ -5,6 +5,10 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getWebModelTunnel } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
+
+  $effect(() => { trackPluginProjection(APPLICATION_PLUGIN_SCOPE); });
+  const pluginActive = $derived(pluginProjection(APPLICATION_PLUGIN_SCOPE).manifests.some((manifest) => manifest.id === 'openai.chatgpt-web'));
 
   let { sessionId, busy, status = $bindable(null), onaction }: {
     sessionId: string;
@@ -31,7 +35,7 @@
     channelReady = false;
     channelCode = '';
     channelDetail = '';
-    if (!current || window.magiDesktop?.runtime !== 'electron') return;
+    if (!pluginActive || !current || window.magiDesktop?.runtime !== 'electron') return;
     let disposed = false;
     let inFlight = false;
     let advancedAt: number | null = null;
@@ -99,7 +103,7 @@
   </form>
 {/snippet}
 
-{#if status && !dismissed}
+{#if pluginActive && status && !dismissed}
   <section class="setup-panel" aria-label={i18n.t('webModel.setup.title')} data-web-model-setup={step}>
     <div class="setup-heading">
       <strong><Icon name={step === 'complete' ? 'check' : 'globe'} size={14} />{i18n.t('webModel.setup.title')}</strong>

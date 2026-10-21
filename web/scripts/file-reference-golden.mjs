@@ -17,8 +17,8 @@ const fileReference = await import(moduleUrl);
 
 assert.equal(
   fileReference.normalizeImplicitFileReferenceTarget('SKILL.md'),
-  null,
-  '裸文件名没有确定基准目录，不得隐式生成可点击文件引用',
+  'SKILL.md',
+  '会话工作区内的已知裸文件名应生成可点击文件引用',
 );
 assert.equal(
   fileReference.normalizeImplicitFileReferenceTarget('./SKILL.md'),
@@ -34,8 +34,12 @@ assert.equal(
 const ambiguous = fileReference.splitFileReferenceText('检查 SKILL.md 是否存在');
 assert.deepEqual(
   ambiguous,
-  [{ kind: 'text', text: '检查 SKILL.md 是否存在' }],
-  '普通文本中的裸文件名不得伪装成工作区文件链接',
+  [
+    { kind: 'text', text: '检查 ' },
+    { kind: 'file', text: 'SKILL.md', target: 'SKILL.md' },
+    { kind: 'text', text: ' 是否存在' },
+  ],
+  '会话中的裸文件名应解析为工作区文件链接',
 );
 
 const qualified = fileReference.splitFileReferenceText('检查 ./SKILL.md 是否存在');

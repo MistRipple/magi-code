@@ -68,22 +68,37 @@ try {
     await tools.click('[data-testid="sidebar-settings"]');
     await waitFor(() => tools.exists('[data-testid="settings-nav-model"]'), '模型设置入口');
     await tools.click('[data-testid="settings-nav-model"]');
-    await waitFor(() => tools.exists('[data-gpt-web-setup-entry] button'), '配置助手入口');
-    await tools.click('[data-gpt-web-setup-entry] button');
   };
   await openEntry();
+  check('未安装插件时模型设置不显示 GPT Web 或配置助手', !await tools.exists('[data-web-model-setup-entry]') && !await tools.exists('[data-testid="settings-nav-webModel"]'));
+  // 仍保留命令入口的安装提示；设置页本身不展示未启用功能。
+  await page.evaluate(`window.dispatchEvent(new CustomEvent('magi:gptWebSetup'))`);
   await waitFor(() => page.evaluate(`document.querySelector('[data-testid="settings-nav-plugins"]')?.classList.contains('active')`), '未安装时跳转插件页');
-  check('未安装插件时及时提示并打开插件管理', await page.evaluate(`document.body.innerText.includes('请先在设置') || document.body.innerText.includes('Install and activate')`));
+  check('直接调用配置命令仍提示安装插件', await page.evaluate(`document.body.innerText.includes('请先在设置') || document.body.innerText.includes('Install and activate')`));
   check('未安装插件时不创建浏览器宿主', !await tools.exists('webview'));
   const installed = await tools.post('/api/plugins/bundled/openai.chatgpt-web/install', {});
   const manifest = JSON.parse(installed.body).plugins.find(item => item.manifest.id === 'openai.chatgpt-web').manifest;
+  check('已安装未激活时仍无 GPT Web 管理页', !await tools.exists('[data-testid="settings-nav-webModel"]'));
   for (const [action, body] of [['enable', {}], ['authorize', { grants: manifest.permissions }], ['activate', {}]]) {
     const result = await tools.post('/api/plugins/openai.chatgpt-web/' + action, { scope: 'application', ...body });
     check('插件 ' + action, result.status === 200, result.body);
   }
   await page.evaluate(`window.dispatchEvent(new CustomEvent('magi-plugin-registry-changed'))`);
   await waitFor(() => tools.exists('[data-testid="settings-nav-webModel"]'), '插件设置入口');
+  await tools.click('[data-testid="settings-nav-model"]');
+  check('插件激活后模型设置仍不展示 GPT Web 管理或引擎注册', !await page.evaluate(`document.querySelector('.settings-tab-content').innerText.includes('GPT Web')`));
   await tools.click('[data-testid="settings-nav-webModel"]');
+  await waitFor(() => tools.exists('[data-web-model-setup-entry]'), '插件内配置助手');
+  check('配置助手只在 GPT Web 插件页显示', true);
+  if (await tools.exists('.toast-close')) await tools.click('.toast-close');
+  for (const width of [360, 390, 720, 1024, 1440]) {
+    await page.call('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+    await page.evaluate(`document.querySelector('[data-web-model-tunnel]').open = true`);
+    check(`插件设置 ${width}px 宽度无横向溢出`, await page.evaluate(`(()=>{const e=document.querySelector('.web-model-settings .apple-scroller-proxy');return e.clientWidth>0 && e.scrollWidth<=e.clientWidth+1 && [...e.querySelectorAll('button,input,select')].every(c=>c.getBoundingClientRect().right<=e.getBoundingClientRect().right+1)})()`));
+    if (process.env.MAGI_SETUP_SETTINGS_SCREENSHOT_PREFIX) await writeFile(process.env.MAGI_SETUP_SETTINGS_SCREENSHOT_PREFIX + '-' + width + '.png', Buffer.from(await tools.screenshot(), 'base64'));
+  }
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await page.evaluate(`document.querySelector('[data-web-model-tunnel]').open = false`);
   await waitFor(() => tools.exists('[data-web-model-connect]'), '浏览器连接入口');
   await tools.click('[data-web-model-connect]');
   await waitFor(() => tools.exists('webview'), '单一 GPT Web guest');
@@ -124,8 +139,9 @@ try {
   await tools.click('[data-testid="settings-back"]');
   await collapsePane();
   await tools.click('[data-testid="sidebar-settings"]');
-  await tools.click('[data-testid="settings-nav-model"]');
-  await tools.click('[data-gpt-web-setup-entry] button');
+  await tools.click('[data-testid="settings-nav-webModel"]');
+  await waitFor(() => tools.exists('[data-web-model-setup-entry] button'), 'GPT Web 插件配置入口');
+  await tools.click('[data-web-model-setup-entry] button');
   await waitFor(() => tools.exists('[data-web-model-setup]'), '配置状态卡片', 60000);
   await waitFor(() => tools.exists('[data-web-model-setup="login"]'), '等待用户登录', 60000);
   check('无本地模型也能执行配置，登录时显示接手提示', true);
@@ -189,6 +205,16 @@ try {
   check('密钥不进入 settings 或配置状态', !settings.includes('sk-fixture-secret-123456'));
   const key = await readFile(join(stateRoot, 'web-model/tunnel-api-key'), 'utf8');
   check('密钥通过独立安全入口保存', key === 'sk-fixture-secret-123456');
+  await tools.click('[data-testid="sidebar-settings"]');
+  await tools.click('[data-testid="settings-nav-webModel"]');
+  const deactivated = await tools.post('/api/plugins/openai.chatgpt-web/deactivate', { scope: 'application' });
+  check('停用 GPT Web 插件成功', deactivated.status === 200, deactivated.body);
+  await page.evaluate(`window.dispatchEvent(new CustomEvent('magi-plugin-registry-changed'))`);
+  await waitFor(() => page.evaluate(`!document.querySelector('[data-testid="settings-nav-webModel"]') && document.querySelector('[data-testid="settings-nav-plugins"]')?.classList.contains('active')`), '停用后退出插件专属设置');
+  check('停用后管理页、配置入口和对话配置卡片同时消失', !await tools.exists('[data-web-model-setup-entry]') && !await tools.exists('[data-web-model-setup]'));
+  await page.evaluate(`window.dispatchEvent(new CustomEvent('magi:webModelSettingsRequest', {detail:{focus:'tunnel'}}))`);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  check('停用后深链接进入插件管理而不挂载配置页', !await tools.exists('[data-web-model-tunnel]') && await page.evaluate(`document.querySelector('[data-testid="settings-nav-plugins"]')?.classList.contains('active')`));
   // Electron 43 在 DevTools 附着 sandbox guest 时偶发自身 preload 诊断，独立记录，应用异常仍失败。
   const hostDiagnostics = errors.filter(error => error.includes('Electron sandboxed_renderer.bundle.js script failed to run')
     || (error.includes("Cannot destructure property 'preloadScripts' of 'binding.startupData'") && error.includes('node:electron/js2c/sandbox_bundle')));

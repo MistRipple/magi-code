@@ -91,6 +91,8 @@ pub struct SpawnedChildExecutionRequest<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub role: &'a str,
+    /// 当前工具调用已校验的委派目的；只对自主并行/上下文隔离拦截完全相同的活跃工作包。
+    pub delegation_purpose: magi_tool_runtime::AgentDelegationPurpose,
     /// 角色定义中的并发上限。`None` 表示该角色不设置角色级上限；全局和会话级
     /// 执行准入仍然继续生效。调用方必须从同一份 AgentRoleRegistry 读取该值。
     pub role_parallelism_limit: Option<u32>,
@@ -122,6 +124,9 @@ pub enum SpawnedChildExecutionError {
     DuplicateTaskName {
         existing_task_id: TaskId,
     },
+    DuplicateAgentWork {
+        existing_task_id: TaskId,
+    },
     RoleCapacityExceeded {
         role: String,
         active: usize,
@@ -140,6 +145,9 @@ impl std::fmt::Display for SpawnedChildExecutionError {
                     f,
                     "同一父任务下 canonical task name 已存在，原任务: {existing_task_id}"
                 )
+            }
+            Self::DuplicateAgentWork { existing_task_id } => {
+                write!(f, "相同工作包已有活跃代理，原任务: {existing_task_id}")
             }
             Self::RoleCapacityExceeded {
                 role,
@@ -536,6 +544,7 @@ impl TaskExecutionRegistry {
             session_id,
             workspace_id,
             role,
+            delegation_purpose,
             role_parallelism_limit,
             plan_store,
             plan_item_id,
@@ -644,6 +653,51 @@ impl TaskExecutionRegistry {
             });
         }
 
+        let parent_plan = self.get(&parent_task_id);
+        let inherited_skill_name =
+            parent_plan
+                .as_ref()
+                .filter(|_| inherit_skill)
+                .and_then(|plan| match plan {
+                    TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
+                });
+        let inherited_execution_root = execution_root.or_else(|| {
+            parent_plan.as_ref().and_then(|plan| match plan {
+                TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
+            })
+        });
+        // 同名检查不足以拦住换名复制；在同一注册锁内读取原 Task/执行计划，
+        // 不新增指纹表。明确要求的多个代理和独立复核可以有意处理相同输入。
+        if matches!(
+            delegation_purpose,
+            magi_tool_runtime::AgentDelegationPurpose::ParallelWork
+                | magi_tool_runtime::AgentDelegationPurpose::ContextIsolation
+        ) && let Some(existing) =
+            task_store
+                .get_children(&parent_task_id)
+                .iter()
+                .find(|existing| {
+                    matches!(
+                        existing.status,
+                        magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                    ) && same_agent_work_package(existing, child_task)
+                        && self.get(&existing.task_id).is_some_and(|plan| match plan {
+                            TaskExecutionPlan::Dispatch {
+                                execution_root,
+                                skill_name,
+                                ..
+                            } => {
+                                execution_root == inherited_execution_root
+                                    && skill_name == inherited_skill_name
+                            }
+                        })
+                })
+        {
+            return Err(SpawnedChildExecutionError::DuplicateAgentWork {
+                existing_task_id: existing.task_id.clone(),
+            });
+        }
+
         if let Some(limit) = role_parallelism_limit {
             let limit = limit as usize;
             let active_role_agent_count = active_execution_agent_count_for_role(
@@ -713,7 +767,6 @@ impl TaskExecutionRegistry {
         }
 
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
-        let parent_plan = self.get(&parent_task_id);
         let inherited_turn_id = parent_plan
             .as_ref()
             .map(|plan| match plan {
@@ -736,18 +789,6 @@ impl TaskExecutionRegistry {
             now,
         );
         let thread_id = thread.thread_id.clone();
-        let inherited_skill_name =
-            parent_plan
-                .as_ref()
-                .filter(|_| inherit_skill)
-                .and_then(|plan| match plan {
-                    TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
-                });
-        let inherited_execution_root = execution_root.or_else(|| {
-            parent_plan.as_ref().and_then(|plan| match plan {
-                TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
-            })
-        });
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
             worker_id: worker_id.clone(),
@@ -938,6 +979,34 @@ impl TaskExecutionRegistry {
             queue_reason,
         })
     }
+}
+
+/// 只比较明确相同的工作包，不用目标相似度或关键词推测任务意图。
+fn same_agent_work_package(existing: &Task, candidate: &Task) -> bool {
+    let (Some(left), Some(right)) = (
+        existing.agent_context_package(),
+        candidate.agent_context_package(),
+    ) else {
+        return false;
+    };
+    existing.goal.trim() == candidate.goal.trim()
+        && existing.executor_binding_target_role() == candidate.executor_binding_target_role()
+        && existing.executor_binding_capability_ids() == candidate.executor_binding_capability_ids()
+        && existing.plan_item_id() == candidate.plan_item_id()
+        && left.summary == right.summary
+        && left.constraints == right.constraints
+        && left.expected_output == right.expected_output
+        && left.fork == right.fork
+        && left.references.len() == right.references.len()
+        && left
+            .references
+            .iter()
+            .zip(&right.references)
+            .all(|(left, right)| {
+                left.kind == right.kind
+                    && left.source_ref == right.source_ref
+                    && left.preview == right.preview
+            })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1200,6 +1269,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1218,6 +1288,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1312,6 +1383,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1363,6 +1435,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1420,6 +1493,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1464,6 +1538,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1500,6 +1575,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1655,6 +1731,8 @@ mod tests {
                         session_id: &session_id,
                         workspace_id: &workspace_id,
                         role,
+                        delegation_purpose:
+                            magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                         role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                         plan_store: None,
                         plan_item_id: None,
@@ -1679,6 +1757,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                 plan_store: None,
                 plan_item_id: None,
@@ -1723,6 +1802,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: Some(DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE as u32),
                 plan_store: None,
                 plan_item_id: None,
@@ -1819,6 +1899,7 @@ mod tests {
                     session_id: &session,
                     workspace_id: &workspace,
                     role: "executor",
+                    delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                     role_parallelism_limit: None,
                     plan_store: Some(&plans),
                     plan_item_id: Some(magi_core::PlanItemId::new("work")),
@@ -1900,6 +1981,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: Some(&plan_store),
                 plan_item_id: Some(magi_core::PlanItemId::new("missing-item")),
@@ -1963,6 +2045,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -1989,6 +2072,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "executor",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: None,
                 plan_store: None,
                 plan_item_id: None,
@@ -2003,6 +2087,111 @@ mod tests {
         );
         assert!(task_store.get_task(&duplicate.task_id).is_none());
         assert!(registry.get(&duplicate.task_id).is_none());
+    }
+
+    #[test]
+    fn autonomous_spawn_rejects_renamed_active_work_but_preserves_deliberate_reviews() {
+        use magi_tool_runtime::AgentDelegationPurpose::*;
+        for purpose in [
+            ParallelWork,
+            ContextIsolation,
+            UserRequested,
+            IndependentReview,
+        ] {
+            let (tasks, sessions, registry, session, workspace, mission, root, now) =
+                spawn_fixture("duplicate-work");
+            let mut first = read_only_test_task("first", root.as_str(), &mission);
+            first.executor_binding = Some(
+                magi_core::TaskExecutorBinding::for_role("explorer")
+                    .with_canonical_task_name("/root/first"),
+            );
+            first.runtime_payload = magi_core::TaskRuntimePayload::AgentContext {
+                package: Box::new(crate::agent_spawn_preflight::parse_agent_context_package(
+                    &serde_json::json!({"context_package": {
+                        "summary":"隔离指定日志的探索输出", "constraints":["只读"],
+                        "expected_output":"错误证据与结论", "references":[{"kind":"file", "source_ref":"server.log"}]
+                    }}), &root, now, 1).unwrap()),
+                accesses: vec![],
+            };
+            let register = |child_task: &Task, delegation_purpose, execution_root| {
+                registry.register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                    task_store: &tasks,
+                    session_store: &sessions,
+                    child_task,
+                    session_id: &session,
+                    workspace_id: &workspace,
+                    role: "explorer",
+                    delegation_purpose,
+                    role_parallelism_limit: None,
+                    plan_store: None,
+                    plan_item_id: None,
+                    execution_root,
+                    inherit_skill: false,
+                    now,
+                })
+            };
+            register(&first, ContextIsolation, None).unwrap();
+            let mut renamed = first.clone();
+            renamed.task_id = TaskId::new("renamed");
+            renamed
+                .executor_binding
+                .as_mut()
+                .unwrap()
+                .canonical_task_name = Some("/root/renamed".into());
+            if let magi_core::TaskRuntimePayload::AgentContext { package, .. } =
+                &mut renamed.runtime_payload
+            {
+                package.package_id = "different-package-id".into();
+                package.references[0].reference_id = "different-reference-id".into();
+                package.created_at = UtcMillis(now.0 + 1);
+            }
+            let threads_before = sessions.thread_registry_snapshot(&session);
+            let result = register(&renamed, purpose, None);
+            if matches!(purpose, ParallelWork | ContextIsolation) {
+                assert!(
+                    matches!(result, Err(SpawnedChildExecutionError::DuplicateAgentWork { existing_task_id }) if existing_task_id == first.task_id)
+                );
+                assert!(tasks.get_task(&renamed.task_id).is_none());
+                assert!(registry.get(&renamed.task_id).is_none());
+                assert_eq!(sessions.thread_registry_snapshot(&session), threads_before);
+                assert_eq!(tasks.get_children(&root).len(), 1);
+                // 相同目标在不同目录、不同输入或不同验收范围下可以是独立工作。
+                register(&renamed, purpose, Some(PathBuf::from("/other-scope"))).unwrap();
+                assert_eq!(tasks.get_children(&root).len(), 2);
+            } else {
+                result.expect("明确要求的多个代理与独立复核不被相同输入误伤");
+            }
+        }
+    }
+
+    #[test]
+    fn work_package_comparison_preserves_different_inputs_and_acceptance() {
+        let mission = MissionId::new("work-package");
+        let mut task = test_task("candidate", "root", &mission);
+        task.runtime_payload = magi_core::TaskRuntimePayload::AgentContext {
+            package: Box::new(crate::agent_spawn_preflight::parse_agent_context_package(
+                &serde_json::json!({"context_package": {"summary":"核对日志", "constraints":["只读"],
+                    "expected_output":"证据", "references":[{"kind":"file", "source_ref":"alpha.log"}]}}),
+                &TaskId::new("root"), UtcMillis(1), 0).unwrap()),
+            accesses: vec![],
+        };
+        for change in 0..4 {
+            let mut different = task.clone();
+            if let magi_core::TaskRuntimePayload::AgentContext { package, .. } =
+                &mut different.runtime_payload
+            {
+                match change {
+                    0 => package.references[0].source_ref = "beta.log".into(),
+                    1 => package.constraints.push("只检查重试错误".into()),
+                    2 => package.expected_output = "修复补丁".into(),
+                    _ => package.summary = "独立检查网络日志".into(),
+                }
+            }
+            assert!(
+                !same_agent_work_package(&task, &different),
+                "change={change}"
+            );
+        }
     }
 
     /// 只读代理不受非 Git 工作区单写者限制，用于只关心容量语义的测试。
@@ -2186,6 +2375,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "limited-role",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: Some(1),
                 plan_store: None,
                 plan_item_id: None,
@@ -2208,6 +2398,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "limited-role",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: Some(1),
                 plan_store: None,
                 plan_item_id: None,
@@ -2246,6 +2437,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 role: "limited-role",
+                delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                 role_parallelism_limit: Some(1),
                 plan_store: None,
                 plan_item_id: None,
@@ -2269,6 +2461,7 @@ mod tests {
                     session_id: &session_id,
                     workspace_id: &workspace_id,
                     role: "unlimited-role",
+                    delegation_purpose: magi_tool_runtime::AgentDelegationPurpose::UserRequested,
                     role_parallelism_limit: None,
                     plan_store: None,
                     plan_item_id: None,

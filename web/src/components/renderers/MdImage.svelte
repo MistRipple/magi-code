@@ -46,16 +46,44 @@
     : { kind: 'image', source: externalImageUrl || undefined, open: externalImageUrl ? openImage : undefined });
 </script>
 
-<img
-  src={imageSource}
-  alt={text}
-  {title}
-  loading="lazy"
-  class="md-image"
+<button
+  type="button"
+  class="md-image-button"
+  title={title}
+  disabled={!localFilePath && !externalImageUrl}
   use:desktopContextMenu={contextDescriptor}
-/>
+  onclick={openImage}
+>
+  <img
+    src={imageSource}
+    alt={text}
+    {title}
+    loading="lazy"
+    class="md-image"
+  />
+</button>
 
 <style>
+  .md-image-button {
+    display: inline-block;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .md-image-button:disabled {
+    cursor: default;
+  }
+
+  .md-image-button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+  }
+
   .md-image {
     max-width: 100%;
     height: auto;

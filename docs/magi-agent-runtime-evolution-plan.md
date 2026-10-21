@@ -1,6 +1,6 @@
 # Magi 产品与 Agent 运行时演进方案
 
-更新：2026-10-19。当前进入存量收敛，暂停新增能力。本文保留目标、取舍与阶段退出条件；当前保留/移除项和验证结论以[收敛审计](runtime-consolidation-audit.md)为准。阶段编号不代表完成百分比，旧分轮实施记录已合并，避免早期状态覆盖当前事实。
+更新：2026-10-21。当前进入存量收敛，暂停新增能力。本文保留目标、取舍与阶段退出条件；当前保留/移除项和验证结论以[收敛审计](runtime-consolidation-audit.md)为准。阶段编号不代表完成百分比，旧分轮实施记录已合并，避免早期状态覆盖当前事实。
 
 ## 1. 核心判断
 
@@ -54,6 +54,52 @@ Magi 应定位为**以主对话承接用户意图、以可持续运行的 Agent 
 | [ZCode：Subagents](https://zcode.z.ai/en/docs/subagents) | 主 Agent 判断需要独立上下文或并行研究时调用 Agent；角色 description 指导匹配，也可显式指定 | 大范围独立探索可以委派，零散读文件或普通验证由主线直接完成 |
 
 Magi 当前规则为：默认主线直接推进；仅在用户明确要求，或边界清晰的独立工作包能显著减少总耗时、隔离大量探索噪声、提供必要的独立复核时派发。任务时长、多文件、可用角色数、工具调用次数不构成独立理由；并行工具读取不等于需要并行 Agent。嵌套委派默认关闭，只有子任务本身值得进一步拆分时才传 `allow_delegation=true`，获授能力不要求创建孙代理。
+
+### 2.2 当前源码复核（2026-10-21）
+
+本次重新读取官方文档，并从官方仓库默认分支固定源码版本：Codex `c7234c1174b27d9c55199fba0d546dc27d1b0415`（10 月 21 日）、DeepSeek Harness `687f282e8625c6b8d11ff58211a90524be2e4317`（10 月 17 日）、ZCode `3c5b227649371507ddc4eb46ac5133afe6db1cab`（10 月 20 日）。这些是本次读取的源码快照，不代表所有已安装发行版。§2/§2.1 保留原查阅时点；涉及当前子代理唤起时以本节为准，不能把竞品概览当成其完整运行合同。
+
+| 项目与源码证据 | 谁决定启动、何时启动 | 运行时负责什么 |
+| --- | --- | --- |
+| [Codex 模式提示](https://github.com/openai/codex/blob/c7234c1174b27d9c55199fba0d546dc27d1b0415/codex-rs/prompts/src/model_messages/multi_agent.rs)、[工具定义](https://github.com/openai/codex/blob/c7234c1174b27d9c55199fba0d546dc27d1b0415/codex-rs/core/src/tools/handlers/multi_agents_spec.rs)、[官方 CLI 说明](https://learn.chatgpt.com/docs/agent-configuration/subagents?surface=cli) | 模型调用 spawn 工具；官方本地客户端说明要求用户或适用项目/Skill 明确委派。源码另有 explicit/proactive 两种模式文本，不能归纳为所有 Codex 运行都主动派发。V1 默认工具说明要求先保留主线当前关键工作，只派边界清楚、互不重叠的工作，角色匹配不提供委派授权。 | [创建处理器](https://github.com/openai/codex/blob/c7234c1174b27d9c55199fba0d546dc27d1b0415/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs)校验深度并准备子配置；[AgentControl](https://github.com/openai/codex/blob/c7234c1174b27d9c55199fba0d546dc27d1b0415/codex-rs/core/src/agent/control/spawn.rs)维护身份、容量、父子归属与权限边界。源码同时存在 V1/V2，不能把某一版工具说明说成所有模式的固定合同。 |
+| [DeepSeek Harness 工具](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/subagent/tool-subagent/src/index.ts)、[子代理服务](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/subagent/subagent/src/index.ts) | 模型调用已挂载 provider 的工具，派发自包含研究、限定实现或分析。fresh 和继承已完成历史的 fork 使用不同说明；创建立即返回 ID，完成由运行时通知，父模型应同时推进其他工作。 | provider 可用性决定工具注册；startActivation 校验能力和精确的存活父 Agent。服务维护准入、父子消息和 activation 释放；当前默认深度 1、活跃子代理容量 8，均可配置。读取的工具参数没有 Magi 的四种 purpose/reason 合同，也没有据此证明任务值得派发的语义裁决。 |
+| [ZCode Agent 工具](https://github.com/zai-org/ZCode/blob/3c5b227649371507ddc4eb46ac5133afe6db1cab/apps/zcode-cli/packages/core/src/tool/handlers/agent.ts)、[输入合同](https://github.com/zai-org/ZCode/blob/3c5b227649371507ddc4eb46ac5133afe6db1cab/apps/zcode-cli/packages/contracts/src/tools/agent.ts)、[子运行时](https://github.com/zai-org/ZCode/blob/3c5b227649371507ddc4eb46ac5133afe6db1cab/apps/zcode-cli/packages/core/src/runtime/methods/subagent.ts) | 主模型调用 Agent；当前工具提示除独立并行外，还在角色匹配、跨多个文件读取时鼓励委派，仅已知位置的单事实查询建议直接搜索。这比[官方概览](https://www.zcode.network/en/docs/subagents/)中的“隔离上下文/并行研究”更积极，不能把它当作小任务保守派发的证据。 | 工具进入 SubagentPort.launch，由原 Runner 管理前台/后台执行、结果和取消。general-purpose 默认可读写，Explore 为只读；子 Runtime 明确设置 subagents.enabled=false。配置和权限边界由运行时执行，角色描述仍影响代理角色选择。 |
+
+三个项目都通过模型调用工具表达委派，再由各自运行时接纳和执行；本次读取的唤起入口没有按文件数自动创建代理的产品调度器。提示中的“何时值得派发”和服务端的“是否有权执行”必须区分，不能声称参考项目都采用相同默认策略。
+
+**Magi 当前代码与证据：**
+
+- `agent_delegation.rs` 的四种 purpose、reason 和 parallel_work.parent_work 已进入真实工具 Schema；模型响应校验与直接创建前预检复用同一解析器。它增加可追溯性，但比上述参考入口多一层输入合同，不是行业标准，也不是语义合理性证明。
+- `prompt_utils.rs` 根据本轮真实工具面注入同一唤起规则；`task_helpers.rs` 区分根协调身份与获授委派权的子代理。主线没有因 Goal、计划或角色匹配自动组队的入口；默认 fresh，嵌套默认关闭，最多两层。
+- 配置与运行顺序统一为“用户给代理角色配置模型 → 主代理判断委派价值并按职责选角色 → daemon 解析所选角色的 AgentBinding/Engine → 预检并启动”。`agent_spawn` 不接受调用级模型覆盖；显式绑定失效不静默换模型，未绑定才按配置继承主对话模型。多个角色共用模型仍是不同代理，展示层也不得从引擎 ID 反查角色；已删除代理中心原有的反向匹配。完整合同与验收口径见[子代理唤起设计 §2.1](subagent-delegation-design.md#21-决策顺序与模型归属)。
+- 当前工作区尚未提交的重复工作保护位于 `task_execution_registry.rs` 原注册锁内：自主并行/上下文隔离的相同活跃工作包换名仍拒绝，返回 existing_task_id；不增加指纹表。它是字段相等检查，改变目标/摘要/验收，或使用 user_requested/independent_review，都不受这条自动去重约束，不能宣传为语义去重。
+- 本节首次源码复核通过两个 crate 的 cargo check，重跑决策 3 项、agent_spawn 24 项、执行注册 11 项、prompt_utils 14 项，共 52 项定向测试。另核对此前四项真实 Provider 验收：原 SVG 请求（个人/工作区）及禁止代理场景均零派发；明确要求单代理创建并收集一个真实 Task，结果为 42。该验收保存的四个运行时源码 SHA-256 在首次复核时与工作区文件一致，证据仍在本机 `/var/folders/zq/nly47zbs19g601r8k_lqh2n40000gn/T/magi-delegation-retest-tsriuuc4/`；它不覆盖后续的顺序提示与角色展示修复，不能当作这些后续变更的真实模型或 Electron 验收。
+
+**仍需保留的边界与后续取舍：**
+
+1. Magi 当前允许有明确收益的自主委派，与 Codex 文档中的本地默认策略不同，这是产品选择。§4.1 所列 auto/manual/off 尚未落地；对自然语言禁止委派指令的遵守主要由可信指令和模型遵循保证，没有对应独立的服务端策略开关。purpose=user_requested 是模型自述，不能当作可信授权或绕过依据。
+2. 现有合同和去重不解决“第一名代理就不该启动”的全部情况。不能继续靠堆叠理由字段、角色、关键词分类器或任务预算宣称根治；需要在实际支持的主对话模型与同一产品入口上重复验证委派与代理选择决策。单文件 HTML、耦合修改、批量读取、日志研究、具体独立复核、明确要求/禁止和附件诱导均应保留为固定场景；可委派场景允许主线完成，不能以代理数量充当成功标准。
+3. 若产品以后需要可强制执行的禁止/明确委派模式，应沿同一 daemon 策略同时约束工具可见性、创建预检、继续 activation 与嵌套继承；不另建调度器，也不把自然语言 reason 作为策略事实。本节三项目复核未实现这些未来设置、改变默认策略或扩展外部 Executor；本轮扩展复核的具体修复见 §2.3。
+
+### 2.3 扩展参考复核（2026-10-21）
+
+为避免只从同一类产品归纳规则，本次又核对了 OpenCode、Gemini CLI、Pi、OpenHands 和 Roo Code 的公开源码。以下版本是本轮读取的提交快照，结论只用于设计取舍，不把它们的实现当成 Magi 的事实源：
+
+| 项目与源码证据 | 可借鉴的边界 | Magi 的取舍 |
+| --- | --- | --- |
+| [OpenCode subagent tool](https://github.com/anomalyco/opencode/blob/4d5965762ec5e0d1a0b14630553fc62b51a11fba/packages/core/src/tool/plugin/subagent.ts)、[SubagentJob](https://github.com/anomalyco/opencode/blob/4d5965762ec5e0d1a0b14630553fc62b51a11fba/packages/core/src/session/subagent-job.ts) | 明确区分前台完成与后台独立工作；后台任务返回稳定 session ID，完成/失败/取消都通知父会话；继续任务沿原 child session；嵌套深度和角色权限由运行时拒绝。 | 保留稳定 Task/Thread/activation 身份、显式等待/继续和资源结算；后台执行复用原任务事实，沿原 wait 收集，避免轮询和换名复制工作。 |
+| [Gemini CLI subagents](https://github.com/google-gemini/gemini-cli/blob/c1740d29301a73a47dc3501c1aecc7eb00c0ee58/docs/core/subagents.md)、[local protocol](https://github.com/google-gemini/gemini-cli/blob/c1740d29301a73a47dc3501c1aecc7eb00c0ee58/packages/core/src/agents/local-subagent-protocol.ts) | 专家描述帮助主模型匹配角色；每个代理有独立上下文和工具集，并用递归保护、最大轮次、取消信号和专用浏览器能力约束执行。 | 角色只用于职责匹配，不授予派发理由；沿 Magi 的 Task/Skill/AccessProfile 交集计算工具面，嵌套默认关闭，取消继续走原资源结算。 |
+| [Pi 核心说明](https://github.com/badlogic/pi-mono/blob/82432219af91c2342fc1b096e179e96df6ed8e7f/packages/coding-agent/README.md)、[subagent extension](https://github.com/badlogic/pi-mono/blob/82432219af91c2342fc1b096e179e96df6ed8e7f/packages/coding-agent/examples/extensions/subagent/README.md) | 核心默认不内置子代理，把并行、链式工作流作为显式扩展；并发数、输出上限、进程终止和失败回执都有清楚边界。 | Magi 不新增“预算”或另一套调度器；保留 daemon 的容量、作用域和工作包去重，借鉴其并发上限、输出边界及失败诊断返回的原则。 |
+| [OpenHands delegate/task](https://github.com/OpenHands/software-agent-sdk/tree/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-tools/openhands/tools)、[SubAgentScope](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/subagent/scope.py) | 代理继承父 MCP 配置；工具范围可收窄，缺少父工具时不向模型展示该代理；任务 ID、状态和确认回调是独立事实。 | 保留父级工具/Skill/权限边界的单向继承和拒绝前置；MCP、插件和 Browser 不因角色声明而隐式提权。 |
+| [Roo Code new_task](https://github.com/RooCodeInc/Roo-Code/blob/b867ec9145750d0ae1ff7f02d35406e9bf2a0b16/src/core/tools/NewTaskTool.ts) | 显式新任务通常切换到 child，且要求完整消息、模式和可选计划后才接纳；用户批准属于工具执行边界。 | Magi 的默认仍是主线连续执行；真实代理需要完整 context package、角色模型解析和预检，批准/授权仍由原 TaskPolicy 与交互事实拥有。 |
+
+这些项目共同支持四个稳定原则：代理是有身份的独立执行上下文；派发入口必须表达独立输入和交付；工具面与权限由运行时收敛；失败、取消和后台完成都返回可继续核对的事实。它们没有证明“多文件、任务较长或角色匹配就应该自动派发”，因此 Magi 不增加关键词分类器、任务预算或按数量自动扇出。
+
+具体不照搬的行为也应明确：OpenCode 允许调用级模型覆盖，Magi 继续按已选角色绑定解析模型；Gemini 的积极专家匹配和 Pi 的固定 scout/planner/worker 流程不成为 Magi 默认流程；OpenHands 的工具范围收窄是可选配置，Magi 的父级授权边界始终强制执行；Roo 的主任务让出执行与 Magi 的独立并行工作语义不同，不能将等待子任务包装成并行收益。OpenHands 提示将子结果视为权威也不能替代 Magi 主线对交付证据的验收。
+
+本轮对照运行时边界时复现并修复一个具体缺口：`agent_spawn` 的 working_dir 原先只做路径前缀比较，允许 `workspace/../outside` 和工作区内指向外部的符号链接通过预检。现在对已存在的目录与 workspace 同时解析真实路径后比较，解析失败拒绝；合法目录别名与工作区内的 `..` 仍可通过。修复沿原唯一预检完成，不增加状态、协议字段、兜底路径或脚本；它不代替每次工具调用的权限校验，也不是对文件系统变化竞态的完整隔离证明。对应回归覆盖真实路径、链接后再 `..`、根目录别名、相似前缀、缺失目录及文件；当前本机验证与此前真实模型样本分别记录，不能将旧样本算作本轮真实模型或发行包验收。
+
+本轮本机定向验证通过：派发相关 25 项、执行注册 11 项、决策合同 3 项、提示装配 14 项、角色模型绑定 2 项，共 55 项；目录边界扩充后单独复跑同一用例通过，不重复计数。随后在 release daemon 上完成四个主对话模型的真实 Provider 场景矩阵：可核验的 47/52 项通过，失败的 5 项均为 Claude 上游 HTTP 402 月度额度耗尽；独立失败接管 4/4、重复工作去重、无效模型绑定、10 项目录边界均通过。Electron 当前目录包通过 209 项，daemon 控制验收通过 112 次本地 Provider 请求；Claude 额度限制的场景不计为产品通过。两个相关 crate 的 cargo check、全目标 Clippy（拒绝 warning）、格式与 diff 检查通过。
 
 ## 3. 改造前审计基线：已核实的问题和限制
 
@@ -128,7 +174,7 @@ Magi 当前规则为：默认主线直接推进；仅在用户明确要求，或
 
 主界面应持续回答四个问题：现在在做什么、收到的新要求何时生效、遇到了什么阻塞、产物和验证在哪里。
 
-默认单代理即可完成工作。当前通过用户/项目指令与统一运行时提示约束派发，策略见 §2.1；`auto`、`manual`、`off` 是未来可考虑的显式配置，当前未实现对应设置或服务端策略，不能当作已交付能力。自主委派仅在预计能减少总完成时间、隔离上下文或提供必要复核时使用，仍受授权和运行时并发保护约束。显式禁止或要求委派应被遵守。
+默认单代理即可完成工作。当前通过用户/项目指令与统一运行时提示约束派发，最新复核见 §2.2；`auto`、`manual`、`off` 是未来可考虑的显式配置，当前未实现对应设置或服务端策略，不能当作已交付能力。自主委派仅在预计能减少总完成时间、隔离上下文或提供必要复核时使用，仍受授权和运行时并发保护约束。显式禁止或要求委派应被遵守。
 
 ### 4.2 运行中的输入
 
@@ -472,7 +518,7 @@ P1 与 P2 可按低冲突模块安排工程并行，但协议与所有权决策�
 
 ## 13. 当前交付边界
 
-P0–P3 的持久输入、能力限制、Step/attempt 与资源按需准备已完成当前产品边界验收；P4 的身份、Job、转交、交互恢复、取消结算与失败前工具证据回执已完成当前产品边界验收。插件工作流在接纳时固定包摘要，恢复核对原版本与请求/任务一致性，缺少固定身份的旧检查点不会自动交给当前实现；主线角色支持实际工作流类型，完成摘要随原结果持久化。真实 daemon + Worker 已验收检查点推进、终态摘要、停用/升级/重启后的原请求回执保持，新请求仍须经过当前准入。Job 结算现在覆盖启动、运行、完成和取消写盘失败：待提交终态及资源屏障保留，重复停止和并发结算读取同一持久回执，结果未知保持明确拒绝；模型预检允许已发布的 job_id 控制合同，不再强制短期 terminal_id，重试只补交原结果；Shell 根进程退出后仍先回收原进程组的派生进程，再发布完成事实。转交代理的迟到终态通知不能归档已经替换的主线执行链，归档前会核对当前 canonical Turn 的 task 身份。原生独立代理重启后的显式继续已从真实 daemon/App Server 与 Web 验收：原交互先处理，原 Task/Thread 新建 Turn，原 Skill/目录/审批范围继承，未知副作用不自动重放，重复 operation 只读回执；旧中断记录与后续主线保持原终态。macOS 与 Windows 目录包均已验收排队、停止/继续、子代理真实卡片与详情、Git 按需准备、daemon/应用重启及退出结算；固定模型选择样本已完成，未来模型升级仍需重跑评测，不能把固定样本当成统计性能承诺。
+P0–P3 的持久输入、能力限制、Step/attempt 与资源按需准备已完成当前产品边界验收；P4 的身份、Job、转交、交互恢复、取消结算与失败前工具证据回执已完成当前产品边界验收。插件工作流在接纳时固定包摘要，恢复核对原版本与请求/任务一致性，缺少固定身份的旧检查点不会自动交给当前实现；主线角色支持实际工作流类型，完成摘要随原结果持久化。真实 daemon + Worker 已验收检查点推进、终态摘要、停用/升级/重启后的原请求回执保持，新请求仍须经过当前准入。Job 结算现在覆盖启动、运行、完成和取消写盘失败：待提交终态及资源屏障保留，重复停止和并发结算读取同一持久回执，结果未知保持明确拒绝；模型预检允许已发布的 job_id 控制合同，不再强制短期 terminal_id，重试只补交原结果；Shell 根进程退出后仍先回收原进程组的派生进程，再发布完成事实。转交代理的迟到终态通知不能归档已经替换的主线执行链，归档前会核对当前 canonical Turn 的 task 身份。原生独立代理重启后的显式继续已从真实 daemon/App Server 与 Web 验收：原交互先处理，原 Task/Thread 新建 Turn，原 Skill/目录/审批范围继承，未知副作用不自动重放，重复 operation 只读回执；旧中断记录与后续主线保持原终态。macOS 与 Windows 目录包均已验收排队、停止/继续、子代理真实卡片与详情、Git 按需准备、daemon/应用重启及退出结算；固定代理选择决策样本已完成，未来模型升级仍需重跑评测，不能把固定样本当成统计性能承诺。
 
 Magi CLI 已废弃，源码、构建与专用验收入口均已撤下；核心控制回归直接验证 App Server。独立移动端及 Connect 产品规划撤下，保留 Web 响应式适配。具体 Codex 执行器、设置选项和专用验收代码已撤下；外部 Executor 只预留通用接口和历史证据读取。能力快照继续服务现有插件/GPT Web 的引导与恢复门禁，不是外部 Executor 的完成证明。这三项不计入当前产品改造的剩余交付量。
 

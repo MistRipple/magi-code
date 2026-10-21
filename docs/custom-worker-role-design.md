@@ -63,6 +63,8 @@ Magi 是以主对话承接意图、由 Agent 完成工作的本地工作台。�
 - `uiOverrides`；
 - `profileOverrides`（如果现有 binding DTO 继续暴露该字段，仅属于绑定显示覆盖，不属于角色 Markdown）。
 
+运行时先判断是否需要委派，再按职责和能力选择代理角色，最后解析该角色的模型绑定。模型是代理的执行配置，不是用来反查代理的身份；多个角色可以共享同一引擎。`agent_spawn` 不接受临时模型覆盖；显式绑定失效不能静默继承主模型。完整顺序见[子代理唤起设计 §2.1](subagent-delegation-design.md#21-决策顺序与模型归属)。
+
 角色定义和绑定配置分开保存。导出角色时只导出可选的非敏感绑定偏好，不嵌入 Engine 的 API Key、连接地址或本机状态。
 
 ### 4.3 持久化
@@ -112,7 +114,11 @@ AgentRoleRegistry 有效角色集合
         ↓
 主 Agent 读取可派发角色
         ↓
+判断委派价值，按独立工作包选择角色
+        ↓
 现有 agent_spawn / 任务分派
+        ↓
+按所选角色解析 AgentBinding → Engine → 模型配置并预检
         ↓
 WorkerRuntime 执行
         ↓

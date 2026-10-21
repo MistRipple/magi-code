@@ -597,6 +597,7 @@ pub fn reject_unknown_model_config_fields(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// 解析已选定角色的模型绑定；不按任务选择模型，也不通过模型反查角色。
 pub fn configured_role_engine_model_config(
     settings_store: &magi_settings_store::SettingsStore,
     role_id: &str,
@@ -1401,10 +1402,18 @@ mod tests {
             .set_section(
                 "agents",
                 json!([{
+                    "templateId": "executor",
+                    "engineId": "reviewer",
+                    "bindingRevision": 1
+                }, {
                     "templateId": "reviewer",
                     "engineId": "sonnet-4-5",
                     "bindingRevision": 7,
                     "enabled": true
+                }, {
+                    "templateId": "security-reviewer",
+                    "engineId": "sonnet-4-5",
+                    "bindingRevision": 1
                 }]),
             )
             .unwrap();
@@ -1420,6 +1429,13 @@ mod tests {
                         "urlMode": "standard",
                         "apiProtocol": "openai_chat",
                         "reasoningEffort": "high"
+                    }
+                }, {
+                    "id": "reviewer",
+                    "llm": {
+                        "baseUrl": "https://api.example.com/v1",
+                        "model": "role-implementation",
+                        "apiProtocol": "openai_chat"
                     }
                 }]),
             )
@@ -1437,6 +1453,20 @@ mod tests {
             resolved.config.api_protocol(),
             Some(HttpModelBridgeProtocol::ChatCompletions)
         );
+        let executor = configured_role_engine_model_config(&store, "executor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.template_id, "executor");
+        assert_eq!(
+            executor.config.require_model().unwrap(),
+            "role-implementation"
+        );
+        let shared = configured_role_engine_model_config(&store, "security-reviewer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.template_id, "security-reviewer");
+        assert_eq!(shared.engine_id, resolved.engine_id);
+        assert_eq!(shared.config.require_model().unwrap(), "role-sonnet");
     }
 
     #[test]
@@ -1449,6 +1479,9 @@ mod tests {
                     "templateId": "executor",
                     "engineId": "",
                     "enabled": true
+                }, {
+                    "templateId": "reviewer",
+                    "engineId": "missing-engine"
                 }]),
             )
             .unwrap();
@@ -1457,6 +1490,11 @@ mod tests {
             configured_role_engine_model_config(&store, "executor")
                 .expect("orchestrator inheritance is valid")
                 .is_none()
+        );
+        assert!(
+            configured_role_engine_model_config(&store, "reviewer")
+                .expect_err("显式绑定失效不能退回继承主模型")
+                .contains("missing-engine")
         );
     }
 }

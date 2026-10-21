@@ -2,7 +2,7 @@
   /**
    * 「设置 → GPT Web」独立分类。
    *
-   * 只有四件事：登录与可用性、停止（释放槽位）、工具通道（OpenAI Tunnel）、清除数据。
+   * 集中管理账号绑定、配置助手、停止（释放槽位）、工具通道和清除数据。
    * 分区只展示 daemon 的事实，不自行推断可用性；GPT Web 的模型、窗口与强度都在网页里，
    * 这里没有任何模型清单或限额配置。
    */
@@ -38,7 +38,7 @@
     refreshWebModelRuntime,
     runWebModelProbe,
   } from '../web/web-model-session-projection';
-  import { activateWebModelTab, appWebModelTab } from '../stores/right-pane.svelte';
+  import { activateWebModelTab, appWebModelTab, rightPaneState, setRightPaneCollapsed } from '../stores/right-pane.svelte';
   import { closeSettings } from '../stores/shell-ui.svelte';
   import { goToSlotOwnerSession } from '../web/web-model-session-projection';
   import {
@@ -137,6 +137,7 @@
     errorMessage = '';
     try {
       await navigateWebModelPage(target);
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
       activateWebModelTab();
       closeSettings();
     } catch (error) {
@@ -160,6 +161,7 @@
         const target = request.focus === 'tunnel'
           ? document.querySelector<HTMLElement>('[data-web-model-tunnel]')
           : document.querySelector<HTMLElement>('[data-web-model-status]');
+        if (target instanceof HTMLDetailsElement) target.open = true;
         target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
       }, 0);
     };
@@ -256,6 +258,7 @@
     errorMessage = '';
     try {
       await ensureAppSession();
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
       activateWebModelTab();
       closeSettings();
     } catch (error) {
@@ -445,18 +448,36 @@
   );
 </script>
 
-<div class="apple-manager">
+<div class="apple-manager web-model-settings">
 <div class="apple-scroller-proxy">
-<div class="settings-section web-model-section">
-  <div class="settings-card" data-web-model-setup-entry>
-    <div class="settings-row">
-      <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.setup.title')}</span><span class="settings-row-desc">{i18n.t('webModel.setup.entryHint')}</span></div>
-      <button class="btn btn--sm btn--primary" disabled={!isDesktop} onclick={() => window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST))}>{i18n.t('webModel.setup.start')}</button>
+  {#if !isDesktop}
+    <div class="settings-section">
+      <div class="settings-notice settings-notice--warn">{i18n.t('settings.browser.webModel.needDesktop')}</div>
     </div>
-  </div>
+  {/if}
+  <section class="settings-section" aria-labelledby="web-model-setup-title" data-web-model-setup-entry>
+    <div class="settings-card">
+      <div class="settings-card-head wm-setup-head">
+        <div class="settings-icon-tile" aria-hidden="true"><Icon name="globe" size={16} /></div>
+        <div class="settings-card-title">
+          <span class="settings-card-name" id="web-model-setup-title">{i18n.t('webModel.setup.title')}</span>
+          <span class="settings-row-desc">{i18n.t('webModel.setup.entryHint')}</span>
+        </div>
+        <div class="settings-card-actions">
+          <button type="button" class="btn btn--sm btn--primary" disabled={!isDesktop} onclick={() => window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST))}>
+            {i18n.t('webModel.setup.start')}<Icon name="chevron-right" size={13} />
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
 
+<section class="settings-section" aria-labelledby="web-model-title">
   <div class="settings-section-header">
-    <div class="settings-section-title" id="web-model-title">{i18n.t('settings.browser.webModel.title')}</div>
+    <div>
+      <div class="settings-section-title" id="web-model-title">{i18n.t('webModel.settings.accountTitle')}</div>
+      <div class="settings-section-desc">{i18n.t('settings.browser.webModel.desc')}</div>
+    </div>
     <div class="settings-section-actions">
       <button
         type="button"
@@ -471,11 +492,6 @@
       </button>
     </div>
   </div>
-  <div class="settings-section-desc">{i18n.t('settings.browser.webModel.desc')}</div>
-
-  {#if !isDesktop}
-    <div class="settings-notice settings-notice--warn">{i18n.t('settings.browser.webModel.needDesktop')}</div>
-  {/if}
 
   <div class="settings-rows">
     <div class="settings-row" data-web-model-status="1">
@@ -532,14 +548,17 @@
     </div>
   </div>
 
-  <details class="tools-group" data-web-model-tunnel="1">
+</section>
+
+<section class="settings-section" aria-label={i18n.t('webModel.group.tools')}>
+  <details class="settings-card tools-group" data-web-model-tunnel="1">
     <summary class="settings-row wm-summary">
       <div class="settings-row-copy">
         <span class="settings-row-title">{i18n.t('webModel.group.tools')}</span>
-        <span class="settings-row-desc">{tunnel?.channel === 'openai_tunnel' ? 'OpenAI Tunnel' : i18n.t('webModel.tunnel.channelNone')}</span>
+        <span class="settings-row-desc">{i18n.t('webModel.settings.toolsDesc')}</span>
       </div>
       <span class="group-summary-end">
-        <span class="state" class:state--ok={tunnel?.ready}>
+        <span class="settings-chip" class:settings-chip--ok={tunnel?.ready}>
           {tunnel?.ready ? i18n.t('webModel.group.toolsReady') : i18n.t('webModel.group.toolsNotReady')}
         </span>
         <span class="group-chevron" aria-hidden="true"><Icon name="chevron-down" size={14} /></span>
@@ -571,19 +590,20 @@
       {/if}
 
       <div class="settings-row">
-        <div class="settings-row-copy"><span class="settings-row-title">Tunnel id</span></div>
+        <div class="settings-row-copy"><label class="settings-row-title" for="web-model-tunnel-id">{i18n.t('webModel.setup.tunnelId')}</label></div>
         <div class="wm-control">
-          <input class="form-input" bind:value={tunnelId} data-web-model-tunnel-id="1" placeholder="tunnel_..." />
+          <input id="web-model-tunnel-id" class="form-input" bind:value={tunnelId} data-web-model-tunnel-id="1" placeholder="tunnel_..." />
         </div>
       </div>
 
       <div class="settings-row">
         <div class="settings-row-copy">
-          <span class="settings-row-title">{i18n.t('webModel.tunnel.apiKey')}</span>
+          <label class="settings-row-title" for="web-model-api-key">{i18n.t('webModel.tunnel.apiKey')}</label>
         </div>
         <div class="wm-control wm-control--inline">
           {#if tunnel?.hasApiKey && !keyEditing}
             <input
+              id="web-model-api-key"
               class="form-input"
               type="text"
               readonly
@@ -597,6 +617,7 @@
             <button type="button" class="btn btn--sm btn--secondary" onclick={startEditingKey}>{i18n.t('webModel.tunnel.keyReplace')}</button>
           {:else}
             <input
+              id="web-model-api-key"
               class="form-input"
               type={keyInputVisible ? 'text' : 'password'}
               autocomplete="off"
@@ -615,9 +636,10 @@
       </div>
 
       <div class="settings-row">
-        <div class="settings-row-copy"><span class="settings-row-title">{i18n.t('webModel.tunnel.toolProfile')}</span></div>
+        <div class="settings-row-copy"><label class="settings-row-title" for="web-model-tool-profile">{i18n.t('webModel.tunnel.toolProfile')}</label></div>
         <div class="wm-control">
           <select
+            id="web-model-tool-profile"
             class="form-input"
             bind:value={toolProfile}
             data-web-model-tool-profile="1"
@@ -632,11 +654,12 @@
 
       <div class="settings-row">
         <div class="settings-row-copy">
-          <span class="settings-row-title">{i18n.t('webModel.tunnel.approvalMode')}</span>
+          <label class="settings-row-title" for="web-model-approval-mode">{i18n.t('webModel.tunnel.approvalMode')}</label>
           <span class="settings-row-desc">{i18n.t(`webModel.tunnel.approval.${approvalMode}Hint`)}</span>
         </div>
         <div class="wm-control">
           <select
+            id="web-model-approval-mode"
             class="form-input"
             bind:value={approvalMode}
             data-web-model-approval-mode="1"
@@ -649,7 +672,7 @@
         </div>
       </div>
 
-      <div class="settings-row">
+      <div class="settings-row wm-form-actions">
         <div class="settings-row-actions">
           <button type="button" class="btn btn--sm btn--primary" disabled={!isDesktop || tunnelBusy} onclick={() => void saveTunnel()}>
             {i18n.t('webModel.action.configureTunnel')}
@@ -660,7 +683,7 @@
         </div>
       </div>
 
-      <div class="settings-row" data-web-model-connector="1">
+      <div class="settings-row settings-row--stacked" data-web-model-connector="1">
         <div class="settings-row-copy">
           <span class="settings-row-title">{i18n.t('webModel.connector.title')}</span>
           {#if connectorMessage}
@@ -681,7 +704,15 @@
       </div>
     </div>
   </details>
+</section>
 
+<section class="settings-section" aria-labelledby="web-model-data-title">
+  <div class="settings-section-header">
+    <div>
+      <div class="settings-section-title" id="web-model-data-title">{i18n.t('webModel.settings.dataTitle')}</div>
+      <div class="settings-section-desc">{i18n.t('webModel.settings.dataDesc')}</div>
+    </div>
+  </div>
   <div class="settings-rows">
     <div class="settings-row">
       <div class="settings-row-copy">
@@ -690,7 +721,7 @@
       </div>
       <button
         type="button"
-        class="btn btn--sm btn--secondary"
+        class="btn btn--sm btn--error"
         data-web-model-clear-data="1"
         disabled={!isDesktop || clearing}
         onclick={() => void clearWebData()}
@@ -698,11 +729,12 @@
     </div>
   </div>
 
+</section>
   {#if notice}
-    <div class="settings-notice settings-notice--success">{notice}</div>
+    <div class="settings-notice settings-notice--success" role="status">{notice}</div>
   {/if}
   {#if errorMessage}
-    <div class="settings-notice settings-notice--error">{errorMessage}</div>
+    <div class="settings-notice settings-notice--error" role="alert">{errorMessage}</div>
     {#if errorIsSlotBusy && slotOwner}
       <div class="settings-row-actions wm-actions-start">
         <button type="button" class="btn btn--sm btn--secondary" onclick={() => goToSlotOwnerSession(slotOwner)}>
@@ -716,32 +748,49 @@
   {/if}
 </div>
 </div>
-</div>
 
 <style>
   /* 视觉来自 settings.css 的共享类与全局 .btn / .form-input，这里只放本页特有的布局。 */
+  .web-model-settings { container: web-model-settings / inline-size; }
+  .web-model-settings .settings-section { flex-shrink: 0; padding: 12px 0; }
+  .web-model-settings .settings-section-header { margin-bottom: 12px; }
+  .web-model-settings .settings-rows { margin-top: 0; }
+  .web-model-settings .settings-row { padding: 12px 0; }
+  .wm-setup-head { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; padding: 14px; }
+  .web-model-settings .tools-group .wm-nested { margin: 0; }
   .wm-control { flex: 0 1 340px; min-width: 0; }
-  .wm-control--inline { display: flex; align-items: center; gap: 6px; }
-  .wm-control--inline .form-input { flex: 1; }
+  .wm-control--inline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .wm-control--inline .form-input { flex: 1 1 140px; min-width: 0; }
   .wm-status-title { display: inline-flex; align-items: center; gap: 8px; }
   .wm-fine { color: var(--foreground-muted); opacity: 0.85; }
   .wm-actions-start { margin-top: 10px; }
-  .wm-nested { border-top: 0; }
+  .wm-form-actions { justify-content: flex-end; }
+  .wm-nested { border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0; }
 
   /* 折叠分组：标题行本身就是一行，右侧是状态文字和展开箭头。 */
-  .tools-group { border-top: 1px solid var(--border-subtle); margin-top: var(--space-3); }
-  .tools-group > summary { cursor: pointer; list-style: none; }
+  .web-model-settings .tools-group > summary { padding: 14px; flex-wrap: wrap; cursor: pointer; list-style: none; }
   .tools-group > summary::-webkit-details-marker { display: none; }
   .tools-group > summary:hover .settings-row-title,
   .tools-group > summary:hover .group-chevron { color: var(--primary); }
+  .tools-group > summary .settings-row-copy { flex: 1 1 240px; }
   .tools-group > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; border-radius: 6px; }
-  .group-summary-end { display: inline-flex; align-items: center; gap: 8px; flex: none; }
-  .group-summary-end .state { color: var(--foreground-muted); font-size: var(--text-xs); }
-  .group-summary-end .state--ok { color: var(--success); }
-  .group-chevron { display: inline-flex; color: var(--foreground-muted); transition: transform 0.15s ease; }
+  .group-summary-end { display: inline-flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; max-width: 100%; margin-left: auto; }
+  .group-summary-end .settings-chip { min-width: 0; white-space: normal; }
+  .group-chevron { display: inline-flex; flex: none; color: var(--foreground-muted); transition: transform 0.15s ease; }
   .tools-group[open] > summary .group-chevron { transform: rotate(180deg); }
 
-  @media (max-width: 640px) {
+  @container web-model-settings (max-width: 760px) {
+    .wm-setup-head { grid-template-columns: 30px minmax(0, 1fr); }
+    .wm-setup-head .settings-card-actions { grid-column: 2; }
+  }
+
+  @container web-model-settings (max-width: 640px) {
+    .settings-row { flex-wrap: wrap; }
+    .settings-row:not(.wm-summary) > .settings-row-copy { flex-basis: 100%; }
+    .settings-section-header { flex-wrap: wrap; }
+    .settings-row-actions { flex: 1 1 100%; }
     .wm-control { flex: 1 1 100%; }
+    .web-model-settings .btn { max-width: 100%; white-space: normal; height: auto; min-height: var(--btn-height-sm); }
+    .wm-form-actions .settings-row-actions { justify-content: flex-start; }
   }
 </style>

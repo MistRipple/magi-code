@@ -479,10 +479,19 @@
   }
 
   /* Responsive 布局覆盖 */
+  @media (max-width: 900px) {
+    .apple-scroller-proxy,
+    .settings-frame {
+      padding-left: 16px;
+      padding-right: 16px;
+      padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    }
+  }
+
   @media (max-width: 720px) {
     .settings-tab-content {
-      padding-left: var(--space-4);
-      padding-right: var(--space-4);
+      padding-left: 0;
+      padding-right: 0;
     }
 
     .settings-tab-content {
@@ -490,7 +499,7 @@
     }
 
     .settings-section {
-      padding: var(--space-4);
+      padding: var(--space-4) 0;
     }
 
     .settings-section-header,
