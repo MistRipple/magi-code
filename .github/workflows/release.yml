@@ -276,7 +276,7 @@ jobs:
           set -euo pipefail
           (cd dist/release-assets && sha256sum * > SHA256SUMS)
       - name: 生成 GitHub 构建来源证明
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/release-assets/*
       - name: 创建 GitHub Release
