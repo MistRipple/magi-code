@@ -79,7 +79,7 @@
   },
   "dependencies": {
     "@magi/desktop-browser-contracts": "0.0.0",
-    "@humanspeak/svelte-markdown": "^1.7.10",
+    "@humanspeak/svelte-markdown": "^2.1.3",
     "@types/qrcode": "^1.5.6",
     "@viz-js/viz": "^3.26.0",
     "@xterm/addon-fit": "^0.11.0",
