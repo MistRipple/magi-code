@@ -1363,7 +1363,7 @@ dependencies = [
  "base64",
  "dirs",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "image",
  "magi-agent-role",
  "magi-app-server-protocol",
@@ -1545,7 +1545,7 @@ name = "magi-daemon"
 version = "3.0.58"
 dependencies = [
  "axum",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "magi-agent-role",
  "magi-api",
  "magi-app-server-protocol",
@@ -1656,7 +1656,7 @@ name = "magi-mcp-server"
 version = "3.0.58"
 dependencies = [
  "axum",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "serde",
  "serde_json",
  "sha2",
@@ -1809,7 +1809,7 @@ dependencies = [
 name = "magi-session-store"
 version = "3.0.58"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "magi-app-server-protocol",
  "magi-core",
  "magi-event-bus",

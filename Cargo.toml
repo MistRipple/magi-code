@@ -62,7 +62,7 @@ sha2 = "0.10"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
-getrandom = "0.3"
+getrandom = "0.4"
 zstd = "0.13"
 ignore = "0.4"
 insta = "1.41"
