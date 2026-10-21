@@ -74,7 +74,7 @@ jobs:
 
       - name: 缓存 cargo-audit
         id: cargo-audit-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
