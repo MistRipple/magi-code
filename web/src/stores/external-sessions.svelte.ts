@@ -5,7 +5,7 @@
  * 事实与展示；点开它就是切换到这个会话。这里只缓存侧栏入口所需的概要（哪些客户端有会话），事实在 daemon，
  * 收到 `mcp.activity` 事件后重新读取。
  */
-import { listMcpExternalSessions, type McpExternalSession } from '../web/agent-api';
+import { AgentApiError, listMcpExternalSessions, type McpExternalSession } from '../web/agent-api';
 import { MCP_ACTIVITY_EVENT } from '../lib/mcp-server-events';
 
 /** 外部会话 id 的前缀（与 daemon 一致）。 */
@@ -20,12 +20,27 @@ export const externalSessions = $state({
   sessions: [] as McpExternalSession[],
 });
 
+let refreshRevision = 0;
+
 /** 读取外部会话概要；没有权限（插件未激活、经隧道访问）时视为没有外部会话。 */
 export async function refreshExternalSessions(): Promise<void> {
+  const revision = ++refreshRevision;
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
   try {
-    externalSessions.sessions = (await listMcpExternalSessions()).sessions;
-  } catch {
-    externalSessions.sessions = [];
+    const result = await listMcpExternalSessions();
+    if (revision !== refreshRevision) return;
+    externalSessions.sessions = result.sessions;
+  } catch (error) {
+    if (revision !== refreshRevision) return;
+    if (error instanceof AgentApiError && [401, 403, 404, 501].includes(error.status)) {
+      externalSessions.sessions = [];
+    } else {
+      // 首次读取失败时也要恢复，不能等下一次 MCP 调用或用户切换工作区。
+      if (typeof window !== 'undefined') scheduleRefresh(3000);
+    }
   }
 }
 
@@ -42,14 +57,14 @@ export function openExternalSession(session: McpExternalSession): void {
 
 let refreshTimer: number | null = null;
 
-function scheduleRefresh(): void {
+function scheduleRefresh(delayMs = 300): void {
   if (refreshTimer !== null) return;
   refreshTimer = window.setTimeout(() => {
     refreshTimer = null;
     void refreshExternalSessions();
-  }, 300);
+  }, delayMs);
 }
 
 if (typeof window !== 'undefined') {
-  window.addEventListener(MCP_ACTIVITY_EVENT, scheduleRefresh);
+  window.addEventListener(MCP_ACTIVITY_EVENT, () => scheduleRefresh());
 }

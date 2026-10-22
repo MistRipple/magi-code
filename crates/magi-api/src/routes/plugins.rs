@@ -527,6 +527,7 @@ async fn install(
     .await?;
     let mut manager = locked(&state, "安装插件")?;
     manager.install(&package, source).map_err(plugin_error)?;
+    publish_plugin_registry_changed(&state);
     snapshot(&manager)
 }
 
@@ -564,7 +565,9 @@ async fn install_or_upgrade(
     } else {
         locked(state, "安装插件")?
             .install(package, source)
-            .map_err(plugin_error)
+            .map_err(plugin_error)?;
+        publish_plugin_registry_changed(state);
+        Ok(())
     }
 }
 
@@ -592,6 +595,7 @@ async fn upgrade_installed_plugin(
             .map_err(plugin_error)?;
         drain.commit(&mut manager);
     }
+    publish_plugin_registry_changed(state);
     release_application_resources(state, &package.manifest().id).await
 }
 
@@ -670,6 +674,7 @@ async fn authorize(
     manager
         .authorize(&id, &request.scope, request.grants)
         .map_err(plugin_error)?;
+    publish_plugin_registry_changed(&state);
     snapshot(&manager)
 }
 async fn enable(
@@ -727,6 +732,7 @@ async fn deactivate(
             .map_err(plugin_error)?;
         drain.commit(&mut manager);
     }
+    publish_plugin_registry_changed(&state);
     if request.scope == "application" {
         release_application_resources(&state, &id).await?;
     }
@@ -753,7 +759,17 @@ async fn uninstall(
     }
     let mut manager = locked(&state, "卸载插件")?;
     manager.uninstall(&id).map_err(plugin_error)?;
+    publish_plugin_registry_changed(&state);
     snapshot(&manager)
+}
+
+// 只发布注册表失效事实；所有客户端经原清单入口读取，不复制激活或权限状态。
+fn publish_plugin_registry_changed(state: &ApiState) {
+    state.event_bus.publish(EventEnvelope::domain(
+        EventId::unique("plugin-registry-changed"),
+        "plugin.registry.changed",
+        serde_json::json!({}),
+    ));
 }
 
 fn mutate_scope<F>(
@@ -766,6 +782,7 @@ where
 {
     let mut manager = locked(state, action)?;
     operation(&mut manager).map_err(plugin_error)?;
+    publish_plugin_registry_changed(state);
     snapshot(&manager)
 }
 fn locked<'a>(

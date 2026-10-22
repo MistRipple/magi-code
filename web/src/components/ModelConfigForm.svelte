@@ -32,7 +32,7 @@
     selectModel,
     saveModelConfig,
     testModelConnection
-  } = $props<{
+  }: {
     formType: FormType;
     statusKey: string;
     config: any;
@@ -60,7 +60,7 @@
     selectModel: (type: string, model: string) => void;
     saveModelConfig: (type: FormType, statusKey: string) => void;
     testModelConnection: (type: FormType, statusKey: string) => void;
-  }>();
+  } = $props();
 
   const keyVisibleKey = $derived(formType);
   // 同一时刻只渲染一个表单，但 statusKey 仍按引擎区分，避免切换引擎时 label 指向旧控件。

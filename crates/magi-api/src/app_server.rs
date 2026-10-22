@@ -661,18 +661,19 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
             event = event_rx.recv(), if event_subscription_active => {
                 match event {
                     Ok(event) => {
-                        let should_send = {
+                        let event = {
                             let guard = connection_state.lock().await;
-                            guard.subscription.active
-                                && event.sequence > guard.subscription.after_sequence
-                                && event_matches(&event, &guard.subscription)
+                            if guard.subscription.active && event.sequence > guard.subscription.after_sequence {
+                                subscription_event(&state, &event, &guard.subscription)
+                            } else {
+                                None
+                            }
                         };
-                        if should_send
-                            && !is_notification_opted_out(
-                                &connection_state,
-                                &format!("event/{}", event.event_type),
-                            )
-                            .await
+                        let Some(event) = event else { continue; };
+                        if !is_notification_opted_out(
+                            &connection_state,
+                            &format!("event/{}", event.event_type),
+                        ).await
                         {
                             let notification = match typed_notification_from_json::<EventNotificationParams>(
                                 format!("event/{}", event.event_type),
@@ -705,9 +706,7 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                                 break;
                             }
                         }
-                        if should_send {
-                            connection_state.lock().await.subscription.after_sequence = event.sequence;
-                        }
+                        connection_state.lock().await.subscription.after_sequence = event.sequence;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         let (snapshot, replacement) = state.event_bus.snapshot_and_subscribe();
@@ -715,7 +714,7 @@ async fn run_connection(socket: WebSocket, state: ApiState, trusted_desktop_surf
                         if is_subscribed(&connection_state).await {
                             connection_state.lock().await.subscription.after_sequence =
                                 snapshot.next_sequence.saturating_sub(1);
-                            let snapshot = filtered_snapshot(&snapshot, &connection_state).await;
+                            let snapshot = filtered_snapshot(&state, &snapshot, &connection_state).await;
                             let notification = typed_notification_from_json::<EventResyncRequiredParams>(
                                 "events/resyncRequired",
                                 json!({
@@ -914,7 +913,7 @@ async fn subscribe_events(
         });
     let resync_required =
         snapshot_requires_resync(&raw_snapshot, after_sequence) || canonical_recovery.is_some();
-    let mut snapshot = filter_snapshot(raw_snapshot, after_sequence, connection_state).await;
+    let mut snapshot = filter_snapshot(state, raw_snapshot, after_sequence, connection_state).await;
     if let Some(recovery) = canonical_recovery {
         snapshot.next_sequence = snapshot
             .next_sequence
@@ -2154,6 +2153,7 @@ async fn is_notification_opted_out(
 }
 
 async fn filtered_snapshot(
+    state: &ApiState,
     snapshot: &EventStreamSnapshot,
     connection_state: &Arc<Mutex<ConnectionState>>,
 ) -> EventStreamSnapshot {
@@ -2163,19 +2163,19 @@ async fn filtered_snapshot(
         recent_events: snapshot
             .recent_events
             .iter()
-            .filter(|event| event_matches(event, &subscription))
-            .cloned()
+            .filter_map(|event| subscription_event(state, event, &subscription))
             .map(public_event_envelope)
             .collect(),
     }
 }
 
 async fn filter_snapshot(
+    state: &ApiState,
     snapshot: EventStreamSnapshot,
     after_sequence: u64,
     connection_state: &Arc<Mutex<ConnectionState>>,
 ) -> EventStreamSnapshot {
-    let snapshot = filtered_snapshot(&snapshot, connection_state).await;
+    let snapshot = filtered_snapshot(state, &snapshot, connection_state).await;
     EventStreamSnapshot {
         next_sequence: snapshot.next_sequence,
         recent_events: snapshot
@@ -2196,6 +2196,18 @@ fn snapshot_requires_resync(snapshot: &EventStreamSnapshot, after_sequence: u64)
         .first()
         .map(|event| event.sequence > expected_next)
         .unwrap_or(snapshot.next_sequence > expected_next)
+}
+
+fn subscription_event(
+    state: &ApiState,
+    event: &EventEnvelope,
+    subscription: &EventSubscription,
+) -> Option<EventEnvelope> {
+    if event_matches(event, subscription) {
+        Some(event.clone())
+    } else {
+        crate::sse::session_directory_invalidation(state, event)
+    }
 }
 
 fn event_matches(event: &EventEnvelope, subscription: &EventSubscription) -> bool {
@@ -2310,7 +2322,7 @@ mod tests {
     use axum::http::header::USER_AGENT;
     use futures_util::{SinkExt, StreamExt};
     use magi_conversation_runtime::CanonicalTurnEventSink;
-    use magi_core::{EventId, TaskCompletionContract, ThreadId, UtcMillis};
+    use magi_core::{EventId, TaskCompletionContract, TaskId, ThreadId, UtcMillis};
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -2327,6 +2339,16 @@ mod tests {
         connect_async,
         tungstenite::{Message as ClientMessage, client::IntoClientRequest},
     };
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
 
     fn event(sequence: u64, session_id: Option<&str>, workspace_id: Option<&str>) -> EventEnvelope {
         EventEnvelope {
@@ -2402,6 +2424,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn background_directory_projection_is_shared_by_live_events_and_snapshots() {
+        let state = test_state();
+        let connection = Arc::new(Mutex::new(ConnectionState::default()));
+        connection.lock().await.subscription = EventSubscription {
+            active: true,
+            session_id: Some(SessionId::new("session-1")),
+            workspace_id: Some(WorkspaceId::new("workspace-1")),
+            after_sequence: 0,
+        };
+        let mut changed = event(2, Some("session-2"), Some("workspace-2"));
+        changed.event_type = "session.turn.completed".into();
+        changed.payload = json!({"canonical_turn": {"text": "private content"}});
+        changed.task_id = Some(TaskId::new("private-task"));
+        let snapshot = EventStreamSnapshot {
+            next_sequence: 3,
+            recent_events: vec![changed.clone()],
+        };
+        let projected = filter_snapshot(&state, snapshot, 0, &connection).await;
+        let live =
+            subscription_event(&state, &changed, &connection.lock().await.subscription).unwrap();
+        assert_eq!(projected.recent_events.len(), 1);
+        assert_eq!(projected.recent_events[0].payload, live.payload);
+        assert_eq!(live.event_type, "session.directory.changed");
+        assert_eq!(live.sequence, 2);
+        assert_eq!(
+            live.payload,
+            json!({"scope": "workspace", "workspace_id": "workspace-2", "session_id": "session-2"})
+        );
+        assert!(live.task_id.is_none());
+        changed.event_type = "session.turn.item".into();
+        assert!(
+            subscription_event(&state, &changed, &connection.lock().await.subscription).is_none()
+        );
+        let replay = filter_snapshot(
+            &state,
+            EventStreamSnapshot {
+                next_sequence: 3,
+                recent_events: vec![live],
+            },
+            2,
+            &connection,
+        )
+        .await;
+        assert!(replay.recent_events.is_empty());
+    }
+
     #[test]
     fn expired_event_cursor_requires_resync() {
         let snapshot = EventStreamSnapshot {
@@ -2428,7 +2497,7 @@ mod tests {
             workspace_id: None,
             after_sequence: 0,
         };
-        let public = filter_snapshot(snapshot.clone(), 0, &connection).await;
+        let public = filter_snapshot(&test_state(), snapshot.clone(), 0, &connection).await;
         assert_eq!(
             public.recent_events[0].payload,
             public_event_envelope(stored).payload

@@ -6,6 +6,7 @@ import {
   type FeedbackOptions,
 } from './notifications';
 import type { IncidentScope } from './notification-policy';
+import { messagesState } from '../stores/messages.svelte';
 
 export interface ActionFeedbackOptions<T> {
   actionLabel: string;
@@ -35,6 +36,11 @@ export async function runActionWithFeedback<T>(
   action: () => Promise<T>,
   options: ActionFeedbackOptions<T>,
 ): Promise<T | null> {
+  const context = {
+    workspaceId: messagesState.currentWorkspaceId || undefined,
+    workspacePath: messagesState.currentWorkspacePath || undefined,
+    sessionId: messagesState.currentSessionId || undefined,
+  };
   try {
     const result = await action();
     showFeedback('success', resolveSuccessMessage(result, options), {
@@ -48,7 +54,8 @@ export async function runActionWithFeedback<T>(
     await options.onError?.(errorMessage, error);
     const directError = directIncidentError(error, errorMessage);
     reportIncident(directError, {
-      scope: options.incidentScope || 'workspace',
+      scope: options.incidentScope || (context.workspaceId ? 'workspace' : 'app'),
+      context,
       title: options.errorTitle || errorMessage,
       ...incidentErrorDiagnostics(error, directError),
       failureStage: 'web_action',

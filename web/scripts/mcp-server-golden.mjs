@@ -145,7 +145,7 @@ assert.doesNotMatch(toolsTab, /SettingsMcpServerSection/);
 
 // ── 托盘：没有待确认项时不产生周期请求；无管理权限时自行停用 ─────────────────
 // 托盘与外部会话里的调用卡片共用同一个存储和同一组操作按钮：批准与拒绝只有一个入口。
-assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0\) void refreshExternalApprovals\(\)/);
+assert.match(approvalStore, /if \(externalApprovals\.approvals\.length > 0 \|\| retryPending\) void refreshExternalApprovals\(\)/);
 assert.match(approvalStore, /disabled = true;/);
 assert.match(approvalActions, /'allow_once'/);
 assert.doesNotMatch(approvalActions, /allow_for_turn/);

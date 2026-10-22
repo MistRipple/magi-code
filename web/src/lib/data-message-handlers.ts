@@ -668,6 +668,7 @@ export function handleUnifiedData(standard: StandardMessage) {
       handleSessionsUpdated(asMessage({
         workspaceId: payload.workspaceId,
         sessions: payload.sessions,
+        allowRuntimeEpochChange: payload.allowRuntimeEpochChange,
         runtimeEpoch: payload.runtimeEpoch,
         eventStreamNextSequence: payload.eventStreamNextSequence,
       }));
@@ -863,7 +864,13 @@ export function handleUnifiedData(standard: StandardMessage) {
       if (newStatus === 'Failed') {
         const directError = failureDetail || i18n.t('notification.missingRuntimeDetail');
         reportIncident(directError, {
-          scope: 'session',
+          scope: typeof payload.sessionId === 'string' && payload.sessionId.trim() ? 'session'
+            : typeof payload.workspaceId === 'string' && payload.workspaceId.trim() ? 'workspace' : 'app',
+          context: {
+            sessionId: typeof payload.sessionId === 'string' ? payload.sessionId.trim() : undefined,
+            workspaceId: typeof payload.workspaceId === 'string' ? payload.workspaceId.trim() : undefined,
+            workspacePath: typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : undefined,
+          },
           source: 'task-runtime',
           title: label,
           failureStage: failureStage || 'task_execution',

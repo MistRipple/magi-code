@@ -68,6 +68,8 @@ import {
   updateAllAgentSkills,
   upsertAgentRegistryBinding,
   upsertAgentRegistryEngine,
+  RUNTIME_CONNECTION_EVENT,
+  type AgentConnectionEventDetail,
 } from "../web/agent-api";
 import type { RoleTemplate } from "../shared/types/role-templates";
 import type {
@@ -261,6 +263,7 @@ function notifySettingsError(actionLabel: string, error: unknown): void {
   const directError = directIncidentError(error, title);
   reportIncident(directError, {
     scope: "app",
+    context: {},
     title,
     ...incidentErrorDiagnostics(error, directError),
     failureStage: "settings_action",
@@ -915,6 +918,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let mcpServersHydrated = $state(true);
   let mcpServersLoading = $state(false);
   let settingsBootstrapBindingGeneration = 0;
+  let settingsBootstrapRequestSeq = 0;
   let fullSettingsBootstrapRequestSeq = 0;
   let mcpExpandedServer = $state<string | null>(null);
   let mcpServerTools = $state<
@@ -1508,11 +1512,13 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   function applyFreshSettingsBootstrapPayload(
     payload: AgentSettingsBootstrapSnapshot,
   ): void {
+    ++settingsBootstrapRequestSeq;
     appState.settingsBootstrapSnapshot = payload;
     applySettingsBootstrapPayload(payload, { allowLocaleHydration: false });
   }
 
   async function refreshSettingsBootstrapFromApi(scope: SettingsBootstrapScope = "core"): Promise<void> {
+    const requestSeq = ++settingsBootstrapRequestSeq;
     const hydratesMcpState = scope === "full";
     const requestBindingGeneration = settingsBootstrapBindingGeneration;
     const requestBindingKey = currentSettingsBootstrapBindingKey();
@@ -1525,7 +1531,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     try {
       const payload = await fetchCurrentSettingsBootstrap({ bootstrapScope: scope });
       if (
-        requestBindingGeneration !== settingsBootstrapBindingGeneration
+        requestSeq !== settingsBootstrapRequestSeq
+        || requestBindingGeneration !== settingsBootstrapBindingGeneration
         || requestBindingKey !== currentSettingsBootstrapBindingKey()
       ) {
         return;
@@ -1535,7 +1542,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       applySettingsBootstrapPayload(payload);
     } catch (e) {
       if (
-        requestBindingGeneration !== settingsBootstrapBindingGeneration
+        requestSeq !== settingsBootstrapRequestSeq
+        || requestBindingGeneration !== settingsBootstrapBindingGeneration
         || requestBindingKey !== currentSettingsBootstrapBindingKey()
       ) {
         return;
@@ -3944,6 +3952,16 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   // 监听来自扩展的实时状态推送（仅保留 SSE 实时推送类型）
   onMount(() => {
+    const refreshVisibleSettings = () => {
+      if (isSettingsActive()) refreshOnShow();
+    };
+    const handleConnection = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === "connected") {
+        refreshVisibleSettings();
+      }
+    };
+    window.addEventListener("focus", refreshVisibleSettings);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleConnection);
     const unsubscribe = vscode.onMessage((msg) => {
       if (msg.type !== "unifiedMessage") return;
       const standard = msg.message as StandardMessage;
@@ -3961,6 +3979,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       if (dataType === "settingsBootstrapLoaded") {
         const snapshot = payload as AgentSettingsBootstrapSnapshot;
         if (settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+          ++settingsBootstrapRequestSeq;
           appState.settingsBootstrapSnapshot = snapshot;
           applySettingsBootstrapPayload(snapshot, { allowLocaleHydration: false });
         }
@@ -3994,13 +4013,17 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       executionStatsStale = true;
     }
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      window.removeEventListener("focus", refreshVisibleSettings);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleConnection);
+    };
   });
 
-  // 设置视图保活后，每次重新显示时刷新只读数据。配置本身由 SSE 推送与
-  // settingsBootstrapSnapshot 驱动，不在这里强制覆盖，避免冲掉用户改到一半的表单。
+  // 重新显示、回到窗口或重连时重读 daemon 配置；apply 层保留未保存草稿。
   // 统计只在确实过期（后台错过了推送）或正停在统计页时才重算。
   function refreshOnShow() {
+    void requestSettingsBootstrap(true, activeTab === "tools" ? "full" : "core");
     if (mcpAutoConnectStale) {
       mcpAutoConnectStale = false;
       void connectEnabledMcpServers();

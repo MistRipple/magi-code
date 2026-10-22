@@ -45,6 +45,10 @@ export async function syncUserQuestions(
     userQuestionState.error = '';
     return;
   }
+  if (userQuestionState.sessionId !== normalizedSessionId) {
+    userQuestionState.pending = [];
+    userQuestionState.hydrated = false;
+  }
   userQuestionState.sessionId = normalizedSessionId;
   userQuestionState.binding = binding.scope === 'workspace'
     ? {

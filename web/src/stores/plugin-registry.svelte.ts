@@ -6,6 +6,7 @@
  * 入口出现与面板打开分别管理：投影只决定“有哪些入口”，不打开任何页面。
  */
 
+import { untrack } from 'svelte';
 import {
   APPLICATION_PLUGIN_SCOPE,
   loadActivePluginCommands,
@@ -15,6 +16,7 @@ import {
   type PluginContributionProjection,
   type PluginManifestProjection,
 } from '../web/plugin-api';
+import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
 export { APPLICATION_PLUGIN_SCOPE };
 
@@ -22,7 +24,7 @@ interface PluginScopeProjection {
   manifests: PluginManifestProjection[];
   commands: PluginContributionProjection[];
   workflows: PluginContributionProjection[];
-  /** 至少完成过一次读取；未完成前不能据此判断插件“不存在”。 */
+  /** 当前修订读取成功；加载中或失败时不能据旧清单判断插件“不存在”。 */
   loaded: boolean;
 }
 
@@ -54,7 +56,11 @@ export function trackPluginProjection(scope: string): void {
   const revision = registry.revision;
   if (requestedRevision.get(scope) === revision) return;
   requestedRevision.set(scope, revision);
-  const isCurrent = () => requestedRevision.get(scope) === revision;
+  // 保留已有入口，但在新修订确认前不以旧清单的缺项撤销用户选择。
+  untrack(() => {
+    projections[scope] = { ...(projections[scope] ?? EMPTY_PROJECTION), loaded: false };
+  });
+  const isCurrent = () => registry.revision === revision && requestedRevision.get(scope) === revision;
   const loading = Promise.all([
     loadActivePluginManifests(scope),
     loadActivePluginCommands(scope),
@@ -64,10 +70,9 @@ export function trackPluginProjection(scope: string): void {
     revokeSelectionsOfRemovedPlugins(projections[scope]?.manifests ?? [], manifests);
     projections[scope] = { manifests, commands, workflows, loaded: true };
   }).catch(() => {
-    // 读取失败按“没有可用入口”处理：入口只能来自 daemon 的成功投影。
     if (!isCurrent()) return;
-    revokeSelectionsOfRemovedPlugins(projections[scope]?.manifests ?? [], []);
-    projections[scope] = { manifests: [], commands: [], workflows: [], loaded: true };
+    // 网络失败不是撤权事实：保留最近一次成功投影，也不能将首次失败标成已加载。
+    requestedRevision.delete(scope);
   });
   inflight.set(scope, loading);
 }
@@ -93,8 +98,14 @@ export function pluginRegistryRevision(): number {
 
 /** 取得已加载的作用域投影：尚未加载时发起读取并等待，用于不在 effect 里的一次性判断。 */
 export async function loadedPluginProjection(scope: string): Promise<PluginScopeProjection> {
-  trackPluginProjection(scope);
-  await inflight.get(scope);
+  let loading: Promise<void> | undefined;
+  let revision: number;
+  do {
+    revision = registry.revision;
+    trackPluginProjection(scope);
+    loading = inflight.get(scope);
+    await loading;
+  } while (revision !== registry.revision || loading !== inflight.get(scope));
   return pluginProjection(scope);
 }
 
@@ -106,4 +117,9 @@ if (typeof window !== 'undefined') {
   window.addEventListener(PLUGIN_REGISTRY_CHANGED_EVENT, notifyPluginRegistryChanged);
   // 其他客户端（桌面窗口、手机 Web）也可能改动了注册表：回到本窗口时重新读取。
   window.addEventListener('focus', notifyPluginRegistryChanged);
+  window.addEventListener(RUNTIME_CONNECTION_EVENT, (event: Event) => {
+    if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') {
+      notifyPluginRegistryChanged();
+    }
+  });
 }

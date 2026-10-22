@@ -45,7 +45,7 @@
     deleteEngine,
     openAddEngineDialog,
     renameEngineDisplay
-  } = $props<{
+  }: {
     modelConfigTab: string;
     orchConfig: any;
     compConfig: any;
@@ -80,7 +80,7 @@
     deleteEngine: (engineId: string) => void;
     openAddEngineDialog: () => void;
     renameEngineDisplay: (engineId: string, newName: string) => void;
-  }>();
+  } = $props();
 
   // 角色 displayName 解析（带 i18n fallback）
   function resolveTemplateDisplayName(templateId: string): string {

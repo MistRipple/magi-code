@@ -25,6 +25,7 @@
     "test:electron-cursor-desktop-live": "node scripts/verify-electron-cursor-desktop-live.mjs",
     "test:electron-conversation-dom": "node scripts/verify-electron-conversation-dom.mjs",
     "test:daemon-input-queue": "npm --prefix web run build && node scripts/verify-daemon-input-queue.mjs",
+    "test:data-loading-live": "npm --prefix web run build && node scripts/verify-data-loading.mjs",
     "test:daemon-approval-recovery": "npm --prefix web run build && node scripts/verify-daemon-approval-recovery.mjs",
     "plugin:center": "node scripts/plugin-center.mjs",
     "plugin-center:build": "node scripts/build-plugin-center.mjs",
@@ -47,7 +48,7 @@
     "posttest": "./scripts/prune-target.sh"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "overrides": {
     "katex": "0.19.0"

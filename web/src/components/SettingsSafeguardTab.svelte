@@ -16,7 +16,7 @@
     safeguardAuditCount,
     safeguardAuditPersistenceHealthy,
     setSafeguardAuditCount,
-  } = $props<{
+  }: {
     SAFEGUARD_CATEGORIES: any[];
     getRulesForCategory: (cat: any) => any[];
     toggleSafeguardRule: (index: number) => void;
@@ -28,7 +28,7 @@
     safeguardAuditCount: number;
     safeguardAuditPersistenceHealthy: boolean;
     setSafeguardAuditCount: (count: number) => void;
-  }>();
+  } = $props();
 
   let view = $state<'rules' | 'audit'>('rules');
 

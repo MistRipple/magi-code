@@ -24,7 +24,7 @@
     getWorkerDisplayName,
     statusTexts,
     statsDisplayKeys,
-  } = $props<{
+  }: {
     totalInputTokens: number;
     totalOutputTokens: number;
     totalTokens: number;
@@ -40,7 +40,7 @@
     getWorkerDisplayName: (worker: string) => string;
     statusTexts: Record<string, () => string>;
     statsDisplayKeys: string[];
-  }>();
+  } = $props();
 
   type Perspective = 'role' | 'engine';
   let perspective = $state<Perspective>('engine');
@@ -123,7 +123,7 @@
         statusClass: getStatusClass(statusObj?.status || 'checking'),
         statusKey: statusObj?.status || 'checking',
         isError: statusObj?.status === 'error',
-        errorMsg: statusObj?.error || null,
+        errorMsg: 'error' in statusObj ? statusObj.error || null : null,
         totalIn,
         totalOut,
         totalTokens: totalIn + totalOut,

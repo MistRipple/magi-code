@@ -16,6 +16,7 @@
   } from '../stores/git-context.svelte';
   import { isSessionIsolated } from '../stores/session-isolation-store.svelte';
   import Icon from './Icon.svelte';
+  import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
   interface Props {
     workspace: ComposerWorkspaceOption | null;
@@ -171,11 +172,20 @@
         console.warn('[GitContextControl] 工作区变更后刷新 Git 上下文失败:', error);
       });
     };
+    const handleConnected = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected' && binding) {
+        void refreshGitContext(binding).catch((error) => {
+          console.warn('[GitContextControl] 重连后刷新 Git 上下文失败:', error);
+        });
+      }
+    };
     document.addEventListener('pointerdown', handleOutside, true);
     window.addEventListener('magi:workspaceContentChanged', handleWorkspaceChanged);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
     return () => {
       document.removeEventListener('pointerdown', handleOutside, true);
       window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceChanged);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
     };
   });
 </script>

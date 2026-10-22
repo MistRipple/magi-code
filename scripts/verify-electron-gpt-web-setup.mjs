@@ -215,12 +215,7 @@ try {
   await page.evaluate(`window.dispatchEvent(new CustomEvent('magi:webModelSettingsRequest', {detail:{focus:'tunnel'}}))`);
   await new Promise(resolve => setTimeout(resolve, 150));
   check('停用后深链接进入插件管理而不挂载配置页', !await tools.exists('[data-web-model-tunnel]') && await page.evaluate(`document.querySelector('[data-testid="settings-nav-plugins"]')?.classList.contains('active')`));
-  // Electron 43 在 DevTools 附着 sandbox guest 时偶发自身 preload 诊断，独立记录，应用异常仍失败。
-  const hostDiagnostics = errors.filter(error => error.includes('Electron sandboxed_renderer.bundle.js script failed to run')
-    || (error.includes("Cannot destructure property 'preloadScripts' of 'binding.startupData'") && error.includes('node:electron/js2c/sandbox_bundle')));
-  const actionableErrors = errors.filter(error => !hostDiagnostics.includes(error));
-  check('配置流程无应用运行时异常', actionableErrors.length === 0, actionableErrors.slice(-4).join('\n'));
-  if (hostDiagnostics.length) console.log('Electron DevTools sandbox 诊断：' + hostDiagnostics.length + ' 条');
+  check('配置流程无运行时异常', errors.length === 0, errors.slice(-4).join('\n'));
   if (process.env.MAGI_SETUP_TEST_SCREENSHOT) await writeFile(process.env.MAGI_SETUP_TEST_SCREENSHOT, Buffer.from(await tools.screenshot(), 'base64'));
 } catch (error) {
   if (page) process.stderr.write((await page.evaluate('document.body.innerText').catch(() => '')).slice(-4000) + '\n');

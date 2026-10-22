@@ -22,6 +22,7 @@
     type GitWorktree,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail } from '../web/agent-api';
 
   let advancedOpen = $state(false);
   let worktrees = $state<GitWorktree[]>([]);
@@ -48,10 +49,10 @@
     addToast('error', message);
   }
 
-  async function refreshRepository(): Promise<void> {
+  async function refreshRepository(force = true): Promise<void> {
     localError = null;
     try {
-      await refreshGitContext(binding, { force: true });
+      await refreshGitContext(binding, { force });
       if (advancedOpen) await loadWorktrees(true);
     } catch (error) {
       console.warn('[GitRepositoryPanel] 刷新仓库失败:', error);
@@ -252,8 +253,15 @@
 
   onMount(() => {
     const handleWorkspaceChanged = () => void refreshRepository();
+    const handleConnected = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') void refreshRepository(false);
+    };
     window.addEventListener('magi:workspaceContentChanged', handleWorkspaceChanged);
-    return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceChanged);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
+    return () => {
+      window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceChanged);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
+    };
   });
 </script>
 

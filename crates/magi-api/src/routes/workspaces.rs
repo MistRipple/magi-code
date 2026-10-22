@@ -217,11 +217,22 @@ async fn register_workspace(
 
     // 先持久化 workspace 注册状态（快），索引放到后台不阻塞响应。
     state.persist_workspace_durable_state_for_api()?;
+    publish_workspace_registry_changed(&state);
     state.schedule_workspace_code_index(workspace_id.clone(), canonical_path.clone());
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.to_string(),
         "registered": true
     })))
+}
+
+fn publish_workspace_registry_changed(state: &ApiState) {
+    state
+        .event_bus
+        .publish(magi_event_bus::EventEnvelope::domain(
+            magi_core::EventId::unique("workspace-registry-changed"),
+            "workspace.registry.changed",
+            serde_json::json!({}),
+        ));
 }
 
 fn new_workspace_id() -> magi_core::WorkspaceId {
@@ -325,6 +336,7 @@ async fn remove_workspace(
         .deregister(&workspace_id)
         .map_err(|e| ApiError::internal_assembly("工作区移除失败", e))?;
     state.persist_workspace_durable_state_for_api()?;
+    publish_workspace_registry_changed(&state);
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 

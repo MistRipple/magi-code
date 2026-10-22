@@ -11,6 +11,8 @@
   import { openCodeTab } from '../stores/right-pane.svelte';
   import { requestOpenHtmlFileInBrowser } from '../lib/browser-navigation';
   import {
+    RUNTIME_CONNECTION_EVENT,
+    type AgentConnectionEventDetail,
     addAgentKnowledgeItem,
     addAgentKnowledgeRelation,
     clearAgentProjectKnowledge,
@@ -495,7 +497,6 @@
       if (!isCurrentKnowledgeLoadRequest(request) || activeKnowledgeLoadRequestId !== request.requestId) {
         return;
       }
-      clearKnowledgeContent();
       loadError = i18n.t('knowledge.toast.loadFailed');
       isLoading = false;
       finishKnowledgeLoad();
@@ -659,7 +660,6 @@
     if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
     }
-    clearKnowledgeContent();
     console.warn('[KnowledgePanel] load project knowledge failed:', error);
     loadError = i18n.t('knowledge.toast.loadFailed');
     isLoading = false;
@@ -949,7 +949,15 @@
       }
     });
 
+    const onConnected = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') {
+        hasRequestedKnowledge = false;
+        if (isKnowledgeActive && hasKnowledgeWorkspaceScope()) requestKnowledgeLoad();
+      }
+    };
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
     return () => {
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
       clearKnowledgeLoadTimeout();
       clearKnowledgeIndexPollTimeout();
       unsubscribe();

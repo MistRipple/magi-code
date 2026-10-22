@@ -5,6 +5,7 @@ import {
   resolveFeedbackPolicy,
   resolveIncidentPolicy,
   type IncidentScope,
+  type IncidentContext,
 } from './notification-policy';
 
 export type FeedbackLevel = 'info' | 'success' | 'warning' | 'error';
@@ -18,6 +19,8 @@ export interface FeedbackOptions {
 
 export interface ReportIncidentOptions extends FeedbackOptions {
   scope: IncidentScope;
+  /** 异步操作的原始归属；显式提供时不借用当前导航。 */
+  context?: IncidentContext;
   level?: 'warning' | 'error';
   actionRequired?: boolean;
   detail?: string;
@@ -101,7 +104,7 @@ export function reportIncident(
         source: options.source,
         actionRequired: options.actionRequired ?? policy.actionRequired,
       },
-      {
+      options.context ?? {
         workspaceId: messagesState.currentWorkspaceId || undefined,
         workspacePath: messagesState.currentWorkspacePath || undefined,
         sessionId: messagesState.currentSessionId || undefined,

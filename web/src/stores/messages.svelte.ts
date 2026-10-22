@@ -1917,24 +1917,12 @@ export function advanceWorkspaceSessionProjectionCursor(
   return true;
 }
 
-export function updateWorkspaceSessionProjectionSessions(
-  workspaceId: string,
-  newSessions: Session[],
-): boolean {
-  const current = messagesState.workspaceSessionProjection;
-  const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
-  if (
-    !currentWorkspaceId
-    || normalizeWorkspaceId(current.workspaceId) !== currentWorkspaceId
-    || !current.runtimeEpoch
-    || current.eventStreamNextSequence < 1
-  ) {
-    return false;
-  }
-  return replaceWorkspaceSessionProjection(currentWorkspaceId, newSessions, {
-    runtimeEpoch: current.runtimeEpoch,
-    eventStreamNextSequence: current.eventStreamNextSequence,
-  });
+/** 注册表移除的工作区不再保留侧栏分片；不改变当前已提交的会话导航。 */
+export function retainWorkspaceSessionProjections(workspaceIds: ReadonlySet<string>): void {
+  const current = messagesState.workspaceSessionProjections;
+  const retained = Object.entries(current).filter(([workspaceId]) => workspaceIds.has(workspaceId));
+  if (retained.length === Object.keys(current).length) return;
+  messagesState.workspaceSessionProjections = Object.fromEntries(retained);
 }
 
 export function clearWorkspaceSessionProjection() {

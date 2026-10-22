@@ -307,6 +307,8 @@ Coordinator 校验状态/幂等
 
 EventBus 只负责实时传输，不作为恢复依据。断线或序号缺口时，客户端按 `afterSequence` 获取事件尾部和 canonical snapshot；如果 daemon 已重启导致内存 EventBus 没有同一 Session 的新事件，HTTP SSE 必须从已恢复的 Canonical Turn Log 生成一次性 recovery envelope（不创建新 Turn、不重发 Provider），App Server WebSocket 必须提供等价的 `events/resyncRequired` canonical snapshot。恢复通知仍携带原 `session_id`、`turn_id` 和终态，不得把全局 `system.*` 事件当作业务 Turn 进展。
 
+侧栏会话目录独立于当前导航：Web 启动、手动刷新和连接恢复时读取所有已注册工作区的目录。SSE 与 App Server 对未订阅会话的目录相关变化投影为 `session.directory.changed`，只携带作用域、工作区和会话身份，保留原序号，不传递正文、工具结果或任务上下文，也不改写 EventBus 原事件。客户端按工作区合并通知并重读权威目录，以运行时代际与事件游标拒绝旧快照；后台刷新不能改变当前会话绑定或覆盖前台目录投影。
+
 ### 5.2 重启、取消与失败
 
 启动时从 Canonical Turn Log 和 TaskStore checkpoint 重建 Coordinator：

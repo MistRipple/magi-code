@@ -2273,6 +2273,9 @@ async function runRecoveryAcceptance(page, electron) {
     || new URL(restartResult.url).searchParams.get("sessionId");
   const restartTurnId = assistantTurnId(restartResult, restartResponseText);
   check("daemon 重启 replay 初始 Turn 具有稳定身份", Boolean(restartSessionId && restartTurnId));
+  // 文本可见早于 canonical 终态提交；历史重放场景必须先等本轮完成，
+  // 否则 SIGKILL 会把测试变成运行中断恢复，并丢失它随后要求的完成 timing。
+  await waitForBackendTiming(restartTurnId, "daemon replay 初始 Turn 完成提交", "personal_chat");
   const beforeDaemonRestart = await healthSnapshot();
   const daemonPid = await waitFor(async () => ownedDaemonPid(electron.pid), "定位 Electron 自有 daemon", 15_000);
   process.kill(daemonPid, "SIGKILL");
@@ -2440,6 +2443,7 @@ async function openSessionDraft(page, { personal = false } = {}) {
 }
 
 async function clickSend(page) {
+  await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-send-button"]:not([disabled])'))`), "输入更新后发送按钮就绪");
   return await page.evaluate(`(() => {
     const element = document.querySelector('[data-testid="input-send-button"]');
     if (!element || element.disabled) {
@@ -3497,7 +3501,7 @@ try {
     await page.evaluate(`document.querySelector('.agent-center-trigger')?.click()`);
     const expandedAgentCenter = await waitFor(async () => {
       const state = await rendererState(page);
-      return state.agentCenter.expanded === "true" ? state : null;
+      return state.agentCenter.expanded === "true" && state.agentCenter.rows.length > 0 ? state : null;
     }, "代理运行中心展开");
     check("代理运行中心支持展开", expandedAgentCenter.agentCenter.expanded === "true");
     check("代理运行中心显示子代理", expandedAgentCenter.agentCenter.rows.length > 0);
@@ -4379,6 +4383,10 @@ try {
   if (shutdownDaemonPid) await stopOwnedDaemon(shutdownDaemonPid);
 
   flushElectronLogBuffers();
+  check(
+    "打包 Electron 启动、重载和重启没有 sandbox 初始化异常",
+    !/sandboxed_renderer\.bundle\.js script failed|binding\.startupData/u.test(electronLogText.join("\n")),
+  );
   const sourceIdentityAfter = await collectSourceIdentity();
   const sourceIdentityStable = sourceIdentityBefore.source_commit === sourceIdentityAfter.source_commit
     && sourceIdentityBefore.worktree_fingerprint_sha256

@@ -5,6 +5,9 @@
 import { i18n } from './i18n.svelte';
 import { addToast } from './messages.svelte';
 import {
+  AgentApiError,
+  RUNTIME_CONNECTION_EVENT,
+  type AgentConnectionEventDetail,
   listMcpServerApprovals,
   resolveMcpServerApproval,
   setWebModelToolPolicy,
@@ -27,6 +30,8 @@ export const externalApprovals = $state({
  * daemon 推来新的待确认事件时再试一次（插件可能刚被激活）。
  */
 let disabled = false;
+let syncRevision = 0;
+let retryPending = false;
 
 /** 已经提醒过（或首次读取时就已存在）的待确认；只对之后新出现的发系统通知。 */
 const knownApprovalIds = new Set<string>();
@@ -61,15 +66,28 @@ function notifyNewApprovals(approvals: McpServerApproval[]): void {
 
 export async function refreshExternalApprovals(): Promise<void> {
   if (disabled) return;
+  if (externalApprovals.busy) {
+    retryPending = true;
+    return;
+  }
+  const revision = ++syncRevision;
   try {
     const approvals = await listMcpServerApprovals();
+    if (revision !== syncRevision) return;
     notifyNewApprovals(approvals);
     externalApprovals.approvals = approvals;
-  } catch {
-    disabled = true;
-    externalApprovals.approvals = [];
-    // 首次读取失败（例如 MCP 插件尚未激活）也算已建立基线：之后新出现的待确认都要提醒。
-    loadedOnce = true;
+    retryPending = false;
+  } catch (error) {
+    if (revision !== syncRevision) return;
+    if (error instanceof AgentApiError && [401, 403, 404, 501].includes(error.status)) {
+      disabled = true;
+      externalApprovals.approvals = [];
+      retryPending = false;
+      loadedOnce = true;
+    } else {
+      // 临时失败保留现有待确认，允许定时器继续读取；不能把它当成撤权。
+      retryPending = true;
+    }
   }
 }
 
@@ -83,46 +101,60 @@ export async function resolveExternalApproval(
   approval: McpServerApproval,
   decision: 'allow_once' | 'deny',
 ): Promise<void> {
+  if (externalApprovals.busy) return;
+  ++syncRevision;
   externalApprovals.busy = true;
+  retryPending = false;
   try {
     externalApprovals.approvals = await resolveMcpServerApproval(approval.approvalId, decision);
   } catch (error) {
     reportFailure(error);
-    await refreshExternalApprovals();
+    retryPending = true;
   } finally {
     externalApprovals.busy = false;
+    if (retryPending) await refreshExternalApprovals();
   }
 }
 
 /** 「始终允许」：把 GPT Web 的授权方式切到始终授权，并放行这一次。随时可在设置里改回。 */
 export async function alwaysAllowExternalApproval(approval: McpServerApproval): Promise<void> {
+  if (externalApprovals.busy) return;
+  ++syncRevision;
   externalApprovals.busy = true;
+  retryPending = false;
   try {
     await setWebModelToolPolicy({ approvalMode: 'always' });
     externalApprovals.approvals = await resolveMcpServerApproval(approval.approvalId, 'allow_once');
     addToast('info', i18n.t('mcpServer.approvals.alwaysSet'));
   } catch (error) {
     reportFailure(error);
-    await refreshExternalApprovals();
+    retryPending = true;
   } finally {
     externalApprovals.busy = false;
+    if (retryPending) await refreshExternalApprovals();
   }
 }
 
 /** 开始跟踪待确认：收到事件时拉取；只有存在待确认项时才低频轮询。返回停止函数。 */
 export function trackExternalApprovals(): () => void {
+  disabled = false;
   void refreshExternalApprovals();
   const onChanged = () => {
     disabled = false;
     void refreshExternalApprovals();
   };
+  const onConnected = (event: Event) => {
+    if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') onChanged();
+  };
   window.addEventListener(MCP_APPROVALS_CHANGED_EVENT, onChanged);
+  window.addEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
   const clock = window.setInterval(() => { externalApprovals.now = Date.now(); }, 1000);
   const poll = window.setInterval(() => {
-    if (externalApprovals.approvals.length > 0) void refreshExternalApprovals();
+    if (externalApprovals.approvals.length > 0 || retryPending) void refreshExternalApprovals();
   }, POLL_WHILE_PENDING_MS);
   return () => {
     window.removeEventListener(MCP_APPROVALS_CHANGED_EVENT, onChanged);
+    window.removeEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
     window.clearInterval(clock);
     window.clearInterval(poll);
   };

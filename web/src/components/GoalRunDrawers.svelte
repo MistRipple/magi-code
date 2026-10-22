@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import {
     addToast,
     messagesState,
@@ -18,7 +19,7 @@
     refreshCurrentGoal,
   } from '../stores/goal-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
-  import { resolveAgentBaseUrl } from '../web/agent-api';
+  import { RUNTIME_CONNECTION_EVENT, type AgentConnectionEventDetail, resolveAgentBaseUrl } from '../web/agent-api';
   import { readStoredAccessProfile } from '../shared/access-profile';
   import { uiClockState, retainUiClock } from '../stores/ui-clock.svelte';
 
@@ -161,6 +162,16 @@
     goalRequestScope = scope;
     ensureGoalState(sessionId, workspaceId, workspacePath);
     void refreshCurrentGoal(sessionId, workspaceId, workspacePath);
+  });
+
+  onMount(() => {
+    const onConnected = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') {
+        void refreshCurrentGoal(currentSessionIdValue(), currentWorkspaceIdValue(), currentWorkspacePathValue());
+      }
+    };
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
+    return () => window.removeEventListener(RUNTIME_CONNECTION_EVENT, onConnected);
   });
 
   const hasCurrentPlan = $derived(currentPlanItems.length > 0);

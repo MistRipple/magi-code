@@ -207,6 +207,7 @@ try {
   const workspaceEnable = await post(page, `/api/plugins/${PLUGIN_ID}/enable`, { scope: `workspace:${workspaceId}` });
   check("插件全局生效：工作区作用域键被拒绝", workspaceEnable.status === 409, `${workspaceEnable.status} ${workspaceEnable.body.slice(0, 120)}`);
   await page.call("Page.reload", { ignoreCache: true });
+  await waitFor(() => exists(page, '[data-testid="input-textarea"]'), "重载后工作台就绪");
   await waitFor(() => exists(page, `[data-workspace-id="${workspaceId}"]`), "工作区进入侧栏");
   await page.evaluate(`(() => {
     const row = document.querySelector('[data-workspace-id="${workspaceId}"]');

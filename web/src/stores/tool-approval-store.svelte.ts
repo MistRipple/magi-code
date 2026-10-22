@@ -38,6 +38,7 @@ export async function syncToolApprovals(
     toolApprovalState.error = '';
     return;
   }
+  if (toolApprovalState.sessionId !== normalizedSessionId) toolApprovalState.pending = [];
   toolApprovalState.sessionId = normalizedSessionId;
   toolApprovalState.binding = binding.scope === 'workspace'
     ? {

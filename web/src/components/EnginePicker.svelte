@@ -12,7 +12,7 @@
     error = false,
     disabled = false,
     onchange,
-  } = $props<{
+  }: {
     value?: string;
     engines?: ModelEngine[];
     inheritModelLabel?: string;
@@ -21,7 +21,7 @@
     error?: boolean;
     disabled?: boolean;
     onchange: (engineId: string) => void;
-  }>();
+  } = $props();
 
   type OptionKind = 'inherit' | 'engine';
   type Option = { id: string; kind: OptionKind; engine?: ModelEngine };

@@ -36,6 +36,8 @@
   let centerPublicKey = $state('');
   let centerConfigOpen = $state(false);
   let centerSynced = false;
+  let listRequestSeq = 0;
+  let centerRequestSeq = 0;
   let guideOpen = $state(false);
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
   let staged = $state<{ candidate: PluginCandidate; preview: PluginCandidatePreview } | null>(null);
@@ -43,15 +45,20 @@
   const anyDraining = $derived(plugins.some((plugin) => plugin.draining.length > 0));
 
   async function refresh(): Promise<void> {
+    const requestSeq = ++listRequestSeq;
     const [installed, bundled] = await Promise.all([listInstalledPlugins(), listBundledPlugins()]);
+    if (requestSeq !== listRequestSeq) return;
     list = installed;
     bundledPlugins = bundled;
     await refreshCenter();
   }
 
   async function refreshCenter(): Promise<void> {
+    const requestSeq = ++centerRequestSeq;
     try {
-      center = await fetchPluginCenter();
+      const next = await fetchPluginCenter();
+      if (requestSeq !== centerRequestSeq) return;
+      center = next;
       // 只在首次读取和保存后同步输入框，避免用户正在输入时被周期刷新覆盖。
       if (!centerSynced) {
         centerSynced = true;
@@ -61,8 +68,8 @@
         centerPublicKey = key?.publicKey ?? '';
       }
     } catch (error) {
+      if (requestSeq !== centerRequestSeq) return;
       // 插件中心不可用不应阻止管理已安装插件。
-      center = null;
       message = describe(error);
     }
   }

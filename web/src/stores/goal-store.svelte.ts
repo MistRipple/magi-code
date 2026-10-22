@@ -140,7 +140,11 @@ export function applySessionPlanSnapshot(
   if (currentGoalId && incomingGoalId && currentGoalId !== incomingGoalId) {
     return false;
   }
-  if (!current.response) {
+  const currentPlan = current.response?.plan ?? null;
+  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
+    return plan === null;
+  }
+  if (!current.response || current.requestController) {
     const pending = current.pendingPlanSnapshot;
     if (
       !pending
@@ -155,12 +159,8 @@ export function applySessionPlanSnapshot(
         revision: incomingRevision,
       };
     }
-    return false;
   }
-  const currentPlan = current.response.plan ?? null;
-  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
-    return plan === null;
-  }
+  if (!current.response) return false;
   writeGoalState(key, {
     response: {
       ...mergePlanSnapshot(current.response, plan, incomingPlanId, incomingRevision),

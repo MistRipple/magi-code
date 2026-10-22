@@ -21,7 +21,7 @@
     deleteRole,
     importRole,
     exportRole,
-  } = $props<{
+  }: {
     roleTemplates: RoleTemplate[];
     registryAgents: AgentBinding[];
     registryEngines: ModelEngine[];
@@ -34,7 +34,7 @@
     deleteRole: (templateId: string, roleRevision: number) => Promise<void>;
     importRole: (content: string, conflict: 'reject' | 'overwrite' | 'rename', newId?: string) => Promise<void>;
     exportRole: (templateId: string) => Promise<void>;
-  }>();
+  } = $props();
 
   type RoleStatus = 'bound' | 'inherit' | 'error';
 

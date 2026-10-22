@@ -140,6 +140,7 @@ function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
         await new Promise((resolve) => {
           releaseSlowProjection = resolve;
         });
+        return new Response('old root removed', { status: 404 });
       }
       return jsonResponse(projectionPayload(rootTaskId));
     }
@@ -414,6 +415,12 @@ await withGoldenViteServer(async (server) => {
   const switchedState = agentRunStore.getAgentRunState(SLOW_SESSION_ID, WORKSPACE_ID);
   assert.equal(switchedState.rootTaskId, RESTARTED_ROOT_TASK_ID);
   assert.equal(switchedState.loading, false, '旧 root 请求结束后不能把新 root 留在永久 loading 状态');
+  const oldRootReads = agentRunFetches.filter((url) => url.pathname.endsWith(SLOW_ROOT_TASK_ID)).length;
+  await agentRunStore.fetchAgentRunProjection(SLOW_SESSION_ID, SLOW_ROOT_TASK_ID, WORKSPACE_ID, WORKSPACE_PATH);
+  assert.equal(
+    agentRunFetches.filter((url) => url.pathname.endsWith(SLOW_ROOT_TASK_ID)).length, oldRootReads + 1,
+    '迟到的 404 不能将过期请求结论提交为永久退休，显式重读仍须经过 daemon',
+  );
 
   agentRunStore.activateAgentRunSession(ACTION_SESSION_ID, WORKSPACE_ID, WORKSPACE_PATH);
   await agentRunStore.fetchAgentRunProjection(

@@ -1,5 +1,4 @@
 import { mount, type Component } from 'svelte';
-import App from './App.svelte';
 import './styles/global.css';
 import './styles/messages.css';
 import './styles/tool-card.css';
@@ -46,7 +45,7 @@ function installPasteDeduplication(): void {
 
 export function bootstrapApp(
   bridge: ClientBridge,
-  RootComponent: Component = App,
+  RootComponent: Component,
 ): ReturnType<typeof mount> | undefined {
   let app: ReturnType<typeof mount> | undefined;
   if (window.__MAGI_WEBVIEW_BOOTED__) {

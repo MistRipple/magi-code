@@ -10,11 +10,11 @@
     type SafeguardAuditEntry,
   } from '../web/agent-api';
 
-  let { persistenceHealthy, onCountChange } = $props<{
+  let { persistenceHealthy, onCountChange }: {
     persistenceHealthy: boolean;
     /** 加载与删除后把最新总数交回设置页，标签上的数量随之更新。 */
     onCountChange: (count: number) => void;
-  }>();
+  } = $props();
 
   let entries = $state<SafeguardAuditEntry[]>([]);
   let total = $state(0);

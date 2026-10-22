@@ -1214,6 +1214,40 @@ await withGoldenViteServer(async (server) => {
   const recoveredStream = FakeEventSource.instances.at(-1);
   recoveredStream.onopen?.();
 
+  // 不打开后台工作区，也必须更新其目录；突发通知按工作区合并。
+  const directoryWorkspaceId = 'workspace-never-opened';
+  const directorySessionId = 'session-never-opened';
+  const directoryRequestsBefore = workspaceSessionsRequestCount;
+  const directoryBootstrapBefore = bootstrapRequestCount;
+  const foregroundBindingBefore = messagesStore.messagesState.currentWorkspaceId;
+  workspaceSessionsInterceptors.push(() => jsonResponse({
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    workspace: { workspaceId: directoryWorkspaceId, rootPath: '/tmp/never-opened' },
+    sessions: [{ sessionId: directorySessionId, title: '后台新标题', createdAt: ACCEPTED_AT,
+      updatedAt: ACCEPTED_AT + 1, messageCount: 2, isRunning: false, hasUnreadCompletion: true }],
+  }));
+  for (let i = 0; i < 3; i += 1) {
+    recoveredStream.onmessage?.({ data: JSON.stringify({
+      event_id: `directory-event-${i}`, event_type: 'session.directory.changed', category: 'domain',
+      sequence: 0, occurred_at: ACCEPTED_AT, workspace_id: directoryWorkspaceId,
+      session_id: directorySessionId, payload: { scope: 'workspace', workspace_id: directoryWorkspaceId },
+    }) });
+  }
+  await waitFor(() => messagesStore.messagesState.workspaceSessionProjections[directoryWorkspaceId]
+    ?.sessions.some((session) => session.id === directorySessionId), '未打开工作区应接收目录变化');
+  assert.equal(workspaceSessionsRequestCount, directoryRequestsBefore + 1, '同工作区突发通知应合并请求');
+  assert.equal(bootstrapRequestCount, directoryBootstrapBefore, '目录通知不得重载当前会话');
+  assert.equal(messagesStore.messagesState.currentWorkspaceId, foregroundBindingBefore, '后台刷新不得改变当前导航');
+  assert.equal(messagesStore.messagesState.workspaceSessionProjection.workspaceId, foregroundBindingBefore,
+    '后台目录不得替换前台投影');
+  const directoryProjection = messagesStore.messagesState.workspaceSessionProjections[directoryWorkspaceId];
+  assert.equal(directoryProjection.sessions[0].name, '后台新标题');
+  assert.equal(directoryProjection.sessions[0].hasUnreadCompletion, true);
+  assert.equal(messagesStore.replaceWorkspaceSessionProjection(directoryWorkspaceId, [], {
+    runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE - 1,
+  }, { mirrorCurrentProjection: false }), false, '旧快照不得清除后台新目录');
+
   const liveAcceptedRequestId = 'request-live-accepted';
   const liveAcceptedResponse = deferred();
   sessionTurnInterceptors.push(() => liveAcceptedResponse.promise);

@@ -4,6 +4,8 @@
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
+    RUNTIME_CONNECTION_EVENT,
+    type AgentConnectionEventDetail,
     listAgentDirectory,
     resolveAgentFileRevealTarget,
     type WorkspaceDirectoryEntry as DirectoryEntry,
@@ -29,6 +31,7 @@
   let treeElement = $state<HTMLElement | null>(null);
   let treeGeneration = 0;
   let selectionGeneration = 0;
+  const directoryRequests = new Map<string, { promise: Promise<void>; refreshQueued: boolean }>();
   const ROOT_DIRECTORY_KEY = '__workspace_root__';
 
   const rootEntries = $derived(dirCache.get(ROOT_DIRECTORY_KEY) ?? []);
@@ -54,6 +57,7 @@
 
   function resetTree(nextTreeKey = currentTreeKey()): void {
     treeGeneration += 1;
+    directoryRequests.clear();
     selectionGeneration += 1;
     loadedTreeKey = nextTreeKey;
     expandedDirPaths = new Set();
@@ -120,47 +124,49 @@
     });
   }
 
-  async function loadDirectory(pathRef?: string, options: { force?: boolean } = {}): Promise<void> {
+  function loadDirectory(pathRef?: string, options: { force?: boolean } = {}): Promise<void> {
     const cacheKey = pathRef || ROOT_DIRECTORY_KEY;
-    if (loadingDirPaths.has(cacheKey)) {
-      return;
+    const existing = directoryRequests.get(cacheKey);
+    if (existing) {
+      existing.refreshQueued ||= options.force === true;
+      return existing.promise;
     }
-    if (!options.force && dirCache.has(cacheKey)) {
-      return;
-    }
+    if (!options.force && dirCache.has(cacheKey)) return Promise.resolve();
 
     const requestGeneration = treeGeneration;
     const requestTreeKey = loadedTreeKey;
     const requestWorkspaceId = workspaceId;
+    const isCurrent = () => requestGeneration === treeGeneration && requestTreeKey === loadedTreeKey;
+    const entry = { promise: Promise.resolve(), refreshQueued: false };
     loadingDirPaths = new Set(loadingDirPaths).add(cacheKey);
-    const nextErrors = new Map(dirErrors);
-    nextErrors.delete(cacheKey);
-    dirErrors = nextErrors;
-
-    try {
-      const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId);
-      if (requestGeneration !== treeGeneration || requestTreeKey !== loadedTreeKey) {
-        return;
-      }
-      const entries = [...(result.entries ?? [])].sort(compareEntries);
-      const nextCache = new Map(dirCache);
-      nextCache.set(cacheKey, entries);
-      dirCache = nextCache;
-    } catch (error) {
-      if (requestGeneration !== treeGeneration || requestTreeKey !== loadedTreeKey) {
-        return;
-      }
-      console.warn('[ProjectFileTree] directory load failed:', error);
-      const nextErrorMap = new Map(dirErrors);
-      nextErrorMap.set(cacheKey, i18n.t('web.projectFilesLoadFailed'));
-      dirErrors = nextErrorMap;
-    } finally {
-      if (requestGeneration === treeGeneration && requestTreeKey === loadedTreeKey) {
-        const nextLoading = new Set(loadingDirPaths);
-        nextLoading.delete(cacheKey);
-        loadingDirPaths = nextLoading;
-      }
-    }
+    entry.promise = (async () => {
+      do {
+        entry.refreshQueued = false;
+        const nextErrors = new Map(dirErrors);
+        nextErrors.delete(cacheKey);
+        dirErrors = nextErrors;
+        try {
+          const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId);
+          if (!isCurrent()) return;
+          // 读取期间发生刷新或切换隐藏文件条件时，先补读，不能提交已过期的结果。
+          if (entry.refreshQueued) continue;
+          dirCache = new Map(dirCache).set(cacheKey, [...(result.entries ?? [])].sort(compareEntries));
+        } catch (error) {
+          if (!isCurrent()) return;
+          if (entry.refreshQueued) continue;
+          console.warn('[ProjectFileTree] directory load failed:', error);
+          dirErrors = new Map(dirErrors).set(cacheKey, i18n.t('web.projectFilesLoadFailed'));
+        }
+      } while (entry.refreshQueued && isCurrent());
+    })().finally(() => {
+      if (!isCurrent()) return;
+      if (directoryRequests.get(cacheKey) === entry) directoryRequests.delete(cacheKey);
+      const nextLoading = new Set(loadingDirPaths);
+      nextLoading.delete(cacheKey);
+      loadingDirPaths = nextLoading;
+    });
+    directoryRequests.set(cacheKey, entry);
+    return entry.promise;
   }
 
   function compareEntries(a: DirectoryEntry, b: DirectoryEntry): number {
@@ -201,8 +207,17 @@
   // 工作区内容变更（如切分支）后刷新文件树，避免停留在旧分支的目录结构。
   onMount(() => {
     const handleWorkspaceContentChanged = () => void refresh();
+    const handleConnected = (event: Event) => {
+      if ((event as CustomEvent<AgentConnectionEventDetail>).detail?.status === 'connected') void refresh();
+    };
     window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
-    return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+    window.addEventListener('focus', handleWorkspaceContentChanged);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
+    return () => {
+      window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+      window.removeEventListener('focus', handleWorkspaceContentChanged);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleConnected);
+    };
   });
 
   // 隐藏文件开关变化时按新条件重读，展开状态不丢。

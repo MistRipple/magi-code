@@ -46,7 +46,7 @@
     updateAllSkills,
     rollbackSkill,
     deleteSkill
-  } = $props<{
+  }: {
     mcpServers: any[];
     mcpServersHydrated: boolean;
     mcpServersLoading: boolean;
@@ -110,7 +110,7 @@
     updateAllSkills: () => void | Promise<void>;
     rollbackSkill: (skillId: string) => void | Promise<void>;
     deleteSkill: (skill: any) => void;
-  }>();
+  } = $props();
 
   function getSkillSourceLabel(skill: any): string {
     if (skill.origin === 'repository') return i18n.t('settings.tools.skillSourceRepository');

@@ -96,5 +96,27 @@ await withGoldenViteServer(async (server) => {
   assert.equal(posted[1].type, 'resolveNotification');
   assert.equal(posted[1].notificationId, 'incident-runtime-1');
 
+  notifications.reportIncident('后台工作区加载失败', {
+    scope: 'workspace',
+    context: { workspaceId: 'background-workspace', workspacePath: '/tmp/background-workspace' },
+  });
+  assert.equal(posted.at(-1).incident.workspaceId, 'background-workspace');
+  assert.equal(posted.at(-1).incident.sessionId, undefined, '后台目录错误不能借用当前会话');
+  notifications.reportIncident('全局设置加载失败', { scope: 'app', context: {} });
+  assert.equal(posted.at(-1).incident.workspaceId, undefined);
+  assert.equal(posted.at(-1).incident.sessionId, undefined);
+
+  const { runActionWithFeedback } = await server.ssrLoadModule('/src/lib/action-feedback.ts');
+  let rejectAction;
+  const action = runActionWithFeedback(() => new Promise((_, reject) => { rejectAction = reject; }), {
+    actionLabel: '读取文件',
+  });
+  store.messagesState.currentWorkspaceId = 'next-workspace';
+  store.messagesState.currentSessionId = 'next-session';
+  rejectAction(new Error('original operation failed'));
+  await action;
+  assert.equal(posted.at(-1).incident.workspaceId, 'workspace-notification-runtime');
+  assert.equal(posted.at(-1).incident.sessionId, 'session-notification-runtime', '异步错误保留操作发起时的归属');
+
   console.log('notification runtime golden passed');
 });

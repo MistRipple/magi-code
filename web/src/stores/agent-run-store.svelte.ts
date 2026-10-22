@@ -390,6 +390,13 @@ export async function fetchAgentRunProjection(
       }
     }
   } catch (err) {
+    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
+    if (
+      latestState.fetchGeneration !== fetchGeneration
+      || latestState.rootTaskId !== rootTaskId
+    ) {
+      return;
+    }
     terminalProjectionLoadError = isTerminalProjectionLoadError(err);
     if (terminalProjectionLoadError) {
       retiredSessionRootIds.add(sessionRootKey(normalizedWorkspaceId, normalizedSessionId, rootTaskId));
@@ -406,13 +413,6 @@ export async function fetchAgentRunProjection(
       return;
     }
     console.warn('[agent-run-store] agent run projection refresh failed:', err);
-    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
-    if (
-      latestState.fetchGeneration !== fetchGeneration
-      || latestState.rootTaskId !== rootTaskId
-    ) {
-      return;
-    }
     latestState.error = 'load_failed';
   } finally {
     clearTimeout(timeout);

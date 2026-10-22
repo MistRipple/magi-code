@@ -10,13 +10,13 @@
     conversationDisplayMode,
     conversationDisplaySaveStatus,
     saveConversationDisplayMode,
-  } = $props<{
+  }: {
     userRules: string;
     userRulesSaveStatus: string;
     conversationDisplayMode: ConversationDisplayMode;
     conversationDisplaySaveStatus: 'idle' | 'saving' | 'saved' | 'error';
     saveConversationDisplayMode: (mode: ConversationDisplayMode) => void;
-  }>();
+  } = $props();
 
   const userRulesStatusText = $derived.by(() => {
     switch (userRulesSaveStatus) {

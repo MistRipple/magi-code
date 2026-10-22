@@ -21,6 +21,7 @@ import {
   type AgentBindingOverride,
   type WorkspaceAgentBindingOverride,
 } from '../../web/agent-binding-context';
+import { PLUGIN_REGISTRY_CHANGED_EVENT } from '../../web/plugin-api';
 import { i18n } from '../../stores/i18n.svelte';
 import { DEFAULT_LOCALE, isSupportedLocale } from '../../i18n/locales';
 import type { PluginSelection, SessionTurnCommand, TurnStartParams } from '../app-server-protocol.generated';
@@ -1672,7 +1673,9 @@ function scheduleSessionSummaryRefresh(
         ? getWorkspaceSessions(refreshTarget.workspaceId, refreshTarget.workspacePath)
         : getPersonalSessions();
       void request.then((snapshot) => {
+        if (snapshot.runtimeEpoch !== currentRuntimeEpoch) return;
         emitDataMessage('sessionsUpdated', {
+          allowRuntimeEpochChange: true,
           ...(refreshTarget.scope === 'workspace' ? { workspaceId: refreshTarget.workspaceId } : {}),
           sessions: snapshot.sessions,
           runtimeEpoch: snapshot.runtimeEpoch,
@@ -1907,6 +1910,23 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   advanceEventStreamCursorFromEvent(event);
+
+  if (eventType === 'plugin.registry.changed') {
+    window.dispatchEvent(new Event(PLUGIN_REGISTRY_CHANGED_EVENT));
+    return;
+  }
+  if (eventType === 'workspace.registry.changed') {
+    window.dispatchEvent(new Event('magi:workspaceRegistryChanged'));
+    return;
+  }
+
+  if (eventType === 'session.directory.changed') {
+    const workspaceId = rustEventWorkspaceId(event);
+    scheduleSessionSummaryRefresh(eventType, workspaceId
+      ? { scope: 'workspace', key: `workspace:${workspaceId}`, workspaceId, workspacePath: '' }
+      : { scope: 'personal', key: 'personal' });
+    return;
+  }
 
   // 外部会话有变化（不属于当前工作区的事件流过滤）：转成窗口事件，侧栏据此刷新外部客户端入口。
   if (eventType === 'mcp.activity') {
@@ -2370,6 +2390,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
     if (eventType === 'task.status.changed' && event.payload) {
       emitDataMessage('taskStatusChanged', {
+        sessionId: rustEventSessionId(event),
+        workspaceId: rustEventWorkspaceId(event),
+        workspacePath: trimBridgeString(event.payload.workspace_path),
         taskId: event.payload.task_id ?? '',
         rootTaskId: event.payload.root_task_id ?? '',
         title: event.payload.title ?? '',
@@ -5512,7 +5535,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'reportIncident':
           if (message.incident && typeof message.incident === 'object') {
             const incident = message.incident as Record<string, unknown>;
-            const scope = resolveNotificationOperationScope(incident);
+            const scope = resolveNotificationOperationScope(incident) ?? (incident.scope === 'app' ? {} : null);
             if (scope) {
               void reportIncident(scope, incident).catch((error) => {
                 if (isSessionMissingError(error)) return;

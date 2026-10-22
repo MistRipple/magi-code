@@ -16,7 +16,7 @@
 
 ## 本地定向回归
 
-- Web：`npm --prefix web run check` 和 web/package.json 中对应的 `test:*`。`test:transport` 包括实时传输、App Server 客户端与滚动协调回归。
+- Web：`npm --prefix web run check` 和 web/package.json 中对应的 `test:*`。`test:transport` 包括实时传输、App Server 客户端、滚动协调和数据加载恢复回归；`test:data-loading` 单独验证临时失败、旧请求、插件修订失效和交互作用域切换。`test:notification-runtime` 覆盖后台目录、全局错误与切换会话后的异步错误归属。
 - Desktop：`npm run check --workspace @magi/desktop`、`npm run test --workspace @magi/desktop`。
 - Worker：`npm run check --workspace @magi/browser-automation-worker`、`npm run test --workspace @magi/browser-automation-worker`。
 - Rust：`cargo check -p <package>` 和受影响的测试目标。Git 工作流用 `cargo test -p magi-git --test workflow`，在临时本地仓库验证分支/worktree，不依赖开发者路径或远端仓库。
@@ -29,6 +29,7 @@
 
 | 入口 | 覆盖范围与前置条件 |
 | --- | --- |
+| `npm run test:data-loading-live` | 构建 Web、独立 daemon 和 Chromium、本地 Provider；验证折叠工作区目录预取、慢目录不阻塞、临时失败重试、后台会话更新、跨客户端工作区变化、daemon 重启恢复、文件树加载途中切换隐藏文件补读，以及设置页重新显示/focus 刷新、迟到响应隔离与未保存草稿保留；不接管用户已有进程 |
 | `npm run test:electron-browser-viewport` | 已打包 Electron、独立状态根与本地 Provider；真实 AI 工具验证固定/自适应视口、窄电脑/手机横屏、DPR/触控、缩放点击、光标常驻/导航/折叠恢复、拖动与网页点击接管后自适应、交还、320px 工具栏/菜单边界和后台页面不改布局 |
 | `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
 | `npm run test:electron-cursor-presentation` | 从当前 Main、Worker 和 Svelte 光标源码启动真实 Electron guest；验证移动完成确认先于原生点击和输入框焦点、原地点击、隐藏/减少动态效果，以及移动途中用户接管、取消、导航和迟到确认；使用本地测试页与独立临时状态目录，需要本机图形环境 |

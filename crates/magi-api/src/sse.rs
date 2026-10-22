@@ -156,14 +156,16 @@ fn event_envelope_stream(
     );
     let snapshot_gap_recovery = snapshot_gap_skipped_count(&snapshot, after_sequence)
         .map(|skipped| lagged_recovery_event(skipped, &snapshot_scope));
-    let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
-        after_sequence.is_none_or(|sequence| event.sequence > sequence)
-            && event_matches_scope(
-                &snapshot_state,
-                event,
-                &snapshot_scope,
-                snapshot_session_id.as_ref(),
-            )
+    let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter_map(move |event| {
+        if after_sequence.is_some_and(|sequence| event.sequence <= sequence) {
+            return None;
+        }
+        event_for_scope(
+            &snapshot_state,
+            event,
+            &snapshot_scope,
+            snapshot_session_id.as_ref(),
+        )
     }));
     let live_stream = BroadcastStream::new(receiver)
         .take_while(|event| {
@@ -179,16 +181,15 @@ fn event_envelope_stream(
             async move {
                 match event {
                     Ok(envelope) => {
-                        let matches_sequence =
-                            after_sequence.is_none_or(|sequence| envelope.sequence > sequence);
-                        (matches_sequence
-                            && event_matches_scope(
-                                &live_state,
-                                &envelope,
-                                &live_scope,
-                                live_session_id.as_ref(),
-                            ))
-                        .then_some(envelope)
+                        if after_sequence.is_some_and(|sequence| envelope.sequence <= sequence) {
+                            return None;
+                        }
+                        event_for_scope(
+                            &live_state,
+                            envelope,
+                            &live_scope,
+                            live_session_id.as_ref(),
+                        )
                     }
                     Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                         Some(lagged_recovery_event(skipped, &live_scope))
@@ -333,6 +334,70 @@ fn snapshot_gap_skipped_count(
     }
 }
 
+// 未订阅的会话只投递目录失效通知，不扩大正文、工具或任务事件的订阅范围。
+fn event_for_scope(
+    state: &ApiState,
+    event: EventEnvelope,
+    scope: &EventStreamScope,
+    session_id: Option<&SessionId>,
+) -> Option<EventEnvelope> {
+    if event_matches_scope(state, &event, scope, session_id) {
+        Some(event)
+    } else {
+        session_directory_invalidation(state, &event)
+    }
+}
+
+/// SSE 和 App Server 共用的侧栏通知投影；保留原事件序号，快照与实时流采用同一规则。
+pub(crate) fn session_directory_invalidation(
+    state: &ApiState,
+    event: &EventEnvelope,
+) -> Option<EventEnvelope> {
+    if !matches!(
+        event.event_type.as_str(),
+        "session.turn.task.accepted"
+            | "session.turn.conversation.accepted"
+            | "session.turn.steered"
+            | "session.turn.queued"
+            | "session.turn.completed"
+            | "session.turn.failed"
+            | "session.turn.interrupted"
+            | "session.turn.superseded"
+            | "session.turn.queue_failed"
+            | "session.title.updated"
+            | "session.deleted"
+            | "session.closed"
+            | "session.viewed"
+            | "message.created"
+    ) {
+        return None;
+    }
+    let session_id = event_session_id(event)?;
+    let workspace_id = event
+        .workspace_id
+        .clone()
+        .or_else(|| event_payload_workspace_id(event).map(WorkspaceId::new))
+        .or_else(|| event_session_workspace_id(state, event));
+    let payload = serde_json::json!({
+        "scope": if workspace_id.is_some() { "workspace" } else { "personal" },
+        "workspace_id": workspace_id.as_ref().map(WorkspaceId::as_str),
+        "session_id": session_id.as_str(),
+    });
+    Some(EventEnvelope {
+        event_type: "session.directory.changed".to_string(),
+        workspace_id,
+        session_id: Some(session_id),
+        mission_id: None,
+        assignment_id: None,
+        task_id: None,
+        payload,
+        event_id: event.event_id.clone(),
+        category: event.category,
+        occurred_at: event.occurred_at,
+        sequence: event.sequence,
+    })
+}
+
 fn event_matches_scope(
     state: &ApiState,
     event: &EventEnvelope,
@@ -405,7 +470,10 @@ fn event_session_workspace_id(state: &ApiState, event: &EventEnvelope) -> Option
 pub(crate) fn event_is_user_global(event: &EventEnvelope) -> bool {
     matches!(
         event.event_type.as_str(),
-        "model.context_window.updated" | "mcp.activity"
+        "model.context_window.updated"
+            | "mcp.activity"
+            | "plugin.registry.changed"
+            | "workspace.registry.changed"
     ) || (matches!(
         event.event_type.as_str(),
         "tool.approval.requested" | "tool.approval.resolved"
@@ -662,6 +730,88 @@ mod tests {
                 Some(&SessionId::new("session-a"))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn background_session_directory_changes_reach_snapshot_and_live_stream_without_content() {
+        let state = test_state_with_event_capacity(32);
+        for (sequence, event_type) in [
+            "session.turn.task.accepted",
+            "session.title.updated",
+            "session.turn.completed",
+            "session.turn.failed",
+            "session.turn.interrupted",
+            "session.turn.superseded",
+            "session.turn.queue_failed",
+            "session.viewed",
+            "session.closed",
+            "session.deleted",
+            "message.created",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.event_bus.publish(EventEnvelope::domain(
+                EventId::new(format!("directory-{sequence}")), event_type,
+                json!({"workspace_id": "workspace-b", "session_id": "session-b", "text": "private content"}),
+            ));
+        }
+        let snapshot = state.event_bus.snapshot();
+        let mut events = Box::pin(event_envelope_stream(
+            state.clone(),
+            EventStreamScope::Workspace(workspace_id("workspace-a")),
+            Some(SessionId::new("session-a")),
+            None,
+        ));
+        for stored in &snapshot.recent_events {
+            let event = events.next().await.expect("background directory snapshot");
+            assert_eq!(event.event_type, "session.directory.changed");
+            assert_eq!(event.sequence, stored.sequence);
+            assert_eq!(
+                event.payload,
+                json!({"scope": "workspace", "workspace_id": "workspace-b", "session_id": "session-b"})
+            );
+            assert!(event.task_id.is_none());
+        }
+        // 正文和任务事件仍被过滤；个人会话与同工作区其他会话也产生轻量通知。
+        state.event_bus.publish(EventEnvelope::domain(
+            EventId::new("private-item"),
+            "session.turn.item",
+            json!({"session_id": "session-b", "text": "private content"}),
+        ));
+        state.event_bus.publish(EventEnvelope::domain(
+            EventId::new("personal-directory"),
+            "session.deleted",
+            json!({"session_id": "personal-session"}),
+        ));
+        let live = events.next().await.expect("live directory change");
+        assert_eq!(live.payload["scope"], "personal");
+        assert_eq!(live.event_type, "session.directory.changed");
+        assert_eq!(
+            state.event_bus.snapshot().recent_events[0].event_type,
+            "session.turn.task.accepted"
+        );
+
+        let personal = EventStreamScope::Personal;
+        let mut same_workspace = snapshot.recent_events[0].clone();
+        same_workspace.workspace_id = Some(workspace_id("workspace-a"));
+        assert_eq!(
+            event_for_scope(&state, same_workspace.clone(), &personal, None)
+                .unwrap()
+                .event_type,
+            "session.directory.changed"
+        );
+        assert_eq!(
+            event_for_scope(
+                &state,
+                same_workspace,
+                &EventStreamScope::Workspace(workspace_id("workspace-a")),
+                Some(&SessionId::new("session-a"))
+            )
+            .unwrap()
+            .event_type,
+            "session.directory.changed"
+        );
     }
 
     #[test]
