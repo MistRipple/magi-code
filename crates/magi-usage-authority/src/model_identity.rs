@@ -7,7 +7,7 @@ use crate::types::{
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    magi_core::hex_lower(hasher.finalize())
 }
 
 pub fn canonicalize_base_url(base_url: &str) -> String {

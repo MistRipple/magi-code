@@ -1970,7 +1970,7 @@ fn latest_session_usage_observation(
 fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {
     let serialized = serde_json::to_vec(history).unwrap_or_default();
     let digest = Sha256::digest(serialized);
-    format!("{digest:x}")
+    magi_core::hex_lower(digest)
 }
 
 /// 按当前请求模型的窗口判断是否需要主动压缩。

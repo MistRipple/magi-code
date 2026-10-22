@@ -123,7 +123,7 @@ impl PluginPackage {
         }
         Ok(Self {
             manifest,
-            digest: format!("{:x}", Sha256::digest(bytes)),
+            digest: magi_core::hex_lower(Sha256::digest(bytes)),
             archive: bytes.to_vec(),
             files,
         })

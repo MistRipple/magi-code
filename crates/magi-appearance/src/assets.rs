@@ -49,7 +49,7 @@ impl AppearanceAssetStore {
         if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
             return Err("背景图像素尺寸超出 3200 万像素限制".to_string());
         }
-        let asset_id = format!("{:x}", Sha256::digest(bytes));
+        let asset_id = magi_core::hex_lower(Sha256::digest(bytes));
         let path = self.root.join(format!("{asset_id}.{extension}"));
         if !path.exists() {
             magi_core::fs_atomic::write_atomic(&path, bytes)

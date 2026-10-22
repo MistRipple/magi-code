@@ -604,7 +604,7 @@ fn verify_binary(
         });
     }
     if !metadata.sha256.is_empty() {
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = magi_core::hex_lower(Sha256::digest(bytes));
         if actual != metadata.sha256 {
             return Err(BrowserHostClientError::BinaryHashMismatch);
         }

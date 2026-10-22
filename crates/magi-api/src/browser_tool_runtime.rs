@@ -575,7 +575,7 @@ impl BrowserToolRuntimeDependencies {
                     magi_browser_authority::BrowserScreenshotFormat::Webp => "webp",
                 };
                 let path = self.persist_artifact(session_id, call_id, &bytes, extension)?;
-                let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                let sha256 = magi_core::hex_lower(Sha256::digest(&bytes));
                 Ok(json!({ "tool": tool_name, "status": "succeeded", "path": path, "mime": metadata.mime_type, "bytes": bytes.len(), "sha256": sha256 }).to_string())
             }
             _ => Err(BrowserToolError::new(
@@ -2674,7 +2674,7 @@ fn validate_screenshot_binary(
             bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
         ),
     };
-    let digest = format!("{:x}", Sha256::digest(bytes));
+    let digest = magi_core::hex_lower(Sha256::digest(bytes));
     if metadata.mime_type != mime
         || metadata.byte_length != bytes.len() as u64
         || metadata.sha256 != digest
@@ -4178,7 +4178,7 @@ mod tests {
             payload_id: "payload-1".to_string(),
             mime_type: "image/png".to_string(),
             byte_length: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: magi_core::hex_lower(Sha256::digest(&bytes)),
         };
         validate_screenshot_binary(
             &magi_browser_authority::BrowserScreenshotFormat::Png,

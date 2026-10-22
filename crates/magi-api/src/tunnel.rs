@@ -567,7 +567,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
         }
         hasher.update(&buffer[..read]);
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = magi_core::hex_lower(hasher.finalize());
     if constant_time_eq(&actual, expected) {
         Ok(())
     } else {
@@ -587,7 +587,7 @@ fn derive_site_preview_token(secret: &str, workspace_id: &str) -> String {
     hasher.update(secret.as_bytes());
     hasher.update(b"\0");
     hasher.update(workspace_id.as_bytes());
-    format!("{:x}", hasher.finalize())
+    magi_core::hex_lower(hasher.finalize())
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {

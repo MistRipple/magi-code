@@ -908,7 +908,10 @@ fn validate_plugin_path(plugin: &InstalledPlugin) -> Result<(), PluginError> {
 fn missing_package_record_path(root: &Path, id: &str) -> PathBuf {
     use sha2::Digest;
     let key = sha2::Sha256::digest(id.as_bytes());
-    root.join(format!("missing-package-{key:x}.json"))
+    root.join(format!(
+        "missing-package-{}.json",
+        magi_core::hex_lower(key)
+    ))
 }
 
 fn stage_package_for_removal(path: &Path) -> Result<PathBuf, PluginError> {

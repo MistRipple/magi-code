@@ -1,4 +1,5 @@
 pub mod agent;
+mod encoding;
 pub mod errors;
 pub mod execution;
 pub mod executor_receipt;
@@ -20,6 +21,7 @@ pub use agent::{
     AGENT_OPERATION_ID_MAX_CHARS, AgentActivation, AgentLifetime, AgentRunOwner, AgentRunTransfer,
     agent_operation_id_is_valid,
 };
+pub use encoding::hex_lower;
 pub use errors::{DomainError, DomainResult, GoalRejection};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
 pub use executor_receipt::{

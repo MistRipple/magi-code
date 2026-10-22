@@ -65,7 +65,7 @@ pub fn export_theme_package(
             .map(|(path, bytes)| ManifestFile {
                 path: path.clone(),
                 bytes: bytes.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(bytes)),
+                sha256: magi_core::hex_lower(Sha256::digest(bytes)),
             })
             .collect(),
     };
@@ -155,7 +155,7 @@ pub fn import_theme_package(bytes: &[u8]) -> Result<ImportedThemePackage, String
             .get(&file.path)
             .ok_or_else(|| "主题包文件缺失".to_string())?;
         if content.len() as u64 != file.bytes
-            || format!("{:x}", Sha256::digest(content)) != file.sha256
+            || magi_core::hex_lower(Sha256::digest(content)) != file.sha256
         {
             return Err(format!("主题包文件校验失败: {}", file.path));
         }
@@ -192,7 +192,7 @@ pub fn import_theme_package(bytes: &[u8]) -> Result<ImportedThemePackage, String
             let asset = payloads
                 .get(asset_path)
                 .ok_or_else(|| "主题包背景资源缺失".to_string())?;
-            if format!("{:x}", Sha256::digest(asset)) != wallpaper.asset_id {
+            if magi_core::hex_lower(Sha256::digest(asset)) != wallpaper.asset_id {
                 return Err("主题包背景资源身份校验失败".to_string());
             }
         }

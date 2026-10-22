@@ -469,7 +469,7 @@ fn fingerprint(value: &impl serde::Serialize) -> Result<String, BridgeClientErro
     // 转 Value 后按 key 排序，消除 HashMap 插入顺序对请求身份的影响。
     let value = serde_json::to_value(value).map_err(journal_error)?;
     let bytes = serde_json::to_vec(&value).map_err(journal_error)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(magi_core::hex_lower(Sha256::digest(bytes)))
 }
 
 pub(crate) fn root_input_request_id(

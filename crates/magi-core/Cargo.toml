@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64.workspace = true
 dunce.workspace = true
 serde.workspace = true
 serde_json.workspace = true

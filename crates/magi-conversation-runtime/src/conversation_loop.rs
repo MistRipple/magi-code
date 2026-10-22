@@ -4057,7 +4057,10 @@ fn task_tool_turn_item_id(context: TaskTurnWritebackContext<'_>, call: &ChatTool
     // Provider 只保证响应内的 call id；不同 Task/Step 复用 ID 不能覆盖先前执行事实。
     let identity = serde_json::to_vec(&(&context.task.task_id, context.model_step_id, &call.id))
         .expect("tool item identity is serializable");
-    format!("turn-item-tool-{:x}", Sha256::digest(identity))
+    format!(
+        "turn-item-tool-{}",
+        magi_core::hex_lower(Sha256::digest(identity))
+    )
 }
 
 fn append_task_tool_call_started_turn_item(

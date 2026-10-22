@@ -17855,30 +17855,24 @@ done
             })
             .collect::<Vec<_>>();
         use sha2::Digest;
-        let first_request_hash = format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                serde_json::to_vec(&serde_json::json!({
-                    "request": requests[0], "maxOutputTokens": null,
-                    "executorCapabilities": harness.provider.executor_capabilities(),
-                    "purpose": magi_session_store::ModelStepPurpose::Execution,
-                    "executionScope": scope_values[0],
-                }))
-                .unwrap()
-            )
-        );
-        let second_request_hash = format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                serde_json::to_vec(&serde_json::json!({
-                    "request": requests[1], "maxOutputTokens": null,
-                    "executorCapabilities": harness.provider.executor_capabilities(),
-                    "purpose": magi_session_store::ModelStepPurpose::Execution,
-                    "executionScope": scope_values[1],
-                }))
-                .unwrap()
-            )
-        );
+        let first_request_hash = magi_core::hex_lower(sha2::Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "request": requests[0], "maxOutputTokens": null,
+                "executorCapabilities": harness.provider.executor_capabilities(),
+                "purpose": magi_session_store::ModelStepPurpose::Execution,
+                "executionScope": scope_values[0],
+            }))
+            .unwrap(),
+        ));
+        let second_request_hash = magi_core::hex_lower(sha2::Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "request": requests[1], "maxOutputTokens": null,
+                "executorCapabilities": harness.provider.executor_capabilities(),
+                "purpose": magi_session_store::ModelStepPurpose::Execution,
+                "executionScope": scope_values[1],
+            }))
+            .unwrap(),
+        ));
         assert_eq!(root_step.request_fingerprint, first_request_hash);
         assert_eq!(steer_step.request_fingerprint, second_request_hash);
         assert_eq!(terminal.model_steps.len(), requests.len());

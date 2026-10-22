@@ -360,11 +360,11 @@ pub(crate) fn project_agent_continuation(
         workspace_id: scope.workspace_id().map(|id| id.to_string()),
         workspace_path: scope.workspace_path(),
         operation_id: format!(
-            "agent-continue-ui-{:x}",
-            Sha256::digest(
+            "agent-continue-ui-{}",
+            magi_core::hex_lower(Sha256::digest(
                 serde_json::to_vec(&(&task.task_id, &turn.turn_id, identity.generation))
                     .expect("continue identity serializes")
-            )
+            ))
         ),
         task_id: task.task_id.to_string(),
         expected_generation: identity.generation,
@@ -683,8 +683,10 @@ pub(crate) fn project_agent_transfer(
     // 同一份控制建议使用稳定幂等身份；刷新或丢失响应后重试不会变成新转交。
     use sha2::{Digest, Sha256};
     request.operation_id = format!(
-        "agent-transfer-ui-{:x}",
-        Sha256::digest(serde_json::to_vec(&request).expect("wire request serializable"))
+        "agent-transfer-ui-{}",
+        magi_core::hex_lower(Sha256::digest(
+            serde_json::to_vec(&request).expect("wire request serializable")
+        ))
     );
     let Ok(source) = read_transfer_source(state, &scope.session_id, &request) else {
         return unavailable("source_unavailable");

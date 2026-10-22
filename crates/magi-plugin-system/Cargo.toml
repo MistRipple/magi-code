@@ -17,7 +17,7 @@ zip.workspace = true
 base64.workspace = true
 ring = "0.17"
 semver = "1"
-jsonschema = { version = "0.58.6", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 
 [dev-dependencies]
 magi-process = { path = "../magi-process" }

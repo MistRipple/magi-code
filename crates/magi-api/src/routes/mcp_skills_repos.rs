@@ -713,7 +713,7 @@ fn read_skill_directory_metadata(dir: &Path) -> Result<SkillDirectoryMetadata, A
                 .ok()
                 .map(|duration| duration.as_millis() as u64)
         }),
-        content_hash: format!("{:x}", hasher.finalize()),
+        content_hash: magi_core::hex_lower(hasher.finalize()),
     })
 }
 

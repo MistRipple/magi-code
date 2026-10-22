@@ -33,7 +33,7 @@ pub fn extract_symbols(file_path: &str, content: &str, ext: &str) -> Option<Vec<
     let mut out: Vec<SymbolEntry> = Vec::new();
     let mut matches = cursor.matches(&query, tree.root_node(), bytes);
     while let Some(m) = matches.next() {
-        for cap in m.captures {
+        for cap in m.captures() {
             let cap_name = capture_names[cap.index as usize];
             let Some(kind) = kind_for_capture(cap_name) else {
                 continue;
@@ -238,6 +238,52 @@ mod tests {
             syms.iter()
                 .any(|s| s.name == "fetch" && s.kind == SymbolKind::Method)
         );
+    }
+
+    #[test]
+    fn extracts_symbols_from_upgraded_language_grammars() {
+        let cases = [
+            (
+                ".js",
+                "export function loadUser() {}",
+                "loadUser",
+                SymbolKind::Function,
+            ),
+            (
+                ".jsx",
+                "function UserView() { return <div />; }",
+                "UserView",
+                SymbolKind::Function,
+            ),
+            (
+                ".tsx",
+                "export function TypedView() { return <div />; }",
+                "TypedView",
+                SymbolKind::Function,
+            ),
+            (
+                ".py",
+                "class UserService:\n    def load_user(self):\n        pass\n",
+                "UserService",
+                SymbolKind::Class,
+            ),
+            (
+                ".go",
+                "package main\nfunc LoadUser() {}\n",
+                "LoadUser",
+                SymbolKind::Function,
+            ),
+        ];
+        for (ext, source, name, kind) in cases {
+            let symbols = extract_symbols(&format!("fixture{ext}"), source, ext)
+                .unwrap_or_else(|| panic!("grammar or query rejected {ext}"));
+            assert!(
+                symbols
+                    .iter()
+                    .any(|symbol| symbol.name == name && symbol.kind == kind),
+                "{ext}: {symbols:?}"
+            );
+        }
     }
 
     #[test]

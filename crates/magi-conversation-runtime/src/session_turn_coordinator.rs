@@ -1171,7 +1171,7 @@ impl SessionTurnCoordinator {
 pub fn request_fingerprint(value: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(value).expect("request fingerprint value must serialize");
     let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
+    format!("sha256:{}", magi_core::hex_lower(digest))
 }
 
 #[cfg(test)]

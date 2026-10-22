@@ -17,6 +17,7 @@
 - UI 层可以继续完善产品表达，但不能反向定义后端协议
 - 禁止长期双实现、回退逻辑与补丁式兼容分支
 - JS 构建要求 Node.js >=22.12.0。Web 使用 Vite 8/Rolldown 与 Oxc；TypeScript 统一使用 6.x，因为当前 svelte-check 4.x 的 peer 合同只支持 5.x/6.x，不能直接换成 TypeScript 7 的新 API。
+- Rust HTTP 使用 reqwest 0.13 默认的 Rustls、系统证书验证与系统代理。摘要和快照依赖升级保持已有 SHA-256 十六进制标识及 zstd 存储格式兼容，不要求迁移用户数据。
 
 ## 运行入口
 

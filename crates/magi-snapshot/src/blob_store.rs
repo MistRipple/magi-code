@@ -220,6 +220,26 @@ mod tests {
     }
 
     #[test]
+    fn reads_legacy_compressed_blob_with_the_same_content_hash() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::new(dir.path()).unwrap();
+        let payload = b"legacy snapshot\n".repeat(100);
+        let hash = "b705b923516f3c5101d456c45c47197f";
+        // Produced by zstd 0.13.3 at the existing level 3; do not regenerate with the current encoder.
+        let legacy = [
+            40, 181, 47, 253, 0, 88, 197, 0, 0, 128, 108, 101, 103, 97, 99, 121, 32, 115, 110, 97,
+            112, 115, 104, 111, 116, 10, 1, 0, 90, 156, 127, 46, 1,
+        ];
+        let path = store.blob_path(hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, legacy).unwrap();
+        assert_eq!(BlobStore::hash_bytes(&payload), hash);
+        assert_eq!(store.get(hash, true).unwrap(), payload);
+        assert_eq!(store.put(&payload, true).unwrap(), hash);
+        assert_eq!(fs::read(path).unwrap(), legacy);
+    }
+
+    #[test]
     fn put_get_round_trip_binary() {
         let dir = tempdir().unwrap();
         let store = BlobStore::new(dir.path()).unwrap();

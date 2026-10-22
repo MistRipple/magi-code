@@ -594,7 +594,7 @@ impl SessionTurnRequestDto {
         let bytes = serde_json::to_vec(&canonical_request)
             .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
         let digest = Sha256::digest(bytes);
-        Ok(format!("sha256:{digest:x}"))
+        Ok(format!("sha256:{}", magi_core::hex_lower(digest)))
     }
 }
 

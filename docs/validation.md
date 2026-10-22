@@ -25,6 +25,8 @@
 
 `npm test` 运行 Desktop、Worker 和 Web 套件，用于明确要求的整体回归或发布预检；日常只运行受影响的 test:*，不默认执行全套。脚本语法可用 `node --check <script.mjs>` / `bash -n <script.sh>` 检查，语法通过不能替代行为验证。
 
+Rust 摘要、压缩或语言解析依赖升级时，运行 `cargo test -p magi-core -p magi-knowledge-store -p magi-snapshot --locked`。其中旧快照夹具固定由 zstd 0.13.3 生成的字节和内容哈希，验证升级后可读且重复存储不改写原文件；语言解析回归直接调用 AST 提取，不能靠正则回退掩盖语法或查询不兼容。
+
 ## 真实集成验收
 
 | 入口 | 覆盖范围与前置条件 |

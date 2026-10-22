@@ -357,7 +357,7 @@ pub(crate) fn drive_dispatch_submission_after_lifecycle_and_restart_lock(
 fn dispatch_request_fingerprint(request: &DispatchSubmissionRequest) -> String {
     let bytes = serde_json::to_vec(request).expect("DispatchSubmissionRequest must serialize");
     let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
+    format!("sha256:{}", magi_core::hex_lower(digest))
 }
 
 fn dispatch_accept_error_to_api_error(error: DispatchSubmissionAcceptError) -> ApiError {

@@ -34,7 +34,7 @@ const MAX_WORKFLOW_STEPS: usize = 32;
 
 fn workflow_child_task_name(action_id: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = format!("{:x}", Sha256::digest(action_id.as_bytes()));
+    let digest = magi_core::hex_lower(Sha256::digest(action_id.as_bytes()));
     format!("workflow_{}", &digest[..32])
 }
 

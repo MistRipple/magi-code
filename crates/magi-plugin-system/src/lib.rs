@@ -111,7 +111,7 @@ pub fn model_tool_name(plugin_id: &str, contribution_id: &str) -> String {
             .collect()
     };
     let digest = sha2::Sha256::digest(format!("{plugin_id}\u{1f}{contribution_id}").as_bytes());
-    let suffix = &format!("{digest:x}")[..DIGEST_HEX];
+    let suffix = &magi_core::hex_lower(digest)[..DIGEST_HEX];
     let readable = format!("plugin__{}__{}", safe(plugin_id), safe(contribution_id));
     let keep = MAX_LEN - DIGEST_HEX - 1;
     let readable: String = readable.chars().take(keep).collect();

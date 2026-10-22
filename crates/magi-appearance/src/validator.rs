@@ -137,7 +137,7 @@ fn contrast_ratio(left: [u8; 3], right: [u8; 3]) -> f64 {
 
 pub fn theme_content_hash(pack: &ThemePack) -> Result<String, String> {
     let payload = serde_json::to_vec(pack).map_err(|error| format!("序列化主题失败: {error}"))?;
-    Ok(format!("{:x}", Sha256::digest(payload)))
+    Ok(magi_core::hex_lower(Sha256::digest(payload)))
 }
 
 pub fn editable_for_source(source: ThemeSource) -> bool {
