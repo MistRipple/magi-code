@@ -94,8 +94,10 @@ const provider = createServer(async (request, response) => {
     if (text.includes('CONTROL_LIVE_SKILL_STEP')) {
       const step = liveSkillRound++;
       const names = (body.tools ?? []).map(tool=>tool.function.name).sort();
-      const expected = [['magi_builtin_web_fetch'],['magi_builtin_tool_catalog'],
-        ['magi_builtin_tool_catalog','magi_builtin_web_fetch'],[]][step];
+      const expected = [['magi_builtin_update_execution_steps','magi_builtin_web_fetch'],
+        ['magi_builtin_tool_catalog','magi_builtin_update_execution_steps'],
+        ['magi_builtin_tool_catalog','magi_builtin_update_execution_steps','magi_builtin_web_fetch'],
+        ['magi_builtin_update_execution_steps']][step];
       assert.deepEqual(names,expected,'每个 Step 使用当前 Skill 目录，包括收紧和放宽');
       if (step === 3) return writeResponse(response,null,null,'CONTROL_LIVE_SKILL_DONE');
       const nextAllowed = [['tool_catalog'],['web_fetch','tool_catalog'],[]][step];
