@@ -116,21 +116,14 @@
     align-items: center;
     height: 48px;
     padding: 0 var(--space-4);
-    background: var(--glass-bg);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    /* Web 与 Desktop 都由 app-container 唯一提供中栏材质。 */
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     flex-shrink: 0;
     position: sticky;
     top: 0;
     z-index: var(--z-sticky);
-  }
-
-  /* Desktop 中栏的 app-container 提供结构性磨砂层。Header 只负责布局
-     和控件状态，不能再使用更不透明的 glass-bg 覆盖中栏材质。 */
-  :global([data-magi-desktop-surface='app']) .header-bar {
-    background: transparent;
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
   }
 
   .header-center {

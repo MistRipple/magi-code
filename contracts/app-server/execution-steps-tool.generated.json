@@ -1,0 +1,92 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "expectedRevision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "stepId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "blocked",
+              "failed",
+              "canceled"
+            ]
+          },
+          "dependsOn": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true,
+            "maxItems": 64
+          },
+          "evidenceRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true,
+            "maxItems": 64
+          },
+          "taskIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true,
+            "maxItems": 64
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "planItemId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "stepId",
+          "title",
+          "status",
+          "dependsOn",
+          "evidenceRefs",
+          "taskIds"
+        ]
+      }
+    },
+    "explanation": {
+      "type": "string",
+      "maxLength": 1000
+    }
+  },
+  "required": [
+    "expectedRevision",
+    "steps"
+  ]
+}

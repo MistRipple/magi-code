@@ -9,7 +9,7 @@
   import { dispatchWebModelAction } from '../web/web-model-actions';
   import { refreshWebModelRuntime } from '../web/web-model-session-projection';
   import { webModelSlotOwner } from '../stores/web-model-runtime.svelte';
-  import { resolveWebSessionBanner } from '../web/web-model-session-banner';
+  import { resolveWebSessionBanner, type WebSessionBanner } from '../web/web-model-session-banner';
   import type { WebConversationProjection } from '../shared/settings-bootstrap';
 
   interface Props {
@@ -22,6 +22,7 @@
     workspaceRequired: boolean;
     /** 发送必然被 daemon 拒绝时为 true，父组件据此禁用发送。 */
     blocksSend?: boolean;
+    infoStatus?: WebSessionBanner | null;
     /** 本会话持有的槽位被释放（停止 / 退出 / 重启）：父组件据此重新拉取绑定投影。 */
     onOwnershipLost?: () => void;
   }
@@ -35,6 +36,7 @@
     toolsDetail,
     workspaceRequired,
     blocksSend = $bindable(false),
+    infoStatus = $bindable(null),
     onOwnershipLost,
   }: Props = $props();
 
@@ -86,6 +88,7 @@
 
   $effect(() => {
     blocksSend = banner?.blocksSend ?? false;
+    infoStatus = banner && !banner.blocksSend ? banner : null;
   });
 
   function runAction(): void {
@@ -94,7 +97,7 @@
   }
 </script>
 
-{#if banner}
+{#if banner?.blocksSend}
   <div
     class="wm-banner"
     class:warning={banner.tone === 'warning'}

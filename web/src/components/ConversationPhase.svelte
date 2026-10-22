@@ -22,7 +22,6 @@
     readOnly?: boolean;
     displayContext?: 'thread' | 'task';
     filePreviewScopeForItem: (item: TimelineRenderItem) => FilePreviewScope;
-    continueInterruptedSession: () => void;
   }
 
   let {
@@ -31,7 +30,6 @@
     readOnly = false,
     displayContext = 'thread',
     filePreviewScopeForItem,
-    continueInterruptedSession,
   }: Props = $props();
 
   // 自动状态只负责“当前阶段展开、离开当前阶段后收起”；用户手动操作优先。
@@ -148,7 +146,6 @@
               {readOnly}
               {displayContext}
               filePreviewScope={filePreviewScopeForItem(detail.entry.item)}
-              onContinueInterrupted={continueInterruptedSession}
               hideResponseDuration
             />
           {:else}
@@ -157,7 +154,6 @@
               {readOnly}
               {displayContext}
               {filePreviewScopeForItem}
-              {continueInterruptedSession}
             />
           {/if}
         </div>

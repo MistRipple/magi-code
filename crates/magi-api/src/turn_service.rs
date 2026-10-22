@@ -405,6 +405,7 @@ async fn submit_session_turn_internal(
                         state: &state,
                         accepted: &accepted_for_turn,
                         prompt_text: signal.text.as_deref(),
+                        control_only: request.resume,
                         continued_at: accepted_at,
                         request_id: signal.request_id.clone(),
                         user_message_id: signal.user_message_id.clone(),
@@ -1220,8 +1221,8 @@ pub(crate) fn decide_session_turn(
     Ok(SessionTurnIntentDecision::new(SessionTurnRouteDto::Execute))
 }
 
-/// 用户点击“继续”：优先恢复可恢复的执行链（daemon 中断等），其次从用户主动停止的
-/// 最近一轮检查点继续；两者都没有时拒绝，而不是把“继续”当成普通消息执行。
+/// 用户点击“继续”：优先恢复可恢复的执行链（daemon 中断等），其次从失败、中断或用户
+/// 主动停止的最近主线检查点继续；两者都没有时拒绝。
 fn decide_resume_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -1288,24 +1289,30 @@ fn user_interrupted_turn_resume(
         .session_store
         .canonical_turns_for_session(&session_id)
         .into_iter()
-        .filter(|turn| !turn.is_session_command())
+        .filter(|turn| !turn.is_session_command() && !turn.metadata.contains_key("agentExecution"))
         .max_by(|left, right| {
             left.turn_seq
                 .cmp(&right.turn_seq)
                 .then_with(|| left.turn_id.cmp(&right.turn_id))
         })?;
-    if turn.status != magi_session_store::CanonicalTurnStatus::Cancelled {
+    if !matches!(
+        turn.status,
+        magi_session_store::CanonicalTurnStatus::Cancelled
+            | magi_session_store::CanonicalTurnStatus::Failed
+            | magi_session_store::CanonicalTurnStatus::Interrupted
+    ) {
         return None;
     }
     let user_item = turn
         .items
         .iter()
         .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)?;
-    if user_item
-        .metadata
-        .get("interruptionSource")
-        .and_then(serde_json::Value::as_str)
-        != Some("user")
+    if turn.status == magi_session_store::CanonicalTurnStatus::Cancelled
+        && user_item
+            .metadata
+            .get("interruptionSource")
+            .and_then(serde_json::Value::as_str)
+            != Some("user")
     {
         return None;
     }
@@ -2413,10 +2420,16 @@ async fn submit_mainline_session_turn(
                 completion_contract: decision.completion_contract.clone(),
                 recovery_checkpoint: decision.recovery_checkpoint.clone(),
                 denied_tools: session_turn_denied_tools(&request),
-                user_message_metadata: std::collections::HashMap::from([(
-                    "route".to_string(),
-                    serde_json::Value::String(session_turn_route_name(route).to_string()),
-                )]),
+                user_message_metadata: {
+                    let mut metadata = std::collections::HashMap::from([(
+                        "route".to_string(),
+                        serde_json::Value::String(session_turn_route_name(route).to_string()),
+                    )]);
+                    if request.resume {
+                        metadata.insert("renderable".to_string(), serde_json::Value::Bool(false));
+                    }
+                    metadata
+                },
             },
         )
         .await?;
@@ -3506,6 +3519,7 @@ pub(crate) struct ContinueUserMessageInput<'a> {
     pub(crate) state: &'a ApiState,
     pub(crate) accepted: &'a SessionContinueAccepted,
     pub(crate) prompt_text: Option<&'a str>,
+    pub(crate) control_only: bool,
     pub(crate) continued_at: UtcMillis,
     pub(crate) request_id: Option<String>,
     pub(crate) user_message_id: Option<String>,
@@ -3522,6 +3536,7 @@ pub(crate) fn write_continue_user_message(
         state,
         accepted,
         prompt_text,
+        control_only,
         continued_at,
         request_id,
         user_message_id,
@@ -3545,6 +3560,9 @@ pub(crate) fn write_continue_user_message(
                         "route".to_string(),
                         serde_json::Value::String("continue".to_string()),
                     )]);
+                    if control_only {
+                        metadata.insert("renderable".to_string(), serde_json::Value::Bool(false));
+                    }
                     if let Some(request_fingerprint) = request_fingerprint {
                         metadata.insert(
                             "requestFingerprint".to_string(),
@@ -4299,6 +4317,7 @@ pub(crate) async fn continue_session_with_expected_root(
                 state,
                 accepted: &accepted_for_turn,
                 prompt_text: prompt_text.as_deref(),
+                control_only: false,
                 continued_at,
                 request_id: Some(request_id.clone()),
                 user_message_id: Some(user_message_id.clone()),

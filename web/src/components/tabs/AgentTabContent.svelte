@@ -731,7 +731,7 @@
     gap: 8px;
     padding: 4px 7px;
     border-radius: 7px;
-    background: color-mix(in srgb, var(--background) 72%, transparent);
+    background: var(--surface-1);
   }
 
   .context-source-title {

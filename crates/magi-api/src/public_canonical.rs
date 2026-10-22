@@ -70,7 +70,12 @@ fn apply_history_item_window(turn: &mut CanonicalTurn, window: usize) {
     let mut kept = Vec::with_capacity(window + 1);
     let mut omitted = 0usize;
     for (index, item) in std::mem::take(&mut turn.items).into_iter().enumerate() {
-        if index >= keep_from || item.kind == CanonicalTurnItemKind::UserMessage {
+        if index >= keep_from
+            || item.kind == CanonicalTurnItemKind::UserMessage
+            || item
+                .metadata
+                .contains_key(magi_session_store::execution_steps::EXECUTION_STEPS_KEY)
+        {
             kept.push(item);
         } else {
             omitted += 1;
@@ -178,6 +183,13 @@ fn public_payload_field<T>(
 const INTERNAL_ITEM_METADATA_KEYS: [&str; 3] = ["providerContext", "toolCalls", "toolApproval"];
 
 fn public_canonical_turn_item_in_place(item: &mut CanonicalTurnItem) {
+    // 继续是输入框上的控制操作。旧版本已将它写入 canonical，但未带
+    // visibility.renderable=false；按 route 归一化公开投影，避免历史会话显示气泡。
+    if item.kind == CanonicalTurnItemKind::UserMessage
+        && item.metadata.get("route").and_then(Value::as_str) == Some("continue")
+    {
+        item.visibility.renderable = false;
+    }
     if let Some(evidence) = item.metadata.remove("executorFailure")
         && let Some(public) = public_canonical_tool_value(evidence, false, None)
     {
@@ -512,6 +524,20 @@ mod tests {
             items: vec![item],
             metadata: Default::default(),
         }
+    }
+
+    #[test]
+    fn public_projection_hides_legacy_continue_control_messages() {
+        let mut item = canonical_tool_item();
+        item.kind = CanonicalTurnItemKind::UserMessage;
+        item.content = Some("继续".to_string());
+        item.metadata
+            .insert("route".to_string(), json!("continue"));
+        assert!(item.visibility.renderable);
+
+        let public = public_canonical_turn_item(item);
+
+        assert!(!public.visibility.renderable);
     }
 
     #[test]

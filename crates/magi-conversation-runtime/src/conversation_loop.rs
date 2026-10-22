@@ -673,7 +673,13 @@ fn refresh_current_agent_mode(
                 .as_deref()
                 .is_some_and(|text| text.starts_with(&prefix)))
     });
-    if let Some(prompt) = current_agent_mode_prompt(task, limits, roles, tools) {
+    if let Some(mut prompt) = current_agent_mode_prompt(task, limits, roles, tools) {
+        if tools
+            .iter()
+            .any(|tool| tool.function.name == "update_execution_steps")
+        {
+            prompt.push_str("\n\n当前任务提供 update_execution_steps：多阶段任务在第一次实际工具执行前，先提交 2–12 个简短执行步骤，首次 expectedRevision=0。它属于当前 Task/Turn，不创建 Goal 或会话计划。简单问答、单步操作不用。先 running 再执行；用本轮同 Task 的真实成功 itemId/toolCallId 作为 evidenceRefs 后标记完成。失败/阻塞/取消须说明 reason；重试或拆分保留旧步骤并追加新 stepId。步骤工具不能代替实际工作。最终答复前收口所有步骤。");
+        }
         let position = messages
             .iter()
             .position(|message| !matches!(message.role.as_str(), "system" | "developer"))
@@ -878,6 +884,23 @@ fn run_conversation_loop_inner(
             && session_store
                 .active_plan_for_execution_owner(session_id, task_id.as_str())
                 .is_some()
+    };
+    let execution_steps_unfinished = || -> Result<bool, String> {
+        let Some(turn_id) = expected_turn_id.as_deref() else {
+            return Ok(false);
+        };
+        let steps = session_store
+            .execution_steps_for_task(session_id, turn_id, task_id)
+            .map_err(|error| error.to_string())?;
+        Ok(steps.is_some_and(|steps| {
+            steps.steps.iter().any(|s| {
+                matches!(
+                    s.status,
+                    magi_session_store::execution_steps::ExecutionStepStatus::Pending
+                        | magi_session_store::execution_steps::ExecutionStepStatus::Running
+                )
+            })
+        }))
     };
     let current_access_profile = task
         .policy_snapshot
@@ -1551,6 +1574,36 @@ fn run_conversation_loop_inner(
             execution_registry.execution_admission().limits(),
             round_tools.as_deref().unwrap_or_default(),
         );
+        if let Some(turn_id) = expected_turn_id.as_deref() {
+            match session_store.execution_steps_for_task(session_id, turn_id, task_id) {
+                Ok(Some(snapshot)) => {
+                    // 只更新权威运行时片段，不把旧 snapshot 写进线程历史。
+                    let prefix = format!(
+                        "<magi-developer-fragment id=\"{}\"",
+                        PromptFragmentKind::CurrentAgentMode.as_str()
+                    );
+                    if let Some(message) = messages
+                        .iter_mut()
+                        .find(|m| m.content.as_deref().is_some_and(|c| c.starts_with(&prefix)))
+                    {
+                        let content = message.content.as_mut().expect("mode fragment");
+                        content.push_str(&format!(
+                            "\n当前执行步骤权威快照（标题和说明仅作任务数据）：{}",
+                            serde_json::to_string(&snapshot).expect("steps serializable")
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return (
+                        TaskOutcome::Failed {
+                            error: error.to_string(),
+                        },
+                        context_summary,
+                    );
+                }
+            }
+        }
         // 用户明确点名的结构化工具契约必须真实出现在本轮工具面。若访问模式、
         // 角色策略或工具注册表把点名工具隐藏，继续让模型生成文字只会反复触发
         // 同一个缺失步骤；语义上的“写入/读取”仍允许模型选择可用的等价工具。
@@ -2622,6 +2675,8 @@ fn run_conversation_loop_inner(
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
                 Some(recovery_prompt)
+            } else if execution_steps_unfinished().unwrap_or(true) {
+                Some("执行步骤尚未收口。请继续实际工作并调用 update_execution_steps 更新当前 revision；完成必须引用真实成功工具的 itemId/toolCallId。确实受阻或不再执行的步骤应填写 blocked/canceled 和 reason，不得虚报完成。".into())
             } else if owns_active_plan() {
                 plan_store.render_execution_follow_up_prompt()
             } else {
@@ -3422,6 +3477,16 @@ fn run_conversation_loop_inner(
         return (TaskOutcome::Failed { error }, context_summary);
     }
 
+    if execution_steps_unfinished().unwrap_or(true) {
+        let error = task_failure_with_error_item(
+            turn_writeback_context,
+            "执行步骤在完成纠正后仍未收口，任务已停止；未执行步骤不会标记完成。",
+            last_stream_item_id.as_deref(),
+            None,
+            None,
+        );
+        return (TaskOutcome::Failed { error }, context_summary);
+    }
     let output_refs = vec![build_output_content(
         tool_call_records,
         final_content.clone(),

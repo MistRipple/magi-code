@@ -8,6 +8,8 @@
   import { dispatchFilePreviewEvent, type FilePreviewScope } from '../lib/file-reference';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
+  import ExecutionSteps from './ExecutionSteps.svelte';
+  import { readExecutionSteps } from '../lib/execution-steps';
   import ExecutorBadge from './ExecutorBadge.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
@@ -41,7 +43,6 @@
     filePreviewScope?: FilePreviewScope;
     canEdit?: boolean;
     onEdit?: () => void;
-    onContinueInterrupted?: () => void;
     /** 轮次折叠容器已在外层展示总耗时时，避免最终消息重复显示。 */
     hideResponseDuration?: boolean;
   }
@@ -52,7 +53,6 @@
     filePreviewScope = undefined,
     canEdit = false,
     onEdit = undefined,
-    onContinueInterrupted = undefined,
     hideResponseDuration = false,
   }: Props = $props();
 
@@ -62,34 +62,20 @@
   const displayText = $derived(resolveConversationMessageText(message, i18n.t.bind(i18n)));
 
   let copied = $state(false);
-  let interruptedRecoverySubmitting = $state(false);
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   let browserAnnotationPreviewRequest = 0;
   let browserAnnotationPreviewError = $state('');
 
-  function handleInterruptedRecoveryStatus(event: Event): void {
-    const status = (event as CustomEvent<{ status?: unknown }>).detail?.status;
-    if (status === 'failed') {
-      interruptedRecoverySubmitting = false;
-    }
-  }
-
-  if (typeof window !== 'undefined') {
-    window.addEventListener('magi:interruptedRecoveryContinueStatus', handleInterruptedRecoveryStatus);
-  }
-
   onDestroy(() => {
     if (copiedResetTimer) {
       clearTimeout(copiedResetTimer);
-    }
-    if (typeof window !== 'undefined') {
-      window.removeEventListener('magi:interruptedRecoveryContinueStatus', handleInterruptedRecoveryStatus);
     }
     browserAnnotationPreviewRequest += 1;
   });
 
   // 派生状态
   const isUser = $derived(message.type === 'user_input');
+  const executionSteps = $derived(readExecutionSteps(message.metadata?.executionSteps));
   const isNotice = $derived(message.type === 'system-notice');
   const interactionMeta = $derived(message.metadata?.interaction as {
     prompt?: string;
@@ -335,12 +321,6 @@
   const isContextCompactionRunning = $derived(
     noticeKind === 'context_compaction' && compactionState === 'running',
   );
-  const canContinueInterrupted = $derived(
-    isInterruptedRecoveryNotice
-      && recoveryState === 'ready'
-      && !interruptedRecoverySubmitting
-      && typeof onContinueInterrupted === 'function',
-  );
   const noticeIcons: Record<string, IconName> = {
     success: 'check-circle',
     error: 'x-circle',
@@ -440,16 +420,13 @@
     previewImageUrl = '';
   }
 
-  function continueInterruptedSession(): void {
-    if (!canContinueInterrupted) return;
-    interruptedRecoverySubmitting = true;
-    onContinueInterrupted?.();
-  }
 
 </script>
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
-{#if isNotice && noticeText && noticeText.trim()}
+{#if executionSteps}
+  <div data-message-id={message.id}><ExecutionSteps snapshot={executionSteps} sessionId={(filePreviewScope?.sessionId || (typeof message.metadata?.sessionId === 'string' ? message.metadata.sessionId : ''))} {filePreviewScope} /></div>
+{:else if isNotice && noticeText && noticeText.trim()}
   <div
     class="system-notice {noticeType}"
     class:interrupted-recovery={isInterruptedRecoveryNotice}
@@ -459,12 +436,6 @@
   >
     {#if isInterruptedRecoveryNotice}
       <span class="notice-text">{noticeText}</span>
-      <button
-        type="button"
-        class="interrupted-recovery-link"
-        disabled={!canContinueInterrupted}
-        onclick={continueInterruptedSession}
-      >继续</button>
     {:else}
       <span
         class="notice-icon"
@@ -580,12 +551,6 @@
         {#if canEdit}
           <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
             <Icon name="edit" size={14} />
-          </button>
-        {/if}
-        {#if canEdit && onContinueInterrupted}
-          <!-- 用户主动停止的最近一轮：从中断检查点继续，由界面显式发出 resume 请求。 -->
-          <button type="button" class="message-action" onclick={() => onContinueInterrupted?.()} title={i18n.t('messageItem.resumeTitle')}>
-            <Icon name="play" size={14} />
           </button>
         {/if}
         {#if copyableText.trim()}
@@ -725,27 +690,6 @@
   .system-notice.interrupted-recovery .notice-text {
     flex: 0 1 auto;
   }
-  .interrupted-recovery-link {
-    flex: 0 0 auto;
-    appearance: none;
-    border: 0;
-    padding: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    text-decoration: underline;
-    text-underline-offset: 3px;
-    cursor: pointer;
-  }
-  .interrupted-recovery-link:hover:not(:disabled),
-  .interrupted-recovery-link:focus-visible:not(:disabled) {
-    text-decoration-thickness: 2px;
-  }
-  .interrupted-recovery-link:disabled {
-    opacity: 0.5;
-    cursor: default;
-    text-decoration: none;
-  }
   .notice-icon {
     display: flex;
     flex-shrink: 0;
@@ -823,7 +767,8 @@
     text-decoration: underline;
   }
 
-  /* 时间与操作按钮浮在气泡正下方：脱离文档流，悬停时不占位，不推动下面的消息。 */
+  /* 时间与操作按钮浮在气泡正下方：脱离文档流，悬停时不占位，不推动下面的消息。
+     容器保持透明，让底层对话材质连续；仅操作按钮在交互时显示局部反馈。 */
   .user-time {
     position: absolute;
     right: var(--space-4);
@@ -832,7 +777,7 @@
     height: 22px;
     padding: 0 6px;
     border-radius: var(--radius-sm);
-    background: var(--background);
+    background: transparent;
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     display: flex;

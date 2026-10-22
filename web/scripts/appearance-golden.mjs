@@ -130,8 +130,8 @@ assert.match(
 );
 assert.match(
   header,
-  /data-magi-desktop-surface='app'[\s\S]*?\.header-bar \{[\s\S]*?background: transparent;[\s\S]*?backdrop-filter: none;[\s\S]*?-webkit-backdrop-filter: none;/,
-  'Desktop Header 必须继承中栏材质，不能额外叠加玻璃背景',
+  /\.header-bar \{[^}]*?background: transparent;[^}]*?backdrop-filter: none;[^}]*?-webkit-backdrop-filter: none;/,
+  'Web 与 Desktop Header 都必须继承中栏材质，不能额外叠加玻璃背景',
 );
 assert.match(bridge, /eventType === 'appearance\.changed'[\s\S]*?magi:appearanceChanged/, 'daemon 外观事件必须同步到所有窗口');
 

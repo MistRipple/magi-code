@@ -15,6 +15,7 @@ use std::{
     thread,
 };
 
+use magi_app_server_protocol as execution_steps_protocol;
 use magi_bridge_client::{
     ChatToolCall,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
@@ -48,6 +49,7 @@ use crate::agent_spawn_preflight::{
 };
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::goal_tool_failure;
+use crate::session_writeback::publish_committed_canonical_item_event;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::task_execution_registry::SpawnedChildExecutionError;
 use crate::tool_execution_ledger::ToolExecutionLedger;
@@ -219,6 +221,13 @@ pub(crate) fn execute_task_tool_call_batch(
             .iter()
             .map(|call| tool_interrupted_before_execution_result(&call.function.name))
             .collect();
+    }
+    if tool_calls.len() > 1
+        && tool_calls
+            .iter()
+            .any(|call| call.function.name == "update_execution_steps")
+    {
+        return tool_calls.iter().map(|call|(serde_json::json!({"tool":call.function.name,"status":"rejected","error_code":"execution_steps_separate_batch","execution_started":false,"error":"请单独提交 update_execution_steps；步骤更新成功后再调用实际工具。"}).to_string(),ExecutionResultStatus::Rejected)).collect();
     }
     tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
         execute_task_tool_call_batch_unchecked(
@@ -2512,7 +2521,10 @@ fn execute_task_tool_call(
             "get_goal" | "create_goal" | "update_goal" | "update_plan"
         );
     let live_skill_rejection = || {
-        if !goal_lifecycle && parse_skill_custom_tool_name(&tool_call.function.name).is_none() {
+        if !goal_lifecycle
+            && tool_call.function.name != "update_execution_steps"
+            && parse_skill_custom_tool_name(&tool_call.function.name).is_none()
+        {
             let access_profile = task
                 .policy_snapshot
                 .as_ref()
@@ -2741,6 +2753,19 @@ fn execute_task_tool_call(
                 Some(&task.task_id),
                 Some(&task.mission_id),
                 &tool_call.function.arguments,
+            );
+        }
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::UpdateExecutionSteps
+        ) {
+            return execute_execution_steps(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                tool_call,
             );
         }
         if matches!(
@@ -3082,6 +3107,68 @@ fn session_has_other_active_tasks(task_store: &TaskStore, task: &magi_core::Task
 
 /// 交互必须绑定发起调用所在的 canonical Turn。独立 Agent Turn 不会改写
 /// Session 当前 Turn 指针，因此不能只从 runtime sidecar 读取目标。
+fn execute_execution_steps(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let turn_id = task_execution_turn_id(session_store, session_id, &task.task_id);
+    let result = (|| -> Result<magi_session_store::CanonicalItemCommitNotice, String> {
+        let turn_id = turn_id
+            .as_deref()
+            .ok_or("当前 Task 没有关联的可写入 Turn")?;
+        let input: execution_steps_protocol::UpdateExecutionStepsParams =
+            serde_json::from_str(&call.function.arguments).map_err(|e| e.to_string())?;
+        for step in &input.steps {
+            for child_id in &step.task_ids {
+                let child = task_store
+                    .get_task(&TaskId::new(child_id))
+                    .ok_or("关联子任务不存在")?;
+                if child.parent_task_id.as_ref() != Some(&task.task_id)
+                    || child.mission_id != task.mission_id
+                {
+                    return Err("只能关联当前 Task 的直接子任务".into());
+                }
+                if step.status == execution_steps_protocol::ExecutionStepStatus::Completed
+                    && child.status != TaskStatus::Completed
+                {
+                    return Err("关联子任务尚未成功完成，不能完成步骤".into());
+                }
+            }
+        }
+        session_store
+            .update_execution_steps(session_id, turn_id, &task.task_id, input)
+            .map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(notice) => {
+            let response = serde_json::json!({"tool":"update_execution_steps","status":"succeeded","execution":notice.item.metadata.get("executionSteps")});
+            publish_committed_canonical_item_event(event_bus, notice);
+            (response.to_string(), ExecutionResultStatus::Succeeded)
+        }
+        Err(error) => {
+            let current = turn_id.as_deref().and_then(|id| {
+                session_store
+                    .execution_steps_for_task(session_id, id, &task.task_id)
+                    .ok()
+                    .flatten()
+            });
+            let code = if error.contains("revision_conflict") {
+                "execution_steps_revision_conflict"
+            } else {
+                "execution_steps_invalid_update"
+            };
+            let failure=magi_core::ToolFailure::coded("update_execution_steps",code,error)
+                .instruction("读取 current_steps 的 revision 与稳定 stepId 修正后重试。只能根据实际成功证据完成步骤；取消、失败和阻塞要填写原因。")
+                .with("current_steps",serde_json::to_value(current).expect("steps serializable"));
+            (failure.into_payload(), ExecutionResultStatus::Failed)
+        }
+    }
+}
+
 fn task_execution_turn_id(
     session_store: &SessionStore,
     session_id: &SessionId,

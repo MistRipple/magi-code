@@ -4325,6 +4325,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     metadata: {
       requestId,
       localSubmission: true,
+      renderable: input.resume !== true,
       sendingAnimation: true,
       ...(browserAnnotationRefs.length > 0 ? { browserAnnotationRefs } : {}),
       ...(skillName ? { skillName } : {}),
@@ -4476,13 +4477,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       placeholderMessageId,
       ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     });
-    const successMessage = turnResult.route === 'continue'
-        ? i18n.t('bridge.detail.continueSubmitted')
-        : i18n.t('bridge.detail.messageSent');
-    emitBridgeSuccessToast(
-      i18n.t('bridge.action.sendMessage'),
-      successMessage,
-    );
+    // Continue 是输入框上的无声控制操作，不在对话区或 Toast 中复制成一条用户消息。
+    if (input.resume !== true) {
+      emitBridgeSuccessToast(
+        i18n.t('bridge.action.sendMessage'),
+        i18n.t('bridge.detail.messageSent'),
+      );
+    }
 
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');
     const rootTaskId = turnResult.rootTaskId;
@@ -4598,7 +4599,7 @@ async function interruptTask(): Promise<void> {
   }
 }
 
-async function continueSessionExecution(): Promise<void> {
+async function continueSessionExecution(expectedSessionId?: string): Promise<void> {
   const sessionId = currentSessionId.trim();
   if (!sessionId) {
     emitBridgeErrorToast(
@@ -4613,10 +4614,12 @@ async function continueSessionExecution(): Promise<void> {
     }
     continueRequestId = '';
   }
+  if (expectedSessionId && expectedSessionId !== sessionId) return;
+  if (bridgeRuntimeIsBusy()) return;
   const requestId = `continue-${generateMessageId()}`;
   continueRequestId = requestId;
   window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
-    detail: { status: 'pending' },
+    detail: { status: 'pending', sessionId, requestId },
   }));
   const accepted = await executeTask({
     text: '继续',
@@ -4631,12 +4634,12 @@ async function continueSessionExecution(): Promise<void> {
   if (accepted) {
     void refreshCurrentGoal(sessionId, currentWorkspaceId, currentWorkspacePath);
     window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
-      detail: { status: 'accepted' },
+      detail: { status: 'accepted', sessionId, requestId },
     }));
     return;
   }
   window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
-    detail: { status: 'failed' },
+    detail: { status: 'failed', sessionId, requestId },
   }));
 }
 
@@ -5680,7 +5683,7 @@ export function createWebClientBridge(): ClientBridge {
           void interruptTask();
           return;
         case 'continueTask':
-          void continueSessionExecution();
+          void continueSessionExecution(typeof message.sessionId === 'string' ? message.sessionId : undefined);
           return;
         case 'renameSession':
           if (

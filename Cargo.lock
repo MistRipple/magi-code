@@ -1612,6 +1612,7 @@ version = "3.0.58"
 dependencies = [
  "insta",
  "magi-agent-role",
+ "magi-app-server-protocol",
  "magi-bridge-client",
  "magi-browser-authority",
  "magi-context-runtime",

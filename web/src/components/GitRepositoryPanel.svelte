@@ -399,7 +399,7 @@
   .git-section { min-width: 0; }
   .git-section-title { margin-bottom: 5px; color: var(--foreground-muted); font-size: var(--text-2xs); font-weight: var(--font-semibold); }
   .git-list { display: flex; flex-direction: column; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); overflow: hidden; }
-  .git-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; padding: 5px 8px; background: var(--background); }
+  .git-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; padding: 5px 8px; background: transparent; }
   .git-row + .git-row { border-top: 1px solid var(--border-subtle); }
   .git-row-main { display: flex; flex-direction: column; min-width: 0; }
   .git-row-main > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-xs); }

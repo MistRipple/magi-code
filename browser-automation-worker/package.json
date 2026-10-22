@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.cjs",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --external:lighthouse --outfile=dist/index.cjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node24 --external:lighthouse --outfile=dist/index.cjs",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test src/**/*.test.ts"
   },
@@ -16,7 +16,7 @@
     "lighthouse": "^13.5.0"
   },
   "devDependencies": {
-    "@types/node": "22.20.5",
+    "@types/node": "24.19.2",
     "esbuild": "0.28.2",
     "tsx": "4.23.15",
     "typescript": "6.0.3"

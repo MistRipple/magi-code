@@ -2187,7 +2187,7 @@
 </section>
 
 <style>
-  .browser-pane { container-type: inline-size; position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
+  .browser-pane { container-type: inline-size; position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: transparent; }
   /* 工具栏固定在右栏内容区内，边框不改变内容槽的有效尺寸。 */
   .browser-toolbar { position: relative; z-index: 10; isolation: isolate; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
   .browser-toolbar-actions { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; }

@@ -77,6 +77,45 @@ await withGoldenViteServer(async (server) => {
   assert.equal(selection.overLimit, 1, 'the image past the limit is reported, not silently dropped');
   assert.equal(policy.MAX_COMPOSER_IMAGES, 5);
 
+  const canonicalTurn = (status, items = []) => ({
+    sessionId: 'session-resume', turnId: `turn-${status}`, turnSeq: 1,
+    acceptedAt: 1, status, items,
+  });
+  assert.equal(policy.composerCanContinue({
+    sessionId: 'session-resume', turns: [canonicalTurn('completed')], runtimeCanResume: false,
+  }), false, 'completed sessions do not show continue');
+  assert.equal(policy.composerCanContinue({
+    sessionId: 'session-resume', turns: [canonicalTurn('failed')], runtimeCanResume: true,
+  }), true, 'recoverable runtime state shows continue');
+  assert.equal(policy.composerCanContinue({
+    sessionId: 'session-resume', turns: [canonicalTurn('cancelled', [{
+      kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' },
+      metadata: { interruptionSource: 'user' },
+    }])], runtimeCanResume: false,
+  }), true, 'a user-stopped task shows continue after reload');
+  assert.equal(policy.composerCanContinue({
+    sessionId: 'session-resume', turns: [canonicalTurn('cancelled', [{
+      kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' },
+    }])], runtimeCanResume: false,
+  }), false, 'an unrelated cancelled turn does not show continue');
+
+  const failedWithTask = canonicalTurn('failed', [{ kind: 'user_message', content: '原任务', worker: { taskId: 'task-1' } }]);
+  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [failedWithTask], runtimeCanResume: false }), true);
+  assert.equal(policy.composerCanContinue({ sessionId: 'other', turns: [failedWithTask], runtimeCanResume: true }), false);
+  for (const status of ['pending', 'running', 'blocked', 'completed', 'superseded']) {
+    assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [canonicalTurn(status)], runtimeCanResume: true }), false,
+      `${status} cannot resume even if a stale runtime projection says it can`);
+  }
+  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
+    failedWithTask, { ...canonicalTurn('completed'), turnSeq: 2 },
+  ], runtimeCanResume: true }), false, 'new completed mainline supersedes earlier failed work');
+  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
+    failedWithTask, { ...canonicalTurn('completed'), turnSeq: 2, metadata: { agentExecution: { taskId: 'child' } } },
+  ], runtimeCanResume: false }), true, 'child terminal state cannot replace the current mainline');
+  assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
+    canonicalTurn('interrupted', [{ metadata: { noticeKind: 'session_interrupted', recoveryState: 'ready' } }]),
+  ], runtimeCanResume: false }), true, 'restart readiness is an authoritative recovery fact');
+
   assert.equal(policy.formatImageSize(0), '');
   assert.equal(policy.formatImageSize(512), '512 B');
   assert.equal(policy.formatImageSize(2048), '2.0 KB');

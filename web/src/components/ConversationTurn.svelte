@@ -18,6 +18,7 @@
   import ConversationAgentGroup from './ConversationAgentGroup.svelte';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
   import ConversationPhase from './ConversationPhase.svelte';
+  import { readExecutionSteps } from '../lib/execution-steps';
   import {
     inferConversationPresentationRole,
   } from '../lib/conversation-presentation';
@@ -39,7 +40,6 @@
     filePreviewScopeForItem: (item: TimelineRenderItem) => FilePreviewScope;
     canEditMessage: (item: TimelineRenderItem) => boolean;
     editMessage: (item: TimelineRenderItem) => void;
-    continueInterruptedSession: () => void;
   }
 
   let {
@@ -53,7 +53,6 @@
     filePreviewScopeForItem,
     canEditMessage,
     editMessage,
-    continueInterruptedSession,
   }: Props = $props();
 
   // 自动状态只负责实时轮次；用户手动展开/收起后，流式更新不能覆盖这个选择。
@@ -117,11 +116,13 @@
   const finalItems = $derived(
     presentationItems.filter((entry) => entry.role === 'final').map((entry) => entry.item),
   );
-  const streamEntries = $derived(buildConversationStreamEntries(presentationItems));
+  const stepItems = $derived(assistantItems.filter((item) => readExecutionSteps(item.message.metadata?.executionSteps)));
+  const streamEntries = $derived(buildConversationStreamEntries(presentationItems.filter((entry) => !readExecutionSteps(entry.item.message.metadata?.executionSteps))));
 
   const hasProcess = $derived(
     streamEntries.some((entry) => entry.kind === 'event' || entry.kind === 'tool-group')
-      || runtimeActive,
+      || runtimeActive
+      || stepItems.length > 0,
   );
   const isLive = $derived(
     runtimeActive
@@ -208,7 +209,6 @@
       filePreviewScope={filePreviewScopeForItem(item)}
       canEdit={canEditMessage(item)}
       onEdit={() => editMessage(item)}
-      onContinueInterrupted={continueInterruptedSession}
     />
   {/each}
 
@@ -247,6 +247,9 @@
   {/if}
 
   <div class="turn-stream" id={`turn-process-${turnId}`}>
+    {#each stepItems as item (item.key)}
+      <MessageItem message={item.message} {readOnly} {displayContext} filePreviewScope={filePreviewScopeForItem(item)} hideResponseDuration />
+    {/each}
     {#each disclosureBlocks as block (block.kind === 'phase' ? block.phase.key : block.key)}
       {#if block.kind === 'phase'}
         {#if expanded}
@@ -256,7 +259,6 @@
           {readOnly}
           {displayContext}
           {filePreviewScopeForItem}
-          {continueInterruptedSession}
         />
         {/if}
       {:else if block.kind === 'agent-group'}
@@ -265,7 +267,6 @@
           {readOnly}
           {displayContext}
           {filePreviewScopeForItem}
-          {continueInterruptedSession}
         />
       {:else if block.kind === 'tool-group'}
         {#if expanded}
@@ -275,7 +276,6 @@
             {readOnly}
             {displayContext}
             {filePreviewScopeForItem}
-            {continueInterruptedSession}
           />
         {/if}
       {:else}
@@ -291,7 +291,6 @@
           {readOnly}
           {displayContext}
           filePreviewScope={filePreviewScopeForItem(block.item)}
-          onContinueInterrupted={continueInterruptedSession}
           hideResponseDuration
         />
       </section>
@@ -310,7 +309,6 @@
       filePreviewScope={filePreviewScopeForItem(item)}
       canEdit={canEditMessage(item)}
       onEdit={() => editMessage(item)}
-      onContinueInterrupted={continueInterruptedSession}
       hideResponseDuration
     />
   {/each}

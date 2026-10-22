@@ -9844,3 +9844,187 @@ fn agent_turn_restart_commits_parent_and_child_atomically_and_restores_interacti
         );
     }
 }
+
+fn execution_steps_params(revision: u64) -> crate::execution_steps::UpdateExecutionStepsParams {
+    serde_json::from_value(json!({"expectedRevision":revision,"steps":[
+        {"stepId":"read","title":"读取资料","status":"running","dependsOn":[],"evidenceRefs":[],"taskIds":[]},
+        {"stepId":"verify","title":"验证结果","status":"pending","dependsOn":["read"],"evidenceRefs":[],"taskIds":[]}
+    ]})).unwrap()
+}
+
+fn execution_steps_store() -> (SessionStore, SessionId, TaskId) {
+    let store = SessionStore::new();
+    let session = SessionId::new("session-execution-steps");
+    let task = TaskId::new("task-execution-steps");
+    store.create_session(session.clone(), "执行步骤").unwrap();
+    accept_test_turn(
+        &store,
+        &session,
+        test_turn("turn-execution-steps", "running", 1),
+    );
+    let mut source = test_turn_item("source", "分析任务");
+    source.kind = "assistant_stream".into();
+    source.source = "orchestrator".into();
+    source.task_id = Some(task.clone());
+    store
+        .append_current_turn_item_for_turn(&session, Some("turn-execution-steps"), source)
+        .unwrap();
+    (store, session, task)
+}
+
+#[test]
+fn execution_steps_survive_following_tool_write_and_durable_reload() {
+    let (store, session, task) = execution_steps_store();
+    let first = store
+        .update_execution_steps(
+            &session,
+            "turn-execution-steps",
+            &task,
+            execution_steps_params(0),
+        )
+        .unwrap();
+    assert_eq!(first.item.metadata["executionSteps"]["revision"], 1);
+    assert!(store.current_goal(&session).is_none());
+    assert!(store.plan(&session).is_none());
+    let mut tool = test_turn_item("proof", "实际工具结果");
+    tool.kind = "tool_call_result".into();
+    tool.source = "orchestrator".into();
+    tool.task_id = Some(task.clone());
+    tool.tool_name = Some("file_read".into());
+    tool.tool_call_id = Some("read-call".into());
+    tool.tool_status = Some("completed".into());
+    tool.tool_result = Some("{\"status\":\"succeeded\"}".into());
+    store
+        .append_current_turn_item_for_turn(&session, Some("turn-execution-steps"), tool)
+        .unwrap();
+    let mut next = execution_steps_params(1);
+    next.steps[0].status = crate::execution_steps::ExecutionStepStatus::Completed;
+    next.steps[0].evidence_refs = vec!["read-call".into()];
+    next.steps[1].status = crate::execution_steps::ExecutionStepStatus::Running;
+    store
+        .update_execution_steps(&session, "turn-execution-steps", &task, next)
+        .unwrap();
+    let snapshot = store
+        .execution_steps_for_task(&session, "turn-execution-steps", &task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.revision, 2);
+    assert_eq!(snapshot.steps[0].evidence_refs, ["proof"]);
+    let restored = SessionStore::from_state(store.state.read().unwrap().clone());
+    assert_eq!(
+        restored
+            .execution_steps_for_task(&session, "turn-execution-steps", &task)
+            .unwrap(),
+        Some(snapshot)
+    );
+    store
+        .update_current_turn_status_for_turn_with_change(
+            &session,
+            Some("turn-execution-steps"),
+            "cancelled",
+        )
+        .unwrap();
+    let stopped = store
+        .execution_steps_for_task(&session, "turn-execution-steps", &task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stopped.steps[0].status,
+        crate::execution_steps::ExecutionStepStatus::Completed
+    );
+    assert_eq!(
+        stopped.steps[1].status,
+        crate::execution_steps::ExecutionStepStatus::Canceled
+    );
+    assert!(
+        store
+            .update_execution_steps(
+                &session,
+                "turn-execution-steps",
+                &task,
+                execution_steps_params(3)
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn execution_steps_reject_stale_revision_foreign_task_and_unverified_completion() {
+    let (store, session, task) = execution_steps_store();
+    store
+        .update_execution_steps(
+            &session,
+            "turn-execution-steps",
+            &task,
+            execution_steps_params(0),
+        )
+        .unwrap();
+    assert!(
+        store
+            .update_execution_steps(
+                &session,
+                "turn-execution-steps",
+                &task,
+                execution_steps_params(0)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .update_execution_steps(
+                &session,
+                "turn-execution-steps",
+                &TaskId::new("foreign"),
+                execution_steps_params(0)
+            )
+            .is_err()
+    );
+    let mut input = execution_steps_params(1);
+    input.steps[0].status = crate::execution_steps::ExecutionStepStatus::Completed;
+    assert!(
+        store
+            .update_execution_steps(&session, "turn-execution-steps", &task, input)
+            .is_err()
+    );
+    let mut input = execution_steps_params(1);
+    input.steps[1].status = crate::execution_steps::ExecutionStepStatus::Running;
+    assert!(
+        store
+            .update_execution_steps(&session, "turn-execution-steps", &task, input)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .execution_steps_for_task(&session, "turn-execution-steps", &task)
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+}
+
+#[test]
+fn execution_steps_persistence_failure_does_not_advance_snapshot_or_sidecar() {
+    let (store, session, task) = execution_steps_store();
+    store
+        .update_execution_steps(
+            &session,
+            "turn-execution-steps",
+            &task,
+            execution_steps_params(0),
+        )
+        .unwrap();
+    let before = store_mutation_snapshot(&store);
+    reject_canonical_writes(&store);
+    assert!(
+        store
+            .update_execution_steps(
+                &session,
+                "turn-execution-steps",
+                &task,
+                execution_steps_params(1)
+            )
+            .is_err()
+    );
+    assert_store_mutation_snapshot_unchanged(&store, &before);
+}

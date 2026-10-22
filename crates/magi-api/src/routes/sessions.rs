@@ -4720,6 +4720,59 @@ mod tests {
     }
 
     #[test]
+    fn control_continue_retains_hidden_canonical_user_input() {
+        let state = test_state();
+        let session_id = SessionId::new("session-hidden-continue");
+        state
+            .session_store
+            .create_session(session_id.clone(), "静默继续")
+            .unwrap();
+        let now = UtcMillis::now();
+        let accepted = SessionContinueAccepted {
+            session_id: session_id.clone(),
+            mission_id: MissionId::new("mission-hidden-continue"),
+            root_task_id: TaskId::new("root-hidden-continue"),
+            action_task_id: TaskId::new("action-hidden-continue"),
+            turn_id: "turn-hidden-continue".to_string(),
+            execution_chain_ref: "chain-hidden-continue".to_string(),
+            resumed_branch_count: 1,
+            runner_started: true,
+        };
+        write_continue_user_message(ContinueUserMessageInput {
+            state: &state,
+            accepted: &accepted,
+            prompt_text: Some("继续"),
+            control_only: true,
+            continued_at: now,
+            request_id: Some("request-hidden-continue".into()),
+            user_message_id: Some("user-hidden-continue".into()),
+            placeholder_message_id: None,
+            request_fingerprint: None,
+            attempt_id: None,
+            orchestrator_thread_id: ThreadId::new("thread-hidden-continue"),
+        })
+        .unwrap();
+        let turns = state.session_store.canonical_turns_for_session(&session_id);
+        let user = turns[0]
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            .unwrap();
+        assert!(!user.visibility.renderable);
+        assert_eq!(user.content.as_deref(), Some("继续"));
+        assert_eq!(
+            user.metadata.get("requestId"),
+            Some(&json!("request-hidden-continue"))
+        );
+        let restored: magi_session_store::CanonicalTurn =
+            serde_json::from_value(serde_json::to_value(&turns[0]).unwrap()).unwrap();
+        assert!(
+            !restored.items[0].visibility.renderable,
+            "回读仍然隐藏控制输入，不依赖前端内存"
+        );
+    }
+
+    #[test]
     fn continue_user_message_opens_new_running_turn_after_interrupted_turn() {
         let state = test_state();
         let session_id = SessionId::new("session-continue-new-turn");
@@ -4755,6 +4808,7 @@ mod tests {
             state: &state,
             accepted: &accepted,
             prompt_text: Some("继续推进"),
+            control_only: false,
             continued_at: UtcMillis(now.0 + 1),
             request_id: None,
             user_message_id: None,

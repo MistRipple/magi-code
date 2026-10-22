@@ -1432,7 +1432,9 @@
     padding-top: 0;
   }
 
-  /* ---- Tab 栏（Apple HIG 分段式胶囊风格） ---- */
+  /* ---- Tab 栏（Apple HIG 分段式胶囊风格） ----
+     Tab 栏本身保持透明，消费面板/桌面宿主提供的底层材质；只有
+     hover 和 active 状态为控件提供局部的半透明反馈。 */
   .kp-tabs-bar {
     display: flex;
     align-items: center;
@@ -1441,9 +1443,9 @@
     border-bottom: none;
     position: sticky;
     top: 0;
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     z-index: var(--z-sticky);
     margin-bottom: var(--space-2);
   }
@@ -1471,8 +1473,9 @@
 
   .kp-tab.active {
     color: var(--foreground);
-    background: var(--surface-active);
+    background: color-mix(in srgb, var(--surface-active) 55%, transparent);
     font-weight: var(--font-semibold);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent);
   }
 
   .kp-tab-count {

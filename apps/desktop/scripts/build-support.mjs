@@ -41,7 +41,7 @@ export async function buildDesktopJavaScript({ development = false } = {}) {
     bundle: true,
     platform: "node",
     format: "cjs",
-    target: "node22",
+    target: "node24",
     logLevel: "info",
     minify: !development,
     sourcemap: development ? "inline" : false,

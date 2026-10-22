@@ -337,17 +337,16 @@
     flex-direction: column;
     height: 520px;
     min-width: 0;
-    background: var(--background);
+    /* Modal 已提供窗口材质，内容和上下栏只负责布局。 */
+    background: transparent;
     border-radius: inherit;
     overflow: hidden;
   }
 
-  /* 顶部玻璃态标题栏 */
+  /* 顶部标题栏 */
   .mac-glass-header {
     flex-shrink: 0;
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    background: transparent;
     border-bottom: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
     z-index: 10;
@@ -665,16 +664,14 @@
     color: var(--error);
   }
 
-  /* 底部玻璃态区域 */
+  /* 底部操作区域 */
   .mac-glass-footer {
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 12px 16px;
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    background: transparent;
     border-top: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
   }
 

@@ -133,6 +133,7 @@ pub(super) fn settle_active_current_turn_items(
     terminal_status: &str,
 ) {
     for item in items {
+        crate::execution_steps::settle_steps(item, terminal_status);
         if current_turn_item_status_is_active(&item.status) {
             item.status = terminal_status.to_string();
         }

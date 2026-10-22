@@ -223,7 +223,7 @@ Magi turns raw model intelligence into a local, durable, reviewable engineering 
 
 #### Prerequisites
 - **Rust**: Pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (supporting Rust 2024 edition).
-- **Node.js**: 22.0.0 or newer, and npm.
+- **Node.js**: 24.22.1 or newer, and npm.
 - **Native packaging tools**: Platform-specific build tools required for packaging Electron desktop installers.
 
 #### 1. Clone and launch development

@@ -2788,6 +2788,10 @@ await withGoldenViteServer(async (server) => {
   );
   const continueTurnBody = capturedTurnBodies.at(-1);
   assert.equal(continueTurnBody.text, '继续');
+  assert.equal(continueTurnBody.resume, true, 'button continuation keeps its structural resume flag');
+  assert.equal(messagesStore.getLocalTurnSubmissionRenderItems(SESSION_ID).some(
+    item => item.message.metadata?.requestId === continueTurnBody.requestId,
+  ), false, 'button continuation must never flash an optimistic user bubble');
   assert.equal(continueTurnBody.sessionId, SESSION_ID);
   assert.equal(
     bootstrapRequestCount,

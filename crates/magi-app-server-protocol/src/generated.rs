@@ -2919,3 +2919,103 @@ pub struct AgentContinueResult {
     pub turn_id: String,
     pub replayed: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionStepStatus {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "canceled")]
+    Canceled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionStepInput {
+    #[serde(rename = "stepId")]
+    pub step_id: String,
+    pub title: String,
+    pub status: ExecutionStepStatus,
+    #[serde(rename = "dependsOn")]
+    pub depends_on: Vec<String>,
+    #[serde(rename = "evidenceRefs")]
+    pub evidence_refs: Vec<String>,
+    #[serde(rename = "taskIds")]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "planItemId")]
+    pub plan_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionStep {
+    #[serde(rename = "stepId")]
+    pub step_id: String,
+    pub title: String,
+    pub status: ExecutionStepStatus,
+    #[serde(rename = "dependsOn")]
+    pub depends_on: Vec<String>,
+    #[serde(rename = "evidenceRefs")]
+    pub evidence_refs: Vec<String>,
+    #[serde(rename = "taskIds")]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "planItemId")]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "startedAt")]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "settledAt")]
+    pub settled_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateExecutionStepsParams {
+    #[serde(rename = "expectedRevision")]
+    pub expected_revision: u64,
+    pub steps: Vec<ExecutionStepInput>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionSteps {
+    #[serde(rename = "executionId")]
+    pub execution_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    pub revision: u64,
+    pub steps: Vec<ExecutionStep>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+}

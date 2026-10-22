@@ -552,6 +552,7 @@ impl CanonicalTurnItem {
     }
 
     pub fn validate_update_from(&self, existing: &Self) -> DomainResult<()> {
+        crate::execution_steps::validate_steps_update(self, existing)?;
         if existing.metadata.contains_key("executorFailure") {
             reject_changed_field(
                 "executorFailure",

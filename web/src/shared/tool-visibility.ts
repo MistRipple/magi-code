@@ -32,6 +32,7 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   // 现役任务状态工具不进入用户可见时间线。
   'agent_wait',
   'update_plan',
+  'update_execution_steps',
   'memory_write',
   // 后端 builtin shell 内部能力（模型不可调用，仅在 shell_exec 内部走子进程协议）
   'process_launch',

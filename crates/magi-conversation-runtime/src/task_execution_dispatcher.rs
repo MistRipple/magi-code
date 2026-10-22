@@ -1761,6 +1761,7 @@ impl LlmTaskDispatcher {
                         definition.function.name.as_str(),
                         "get_goal" | "create_goal" | "update_goal" | "update_plan"
                     ))
+                    || definition.function.name == "update_execution_steps"
                     || active_skill_allowed_tools.is_none_or(|allowed_tools| {
                         allowed_tools
                             .iter()

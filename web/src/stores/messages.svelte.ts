@@ -2068,7 +2068,7 @@ export function getLocalTurnSubmissionRenderItems(
 ): TimelineRenderItem[] {
   const sessionKey = executionSessionKey(sessionId);
   return [...localTurnSubmissionProjections.values()]
-    .filter((submission) => submission.sessionId === sessionKey)
+    .filter((submission) => submission.sessionId === sessionKey && submission.message.metadata?.renderable !== false)
     .sort((left, right) => (
       left.message.timestamp - right.message.timestamp
       || left.requestId.localeCompare(right.requestId)

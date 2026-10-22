@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+magi-app-server-protocol = { path = "../magi-app-server-protocol" }
 magi-core = { path = "../magi-core" }
 magi-browser-authority = { path = "../magi-browser-authority" }
 magi-web-model = { path = "../magi-web-model" }

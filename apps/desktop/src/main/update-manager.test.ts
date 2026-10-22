@@ -15,7 +15,7 @@ import type { UpdateManager } from "./update-manager.js";
 
 const require = createRequire(import.meta.url);
 const source = readFileSync(new URL("./update-manager.ts", import.meta.url), "utf8");
-const compiled = transformSync(source, { loader: "ts", format: "cjs", target: "node22" }).code;
+const compiled = transformSync(source, { loader: "ts", format: "cjs", target: "node24" }).code;
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 function fixture(spawnHelper: typeof spawn = spawn, options: {

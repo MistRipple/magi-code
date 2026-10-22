@@ -3,6 +3,7 @@ mod persistence_compat;
 mod agent_turn;
 mod lifecycle;
 pub use agent_turn::{AgentRunTransferResolver, AgentTurnBinding};
+pub mod execution_steps;
 mod model_step;
 mod models;
 mod store;

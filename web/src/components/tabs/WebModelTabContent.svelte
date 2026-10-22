@@ -264,7 +264,7 @@
 >
   <!-- 应用级标题栏：只放共享事实（后台推理 / 发送条数 / 连接状态）与两个显式动作。「清除数据」是
        破坏性操作，只在设置里提供，不放在随手可点的标题栏。 -->
-  <div class="web-model-bar" data-magi-surface="toolbar">
+  <div class="web-model-bar">
     <!-- 只读地址：让用户确认页面在 chatgpt.com 上，不可编辑、不可前进后退或刷新。 -->
     <span class="bar-address" title={homeUrl}><Icon name="globe" size={12} />{homeHost}</span>
     <button
@@ -389,7 +389,7 @@
     height: 36px;
     padding: 0 8px;
     font-size: 11px;
-    background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+    background: transparent;
     border-bottom: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
   }
 

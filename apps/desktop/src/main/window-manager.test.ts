@@ -10,7 +10,7 @@ import type { WindowManager, DesktopAppearance } from "./window-manager.js";
 const require = createRequire(import.meta.url);
 const compiled = buildSync({
   entryPoints: [fileURLToPath(new URL("./window-manager.ts", import.meta.url))],
-  bundle: true, platform: "node", format: "cjs", target: "node22",
+  bundle: true, platform: "node", format: "cjs", target: "node24",
   external: ["electron"], write: false,
 }).outputFiles[0]!.text;
 

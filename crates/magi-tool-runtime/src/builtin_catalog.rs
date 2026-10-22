@@ -113,6 +113,7 @@ pub enum BuiltinToolName {
     /// 更新本 session 的用户可见计划。真实执行任务由 ActiveExecutionChain 负责。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     UpdatePlan,
+    UpdateExecutionSteps,
     // ── 跨 session 项目记忆（任务系统 L14）──
     /// 写入或删除当前 workspace 的 ProjectMemory entry。物理存储在
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
@@ -196,7 +197,7 @@ impl BuiltinToolName {
             | Self::GitBranchDelete
             | Self::GitWorktreeCreate
             | Self::GitWorktreeRemove => Scope::SessionMainlineOrCoordinatorTask,
-            Self::AskUserQuestion => Scope::TaskOnly,
+            Self::AskUserQuestion | Self::UpdateExecutionSteps => Scope::TaskOnly,
             Self::ProcessLaunch
             | Self::ProcessRead
             | Self::ProcessWrite
@@ -206,7 +207,7 @@ impl BuiltinToolName {
         }
     }
 
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 83] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -287,6 +288,7 @@ impl BuiltinToolName {
         Self::ContextRead,
         Self::ContextRequest,
         Self::UpdatePlan,
+        Self::UpdateExecutionSteps,
         Self::MemoryWrite,
         Self::AskUserQuestion,
     ];
@@ -373,6 +375,7 @@ impl BuiltinToolName {
             Self::ContextRead => "context_read",
             Self::ContextRequest => "context_request",
             Self::UpdatePlan => "update_plan",
+            Self::UpdateExecutionSteps => "update_execution_steps",
             Self::MemoryWrite => "memory_write",
             Self::AskUserQuestion => "ask_user_question",
         }
@@ -452,7 +455,9 @@ impl BuiltinToolName {
             | Self::ContextSearch
             | Self::ContextRead
             | Self::ContextRequest => "agent_coordination",
-            Self::UpdatePlan | Self::AskUserQuestion => "session_state",
+            Self::UpdatePlan | Self::UpdateExecutionSteps | Self::AskUserQuestion => {
+                "session_state"
+            }
             Self::MemoryWrite => "project_memory",
         }
     }
@@ -539,6 +544,7 @@ impl BuiltinToolName {
             "context_read" => Some(Self::ContextRead),
             "context_request" => Some(Self::ContextRequest),
             "update_plan" => Some(Self::UpdatePlan),
+            "update_execution_steps" => Some(Self::UpdateExecutionSteps),
             "memory_write" => Some(Self::MemoryWrite),
             "ask_user_question" => Some(Self::AskUserQuestion),
             _ => None,
@@ -664,6 +670,7 @@ impl BuiltinToolName {
                 | Self::CreateGoal
                 | Self::UpdateGoal
                 | Self::UpdatePlan
+                | Self::UpdateExecutionSteps
                 | Self::MemoryWrite
                 | Self::BrowserClick
                 | Self::BrowserType
@@ -794,6 +801,7 @@ impl BuiltinToolName {
             | Self::CreateGoal
             | Self::UpdateGoal
             | Self::UpdatePlan
+            | Self::UpdateExecutionSteps
             | Self::MemoryWrite
             | Self::AskUserQuestion => RestrictedWriteProfilePolicy::AutoAllowed,
             Self::BrowserClick
@@ -851,6 +859,7 @@ impl BuiltinToolName {
                 | Self::CreateGoal
                 | Self::UpdateGoal
                 | Self::UpdatePlan
+                | Self::UpdateExecutionSteps
                 | Self::MemoryWrite
         )
     }
@@ -890,6 +899,7 @@ impl BuiltinToolName {
             | Self::ContextRead
             | Self::ContextRequest
             | Self::UpdatePlan
+            | Self::UpdateExecutionSteps
             | Self::MemoryWrite
             | Self::AskUserQuestion
             | Self::BrowserNavigate
@@ -1221,6 +1231,9 @@ impl BuiltinToolName {
             }
             Self::ContextRequest => {
                 "当 AgentContextPackage 和 context_search/context_read 都不足以完成任务时，向父任务发送明确的上下文请求。父任务可通过 agent_send 回复；不要用它替代已有引用读取。"
+            }
+            Self::UpdateExecutionSteps => {
+                "更新当前 Task/Turn 的实时执行步骤，不创建 Goal 或会话计划。复杂多阶段任务在实际执行前先提交 2–12 个简短步骤，首次 expectedRevision=0，后续沿用返回的 revision 和 stepId。简单问答、单步操作不用。先把步骤设为 running 再动手，完成时提交本轮同 Task 成功工具或助手 itemId 作为 evidenceRefs；失败/阻塞/取消须填写 reason。并行步骤用 taskIds 绑定直接子任务；dependsOn 必须先完成。保留所有旧步骤及已结束事实；失败重试、拆分或范围变化时取消未开始的旧步骤并追加新 stepId。不要将一次工具调用失败当作整个阶段失败；可先恢复。最终答复前收口全部步骤，不得虚报完成。"
             }
             Self::UpdatePlan => {
                 "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时 planId 和每个 itemId 必须显式传 null，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。存在未完成 Goal 时，expectedGoalId 和 expectedGoalControlRevision 必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision；没有 Goal 时两者都显式传 null。\n\n\
@@ -2012,6 +2025,10 @@ impl BuiltinToolName {
                 },
                 "required": ["request"]
             }),
+            Self::UpdateExecutionSteps => serde_json::from_str(include_str!(
+                "../../../contracts/app-server/execution-steps-tool.generated.json"
+            ))
+            .expect("generated execution steps schema"),
             Self::UpdatePlan => serde_json::json!({
                 "type": "object",
                 "properties": {

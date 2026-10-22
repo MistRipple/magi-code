@@ -1158,13 +1158,59 @@ pub fn upsert_session_turn_item_for_turn(
     )
 }
 
+fn attach_execution_step(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    turn_id: Option<&str>,
+    item: &mut ActiveExecutionTurnItem,
+) -> Result<(), String> {
+    if item
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| name == "update_execution_steps")
+    {
+        return Ok(());
+    }
+    let (Some(turn_id), Some(task_id)) = (turn_id, item.task_id.as_ref()) else {
+        return Ok(());
+    };
+    // progress/result 重写保留最初归属，不随步骤推进重绑。
+    if let Some(step) = session_store.execution_step_for_item(session_id, turn_id, &item.item_id) {
+        item.metadata.insert(
+            magi_session_store::execution_steps::EXECUTION_STEP_KEY.into(),
+            serde_json::json!(step),
+        );
+        return Ok(());
+    }
+    if let Some(snapshot) = session_store
+        .execution_steps_for_task(session_id, turn_id, task_id)
+        .map_err(|e| e.to_string())?
+    {
+        let running = snapshot
+            .steps
+            .iter()
+            .filter(|s| {
+                s.status == magi_session_store::execution_steps::ExecutionStepStatus::Running
+            })
+            .collect::<Vec<_>>();
+        if running.len() == 1 {
+            item.metadata.insert(
+                magi_session_store::execution_steps::EXECUTION_STEP_KEY.into(),
+                serde_json::json!(running[0].step_id),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn append_session_turn_item_for_turn_raw(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
-    item: ActiveExecutionTurnItem,
+    mut item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Result<Option<PublishedSessionTurnItem>, String> {
+    attach_execution_step(session_store, session_id, expected_turn_id, &mut item)?;
     if let Some(turn_id) = expected_turn_id
         && let Some(owned) = session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
         && let Some(binding) = owned
@@ -1199,9 +1245,10 @@ fn upsert_session_turn_item_for_turn_raw(
     session_store: &SessionStore,
     session_id: &SessionId,
     expected_turn_id: Option<&str>,
-    item: ActiveExecutionTurnItem,
+    mut item: ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
 ) -> Result<Option<PublishedSessionTurnItem>, String> {
+    attach_execution_step(session_store, session_id, expected_turn_id, &mut item)?;
     if let Some(turn_id) = expected_turn_id
         && let Some(owned) = session_store.canonical_turn_for_session_turn_id(session_id, turn_id)
         && let Some(binding) = owned

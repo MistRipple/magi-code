@@ -268,7 +268,7 @@
     min-width: 0;
     min-height: 0;
     overflow: hidden;
-    background: color-mix(in srgb, var(--background) 76%, transparent);
+    background: transparent;
   }
 
   .terminal-host {

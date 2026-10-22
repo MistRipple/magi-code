@@ -12,7 +12,6 @@
     readOnly?: boolean;
     displayContext?: 'thread' | 'task';
     filePreviewScopeForItem: (item: TimelineRenderItem) => FilePreviewScope;
-    continueInterruptedSession: () => void;
   }
 
   let {
@@ -20,7 +19,6 @@
     readOnly = false,
     displayContext = 'thread',
     filePreviewScopeForItem,
-    continueInterruptedSession,
   }: Props = $props();
 
   let expanded = $state(false);
@@ -138,7 +136,6 @@
           {readOnly}
           {displayContext}
           filePreviewScope={filePreviewScopeForItem(item)}
-          onContinueInterrupted={continueInterruptedSession}
           hideResponseDuration
         />
       {/each}

@@ -5145,6 +5145,230 @@
           "type": "boolean"
         }
       }
+    },
+    "ExecutionStepStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+        "canceled"
+      ]
+    },
+    "ExecutionStepInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stepId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionStepStatus"
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "taskIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "planItemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "stepId",
+        "title",
+        "status",
+        "dependsOn",
+        "evidenceRefs",
+        "taskIds"
+      ]
+    },
+    "ExecutionStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stepId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionStepStatus"
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "taskIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "planItemId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "startedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "settledAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      },
+      "required": [
+        "stepId",
+        "title",
+        "status",
+        "dependsOn",
+        "evidenceRefs",
+        "taskIds"
+      ]
+    },
+    "UpdateExecutionStepsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/ExecutionStepInput"
+          }
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "steps"
+      ]
+    },
+    "ExecutionSteps": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rust-type": "u64"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/ExecutionStep"
+          }
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "x-rust-type": "u64"
+        }
+      },
+      "required": [
+        "executionId",
+        "turnId",
+        "taskId",
+        "revision",
+        "steps",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   }
 }

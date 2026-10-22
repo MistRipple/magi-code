@@ -1323,3 +1323,46 @@ export interface AgentContinueResult {
   turnId: string;
   replayed: boolean;
 }
+
+export type ExecutionStepStatus = "pending" | "running" | "completed" | "blocked" | "failed" | "canceled";
+
+export interface ExecutionStepInput {
+  stepId: string;
+  title: string;
+  status: ExecutionStepStatus;
+  dependsOn: Array<string>;
+  evidenceRefs: Array<string>;
+  taskIds: Array<string>;
+  reason?: string;
+  planItemId?: string;
+}
+
+export interface ExecutionStep {
+  stepId: string;
+  title: string;
+  status: ExecutionStepStatus;
+  dependsOn: Array<string>;
+  evidenceRefs: Array<string>;
+  taskIds: Array<string>;
+  reason?: string;
+  planItemId?: string;
+  startedAt?: number;
+  settledAt?: number;
+}
+
+export interface UpdateExecutionStepsParams {
+  expectedRevision: number;
+  steps: Array<ExecutionStepInput>;
+  explanation?: string;
+}
+
+export interface ExecutionSteps {
+  executionId: string;
+  turnId: string;
+  taskId: string;
+  revision: number;
+  steps: Array<ExecutionStep>;
+  explanation?: string;
+  createdAt: number;
+  updatedAt: number;
+}

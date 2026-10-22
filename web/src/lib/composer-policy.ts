@@ -1,3 +1,5 @@
+import type { CanonicalTurn } from '../shared/protocol/canonical-turn';
+
 /**
  * 输入框的纯规则：附件上限、会话命令与附件的互斥、拖入文件的筛选、排队消息的摘要。
  *
@@ -117,4 +119,28 @@ export function summarizeQueuedMessage(queued: QueuedMessageShape): QueuedAttach
  */
 export function queuedMessageEditable(queued: QueuedMessageShape): boolean {
   return !queued.interruptTurnId && (queued.browserAnnotationRefs?.length ?? 0) === 0;
+}
+
+/** 只投影当前主线的恢复资格；子代理与正常完成的历史不能激活输入框继续。 */
+export function composerCanContinue(input: {
+  sessionId: string;
+  turns: readonly CanonicalTurn[];
+  runtimeCanResume: boolean;
+}): boolean {
+  if (!input.sessionId) return false;
+  const latest = input.turns
+    .filter(turn => turn.sessionId === input.sessionId && !turn.metadata?.agentExecution
+      && !turn.items.some(item => item.metadata?.sessionCommand))
+    .reduce<CanonicalTurn | null>((last, turn) => {
+      if (!last) return turn;
+      if (turn.turnSeq !== last.turnSeq) return turn.turnSeq > last.turnSeq ? turn : last;
+      return turn.turnId.localeCompare(last.turnId) > 0 ? turn : last;
+    }, null);
+  if (!latest || !['cancelled', 'failed', 'interrupted'].includes(latest.status)) return false;
+  if (input.runtimeCanResume) return true;
+  if (latest.items.some(item => item.metadata?.noticeKind === 'session_interrupted'
+    && item.metadata?.recoveryState === 'ready')) return true;
+  const user = latest.items.find(item => item.kind === 'user_message');
+  return Boolean(user?.content?.trim() && user.worker?.taskId
+    && (latest.status !== 'cancelled' || user.metadata?.interruptionSource === 'user'));
 }

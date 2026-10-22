@@ -168,6 +168,7 @@ pub fn builtin_exposed_externally(tool: BuiltinToolName) -> bool {
         | T::CreateGoal
         | T::UpdateGoal
         | T::UpdatePlan
+        | T::UpdateExecutionSteps
         | T::MemoryWrite
         | T::ContextSearch
         | T::ContextRead
@@ -415,6 +416,7 @@ mod tests {
                         | "create_goal"
                         | "update_goal"
                         | "update_plan"
+                        | "update_execution_steps"
                         | "memory_write"
                         | "view_image"
                         | "image_generate"

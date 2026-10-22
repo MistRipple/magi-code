@@ -594,6 +594,11 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
   if (item.visibility.renderable === false) {
     return false;
   }
+  // 继续是输入框上的控制操作。旧版本可能已将它持久化为可见用户消息，
+  // 公开投影归一化前也要在时间线侧保持静默；手动输入“继续”走 execute route，不受影响。
+  if (item.kind === 'user_message' && item.metadata?.route === 'continue') {
+    return false;
+  }
   if (
     item.kind === 'assistant_text'
     && isCanonicalTerminalStatus(item.status)
@@ -712,6 +717,7 @@ function buildMessage(
     metadata: {
       ...messageMetadataWithoutTransportAttachments(item.metadata),
       ...(inputDelivery ? { inputDelivery } : {}),
+      sessionId: item.sessionId,
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,

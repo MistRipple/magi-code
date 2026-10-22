@@ -24,6 +24,13 @@ assert.equal(rootPackage.version, '0.0.0', 'npm workspace 只能使用非产品�
 assert.equal(desktopPackage.version, '0.0.0', 'Electron package 版本必须在构建时由 Cargo 注入');
 assert.equal(webPackage.version, undefined, 'Web 不得复制产品版本');
 
+for (const workflow of [ci, security, release]) {
+  assert.doesNotMatch(workflow, /node-version:\s*\"22\"/, 'CI 与发布必须使用 Node 24');
+  assert.match(workflow, /node-version:\s*\"24\"/, 'CI 与发布必须显式使用 Node 24');
+}
+assert.equal(rootPackage.engines?.node, '>=24.22.1', 'Node 构建基线必须与 CI 的 Node 24 对齐');
+assert.equal(desktopPackage.devDependencies?.['@types/node'], '24.19.2', 'Desktop 类型声明必须与 Node 24 对齐');
+
 assert.match(ci, /npm ci[\s\S]*npm run release:preflight/, 'CI 必须从根 lockfile 执行统一发布前置校验');
 assert.match(preflight, /npm, \["run", "check"\]/, '发布前置校验必须执行 workspace 检查');
 assert.match(preflight, /npm, \["run", "test"\]/, '发布前置校验必须执行 workspace 测试');

@@ -1,4 +1,5 @@
 import type { ModelStep } from '../app-server-protocol.generated';
+import { readExecutionSteps } from '../../lib/execution-steps';
 
 export const CANONICAL_TURN_SCHEMA_VERSION = 'canonical-turn.v1' as const;
 
@@ -425,6 +426,12 @@ export function normalizeCanonicalTurnItemStrict(
   }
   if (hasOwn(record, 'metadata') && record.metadata !== null && !readRecord(record.metadata)) {
     throw new CanonicalProtocolError(`${path}.metadata`, 'must be an object');
+  }
+  if (item.metadata?.executionSteps !== undefined) {
+    const steps = readExecutionSteps(item.metadata.executionSteps);
+    if (!steps || steps.turnId !== item.turnId || steps.taskId !== item.worker?.taskId || steps.executionId !== item.itemId) {
+      throw new CanonicalProtocolError(`${path}.metadata.executionSteps`, 'invalid execution steps or owner');
+    }
   }
   return item;
 }

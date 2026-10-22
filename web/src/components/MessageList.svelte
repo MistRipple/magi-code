@@ -27,7 +27,6 @@
     sessionSuggestions,
     type SessionSuggestion,
   } from '../stores/session-suggestions.svelte';
-  import { vscode } from '../lib/vscode-bridge';
   import { getAgentSessionMessages } from '../web/agent-api';
   import { normalizeCanonicalTurnStrict } from '../shared/protocol/canonical-turn';
   import { setCanonicalTimelineError } from '../stores/turn-store.svelte';
@@ -137,10 +136,6 @@
   const visibleStartIndex = $derived(Math.max(0, safeRenderItems.length - visibleRenderLimit));
   const activeRenderItems = $derived(safeRenderItems.slice(visibleStartIndex));
   const hasHiddenLocalHistory = $derived(safeRenderItems.length > visibleRenderLimit);
-
-  function continueInterruptedSession(): void {
-    vscode.postMessage({ type: 'continueTask' });
-  }
 
   type TimelineRenderEntry =
     | { kind: 'message'; key: string; item: TimelineRenderItem }
@@ -1834,7 +1829,6 @@
             {filePreviewScopeForItem}
             canEditMessage={(item) => canEditUserMessage(item.message)}
             editMessage={(item) => editUserMessage(item.message)}
-            continueInterruptedSession={continueInterruptedSession}
           />
         {:else if entry.kind === 'message'}
           <MessageItem
@@ -1844,7 +1838,6 @@
             filePreviewScope={filePreviewScopeForItem(entry.item)}
             canEdit={canEditUserMessage(entry.item.message)}
             onEdit={() => editUserMessage(entry.item.message)}
-            onContinueInterrupted={continueInterruptedSession}
           />
         {:else}
           {#if entry.kind === 'runtime'}

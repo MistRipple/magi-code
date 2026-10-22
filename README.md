@@ -223,7 +223,7 @@ Magi 的目标很直接：把模型能力变成一套能够长期协作、可恢
 
 #### 环境要求
 - **Rust**：由 [`rust-toolchain.toml`](rust-toolchain.toml) 固定版本（支持 Rust 2024 edition）。
-- **Node.js**：22.0.0 或更高版本，以及 npm。
+- **Node.js**：24.22.1 或更高版本，以及 npm。
 - **系统打包依赖**：构建 Electron 桌面安装包所需的操作系统对应构建工具链。
 
 #### 1. 克隆与开发启动

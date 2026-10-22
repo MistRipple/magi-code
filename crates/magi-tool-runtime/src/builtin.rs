@@ -158,6 +158,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::ContextRead
             | BuiltinToolName::ContextRequest
             | BuiltinToolName::UpdatePlan
+            | BuiltinToolName::UpdateExecutionSteps
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::AskUserQuestion => execute_orchestration_only(self.name),
         }

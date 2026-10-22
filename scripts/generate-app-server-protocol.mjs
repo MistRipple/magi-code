@@ -500,11 +500,26 @@ function generateTypeScript(schema) {
   return `${output.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
 }
 
+function generateExecutionStepsToolSchema(schema) {
+  function expand(value) {
+    if (Array.isArray(value)) return value.map(expand);
+    if (!value || typeof value !== 'object') return value;
+    if (value.$ref) return expand(schema.$defs[refName(value.$ref)]);
+    return Object.fromEntries(Object.entries(value).filter(([key]) => !key.startsWith('x-rust-')).map(([key, child]) => [key, expand(child)]));
+  }
+  return `${JSON.stringify(expand(schema.$defs.UpdateExecutionStepsParams), null, 2)}\n`;
+}
+
 async function main() {
   const check = process.argv[2] === '--check' && process.argv.length === 3;
   if (process.argv.length > 2 && !check) fail('only --check is supported');
   const schema = loadSchema(await readFile(schemaPath, 'utf8'));
-  const expected = [[rustPath, generateRust(schema)], [tsPath, generateTypeScript(schema)]];
+  const executionStepsToolPath = resolve(root, 'contracts/app-server/execution-steps-tool.generated.json');
+  const expected = [
+    [rustPath, generateRust(schema)],
+    [tsPath, generateTypeScript(schema)],
+    [executionStepsToolPath, generateExecutionStepsToolSchema(schema)],
+  ];
   if (check) {
     const mismatches = [];
     for (const [path, content] of expected) {

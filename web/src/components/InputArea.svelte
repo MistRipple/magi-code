@@ -65,6 +65,8 @@
   } from '../shared/session-navigation.svelte';
   import WebModelModeChooser from './WebModelModeChooser.svelte';
   import WebModelSessionBanner from './WebModelSessionBanner.svelte';
+  import type { WebSessionBanner } from '../web/web-model-session-banner';
+  import { dispatchWebModelAction } from '../web/web-model-actions';
   import WebModelSetupPanel from './WebModelSetupPanel.svelte';
   import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
   import { WEB_MODEL_SETUP_COMMAND, WEB_MODEL_SETUP_REQUEST, setupIsActive, type SetupAction } from '../web/web-model-setup';
@@ -95,6 +97,7 @@
   import { APPLICATION_PLUGIN_SCOPE, pluginProjection, trackPluginProjection } from '../stores/plugin-registry.svelte';
   import {
     composerAttachmentTotal,
+    composerCanContinue,
     MAX_COMPOSER_IMAGE_BYTES,
     MAX_COMPOSER_IMAGES,
     queuedMessageEditable,
@@ -530,6 +533,32 @@
   ));
 
   const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
+  let resumeSubmittingSessionId = $state('');
+  const resumeSubmitting = $derived(Boolean(currentSessionId) && resumeSubmittingSessionId === currentSessionId);
+  $effect(() => {
+    if (resumeSubmittingSessionId && resumeSubmittingSessionId !== currentSessionId) resumeSubmittingSessionId = '';
+  });
+  const canContinueSession = $derived(composerCanContinue({
+    sessionId: currentSessionId?.trim() || '',
+    turns: turnStoreState.reducer.turns,
+    runtimeCanResume: messagesState.orchestratorRuntimeState?.sessionId === currentSessionId
+      && messagesState.orchestratorRuntimeState?.canResume === true,
+  }));
+  onMount(() => {
+    const handleContinueStatus = (event: Event) => {
+      const detail = (event as CustomEvent<{ sessionId: string; status: string }>).detail;
+      if (detail?.sessionId !== messagesState.currentSessionId) return;
+      resumeSubmittingSessionId = detail.status === 'pending' ? detail.sessionId : '';
+    };
+    window.addEventListener('magi:interruptedRecoveryContinueStatus', handleContinueStatus);
+    return () => window.removeEventListener('magi:interruptedRecoveryContinueStatus', handleContinueStatus);
+  });
+  function continueSession(): void {
+    if (!canContinueSession || resumeSubmitting || isSending || sessionInputLocked
+      || isInteractionBlocking || composerHasDraft() || webSendBlocked) return;
+    vscode.postMessage({ type: 'continueTask', sessionId: currentSessionId });
+  }
+
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
@@ -556,6 +585,7 @@
   });
   /** GPT Web 状态条判定发送必然被 daemon 拒绝（对话已失效 / 冲突 / 被占用）。 */
   let webSendBlocked = $state(false);
+  let webInfoStatus = $state<WebSessionBanner | null>(null);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
     sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady && selectedPluginCommand?.pluginCommandId !== WEB_MODEL_SETUP_COMMAND && !setupIsActive(setupStatus))
@@ -568,6 +598,8 @@
     return selectedImages.length > 0
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
+      || selectedBrowserAnnotations.length > 0
+      || Boolean(selectedGoalMode || selectedSessionCommand || selectedSkill || selectedWorkflow || selectedPluginCommand)
       || selectedBrowserNodeSelections.length > 0
       || selectedPluginSelections.length > 0;
   });
@@ -1167,7 +1199,6 @@
       name: image.name,
       size: image.size,
     }];
-    addToast('success', i18n.t('input.imageAdded'));
     return true;
   }
 
@@ -1682,9 +1713,6 @@
       const profile = (event as CustomEvent<{ profile?: unknown }>).detail?.profile;
       if (!isAccessProfile(profile)) return;
       selectAccessProfile(profile);
-      addToast('success', i18n.t('input.access.switched', {
-        mode: i18n.t(accessProfileOptions.find((option) => option.value === profile)?.labelKey ?? 'input.access.restricted'),
-      }));
     }
     function handleBrowserAnnotationCreated(event: Event) {
       const annotation = (event as CustomEvent<BrowserAnnotationSnapshot>).detail;
@@ -2711,7 +2739,6 @@
         console.warn('[InputArea] 切换主线模型后刷新设置快照失败:', error);
         addToast('warning', i18n.t('input.modelSavedSyncPending'));
       }
-      addToast('success', i18n.t('input.modelSwitched', { model: normalizedModel }));
       pickerOpen = false;
     } catch (error) {
       console.warn('[InputArea] 保存主线模型失败:', error);
@@ -2870,7 +2897,6 @@
         console.warn('[InputArea] 切换 Web 引擎后刷新设置快照失败:', error);
         addToast('warning', i18n.t('input.modelSavedSyncPending'));
       }
-      addToast('success', i18n.t('input.modelSwitched', { model: engine.displayName || engineId }));
       pickerOpen = false;
     } catch (error) {
       console.warn('[InputArea] 保存 Web 引擎绑定失败:', error);
@@ -2908,7 +2934,6 @@
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
       );
-      addToast('success', i18n.t('input.reasoningSwitched', { level: reasoningEffortLabel(value) }));
     } catch (error) {
       console.warn('[InputArea] 保存主线思考强度失败:', error);
       pickerError = i18n.t('input.reasoningSaveFailed');
@@ -2931,7 +2956,6 @@
         modelContextWindows: objectRecord(saved.modelContextWindows) as Record<string, number>,
       } as AgentSettingsBootstrapSnapshot;
     }
-    addToast('success', i18n.t('input.contextRing.saved', { model }));
   }
 
   // Prompt enhance：调用后端模型重写当前 textarea 文本
@@ -2970,7 +2994,6 @@
       inputValue = next;
       pendingCaretOffset = next.length;
       queueMicrotask(focusEditor);
-      addToast('success', i18n.t('input.enhance.success'));
     } catch (error) {
       if (abortController.signal.aborted || requestSeq !== enhanceRequestSeq) return;
       console.warn('[InputArea] 提示词优化失败:', error);
@@ -2987,7 +3010,6 @@
     pendingCaretOffset = enhanceOriginalPrompt.length;
     clearEnhanceSnapshot();
     queueMicrotask(focusEditor);
-    addToast('info', i18n.t('input.enhance.restored'));
   }
 </script>
 
@@ -3273,6 +3295,7 @@
       toolsDetail={currentPickerWebEngine?.tools?.detail}
       workspaceRequired={isPersonalSession}
       bind:blocksSend={webSendBlocked}
+      bind:infoStatus={webInfoStatus}
       onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
     />
 
@@ -3298,21 +3321,9 @@
       tabindex={sessionInputLocked || (isInteractionBlocking && !editingQueuedMessage) ? -1 : 0}
       aria-multiline="true"
       aria-disabled={sessionInputLocked || (isInteractionBlocking && !editingQueuedMessage)}
-      data-placeholder={selectedGoalMode
-        ? i18n.t('input.placeholderWithGoal')
-        : selectedSessionCommand
-          ? i18n.t('input.placeholderWithCompact')
-        : selectedSkill
-          ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
-        : selectedWorkflow
-          ? i18n.t('input.placeholderWithWorkflow', { workflowName: selectedWorkflow.name })
-        : selectedPluginCommand
-          ? i18n.t('input.placeholderWithPluginCommand', { commandName: selectedPluginCommand.name })
-        : selectedImages.length > 0
-          ? i18n.t('input.placeholderWithImages')
-        : selectedContextReferences.length > 0
-          ? i18n.t('input.placeholderWithReferences')
-          : i18n.t('input.placeholderDefault')}
+      data-placeholder={selectedImages.length > 0
+        ? i18n.t('input.placeholderWithImages')
+        : i18n.t('input.placeholderDefault')}
       onkeydown={handleKeydown}
       oninput={handleComposerInput}
       onkeyup={handleComposerSelectionChange}
@@ -3367,7 +3378,6 @@
             </button>
           {/each}
         </div>
-        <div class="ia-slash-hint" aria-hidden="true">{i18n.t('input.slash.hint')}</div>
       </div>
     {/if}
 
@@ -3733,19 +3743,6 @@
                     onBindSaved={bindSavedWebConversation}
                   />
                 {/if}
-                {#if currentSessionUsesWebEngine && currentSessionHasCanonicalHistory}
-                  <!-- 首条消息之后对话方式固定，只读显示，不能互相转换。 -->
-                  <p class="ia-picker-notice" data-web-model-mode-locked={webConversationMode}>
-                    {i18n.t('webModel.mode.locked', {
-                      mode: webConversationMode === 'saved'
-                        ? i18n.t('webModel.mode.saved')
-                        : i18n.t('webModel.mode.temporary'),
-                    })}
-                  </p>
-                {/if}
-                {#if currentPickerEngineId}
-                  <p class="ia-picker-notice">{i18n.t('input.mainModelPicker.webNotice')}</p>
-                {/if}
                 {#if pickerWebEngines.length > 0 && !canSelectPickerWebEngine}
                   <p class="ia-picker-notice ia-picker-notice--warning">
                     {i18n.t('input.mainModelPicker.webLocalSessionBlocked')}
@@ -3755,6 +3752,16 @@
             </div>
           {/if}
           </div>
+          {#if webInfoStatus}
+            <button type="button" class="ia-enhance" data-web-model-info={webInfoStatus.id}
+              title={i18n.t(webInfoStatus.textKey, webInfoStatus.params)}
+              aria-label={i18n.t(webInfoStatus.textKey, webInfoStatus.params)}
+              onclick={() => webInfoStatus?.action
+                ? dispatchWebModelAction({ kind: webInfoStatus.action.kind, sessionId: currentSessionId?.trim() || '' })
+                : (pickerOpen = !pickerOpen)}>
+              <Icon name="info" size={14} />
+            </button>
+          {/if}
           {#if currentSessionUsesWebEngine}
             <!-- GPT Web 对话方式：临时 / 已保存。首条消息前可切换，之后固定（只读显示）。
                  常驻在工具栏而不是藏在模型选择器里：用户新开 Web 会话时第一眼就能看到并选择。 -->
@@ -3820,6 +3827,18 @@
             aria-label={sendButtonTitle}
           >
             <Icon name={sendPreparing ? 'loader' : 'check'} size={14} class={sendPreparing ? 'spinning' : ''} />
+          </button>
+          {:else if resumeSubmitting || (!isSending && !hasContent && !editingTurn && canContinueSession)}
+          <button
+            type="button"
+            class="ia-send ready"
+            data-testid="input-continue-button"
+            onclick={continueSession}
+            disabled={resumeSubmitting || sessionInputLocked || isInteractionBlocking || webSendBlocked || Boolean(setupRequestId)}
+            title={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
+            aria-label={i18n.t(resumeSubmitting ? 'input.continuing' : 'input.continue')}
+          >
+            <Icon name={resumeSubmitting ? 'loader' : 'play'} size={14} class={resumeSubmitting ? 'spinning' : ''} />
           </button>
           {:else if isSending}
           {#if hasContent}
@@ -3964,9 +3983,11 @@
     /* 输入列随中间面板自适应铺满，仅保留基础安全留白。 */
     padding-block: var(--space-3) var(--space-4);
     padding-inline: var(--space-4);
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    /* 输入区是主对话面板的一部分，外层不再叠加独立玻璃底色；
+       只让 .ia-wrapper 作为真正的输入控件承担表面层级。 */
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     position: relative;
     z-index: 1;
   }
@@ -5005,13 +5026,6 @@
     font-size: 11px;
     font-weight: 600;
     line-height: 1;
-  }
-  .ia-slash-hint {
-    padding: 6px 9px 2px;
-    margin-top: 4px;
-    color: var(--foreground-muted);
-    font-size: 11px;
-    border-top: 1px solid var(--border-subtle);
   }
   .ia-slash-item.disabled {
     cursor: not-allowed;
