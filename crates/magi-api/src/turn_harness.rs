@@ -15976,7 +15976,11 @@ done
                         .iter()
                         .filter(|request| {
                             request.tools.as_ref().is_some_and(|tools| {
-                                tools.len() == 1 && tools[0].function.name == "file_read"
+                                tools.len() == 2
+                                    && tools.iter().any(|tool| tool.function.name == "file_read")
+                                    && tools
+                                        .iter()
+                                        .any(|tool| tool.function.name == "update_execution_steps")
                             })
                         })
                         .count();

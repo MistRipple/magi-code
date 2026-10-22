@@ -185,8 +185,14 @@ const INTERNAL_ITEM_METADATA_KEYS: [&str; 3] = ["providerContext", "toolCalls", 
 fn public_canonical_turn_item_in_place(item: &mut CanonicalTurnItem) {
     // 继续是输入框上的控制操作。旧版本已将它写入 canonical，但未带
     // visibility.renderable=false；按 route 归一化公开投影，避免历史会话显示气泡。
+    let legacy_continue_request = item
+        .metadata
+        .get("requestId")
+        .and_then(Value::as_str)
+        .is_some_and(|request_id| request_id.starts_with("continue-"));
     if item.kind == CanonicalTurnItemKind::UserMessage
-        && item.metadata.get("route").and_then(Value::as_str) == Some("continue")
+        && (item.metadata.get("route").and_then(Value::as_str) == Some("continue")
+            || legacy_continue_request)
     {
         item.visibility.renderable = false;
     }
@@ -531,8 +537,7 @@ mod tests {
         let mut item = canonical_tool_item();
         item.kind = CanonicalTurnItemKind::UserMessage;
         item.content = Some("继续".to_string());
-        item.metadata
-            .insert("route".to_string(), json!("continue"));
+        item.metadata.insert("route".to_string(), json!("continue"));
         assert!(item.visibility.renderable);
 
         let public = public_canonical_turn_item(item);

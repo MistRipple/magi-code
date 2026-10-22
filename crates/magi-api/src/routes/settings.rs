@@ -2827,6 +2827,7 @@ mod tests {
             "context_read",
             "context_request",
             "update_plan",
+            "update_execution_steps",
             "memory_write",
             "ask_user_question",
         ];

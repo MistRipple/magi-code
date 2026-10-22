@@ -1377,6 +1377,7 @@
   "settings.tools.builtin.knowledgeGraphQuery": "Knowledge Graph Query",
   "settings.tools.builtin.codeSymbols": "Code Symbols",
   "settings.tools.builtin.toolCatalog": "Tool Catalog",
+  "settings.tools.builtin.updateExecutionSteps": "Update Execution Steps",
   "settings.tools.builtin.gitStatus": "Git Status",
   "settings.tools.builtin.gitBranchList": "Branch List",
   "settings.tools.builtin.gitBranchCreate": "Create Branch",

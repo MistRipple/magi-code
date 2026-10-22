@@ -1377,6 +1377,7 @@
   "settings.tools.builtin.knowledgeGraphQuery": "知识图谱检索",
   "settings.tools.builtin.codeSymbols": "代码符号",
   "settings.tools.builtin.toolCatalog": "工具目录",
+  "settings.tools.builtin.updateExecutionSteps": "更新执行步骤",
   "settings.tools.builtin.gitStatus": "Git 状态",
   "settings.tools.builtin.gitBranchList": "分支列表",
   "settings.tools.builtin.gitBranchCreate": "创建分支",

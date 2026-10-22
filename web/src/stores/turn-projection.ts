@@ -596,7 +596,9 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
   }
   // 继续是输入框上的控制操作。旧版本可能已将它持久化为可见用户消息，
   // 公开投影归一化前也要在时间线侧保持静默；手动输入“继续”走 execute route，不受影响。
-  if (item.kind === 'user_message' && item.metadata?.route === 'continue') {
+  const requestId = typeof item.metadata?.requestId === 'string' ? item.metadata.requestId : '';
+  if (item.kind === 'user_message' && (item.metadata?.route === 'continue'
+    || requestId.startsWith('continue-'))) {
     return false;
   }
   if (

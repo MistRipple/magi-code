@@ -6368,16 +6368,19 @@ mod tests {
         let mut tightened = original.clone();
         tightened.custom_tool_bindings.clear();
         skills.register(tightened);
-        assert!(
-            dispatcher
-                .build_tool_definitions(
-                    &task,
-                    Some("code-review"),
-                    AccessProfile::Restricted,
-                    Some(&workspace)
-                )
-                .is_empty(),
-            "同名 Skill 收紧为封闭空集合后不能继续发布缓存的自定义工具"
+        let tightened_tools = dispatcher.build_tool_definitions(
+            &task,
+            Some("code-review"),
+            AccessProfile::Restricted,
+            Some(&workspace),
+        );
+        assert_eq!(
+            tightened_tools
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["update_execution_steps"],
+            "同名 Skill 收紧为封闭空集合后不能继续发布缓存的自定义工具，但执行步骤工具仍须可用"
         );
         skills.register(original);
         for denied in [false, true] {
@@ -6783,7 +6786,7 @@ mod tests {
                 .map(|definition| definition.function.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(tools(), ["search_text"]);
+        assert_eq!(tools(), ["search_text", "update_execution_steps"]);
         let available =
             dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
         assert!(
@@ -6796,7 +6799,7 @@ mod tests {
                 .contains("read-only-skill")
         );
         registry.replace([]);
-        assert!(tools().is_empty());
+        assert_eq!(tools(), ["update_execution_steps"]);
         let available =
             dispatcher.build_tool_definitions(&task, None, AccessProfile::Restricted, None);
         assert!(
