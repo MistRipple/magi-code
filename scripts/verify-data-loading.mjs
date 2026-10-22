@@ -11,15 +11,23 @@ import { connectTarget, waitFor } from './lib/electron-harness.mjs';
 // 独立 daemon + 真实 Chromium；只用本地 Provider，不接触用户配置和正在运行的 Magi。
 const root = new URL('..', import.meta.url).pathname;
 const fixture = await mkdtemp(join(tmpdir(), 'magi-data-loading-'));
+const richReply = [
+  '# RENDER_UPGRADE_OK', '**bold-upgrade** and `inline-upgrade`',
+  '| Column | Value |', '| --- | --- |', '| fixture | table-upgrade |',
+  '', '$x^2 + y^2 = z^2$', '', '```javascript', 'const upgrade = true;', '```',
+  '', '```mermaid', 'flowchart LR', '  A[Upgrade] --> B[Verified]', '```',
+].join('\n');
 const provider = createServer(async (request, response) => {
-  for await (const _ of request) { /* drain */ }
+  let body = '';
+  for await (const chunk of request) body += chunk;
   if (request.method === 'GET') {
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ data: [{ id: 'loading-fixture' }] }));
     return;
   }
   response.writeHead(200, { 'content-type': 'text/event-stream' });
-  response.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'LOADING_OK' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  const content = body.includes('render-upgrade-fixture') ? richReply : 'LOADING_OK';
+  response.end(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
 });
 const unusedPort = async () => {
   const server = createServer();
@@ -176,6 +184,17 @@ app.whenReady().then(()=>{const win=new BrowserWindow({show:false,webPreferences
   await waitFor(() => page.evaluate(`document.querySelector('.project-file-tree')?.textContent.includes('.hidden.txt')`), '隐藏文件切换补读');
   assert.ok(fileReads >= 2);
   console.log('✓ 文件树读取期间切换条件会补读');
+  await click('button[data-sidebar-mode="projects"]');
+  const richTurn = await submit(fast, 'render-upgrade-fixture');
+  await waitFor(() => page.evaluate(`!!document.querySelector('.session-item[data-session-id="${richTurn.sessionId}"]')`), '富文本会话目录更新');
+  await click(`.session-item[data-session-id="${richTurn.sessionId}"]`);
+  await waitFor(() => page.evaluate(`Array.from(document.querySelectorAll('.markdown-content h1')).some(node => node.textContent === 'RENDER_UPGRADE_OK')`), 'Markdown 2 标题');
+  assert.ok(await page.evaluate(`Array.from(document.querySelectorAll('.markdown-content strong')).some(node => node.textContent === 'bold-upgrade')`));
+  assert.ok(await page.evaluate(`Array.from(document.querySelectorAll('.markdown-content td')).some(node => node.textContent === 'table-upgrade')`));
+  await waitFor(() => page.evaluate(`!!document.querySelector('.markdown-content .katex')`), 'KaTeX 公式');
+  await waitFor(() => page.evaluate(`!!document.querySelector('.markdown-content .language-javascript .hljs-keyword')`), '代码高亮');
+  await waitFor(() => page.evaluate(`!!document.querySelector('.markdown-content .svg-wrapper svg')`), 'Mermaid 12 流程图');
+  console.log('✓ Markdown 标题/表格/公式/代码高亮与 Mermaid 真实渲染');
   // 已挂载的设置页重新显示、focus 和重连都要重读配置，同时保留本地草稿。
   const modelUrl = '#model-config-orch-base-url';
   const savedUrl = suffix => `http://127.0.0.1:${provider.address().port}/${suffix}`;

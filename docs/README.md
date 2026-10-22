@@ -16,6 +16,7 @@
 - 前端以现有产品方案为基线，不发散成新的 UI 产品方向
 - UI 层可以继续完善产品表达，但不能反向定义后端协议
 - 禁止长期双实现、回退逻辑与补丁式兼容分支
+- JS 构建要求 Node.js >=22.12.0。Web 使用 Vite 8/Rolldown 与 Oxc；TypeScript 统一使用 6.x，因为当前 svelte-check 4.x 的 peer 合同只支持 5.x/6.x，不能直接换成 TypeScript 7 的新 API。
 
 ## 运行入口
 
@@ -42,6 +43,8 @@ npm run desktop:dev
 `desktop:dev` 只连接已经由 `scripts/dev-daemon.sh` 启动的 daemon，不会再启动第二个 daemon；正式发行包才由 Electron Main 自己托管 daemon sidecar。
 
 发布统一由 Electron Builder 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
+
+Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 43 的历史发行版。Windows 继续提供 x64 安装器，Linux 继续提供 x64 AppImage/Deb。
 
 在线更新由 Electron Main 拥有状态。macOS 未签名发行包使用 ZIP 下载、SHA-512 校验、`ditto` 解包及安装助手替换；下载按连续无数据 60 秒超时，断流最多尝试三次，保留部分 ZIP 并通过 HTTP Range 续传。不支持 Range 时覆盖重下。界面在版本与可执行入口验证通过后才展示可重启，之前进度最多 99%。安装助手启动失败保留当前应用和可重试状态，暂存包丢失时重新下载准备；替换后系统拒绝打开新包则恢复旧包。Windows/Linux 沿用 electron-updater，安装错误须返回发起安装的 IPC 调用。
 

@@ -61,7 +61,7 @@ git config user.email east_xiaodong@126.com
 
 ### 环境、磁盘与凭据
 
-- Node.js 建议与 CI 对齐，使用 22.x，最低 22.12.0（Vite 7 构建要求）。
+- Node.js 建议与 CI 对齐，使用 22.x，最低 22.12.0（Vite 8、Electron 45 与 ASAR 4 构建要求）。
 - Rust 以 rust-toolchain.toml 为准，目前为 1.97.0，安装 clippy、rustfmt；预检脚本与工作流必须对齐。
 - 安装 cargo-audit，当前安全工作流固定为 0.22.2。另需 Git、GitHub CLI、jq、curl 及当前平台原生构建工具；macOS 需要 Xcode Command Line Tools。
 - 检查磁盘空间。Rust debug/release 缓存、Electron 解包目录和安装包会同时占用空间。只清理已确认可重建、没有进程使用的生成缓存，不删除状态目录、工作区数据或未提交文件。

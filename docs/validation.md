@@ -29,7 +29,7 @@
 
 | 入口 | 覆盖范围与前置条件 |
 | --- | --- |
-| `npm run test:data-loading-live` | 构建 Web、独立 daemon 和 Chromium、本地 Provider；验证折叠工作区目录预取、慢目录不阻塞、临时失败重试、后台会话更新、跨客户端工作区变化、daemon 重启恢复、文件树加载途中切换隐藏文件补读，以及设置页重新显示/focus 刷新、迟到响应隔离与未保存草稿保留；不接管用户已有进程 |
+| `npm run test:data-loading-live` | 构建 Web、独立 daemon 和 Chromium、本地 Provider；验证折叠工作区目录预取、慢目录不阻塞、临时失败重试、后台会话更新、跨客户端工作区变化、daemon 重启恢复、文件树加载途中切换隐藏文件补读、Markdown/公式/代码高亮/Mermaid 实际渲染，以及设置页重新显示/focus 刷新、迟到响应隔离与未保存草稿保留；不接管用户已有进程 |
 | `npm run test:electron-browser-viewport` | 已打包 Electron、独立状态根与本地 Provider；真实 AI 工具验证固定/自适应视口、窄电脑/手机横屏、DPR/触控、缩放点击、光标常驻/导航/折叠恢复、拖动与网页点击接管后自适应、交还、320px 工具栏/菜单边界和后台页面不改布局 |
 | `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
 | `npm run test:electron-cursor-presentation` | 从当前 Main、Worker 和 Svelte 光标源码启动真实 Electron guest；验证移动完成确认先于原生点击和输入框焦点、原地点击、隐藏/减少动态效果，以及移动途中用户接管、取消、导航和迟到确认；使用本地测试页与独立临时状态目录，需要本机图形环境 |

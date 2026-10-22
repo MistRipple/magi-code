@@ -12,13 +12,13 @@
   "dependencies": {
     "@magi/desktop-browser-contracts": "0.0.0",
     "ajv": "^8.20.0",
-    "devtools-protocol": "0.0.1551306",
-    "lighthouse": "^13.4.1"
+    "devtools-protocol": "^0.0.1724436",
+    "lighthouse": "^13.5.0"
   },
   "devDependencies": {
-    "@types/node": "22.15.30",
-    "esbuild": "0.25.12",
-    "tsx": "4.20.6",
-    "typescript": "5.9.3"
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3"
   }
 }

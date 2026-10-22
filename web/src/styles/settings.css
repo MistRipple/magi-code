@@ -35,7 +35,7 @@
     --ind-row-selected: var(--primary-muted);
   }
   /* 每个 Tab 的根容器自动撑满内容区域 */
-  .settings-tab-content > :global(*) {
+  .settings-tab-content > * {
     flex: 1 1 auto;
     min-height: 0;
   }
@@ -471,7 +471,7 @@
     color: var(--foreground-muted);
     gap: var(--space-3);
   }
-  .loading-state :global(svg) {
+  .loading-state svg {
     animation: spin 1s linear infinite;
   }
   .loading-state span {

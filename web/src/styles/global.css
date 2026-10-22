@@ -1658,7 +1658,7 @@ body.vscode-light .hljs-params {
   color: var(--dock-tone, var(--primary));
 }
 
-.dock-lead :global(svg) {
+.dock-lead svg {
   color: inherit;
 }
 

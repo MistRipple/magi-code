@@ -44,12 +44,12 @@ function magiDaemonDevGuardPlugin(agentBaseUrl: string, webRoot: string) {
 }
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, __dirname, '');
+  const env = loadEnv(mode, import.meta.dirname, '');
   const agentBaseUrl =
     env.VITE_AGENT_BASE_URL?.trim() || env.VITE_AGENT_PROXY_TARGET?.trim() || DEFAULT_AGENT_BASE_URL;
   const devHost = env.MAGI_VITE_HOST?.trim() || DEFAULT_DEV_HOST;
   const devPort = Number(env.MAGI_VITE_PORT || DEFAULT_DEV_PORT);
-  const webRoot = resolve(__dirname);
+  const webRoot = import.meta.dirname;
 
   return {
     base: './',
@@ -63,9 +63,9 @@ export default defineConfig(({ mode }) => {
     ],
     resolve: {
       alias: {
-        $lib: resolve(__dirname, './src/lib'),
-        $components: resolve(__dirname, './src/components'),
-        $stores: resolve(__dirname, './src/stores'),
+        $lib: resolve(webRoot, './src/lib'),
+        $components: resolve(webRoot, './src/components'),
+        $stores: resolve(webRoot, './src/stores'),
       },
     },
     optimizeDeps: {
@@ -88,9 +88,9 @@ export default defineConfig(({ mode }) => {
       outDir: 'dist',
       emptyOutDir: true,
       chunkSizeWarningLimit: 1500,
-      rollupOptions: {
+      rolldownOptions: {
         input: {
-          web: resolve(__dirname, 'web.html'),
+          web: resolve(webRoot, 'web.html'),
         },
         output: {
           entryFileNames: 'assets/[name]-[hash].js',
@@ -99,7 +99,7 @@ export default defineConfig(({ mode }) => {
         },
       },
       sourcemap: false,
-      minify: 'esbuild',
+      minify: 'oxc',
     },
     server: {
       host: devHost,

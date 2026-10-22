@@ -68,7 +68,7 @@ publish:
 mac:
   category: public.app-category.developer-tools
   icon: icons/icon.icns
-  minimumSystemVersion: "12.0"
+  minimumSystemVersion: "13.0"
   hardenedRuntime: true
   notarize: false
   gatekeeperAssess: false
