@@ -1211,6 +1211,7 @@ function applyCanonicalTurnsSnapshot(
   sessionId: string,
   turns: unknown,
   lastAppliedEventSeq: number,
+  runtimeEpoch: string,
 ): boolean {
   if (!Array.isArray(turns)) {
     setCanonicalTimelineError(new Error('canonical snapshot turns must be an array'));
@@ -1230,8 +1231,8 @@ function applyCanonicalTurnsSnapshot(
   }
   const canonicalTurns = canonicalTurnsForSession(sessionId, normalizedTurns);
   const projection = turnStoreState.reducer.sessionId === sessionId
-    ? mergeCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq)
-    : replaceCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq);
+    ? mergeCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq, runtimeEpoch)
+    : replaceCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq, runtimeEpoch);
   if (!projection) {
     return false;
   }
@@ -1265,6 +1266,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
     : null;
   const workspaceId = typeof workspace?.workspaceId === 'string' ? workspace.workspaceId.trim() : '';
   const workspacePath = typeof workspace?.rootPath === 'string' ? workspace.rootPath.trim() : '';
+  const runtimeEpoch = workspaceSessionCursorFromBootstrap(message).runtimeEpoch;
   const canonicalTurns = (message as Record<string, unknown>).canonicalTurns;
   const canonicalEventNextSequence = Number(
     (message as Record<string, unknown>).canonicalEventNextSequence,
@@ -1386,7 +1388,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
           resetTimelineView: true,
           resetPanelState: true,
         });
-        clearCanonicalSessionTurns();
+        clearCanonicalSessionTurns(undefined, runtimeEpoch);
         messagesState.canonicalTimelineProjection = null;
         setQueuedMessages([]);
       }
@@ -1436,7 +1438,8 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
         && workspacePath === currentWorkspacePath
   );
 
-  // 同 session 恢复按事件水位决定是否接管快照；水位不落后的快照必须进入 reducer，
+  // 同一 daemon 代际内按事件水位接管快照；重启后水位可能回落，必须接受新代际基线。
+  // 水位不落后的快照必须进入 reducer，
   // 否则 bridge 已推进 SSE cursor 而 canonical 状态未同步，会永久跳过恢复区间。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
@@ -1457,7 +1460,8 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
       const canonicalSessionTurns = canonicalTurnsForSession(sessionId, canonicalTurns);
-      const shouldApplyCanonicalSnapshot = canonicalEventWatermark
+      const runtimeChanged = Boolean(runtimeEpoch && runtimeEpoch !== turnStoreState.runtimeEpoch);
+      const shouldApplyCanonicalSnapshot = runtimeChanged || canonicalEventWatermark
         >= turnStoreState.reducer.lastAppliedEventSeq;
       // bootstrap 的处理态和 canonical turn 可能并非同一时刻落盘。只要快照还没有
       // 当前绑定的 requestId，就不能用它替换本地轮次，否则无论快照显示 idle 还是
@@ -1497,7 +1501,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
       });
 
       if (shouldApplyCanonicalSnapshot && !preserveLocalTurnDuringStaleSnapshot) {
-        applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns, canonicalEventWatermark);
+        applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns, canonicalEventWatermark, runtimeEpoch);
         reconcileRuntimeStateFromCanonicalTurns(sessionId);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
@@ -1523,7 +1527,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
       resetPanelState: false,
       preserveExecutionState: true,
     });
-    clearCanonicalSessionTurns(sessionId);
+    clearCanonicalSessionTurns(sessionId, runtimeEpoch);
 
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
@@ -1538,7 +1542,7 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
 
     setCurrentSessionId(sessionId);
     clearStaleSettingsBootstrapSnapshot();
-    applyCanonicalTurnsSnapshot(sessionId, canonicalTurns, canonicalEventWatermark);
+    applyCanonicalTurnsSnapshot(sessionId, canonicalTurns, canonicalEventWatermark, runtimeEpoch);
     handleStateUpdate({
       ...message,
       state: {

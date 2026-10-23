@@ -17,6 +17,8 @@ import { buildCanonicalTimelineProjection, updateCanonicalTimelineProjection } f
 
 export const turnStoreState = $state({
   reducer: createCanonicalTurnReducerState(''),
+  // canonical 事件水位只在同一 daemon 代际中可比较。
+  runtimeEpoch: '',
   projection: null as SessionTimelineProjection | null,
   lastError: null as string | null,
 });
@@ -268,7 +270,9 @@ export function replaceCanonicalSessionTurns(
   sessionId: string,
   turns: CanonicalTurn[],
   lastAppliedEventSeq = 0,
+  runtimeEpoch = turnStoreState.runtimeEpoch,
 ): SessionTimelineProjection | null {
+  turnStoreState.runtimeEpoch = runtimeEpoch;
   turnStoreState.reducer = replaceCanonicalTurns(sessionId, turns, lastAppliedEventSeq);
   turnStoreState.lastError = null;
   const projection = publishProjection();
@@ -285,6 +289,7 @@ export function mergeCanonicalSessionTurns(
   sessionId: string,
   turns: CanonicalTurn[],
   lastAppliedEventSeq = 0,
+  runtimeEpoch = turnStoreState.runtimeEpoch,
 ): SessionTimelineProjection | null {
   const normalizedSessionId = normalizeSessionId(sessionId);
   if (!normalizedSessionId || turnStoreState.reducer.sessionId !== normalizedSessionId) {
@@ -313,12 +318,13 @@ export function mergeCanonicalSessionTurns(
       byTurnId.set(turn.turnId, turn);
     }
   }
+  const runtimeChanged = Boolean(runtimeEpoch && runtimeEpoch !== turnStoreState.runtimeEpoch);
+  turnStoreState.runtimeEpoch = runtimeEpoch;
   turnStoreState.reducer = {
     ...turnStoreState.reducer,
-    lastAppliedEventSeq: Math.max(
-      turnStoreState.reducer.lastAppliedEventSeq,
-      lastAppliedEventSeq,
-    ),
+    lastAppliedEventSeq: runtimeChanged
+      ? lastAppliedEventSeq
+      : Math.max(turnStoreState.reducer.lastAppliedEventSeq, lastAppliedEventSeq),
     turns: [...byTurnId.values()]
       .map((turn) => ({
         ...turn,
@@ -512,9 +518,10 @@ export function mergeEarlierCanonicalTurnItems(input: {
   return publishProjection();
 }
 
-export function clearCanonicalSessionTurns(sessionId?: string): void {
+export function clearCanonicalSessionTurns(sessionId?: string, runtimeEpoch = ''): void {
   const nextSessionId = normalizeSessionId(sessionId);
   turnStoreState.reducer = createCanonicalTurnReducerState(nextSessionId);
+  turnStoreState.runtimeEpoch = runtimeEpoch;
   turnStoreState.projection = null;
   turnStoreState.lastError = null;
 }

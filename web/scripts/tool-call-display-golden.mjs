@@ -143,10 +143,10 @@ assert.match(
   /\{:else if durationLabel\}[\s\S]*?class="turn-status-header"/,
   '无过程的直接回复也必须显示一致的静态轮次状态行',
 );
-assert.match(
+assert.doesNotMatch(
   conversationTurnSource,
-  /import TurnRuntimeSummary from '\.\/TurnRuntimeSummary\.svelte';[\s\S]*?\{#if !isLive && durationMs !== null && completedAt !== null\}[\s\S]*?<TurnRuntimeSummary durationMs=\{durationMs\} \{completedAt\} showDuration=\{false\} \/>/,
-  '摘要模式在最终结果底部复用原始模式的时间组件，但耗时已在轮次标题上显示，底部只补充完成时间，不得重复耗时',
+  /TurnRuntimeSummary|responseCompletedAt/,
+  '摘要模式只在轮次标题显示处理耗时，不得在轮次底部再渲染第二层时间信息',
 );
 assert.match(
   await readFile(new URL('../src/components/TurnRuntimeSummary.svelte', import.meta.url), 'utf8'),

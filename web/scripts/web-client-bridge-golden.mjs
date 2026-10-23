@@ -2789,6 +2789,8 @@ await withGoldenViteServer(async (server) => {
   const continueTurnBody = capturedTurnBodies.at(-1);
   assert.equal(continueTurnBody.text, '继续');
   assert.equal(continueTurnBody.resume, true, 'button continuation keeps its structural resume flag');
+  assert.equal(messagesStore.messagesState.continueSubmissionPending, true,
+    'continue submission temporarily blocks editing the interrupted message');
   assert.equal(messagesStore.getLocalTurnSubmissionRenderItems(SESSION_ID).some(
     item => item.message.metadata?.requestId === continueTurnBody.requestId,
   ), false, 'button continuation must never flash an optimistic user bubble');
@@ -2824,6 +2826,10 @@ await withGoldenViteServer(async (server) => {
     canonicalTurn: null,
     canonicalItem: null,
   }));
+  await waitFor(
+    () => messagesStore.messagesState.continueSubmissionPending === false,
+    'accepted continuation clears the temporary edit barrier',
+  );
   await waitFor(
     () => messagesStore.messagesState.pendingRequests.has(continueTurnBody.requestId),
     'continueTask accepted response must keep the request tracked until terminal runtime output arrives',

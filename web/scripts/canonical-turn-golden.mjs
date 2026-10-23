@@ -22,6 +22,7 @@ await withGoldenViteServer(async (server) => {
   assertUserCommandSurvivesAcceptanceAndReload(reducer, projection, userMessageCommand);
   assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore);
   assertSnapshotMergeKeepsLiveTurnIdentity(turnStore);
+  assertRestartBootstrapRebasesCanonicalWatermark(dataHandlers, messagesStore, turnStore);
   assertSteeringConsumptionReceipts(reducer, projection, canonicalProtocol);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
@@ -363,6 +364,44 @@ function assertEarlierTurnItemsMergeIntoTheWindowedTurn(turnStore) {
   assert.equal(turnStore.mergeEarlierCanonicalTurnItems({
     sessionId: 'session-other', turnId: c.turnId, items: [], hasMoreBefore: false, beforeItemSeq: null, omittedItemCount: 0,
   }), null);
+}
+
+function assertRestartBootstrapRebasesCanonicalWatermark(dataHandlers, messagesStore, turnStore) {
+  const c = baseCase('restart-watermark', 'session-restart-watermark', 'turn-restart-watermark', 12000);
+  const earlier = baseCase('earlier-history', c.sessionId, 'turn-earlier-history', 11000);
+  const running = turn(c, 'running', [user(c, 1, '重启后继续处理')]);
+  const stopped = turn(c, 'interrupted', running.items);
+  messagesStore.messagesState.currentWorkspaceId = null;
+  messagesStore.messagesState.currentWorkspacePath = '';
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({ persist: false });
+  const baseline = turnStore.replaceCanonicalSessionTurns(c.sessionId,
+    [turn(earlier, 'completed', [user(earlier, 1, '已经加载的历史')]), running], 500, 'before-restart');
+  messagesStore.setCanonicalTimelineProjection(baseline);
+  messagesStore.applyAuthoritativeProcessingState({ isProcessing: true, pendingRequestIds: [], stage: 'running' });
+  const bootstrap = (epoch, nextSequence, latest) => dataHandlers.handleUnifiedData({
+    id: `restart-${epoch}-${nextSequence}`, category: 'data', type: 'system', source: 'orchestrator',
+    agent: 'orchestrator', lifecycle: 'completed', blocks: [], timestamp: 12500, updatedAt: 12500,
+    data: { dataType: 'sessionBootstrapLoaded', payload: {
+      scope: 'personal', agent: { runtimeEpoch: epoch }, eventStreamNextSequence: 1000,
+      canonicalEventNextSequence: nextSequence, sessionId: c.sessionId,
+      workspace: { workspaceId: '', rootPath: '' }, sessions: [], canonicalTurns: [latest],
+      state: { currentSessionId: c.sessionId, currentWorkspaceId: '', currentWorkspacePath: '',
+        sessions: [], isProcessing: false, processingState: null, messages: [], edits: [], changedFiles: [], pendingChanges: [], pendingChangesState: null },
+      notifications: { notifications: [] }, orchestratorRuntimeState: null,
+    } },
+  });
+  bootstrap('before-restart', 12, stopped);
+  assert.equal(turnStore.turnStoreState.reducer.turns.at(-1).status, 'running', '同代际的旧快照不能覆盖运行态');
+  bootstrap('after-restart', 12, stopped);
+  assert.equal(turnStore.turnStoreState.reducer.turns.at(-1).status, 'interrupted', '新代际低水位快照必须接管旧运行态');
+  assert.equal(messagesStore.messagesState.isProcessing, false, '重连不能留下永久停止按钮');
+  assert.equal(turnStore.turnStoreState.reducer.lastAppliedEventSeq, 11, '事件水位必须重置到新代际基线');
+  assert.equal(turnStore.turnStoreState.reducer.turns.length, 2, '重连保留已经加载的较早历史');
+  const next = baseCase('post-restart', c.sessionId, 'turn-post-restart', 13000);
+  turnStore.applyCanonicalTurnEvent(event(next, 12, 'turn_started', { turn: turn(next, 'running', [user(next, 1, '新的消息')]) }));
+  assert.equal(turnStore.turnStoreState.reducer.turns.at(-1).turnId, next.turnId, '新代际的低序号实时事件必须继续生效');
+  messagesStore.setCurrentSessionId(null);
 }
 
 function assertSnapshotMergeKeepsLiveTurnIdentity(turnStore) {

@@ -94,11 +94,12 @@ pub(crate) fn resolved_path_dto(path: PathBuf) -> Result<ResolvedPathDto, ApiErr
 pub(crate) fn browse_directory(
     path: PathBuf,
     show_hidden: bool,
+    include_files: bool,
 ) -> Result<DirectoryBrowseDto, ApiError> {
     if !path.is_dir() {
         return Err(ApiError::InvalidInput("路径不是目录".to_string()));
     }
-    let entries = read_directory_entries(&path, show_hidden)?;
+    let entries = read_directory_entries(&path, show_hidden, include_files)?;
     let parent_path_ref = path.parent().filter(|parent| *parent != path).map(path_ref);
     Ok(DirectoryBrowseDto {
         path_ref: path_ref(&path),
@@ -113,12 +114,14 @@ pub(crate) fn browse_directory(
 fn read_directory_entries(
     path: &Path,
     show_hidden: bool,
+    include_files: bool,
 ) -> Result<Vec<DirectoryEntryDto>, ApiError> {
     struct Entry {
         file_name: OsString,
         display_name: String,
         canonical_path: PathBuf,
         hidden: bool,
+        is_directory: bool,
     }
 
     let mut entries = std::fs::read_dir(path)
@@ -126,7 +129,7 @@ fn read_directory_entries(
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let metadata = entry.metadata().ok()?;
-            if !metadata.is_dir() {
+            if !metadata.is_dir() && !(include_files && metadata.is_file()) {
                 return None;
             }
             let file_name = entry.file_name();
@@ -140,14 +143,16 @@ fn read_directory_entries(
                 file_name,
                 canonical_path,
                 hidden,
+                is_directory: metadata.is_dir(),
             })
         })
         .collect::<Vec<_>>();
 
     entries.sort_by(|left, right| {
         right
-            .hidden
-            .cmp(&left.hidden)
+            .is_directory
+            .cmp(&left.is_directory)
+            .then_with(|| right.hidden.cmp(&left.hidden))
             .then_with(|| {
                 left.display_name
                     .to_lowercase()
@@ -162,7 +167,7 @@ fn read_directory_entries(
             name: entry.display_name,
             path_ref: path_ref(&entry.canonical_path),
             display_path: display_path(&entry.canonical_path),
-            is_directory: true,
+            is_directory: entry.is_directory,
             is_hidden: entry.hidden,
         })
         .collect())

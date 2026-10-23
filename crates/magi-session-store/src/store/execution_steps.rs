@@ -107,13 +107,13 @@ impl SessionStore {
                     .flatten();
                 let snapshot = prepare_steps(previous, task.as_str(), input, old.as_ref())?;
                 for step in &snapshot.steps {
-                    if let Some(plan_id) = &step.plan_item_id {
-                        if !state.plans.iter().any(|p| {
+                    if let Some(plan_id) = &step.plan_item_id
+                        && !state.plans.iter().any(|p| {
                             &p.session_id == session
                                 && p.items.iter().any(|i| i.item_id.as_str() == plan_id)
-                        }) {
-                            return Err(invalid("关联的计划项不存在"));
-                        }
+                        })
+                    {
+                        return Err(invalid("关联的计划项不存在"));
                     }
                 }
                 let now = UtcMillis(snapshot.updated_at);

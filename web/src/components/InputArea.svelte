@@ -281,7 +281,8 @@
   let contextPickerOpen = $state(false);
   let WebFolderPickerComponent = $state<Component<{
     title?: string;
-    onSelect: (selection: { pathRef: string; displayPath: string; name: string }) => void;
+    includeFiles?: boolean;
+    onSelect: (selection: { pathRef: string; displayPath: string; name: string; isDirectory: boolean }) => void;
     onCancel: () => void;
     disabled?: boolean;
   }> | null>(null);
@@ -492,10 +493,13 @@
     // InputArea 在会话切换时不会销毁。先归档旧作用域的草稿，再清空当前渲染状态，
     // 避免新会话继承旧会话的图片、标记或文本，同时保留用户尚未发送的输入。
     const previousScopeKey = composerReferenceScopeKey;
-    if (composerHasDraft()) {
-      scopedComposerDrafts.set(previousScopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
-    } else {
-      scopedComposerDrafts.delete(previousScopeKey);
+    // 编辑暂时借用输入区，原草稿已在进入编辑时保存；导航不能用编辑内容覆盖它。
+    if (!loadedEditingTurnId) {
+      if (composerHasDraft()) {
+        scopedComposerDrafts.set(previousScopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
+      } else {
+        scopedComposerDrafts.delete(previousScopeKey);
+      }
     }
 
     composerReferenceScopeKey = nextScopeKey;
@@ -946,6 +950,7 @@
   }
 
   let loadedEditingTurnId = '';
+  let loadedEditingScopeKey = '';
   const editingTurn = $derived(messagesState.editingTurn);
 
   $effect(() => {
@@ -970,13 +975,28 @@
     const draft = editingTurn;
     if (!draft) {
       if (loadedEditingTurnId) {
+        const previousScopeKey = loadedEditingScopeKey;
         loadedEditingTurnId = '';
-        clearComposerState();
+        loadedEditingScopeKey = '';
+        // 导航已经恢复了目标会话的草稿，此时不能再清空新的输入区。
+        if (previousScopeKey !== currentComposerReferenceScopeKey()) return;
+        clearComposerState({ preserveScopedDraft: true });
+        const previousDraft = scopedComposerDrafts.get(previousScopeKey);
+        if (previousDraft) restoreComposerSubmissionDraft(previousDraft);
       }
       return;
     }
     if (draft.turnId === loadedEditingTurnId) return;
+    const scopeKey = currentComposerReferenceScopeKey();
+    if (!loadedEditingTurnId) {
+      if (composerHasDraft()) {
+        scopedComposerDrafts.set(scopeKey, captureComposerSubmissionDraft(resolveComposerRawContent()));
+      } else {
+        scopedComposerDrafts.delete(scopeKey);
+      }
+    }
     loadedEditingTurnId = draft.turnId;
+    loadedEditingScopeKey = scopeKey;
     invalidateEnhanceState();
     editingQueuedMessage = null;
     queueEditConflict = '';
@@ -1253,7 +1273,7 @@
         if (match.startsWith('`')) return `<span class="md-code">${match}</span>`;
         return `<span class="md-italic">${match}</span>`;
       });
-    return raw
+    const html = raw
       .split('\n')
       .map((line) => {
         const escaped = escapeHtml(line);
@@ -1275,6 +1295,8 @@
         return prefix + renderInline(rest);
       })
       .join('\n');
+    // Chromium 需要末尾的空行占位才能把光标留在换行之后，否则后续输入会回到上一行。
+    return raw.endsWith('\n') ? `${html}<br data-editor-tail="">` : html;
   }
 
   // 浏览器在 contenteditable 中可能插入 <br>/<div>；这里统一抽出纯文本，
@@ -1290,6 +1312,7 @@
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const el = node as HTMLElement;
       if (el.tagName === 'BR') {
+        if (el.hasAttribute('data-editor-tail')) return;
         result += '\n';
         return;
       }
@@ -1308,16 +1331,31 @@
     return extractEditorText(inputTextareaEl);
   }
 
-  function getEditorCaretOffset(): number {
-    if (!inputTextareaEl) return 0;
+  function getEditorSelectionOffsets(): { start: number; end: number } {
+    const fallback = { start: inputValue.length, end: inputValue.length };
+    if (!inputTextareaEl) return fallback;
     const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0) return 0;
+    if (!selection || selection.rangeCount === 0) return fallback;
     const range = selection.getRangeAt(0);
-    if (!inputTextareaEl.contains(range.endContainer)) return inputValue.length;
+    if (!inputTextareaEl.contains(range.startContainer)
+      || !inputTextareaEl.contains(range.endContainer)) return fallback;
     const pre = range.cloneRange();
     pre.selectNodeContents(inputTextareaEl);
+    pre.setEnd(range.startContainer, range.startOffset);
+    const start = pre.toString().length;
     pre.setEnd(range.endContainer, range.endOffset);
-    return pre.toString().length;
+    return { start, end: pre.toString().length };
+  }
+
+  function getEditorCaretOffset(): number {
+    return getEditorSelectionOffsets().end;
+  }
+
+  function insertEditorText(text: string): void {
+    const value = readEditorText();
+    const { start, end } = getEditorSelectionOffsets();
+    pendingCaretOffset = start + text.length;
+    inputValue = `${value.slice(0, start)}${text}${value.slice(end)}`;
   }
 
   function setEditorCaretOffset(offset: number) {
@@ -1525,10 +1563,10 @@
   }
 
   function handleContextReferenceSelected(
-    selection: { pathRef: string; displayPath: string; name: string },
+    selection: { pathRef: string; displayPath: string; name: string; isDirectory: boolean },
   ) {
     addContextReference({
-      kind: 'directory',
+      kind: selection.isDirectory ? 'directory' : 'file',
       path: selection.displayPath,
       pathRef: selection.pathRef,
       name: selection.name,
@@ -2075,14 +2113,7 @@
 
   function insertNewlineAtCursor() {
     invalidateEnhanceState();
-    if (!inputTextareaEl) {
-      inputValue += '\n';
-      return;
-    }
-    const offset = getEditorCaretOffset();
-    const value = readEditorText();
-    pendingCaretOffset = offset + 1;
-    inputValue = `${value.slice(0, offset)}\n${value.slice(offset)}`;
+    insertEditorText('\n');
   }
 
   function isEnterKey(event: KeyboardEvent): boolean {
@@ -2099,47 +2130,38 @@
 
   // 处理键盘事件
   function handleKeydown(event: KeyboardEvent) {
+    // 部分按键事件不带组合态标记，组件收到 compositionstart 后同样必须让 IME 接管。
+    if (isComposing || event.isComposing || event.keyCode === 229) return;
     if (isNewlineShortcut(event)) {
-      // 输入法组合态下回车只用于上屏，不能插入换行或触发发送。
-      if (event.isComposing || event.keyCode === 229) {
-        return;
-      }
       event.preventDefault();
       closeSlashMenu();
       insertNewlineAtCursor();
       return;
     }
     if (slashMenuOpen) {
-      // 斜杠菜单展开时优先处理导航；输入法组合态下不拦截，交给 IME 完成上屏。
-      if (!event.isComposing && event.keyCode !== 229) {
-        if (event.key === 'ArrowDown') {
-          event.preventDefault();
-          slashHighlightIndex = (slashHighlightIndex + 1) % filteredSlashCommands.length;
-          return;
-        }
-        if (event.key === 'ArrowUp') {
-          event.preventDefault();
-          slashHighlightIndex = (slashHighlightIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
-          return;
-        }
-        if (event.key === 'Escape') {
-          event.preventDefault();
-          closeSlashMenu();
-          return;
-        }
-        if (event.key === 'Tab' || isEnterKey(event)) {
-          event.preventDefault();
-          const chosen = filteredSlashCommands[slashHighlightIndex] ?? filteredSlashCommands[0];
-          if (chosen) commitSlashCommand(chosen);
-          return;
-        }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        slashHighlightIndex = (slashHighlightIndex + 1) % filteredSlashCommands.length;
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        slashHighlightIndex = (slashHighlightIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeSlashMenu();
+        return;
+      }
+      if (event.key === 'Tab' || isEnterKey(event)) {
+        event.preventDefault();
+        const chosen = filteredSlashCommands[slashHighlightIndex] ?? filteredSlashCommands[0];
+        if (chosen) commitSlashCommand(chosen);
+        return;
       }
     }
     if (isEnterKey(event)) {
-      // 输入法组合态下回车只用于上屏，不能误触发发送
-      if (event.isComposing || event.keyCode === 229) {
-        return;
-      }
       if (event.metaKey || event.ctrlKey || event.shiftKey) {
         event.preventDefault();
         return;
@@ -2336,15 +2358,7 @@
     if (typeof text !== 'string' || text.length === 0) return;
     event.preventDefault();
     invalidateEnhanceState();
-    if (!inputTextareaEl) {
-      pendingCaretOffset = (inputValue.length + text.length);
-      inputValue = inputValue + text;
-      return;
-    }
-    const offset = getEditorCaretOffset();
-    const current = readEditorText();
-    pendingCaretOffset = offset + text.length;
-    inputValue = `${current.slice(0, offset)}${text}${current.slice(offset)}`;
+    insertEditorText(text);
   }
 
   // 拖入图片：浏览器端直接作为图片附件。桌面端的拖入由原生通道按「文件引用」处理，
@@ -3908,6 +3922,7 @@
     {#if WebFolderPickerComponent}
       <WebFolderPickerComponent
         title={i18n.t('input.add.contextPickerTitle')}
+        includeFiles={true}
         onSelect={handleContextReferenceSelected}
         onCancel={() => (contextPickerOpen = false)}
       />

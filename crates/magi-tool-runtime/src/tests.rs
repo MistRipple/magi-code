@@ -7259,6 +7259,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "context_read",
             "context_request",
             "update_plan",
+            "update_execution_steps",
             "memory_write",
             "ask_user_question",
         ],

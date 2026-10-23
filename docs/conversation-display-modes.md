@@ -95,7 +95,7 @@ Rust canonical turn/item（itemVersion 单调递增）
 
 - Markdown 正文分为稳定区与流式区，稳定区在流式期间不重新解析，避免已渲染内容闪烁或重挂载。
 - 时间线按 turn 身份分组，组的 key 不随条目追加变化。
-- 事件流断线或出现缺口时重新同步 bootstrap 快照，reducer 不猜测缺失片段。
+- 事件流断线或出现缺口时重新同步 bootstrap 快照，reducer 不猜测缺失片段。canonical 事件水位只在相同 daemon `runtimeEpoch` 中比较；重启后按新代际快照重建水位并保留已加载的较早历史，避免丢弃序号回落的新终态或后续事件。
 
 ## 验证
 

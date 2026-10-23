@@ -11,7 +11,8 @@
 
   interface Props {
     title?: string;
-    onSelect: (selection: { pathRef: string; displayPath: string; name: string }) => void;
+    includeFiles?: boolean;
+    onSelect: (selection: { pathRef: string; displayPath: string; name: string; isDirectory: boolean }) => void;
     onCancel: () => void;
     disabled?: boolean;
   }
@@ -21,6 +22,7 @@
     onSelect,
     onCancel,
     disabled = false,
+    includeFiles = false,
   }: Props = $props();
 
   let currentPathRef = $state('');
@@ -57,6 +59,10 @@
         if (token !== requestToken) {
           return;
         }
+        if (resolved.kind === 'file' && includeFiles) {
+          onSelect({ ...resolved, isDirectory: false });
+          return;
+        }
         if (resolved.kind !== 'directory') {
           error = directoryLoadFailedText();
           return;
@@ -64,7 +70,7 @@
         targetPathRef = resolved.pathRef;
         showManualInput = false;
       }
-      const result = await browseAgentDirectory({ pathRef: targetPathRef, showHidden });
+      const result = await browseAgentDirectory({ pathRef: targetPathRef, showHidden, includeFiles });
       if (token !== requestToken) {
         return;
       }
@@ -115,7 +121,8 @@
   }
 
   function handleDblClick(entry: DirectoryPickerEntry): void {
-    enterDirectory(entry);
+    if (entry.isDirectory) enterDirectory(entry);
+    else onSelect(entry);
   }
 
   function navigateToNode(node: DirectoryPathNode): void {
@@ -144,6 +151,7 @@
       pathRef: currentPathRef,
       displayPath: currentDisplayPath,
       name: current?.name || currentDisplayPath,
+      isDirectory: true,
     });
   }
 
@@ -294,10 +302,10 @@
             ondblclick={() => handleDblClick(entry)}
           >
             <div class="mac-item-icon">
-              <Icon name="folder" size={16} />
+              <Icon name={entry.isDirectory ? 'folder' : 'document'} size={16} />
             </div>
             <span class="mac-item-name">{entry.name}</span>
-            <div class="mac-item-chevron"><Icon name="chevron-right" size={12} /></div>
+            {#if entry.isDirectory}<div class="mac-item-chevron"><Icon name="chevron-right" size={12} /></div>{/if}
           </button>
         {/each}
       </div>

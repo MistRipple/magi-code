@@ -14,7 +14,6 @@
   import Icon from './Icon.svelte';
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
-  import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import ConversationAgentGroup from './ConversationAgentGroup.svelte';
   import ConversationToolGroup from './ConversationToolGroup.svelte';
   import ConversationPhase from './ConversationPhase.svelte';
@@ -145,13 +144,6 @@
   const durationMs = $derived.by(() => {
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const value = items[index].message.metadata?.responseDurationMs;
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
-    }
-    return null;
-  });
-  const completedAt = $derived.by(() => {
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const value = items[index].message.metadata?.responseCompletedAt;
       if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
     }
     return null;
@@ -297,7 +289,7 @@
       {/if}
     {/each}
     {#if expanded && runtimeActive}
-    <div class="turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} /></div>
+    <div class="turn-runtime-row"><TurnRuntimeIndicator {elapsedSeconds} showElapsed={false} /></div>
     {/if}
   </div>
 
@@ -313,10 +305,6 @@
     />
   {/each}
 
-  <!-- 耗时已经显示在轮次标题上；底部只补充完成时间，不再把同一个耗时重复一遍。 -->
-  {#if !isLive && durationMs !== null && completedAt !== null}
-    <TurnRuntimeSummary durationMs={durationMs} {completedAt} showDuration={false} />
-  {/if}
 </article>
 
 <style>

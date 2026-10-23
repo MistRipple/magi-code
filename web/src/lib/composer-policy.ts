@@ -144,3 +144,23 @@ export function composerCanContinue(input: {
   return Boolean(user?.content?.trim() && user.worker?.taskId
     && (latest.status !== 'cancelled' || user.metadata?.interruptionSource === 'user'));
 }
+
+/** 编辑入口只能属于当前主线最新轮次；隐藏的 Continue 控制轮次也必须参与比较。 */
+export function isLatestMainlineTurn(input: {
+  sessionId: string;
+  turnId: string;
+  turns: readonly CanonicalTurn[];
+}): boolean {
+  const sessionId = input.sessionId.trim();
+  const turnId = input.turnId.trim();
+  if (!sessionId || !turnId) return false;
+  const latest = input.turns
+    .filter(turn => turn.sessionId === sessionId && !turn.metadata?.agentExecution
+      && !turn.items.some(item => item.metadata?.sessionCommand))
+    .reduce<CanonicalTurn | null>((last, turn) => {
+      if (!last) return turn;
+      if (turn.turnSeq !== last.turnSeq) return turn.turnSeq > last.turnSeq ? turn : last;
+      return turn.turnId.localeCompare(last.turnId) > 0 ? turn : last;
+    }, null);
+  return latest?.turnId === turnId;
+}

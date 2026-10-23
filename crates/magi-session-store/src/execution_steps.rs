@@ -260,10 +260,10 @@ pub(crate) fn prepare_steps(
                 "完成步骤必须引用真实成功执行证据或已完成的直接子任务",
             ));
         }
-        if let Some(plan_id) = &s.plan_item_id {
-            if plan_id.trim().is_empty() {
-                return Err(invalid("planItemId 不能为空"));
-            }
+        if let Some(plan_id) = &s.plan_item_id
+            && plan_id.trim().is_empty()
+        {
+            return Err(invalid("planItemId 不能为空"));
         }
         steps.push(ExecutionStep {
             step_id: s.step_id.clone(),

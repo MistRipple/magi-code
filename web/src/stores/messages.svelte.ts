@@ -163,6 +163,9 @@ export const messagesState = $state({
   } as SessionHistoryState,
   queuedMessages: [] as QueuedMessage[],
   editingTurn: null as TurnEditingDraft | null,
+  /** 输入框“继续”提交中的短暂屏障，避免隐藏控制轮次期间旧消息重新出现编辑入口。 */
+  continueSubmissionSessionId: null as string | null,
+  continueSubmissionPending: false,
   notificationCenter: {
     isLoading: false,
     operation: null,
@@ -1584,6 +1587,7 @@ export function setCurrentSessionId(id: string | null) {
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
     messagesState.editingTurn = null;
+    setContinueSubmissionPending(null, false);
     messagesState.sessionHistory = createEmptySessionHistoryState(
       messagesState.currentWorkspaceId,
       messagesState.currentWorkspacePath,
@@ -2711,6 +2715,17 @@ export function cancelTurnEditing(): void {
   messagesState.editingTurn = null;
 }
 
+export function setContinueSubmissionPending(sessionId: string | null | undefined, pending: boolean): void {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!pending || !normalizedSessionId) {
+    messagesState.continueSubmissionSessionId = null;
+    messagesState.continueSubmissionPending = false;
+    return;
+  }
+  messagesState.continueSubmissionSessionId = normalizedSessionId;
+  messagesState.continueSubmissionPending = true;
+}
+
 export function completeTurnEditing(replacedTurnId: string): void {
   const normalizedTurnId = replacedTurnId.trim();
   if (!normalizedTurnId || messagesState.editingTurn?.turnId !== normalizedTurnId) {
@@ -2740,6 +2755,7 @@ export function clearAllMessages(options: {
   );
   messagesState.queuedMessages = [];
   messagesState.editingTurn = null;
+  setContinueSubmissionPending(null, false);
   messagesState.messageJump = {
     messageId: null,
     nonce: messagesState.messageJump.nonce,

@@ -134,8 +134,8 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /if \(isNewlineShortcut\(event\)\) \{[\s\S]*?event\.isComposing[\s\S]*?closeSlashMenu\(\);[\s\S]*?insertNewlineAtCursor\(\);/,
-  '换行快捷键必须优先于斜杠菜单处理，并在输入法组合态下不改变输入内容',
+  /function handleKeydown\(event: KeyboardEvent\) \{[\s\S]{0,180}?if \(isComposing \|\| event\.isComposing \|\| event\.keyCode === 229\) return;\s*if \(isNewlineShortcut\(event\)\) \{\s*event\.preventDefault\(\);\s*closeSlashMenu\(\);\s*insertNewlineAtCursor\(\);/,
+  '输入法组合态必须先于快捷键处理；换行快捷键必须优先于斜杠菜单',
 );
 assert.match(zhLocaleSource, /"input\.send": "发送 \(Enter 发送，Shift\+Enter 或 Option\/Alt\+Enter 换行\)"/, '中文发送提示必须与实际快捷键一致');
 assert.match(enLocaleSource, /"input\.send": "Send \(Enter to send, Shift\+Enter or Option\/Alt\+Enter for newline\)"/, '英文发送提示必须与实际快捷键一致');

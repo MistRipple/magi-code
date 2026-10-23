@@ -163,6 +163,7 @@ import {
   settlePendingRequestSnapshot,
   settleAuthoritativeIdleState,
   completeTurnEditing,
+  setContinueSubmissionPending,
   createRequestBinding,
   getRequestBinding,
   adoptCurrentSessionIdForLiveTurn,
@@ -4621,6 +4622,7 @@ async function continueSessionExecution(expectedSessionId?: string): Promise<voi
   window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
     detail: { status: 'pending', sessionId, requestId },
   }));
+  setContinueSubmissionPending(sessionId, true);
   const accepted = await executeTask({
     text: '继续',
     resume: true,
@@ -4632,12 +4634,14 @@ async function continueSessionExecution(expectedSessionId?: string): Promise<voi
     contextReferences: [],
   });
   if (accepted) {
+    setContinueSubmissionPending(sessionId, false);
     void refreshCurrentGoal(sessionId, currentWorkspaceId, currentWorkspacePath);
     window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
       detail: { status: 'accepted', sessionId, requestId },
     }));
     return;
   }
+  setContinueSubmissionPending(sessionId, false);
   window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
     detail: { status: 'failed', sessionId, requestId },
   }));

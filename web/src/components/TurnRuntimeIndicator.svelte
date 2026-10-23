@@ -9,6 +9,8 @@
 
   interface Props {
     elapsedSeconds: number;
+    /** 摘要轮次标题已经计时，过程行只保留运行和重试状态。 */
+    showElapsed?: boolean;
     /**
      * 承载该运行指示的会话 id。
      *
@@ -18,7 +20,7 @@
     sessionId?: string;
   }
 
-  let { elapsedSeconds, sessionId }: Props = $props();
+  let { elapsedSeconds, sessionId, showElapsed = true }: Props = $props();
   const elapsedLabel = $derived(formatElapsed(Math.max(0, elapsedSeconds)));
 
   /**
@@ -89,7 +91,9 @@
   {#if stageLabel}
     <span class="turn-runtime-stage" data-web-model-stage={webStage?.stage}>{stageLabel}</span>
   {/if}
-  <span class="turn-runtime-elapsed-time">{elapsedLabel}</span>
+  {#if showElapsed}
+    <span class="turn-runtime-elapsed-time">{elapsedLabel}</span>
+  {/if}
 </div>
 
 <style>

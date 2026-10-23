@@ -115,6 +115,15 @@ await withGoldenViteServer(async (server) => {
   assert.equal(policy.composerCanContinue({ sessionId: 'session-resume', turns: [
     canonicalTurn('interrupted', [{ metadata: { noticeKind: 'session_interrupted', recoveryState: 'ready' } }]),
   ], runtimeCanResume: false }), true, 'restart readiness is an authoritative recovery fact');
+  assert.equal(policy.isLatestMainlineTurn({
+    sessionId: 'session-resume', turnId: failedWithTask.turnId, turns: [
+      failedWithTask,
+      { ...canonicalTurn('cancelled', [{ kind: 'user_message', content: '继续', metadata: { route: 'continue' } }]), turnSeq: 2 },
+    ],
+  }), false, 'a hidden continue turn still makes the interrupted turn non-editable');
+  assert.equal(policy.isLatestMainlineTurn({
+    sessionId: 'session-resume', turnId: failedWithTask.turnId, turns: [failedWithTask],
+  }), true, 'the latest stopped mainline remains editable before continuation');
 
   assert.equal(policy.formatImageSize(0), '');
   assert.equal(policy.formatImageSize(512), '512 B');

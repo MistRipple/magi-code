@@ -938,6 +938,8 @@ struct FilesystemBrowseQuery {
     base_path_ref: Option<String>,
     #[serde(default)]
     show_hidden: Option<String>,
+    #[serde(default)]
+    include_files: Option<String>,
 }
 
 async fn browse_filesystem(
@@ -959,7 +961,11 @@ async fn browse_filesystem(
         .map(magi_core::HostPath::into_path_buf)
         .map_err(|e| directory_access_error("规范化目录失败", &path, e))?;
     let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
-    let payload = browse_directory(canonical, show_hidden)?;
+    let payload = browse_directory(
+        canonical,
+        show_hidden,
+        show_hidden_enabled(query.include_files.as_deref()),
+    )?;
     Ok(Json(serde_json::to_value(payload).unwrap_or_default()))
 }
 
@@ -2381,6 +2387,52 @@ mod tests {
             vec![".hidden-a", ".hidden-z", "workspace-a", "workspace-z"],
             "隐藏目录必须优先，组内按名称排序"
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_browse_includes_files_only_when_requested() {
+        let root = unique_temp_dir("magi-filesystem-browse-files");
+        fs::write(root.join("visible.txt"), "visible\n").unwrap();
+        fs::write(root.join(".hidden.txt"), "hidden\n").unwrap();
+        fs::create_dir_all(root.join("folder")).unwrap();
+        for (suffix, expected_names) in [
+            ("", vec!["folder"]),
+            ("&includeFiles=1", vec!["folder", "visible.txt"]),
+            (
+                "&includeFiles=1&showHidden=1",
+                vec!["folder", ".hidden.txt", "visible.txt"],
+            ),
+        ] {
+            let response = routes()
+                .with_state(build_state())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/filesystem/browse?path={}{}",
+                            root.to_string_lossy(),
+                            suffix
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = read_json_response(response).await;
+            let entries = payload["entries"].as_array().unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_names
+            );
+            for entry in entries {
+                assert_eq!(entry["isDirectory"], entry["name"] == "folder");
+                let resolved = decode_path_ref(entry["pathRef"].as_str().unwrap()).unwrap();
+                assert!(resolved.as_path().exists());
+            }
+        }
     }
 
     #[tokio::test]

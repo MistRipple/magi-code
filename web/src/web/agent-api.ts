@@ -2040,7 +2040,7 @@ export interface DirectoryPathNode {
 }
 
 export interface DirectoryPickerEntry extends DirectoryPathNode {
-  isDirectory: true;
+  isDirectory: boolean;
   isHidden: boolean;
 }
 
@@ -2121,6 +2121,7 @@ export async function browseAgentDirectory(
     input?: string;
     basePathRef?: string;
     showHidden?: boolean;
+    includeFiles?: boolean;
   } = {},
 ): Promise<DirectoryListResult> {
   try {
@@ -2136,6 +2137,9 @@ export async function browseAgentDirectory(
     }
     if (options.showHidden) {
       query.set('showHidden', '1');
+    }
+    if (options.includeFiles) {
+      query.set('includeFiles', '1');
     }
     const response = await getTransport().request(agentUrl('/api/filesystem/browse', query.toString()));
     return await parseAgentJson<DirectoryListResult>(response, 'browse directory');
