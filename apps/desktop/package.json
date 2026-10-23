@@ -21,7 +21,7 @@
     "@electron/asar": "4.3.1",
     "@electron/get": "5.1.0",
     "@magi/desktop-browser-contracts": "0.0.0",
-    "@types/node": "24.19.2",
+    "@types/node": "26.6.5",
     "@types/ws": "8.18.2",
     "electron": "45.0.0",
     "electron-builder": "26.15.3",
