@@ -3257,10 +3257,31 @@ try {
   await waitFor(() => page.evaluate(`Boolean(document.querySelector('[data-testid="input-stop-button"]:not([disabled])'))`), "继续验收已确认会话的活动 Turn");
   check("继续验收可停止当前 Turn", await clickStop(page));
   await waitFor(async () => !(await rendererState(page)).stop, "继续验收取消完成");
-  await waitFor(() => page.evaluate(`Boolean(document.querySelector('button[title="从中断处继续"]'))`), "中断后的继续按钮");
-  await page.evaluate(`document.querySelector('button[title="从中断处继续"]').click()`);
-  await waitForAssistant(page, "ELECTRON_BOUNDARY_CONTINUE_OK", "从中断处继续的最终回复");
-  check("真实继续按钮恢复执行并产生正确回复", true);
+  const userMessageCountBeforeContinue = await page.evaluate(
+    `document.querySelectorAll('.message-item.user').length`,
+  );
+  await waitFor(
+    () => page.evaluate(`Boolean(document.querySelector('[data-testid="input-continue-button"]:not([disabled])'))`),
+    "中断后的输入区继续按钮",
+  );
+  await page.evaluate(`document.querySelector('[data-testid="input-continue-button"]').click()`);
+  await waitForAssistant(page, "ELECTRON_BOUNDARY_CONTINUE_OK", "从输入区继续后的最终回复");
+  const resumedUserMessages = await page.evaluate(`(() => {
+    const messages = [...document.querySelectorAll('.message-item.user')];
+    return {
+      count: messages.length,
+      controlBubbles: messages.filter((item) => (
+        (item.querySelector('.user-content')?.innerText || '').trim() === '继续'
+      )).length,
+    };
+  })()`);
+  check(
+    "后台继续不新增继续气泡",
+    resumedUserMessages.count === userMessageCountBeforeContinue
+      && resumedUserMessages.controlBubbles === 0,
+    JSON.stringify(resumedUserMessages),
+  );
+  check("真实输入区继续按钮恢复执行并产生正确回复", true);
 
   const workspaceRoot = await mkdtemp(join(stateRoot, "workspace-"));
   // 多代理验收需要 Git 工作副本，才能按生产规则隔离并行可写代理。
