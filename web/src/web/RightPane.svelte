@@ -360,7 +360,7 @@
           await createAppBrowserSession();
           const result = await runWebModelProbe();
           const summary = result.reason
-            ? `${result.status} · ${result.reason}`
+            ? `${result.status}: ${result.reason}`
             : result.status;
           addToast(result.status === 'ok' ? 'success' : 'warning', summary, undefined, { forceVisible: true });
         } catch (error) {
@@ -583,7 +583,7 @@
     }
     if (kind === 'plugin') {
       const item = pluginViews.find(({ manifest, view }) => manifest.id === pluginId && view.id === contributionId);
-      if (item) openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name} · ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
+      if (item) openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name}: ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
       return;
     }
     createTerminalPane();
@@ -1096,7 +1096,7 @@
     }
     if (tab.kind === 'browser') {
       const occupied = (tab.payload as BrowserTabPayload).agentOccupied;
-      return `${tabLabel(tab)} · ${i18n.t(occupied ? 'browser.control.agentOccupied' : 'browser.control.released')}`;
+      return `${tabLabel(tab)}: ${i18n.t(occupied ? 'browser.control.agentOccupied' : 'browser.control.released')}`;
     }
     if (tab.kind === 'terminal') {
       const payload = tab.payload as TerminalTabPayload;
@@ -1536,7 +1536,7 @@
       </div>
     {:else if largeTextFile}
       <div class="right-pane-large-text">
-        <div class="right-pane-notice">{i18n.t('edits.nonText.largeTextTitle')} · {i18n.t('edits.nonText.size')}: {formatSize(activeCodePayload?.size)}</div>
+        <div class="right-pane-notice ui-meta"><span>{i18n.t('edits.nonText.largeTextTitle')}</span><span>{i18n.t('edits.nonText.size')}: {formatSize(activeCodePayload?.size)}</span></div>
         {#if activeCodePayload?.headSummary}
           <div class="right-pane-summary-section">
             <div class="right-pane-summary-title">{i18n.t('edits.nonText.head')}</div>

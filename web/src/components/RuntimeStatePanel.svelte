@@ -385,7 +385,7 @@
     const versionLabel = typeof version === 'number' && Number.isFinite(version)
       ? i18n.t('runtimeState.summary.planVersion', { version })
       : '';
-    return [statusLabel, versionLabel].filter(Boolean).join(' · ') || '--';
+    return [statusLabel, versionLabel].filter(Boolean).join(', ') || '--';
   }
 
   function formatSnapshotStorageLabel(storage: string | undefined): string {
@@ -556,7 +556,7 @@
     if (reviewRequiredTaskCount > 0) {
       summary.push(`${i18n.t('runtimeDiagnostics.assignmentStatus.reviewRequired')} ${reviewRequiredTaskCount}`);
     }
-    return summary.join(' · ');
+    return summary.join(', ');
   }
 
   function formatTimelineTypeLabel(type: string): string {
@@ -611,7 +611,7 @@
           .split('.')
           .map((part) => formatRuntimeTokenLabel(part))
           .filter(Boolean)
-          .join(' · ') || '运行事件';
+          .join(', ') || '运行事件';
     }
   }
 
@@ -662,7 +662,7 @@
   }
 
   function appendRuntimeRecordSummary(label: string, summary: string): string {
-    return summary ? `${label} · ${summary}` : label;
+    return summary ? `${label}: ${summary}` : label;
   }
 
   function formatRuntimeRecordPreview(value: unknown): string {
@@ -787,7 +787,7 @@
   {#if panelVisible}
   <section
     bind:this={panelRef}
-    class="runtime-diagnostics runtime-diagnostics--{statusModifier}"
+    class="runtime-diagnostics"
     class:runtime-diagnostics--expanded={isPanelExpanded}
   >
     <button
@@ -910,27 +910,27 @@
                   ></div>
                 </div>
               {/if}
-              <div class="metric-card__sub">
-                {i18n.t('runtimeDiagnostics.tokens', { value: formatTokens(snap.budgetState.tokenUsed) })}
+              <div class="metric-card__sub ui-meta">
+                <span>{i18n.t('runtimeDiagnostics.tokens', { value: formatTokens(snap.budgetState.tokenUsed) })}</span>
                 {#if snap.budgetState.tokenLimit != null}
-                  · {i18n.t('runtimeDiagnostics.tokenLimit', { value: formatTokens(snap.budgetState.tokenLimit) })}
+                  <span>{i18n.t('runtimeDiagnostics.tokenLimit', { value: formatTokens(snap.budgetState.tokenLimit) })}</span>
                 {/if}
                 {#if snap.budgetState.remainingTokens != null}
-                  · {i18n.t('runtimeDiagnostics.remainingTokens', { value: formatTokens(snap.budgetState.remainingTokens) })}
+                  <span>{i18n.t('runtimeDiagnostics.remainingTokens', { value: formatTokens(snap.budgetState.remainingTokens) })}</span>
                 {/if}
                 {#if snap.budgetState.errorRate != null && snap.budgetState.errorRate > 0}
-                  · {i18n.t('runtimeDiagnostics.errorRate', { rate: Math.round(snap.budgetState.errorRate * 100) })}
+                  <span>{i18n.t('runtimeDiagnostics.errorRate', { rate: Math.round(snap.budgetState.errorRate * 100) })}</span>
                 {/if}
               </div>
               {#if snap.budgetState.usageRatio != null}
                 <div
-                  class="metric-card__sub"
+                  class="metric-card__sub ui-meta"
                   class:metric-card__sub--notice={resolveBudgetTone(snap.budgetState.warningLevel) === 'notice'}
                   class:metric-card__sub--warn={resolveBudgetTone(snap.budgetState.warningLevel) === 'warning'}
                   class:metric-card__sub--danger={resolveBudgetTone(snap.budgetState.warningLevel) === 'danger'}
                 >
-                  {resolveBudgetToneLabel(snap.budgetState.warningLevel)}
-                  · {i18n.t('runtimeDiagnostics.usageRatio', { value: formatUsageRatio(snap.budgetState.usageRatio) })}
+                  <span>{resolveBudgetToneLabel(snap.budgetState.warningLevel)}</span>
+                  <span>{i18n.t('runtimeDiagnostics.usageRatio', { value: formatUsageRatio(snap.budgetState.usageRatio) })}</span>
                 </div>
               {/if}
             </div>
@@ -1035,10 +1035,8 @@
   }
 
   .runtime-diagnostics {
-    --runtime-status-color: var(--vscode-editorWidget-border, var(--border));
     margin: 0 12px;
     border: var(--magi-hairline) solid var(--vscode-editorWidget-border, var(--border));
-    border-left: 2px solid var(--runtime-status-color);
     border-radius: 8px;
     background: var(--vscode-editorWidget-background, var(--surface-2));
     color: var(--vscode-foreground, var(--foreground));
@@ -1053,16 +1051,6 @@
     border-bottom-left-radius: 0;
     border-bottom-right-radius: 0;
   }
-
-  /* 左侧状态线贯穿标题栏和展开内容。 */
-  .runtime-diagnostics--completed { --runtime-status-color: var(--success); }
-  .runtime-diagnostics--failed    { --runtime-status-color: var(--vscode-editorError-foreground, var(--error)); }
-  .runtime-diagnostics--cancelled { --runtime-status-color: var(--vscode-editorWidget-border, var(--border)); }
-  .runtime-diagnostics--idle      { --runtime-status-color: var(--vscode-editorWidget-border, var(--border)); }
-  .runtime-diagnostics--running   { --runtime-status-color: var(--vscode-progressBar-background, var(--info)); }
-  .runtime-diagnostics--waiting   { --runtime-status-color: var(--vscode-editorWarning-foreground, var(--warning)); }
-  .runtime-diagnostics--paused    { --runtime-status-color: var(--vscode-editorWarning-foreground, var(--warning)); }
-  .runtime-diagnostics--blocked   { --runtime-status-color: var(--vscode-editorWarning-foreground, var(--warning)); }
 
   .runtime-diagnostics__summary-button {
     width: 100%;
@@ -1108,7 +1096,7 @@
   }
 
   .summary__badge {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     padding: 1px 6px;
     border-radius: 3px;
@@ -1148,7 +1136,7 @@
   }
 
   .summary__phase {
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.72;
     min-width: 0;
     overflow: hidden;
@@ -1160,14 +1148,14 @@
     padding-left: 6px;
     border-left: var(--magi-hairline) solid var(--border-subtle);
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
 
   .summary__time {
     margin-left: auto;
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.5;
     font-variant-numeric: tabular-nums;
   }
@@ -1186,7 +1174,6 @@
     overflow-y: auto;
     border: var(--magi-hairline) solid var(--vscode-editorWidget-border, var(--border));
     border-top: 0;
-    border-left: 2px solid var(--runtime-status-color);
     border-radius: 0 0 8px 8px;
     box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
     pointer-events: auto;
@@ -1216,7 +1203,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.8;
     min-width: 0;
   }
@@ -1226,7 +1213,7 @@
   }
 
   .metric-card__title {
-    font-size: 11px;
+    font-size: var(--text-xs);
     min-width: 0;
     overflow-wrap: anywhere;
   }
@@ -1250,7 +1237,7 @@
   }
 
   .metric-card__sub {
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.7;
     min-width: 0;
     overflow-wrap: anywhere;
@@ -1315,7 +1302,7 @@
   }
 
   .runtime-diagnostics__label {
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.8;
     margin-bottom: 2px;
   }
@@ -1328,7 +1315,7 @@
     background: color-mix(in srgb, var(--vscode-editor-background, var(--surface-1)) 68%, transparent);
     color: var(--vscode-foreground, var(--foreground));
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1.5;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -1350,7 +1337,7 @@
   }
 
   .runtime-diagnostics__kv-label {
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.75;
   }
 
@@ -1438,7 +1425,7 @@
   }
 
   .runtime-diagnostics__ops-time {
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.7;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -1448,7 +1435,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.78;
     line-height: 1.5;
     min-width: 0;
@@ -1456,25 +1443,10 @@
     word-break: break-word;
   }
 
-  .runtime-diagnostics__ops-item--success {
-    border-left: 2px solid var(--success);
-    padding-left: 8px;
-  }
-
-  .runtime-diagnostics__ops-item--warning {
-    border-left: 2px solid var(--vscode-editorWarning-foreground, var(--warning));
-    padding-left: 8px;
-  }
-
-  .runtime-diagnostics__ops-item--error {
-    border-left: 2px solid var(--vscode-inputValidation-errorBorder, var(--error));
-    padding-left: 8px;
-  }
-
   .runtime-diagnostics__record-kind {
     flex: 0 0 auto;
     font-weight: var(--font-semibold);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .runtime-diagnostics__ops-item--success .runtime-diagnostics__record-kind {

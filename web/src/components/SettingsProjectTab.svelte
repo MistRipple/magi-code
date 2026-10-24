@@ -137,7 +137,7 @@
     const parts = [`Magi v${displayVersion}`];
     if (core) parts.push(`core v${core.version}`, `build ${shortBuild}`);
     try {
-      await navigator.clipboard.writeText(parts.join(' · '));
+      await navigator.clipboard.writeText(parts.join(', '));
       showFeedback('success', i18n.t('settings.about.copied'), {
         presentation: 'toast',
         source: 'settings-about',
@@ -253,7 +253,7 @@
   <!-- 开源与反馈：三个入口做成并排的卡片 -->
   <section class="settings-section" aria-labelledby="project-repository-title">
     <div class="settings-section-title" id="project-repository-title">{i18n.t('settings.project.repositoryLabel')}</div>
-    <div class="settings-section-desc">{i18n.t('settings.project.repositoryDesc')}</div>
+
 
     <div class="settings-rows" aria-label={i18n.t('settings.project.moreLinks')}>
       {#each PROJECT_LINKS as link (link.id)}

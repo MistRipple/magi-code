@@ -548,7 +548,7 @@
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--surface-2) 60%, transparent);
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     line-height: 1.35;
   }
@@ -580,7 +580,7 @@
   .change-tree-file-stats {
     width: auto;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }

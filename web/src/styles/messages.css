@@ -52,11 +52,6 @@
   border: none;
 }
 
-/* 编排者卡片消息 */
-.message-item.assistant.card-shell[data-source="orchestrator"] {
-  --stream-accent: var(--color-orchestrator);
-}
-
 /* 流式输出时，移除外层卡片的呼吸动画，仅保留三点跳动动画 */
 .message-item.assistant.streaming {
   position: relative;

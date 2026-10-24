@@ -135,7 +135,7 @@
       <span>{i18n.t('mcpServer.audit.filter')}</span>
       <SelectField bind:value={filterTokenId} onchange={(next) => { filterTokenId = next; changeFilter(); }} data-mcp-audit-filter="1"
         label={i18n.t('mcpServer.audit.filter')}
-        options={[{ value: '', label: i18n.t('mcpServer.audit.filterAll') }, ...tokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${token.prefix}…` }))]} />
+        options={[{ value: '', label: i18n.t('mcpServer.audit.filterAll') }, ...tokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${token.prefix}…` }))]} />
     </div>
     <div class="action-row">
       {#if hasSession}
@@ -161,10 +161,10 @@
                 {i18n.t(`mcpServer.audit.outcome.${entry.outcome}`)}
               </span>
             </span>
-            <span class="meta">
-              {entry.clientName} · {formatTime(entry.atMs)}
-              {#if entry.paths.length > 0} · {entry.paths.slice(0, 3).join(', ')}{/if}
-              {#if entry.detail} · {entry.detail}{/if}
+            <span class="meta ui-meta">
+              <span>{entry.clientName}</span><span>{formatTime(entry.atMs)}</span>
+              {#if entry.paths.length > 0}<span>{entry.paths.slice(0, 3).join(', ')}</span>{/if}
+              {#if entry.detail}<span>{entry.detail}</span>{/if}
             </span>
           </div>
         </li>
@@ -216,7 +216,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .field :global(.select-field select) {
@@ -230,7 +230,7 @@
 
   .meta {
     margin: 0;
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.66;
     overflow-wrap: anywhere;
   }
@@ -273,7 +273,7 @@
   .badge {
     padding: 1px 6px;
     border-radius: 999px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     background: var(--accent-soft, rgba(80, 140, 255, 0.16));
     color: var(--accent-strong, #3b6fd4);
   }

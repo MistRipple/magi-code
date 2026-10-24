@@ -315,7 +315,7 @@
       return summary;
     }
     const failure = normalizeDisplayText(publicErrorText || errorText);
-    return [summary, failure].filter(Boolean).join(' · ');
+    return [summary, failure].filter(Boolean).join(', ');
   });
   const isExpandable = $derived(Boolean(
     displayCommand

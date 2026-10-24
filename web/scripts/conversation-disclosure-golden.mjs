@@ -117,7 +117,7 @@ await withGoldenViteServer(async (server) => {
   );
   assert.equal(
     groupLabel([toolItem('t', 'browser_click', {}, 'error')]),
-    '浏览器点击 · 失败',
+    '浏览器点击: 失败',
   );
 
   // ---- 结果未确认（副作用可能已发生）与普通失败分开呈现 ----
@@ -126,12 +126,12 @@ await withGoldenViteServer(async (server) => {
     item.message.blocks[0].toolCall.result = JSON.stringify({ tool: 'browser_click', status: 'indeterminate', error_code: 'browser_host_request_indeterminate' });
     return item;
   };
-  assert.equal(groupLabel([unconfirmedItem('u')]), '浏览器点击 · 结果未确认');
+  assert.equal(groupLabel([unconfirmedItem('u')]), '浏览器点击: 结果未确认');
   {
     // 未确认来自正式的 item 状态，而不是从结果文本里嗅探
     const sniffed = toolItem('s', 'browser_click', {}, 'error');
     sniffed.message.blocks[0].toolCall.result = JSON.stringify({ status: 'indeterminate' });
-    assert.equal(groupLabel([sniffed]), '浏览器点击 · 失败');
+    assert.equal(groupLabel([sniffed]), '浏览器点击: 失败');
   }
   assert.equal(
     groupLabel([unconfirmedItem('u'), toolItem('f', 'browser_type', { text: 'x' }, 'error'), toolItem('ok', 'browser_read')]),

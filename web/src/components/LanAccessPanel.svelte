@@ -313,5 +313,5 @@
   .tunnel-toggle-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; padding: 6px 12px; font-size: var(--text-xs); font-weight: var(--font-medium); color: var(--primary-foreground); background: var(--primary); border: none; border-radius: var(--radius-md); cursor: pointer; transition: opacity 0.15s; }
   .tunnel-toggle-btn:hover:not(:disabled) { opacity: 0.85; }
   .tunnel-toggle-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .tunnel-hint { font-size: 10px; color: var(--foreground-muted); margin: 6px 0 0 0; text-align: center; line-height: 1.4; }
+  .tunnel-hint { font-size: var(--text-xs); color: var(--foreground-muted); margin: 6px 0 0 0; text-align: center; line-height: 1.4; }
 </style>

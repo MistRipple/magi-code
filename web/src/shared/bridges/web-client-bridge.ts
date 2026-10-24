@@ -4528,6 +4528,8 @@ async function interruptTask(): Promise<void> {
     );
     return;
   }
+  if (messagesState.interruptPendingSessions.has(sessionId)) return;
+  messagesState.interruptPendingSessions = new Set([...messagesState.interruptPendingSessions, sessionId]);
   const processingSnapshot = captureProcessingRequestSnapshot(sessionId);
   try {
     const response = await interruptAgentSession(sessionId);
@@ -4603,6 +4605,10 @@ async function interruptTask(): Promise<void> {
     settleProcessingRequestSnapshot(processingSnapshot);
     emitBridgeErrorToast(i18n.t('bridge.action.stopTask'), error);
     scheduleRecovery('user_interrupt_failed', error, true);
+  } finally {
+    messagesState.interruptPendingSessions = new Set(
+      [...messagesState.interruptPendingSessions].filter((pendingSession) => pendingSession !== sessionId),
+    );
   }
 }
 

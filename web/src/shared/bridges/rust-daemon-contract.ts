@@ -1471,7 +1471,7 @@ function buildEventSummary(event: RustEventEnvelope): string {
   if (issueDetail && !status) {
     parts.push('需要关注');
   }
-  return parts.length > 0 ? `${eventLabel}：${parts.join(' · ')}` : eventLabel;
+  return parts.length > 0 ? `${eventLabel}：${parts.join(', ')}` : eventLabel;
 }
 
 function resolveEventReadableTitle(payload: Record<string, unknown>): string {
@@ -1514,7 +1514,7 @@ function formatRuntimeEventLabel(eventType: string): string {
       return '运行态维护';
     default:
       return eventType
-        ? eventType.split('.').map(formatRuntimeEventTokenLabel).filter(Boolean).join(' · ')
+        ? eventType.split('.').map(formatRuntimeEventTokenLabel).filter(Boolean).join(', ')
         : '运行事件';
   }
 }

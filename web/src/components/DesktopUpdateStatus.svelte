@@ -252,7 +252,7 @@
     display: inline-flex;
     align-items: center;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -370,7 +370,7 @@
     align-items: center;
     justify-content: center;
     color: currentColor;
-    font-size: 6.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
     line-height: 1;

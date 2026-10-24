@@ -394,9 +394,9 @@ function singleToolLabel(
     : target && TARGETED_TOOL_ACTIONS.has(descriptor.action)
       ? translate(`${actionKey}Target`, { target })
       : translate(actionKey);
-  if (descriptor.unconfirmed) return `${label} · ${translate('messageList.turnDisclosure.toolUnconfirmed')}`;
+  if (descriptor.unconfirmed) return `${label}: ${translate('messageList.turnDisclosure.toolUnconfirmed')}`;
   return descriptor.status === 'error'
-    ? `${label} · ${translate('messageList.turnDisclosure.toolFailed')}`
+    ? `${label}: ${translate('messageList.turnDisclosure.toolFailed')}`
     : label;
 }
 

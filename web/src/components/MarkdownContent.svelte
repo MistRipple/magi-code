@@ -148,7 +148,7 @@
 
   .markdown-content :global(code) {
     font-family: var(--font-mono);
-    font-size: 0.9em;
+    font-size: max(var(--text-xs), 0.9em);
   }
 
   .markdown-content :global(table) {

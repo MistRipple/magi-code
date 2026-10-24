@@ -464,7 +464,7 @@
   .engine-card-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .engine-card-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .engine-card-meta { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .engine-ref-count { margin-left: var(--space-2); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: 10px; }
+  .engine-ref-count { margin-left: var(--space-2); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: var(--text-xs); }
   .engine-card-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
   .engine-card-toggle { display: flex; align-items: center; }
   .engine-select {
@@ -487,7 +487,7 @@
   .role-template-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .role-template-item-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
   .role-template-item-desc { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .role-template-item-badge { font-size: 10px; padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
+  .role-template-item-badge { font-size: var(--text-xs); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
 
   /* Nested rows share their parent edge. */
   .settings-card .settings-rows { box-shadow: none; }

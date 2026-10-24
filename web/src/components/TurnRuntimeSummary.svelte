@@ -31,14 +31,14 @@
 </script>
 
 <div class="message-runtime-footer completed" class:has-content={hasContent}>
-  <span class="message-runtime-text">
+  <span class="message-runtime-text ui-meta">
     {#if showDuration}
-      {i18n.t('messageItem.responseDurationLabel')} {durationLabel}
+      <span>{i18n.t('messageItem.responseDurationLabel')} {durationLabel}</span>
       {#if normalizedCompletedAt !== null}
-        · {formatTraceableTime(normalizedCompletedAt)}
+        <span>{formatTraceableTime(normalizedCompletedAt)}</span>
       {/if}
     {:else if normalizedCompletedAt !== null}
-      {formatTraceableTime(normalizedCompletedAt)}
+      <span>{formatTraceableTime(normalizedCompletedAt)}</span>
     {/if}
   </span>
 </div>

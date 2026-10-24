@@ -147,7 +147,7 @@ await withGoldenViteServer(async (server) => {
         remainingTokens: 5740,
         tokenLimit: 10000,
       }, t),
-      '上下文 43% · 已用 4.3k · 剩余 5.7k · 窗口 10.0k',
+      '上下文 43%, 已用 4.3k, 剩余 5.7k, 窗口 10.0k',
       'normal tooltip composes label/usage/remaining/limit with k formatting',
     );
   }
@@ -170,7 +170,7 @@ await withGoldenViteServer(async (server) => {
         remainingTokens: 262_400,
         tokenLimit: 272_000,
       }, t),
-      '上下文 4% · 已用 9.6k · 剩余 262.4k · 窗口 272.0k',
+      '上下文 4%, 已用 9.6k, 剩余 262.4k, 窗口 272.0k',
       'small but non-zero context usage must remain visible',
     );
   }
@@ -193,7 +193,7 @@ await withGoldenViteServer(async (server) => {
         remainingTokens: 271_664,
         tokenLimit: 272_000,
       }, t),
-      '上下文 <1% · 已用 336 · 剩余 271.7k · 窗口 272.0k',
+      '上下文 <1%, 已用 336, 剩余 271.7k, 窗口 272.0k',
       'tiny non-zero usage keeps precise token details in tooltip',
     );
   }
@@ -216,7 +216,7 @@ await withGoldenViteServer(async (server) => {
         remainingTokens: 262_400,
         tokenLimit: 272_000,
       }, t),
-      '上下文 4% · 已用 9.6k · 剩余 262.4k · 窗口 272.0k',
+      '上下文 4%, 已用 9.6k, 剩余 262.4k, 窗口 272.0k',
       'tooltip follows the same derived effective ratio',
     );
   }
@@ -256,7 +256,7 @@ await withGoldenViteServer(async (server) => {
   // 场景 7：tooltip 在 token 字段缺失时回退占位，而非崩溃。
   {
     const tip = ring.buildRingTooltip({ usageRatio: 0.1 }, t);
-    assert.equal(tip, '上下文 10% · 已用 -- · 剩余 -- · 窗口 --',
+    assert.equal(tip, '上下文 10%, 已用 --, 剩余 --, 窗口 --',
       'missing token fields degrade to -- inside the tooltip');
   }
 
@@ -407,7 +407,7 @@ await withGoldenViteServer(async (server) => {
     );
     assert.equal(
       ring.buildRingTooltip(input, t),
-      '上下文 25% · 已用 68.0k · 剩余 204.0k · 窗口 272.0k · 最近压缩 窗口压力 180.0k->36.0k',
+      '上下文 25%, 已用 68.0k, 剩余 204.0k, 窗口 272.0k, 最近压缩 窗口压力 180.0k->36.0k',
       'tooltip includes compaction as explanatory metadata',
     );
   }

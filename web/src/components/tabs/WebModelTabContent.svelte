@@ -388,7 +388,7 @@
     gap: 6px;
     height: 36px;
     padding: 0 8px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     background: transparent;
     border-bottom: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.18));
   }
@@ -429,7 +429,7 @@
     margin: 0;
     padding: 4px 8px;
     overflow: hidden;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 14px;
     color: var(--foreground);
     background: var(--accent-soft, rgba(80, 140, 255, 0.16));
@@ -491,7 +491,7 @@
     padding: 1px 8px;
     border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: 6px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     background: transparent;
     cursor: pointer;
   }

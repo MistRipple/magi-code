@@ -367,7 +367,7 @@
           style={`top: ${markerPositions[focusedItem.turnId] ?? 8}px;`}
         >
           <div class="turn-navigation-preview-kicker">
-            <span>{i18n.t('messageList.turnNavigation.round', { index: focusedItem.index })} · {statusLabel(focusedItem.status)}</span>
+            <span class="ui-meta"><span>{i18n.t('messageList.turnNavigation.round', { index: focusedItem.index })}</span><span>{statusLabel(focusedItem.status)}</span></span>
             {#if focusedItem.sentAt !== undefined}
               <span class="turn-navigation-preview-time">
                 {i18n.t('messageList.turnNavigation.sentAt', { time: formatTraceableTime(focusedItem.sentAt) })}

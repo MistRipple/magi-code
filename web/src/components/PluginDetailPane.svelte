@@ -43,7 +43,7 @@
   const removable = $derived(Boolean(plugin) && plugin!.activeScopes.length === 0 && plugin!.enabledScopes.length === 0);
 
   function permissionText(permission: PluginPermission): string {
-    return `${permission.kind} · ${permission.scope}${permission.targets.length ? ` · ${permission.targets.join(', ')}` : ''}`;
+    return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
   }
 
   function sourceLabel(installed: InstalledPluginProjection): string {

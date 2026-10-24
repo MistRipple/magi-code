@@ -96,7 +96,7 @@
   li.running { color:var(--foreground); } li.problem { color:var(--error); }
   .step-button { display:flex; width:100%; gap:8px; align-items:flex-start; border:0; background:none; padding:0; color:inherit; font:inherit; text-align:left; cursor:pointer; }
   .step-icon { width:16px; display:inline-flex; justify-content:center; padding-top:2px; flex-shrink:0; } li.running .step-icon { color:var(--primary); } li.completed .step-icon { color:var(--success); }
-  .step-copy { display:flex; flex-direction:column; min-width:0; flex:1; } .step-title { overflow-wrap:anywhere; } .step-reason { color:var(--foreground-muted); font-size:11px; white-space:pre-wrap; } .step-status { font-size:11px; white-space:nowrap; }
+  .step-copy { display:flex; flex-direction:column; min-width:0; flex:1; } .step-title { overflow-wrap:anywhere; } .step-reason { color:var(--foreground-muted); font-size: var(--text-xs); white-space:pre-wrap; } .step-status { font-size: var(--text-xs); white-space:nowrap; }
   .step-details { margin:8px 0 5px 24px; display:flex; flex-direction:column; gap:6px; color:var(--foreground-muted); font-size:12px; }
   .agent-link { background:none; border:0; color:var(--primary); padding:0; cursor:pointer; text-align:left; }
   button:focus-visible { outline:2px solid var(--primary); outline-offset:3px; border-radius:3px; }

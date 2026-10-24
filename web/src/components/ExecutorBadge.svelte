@@ -103,11 +103,11 @@
     white-space: nowrap;
   }
 
-  .size-sm { padding: 1px 6px; font-size: 11px; }
+  .size-sm { padding: 1px 6px; font-size: var(--text-xs); }
   .size-md { padding: 2px 8px; font-size: var(--text-xs); }
   .size-lg { padding: 4px 10px; font-size: var(--text-sm); }
 
-  .executor-icon { font-size: 0.9em; }
+  .executor-icon { font-size: max(var(--text-xs), 0.9em); }
 
   .executor-name {
     color: var(--executor-color);
@@ -117,7 +117,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 0.9em;
+    font-size: max(var(--text-xs), 0.9em);
     opacity: 0.8;
   }
 

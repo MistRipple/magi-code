@@ -1497,7 +1497,7 @@
   }
 
   .kp-tab-count {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     min-width: 18px;
     height: 18px;
@@ -1780,7 +1780,7 @@
   }
 
   .kp-stat-label {
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1941,7 +1941,7 @@
   .kp-preview-date {
     flex: 0 0 auto;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
 
@@ -2131,7 +2131,7 @@
   }
 
   .kp-tag {
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     padding: 1px 6px;
     background: var(--surface-2);
     border-radius: var(--radius-sm);
@@ -2140,7 +2140,7 @@
 
   /* ---- 分类徽章 ---- */
   .kp-category-badge {
-    font-size: 10px;
+    font-size: var(--text-xs);
     padding: 1px 6px;
     background: var(--surface-2);
     border-radius: var(--radius-sm);

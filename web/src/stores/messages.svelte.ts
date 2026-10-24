@@ -167,6 +167,8 @@ export const messagesState = $state({
   /** 输入框“继续”提交中的短暂屏障，避免隐藏控制轮次期间旧消息重新出现编辑入口。 */
   continueSubmissionSessionId: null as string | null,
   continueSubmissionPending: false,
+  /** 仅表示中断 HTTP 请求在途，不能作为 Turn 已停止的事实。由 bridge 领取和释放。 */
+  interruptPendingSessions: new Set<string>(),
   notificationCenter: {
     isLoading: false,
     operation: null,

@@ -68,7 +68,7 @@
   function controlTitle(): string {
     const branch = gitContextState.currentBranch || i18n.t('input.branch.detached');
     const items = statusItems();
-    return `${branch} · ${items.length > 0 ? items.join(' · ') : i18n.t('input.branch.status.clean')}`;
+    return `${branch}: ${items.length > 0 ? items.join(', ') : i18n.t('input.branch.status.clean')}`;
   }
 
   async function toggle(): Promise<void> {
@@ -294,9 +294,9 @@
     background: color-mix(in srgb, var(--primary) 12%, var(--surface-1));
     color: var(--primary);
   }
-  .git-context-branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+  .git-context-branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs); }
   .git-context-dirty { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--warning); }
-  .git-context-conflict { color: var(--error); font-size: 10px; font-weight: var(--font-semibold); }
+  .git-context-conflict { color: var(--error); font-size: var(--text-xs); font-weight: var(--font-semibold); }
   .git-context-popover {
     position: absolute; bottom: calc(100% + 7px); left: 0; z-index: 34; width: min(280px, calc(100vw - 24px));
     padding: 6px; border: 0; border-radius: calc(var(--radius-sm) + 6px); background: var(--dropdown-bg);
@@ -311,15 +311,15 @@
   .git-context-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .git-context-item:hover:not(:disabled), .git-context-item.selected { background: var(--surface-hover); }
   .git-context-item:disabled { cursor: not-allowed; opacity: 0.52; }
-  .git-context-warning, .git-context-error { display: flex; flex-direction: column; gap: 5px; margin: 5px 0; padding: 7px 8px; border-radius: var(--radius-sm); color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); font-size: 11px; line-height: 1.4; }
+  .git-context-warning, .git-context-error { display: flex; flex-direction: column; gap: 5px; margin: 5px 0; padding: 7px 8px; border-radius: var(--radius-sm); color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); font-size: var(--text-xs); line-height: 1.4; }
   .git-context-error { color: var(--error); background: color-mix(in srgb, var(--error) 10%, transparent); }
-  .git-context-warning button, .git-context-error button { align-self: flex-start; padding: 0; border: 0; border-bottom: var(--magi-hairline) solid currentColor; background: transparent; color: inherit; cursor: pointer; font-size: 11px; }
+  .git-context-warning button, .git-context-error button { align-self: flex-start; padding: 0; border: 0; border-bottom: var(--magi-hairline) solid currentColor; background: transparent; color: inherit; cursor: pointer; font-size: var(--text-xs); }
   .git-context-create { display: flex; gap: 6px; padding: 6px; border-top: var(--magi-hairline) solid var(--border-subtle); }
   .git-context-create input { height: 28px; padding: 0 7px; border: var(--magi-hairline) solid var(--border-subtle); border-radius: var(--radius-sm); }
-  .git-context-create button, .git-context-actions button { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: 11px; }
+  .git-context-create button, .git-context-actions button { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: var(--text-xs); }
   .git-context-create button:hover:not(:disabled), .git-context-actions button:hover { background: var(--surface-hover); color: var(--foreground); }
   .git-context-actions { display: flex; justify-content: space-between; gap: 4px; padding-top: 4px; border-top: var(--magi-hairline) solid var(--border-subtle); }
-  .git-context-empty { padding: 12px 8px; color: var(--foreground-muted); font-size: 11px; text-align: center; }
+  .git-context-empty { padding: 12px 8px; color: var(--foreground-muted); font-size: var(--text-xs); text-align: center; }
   @media (max-width: 640px) {
     .git-context-popover { position: fixed; bottom: calc(44px + env(safe-area-inset-bottom)); left: 12px; width: calc(100vw - 24px); }
   }
@@ -350,7 +350,7 @@
     }
 
     .git-context-conflict {
-      font-size: 8px;
+      font-size: var(--text-xs);
       line-height: 1;
     }
   }

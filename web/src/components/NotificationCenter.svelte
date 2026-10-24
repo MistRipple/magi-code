@@ -598,7 +598,7 @@
 
   .notif-scope,
   .notif-count {
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm, 4px);

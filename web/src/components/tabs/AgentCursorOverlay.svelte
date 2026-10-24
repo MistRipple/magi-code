@@ -364,7 +364,7 @@
     box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 4px 12px rgba(8, 10, 24, 0.24);
     color: var(--primary-foreground, #fff);
     font-family: var(--font-sans, inherit);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 1;
     white-space: nowrap;

@@ -48,7 +48,7 @@
           id: pluginMainPageId(manifest.id, view.id),
           pluginId: manifest.id,
           entry: view.entry,
-          label: `${manifest.name} · ${view.title}`,
+          label: `${manifest.name}: ${view.title}`,
         }))
     )),
   );

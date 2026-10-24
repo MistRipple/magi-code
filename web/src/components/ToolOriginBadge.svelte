@@ -21,7 +21,7 @@
     padding: 0 6px;
     border: var(--magi-hairline) solid var(--border);
     border-radius: 9px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 16px;
     color: var(--foreground-muted);
     white-space: nowrap;

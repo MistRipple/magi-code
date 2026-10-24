@@ -872,7 +872,7 @@
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     background: var(--surface-2);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     line-height: 18px;
     text-align: center;

@@ -78,6 +78,8 @@ let pendingChangesRequestCount = 0;
 let pendingChangesPayloadOverride = null;
 let queuedTurnPayloads = [];
 let interruptRequestCount = 0;
+let interruptResponseGate = null;
+let interruptFailure = false;
 const goalRefreshQueries = [];
 
 class MemoryStorage {
@@ -491,10 +493,12 @@ function installFetchStub() {
     }
     if (parsed.pathname === '/api/session/interrupt') {
       interruptRequestCount += 1;
+      if (interruptResponseGate) await interruptResponseGate;
+      if (interruptFailure) throw new Error('interrupt connection failed');
       queuedTurnPayloads = queuedTurnPayloads.slice(1);
       return jsonResponse({
         interrupted: true,
-        sessionId: SESSION_ID,
+        sessionId: JSON.parse(String(init.body || '{}')).sessionId,
         workspaceId: WORKSPACE_ID,
         turnId: TURN_ID,
         eventId: `event-interrupt-${interruptRequestCount}`,
@@ -2260,7 +2264,18 @@ await withGoldenViteServer(async (server) => {
     [interruptCanonicalTurn],
     2,
   );
+  let releaseInterrupt;
+  interruptResponseGate = new Promise(resolve => { releaseInterrupt = resolve; });
   bridge.postMessage({ type: 'interruptTask' });
+  await waitFor(() => interruptRequestCount === 1, '中断请求应已发出');
+  assert.equal(messagesStore.messagesState.interruptPendingSessions.has(SESSION_ID), true,
+    '停止操作在真实响应到达前应保持在途状态');
+  assert.equal(messagesStore.messagesState.interruptPendingSessions.has('another-session'), false,
+    '中断请求状态不能污染其他会话');
+  bridge.postMessage({ type: 'interruptTask' });
+  assert.equal(interruptRequestCount, 1, '同一会话不得重复发出中断请求');
+  releaseInterrupt();
+  interruptResponseGate = null;
   await waitFor(
     () => interruptRequestCount === 1 && messagesStore.messagesState.queuedMessages.length === 0,
     '停止当前轮次后必须同步服务端已按 FIFO 启动的队首消息',
@@ -2270,7 +2285,8 @@ await withGoldenViteServer(async (server) => {
     false,
     '中断 API 确认后必须在队列同步完成前精确收敛被中断 request',
   );
-
+  assert.equal(messagesStore.messagesState.interruptPendingSessions.has(SESSION_ID), false,
+    '中断请求完成后应释放在途状态');
   const streamCountBeforeLagged = FakeEventSource.instances.length;
   const pendingChangesRequestsBeforeLagged = pendingChangesRequestCount;
   pendingChangesPayloadOverride = [{
@@ -3459,6 +3475,13 @@ await withGoldenViteServer(async (server) => {
       workspace_id: RACE_WORKSPACE_ID, session_id: RACE_SESSION_ID, payload: { goal_id: 'goal-late', step_id: 'late-response' } },
   } });
   await waitFor(() => goalRefreshQueries.length > goalReadsBeforeUsage, 'Turn 结束后的迟到用量提交也必须刷新服务端 Goal 快照');
+
+  interruptFailure = true;
+  bridge.postMessage({ type: 'interruptTask' });
+  await waitFor(() => interruptRequestCount === 2
+    && messagesStore.messagesState.interruptPendingSessions.size === 0,
+  '中断请求失败时应解除 loading，允许用户重试');
+  interruptFailure = false;
 
   console.log('web client bridge golden replay passed');
 }, {

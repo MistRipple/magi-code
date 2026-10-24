@@ -523,9 +523,9 @@
 
 {#snippet workspaceBinding(id: string)}
   {@const workspace = workspaces.find((entry) => entry.workspaceId === id)}
-  <p class="meta" data-mcp-bound-workspace={id}>
-    {i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaceName(id) })}
-    · <code>{workspace?.rootPath ?? i18n.t('mcpServer.token.workspaceUnavailable')}</code>
+  <p class="meta ui-meta" data-mcp-bound-workspace={id}>
+    <span>{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaceName(id) })}</span>
+    <code>{workspace?.rootPath ?? i18n.t('mcpServer.token.workspaceUnavailable')}</code>
   </p>
   <p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>
 {/snippet}
@@ -651,7 +651,7 @@
           <div class="field">
             <span>{i18n.t('mcpServer.quickAdd.token')}</span>
             <SelectField bind:value={quickAddTokenId} data-mcp-quick-add-token="1" label={i18n.t('mcpServer.quickAdd.token')}
-              options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${workspaceName(token.workspaceId)} · ${token.prefix}…` }))} />
+              options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…` }))} />
           </div>
           {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId)}{/if}
           {#if quickAddToken && !quickAddToken.hasSecret}
@@ -833,9 +833,9 @@
                 <p class="meta">{i18n.t('mcpServer.token.workspaceRestoreHint')}</p>
               {/if}
               {@render workspaceBinding(token.workspaceId)}
-              <span class="meta">
-                {token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}
-                · {token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}
+              <span class="meta ui-meta">
+                <span>{token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}</span>
+                <span>{token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}</span>
               </span>
             </div>
             {#if token.state !== 'revoked'}
@@ -957,7 +957,7 @@
         <span>{i18n.t('mcpServer.token.workspace')}</span>
         <SelectField bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}
           label={i18n.t('mcpServer.token.workspace')}
-          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: `${workspace.name} · ${workspace.rootPath}` })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
+          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: `${workspace.name}: ${workspace.rootPath}` })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
       </div>
       {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
       <div class="field">
@@ -1002,7 +1002,7 @@
         <span>{i18n.t('mcpServer.snippets.useToken')}</span>
         <SelectField bind:value={connectTokenId} data-mcp-connect-token="1" onchange={(next) => { connectTokenId = next; connectTokenTouched = true; }}
           label={i18n.t('mcpServer.snippets.useToken')}
-          options={[{ value: '', label: i18n.t('mcpServer.snippets.placeholderOption') }, ...connectTokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${workspaceName(token.workspaceId)} · ${token.prefix}…${token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}`, disabled: !token.hasSecret }))]} />
+          options={[{ value: '', label: i18n.t('mcpServer.snippets.placeholderOption') }, ...connectTokens.map(token => ({ value: token.tokenId, label: `${token.clientName}: ${workspaceName(token.workspaceId)}: ${token.prefix}…${token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}`, disabled: !token.hasSecret }))]} />
       </div>
       {#if connectToken}{@render workspaceBinding(connectToken.workspaceId)}{/if}
       {#if connectTokens.some((token) => !token.hasSecret)}
@@ -1075,7 +1075,7 @@
     min-width: 16px;
     padding: 0 5px;
     border-radius: 999px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 16px;
     text-align: center;
     background: var(--accent-soft, rgba(80, 140, 255, 0.16));
@@ -1103,7 +1103,7 @@
 
   .meta {
     margin: 0;
-    font-size: 11px;
+    font-size: var(--text-xs);
     opacity: 0.66;
     overflow-wrap: anywhere;
   }
@@ -1254,7 +1254,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .field input,
@@ -1287,7 +1287,7 @@
     margin: 0;
     padding: 8px 10px;
     border-radius: 8px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     overflow-x: auto;
     background: var(--surface-muted, rgba(127, 127, 127, 0.1));
   }

@@ -382,7 +382,7 @@
     border: var(--magi-hairline) solid var(--border);
     border-radius: 999px;
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.7;
   }
 
@@ -516,7 +516,7 @@
     border-radius: 4px;
     color: var(--foreground-muted);
     font: inherit;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 15px;
     text-align: center;
     opacity: 0.7;

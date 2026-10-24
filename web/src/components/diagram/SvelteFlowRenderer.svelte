@@ -135,7 +135,7 @@
         height: 16,
       },
       style: 'stroke: var(--diagram-connector, color-mix(in srgb, var(--foreground) 82%, var(--background) 18%)); stroke-width: 2;',
-      labelStyle: 'fill: var(--foreground-muted); font-size: 11px;',
+      labelStyle: 'fill: var(--foreground-muted); font-size: var(--text-xs);',
     }));
   }
 

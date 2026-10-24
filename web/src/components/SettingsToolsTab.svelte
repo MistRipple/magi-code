@@ -699,7 +699,7 @@
                 {i18n.t('settings.tools.builtinTools')}
                 <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
               </div>
-              <div class="settings-section-desc">{i18n.t('settings.tools.builtinDesc')}</div>
+
             </div>
             <div class="settings-section-actions">
               <button
@@ -773,7 +773,7 @@
                             <div class="builtin-tool-identity">
                               <span
                                 class="builtin-tool-name"
-                                title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
+                                title={`${getBuiltinToolLabel(tool.name)}: ${tool.name}`}
                               >
                                 {getBuiltinToolLabel(tool.name)}
                               </span>
@@ -860,7 +860,7 @@
           <div class="settings-section-header">
             <div>
               <div class="settings-section-title">{i18n.t('settings.tools.mcpTools')}</div>
-              <div class="settings-section-desc">{i18n.t('settings.tools.mcpDesc')}</div>
+
             </div>
             <div class="settings-section-actions">
               <button class="btn btn--primary btn--sm" onclick={() => openMCPDialog(null)}>
@@ -1004,7 +1004,7 @@
           <div class="settings-section-header">
             <div>
               <div class="settings-section-title">{i18n.t('settings.tools.skillsTools')}</div>
-              <div class="settings-section-desc">{i18n.t('settings.tools.skillsDesc')}</div>
+
             </div>
             <div class="settings-section-actions">
               <button class="btn btn--secondary btn--sm" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
@@ -1247,7 +1247,7 @@
     margin-left: 8px;
     vertical-align: 1px;
     font-weight: var(--font-normal);
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     padding: 2px 8px;
     border-radius: 999px;
@@ -1275,7 +1275,7 @@
     border: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
     background: rgba(var(--foreground-rgb), 0.04);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     white-space: nowrap;
   }
@@ -1338,7 +1338,7 @@
     gap: 4px;
     color: var(--foreground-muted);
     font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 10px;
+    font-size: var(--text-xs);
   }
 
   .command-environment-command.command-available {
@@ -1364,7 +1364,7 @@
   .command-environment-empty {
     margin-top: 8px;
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
   }
 
 
@@ -1501,7 +1501,7 @@
   .tool-code {
     min-width: 0;
     overflow: hidden;
-    font-size: 9.5px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     line-height: 1.2;
     text-overflow: ellipsis;
@@ -1522,7 +1522,7 @@
     border-radius: 4px;
     background: rgba(var(--foreground-rgb), 0.06);
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     white-space: nowrap;
   }
@@ -1533,7 +1533,7 @@
   }
 
   .tool-runtime-status {
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     white-space: nowrap;
   }
@@ -1704,7 +1704,7 @@
   .mcp-server-subtitle {
     overflow: hidden;
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.3;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1744,7 +1744,7 @@
     align-items: center;
     gap: 7px;
     color: var(--foreground);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
   }
 
@@ -1754,7 +1754,7 @@
     border-radius: 999px;
     background: rgba(var(--foreground-rgb), 0.07);
     color: var(--foreground-muted);
-    font-size: 9px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 16px;
     text-align: center;
@@ -1862,7 +1862,7 @@
     padding: 8px;
     border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--error, #d33) 24%, transparent);
     color: var(--error, #d33);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.45;
   }
 
@@ -1878,7 +1878,7 @@
     overflow: auto;
     color: var(--foreground);
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     overflow-wrap: anywhere;
     white-space: pre-wrap;
   }
@@ -1905,7 +1905,7 @@
   .mcp-tool-name {
     overflow: hidden;
     color: var(--foreground);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 1.35;
     text-overflow: ellipsis;
@@ -1916,7 +1916,7 @@
     overflow: hidden;
     margin-top: 2px;
     color: var(--foreground-muted);
-    font-size: 9.5px;
+    font-size: var(--text-xs);
     line-height: 1.35;
     line-clamp: 1;
     -webkit-box-orient: vertical;
@@ -1925,7 +1925,7 @@
   .mcp-tools-empty {
     padding: 14px 10px;
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     text-align: center;
   }
 
@@ -2009,26 +2009,26 @@
   .skill-main { min-width: 0; }
   .skill-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .skill-name { max-width: 42%; font-size: 13px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .skill-source-tag, .skill-status-tag { font-size: 9px; line-height: 16px; padding: 0 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
+  .skill-source-tag, .skill-status-tag { font-size: var(--text-xs); line-height: 16px; padding: 0 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
   .skill-source-tag { border: var(--magi-hairline) solid var(--border); color: var(--foreground-muted); }
   .skill-status-tag.success { color: var(--success); background: rgba(var(--success-rgb, 52, 199, 89), 0.1); }
   .skill-status-tag.warning { color: var(--warning); background: rgba(var(--warning-rgb, 255, 149, 0), 0.11); }
   .skill-status-tag.modified { color: var(--primary); background: rgba(var(--primary-rgb, 0, 122, 255), 0.1); }
   .skill-status-tag.error { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.1); }
   .skill-status-tag.disabled { color: var(--foreground-muted); background: var(--surface-3); }
-  .skill-desc { margin: 3px 0 0; font-size: 11px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: 10px; color: var(--foreground-muted); }
+  .skill-desc { margin: 3px 0 0; font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-meta span { min-width: 0; max-width: 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-builtin-badge {
     padding: 1px 8px;
     border-radius: 999px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     background: var(--surface-muted, rgba(127, 127, 127, 0.14));
     opacity: 0.8;
   }
 
   .skill-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
-  .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .skill-action-btn:hover { color: var(--foreground); background: rgba(var(--foreground-rgb), 0.05); }
   .skill-action-btn.primary { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
   .skill-action-btn.danger:hover { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.08); }
@@ -2046,9 +2046,9 @@
   .skill-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .skill-detail-title { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; }
   .skill-detail-file { font-family: var(--font-mono, monospace); font-size: 12px; font-weight: var(--font-semibold); color: var(--foreground); }
-  .skill-detail-size { font-size: 11px; color: var(--foreground-muted); }
+  .skill-detail-size { font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-detail-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: color-mix(in srgb, var(--foreground) 6%, transparent); }
-  .skill-detail-tab { padding: 1px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .skill-detail-tab { padding: 1px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: var(--font-semibold); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
   .skill-detail-meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; font-size: 12px; }
   .skill-detail-meta dt { color: var(--foreground-muted); }
@@ -2063,7 +2063,7 @@
     font-size: 13px;
   }
   .skill-detail-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.55; color: var(--foreground); }
-  .skill-detail-files-title { margin-bottom: 4px; font-size: 11px; font-weight: var(--font-semibold); color: var(--foreground-muted); }
+  .skill-detail-files-title { margin-bottom: 4px; font-size: var(--text-xs); font-weight: var(--font-semibold); color: var(--foreground-muted); }
   .skill-detail-files ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow: auto; }
   .skill-detail-files li { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
   .skill-detail-files code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
@@ -2097,7 +2097,7 @@
   }
 
   /* 空状态 */
-  
-  
-  
+
+
+
 </style>

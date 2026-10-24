@@ -466,7 +466,7 @@
 
   .context-breakdown-empty {
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .context-breakdown-list {
@@ -521,7 +521,7 @@
     padding-top: 5px;
     border-top: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .category-messages { background: #3b82f6; }

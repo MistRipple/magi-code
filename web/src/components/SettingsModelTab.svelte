@@ -831,7 +831,7 @@
     align-self: center;
     padding: 0 6px 2px 4px;
     color: var(--ind-foreground-soft, var(--ind-foreground-muted));
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
   .tab-group-divider {

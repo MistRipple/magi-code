@@ -20,7 +20,6 @@
   import { onDestroy } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
-  import { getAgentColor } from '../lib/agent-colors';
   import {
     formatTraceableTime,
   } from '../lib/utils';
@@ -104,13 +103,6 @@
     typeof message.metadata?.turnId === 'string' ? message.metadata.turnId.trim() : '',
   );
 
-  // 动态 agent 颜色：为消息左侧色带和流式动画提供颜色
-  const agentColorStyle = $derived.by(() => {
-    const source = message.source;
-    if (!source) return '';
-    const { color } = getAgentColor(source);
-    return `border-left-color: ${color}; --stream-accent: ${color};`;
-  });
   const safeBlocks = $derived(
     (message.blocks || []).filter((b): b is ContentBlock =>
       !!b && typeof b === 'object' && 'type' in b
@@ -579,7 +571,6 @@
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
-    style={agentColorStyle}
   >
     <!-- 非主角色：来源标识固定渲染，占位/有内容共用同一节点，避免首 token 漂移 -->
     {#if !isNativeSource}
@@ -707,7 +698,7 @@
     flex: 1;
   }
   .notice-time {
-    font-size: 10px;
+    font-size: var(--text-xs);
     opacity: 0.6;
     margin-left: 4px;
   }
@@ -881,7 +872,6 @@
     border-radius: var(--radius-lg);
     background: var(--assistant-message-bg);
     border: var(--magi-hairline) solid var(--border);
-    border-left-width: 3px;
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
@@ -971,7 +961,7 @@
   }
   .system-section-badge {
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1;
     color: var(--info);
     border: var(--magi-hairline) solid color-mix(in srgb, var(--info) 45%, transparent);
@@ -1113,7 +1103,7 @@
     border-radius: 50%;
     background: var(--info);
     color: white;
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-bold);
     line-height: 1;
   }

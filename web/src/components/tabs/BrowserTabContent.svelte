@@ -2129,7 +2129,7 @@
           <button
             type="button"
             class={`viewport-resize-handle viewport-resize-handle--${edge}`}
-            aria-label={i18n.t('browser.viewport.resize') + ' · ' + i18n.t(edge === 'bottom' ? 'browser.viewport.height' : edge === 'corner' ? 'browser.viewport.custom' : 'browser.viewport.width')}
+            aria-label={i18n.t('browser.viewport.resize') + ': ' + i18n.t(edge === 'bottom' ? 'browser.viewport.height' : edge === 'corner' ? 'browser.viewport.custom' : 'browser.viewport.width')}
             title={i18n.t('browser.viewport.resize')}
             onpointerdown={(event) => startViewportResize(event, edge)}
             onlostpointercapture={finishViewportResize}
@@ -2246,14 +2246,14 @@
   .viewport-toolbar input:focus-visible { outline: none; box-shadow: var(--magi-focus-shadow); }
   .viewport-custom input[aria-invalid="true"] { border-color: var(--error); }
   .viewport-dimension-separator, .viewport-unit { color: var(--foreground-muted); }
-  .viewport-unit { font-size: 11px; }
-  .viewport-preview-scale { color: var(--foreground-muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
-  .viewport-input-error { grid-column: 1 / -1; color: var(--error); font-size: 11px; overflow-wrap: anywhere; }
-  .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: var(--font-bold); }
-  .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .viewport-unit { font-size: var(--text-xs); }
+  .viewport-preview-scale { color: var(--foreground-muted); font-size: var(--text-xs); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .viewport-input-error { grid-column: 1 / -1; color: var(--error); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: var(--text-xs); font-weight: var(--font-bold); }
+  .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
   .hand-back-button { color: var(--primary); background: var(--primary-muted); }
   .browser-actions-menu button:disabled { opacity: .45; cursor: default; }
-  .browser-actions-heading { padding: 5px 8px; color: var(--foreground-muted); font-size: 10px; }
+  .browser-actions-heading { padding: 5px 8px; color: var(--foreground-muted); font-size: var(--text-xs); }
   .annotation-comment { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @container (max-width: 520px) {
     /* 窄右栏仍保持单行：型号名称可截断，尺寸输入和适应比例始终可见。 */
@@ -2261,7 +2261,7 @@
     .viewport-preset { width: 100%; }
     .viewport-custom { gap: 3px; }
     .viewport-custom input { width: 46px; padding-inline: 2px; }
-    .viewport-preview-scale { font-size: 10px; }
+    .viewport-preview-scale { font-size: var(--text-xs); }
   }
   @container (max-width: 360px) {
     .address-submit { display: none; }
@@ -2269,9 +2269,9 @@
   }
   .browser-download-panel { position: fixed; top: calc(anchor(bottom) - 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; transform: translateY(-100%); }
   .browser-download-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
-  .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; white-space: nowrap; }
-  .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 0; border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
+  .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: var(--text-xs); white-space: nowrap; }
+  .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 0; border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .browser-download-panel button:hover { background: var(--surface-hover); }
   .browser-surface-slot { position: relative; z-index: 0; display: flex; justify-content: center; align-items: flex-start; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
   .browser-viewport { display: flex; flex: 0 0 auto; min-width: 0; min-height: 0; overflow: hidden; }
@@ -2313,7 +2313,7 @@
   .browser-placeholder.error { color: var(--error); }
   .browser-record { display: flex; flex: 1; flex-direction: column; align-items: center; gap: 9px; min-width: 0; padding: 44px 24px; color: var(--foreground-muted); text-align: center; }
   .browser-record strong { max-width: 100%; color: var(--foreground); font-size: var(--text-md); font-weight: var(--font-semibold); overflow-wrap: anywhere; }
-  .browser-record-url { max-width: 100%; color: var(--foreground-muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+  .browser-record-url { max-width: 100%; color: var(--foreground-muted); font-family: var(--font-mono); font-size: var(--text-xs); overflow-wrap: anywhere; }
   .browser-record-description { max-width: 420px; font-size: var(--text-sm); line-height: 1.5; }
   .browser-record-annotations { display: grid; gap: 5px; width: min(420px, 100%); margin-top: 8px; }
   .browser-record-annotation { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border: var(--magi-hairline) solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }

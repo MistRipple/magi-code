@@ -3343,7 +3343,7 @@ import {
                                     {#if awaiting > 0}
                                       {i18n.t('externalSession.awaitingShort', { count: awaiting })}
                                     {:else}
-                                      {i18n.t('externalSession.badge')} · {formatRelativeTime(externalSession.lastActivityAtMs, relativeTimeNow, i18n.locale)}
+                                      <span>{i18n.t('externalSession.badge')}</span> <span>{formatRelativeTime(externalSession.lastActivityAtMs, relativeTimeNow, i18n.locale)}</span>
                                     {/if}
                                   </span>
                                 </button>
@@ -4740,7 +4740,7 @@ import {
     border-radius: 8px;
     background: color-mix(in srgb, var(--foreground) 10%, transparent);
     color: var(--foreground-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     line-height: 1;
   }
@@ -4811,7 +4811,7 @@ import {
   .session-rename-error {
     padding-left: 1px;
     color: var(--error);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.25;
   }
 

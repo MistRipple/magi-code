@@ -482,10 +482,10 @@
           <span class="context-revision">r{contextPackage.revision}</span>
         </span>
         <span class="context-metrics">
-          <span>{i18n.t('agentTab.context.package')} · 1</span>
-          <span>{i18n.t('agentTab.context.references')} · {contextPackage.references.length}</span>
-          <span>{i18n.t('agentTab.context.reads')} · {contextReadCount}</span>
-          <span>{i18n.t('agentTab.context.tokens')} · {formatTokens(contextAccessTokens)}</span>
+          <span>{i18n.t('agentTab.context.package')} 1</span>
+          <span>{i18n.t('agentTab.context.references')} {contextPackage.references.length}</span>
+          <span>{i18n.t('agentTab.context.reads')} {contextReadCount}</span>
+          <span>{i18n.t('agentTab.context.tokens')} {formatTokens(contextAccessTokens)}</span>
           <span class="context-chevron" aria-hidden="true">{contextExpanded ? '⌃' : '⌄'}</span>
         </span>
       </button>
@@ -601,7 +601,7 @@
     flex-wrap: wrap;
     gap: 5px;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .agent-capabilities strong {
@@ -664,14 +664,14 @@
     border-radius: 999px;
     background: color-mix(in srgb, var(--primary) 12%, transparent);
     color: var(--primary);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 18px;
     padding: 0 6px;
     white-space: nowrap;
   }
 
   .context-metrics {
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
 
@@ -711,7 +711,7 @@
   .context-detail-block strong,
   .context-list-block > strong {
     color: var(--foreground);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .context-detail-block ul {
@@ -745,7 +745,7 @@
   .context-empty {
     color: var(--foreground-muted);
     opacity: 0.72;
-    font-size: 10px;
+    font-size: var(--text-xs);
   }
 
   @media (max-width: 720px) {

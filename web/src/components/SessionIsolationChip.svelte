@@ -153,7 +153,7 @@
     background: color-mix(in srgb, var(--surface-1) 88%, transparent);
     color: var(--foreground-muted);
     cursor: pointer;
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
     transition:
       background var(--transition-fast),
@@ -195,7 +195,7 @@
   .session-isolation-heading {
     padding: 4px 8px 6px;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .session-isolation-item {

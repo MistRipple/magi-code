@@ -429,16 +429,16 @@
       {#if agent.queueReason}
         <span class="agent-diagnostic">{agent.queueReason}</span>
       {:else if agent.failureCode || agent.failureStage}
-        <span class="agent-diagnostic">
-          {failureCodeLabel(agent.failureCode) || i18n.t('activeAgentCenter.status.failed')}
-          {#if agent.failureStage} · {failureStageLabel(agent.failureStage)}{/if}
-          {#if agent.failureMessage} · {agent.failureMessage}{/if}
+        <span class="agent-diagnostic ui-meta">
+          <span>{failureCodeLabel(agent.failureCode) || i18n.t('activeAgentCenter.status.failed')}</span>
+          {#if agent.failureStage}<span>{failureStageLabel(agent.failureStage)}</span>{/if}
+          {#if agent.failureMessage}<span>{agent.failureMessage}</span>{/if}
         </span>
       {/if}
     </span>
     <span class="agent-status agent-status--{statusTone(agent)}">
       <Icon name={icon.name} size={12} class={icon.spinning ? 'spinning' : ''} />
-      <span>{statusLabel(agent)} · {durationLabel(agent)}</span>
+      <span class="ui-meta"><span>{statusLabel(agent)}</span><span>{durationLabel(agent)}</span></span>
     </span>
   </button>
 {/snippet}
@@ -1070,11 +1070,9 @@
   }
 
   .agent-diagnostic {
-    overflow: hidden;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    font-size: var(--text-xs);
+    white-space: normal;
   }
 
   .agent-status {
@@ -1082,7 +1080,7 @@
     align-items: center;
     gap: 4px;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
 

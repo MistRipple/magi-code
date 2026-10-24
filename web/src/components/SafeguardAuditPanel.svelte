@@ -182,7 +182,7 @@
   .audit-item { padding: var(--space-2) var(--space-3); display: flex; flex-direction: column; gap: 4px; }
   .audit-item + .audit-item { border-top: var(--magi-hairline) solid var(--border-subtle, var(--border)); }
   .audit-item-head { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
-  .audit-decision { flex-shrink: 0; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: color-mix(in srgb, var(--foreground) 10%, transparent); }
+  .audit-decision { flex-shrink: 0; padding: 1px 8px; border-radius: 10px; font-size: var(--text-xs); background: color-mix(in srgb, var(--foreground) 10%, transparent); }
   .audit-decision[data-decision='hard_block'] { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
   .audit-decision[data-decision='audit_only'] { color: var(--foreground-muted); }
   .audit-tool { min-width: 0; font-family: var(--font-mono, monospace); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

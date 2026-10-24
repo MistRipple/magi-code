@@ -71,7 +71,7 @@
     return `${i18n.t('messageItem.retry.scheduledTitle', {
       attempt: retryRuntime.attempt,
       maxAttempts: retryRuntime.maxAttempts,
-    })} · ${i18n.t('messageItem.retry.scheduledWait', { seconds })}`;
+    })}, ${i18n.t('messageItem.retry.scheduledWait', { seconds })}`;
   });
   const stageLabel = $derived.by(() => {
     if (retryLabel) return retryLabel;

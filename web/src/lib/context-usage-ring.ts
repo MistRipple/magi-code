@@ -202,5 +202,5 @@ export function buildRingTooltip(input: ContextRingInput, t: Translate): string 
   return [
     `${t('input.contextRing.label')} ${percent}%`,
     ...buildRingDetailItems(input, t).map((item) => item.text),
-  ].join(' · ');
+  ].join(', ');
 }

@@ -219,9 +219,9 @@
   function tunnelStatusText(status: WebModelTunnelStatus): string {
     if (TUNNEL_CODES.has(status.code)) {
       const label = i18n.t(`webModel.tunnel.code.${status.code}`);
-      return status.ready || !status.detail ? label : `${label} · ${status.detail}`;
+      return status.ready || !status.detail ? label : `${label}: ${status.detail}`;
     }
-    return status.detail ? `${status.code} · ${status.detail}` : status.code;
+    return status.detail ? `${status.code}: ${status.detail}` : status.code;
   }
 
   /** 应用级会话要先存在，宿主内容槽才会挂载主页 guest，探测才可能读到页面。 */
@@ -526,9 +526,9 @@
       <div class="settings-row-copy">
         <span class="settings-row-title">{i18n.t('webModel.slot.title')}</span>
         {#if slotOwner}
-          <span class="settings-row-desc">
-            {slotOwner.active ? i18n.t('webModel.slot.ownedActive') : i18n.t('webModel.slot.owned')}
-            · {slotOwner.sessionTitle?.trim() || i18n.t('webModel.slot.untitled')}
+          <span class="settings-row-desc ui-meta">
+            <span>{slotOwner.active ? i18n.t('webModel.slot.ownedActive') : i18n.t('webModel.slot.owned')}</span>
+            <span>{slotOwner.sessionTitle?.trim() || i18n.t('webModel.slot.untitled')}</span>
           </span>
         {:else}
           <span class="settings-row-desc">{i18n.t('webModel.slot.idle')}</span>

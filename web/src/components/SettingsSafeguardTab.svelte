@@ -173,7 +173,7 @@
 
   .rules-save-status.error { color: var(--danger); }
 
-  .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: 11px; font-weight: var(--font-normal); font-variant-numeric: tabular-nums; }
+  .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: var(--text-xs); font-weight: var(--font-normal); font-variant-numeric: tabular-nums; }
 
   .safeguard-policy-note {
     margin-top: 8px;

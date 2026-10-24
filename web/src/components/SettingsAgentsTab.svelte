@@ -445,7 +445,7 @@
   function domainCapabilityDescription(capability: DomainCapability): string {
     const description = capabilityDescription(capability);
     if (capability.availableToAllRoles) return description;
-    return `${description} · ${i18n.t('settings.agents.domainAvailableToRoles', {
+    return `${description}, ${i18n.t('settings.agents.domainAvailableToRoles', {
       roles: formatLocalizedFallbackList(capability.roleNames),
     })}`;
   }
@@ -792,7 +792,7 @@
     align-items: center;
     border-radius: 999px;
     padding: 3px 7px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
   }
   .source-badge.source-builtin { color: var(--ind-foreground-soft); background: color-mix(in srgb, var(--ind-foreground) 7%, transparent); }
@@ -843,7 +843,7 @@
   .role-editor-eyebrow {
     margin-bottom: 5px;
     color: var(--ind-tab-accent);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-bold);
     letter-spacing: .04em;
   }
@@ -961,7 +961,7 @@
   }
 
   .role-tab-subtitle {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     line-height: 1.2;
     color: var(--ind-foreground-soft);
@@ -1024,7 +1024,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     font-weight: calc(var(--font-semibold) + 50);
     font-variant-numeric: tabular-nums;
     color: var(--ind-tab-accent);
@@ -1126,7 +1126,7 @@
     padding: 0 8px;
     border-radius: 999px;
     border: var(--magi-hairline) solid var(--ind-border-control);
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 1;
     color: var(--ind-foreground-secondary);

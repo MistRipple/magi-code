@@ -350,7 +350,7 @@
     flex: 0 0 auto;
     padding: 0 8px;
     border-radius: 999px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 18px;
   }
 

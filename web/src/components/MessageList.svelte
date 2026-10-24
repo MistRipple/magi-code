@@ -586,7 +586,7 @@
           .filter((view) => view.placements.includes('home') && view.placements.includes('main'))
           .map((view) => ({
             id: pluginMainPageId(manifest.id, view.id),
-            label: `${manifest.name} · ${view.title}`,
+            label: `${manifest.name}: ${view.title}`,
           }))
       ))
       : [],
@@ -1780,7 +1780,7 @@
             {#each homeCards as card (card.key)}
               <section class="plugin-home-card" data-testid="plugin-home-card" data-card-id={card.key}>
                 <header class="plugin-home-card-header">
-                  <span class="plugin-home-card-title">{card.pluginName} · {card.title}</span>
+                  <span class="plugin-home-card-title ui-meta"><span>{card.pluginName}</span><span>{card.title}</span></span>
                   {#if card.pageId}
                     <button type="button" class="plugin-home-card-open" onclick={() => setCurrentTopTab(card.pageId!)}>{i18n.t('messageList.pluginCardOpen')}</button>
                   {/if}

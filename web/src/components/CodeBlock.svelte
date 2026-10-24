@@ -322,7 +322,7 @@
   }
 
   .streaming-badge {
-    font-size: 10px;
+    font-size: var(--text-xs);
     background: var(--primary);
     color: var(--primary-foreground);
     padding: 0 4px;

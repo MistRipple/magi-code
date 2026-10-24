@@ -49,7 +49,7 @@
   {#if approval.agent}
     <div class="tool-approval-agent">
       {i18n.t('toolCall.approval.requestedByAgent', {
-        agent: [approval.agent.role, approval.agent.title].filter(Boolean).join(' · '),
+        agent: [approval.agent.role, approval.agent.title].filter(Boolean).join(', '),
       })}
     </div>
   {/if}

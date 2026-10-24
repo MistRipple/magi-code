@@ -22,7 +22,7 @@ export function parseToolIdentity(toolName: string): ParsedToolIdentity {
       source: 'mcp',
       baseName,
       qualifier,
-      displayName: `${baseName} · ${qualifier}`,
+      displayName: `${baseName} (${qualifier})`,
     };
   }
   if (parts.length >= 3 && parts[0] === 'skill') {
@@ -32,7 +32,7 @@ export function parseToolIdentity(toolName: string): ParsedToolIdentity {
       source: 'skill',
       baseName,
       qualifier,
-      displayName: `${baseName} · ${qualifier}`,
+      displayName: `${baseName} (${qualifier})`,
     };
   }
 

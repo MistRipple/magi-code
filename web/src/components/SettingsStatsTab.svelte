@@ -82,7 +82,7 @@
     if (resolvedModels.length > 1) {
       return i18n.t('settings.stats.usedModels', {
         count: resolvedModels.length,
-        models: resolvedModels.join(' · '),
+        models: resolvedModels.join(', '),
       });
     }
     return i18n.t('settings.stats.unknownModel');
@@ -159,7 +159,6 @@
         statusKey: 'recorded',
         isError: false,
         errorMsg: null,
-        isCore: bindings.some((binding: AgentExecutionStatsItem) => binding.role !== 'worker'),
       };
     }
     const statusKey = status?.status || 'recorded';
@@ -169,7 +168,6 @@
       statusKey,
       isError: statusClass === 'error',
       errorMsg: status?.error || null,
-      isCore: bindings.some((binding: AgentExecutionStatsItem) => binding.role !== 'worker'),
     };
   }
 
@@ -191,7 +189,6 @@
     statusClass: string;
     statusKey: string;
     errorMsg: string | null;
-    isCore: boolean;
     identityKeys: string[];
     connectionCount: number;
     sourceLabels: string[];
@@ -294,7 +291,6 @@
     statusClass: string;
     statusKey: string;
     errorMsg: string | null;
-    isCore: boolean;
     tokenOptional: boolean;
     // 仅在某个视角下使用：
     roleAtom?: RoleAtom;
@@ -317,7 +313,6 @@
           statusClass: er.statusClass,
           statusKey: er.statusKey,
           errorMsg: er.errorMsg,
-          isCore: er.isCore,
           tokenOptional: er.tokenOptional,
           engineRow: er,
         }))
@@ -335,7 +330,6 @@
           statusClass: atom.statusClass,
           statusKey: atom.statusKey,
           errorMsg: atom.errorMsg,
-          isCore: atom.worker === 'orchestrator' || atom.worker === 'auxiliary' || atom.worker === 'imageGeneration',
           tokenOptional: atom.tokenOptional,
           roleAtom: atom,
         }))
@@ -558,7 +552,7 @@
           </span>
         {:else if topWorstRole && topWorstRole.successRate !== null && topWorstRole.successRate < 0.7}
           <span class="insight-kicker">{i18n.t('settings.stats.insightWarnKicker')}</span>
-          <span class="insight-headline">{topWorstRole.label} · {i18n.t('settings.stats.failRate', { pct: formatPct(1 - topWorstRole.successRate) })}</span>
+          <span class="insight-headline ui-meta"><span>{topWorstRole.label}</span><span>{i18n.t('settings.stats.failRate', { pct: formatPct(1 - topWorstRole.successRate) })}</span></span>
           <span class="insight-meta">{i18n.t('settings.stats.insightWorstSuccessMeta', { calls: topWorstRole.calls })}</span>
         {:else}
           <span class="insight-kicker">{i18n.t('settings.stats.insightHealthyKicker')}</span>
@@ -623,22 +617,18 @@
                 <Icon name={perspective === 'role' ? 'bot' : 'model'} size={11} />
               </div>
               <div class="row-label-stack">
-                <span class="row-name-txt">
-                  {row.label}
-                  {#if row.isCore}
-                    <span class="badge-core">CORE</span>
-                  {/if}
-                </span>
+                <span class="row-name-txt" title={row.label}>{row.label}</span>
                 <span class="row-model-txt" title={row.subLabel}>{row.subLabel}</span>
               </div>
-              <div class="row-metric num">{row.calls || '--'}</div>
+              <div class="row-metric num" data-label={i18n.t('settings.stats.colCalls')}>{row.calls || '--'}</div>
               <div
                 class="row-metric num"
+                data-label={i18n.t('settings.stats.colSuccess')}
                 class:success={row.successRate != null && row.successRate >= 0.95}
                 class:warn={row.successRate != null && row.successRate >= 0.7 && row.successRate < 0.95}
                 class:danger={row.successRate != null && row.successRate < 0.7}
               >{formatPct(row.successRate)}</div>
-              <div class="row-metric num">{formatUsageTokens(row.totalTokens, row.calls, row.tokenOptional)}</div>
+              <div class="row-metric num" data-label={i18n.t('settings.stats.colToken')}>{formatUsageTokens(row.totalTokens, row.calls, row.tokenOptional)}</div>
             </div>
           {/each}
         </div>
@@ -854,7 +844,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     letter-spacing: 0;
@@ -874,7 +864,7 @@
     font-variant-numeric: tabular-nums;
   }
   .insight-meta {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -945,7 +935,7 @@
     border: none;
     background: transparent;
     color: var(--ind-foreground-muted);
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     padding: 3px 9px;
     border-radius: 5px;
@@ -971,7 +961,7 @@
     display: grid;
     grid-template-columns: 24px minmax(0, 1.2fr) 50px 50px 64px;
     padding: 6px 14px;
-    font-size: 9px;
+    font-size: var(--text-xs);
     font-weight: var(--font-bold);
     letter-spacing: 0.08em;
     color: var(--ind-foreground-soft);
@@ -1030,28 +1020,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     letter-spacing: -0.01em;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .badge-core {
-    font-size: 7.5px;
-    font-weight: var(--font-bold);
-    padding: 1px 4px;
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--ind-foreground) 8%, transparent);
-    color: var(--ind-foreground-soft);
-    letter-spacing: 0.04em;
+    display: block;
   }
   .row-model-txt {
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .row-metric {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
     color: var(--ind-foreground);
@@ -1078,7 +1057,7 @@
     gap: 4px;
   }
   .slice-kicker {
-    font-size: 9.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     letter-spacing: 0.08em;
@@ -1113,7 +1092,7 @@
     align-items: center;
     gap: 4px;
     padding: 2px 7px;
-    font-size: 9.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     border-radius: 999px;
     background: color-mix(in srgb, var(--ind-foreground) 5%, transparent);
@@ -1132,7 +1111,7 @@
   .apple-indicator.checking { animation: stats-pulse 1.4s ease-in-out infinite; }
   @keyframes stats-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
   .slice-sub {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -1164,7 +1143,7 @@
     letter-spacing: -0.4px;
   }
   .kpi-label {
-    font-size: 9.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     text-transform: uppercase;
@@ -1180,12 +1159,12 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     color: var(--ind-foreground-secondary);
   }
   .slice-section-head .small-note {
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     font-weight: var(--font-medium);
   }
@@ -1196,7 +1175,7 @@
   }
   .token-usage-note {
     color: var(--ind-foreground-muted);
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     line-height: 1.45;
   }
   .bar-item {
@@ -1206,7 +1185,7 @@
     gap: 10px;
   }
   .bar-label {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground);
     white-space: nowrap;
     overflow: hidden;
@@ -1228,7 +1207,7 @@
   }
   .bar-item.muted .bar-fill { background: var(--ind-foreground-muted); }
   .bar-meta {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: var(--ind-foreground-muted);
     text-align: right;
@@ -1246,7 +1225,7 @@
   .breakdown-head {
     padding: 0 8px 4px;
     color: var(--ind-foreground-soft);
-    font-size: 9px;
+    font-size: var(--text-xs);
     font-weight: var(--font-bold);
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -1269,7 +1248,7 @@
     min-width: 0;
     gap: 7px;
     color: var(--ind-foreground);
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1290,14 +1269,14 @@
   }
   .breakdown-metric {
     color: var(--ind-foreground-secondary);
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
   .breakdown-metric.num { text-align: right; }
   .breakdown-empty {
     padding: 9px 8px;
     color: var(--ind-foreground-muted);
-    font-size: 10.5px;
+    font-size: var(--text-xs);
   }
 
   .slice-error {
@@ -1308,7 +1287,7 @@
     border-radius: 8px;
     background: color-mix(in srgb, var(--error, #ff3b30) 8%, transparent);
     color: var(--error, #ff3b30);
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1.4;
   }
   .slice-error span {
@@ -1349,6 +1328,22 @@
   }
 
   @container stats-tab (max-width: 520px) {
+    .stats-scroll-panel { padding-inline: 16px; }
+    .col-head { display: none; }
+    .stats-row {
+      grid-template-columns: 22px repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .row-label-stack { grid-column: 2 / -1; }
+    .row-metric { grid-row: 2; display: flex; flex-direction: column; align-items: flex-start; }
+    .row-metric:nth-child(3) { grid-column: 2; }
+    .row-metric:nth-child(4) { grid-column: 3; }
+    .row-metric:nth-child(5) { grid-column: 4; }
+    .row-metric::before {
+      content: attr(data-label);
+      color: var(--ind-foreground-muted);
+      font-weight: var(--font-normal);
+    }
     .insight-strip { grid-template-columns: 1fr; }
     .insight-cell,
     .insight-cell:nth-child(2),

@@ -160,9 +160,7 @@
   --font-mono: var(--vscode-editor-font-family, 'Fira Code', Consolas, 'Courier New', monospace);
 
   /* 字体大小 */
-  --text-2xs: 10px;
-  /* 极小: 时间戳 */
-  --text-xs: 11px;
+  --text-xs: 12px;
   /* 辅助: 徽章、提示 */
   --text-sm: 12px;
   /* 次要: 描述文字 */
@@ -680,7 +678,7 @@ textarea::placeholder {
 /* 代码样式 */
 code {
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: max(var(--text-xs), 0.9em);
   /* 路径、端点、版本等只读值不自动变成标签；正文代码强调由 Markdown 负责。 */
   background: transparent;
   padding: 0;
@@ -756,15 +754,15 @@ pre code {
   position: absolute;
   top: -2px;
   right: -2px;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
   border-radius: var(--radius-full);
   background: var(--error);
   color: var(--primary-foreground);
-  font-size: 9px;
+  font-size: var(--text-xs);
   font-weight: var(--font-bold);
-  line-height: 14px;
+  line-height: 16px;
   text-align: center;
   pointer-events: none;
 }
@@ -1366,7 +1364,7 @@ input:focus-visible + .control-switch { box-shadow: var(--magi-focus-shadow); }
 
 .inline-alert {
   padding: var(--space-2) var(--space-3);
-  border-left: 3px solid currentColor;
+  border-radius: var(--radius-sm);
   font-size: var(--text-sm);
   line-height: 1.5;
 }
@@ -1919,10 +1917,25 @@ body.vscode-light .hljs-params {
 /* Shared prose and feedback also cover settings, diagnostics and plugin help. */
 p { text-wrap: pretty; }
 strong, b { font-weight: var(--font-bold); }
+/* 元数据按独立字段换行，避免用标点拼成一条不可适配的长文本。 */
+.ui-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.ui-meta > * { min-width: 0; overflow-wrap: anywhere; }
 [data-copy-feedback="true"] svg {
   animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
     magi-feedback-fade 160ms 2340ms ease-out forwards;
 }
 @media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    scroll-behavior: auto !important;
+  }
   [data-copy-feedback="true"] svg { animation: none; }
 }

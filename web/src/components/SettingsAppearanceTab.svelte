@@ -339,7 +339,7 @@
     <div class="settings-section-header">
       <div>
         <div class="settings-section-title">{i18n.t('settings.locale.label')}</div>
-        <div class="settings-section-desc">{i18n.t('settings.locale.description')}</div>
+
       </div>
       <div class="settings-section-actions">
         <SelectField value={i18n.locale} label={i18n.t('settings.locale.label')}
@@ -383,9 +383,9 @@
     <div class="settings-row">
       <div class="settings-row-copy">
         <span class="settings-row-title">{i18n.t('appearance.followSystem')}</span>
-        <span class="settings-row-desc">
-          {i18n.t('appearance.followSystemDescription')}
-          · {i18n.t('appearance.currentMode', { mode: i18n.t(`appearance.mode.${runtime.mode}`) })}
+        <span class="settings-row-desc ui-meta">
+          <span>{i18n.t('appearance.followSystemDescription')}</span>
+          <span>{i18n.t('appearance.currentMode', { mode: i18n.t(`appearance.mode.${runtime.mode}`) })}</span>
         </span>
       </div>
       <Toggle
@@ -436,7 +436,7 @@
         <div class="theme-card-body">
           <div class="theme-meta">
             <strong title={record.pack.name}>{record.pack.name}</strong>
-            <span>{sourceLabel(record)} · {materialLabel(record.pack.material)}</span>
+            <span class="ui-meta"><span>{sourceLabel(record)}</span><span>{materialLabel(record.pack.material)}</span></span>
           </div>
           <div class="theme-actions">
             <button
@@ -473,7 +473,7 @@
         <header class="editor-header">
           <div>
             <h3>{editorTitle}</h3>
-            <p>{i18n.t('appearance.previewHint')} · {i18n.t('overlay.draftSession')}</p>
+            <p class="ui-meta"><span>{i18n.t('appearance.previewHint')}</span><span>{i18n.t('overlay.draftSession')}</span></p>
           </div>
           <button class="btn-icon btn-icon--sm" type="button" title={i18n.t('common.cancel')} onclick={() => void closeEditor()} disabled={Boolean(busyAction)}>
             <Icon name="close" size={14} />
@@ -585,7 +585,7 @@
   .theme-card-body { justify-content: space-between; gap: 8px; min-height: 54px; padding: 9px 10px; }
   .theme-meta { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
   .theme-meta strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); }
-  .theme-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-2xs); }
+  .theme-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); }
   .theme-editor { width: 100%; display: flex; flex-direction: column; }
   .editor-header { justify-content: space-between; gap: 12px; padding: 17px 20px; border-bottom: var(--magi-hairline) solid var(--border); }
   .editor-header h3 { margin: 0; font-size: var(--text-lg); }

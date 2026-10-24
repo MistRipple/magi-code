@@ -167,7 +167,7 @@
 
   .filespan-dir {
     color: var(--foreground-muted);
-    font-size: 0.85em;
+    font-size: max(var(--text-xs), 0.85em);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

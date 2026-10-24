@@ -842,7 +842,7 @@
     if (!hasError) {
       return toolSummary;
     }
-    return [toolSummary, publicErrorMessage].filter(Boolean).join(' · ');
+    return [toolSummary, publicErrorMessage].filter(Boolean).join(', ');
   });
 
   function toolStatusLabel(value: VisualToolStatus): string {
@@ -976,7 +976,7 @@
     type="button"
     class="agent-spawn-card status-{agentSpawnStatusInfo.class}"
     class:compact-agent={compactAgent}
-    aria-label={[display.title, toolStatusLabel(agentSpawnVisualStatus), canOpen ? i18n.t('toolCall.agentSpawn.viewDetails') : ''].filter(Boolean).join(' · ')}
+    aria-label={[display.title, toolStatusLabel(agentSpawnVisualStatus), canOpen ? i18n.t('toolCall.agentSpawn.viewDetails') : ''].filter(Boolean).join(', ')}
     class:clickable={canOpen}
     disabled={!canOpen}
     onclick={canOpen ? () => openAgentSpawnTab(display) : undefined}
@@ -1008,15 +1008,12 @@
           {/if}
         </span>
         {#if agentSpawnCreationFailed && (display.errorCode || display.failureStage)}
-          <span class="agent-spawn-diagnostic">
+          <span class="agent-spawn-diagnostic ui-meta">
             {#if display.errorCode}
-              {i18n.t('toolCall.agentSpawn.failureCode')}{display.errorCode}
-            {/if}
-            {#if display.errorCode && display.failureStage}
-              ·
+              <span>{i18n.t('toolCall.agentSpawn.failureCode')}{display.errorCode}</span>
             {/if}
             {#if display.failureStage}
-              {i18n.t('toolCall.agentSpawn.failureStage')}{agentSpawnFailureStageLabel(display.failureStage)}
+              <span>{i18n.t('toolCall.agentSpawn.failureStage')}{agentSpawnFailureStageLabel(display.failureStage)}</span>
             {/if}
           </span>
         {/if}
@@ -1328,7 +1325,7 @@
     padding: 1px 6px;
     border-radius: 999px;
     border: var(--magi-hairline) solid transparent;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.4;
     font-weight: var(--font-medium);
     white-space: nowrap;
@@ -1692,7 +1689,7 @@
   .agent-spawn-role {
     flex-shrink: 0;
     max-width: 100%;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1.4;
     white-space: normal;
     overflow-wrap: anywhere;
@@ -1806,7 +1803,7 @@
     padding: 0 var(--space-2);
     border: var(--magi-hairline) solid var(--border);
     border-radius: 999px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.6;
   }
 

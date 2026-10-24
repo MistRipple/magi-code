@@ -39,7 +39,7 @@
   function describe(image: TrayImage, index: number): string {
     const size = image.size ? formatImageSize(image.size) : '';
     const base = image.name || i18n.t('messageItem.imageAlt', { index: index + 1 });
-    return size ? `${base} · ${size}` : base;
+    return size ? `${base}: ${size}` : base;
   }
 
   function openPreview(index: number): void {

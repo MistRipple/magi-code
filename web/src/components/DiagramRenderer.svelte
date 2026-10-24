@@ -134,7 +134,7 @@
     const nodes = Array.isArray(payload.graph?.nodes) ? payload.graph.nodes.length : 0;
     const edges = Array.isArray(payload.graph?.edges) ? payload.graph.edges.length : 0;
     return nodes || edges
-      ? `${nodes} ${i18n.t('diagramRenderer.nodes')} · ${edges} ${i18n.t('diagramRenderer.edges')}`
+      ? `${nodes} ${i18n.t('diagramRenderer.nodes')}: ${edges} ${i18n.t('diagramRenderer.edges')}`
       : '';
   }
 

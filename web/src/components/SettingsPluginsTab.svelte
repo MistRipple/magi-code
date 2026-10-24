@@ -173,7 +173,7 @@
   }
 
   function permissionText(permission: PluginPermission): string {
-    return `${permission.kind} · ${permission.scope}${permission.targets.length ? ` · ${permission.targets.join(', ')}` : ''}`;
+    return `${permission.kind}: ${permission.scope}${permission.targets.length ? `, ${permission.targets.join(', ')}` : ''}`;
   }
 
   const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
@@ -536,7 +536,7 @@
   .store { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: min(600px, 68vh); min-height: 380px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; overflow: hidden; }
   .store-list { display: flex; flex-direction: column; min-height: 0; border-right: var(--magi-hairline) solid var(--border); }
   .store-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 6px 8px; }
-  .store-group { display: flex; align-items: center; justify-content: space-between; padding: 12px 8px 4px; font-size: 11px; font-weight: var(--font-medium); color: var(--foreground-muted); letter-spacing: 0.02em; }
+  .store-group { display: flex; align-items: center; justify-content: space-between; padding: 12px 8px 4px; font-size: var(--text-xs); font-weight: var(--font-medium); color: var(--foreground-muted); letter-spacing: 0.02em; }
   .store-group[data-group='updatable'] { color: var(--primary); }
   .store-item { display: flex; align-items: center; gap: var(--space-2); width: 100%; padding: 8px; border: 0; border-radius: 8px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
   .store-item:hover { background: var(--surface-hover); }
@@ -550,7 +550,7 @@
   .store-item-state[data-state='updatable'] { color: var(--primary); }
   .store-item-state[data-state='active'] { color: var(--success); }
   .store-item-state[data-state='working'] { color: var(--primary); }
-  .store-item-version { font-size: 10px; font-variant-numeric: tabular-nums; }
+  .store-item-version { font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
   .store-pager { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-top: var(--magi-hairline) solid var(--border); }
   .store-pager-actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
   .store-detail { min-width: 0; min-height: 0; overflow-y: auto; }

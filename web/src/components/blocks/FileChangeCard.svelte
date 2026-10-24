@@ -344,7 +344,7 @@
 
   .non-text-section-label {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs, 11px);
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     letter-spacing: 0.04em;
     text-transform: uppercase;

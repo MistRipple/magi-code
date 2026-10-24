@@ -117,7 +117,7 @@
           opacity: 0.5,
           width: 1.6,
           color: muted,
-          'font-size': 11,
+          'font-size': 12,
           'font-family': 'ui-sans-serif, system-ui, sans-serif',
           'text-background-color': codeBg,
           'text-background-opacity': 0.85,

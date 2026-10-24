@@ -334,7 +334,6 @@
   const GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN = /^(clipboard|image|pasted[-_ ]?image)\.[^.]+$/i;
   const CLIPBOARD_IMAGE_TYPE_PRIORITY = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
-  let stopLoading = $state(false);
   let enhanceLoading = $state(false);
   let enhanceOriginalPrompt = $state<string | null>(null);
   let enhanceResultPrompt = $state<string | null>(null);
@@ -425,6 +424,7 @@
   ));
 
   const currentSessionId = $derived(messagesState.currentSessionId);
+  const stopLoading = $derived(messagesState.interruptPendingSessions.has(currentSessionId?.trim() || ''));
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
@@ -2214,17 +2214,9 @@
   }
 
   // 代理运行运行时，输入框停止入口与目标面板共用同一条可恢复中断链路。
-  async function stopTask() {
+  function stopTask() {
     if (stopLoading || isDraftSession) return;
-    stopLoading = true;
-    try {
-      vscode.postMessage({ type: 'interruptTask' });
-    } catch (err) {
-      console.warn('[InputArea] stop task failed:', err);
-      addToast('error', i18n.t('input.stopFailed'));
-    } finally {
-      stopLoading = false;
-    }
+    vscode.postMessage({ type: 'interruptTask' });
   }
 
   function deleteQueuedMessage(queuedMessageId: string, expectedRevision?: number) {
@@ -3946,7 +3938,9 @@
             data-testid="input-stop-button"
             onclick={stopTask}
             disabled={stopLoading || isDraftSession}
-            title={shouldInterruptAgentRunFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
+            aria-busy={stopLoading}
+            aria-label={stopLoading ? i18n.t('input.stopping') : i18n.t('input.stop')}
+            title={stopLoading ? i18n.t('input.stopping') : shouldInterruptAgentRunFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>
@@ -4181,8 +4175,11 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     overflow-y: auto;
+    scrollbar-width: none;
     cursor: text;
   }
+
+  .ia-textarea::-webkit-scrollbar { display: none; }
 
   .ia-textarea.is-empty::before {
     content: attr(data-placeholder);
@@ -4197,7 +4194,7 @@
   .ia-textarea :global(.md-italic) { font-style: italic; }
   .ia-textarea :global(.md-code) {
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 0.92em;
+    font-size: max(var(--text-xs), 0.92em);
     background: color-mix(in srgb, var(--foreground) 8%, transparent);
     border-radius: 3px;
     padding: 0 3px;
@@ -4295,7 +4292,7 @@
     border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     cursor: pointer;
     transition: all var(--transition-fast);
   }
@@ -4398,7 +4395,7 @@
     border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     cursor: pointer;
     transition: all var(--transition-fast);
   }
@@ -4453,7 +4450,7 @@
     background: var(--surface-2);
     border-radius: var(--radius-full);
     overflow: hidden;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1;
   }
   .ia-web-mode-btn {
@@ -4492,7 +4489,7 @@
     border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--primary) 12%, transparent);
     color: inherit;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 16px;
     font-weight: calc(var(--font-semibold) + 50);
     white-space: nowrap;
@@ -4509,7 +4506,7 @@
     border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     cursor: pointer;
     transition: all var(--transition-fast);
   }
@@ -4567,7 +4564,7 @@
   .ia-add-group-label {
     padding: 7px 9px 4px;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
   }
   .ia-add-item {
@@ -4747,7 +4744,7 @@
     margin: 0;
     padding: 1px 6px 4px;
     border-bottom: 0;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 16px;
   }
   .ia-picker-item.ia-access-option {
@@ -4796,11 +4793,11 @@
   .ia-access-option .ia-picker-item-label {
     white-space: nowrap;
     word-break: normal;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 15px;
   }
   .ia-access-option .ia-picker-item-desc {
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1.25;
     overflow-wrap: break-word;
   }
@@ -4810,7 +4807,7 @@
     border-radius: 4px;
     background: color-mix(in srgb, var(--primary) 12%, transparent);
     color: var(--primary);
-    font-size: 8px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 13px;
   }
@@ -4823,7 +4820,7 @@
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 4%, transparent);
   }
   .ia-picker-header {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     padding: 2px 6px 6px;
     border-bottom: 1px dashed var(--border-subtle);
@@ -4894,7 +4891,7 @@
   .ia-model-tier {
     flex: 0 0 auto;
     margin-left: 4px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     letter-spacing: 0.04em;
     color: var(--foreground-muted);
   }
@@ -4904,7 +4901,7 @@
     margin-left: 6px;
     padding: 0 6px;
     border-radius: 999px;
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 16px;
     white-space: nowrap;
     background: var(--primary-soft, rgba(80, 140, 255, 0.16));
@@ -4912,7 +4909,7 @@
   }
   .ia-picker-notice {
     margin: 6px 6px 0;
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1.5;
     color: var(--foreground-muted);
   }
@@ -4925,7 +4922,7 @@
     background: var(--border-subtle);
   }
   .ia-picker-item-desc {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     line-height: 1.4;
   }
@@ -4938,7 +4935,7 @@
     border-top: 1px dashed var(--border-subtle);
   }
   .ia-picker-status {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     padding: 8px 6px;
     text-align: center;
@@ -4953,7 +4950,7 @@
   .ia-picker-retry {
     align-self: center;
     padding: 2px 10px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     background: transparent;
     border: 0;
     border-radius: var(--radius-full);
@@ -5008,7 +5005,7 @@
     border-radius: var(--radius-full);
     background: var(--info);
     color: white;
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: var(--font-bold);
     line-height: 1;
   }
@@ -5021,7 +5018,7 @@
   }
   .ia-reference-chip-desc {
     color: color-mix(in srgb, var(--primary) 72%, var(--foreground-muted));
-    font-size: 11px;
+    font-size: var(--text-xs);
     max-width: 220px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5115,7 +5112,7 @@
   .ia-slash-group-label {
     padding: 6px 9px 4px;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     line-height: 1;
   }
@@ -5184,7 +5181,7 @@
     -webkit-line-clamp: 2;
     line-clamp: 2;
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     line-height: 1.35;
     overflow: hidden;
   }

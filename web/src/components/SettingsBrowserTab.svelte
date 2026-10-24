@@ -764,12 +764,12 @@
     margin-top: 2px;
     color: var(--foreground-muted);
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-    font-size: 10px;
+    font-size: var(--text-xs);
   }
-  .resource-row-status { flex: 0 0 auto; max-width: 104px; color: var(--foreground-muted); font-size: 10px; text-align: right; }
+  .resource-row-status { flex: 0 0 auto; max-width: 104px; color: var(--foreground-muted); font-size: var(--text-xs); text-align: right; }
   .resource-row-status--ready { color: var(--primary); }
   .resource-manager-footer { align-items: flex-start; padding-top: 10px; }
-  .resource-manager-footer > span { max-width: 64%; color: var(--foreground-muted); font-size: 10px; line-height: 1.45; }
+  .resource-manager-footer > span { max-width: 64%; color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.45; }
   .resource-empty {
     display: flex;
     align-items: center;

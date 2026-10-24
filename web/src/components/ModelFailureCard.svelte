@@ -181,7 +181,6 @@
     box-sizing: border-box;
     padding: var(--space-3) var(--space-4);
     border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 42%, var(--border));
-    border-left: 3px solid var(--error);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--error) 7%, var(--surface));
     color: var(--foreground);

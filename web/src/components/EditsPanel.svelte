@@ -396,7 +396,7 @@
     flex: 0 0 auto;
     padding: 4px calc(var(--space-2) + var(--space-1)) 0;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
   }
 
@@ -455,7 +455,7 @@
     background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
@@ -501,13 +501,13 @@
 
   .group-label {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
   }
 
   .group-count {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     opacity: 0.72;
   }
 
@@ -516,7 +516,7 @@
     align-items: center;
     gap: 6px;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     font-weight: var(--font-semibold);
   }

@@ -68,7 +68,7 @@ import {
         id: manifest.id,
         manifest,
         entry: view.entry,
-        label: `${manifest.name} · ${view.title}`,
+        label: `${manifest.name}: ${view.title}`,
         title: view.title,
         description: manifest.description,
       }))));
@@ -86,7 +86,7 @@ import {
       id: manifest.id,
       manifest,
       entry: '',
-      label: `${manifest.name} · ${i18n.t('settings.plugins.settings.title')}`,
+      label: `${manifest.name}: ${i18n.t('settings.plugins.settings.title')}`,
       title: i18n.t('settings.plugins.settings.title'),
       description: manifest.description,
     })));
@@ -874,7 +874,7 @@ import {
     margin-bottom: var(--space-2);
   }
 
-  .form-error { font-size: 11px; color: var(--error); margin-top: 8px; line-height: 1.5; }
+  .form-error { font-size: var(--text-xs); color: var(--error); margin-top: 8px; line-height: 1.5; }
 
   .mcp-editor-title {
     display: flex;
@@ -1007,7 +1007,7 @@ import {
   .mcp-enabled-field strong { color: var(--foreground); font-size: var(--text-xs); }
   .mcp-enabled-field span {
     color: var(--foreground-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
   .mcp-form-section {
@@ -1234,7 +1234,7 @@ import {
   .skill-library-info { min-width: 0; overflow: hidden; }
   .skill-library-name-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .skill-library-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
-  .skill-library-status { padding: 1px 6px; border-radius: 4px; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); font-size: 10px; white-space: nowrap; }
+  .skill-library-status { padding: 1px 6px; border-radius: 4px; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); font-size: var(--text-xs); white-space: nowrap; }
   .skill-library-status.is-update { background: rgba(var(--warning-rgb, 255, 149, 0), 0.11); color: var(--warning); }
   .skill-library-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; line-height: 1.5; }
   .skill-library-meta { display: flex; gap: var(--space-3); margin-top: var(--space-2); flex-wrap: wrap; }

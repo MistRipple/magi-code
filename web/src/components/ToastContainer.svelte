@@ -123,10 +123,6 @@
     }
   }
 
-  .toast.success { border-left: 3px solid var(--success); }
-  .toast.error { border-left: 3px solid var(--error); }
-  .toast.warning { border-left: 3px solid var(--warning); }
-
   .toast-icon {
     flex-shrink: 0;
     width: var(--icon-md);

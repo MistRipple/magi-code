@@ -332,7 +332,7 @@
     text-overflow: ellipsis;
   }
   .trigger-sublabel {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     line-height: 1.3;
     white-space: nowrap;
@@ -365,7 +365,7 @@
   }
 
   .group-label {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -446,7 +446,7 @@
     text-overflow: ellipsis;
   }
   .opt-sub {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     color: var(--ind-foreground-muted);
     line-height: 1.3;
     white-space: nowrap;

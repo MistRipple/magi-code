@@ -727,10 +727,10 @@
                 onkeydown={handleGoalEditKeydown}
               ></textarea>
               <div class="goal-edit-footer">
-                <span class="goal-edit-hint">
-                  {i18n.t('goalPanel.edit.hint')}
+                <span class="goal-edit-hint ui-meta">
+                  <span>{i18n.t('goalPanel.edit.hint')}</span>
                   {#if goalObjectiveDraft.length >= GOAL_OBJECTIVE_MAX_CHARS * 0.9}
-                    · {i18n.t('goalPanel.edit.counter', { count: goalObjectiveDraft.length, max: GOAL_OBJECTIVE_MAX_CHARS })}
+                    <span>{i18n.t('goalPanel.edit.counter', { count: goalObjectiveDraft.length, max: GOAL_OBJECTIVE_MAX_CHARS })}</span>
                   {/if}
                 </span>
                 <span class="goal-edit-buttons">
@@ -913,7 +913,7 @@
 
   .goal-status-title {
     color: var(--goal-tone);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     white-space: nowrap;
   }
@@ -991,7 +991,7 @@
 
   .goal-detail-label {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     line-height: var(--leading-tight);
   }
@@ -1028,7 +1028,7 @@
 
   .goal-note-meta {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
   }
 
   .goal-note-toggle {
@@ -1037,7 +1037,7 @@
     background: transparent;
     color: var(--primary);
     font: inherit;
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     cursor: pointer;
   }
 
@@ -1055,7 +1055,7 @@
     list-style: none;
     color: var(--foreground-muted);
     font-family: var(--font-mono, monospace);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     overflow-wrap: anywhere;
   }
 
@@ -1127,7 +1127,7 @@
   .goal-edit-hint {
     min-width: 0;
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     line-height: 1.4;
   }
 
@@ -1154,7 +1154,7 @@
     border-radius: var(--radius-sm);
     background: var(--primary);
     color: var(--primary-foreground);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     cursor: pointer;
   }
@@ -1177,7 +1177,7 @@
   .plan-running {
     flex: 0 0 auto;
     color: var(--primary);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     font-weight: var(--font-medium);
     white-space: nowrap;
   }
@@ -1295,7 +1295,7 @@
 
   .run-row-meta {
     color: var(--foreground-muted);
-    font-size: var(--text-2xs);
+    font-size: var(--text-xs);
     line-height: var(--leading-tight);
   }
 
