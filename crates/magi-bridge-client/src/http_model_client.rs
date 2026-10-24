@@ -1,4 +1,3 @@
-use crate::EndpointUrlMode;
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolChoice, ToolDefinition,
     ToolInputSchema, parse_tool_result_model_content,
@@ -85,7 +84,6 @@ pub struct HttpModelBridgeClient {
     api_key: Option<String>,
     model: String,
     protocol: HttpModelBridgeProtocol,
-    url_mode: EndpointUrlMode,
     /// 推理强度配置：构造期注入；调用时透传到协议层 request body。
     /// `None` 表示未配置（保留协议默认行为）。
     reasoning_effort: Option<ReasoningEffort>,
@@ -137,43 +135,24 @@ impl HttpModelBridgeClient {
         protocol: HttpModelBridgeProtocol,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
-        Self::new_with_protocol_and_url_mode(
-            base_url,
-            api_key,
-            model,
-            protocol,
-            EndpointUrlMode::Standard,
-            reasoning_effort,
-        )
-    }
-
-    pub fn new_with_protocol_and_url_mode(
-        base_url: String,
-        api_key: Option<String>,
-        model: String,
-        protocol: HttpModelBridgeProtocol,
-        url_mode: EndpointUrlMode,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Self {
         Self {
             base_url,
             api_key,
             model,
             protocol,
-            url_mode,
             reasoning_effort,
         }
     }
 
     #[cfg(test)]
     fn chat_completions_url(&self) -> Result<String, BridgeClientError> {
-        build_protocol_endpoint_url(&self.base_url, "/v1/chat/completions", self.url_mode).map_err(
-            |reason| BridgeClientError::CallFailed {
+        build_protocol_endpoint_url(&self.base_url, "/v1/chat/completions").map_err(|reason| {
+            BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
                 message: format!("invalid base_url: {reason}"),
-            },
-        )
+            }
+        })
     }
 
     fn provider_family(&self) -> ProviderFamily {
@@ -259,11 +238,13 @@ impl HttpModelBridgeClient {
                     message: format!("build anthropic request failed: {reason}"),
                 })?,
         };
-        let url = build_protocol_endpoint_url(&self.base_url, &adapted.url_path, self.url_mode)
-            .map_err(|reason| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Protocol,
-                code: None,
-                message: format!("invalid base_url: {reason}"),
+        let url =
+            build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(|reason| {
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("invalid base_url: {reason}"),
+                }
             })?;
         headers.append(&mut adapted.extra_headers);
         Ok(HttpModelRequest {
@@ -1959,23 +1940,16 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
             "claude-test",
         )
         .expect("anthropic adapter should build test request");
-    build_protocol_endpoint_url(base_url, &request.url_path, EndpointUrlMode::Standard)
+    build_protocol_endpoint_url(base_url, &request.url_path)
 }
 
-fn build_protocol_endpoint_url(
-    base_url: &str,
-    endpoint_path: &str,
-    url_mode: EndpointUrlMode,
-) -> Result<String, String> {
+fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<String, String> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
         return Err("base_url must not be empty".to_string());
     }
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err("base_url must start with http:// or https://".to_string());
-    }
-    if url_mode == EndpointUrlMode::Full {
-        return Ok(trimmed.to_string());
     }
 
     let normalized = trimmed.trim_end_matches('/');
@@ -3610,35 +3584,26 @@ mod tests {
     }
 
     #[test]
-    fn full_url_mode_preserves_the_configured_endpoint() {
-        let cases = [
-            (
-                HttpModelBridgeProtocol::ChatCompletions,
-                "https://gateway.example.com/custom/model/invoke?api-version=2026-07-31",
-            ),
-            (
-                HttpModelBridgeProtocol::Responses,
-                "https://gateway.example.com/custom/responses?api-version=2026-07-31",
-            ),
-            (
-                HttpModelBridgeProtocol::AnthropicMessages,
-                "https://gateway.example.com/vendor/claude/stream/",
-            ),
-        ];
-
-        for (protocol, endpoint) in cases {
-            let client = HttpModelBridgeClient::new_with_protocol_and_url_mode(
-                endpoint.to_string(),
-                Some("test-key".to_string()),
-                "test-model".to_string(),
-                protocol,
-                EndpointUrlMode::Full,
-                None,
-            );
-            let (url, _, _) = client
-                .build_probe_request()
-                .expect("完整路径请求必须可构造");
-            assert_eq!(url, endpoint);
+    fn standard_endpoints_follow_the_selected_protocol() {
+        for (protocol, suffix) in [
+            (HttpModelBridgeProtocol::ChatCompletions, "chat/completions"),
+            (HttpModelBridgeProtocol::Responses, "responses"),
+            (HttpModelBridgeProtocol::AnthropicMessages, "messages"),
+        ] {
+            for base in [
+                "https://gateway.example.com",
+                "https://gateway.example.com/v1/",
+            ] {
+                let client = HttpModelBridgeClient::new_with_protocol(
+                    base.to_string(),
+                    Some("test-key".to_string()),
+                    "test-model".to_string(),
+                    protocol,
+                    None,
+                );
+                let (url, _, _) = client.build_probe_request().unwrap();
+                assert_eq!(url, format!("https://gateway.example.com/v1/{suffix}"));
+            }
         }
     }
 

@@ -55,7 +55,7 @@
     gap: 8px;
     width: min(360px, calc(100vw - 32px));
     padding: 12px 14px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.28));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.28));
     border-radius: 12px;
     background: var(--surface-elevated, var(--surface, #fff));
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
@@ -63,7 +63,7 @@
 
   .tray-title {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .item {
@@ -77,7 +77,7 @@
 
   .summary {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     overflow-wrap: anywhere;
   }
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import Icon from './Icon.svelte';
@@ -21,13 +22,12 @@
     saveStatus,
     testStatus,
     fetchingModels,
-    modelDropdownOpen,
-    dropdownPosition,
+    modelListOpen,
+    modelListPosition,
     modelLists,
     getBaseUrlPlaceholder,
-    shouldRecommendStandardUrlMode,
-    openModelDropdown,
-    closeModelDropdown,
+    openModelList,
+    closeModelList,
     fetchModelList,
     selectModel,
     saveModelConfig,
@@ -49,13 +49,12 @@
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
     fetchingModels: Record<string, boolean>;
-    modelDropdownOpen: Record<string, boolean>;
-    dropdownPosition: any;
+    modelListOpen: Record<string, boolean>;
+    modelListPosition: any;
     modelLists: Record<string, string[]>;
     getBaseUrlPlaceholder: () => string;
-    shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
-    openModelDropdown: (type: string, target: HTMLElement) => void;
-    closeModelDropdown: (key: string) => void;
+    openModelList: (type: string, target: HTMLElement) => void;
+    closeModelList: (key: string) => void;
     fetchModelList: (type: FormType, statusKey: string) => void;
     selectModel: (type: string, model: string) => void;
     saveModelConfig: (type: FormType, statusKey: string) => void;
@@ -69,9 +68,8 @@
   function editableConfigSnapshot(value: any): string {
     const normalized = {
       baseUrl: String(value?.baseUrl ?? ''),
-      urlMode: value?.urlMode === 'full' ? 'full' : 'standard',
       ...(formType !== 'image'
-        ? { apiProtocol: String(value?.apiProtocol ?? 'openai_chat') }
+        ? { apiProtocol: String(value?.apiProtocol ?? 'openai_responses') }
         : {}),
       apiKey: String(value?.apiKey ?? ''),
       ...(showModelField ? { model: String(value?.model ?? '') } : {}),
@@ -220,10 +218,14 @@
 
   // --- 下拉外部点击关闭 ---
   // 模型下拉用 position: fixed 渲染到 .model-combobox 之外的 stacking context，
-  // 这里用两个 ref 锁定边界：只有点击落在 combobox 或 dropdown 内才视为内部交互，
+  // 这里用两个 ref 锁定边界：只有点击落在 combobox 或选项列表 内才视为内部交互，
   // 其余 pointerdown 一律关闭本表单的下拉。
   let comboboxEl: HTMLDivElement | undefined = $state();
-  let dropdownEl: HTMLDivElement | undefined = $state();
+  let modelListEl: HTMLDivElement | undefined = $state();
+  let modelQuery = $state('');
+  const filteredModels = $derived((modelLists[statusKey] ?? []).filter(model =>
+    model.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase())));
+  $effect(() => { if (!modelListOpen[statusKey] || (modelLists[statusKey]?.length ?? 0) <= 10) modelQuery = ''; });
 
   function portalToBody(node: HTMLElement) {
     document.body.appendChild(node);
@@ -235,20 +237,20 @@
   }
 
   $effect(() => {
-    if (!modelDropdownOpen[statusKey]) return;
+    if (!modelListOpen[statusKey]) return;
     function handlePointerDown(event: PointerEvent) {
       const target = event.target as Node | null;
       if (!target) return;
       if (comboboxEl?.contains(target)) return;
-      if (dropdownEl?.contains(target)) return;
-      closeModelDropdown(statusKey);
+      if (modelListEl?.contains(target)) return;
+      closeModelList(statusKey);
     }
     function handleScroll(event: Event) {
       const target = event.target;
-      if (target instanceof Node && (comboboxEl?.contains(target) || dropdownEl?.contains(target))) {
+      if (target instanceof Node && (comboboxEl?.contains(target) || modelListEl?.contains(target))) {
         return;
       }
-      closeModelDropdown(statusKey);
+      closeModelList(statusKey);
     }
     window.addEventListener('pointerdown', handlePointerDown, true);
     window.addEventListener('scroll', handleScroll, true);
@@ -275,7 +277,7 @@
     const input = button?.parentElement?.querySelector('input') ?? null;
     const hasModels = Array.isArray(modelLists[statusKey]) && modelLists[statusKey].length > 0;
     if (input) {
-      openModelDropdown(statusKey, input);
+      openModelList(statusKey, input);
     }
     if (!hasModels) {
       void fetchModelList(formType, statusKey);
@@ -296,10 +298,6 @@
   }
 
   function protocolEndpointLabel(): string {
-    const baseUrl = String(config.baseUrl ?? '').trim();
-    if (config.urlMode === 'full') {
-      return baseUrl || i18n.t('settings.model.protocol.fullEndpoint');
-    }
     return protocolEndpointPath(config.apiProtocol);
   }
 
@@ -369,59 +367,24 @@
 
   <section class="cfg-card" aria-label={i18n.t('settings.model.card.connection')}>
   <h4 class="cfg-card-title">{i18n.t('settings.model.card.connection')}</h4>
-  <div class="llm-config-field-row url-mode-row">
-    <div class="llm-config-field">
-      <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
-      <input
-        id={fieldId('base-url')}
-        type="text"
-        class="form-input"
-        bind:value={config.baseUrl}
-        placeholder={getBaseUrlPlaceholder()}
-      />
-    </div>
-    <div class="llm-config-field llm-config-field--compact">
-      <span class="form-label" id={fieldId('url-mode-label')}>{i18n.t('settings.model.field.urlMode')}</span>
-      <div class="ui-segmented url-mode-switch" role="group" aria-labelledby={fieldId('url-mode-label')}>
-        <button
-          type="button"
-          class="ui-segmented__option"
-          class:active={config.urlMode === 'standard'}
-          onclick={() => { config.urlMode = 'standard'; }}
-        >
-          {i18n.t('settings.model.urlMode.standard')}
-        </button>
-        <button
-          type="button"
-          class="ui-segmented__option"
-          class:active={config.urlMode === 'full'}
-          onclick={() => { config.urlMode = 'full'; }}
-        >
-          {i18n.t('settings.model.urlMode.full')}
-        </button>
-      </div>
-      {#if shouldRecommendStandardUrlMode(config.baseUrl)}
-        <div class="llm-config-hint">
-          {i18n.t('settings.model.urlMode.standardRecommended')}
-        </div>
-      {/if}
-    </div>
+  <div class="llm-config-field">
+    <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
+    <input
+      id={fieldId('base-url')}
+      type="text"
+      class="form-input"
+      bind:value={config.baseUrl}
+      placeholder={getBaseUrlPlaceholder()}
+    />
   </div>
 
   {#if showProtocolField}
     <div class="llm-config-field protocol-field">
       <label class="form-label" for={fieldId('protocol')}>{i18n.t('settings.model.field.apiProtocol')}</label>
       <div class="protocol-control-row">
-        <select
-          id={fieldId('protocol')}
-          class="form-input protocol-select"
-          bind:value={config.apiProtocol}
-          title={i18n.t('settings.model.protocolHint')}
-        >
-          <option value="openai_responses">{i18n.t('settings.model.protocol.openaiResponses')}</option>
-          <option value="openai_chat">{i18n.t('settings.model.protocol.openaiChat')}</option>
-          <option value="anthropic_messages">{i18n.t('settings.model.protocol.anthropicMessages')}</option>
-        </select>
+        <SelectField id={fieldId('protocol')} bind:value={config.apiProtocol}
+          label={i18n.t('settings.model.field.apiProtocol')}
+          options={[{ value: 'openai_responses', label: i18n.t('settings.model.protocol.openaiResponses') }, { value: 'openai_chat', label: i18n.t('settings.model.protocol.openaiChat') }, { value: 'anthropic_messages', label: i18n.t('settings.model.protocol.anthropicMessages') }]} />
         <div
           class="protocol-endpoint"
           aria-live="polite"
@@ -478,7 +441,7 @@
             class="form-input"
             bind:value={config.model}
             onfocus={(e) => {
-              if ((modelLists[statusKey]?.length ?? 0) > 0) openModelDropdown(statusKey, e.currentTarget);
+              if ((modelLists[statusKey]?.length ?? 0) > 0) openModelList(statusKey, e.currentTarget);
             }}
           />
           <button
@@ -497,23 +460,35 @@
               <Icon name="download" size={12} />
             {/if}
           </button>
-          {#if modelDropdownOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
+          {#if modelListOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
             <div
-              bind:this={dropdownEl}
+              bind:this={modelListEl}
               use:portalToBody
-              class="model-dropdown"
+              class="model-select-list"
               data-magi-surface="popover"
-              style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
+              style="top: {modelListPosition.top}px; left: {modelListPosition.left}px; width: {modelListPosition.width}px;"
             >
-              {#each modelLists[statusKey] as m}
+              {#if modelLists[statusKey].length > 10}
+                <input class="form-input model-select-search" type="search" bind:value={modelQuery}
+                  aria-label={i18n.t('selection.searchFor', { label: i18n.t('settings.model.field.model') })}
+                  placeholder={i18n.t('selection.search')} />
+              {/if}
+              <div role="listbox" aria-label={i18n.t('settings.model.field.model')}>
+              {#each filteredModels as m}
                 <button
-                  class="model-dropdown-item"
+                  type="button"
+                  class="model-select-option"
+                  role="option"
+                  aria-selected={config.model === m}
                   class:selected={config.model === m}
                   onclick={() => { selectModel(statusKey, m); }}
                 >
                   {m}
                 </button>
+              {:else}
+                <p class="select-empty" role="status">{i18n.t('selection.empty')}</p>
               {/each}
+              </div>
             </div>
           {/if}
         </div>
@@ -551,12 +526,9 @@
     {#if showAdvancedOptions}
       <div class="llm-config-field">
         <label class="form-label" for={fieldId('level')}>{i18n.t('settings.model.field.level')}</label>
-        <select id={fieldId('level')} class="form-input" bind:value={config.reasoningEffort}>
-          <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
-          <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
-          <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
-          <option value="xhigh">{i18n.t('settings.model.reasoning.xhigh')}</option>
-        </select>
+        <SelectField id={fieldId('level')} bind:value={config.reasoningEffort}
+          label={i18n.t('settings.model.field.level')}
+          options={[{ value: 'low', label: i18n.t('settings.model.reasoning.low') }, { value: 'medium', label: i18n.t('settings.model.reasoning.medium') }, { value: 'high', label: i18n.t('settings.model.reasoning.high') }, { value: 'xhigh', label: i18n.t('settings.model.reasoning.xhigh') }]} />
       </div>
     {/if}
   </div>
@@ -726,14 +698,6 @@
   .llm-config-field-row.model-row.has-context-window {
     grid-template-columns: minmax(0, 1fr) minmax(118px, 0.42fr);
   }
-  .llm-config-field-row.url-mode-row {
-    grid-template-columns: minmax(0, 1fr) 180px;
-    align-items: end;
-  }
-
-  .llm-config-field--compact {
-    min-width: 0;
-  }
 
   .cfg-header { display: flex; flex-direction: column; gap: var(--space-1); }
   .cfg-title-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
@@ -743,7 +707,7 @@
     align-items: center;
     gap: 6px;
     padding: 1px 9px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
@@ -761,7 +725,7 @@
     flex-direction: column;
     gap: var(--space-3);
     padding: var(--space-4);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg);
   }
   .cfg-card-title {
@@ -791,14 +755,15 @@
   }
 
   .protocol-control-row {
-    display: grid;
-    grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+    display: flex;
+    flex-wrap: wrap;
     gap: var(--space-3);
     align-items: center;
   }
 
-  .protocol-select {
-    min-width: 0;
+  .protocol-control-row > :global(.select-field) {
+    flex: 0 1 300px;
+    max-width: 100%;
   }
 
   .vision-context-window-field {
@@ -856,8 +821,8 @@
   }
 
   .vision-builtin-rules {
-    border-top: 1px solid var(--border-subtle);
-    border-bottom: 1px solid var(--border-subtle);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }
 
   .vision-builtin-rules summary {
@@ -922,7 +887,7 @@
 
   .vision-builtin-rule {
     padding: 3px 7px;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: var(--radius-sm);
     color: var(--foreground-muted);
     background: color-mix(in srgb, var(--surface-2) 68%, transparent);
@@ -994,10 +959,7 @@
     gap: var(--space-2);
     min-width: 0;
     min-height: var(--btn-height-md);
-    padding: 0 var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+    padding: 0;
   }
 
   .protocol-endpoint__label {
@@ -1021,8 +983,6 @@
     font-size: var(--text-xs);
     line-height: 1.45;
   }
-
-  .url-mode-switch { min-width: 0; }
 
   .api-key-wrapper {
     position: relative;
@@ -1088,17 +1048,19 @@
     opacity: 0.6;
   }
 
-  .model-dropdown {
+  .model-select-list {
     position: fixed;
     z-index: var(--z-popover);
-    max-height: 200px;
+    max-height: 264px;
     overflow-y: auto;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-top: none;
     border-radius: 0 0 var(--radius-sm) var(--radius-sm);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   }
-  .model-dropdown-item {
+  .model-select-search { margin: 4px; width: calc(100% - 8px); }
+  .select-empty { margin: 8px; color: var(--foreground-muted); font-size: var(--text-xs); }
+  .model-select-option {
     display: block;
     width: 100%;
     padding: 6px var(--space-3);
@@ -1113,10 +1075,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .model-dropdown-item:hover {
+  .model-select-option:hover {
     background: var(--secondary);
   }
-  .model-dropdown-item.selected {
+  .model-select-option.selected {
     color: var(--primary);
     background: var(--primary-muted, rgba(var(--primary-rgb, 100, 149, 237), 0.1));
   }
@@ -1159,7 +1121,7 @@
     line-height: 1.5;
     color: var(--warning, #d97706);
     background: var(--warning-bg, rgba(217, 119, 6, 0.12));
-    border: 1px solid var(--warning-border, rgba(217, 119, 6, 0.3));
+    border: var(--magi-hairline) solid var(--warning-border, rgba(217, 119, 6, 0.3));
     border-radius: var(--radius-full);
   }
 
@@ -1186,11 +1148,7 @@
     .llm-config-field-row,
     .llm-config-field-row.model-row,
     .llm-config-field-row.model-row.has-level,
-    .llm-config-field-row.model-row.has-context-window,
-    .llm-config-field-row.url-mode-row {
-      grid-template-columns: 1fr;
-    }
-    .protocol-control-row {
+    .llm-config-field-row.model-row.has-context-window {
       grid-template-columns: 1fr;
     }
   }
@@ -1218,11 +1176,7 @@
     .llm-config-field-row,
     .llm-config-field-row.model-row,
     .llm-config-field-row.model-row.has-level,
-    .llm-config-field-row.model-row.has-context-window,
-    .llm-config-field-row.url-mode-row {
-      grid-template-columns: 1fr;
-    }
-    .protocol-control-row {
+    .llm-config-field-row.model-row.has-context-window {
       grid-template-columns: 1fr;
     }
   }

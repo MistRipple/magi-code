@@ -1,5 +1,6 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
     applyPluginCandidate,
     authorizeAndActivatePlugin,
@@ -16,9 +17,10 @@
     type PluginCandidate,
   } from '../web/plugin-api';
   import PluginDetailPane from './PluginDetailPane.svelte';
-  import PluginGuideModal from './PluginGuideModal.svelte';
+  import PluginGuidePage from './PluginGuidePage.svelte';
   import Icon from './Icon.svelte';
-  import Modal from './Modal.svelte';
+  import SettingsDetailPage from './SettingsDetailPage.svelte';
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import { openSettings } from '../stores/shell-ui.svelte';
   import { buildStoreItems, filterStoreItems, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision } from '../stores/plugin-registry.svelte';
@@ -36,6 +38,7 @@
   let centerPublicKey = $state('');
   let centerConfigOpen = $state(false);
   let centerSynced = false;
+  let centerDraftBaseline = $state('');
   let listRequestSeq = 0;
   let centerRequestSeq = 0;
   let guideOpen = $state(false);
@@ -66,6 +69,9 @@
         const key = center.config.trustedKeys[0];
         centerKeyId = key?.keyId ?? '';
         centerPublicKey = key?.publicKey ?? '';
+        centerDraftBaseline = JSON.stringify(center.config);
+        const restored = loadViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
+        ({ centerUrl, centerKeyId, centerPublicKey, address } = restored);
       }
     } catch (error) {
       if (requestSeq !== centerRequestSeq) return;
@@ -83,6 +89,7 @@
           : [],
       });
       centerConfigOpen = false;
+      clearViewDraft('plugin-sources');
       centerSynced = false;
     });
   }
@@ -209,6 +216,14 @@
   // 过滤条件变化后回到第一页。
   $effect(() => { void filter; void query; page = 1; });
 
+  async function uninstallItem(item: StoreItem): Promise<void> {
+    const { id, name } = item;
+    if (!(await confirmMessage(i18n.t('overlay.uninstallBody', { name }), {
+      title: i18n.t('settings.plugins.uninstall'), confirmLabel: i18n.t('settings.plugins.uninstall'), tone: 'danger',
+    }))) return;
+    await run(() => uninstallPlugin(id));
+  }
+
   async function installItem(item: StoreItem): Promise<void> {
     // 内置包优先：第一方插件只接受内置来源，且离线可装。
     if (item.bundled) {
@@ -222,6 +237,10 @@
     if (!item.catalog) return;
     await run(() => installFromPluginCenter(item.id, item.catalog!.version));
   }
+
+  $effect(() => {
+    if (centerSynced && centerDraftBaseline) saveViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
+  });
 
   function closeSources(): void {
     sourcesOpen = false;
@@ -238,6 +257,7 @@
   }
 </script>
 
+<div hidden={sourcesOpen || guideOpen}>
 <div class="apple-manager">
 <div class="apple-scroller-proxy">
   {#if message}
@@ -415,7 +435,7 @@
               onInstall={() => void installItem(selected)}
               onUpdateFromCenter={() => void updateFromCenter(selected)}
               onUpgradeFile={(event) => void stageFile(event)}
-              onUninstall={() => void run(() => uninstallPlugin(selected.id))}
+              onUninstall={() => void uninstallItem(selected)}
               onActivate={() => void run(() => authorizeAndActivatePlugin(selected.id, selected.installed!.manifest))}
               onDeactivate={() => void run(() => deactivatePlugin(selected.id))}
               onDisable={() => void run(() => disablePlugin(selected.id))}
@@ -440,14 +460,16 @@
 </div>
 </div>
 
+</div>
+
 {#if sourcesOpen}
-  <Modal size="lg" closeOnEscape={true} closeOnBackdrop={true} onClose={closeSources}>
+  <SettingsDetailPage title={i18n.t('settings.plugins.store.sources')} {busy} onClose={closeSources}>
     {#snippet header()}
       <div class="sources-header">
         <h3>{i18n.t('settings.plugins.store.sources')}</h3>
-        <button class="modal-close" data-testid="plugin-sources-close" aria-label={i18n.t('settings.plugins.candidate.cancel')} onclick={closeSources}><Icon name="close" size={18} /></button>
       </div>
     {/snippet}
+    <p class="settings-hint" role="status">{i18n.t('overlay.draftMemory')}</p>
     <div class="sources-body">
       <section>
         <h4>{i18n.t('settings.plugins.center.title')}</h4>
@@ -496,11 +518,11 @@
         </div>
       </section>
     </div>
-  </Modal>
+  </SettingsDetailPage>
 {/if}
 
 {#if guideOpen}
-  <PluginGuideModal onClose={() => { guideOpen = false; }} />
+  <PluginGuidePage onClose={() => { guideOpen = false; }} />
 {/if}
 
 <style>
@@ -511,8 +533,8 @@
   .store-count { margin-left: 2px; color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
 
   /* 左右分栏：整体是一块带边框的面板，左侧列表独立滚动，右侧显示所选插件。 */
-  .store { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: min(600px, 68vh); min-height: 380px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-  .store-list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+  .store { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: min(600px, 68vh); min-height: 380px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; overflow: hidden; }
+  .store-list { display: flex; flex-direction: column; min-height: 0; border-right: var(--magi-hairline) solid var(--border); }
   .store-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 6px 8px; }
   .store-group { display: flex; align-items: center; justify-content: space-between; padding: 12px 8px 4px; font-size: 11px; font-weight: var(--font-medium); color: var(--foreground-muted); letter-spacing: 0.02em; }
   .store-group[data-group='updatable'] { color: var(--primary); }
@@ -529,12 +551,12 @@
   .store-item-state[data-state='active'] { color: var(--success); }
   .store-item-state[data-state='working'] { color: var(--primary); }
   .store-item-version { font-size: 10px; font-variant-numeric: tabular-nums; }
-  .store-pager { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-top: 1px solid var(--border); }
+  .store-pager { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-top: var(--magi-hairline) solid var(--border); }
   .store-pager-actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
   .store-detail { min-width: 0; min-height: 0; overflow-y: auto; }
-  @media (max-width: 720px) {
+  @container settings-content (max-width: 720px) {
     .store { grid-template-columns: minmax(0, 1fr); height: auto; }
-    .store-list { border-right: 0; border-bottom: 1px solid var(--border); max-height: 320px; }
+    .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); max-height: 320px; }
   }
   .plugin-perm { display: grid; gap: var(--space-2); }
   .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }

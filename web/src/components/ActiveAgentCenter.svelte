@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import type {
     AgentProjectionDto,
@@ -587,11 +588,11 @@
                   <Icon name="chevron-right" size={12} class={completedExpanded ? 'completed-chevron completed-chevron--open' : 'completed-chevron'} />
                 </span>
               </button>
-              {#if completedExpanded}
+              <Disclosure expanded={completedExpanded}>
                 {#each agentGroups.completed as agent (agent.agentRunId)}
                   {@render agentRow(agent)}
                 {/each}
-              {/if}
+              </Disclosure>
             </section>
           {/if}
         </div>
@@ -643,7 +644,7 @@
     min-width: 34px;
     height: 32px;
     padding: 0 9px;
-    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 88%, transparent);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--background) 94%, transparent);
     color: var(--foreground);
@@ -687,7 +688,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--dropdown-bg);
     box-shadow: var(--shadow-xl);
@@ -700,7 +701,7 @@
     justify-content: space-between;
     min-height: 46px;
     padding: 0 9px 0 12px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
 
   .panel-heading {
@@ -779,7 +780,7 @@
     gap: 8px;
     margin-bottom: 7px;
     padding: 9px;
-    border: 1px solid color-mix(in srgb, var(--foreground-muted) 18%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--foreground-muted) 18%, transparent);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
   }
@@ -852,7 +853,7 @@
     gap: 5px;
     min-height: 27px;
     padding: 0 8px;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: var(--radius-md);
     background: var(--surface-raised);
     color: var(--foreground);
@@ -907,7 +908,7 @@
     gap: 5px;
     min-height: 30px;
     padding: 0 10px;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: var(--radius-md);
     font-size: var(--text-sm);
     cursor: pointer;
@@ -936,7 +937,7 @@
 
   .agent-group--attention {
     padding: 3px;
-    border: 1px solid color-mix(in srgb, var(--error) 22%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 22%, transparent);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--error) 5%, transparent);
   }

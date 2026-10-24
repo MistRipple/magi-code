@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Disclosure from './Disclosure.svelte';
+  import FileName from './FileName.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
@@ -738,7 +740,7 @@
               {/each}
             </div>
           {/if}
-          {#if builtinExpanded}
+          <Disclosure expanded={builtinExpanded}>
             <div class="tools-fixed-panel tools-fixed-panel--builtin builtin-tool-panel">
               {#if builtinTools.length === 0}
                 <div class="settings-empty"><span>{i18n.t('settings.tools.noBuiltinTools')}</span></div>
@@ -796,7 +798,7 @@
                 </div>
               {/if}
             </div>
-          {/if}
+          </Disclosure>
         </div>
 
         <!-- 命令环境 -->
@@ -912,6 +914,7 @@
                       </span>
                       <Toggle
                         checked={server.enabled}
+                        ariaLabel={server.name}
                         title={server.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
                         onchange={() => toggleMCPServer(server.id, server.enabled)}
                       />
@@ -935,7 +938,7 @@
                     </div>
                   </div>
 
-                  {#if mcpExpandedServer === server.id}
+                  <Disclosure expanded={mcpExpandedServer === server.id}>
                     <div class="mcp-tools-popover" data-magi-surface="popover">
                       <div class="mcp-tools-header">
                         <div class="mcp-tools-heading">
@@ -988,7 +991,7 @@
                         {/if}
                       </div>
                     </div>
-                  {/if}
+                  </Disclosure>
                 </div>
               {/each}
               </div>
@@ -1063,6 +1066,7 @@
                     {#if skill.source !== 'custom'}
                       <Toggle
                         checked={skill.enabled !== false}
+                        ariaLabel={skill.name}
                         disabled={skillTogglingIds.has(skill.skillId)}
                         title={skill.enabled !== false ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
                         onchange={(enabled) => toggleSkill(skill.skillId, enabled)}
@@ -1104,7 +1108,7 @@
                   </div>
                 </div>
 
-                {#if skillExpandedId === skill.skillId}
+                <Disclosure expanded={skillExpandedId === skill.skillId}>
                   {@const state = skillDetails[skill.skillId]}
                   <div class="skill-detail">
                     {#if !state || state.status === 'loading'}
@@ -1146,14 +1150,14 @@
                           <div class="skill-detail-files-title">{i18n.t('settings.tools.skillDetailFiles', { count: state.detail.files.length })}</div>
                           <ul>
                             {#each state.detail.files as file (file.path)}
-                              <li><code title={file.path}>{file.path}</code><span>{formatSkillFileSize(file.size)}</span></li>
+                              <li><code title={file.path}><FileName name={file.path} /></code><span>{formatSkillFileSize(file.size)}</span></li>
                             {/each}
                           </ul>
                         </div>
                       {/if}
                     {/if}
                   </div>
-                {/if}
+                </Disclosure>
                 </div>
               {/each}
               </div>
@@ -1242,7 +1246,7 @@
   .builtin-count-tag {
     margin-left: 8px;
     vertical-align: 1px;
-    font-weight: 400;
+    font-weight: var(--font-normal);
     font-size: 11px;
     color: var(--foreground-muted);
     padding: 2px 8px;
@@ -1257,7 +1261,7 @@
     min-width: 0;
     flex-wrap: wrap;
     padding: 10px 12px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 10px;
   }
 
@@ -1268,11 +1272,11 @@
     min-height: 22px;
     padding: 2px 7px;
     border-radius: 999px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
     background: rgba(var(--foreground-rgb), 0.04);
     font-size: 10px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     white-space: nowrap;
   }
 
@@ -1316,7 +1320,7 @@
     width: 100%;
     box-sizing: border-box;
     padding: 12px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 10px;
   }
 
@@ -1373,7 +1377,7 @@
     overscroll-behavior: contain;
     scrollbar-color: var(--scrollbar-thumb) transparent;
     scrollbar-width: thin;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
   }
 
@@ -1385,7 +1389,7 @@
   }
 
   .builtin-category-group + .builtin-category-group {
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
   }
 
   .builtin-category-summary {
@@ -1424,7 +1428,7 @@
 
   .builtin-category-group > .builtin-tool-list {
     padding: 3px 10px 5px 45px;
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     background: color-mix(in srgb, var(--surface-2) 68%, transparent);
     animation: builtin-tool-list-in 0.14s ease-out;
   }
@@ -1447,7 +1451,7 @@
     min-height: 44px;
     padding: 5px 4px;
     border: 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--border) 72%, transparent);
     border-radius: 0;
     background: transparent;
     transition: background 0.15s ease;
@@ -1488,7 +1492,7 @@
     overflow: hidden;
     color: var(--foreground);
     font-size: 13px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     line-height: 1.25;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1519,7 +1523,7 @@
     background: rgba(var(--foreground-rgb), 0.06);
     color: var(--foreground-muted);
     font-size: 10px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     white-space: nowrap;
   }
 
@@ -1574,7 +1578,7 @@
     right: 8px;
     left: 34px;
     background: var(--background);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 9px;
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2), 0 1px 3px rgba(0, 0, 0, 0.08);
     z-index: var(--z-popover);
@@ -1591,8 +1595,8 @@
     right: 10px;
     width: 8px;
     height: 8px;
-    border-top: 1px solid var(--border);
-    border-left: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
+    border-left: var(--magi-hairline) solid var(--border);
     background: var(--background);
     content: '';
     transform: rotate(45deg);
@@ -1611,7 +1615,7 @@
 
   .mcp-server-list {
     width: 100%;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 10px;
   }
 
@@ -1621,7 +1625,7 @@
   }
 
   .mcp-server-item + .mcp-server-item {
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
   }
 
   .mcp-server-item.expanded {
@@ -1691,7 +1695,7 @@
     overflow: hidden;
     color: var(--foreground);
     font-size: 13px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     line-height: 1.3;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1732,7 +1736,7 @@
     align-items: center;
     min-height: 36px;
     padding: 5px 8px 5px 11px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
 
   .mcp-tools-heading {
@@ -1741,7 +1745,7 @@
     gap: 7px;
     color: var(--foreground);
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .mcp-tools-count {
@@ -1751,7 +1755,7 @@
     background: rgba(var(--foreground-rgb), 0.07);
     color: var(--foreground-muted);
     font-size: 9px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 16px;
     text-align: center;
   }
@@ -1759,7 +1763,7 @@
   /* Apply consistent tile classes */
   .apple-tile {
     background: rgba(255, 255, 255, 0.92);
-    border: 1px solid rgba(60, 60, 67, 0.16);
+    border: var(--magi-hairline) solid rgba(60, 60, 67, 0.16);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.05);
     border-radius: 12px;
     padding: 14px 18px 18px 16px;
@@ -1856,7 +1860,7 @@
 
   .mcp-connection-diagnostic {
     padding: 8px;
-    border-bottom: 1px solid color-mix(in srgb, var(--error, #d33) 24%, transparent);
+    border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--error, #d33) 24%, transparent);
     color: var(--error, #d33);
     font-size: 10px;
     line-height: 1.45;
@@ -1865,7 +1869,7 @@
   .mcp-connection-diagnostic span {
     display: block;
     margin-bottom: 4px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .mcp-connection-diagnostic code {
@@ -1902,7 +1906,7 @@
     overflow: hidden;
     color: var(--foreground);
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1939,7 +1943,7 @@
     overflow-y: auto;
     padding: 10px 12px;
     background: var(--background);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
     box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.08);
     font-size: var(--text-xs);
@@ -1959,7 +1963,7 @@
     align-items: center;
     justify-content: center;
     background: transparent;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-sm);
     cursor: pointer;
     color: var(--foreground-muted);
@@ -1980,7 +1984,7 @@
   .skill-list {
     display: flex;
     flex-direction: column;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
     overflow: hidden;
   }
@@ -1992,7 +1996,7 @@
     min-height: 64px;
     padding: 9px 12px;
   }
-  .skill-item { border-bottom: 1px solid var(--border); }
+  .skill-item { border-bottom: var(--magi-hairline) solid var(--border); }
   .skill-item:last-child { border-bottom: 0; }
   .skill-row:hover { background: rgba(var(--foreground-rgb), 0.025); }
   .skill-row.disabled .skill-avatar {
@@ -2004,9 +2008,9 @@
   .skill-avatar { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); }
   .skill-main { min-width: 0; }
   .skill-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .skill-name { max-width: 42%; font-size: 13px; font-weight: 650; color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-name { max-width: 42%; font-size: 13px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-source-tag, .skill-status-tag { font-size: 9px; line-height: 16px; padding: 0 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
-  .skill-source-tag { border: 1px solid var(--border); color: var(--foreground-muted); }
+  .skill-source-tag { border: var(--magi-hairline) solid var(--border); color: var(--foreground-muted); }
   .skill-status-tag.success { color: var(--success); background: rgba(var(--success-rgb, 52, 199, 89), 0.1); }
   .skill-status-tag.warning { color: var(--warning); background: rgba(var(--warning-rgb, 255, 149, 0), 0.11); }
   .skill-status-tag.modified { color: var(--primary); background: rgba(var(--primary-rgb, 0, 122, 255), 0.1); }
@@ -2024,7 +2028,7 @@
   }
 
   .skill-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
-  .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
   .skill-action-btn:hover { color: var(--foreground); background: rgba(var(--foreground-rgb), 0.05); }
   .skill-action-btn.primary { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
   .skill-action-btn.danger:hover { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.08); }
@@ -2041,11 +2045,11 @@
   .skill-detail-note--error { color: var(--error); }
   .skill-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .skill-detail-title { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; }
-  .skill-detail-file { font-family: var(--font-mono, monospace); font-size: 12px; font-weight: 600; color: var(--foreground); }
+  .skill-detail-file { font-family: var(--font-mono, monospace); font-size: 12px; font-weight: var(--font-semibold); color: var(--foreground); }
   .skill-detail-size { font-size: 11px; color: var(--foreground-muted); }
   .skill-detail-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: color-mix(in srgb, var(--foreground) 6%, transparent); }
   .skill-detail-tab { padding: 1px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
-  .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+  .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: var(--font-semibold); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
   .skill-detail-meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; font-size: 12px; }
   .skill-detail-meta dt { color: var(--foreground-muted); }
   .skill-detail-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
@@ -2053,13 +2057,13 @@
     max-height: 360px;
     overflow: auto;
     padding: 10px 12px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
     background: var(--surface-1);
     font-size: 13px;
   }
   .skill-detail-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.55; color: var(--foreground); }
-  .skill-detail-files-title { margin-bottom: 4px; font-size: 11px; font-weight: 600; color: var(--foreground-muted); }
+  .skill-detail-files-title { margin-bottom: 4px; font-size: 11px; font-weight: var(--font-semibold); color: var(--foreground-muted); }
   .skill-detail-files ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow: auto; }
   .skill-detail-files li { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
   .skill-detail-files code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }

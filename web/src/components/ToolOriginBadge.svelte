@@ -19,7 +19,7 @@
   .tool-origin {
     flex: 0 0 auto;
     padding: 0 6px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 9px;
     font-size: 10px;
     line-height: 16px;

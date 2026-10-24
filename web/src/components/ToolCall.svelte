@@ -52,7 +52,8 @@
     sanitizeToolDisplayPayload,
   } from '../lib/tool-call-display';
   import type { ConversationPresentationRole } from '../lib/conversation-presentation';
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
+  import Disclosure from './Disclosure.svelte';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -102,6 +103,9 @@
   // 首次渲染后不再跟随状态更新，避免覆盖用户主动展开或收起的选择。
   let collapsed = $state(untrack(() => presentationRole !== 'artifact' && presentationRole !== 'attention'));
   let copySuccess = $state(false);
+  let copyRevision = $state(0);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
   let lastLoggedErrorSignature = $state('');
   let lastReportedAgentSpawnFailureSignature = $state('');
   let lastAutoExpandedApprovalId = $state('');
@@ -878,7 +882,9 @@
     try {
       await navigator.clipboard.writeText(content);
       copySuccess = true;
-      setTimeout(() => { copySuccess = false; }, 2000);
+      copyRevision += 1;
+      clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => { copySuccess = false; }, 2500);
     } catch (e) {
       console.error('复制失败:', e);
     }
@@ -1092,7 +1098,7 @@
         </div>
       {/if}
 
-      {#if canExpand && !collapsed}
+      <Disclosure expanded={canExpand && !collapsed}>
         <div class="tool-content" class:diagram-content={isDiagramTool} id={detailId}>
           {#if hasInput && !isDiagramTool}
             <div class="tool-section">
@@ -1145,8 +1151,8 @@
               {:else}
                 <div class="section-header">
                   <span class="section-label">{i18n.t('toolCall.section.output')}</span>
-                  <button class="copy-btn" onclick={copyOutput} title={copySuccess ? i18n.t('toolCall.copySuccess') : i18n.t('toolCall.copyOutput')}>
-                    <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
+                  <button class="copy-btn" class:copied={copySuccess} onclick={copyOutput} title={copySuccess ? i18n.t('toolCall.copySuccess') : i18n.t('toolCall.copyOutput')}>
+                    {#key copyRevision}<Icon name={copySuccess ? 'check' : 'copy'} size={12} />{/key}
                   </button>
                 </div>
                 {#if imagePreview}
@@ -1250,14 +1256,14 @@
           {/if}
 
         </div>
-      {/if}
+      </Disclosure>
     </div>
   {/if}
 {/if}
 
 <style>
   .tool-call {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     margin-top: var(--space-2);
     overflow: hidden;
@@ -1321,10 +1327,10 @@
     align-items: center;
     padding: 1px 6px;
     border-radius: 999px;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     font-size: 10px;
     line-height: 1.4;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     white-space: nowrap;
     flex-shrink: 0;
   }
@@ -1403,10 +1409,8 @@
 
   .tool-content {
     padding: var(--space-3);
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     background: var(--surface-2);
-    animation: slideDown 0.2s ease-out;
-    transform-origin: top;
   }
 
   .tool-content.diagram-content {
@@ -1414,10 +1418,6 @@
     background: var(--code-bg);
   }
 
-  @keyframes slideDown {
-    from { opacity: 0; max-height: 0; transform: translateY(-8px); }
-    to { opacity: 1; max-height: 500px; transform: translateY(0); }
-  }
 
   .tool-section { margin-top: var(--space-3); }
   .tool-section:first-child { margin-top: 0; }
@@ -1443,7 +1443,7 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-1);
   }
@@ -1495,6 +1495,11 @@
     color: var(--foreground);
   }
 
+  .copy-btn.copied :global(svg) {
+    animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
+      magi-feedback-fade 160ms 2340ms ease-out forwards;
+  }
+
   .section-content {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -1520,7 +1525,7 @@
     max-width: min(100%, 640px);
     max-height: 420px;
     object-fit: contain;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--code-bg);
   }
@@ -1617,7 +1622,7 @@
     gap: var(--space-3);
     padding: var(--space-3);
     margin-top: var(--space-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1);
     color: inherit;
@@ -1674,7 +1679,7 @@
 
   .agent-spawn-title {
     font-size: var(--text-sm);
-    font-weight: 500;
+    font-weight: var(--font-medium);
     color: var(--foreground);
     line-height: 1.45;
     white-space: normal;
@@ -1799,7 +1804,7 @@
     display: inline-block;
     margin-right: var(--space-1);
     padding: 0 var(--space-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 999px;
     font-size: 10px;
     line-height: 1.6;
@@ -1809,7 +1814,7 @@
     margin-top: 2px;
     color: var(--foreground);
     font-size: var(--text-sm);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     overflow-wrap: anywhere;
   }
 

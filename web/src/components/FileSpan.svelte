@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from './FileName.svelte';
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
   import type { FilePreviewScope } from '../lib/file-reference';
@@ -103,7 +104,7 @@
         <Icon name={fileIcon} size={14} />
       </span>
     {/if}
-    <span class="filespan-name">{filename}</span>
+    <span class="filespan-name"><FileName name={filename} /></span>
     {#if directory}
       <span class="filespan-dir">{directory}</span>
     {/if}
@@ -119,7 +120,7 @@
         <Icon name={fileIcon} size={14} />
       </span>
     {/if}
-    <span class="filespan-name">{filename}</span>
+    <span class="filespan-name"><FileName name={filename} /></span>
   </span>
 {/if}
 
@@ -156,6 +157,8 @@
   }
 
   .filespan-name {
+    display: flex;
+    min-width: 0;
     color: var(--info);
     white-space: nowrap;
     overflow: hidden;

@@ -10,6 +10,7 @@
   import { getAgentMessageItem } from '../web/agent-api';
   import { valueToDisplayText } from '../stores/turn-projection';
   import Icon from './Icon.svelte';
+  import Disclosure from './Disclosure.svelte';
   import ToolCall from './ToolCall.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { openAgentTab } from '../stores/right-pane.svelte';
@@ -59,7 +60,7 @@
     <span class="execution-steps-title"><Icon name="list" size={14} /> {i18n.t('executionSteps.title')}</span>
     <span class="execution-steps-count">{completed} / {snapshot.steps.length}<Icon name={expanded ? 'chevron-down' : 'chevron-right'} size={13} /></span>
   </button>
-  {#if expanded}
+  <Disclosure {expanded}>
     <ol>
       {#each snapshot.steps as step (step.stepId)}
         <li class:running={step.status === 'running'} class:completed={step.status === 'completed'} class:problem={step.status === 'blocked' || step.status === 'failed'}>
@@ -68,7 +69,7 @@
             <span class="step-copy"><span class="step-title">{step.title}</span>{#if step.reason}<span class="step-reason">{step.reason}</span>{/if}</span>
             <span class="step-status">{label(step.status)}</span>
           </button>
-          {#if selected[step.stepId]}
+          <Disclosure expanded={!!selected[step.stepId]}>
             <div class="step-details">
               {#if step.dependsOn.length}<div>{i18n.t('executionSteps.dependencies', { titles: step.dependsOn.map((id) => snapshot.steps.find((s) => s.stepId === id)?.title || id).join('、') })}</div>{/if}
               {#each step.taskIds as taskId (taskId)}<button type="button" class="agent-link" onclick={() => openAgentTab(sessionId, taskId)}>{i18n.t('executionSteps.agent')}</button>{/each}
@@ -78,17 +79,17 @@
               {/each}
               {#if loading === step.stepId}<span>{i18n.t('messageList.loadingOlder')}</span>{:else if error}<span>{error}</span>{:else if evidence(step.stepId).length === 0 && step.taskIds.length === 0}<span>{i18n.t('executionSteps.noEvidence')}</span>{/if}
             </div>
-          {/if}
+          </Disclosure>
         </li>
       {/each}
     </ol>
     {#if snapshot.explanation}<p class="step-reason">{snapshot.explanation}</p>{/if}
-  {/if}
+  </Disclosure>
 </section>
 <style>
-  .execution-steps { margin: 8px 0 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .execution-steps { margin: 8px 0 12px; padding: 10px 12px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; }
   .execution-steps-header { border:0; background:none; width:100%; padding:0; display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--foreground-muted); font-size:12px; cursor:pointer; text-align:left; }
-  .execution-steps-title { display:flex; gap:6px; align-items:center; color:var(--foreground); font-weight:600; }
+  .execution-steps-title { display:flex; gap:6px; align-items:center; color:var(--foreground); font-weight:var(--font-semibold); }
   .execution-steps-count { display:flex; align-items:center; gap:8px; font-variant-numeric:tabular-nums; }
   ol { list-style:none; padding:0; margin:10px 0 0; display:flex; flex-direction:column; gap:7px; }
   li { color:var(--foreground-muted); font-size:13px; line-height:1.45; }

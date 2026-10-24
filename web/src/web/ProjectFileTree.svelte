@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from '../components/FileName.svelte';
   import { onMount, untrack } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
@@ -290,7 +291,7 @@
       {:else}
         <FileTypeIcon path={entry.displayPath} size={14} />
       {/if}
-      <span class="file-tree-name">{entry.name}</span>
+      <span class="file-tree-name"><FileName name={entry.name} preserveExtension={!entry.isDirectory} /></span>
     </button>
 
     {#if entry.isDirectory && expanded}
@@ -386,6 +387,7 @@
   }
 
   .file-tree-name {
+    display: flex;
     flex: 1;
     min-width: 0;
     overflow: hidden;

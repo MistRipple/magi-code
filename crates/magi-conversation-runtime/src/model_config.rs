@@ -9,10 +9,10 @@
 //! [`MODEL_CONFIG_FIELDS`] 中的字段，未知字段一律拒绝。
 
 use magi_bridge_client::{
-    EndpointUrlMode, HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
+    HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
 };
 use magi_core::SessionId;
-use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
+use magi_usage_authority::{LlmConfig, ReasoningEffort};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -116,13 +116,6 @@ pub struct TextModelRule {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModelUrlMode {
-    Standard,
-    Full,
-    Proxy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelApiProtocol {
     OpenAiChat,
     OpenAiResponses,
@@ -172,24 +165,6 @@ impl ModelApiProtocol {
     }
 }
 
-impl ModelUrlMode {
-    fn from_label(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "full" => Self::Full,
-            "proxy" => Self::Proxy,
-            _ => Self::Standard,
-        }
-    }
-
-    fn to_usage_url_mode(self) -> UrlMode {
-        match self {
-            Self::Full => UrlMode::Full,
-            Self::Proxy => UrlMode::Proxy,
-            Self::Standard => UrlMode::Default,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelReasoningEffort {
     Low,
@@ -234,7 +209,6 @@ pub struct NormalizedModelConfig {
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
-    url_mode: ModelUrlMode,
     api_protocol: ModelApiProtocol,
     reasoning_effort: Option<ModelReasoningEffort>,
     context_window_tokens: Option<u64>,
@@ -255,9 +229,7 @@ impl NormalizedModelConfig {
     /// 防止运行时重新根据模型名或地址猜测协议。完全空的 section 仅用于表达“未配置”，
     /// 不会构造客户端。
     pub fn from_settings_value(value: &Value) -> Result<Self, String> {
-        let url_mode_label =
-            string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
-        let has_connection_fields = ["baseUrl", "apiKey", "model", "urlMode", "apiProtocol"]
+        let has_connection_fields = ["baseUrl", "apiKey", "model", "apiProtocol"]
             .iter()
             .any(|field| value.get(*field).is_some());
         let api_protocol = match string_field(value, "apiProtocol") {
@@ -268,13 +240,12 @@ impl NormalizedModelConfig {
             None if has_connection_fields => {
                 return Err("模型配置缺少 apiProtocol".to_string());
             }
-            None => ModelApiProtocol::OpenAiChat,
+            None => ModelApiProtocol::OpenAiResponses,
         };
         Ok(Self {
             base_url: string_field(value, "baseUrl"),
             api_key: string_field(value, "apiKey"),
             model: string_field(value, "model"),
-            url_mode: ModelUrlMode::from_label(&url_mode_label),
             api_protocol,
             reasoning_effort: value
                 .get("reasoningEffort")
@@ -349,16 +320,11 @@ impl NormalizedModelConfig {
         if model.is_empty() {
             return None;
         }
-        let url_mode = match self.url_mode {
-            ModelUrlMode::Full => EndpointUrlMode::Full,
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => EndpointUrlMode::Standard,
-        };
-        Some(HttpModelBridgeClient::new_with_protocol_and_url_mode(
+        Some(HttpModelBridgeClient::new_with_protocol(
             base_url,
             self.api_key.clone(),
             model.to_string(),
             protocol,
-            url_mode,
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
         ))
@@ -367,15 +333,10 @@ impl NormalizedModelConfig {
     pub fn to_http_image_generation_client(&self) -> Result<HttpImageGenerationClient, String> {
         let base_url = self.normalized_http_base_url()?;
         let model = self.require_model()?.to_string();
-        let url_mode = match self.url_mode {
-            ModelUrlMode::Full => EndpointUrlMode::Full,
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => EndpointUrlMode::Standard,
-        };
         Ok(HttpImageGenerationClient::new(
             base_url,
             self.api_key.clone(),
             model,
-            url_mode,
         ))
     }
 
@@ -391,7 +352,6 @@ impl NormalizedModelConfig {
             base_url: self.base_url.clone()?,
             api_key: self.api_key.clone(),
             account_fingerprint: None,
-            url_mode: self.url_mode.to_usage_url_mode(),
             reasoning_effort: self
                 .reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
@@ -399,19 +359,11 @@ impl NormalizedModelConfig {
     }
 
     pub fn models_list_url(&self) -> Result<String, String> {
-        self.require_models_listable()?;
         let normalized = self.normalized_http_base_url()?;
         if normalized.ends_with("/v1") {
             return Ok(format!("{normalized}/models"));
         }
         Ok(format!("{normalized}/v1/models"))
-    }
-
-    pub fn require_models_listable(&self) -> Result<(), String> {
-        if matches!(self.url_mode, ModelUrlMode::Full) {
-            return Err("完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string());
-        }
-        Ok(())
     }
 
     fn normalized_http_base_url(&self) -> Result<String, String> {
@@ -422,12 +374,7 @@ impl NormalizedModelConfig {
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             return Err("baseUrl 必须以 http:// 或 https:// 开头".to_string());
         }
-        match self.url_mode {
-            ModelUrlMode::Full => Ok(base_url.to_string()),
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => {
-                Ok(base_url.trim_end_matches('/').to_string())
-            }
-        }
+        Ok(base_url.trim_end_matches('/').to_string())
     }
 }
 
@@ -573,12 +520,56 @@ pub const MODEL_CONFIG_FIELDS: &[&str] = &[
     "baseUrl",
     "apiKey",
     "model",
-    "urlMode",
     "apiProtocol",
     "reasoningEffort",
     "contextWindowTokens",
     "textModelRules",
 ];
+
+/// 启动时移除已删除的完整路径字段，避免旧设置被投影回请求。
+pub fn canonicalize_model_settings(
+    store: &magi_settings_store::SettingsStore,
+) -> Result<(), std::io::Error> {
+    fn remove_legacy_path_field(config: &mut Value) {
+        if let Some(fields) = config.as_object_mut() {
+            fields.remove("urlMode");
+        }
+    }
+
+    let mut updates = Vec::new();
+    for (section, original) in store.snapshot() {
+        let mut config = original.clone();
+        match section.as_str() {
+            "orchestrator" | "auxiliary" | "vision" | "imageGeneration" => {
+                remove_legacy_path_field(&mut config);
+            }
+            "workers" => {
+                if let Some(workers) = config.as_object_mut() {
+                    for worker in workers.values_mut() {
+                        remove_legacy_path_field(worker);
+                    }
+                }
+            }
+            "engines" => {
+                if let Some(engines) = config.as_array_mut() {
+                    for engine in engines {
+                        if let Some(llm) = engine.get_mut("llm") {
+                            remove_legacy_path_field(llm);
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+        if config != original {
+            updates.push((section, config));
+        }
+    }
+    if !updates.is_empty() {
+        store.apply_section_changes(updates, Vec::new())?;
+    }
+    Ok(())
+}
 
 /// 模型配置写入入口的严格 schema 校验：只接受 [`MODEL_CONFIG_FIELDS`]。
 pub fn reject_unknown_model_config_fields(value: &Value) -> Result<(), String> {
@@ -1018,7 +1009,6 @@ mod tests {
             "baseUrl": "https://gateway.example.com/anthropic",
             "apiKey": "sk-test",
             "model": "claude-sonnet",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         }));
         assert_eq!(
@@ -1034,7 +1024,6 @@ mod tests {
             "baseUrl": "https://gateway.example.com",
             "apiKey": "sk-test",
             "model": "deepseek-chat",
-            "urlMode": "standard",
             "apiProtocol": "anthropic_messages"
         }));
         assert_eq!(
@@ -1050,7 +1039,6 @@ mod tests {
             "baseUrl": "https://api.openai.com",
             "apiKey": "sk-test",
             "model": "gpt-5",
-            "urlMode": "standard",
             "apiProtocol": "openai_responses"
         }));
 
@@ -1063,12 +1051,68 @@ mod tests {
     }
 
     #[test]
+    fn empty_model_config_defaults_to_responses_without_creating_a_client() {
+        let config = model_config(json!({}));
+        assert_eq!(
+            config.api_protocol(),
+            Some(HttpModelBridgeProtocol::Responses)
+        );
+        assert!(config.to_http_model_client().is_none());
+    }
+
+    #[test]
+    fn canonical_model_settings_cleanup_is_persistent_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let connection = json!({
+            "baseUrl": "https://gateway.example.com/v1",
+            "apiKey": "test-key",
+            "model": "test-model",
+            "apiProtocol": "openai_chat",
+            "urlMode": "full",
+            "unrelatedModelOption": "keep"
+        });
+        let store = magi_settings_store::SettingsStore::with_persistence_path(path.clone());
+        for section in ["orchestrator", "auxiliary", "vision", "imageGeneration"] {
+            store.set_section(section, connection.clone()).unwrap();
+        }
+        store
+            .set_section("workers", json!({"worker-1": connection}))
+            .unwrap();
+        store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "worker-1", "displayName": "Worker", "llm": connection
+                }]),
+            )
+            .unwrap();
+        store
+            .set_section("unrelated", json!({"keep": true}))
+            .unwrap();
+        canonicalize_model_settings(&store).unwrap();
+        let mut expected = connection;
+        expected.as_object_mut().unwrap().remove("urlMode");
+        let reloaded = magi_settings_store::SettingsStore::with_persistence_path(path);
+        reloaded.load_from_disk().unwrap();
+        for section in ["orchestrator", "auxiliary", "vision", "imageGeneration"] {
+            assert_eq!(reloaded.get_section(section), expected);
+        }
+        assert_eq!(reloaded.get_section("workers")["worker-1"], expected);
+        assert_eq!(reloaded.get_section("engines")[0]["llm"], expected);
+        assert_eq!(reloaded.get_section("engines")[0]["displayName"], "Worker");
+        assert_eq!(reloaded.get_section("unrelated"), json!({"keep": true}));
+        let revision = reloaded.revision();
+        canonicalize_model_settings(&reloaded).unwrap();
+        assert_eq!(reloaded.revision(), revision, "规范配置不应重复写盘");
+    }
+
+    #[test]
     fn configured_model_requires_explicit_api_protocol() {
         let error = NormalizedModelConfig::from_settings_value(&json!({
             "baseUrl": "https://gateway.example.com",
             "apiKey": "sk-test",
             "model": "kiro-claude-sonnet-4-6",
-            "urlMode": "standard"
         }))
         .expect_err("已配置连接不得缺少 apiProtocol");
 
@@ -1126,7 +1170,6 @@ mod tests {
             "baseUrl": "https://api.deepseek.com/v1",
             "apiKey": "sk-test",
             "model": "deepseek-chat",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
             "unexpected": "value"
         });
@@ -1142,7 +1185,6 @@ mod tests {
             "baseUrl": "https://api.deepseek.com/v1",
             "apiKey": "sk-test",
             "model": "deepseek-chat",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
             "reasoningEffort": "high",
             "contextWindowTokens": 128000,
@@ -1156,7 +1198,6 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "http://127.0.0.1:8320/v1",
             "apiKey": "test-key",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         }));
 
@@ -1166,9 +1207,6 @@ mod tests {
             "http://127.0.0.1:8320/v1"
         );
         assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
-        config
-            .require_models_listable()
-            .expect("standard url mode can list models");
         assert_eq!(
             config.models_list_url().expect("models url"),
             "http://127.0.0.1:8320/v1/models"
@@ -1180,7 +1218,6 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "https://api.anthropic.com",
             "apiKey": "test-key",
-            "urlMode": "standard",
             "apiProtocol": "anthropic_messages"
         }));
 
@@ -1188,9 +1225,6 @@ mod tests {
             config.api_protocol(),
             Some(HttpModelBridgeProtocol::AnthropicMessages)
         );
-        config
-            .require_models_listable()
-            .expect("standard url mode should list OpenAI-compatible models");
         assert_eq!(
             config.models_list_url().expect("models url"),
             "https://api.anthropic.com/v1/models"
@@ -1198,33 +1232,16 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_rejects_models_listing() {
-        let config = model_config(json!({
-            "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
-            "apiKey": "test-key",
-            "urlMode": "full",
-            "apiProtocol": "openai_chat"
-        }));
-
-        let error = config
-            .models_list_url()
-            .expect_err("full path has no canonical models endpoint");
-        assert!(error.contains("完整路径模式下不支持自动获取模型列表"));
-    }
-
-    #[test]
     fn usage_llm_config_derives_provider_from_api_protocol() {
         let config = model_config(json!({
             "baseUrl": "https://example.test/v1",
             "model": "gpt-test",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         }));
 
         let usage = config.to_usage_llm_config().expect("usage config");
         assert_eq!(usage.provider, "openai");
         assert_eq!(usage.model, "gpt-test");
-        assert_eq!(usage.url_mode, UrlMode::Default);
     }
 
     #[test]
@@ -1233,7 +1250,6 @@ mod tests {
             "baseUrl": "https://api.deepseek.com/v1",
             "apiKey": "test-key",
             "model": "deepseek-chat",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         }));
 
@@ -1250,24 +1266,6 @@ mod tests {
             "baseUrl": "https://api.anthropic.com",
             "apiKey": "test-key",
             "model": "claude-sonnet",
-            "urlMode": "standard",
-            "apiProtocol": "anthropic_messages"
-        }));
-
-        assert!(config.to_http_model_client().is_some());
-        assert_eq!(
-            config.api_protocol(),
-            Some(HttpModelBridgeProtocol::AnthropicMessages)
-        );
-    }
-
-    #[test]
-    fn full_mode_does_not_override_explicit_protocol() {
-        let config = model_config(json!({
-            "baseUrl": "https://openai-compatible.example.com/v1/chat/completions",
-            "apiKey": "test-key",
-            "model": "claude-sonnet",
-            "urlMode": "full",
             "apiProtocol": "anthropic_messages"
         }));
 
@@ -1344,7 +1342,6 @@ mod tests {
                     "baseUrl": "https://vision.example.com/v1",
                     "apiKey": "test-key",
                     "model": "vision-model",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                     "contextWindowTokens": 256000,
                     "textModelRules": []
@@ -1377,7 +1374,6 @@ mod tests {
             "baseUrl": "https://vision.example.com/v1",
             "apiKey": "test-key",
             "model": "vision-model",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
             "contextWindowTokens": 128000,
             "textModelRules": [{"matchMode": "regex", "pattern": "("}]
@@ -1388,7 +1384,6 @@ mod tests {
             "baseUrl": "https://vision.example.com/v1",
             "apiKey": "test-key",
             "model": "vision-model",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
             "contextWindowTokens": 1000
         });
@@ -1426,7 +1421,6 @@ mod tests {
                         "baseUrl": "https://api.example.com/v1",
                         "apiKey": "sk-role",
                         "model": "role-sonnet",
-                        "urlMode": "standard",
                         "apiProtocol": "openai_chat",
                         "reasoningEffort": "high"
                     }

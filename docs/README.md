@@ -16,6 +16,7 @@
 - 前端以现有产品方案为基线，不发散成新的 UI 产品方向
 - UI 层可以继续完善产品表达，但不能反向定义后端协议
 - 禁止长期双实现、回退逻辑与补丁式兼容分支
+- HTTP 模型连接统一填写 API 基础地址，由显式 `apiProtocol` 生成标准端点；仅提供 OpenAI Responses（新配置默认）、OpenAI Chat Completions 与 Anthropic Messages。已有配置保留所选协议，启动时移除废弃的路径模式字段。GPT Web 与插件引擎继续使用各自的非 HTTP 入口。
 - JS 构建要求 Node.js >=24.22.1。Electron 45、Desktop Main 和 Browser Automation Worker 均以 Electron 内置 Node 24 为运行目标；Web 使用 Vite 8/Rolldown 与 Oxc；TypeScript 统一使用 6.x，因为当前 svelte-check 4.x 的正式检查合同仍不支持直接切换 TypeScript 7。
 - Rust HTTP 使用 reqwest 0.13 默认的 Rustls、系统证书验证与系统代理。摘要和快照依赖升级保持已有 SHA-256 十六进制标识及 zstd 存储格式兼容，不要求迁移用户数据。
 

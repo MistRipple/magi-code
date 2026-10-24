@@ -148,7 +148,7 @@
     gap: 5px;
     height: 24px;
     padding: 0 8px;
-    border: 1px solid var(--border-subtle);
+    border: 0;
     border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--surface-1) 88%, transparent);
     color: var(--foreground-muted);
@@ -186,10 +186,10 @@
     z-index: 34;
     width: 200px;
     padding: 6px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border: 0;
+    border-radius: calc(var(--radius-sm) + 6px);
     background: var(--dropdown-bg);
-    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 36px rgba(0, 0, 0, 0.32);
   }
 
   .session-isolation-heading {

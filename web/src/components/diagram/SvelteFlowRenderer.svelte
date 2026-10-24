@@ -108,7 +108,7 @@
         'min-width: 132px',
         'max-width: 220px',
         'padding: 8px 12px',
-        'border: 1px solid var(--primary)',
+        'border: var(--magi-hairline) solid var(--primary)',
         'border-radius: 6px',
         'background: var(--surface-2)',
         'color: var(--foreground)',

@@ -17,7 +17,6 @@ fn make_llm_config() -> LlmConfig {
         base_url: "https://api.anthropic.com/v1".to_string(),
         api_key: Some("sk-test-key-12345".to_string()),
         account_fingerprint: None,
-        url_mode: UrlMode::Default,
         reasoning_effort: None,
     }
 }

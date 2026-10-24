@@ -684,7 +684,7 @@ fn build_client_from_section(
 /// 构造业务主对话（orchestrator）的 client。
 ///
 /// 主对话采用「全局连接 base + 会话级模型覆盖」两层模型：
-/// - 全局 `orchestrator` 段是权威连接 base，只承载 baseUrl / apiKey / urlMode；
+/// - 全局 `orchestrator` 段是权威连接 base，只承载 baseUrl / apiKey / apiProtocol；
 /// - 会话级 `orchestrator` 覆盖段只携带 `model` 与 `reasoningEffort` 两个字段，
 ///   在解析时叠加到全局 base 之上，使各会话能独立切换主模型与思考强度而互不污染。
 ///
@@ -4431,7 +4431,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": format!("http://{address}/v1"),
                     "model": "auxiliary-enrichment-test",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
             )
@@ -7030,7 +7029,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),
             )
@@ -7051,7 +7049,6 @@ mod tests {
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-orch",
             "model": "global-default-model",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
             "reasoningEffort": "medium",
         });
@@ -7088,7 +7085,6 @@ mod tests {
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-orch",
             "model": "global-default-model",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat",
         });
         let override_section = serde_json::json!({
@@ -7153,7 +7149,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),
             )
@@ -7188,7 +7183,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),
             )
@@ -7230,7 +7224,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),
             )
@@ -7391,7 +7384,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-old",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                 }),
             )

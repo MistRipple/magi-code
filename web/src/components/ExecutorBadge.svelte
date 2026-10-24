@@ -97,9 +97,9 @@
     padding: 2px 8px;
     border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--executor-color) 15%, transparent);
-    border: 1px solid color-mix(in srgb, var(--executor-color) 30%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--executor-color) 30%, transparent);
     font-size: var(--text-xs);
-    font-weight: 500;
+    font-weight: var(--font-medium);
     white-space: nowrap;
   }
 

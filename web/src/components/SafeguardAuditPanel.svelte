@@ -41,7 +41,8 @@
 
   onMount(() => { void load(); });
 
-  async function remove(selection: { eventIds: string[] } | { all: true }): Promise<void> {
+  async function remove(selection: { eventIds: string[] } | { all: true }, anchor?: HTMLElement): Promise<void> {
+    if (anchor && !(await confirmMessage(i18n.t('overlay.deleteAuditBody'), { title: i18n.t('settings.safeguard.audit.delete'), confirmLabel: i18n.t('settings.safeguard.audit.delete'), tone: 'danger', anchor }))) return;
     deleting = true;
     try {
       const result = await deleteSafeguardAudit(selection);
@@ -62,7 +63,7 @@
   }
 
   async function clearAll(): Promise<void> {
-    if (!(await confirmMessage(i18n.t('settings.safeguard.audit.clearConfirm', { count: total }), { tone: 'danger' }))) {
+    if (!(await confirmMessage(i18n.t('settings.safeguard.audit.clearConfirm', { count: total }), { tone: 'danger', confirmLabel: i18n.t('settings.safeguard.audit.clearAll') }))) {
       return;
     }
     await remove({ all: true });
@@ -138,7 +139,7 @@
               title={i18n.t('settings.safeguard.audit.delete')}
               aria-label={i18n.t('settings.safeguard.audit.delete')}
               disabled={deleting}
-              onclick={() => void remove({ eventIds: [entry.eventId] })}
+              onclick={(event) => void remove({ eventIds: [entry.eventId] }, event.currentTarget)}
             ><Icon name="delete" size={12} /></button>
           </div>
           <div class="audit-rules">
@@ -170,16 +171,16 @@
 
 <style>
   .audit-panel { display: flex; flex-direction: column; gap: var(--space-3); }
-  .audit-warning { padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; color: var(--danger); font-size: var(--text-xs); }
+  .audit-warning { padding: 8px 10px; border: var(--magi-hairline) solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; color: var(--danger); font-size: var(--text-xs); }
   .audit-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
   .audit-toolbar-actions { display: flex; gap: var(--space-2); }
   .audit-count { color: var(--foreground-muted); font-size: var(--text-xs); }
   .audit-error { margin: 0; color: var(--danger); font-size: var(--text-sm); }
   .audit-empty, .audit-status { padding: var(--space-6) 0; margin: 0; text-align: center; color: var(--foreground-muted); font-size: var(--text-sm); }
   .audit-more { display: flex; justify-content: center; }
-  .audit-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
+  .audit-list { list-style: none; margin: 0; padding: 0; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
   .audit-item { padding: var(--space-2) var(--space-3); display: flex; flex-direction: column; gap: 4px; }
-  .audit-item + .audit-item { border-top: 1px solid var(--border-subtle, var(--border)); }
+  .audit-item + .audit-item { border-top: var(--magi-hairline) solid var(--border-subtle, var(--border)); }
   .audit-item-head { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
   .audit-decision { flex-shrink: 0; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: color-mix(in srgb, var(--foreground) 10%, transparent); }
   .audit-decision[data-decision='hard_block'] { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }

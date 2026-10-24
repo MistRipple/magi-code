@@ -108,7 +108,7 @@
     copyResetTimer = setTimeout(() => {
       copied = false;
       copyResetTimer = null;
-    }, 1500);
+    }, 2500);
   }
 
   onDestroy(() => {
@@ -124,7 +124,7 @@
     </span>
     <button
       type="button"
-      class="model-failure-copy"
+      class="model-failure-copy" class:copied data-copy-feedback={copied}
       onclick={() => void copyFailure()}
       title={copied
         ? i18n.t('messageItem.modelFailure.copied')
@@ -180,7 +180,7 @@
     max-width: none;
     box-sizing: border-box;
     padding: var(--space-3) var(--space-4);
-    border: 1px solid color-mix(in srgb, var(--error) 42%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 42%, var(--border));
     border-left: 3px solid var(--error);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--error) 7%, var(--surface));
@@ -271,7 +271,7 @@
 
   .model-failure-action {
     padding: 4px 12px;
-    border: 1px solid color-mix(in srgb, var(--error) 42%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 42%, var(--border));
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground);

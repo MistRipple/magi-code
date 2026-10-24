@@ -679,7 +679,8 @@
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
-  const showScrollBtn = $derived(!shouldAutoScroll && safeRenderMessages.length > 0);
+  let distanceToBottom = $state(0);
+  const showScrollBtn = $derived(!shouldAutoScroll && distanceToBottom > 120 && safeRenderMessages.length > 0);
   let wasActive = $state(false);
   let lastObservedScrollTop = 0;
   let activationRestoreNonce = 0;
@@ -709,6 +710,11 @@
   let destroyed = false;
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
+
+  function updateBottomDistance(): void {
+    if (!containerRef) return;
+    distanceToBottom = Math.max(0, containerRef.scrollHeight - containerRef.scrollTop - containerRef.clientHeight);
+  }
 
   function currentHistoryLoadScopeKey(): string {
     const workspaceId = (messagesState.currentWorkspaceId || '').trim();
@@ -798,6 +804,7 @@
       || observationRecoveryEpoch !== scrollRecoveryEpoch
       || !containerRef
     ) return;
+    updateBottomDistance();
     if (shouldAutoScroll) {
       scrollPanelToBottom();
       return;
@@ -854,6 +861,7 @@
         );
       });
     });
+    contentResizeObserver.observe(containerRef);
     for (const element of containerRef.querySelectorAll<HTMLElement>(
       '[data-message-id], [data-layout-observation]',
     )) {
@@ -930,6 +938,7 @@
       containerRef.scrollTop,
     );
     lastObservedScrollTop = containerRef.scrollTop;
+    updateBottomDistance();
   }
 
   function captureVisibleAnchor() {
@@ -1492,6 +1501,8 @@
       contentResizeFrame = 0;
     }
     cancelScheduledScrollStateSync();
+    // 在原生滚动生效前撤销跟随，避免同一帧的新 token 抢先写回底部。
+    updatePanelScrollState(panelKey, { autoScrollEnabled: false }, { persist: false });
   }
 
   function canNestedScrollerConsumeWheel(target: EventTarget | null, deltaY: number): boolean {
@@ -1528,6 +1539,8 @@
   }
 
   function handleKeydownIntent(event: KeyboardEvent): void {
+    if (event.defaultPrevented || (event.target instanceof Element
+      && event.target.closest('button, a, input, textarea, select, [contenteditable="true"]'))) return;
     const scrollingUp = event.key === 'ArrowUp'
       || event.key === 'PageUp'
       || event.key === 'Home'
@@ -1552,6 +1565,10 @@
     const onPointerDown = (event: PointerEvent) => {
       if (event.isPrimary === false) return;
       pointerStart = { x: event.clientX, y: event.clientY, pointerType: event.pointerType };
+      const rect = node.getBoundingClientRect();
+      if (event.pointerType === 'mouse' && (event.clientX >= rect.left + node.clientWidth || event.clientX < rect.left)) {
+        cancelScrollRecoveryForUserIntent();
+      }
       if (!isInteractiveTarget(event.target)) {
         node.focus({ preventScroll: true });
       }
@@ -1621,7 +1638,8 @@
     if (target !== containerRef) return;
     const { scrollTop, scrollHeight, clientHeight } = target;
     const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-    const isNearBottom = distanceFromBottom < 100;
+    distanceToBottom = Math.max(0, distanceFromBottom);
+    const isNearBottom = distanceFromBottom <= 40;
     const scrollScopeKey = currentScrollScopeKey();
     const hadPendingProgrammaticScroll = scrollCoordinator.isPendingFor(
       scrollInteractionEpoch,
@@ -1653,7 +1671,7 @@
       nextAutoScroll = false;
     } else if (userScrollDirection === 'up') {
       nextAutoScroll = false;
-    } else if (isNearBottom) {
+    } else if (isNearBottom && userScrollDirection === 'down') {
       nextAutoScroll = true;
     }
     lastObservedScrollTop = scrollTop;
@@ -1869,7 +1887,7 @@
 
   <!-- 滚动按钮：绝对定位在消息列表右下角 -->
   {#if showScrollBtn}
-    <button class="scroll-to-bottom floating-overlay-control" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')}>
+    <button class="scroll-to-bottom floating-overlay-control" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')} aria-label={i18n.t('messageList.scrollToBottom')}>
       <Icon name="chevron-down" size={16} />
     </button>
   {/if}
@@ -1978,7 +1996,7 @@
     gap: 6px;
     min-height: 30px;
     padding: 0 var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-full);
     background: transparent;
     color: var(--foreground);
@@ -1999,7 +2017,7 @@
   .plugin-home-card {
     flex: 1 1 320px;
     min-width: 0;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg, 12px);
     overflow: hidden;
     background: var(--surface-1);
@@ -2011,13 +2029,13 @@
     justify-content: space-between;
     gap: var(--space-2);
     padding: 6px var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     font-size: var(--text-xs);
   }
 
   .plugin-home-card-title {
     color: var(--foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .plugin-home-card-open {
@@ -2108,7 +2126,7 @@
     gap: var(--space-3);
     min-height: 68px;
     padding: var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1, rgba(255,255,255,0.02));
     color: var(--foreground);
@@ -2203,7 +2221,7 @@
     min-height: 32px;
     margin-top: var(--space-4);
     padding: 0 var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-2);
     color: var(--foreground);

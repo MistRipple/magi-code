@@ -6,6 +6,8 @@
 
   /* Tab 内容区域 */
   .settings-tab-content {
+    container-type: inline-size;
+    container-name: settings-content;
     flex: 1;
     min-height: 0;
     overflow: hidden;
@@ -73,94 +75,19 @@
   }
   .apple-scroller-proxy::-webkit-scrollbar { width: 0; }
   
-  /* Apple 风格卡片/面板 */
-  .apple-glass-panel {
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(var(--foreground-rgb), 0.3);
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
-      0 2px 8px rgba(0,0,0,0.1);
-    border-radius: 12px;
-    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
-  }
-  .apple-glass-panel:hover {
-    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
-  }
-
-
-  .apple-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 12px;
-    padding-bottom: 6px;
-  }
-
-  .apple-dashboard-bar {
-    flex-wrap: wrap;
-    gap: var(--space-3);
-  }
-
+  /* Quiet shared surfaces; colour layers come from the selected theme. */
+  .apple-glass-panel,
   .apple-tile {
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(var(--foreground-rgb), 0.3);
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
-      0 2px 8px rgba(0,0,0,0.1);
+    background: transparent;
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
     border-radius: 12px;
-    padding: 10px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    box-sizing: border-box;
-    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+    transition: background var(--transition-fast);
   }
+  .apple-tile { padding: 10px 14px; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box; }
+  .apple-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; padding-bottom: 6px; }
+  .apple-dashboard-bar { flex-wrap: wrap; gap: var(--space-3); }
 
-  .apple-tile:hover {
-    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
-  }
-
-  body.theme-dark .apple-glass-panel,
-  body.vscode-dark .apple-glass-panel,
-  :root.theme-dark .apple-glass-panel {
-    background: color-mix(in srgb, var(--background) 92%, var(--surface-2) 8%);
-    border-color: color-mix(in srgb, var(--border) 78%, var(--foreground) 22%);
-    box-shadow:
-      inset 0 0 0 1px color-mix(in srgb, var(--surface-3) 72%, transparent),
-      0 2px 8px rgba(0,0,0,0.05);
-  }
-
-  body.theme-dark .apple-glass-panel:hover,
-  body.vscode-dark .apple-glass-panel:hover,
-  :root.theme-dark .apple-glass-panel:hover {
-    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
-    background: color-mix(in srgb, var(--background) 96%, var(--surface-hover) 4%);
-  }
-
-  body.theme-dark .apple-tile,
-  body.vscode-dark .apple-tile,
-  :root.theme-dark .apple-tile {
-    background: color-mix(in srgb, var(--background) 92%, var(--surface-2) 8%);
-    border-color: color-mix(in srgb, var(--border) 72%, var(--foreground) 28%);
-    box-shadow:
-      inset 0 0 0 1px color-mix(in srgb, var(--surface-3) 72%, transparent),
-      0 2px 8px rgba(0,0,0,0.05);
-  }
-
-  body.theme-dark .apple-tile:hover,
-  body.vscode-dark .apple-tile:hover,
-  :root.theme-dark .apple-tile:hover {
-    border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
-    background: color-mix(in srgb, var(--background) 96%, var(--surface-hover) 4%);
-  }
-  
   .tile-row {
     display: flex;
     align-items: center;
@@ -251,7 +178,7 @@
   }
   .settings-section-title {
     font-size: 14px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1.4;
     color: var(--foreground);
   }
@@ -289,11 +216,12 @@
      与工具、模型、代理页同一套材质：淡灰底、1px 边框、8~10px 圆角；按钮用全局 .btn，输入框用 .form-input。
      ------------------------------------------ */
   .settings-card {
-    border: 1px solid var(--border);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
     border-radius: 10px;
     overflow: hidden;
   }
-  .settings-card--accent { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+  .settings-card--accent { box-shadow: inset 0 0 0 var(--magi-hairline) color-mix(in srgb, var(--primary) 55%, var(--border)); }
   .settings-card-head { display: flex; align-items: flex-start; gap: var(--space-3); padding: var(--space-3) var(--space-3) var(--space-2); }
   .settings-card-body { display: grid; gap: var(--space-3); padding: 0 var(--space-3) var(--space-3); }
   .settings-card-foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); }
@@ -309,14 +237,15 @@
   .settings-rows {
     margin-top: var(--space-2);
     padding: 0 14px;
-    border: 1px solid var(--border);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
     border-radius: 10px;
   }
   .settings-row {
     display: flex; align-items: center; gap: var(--space-3); min-height: 52px;
     padding: var(--space-2) 0; box-sizing: border-box;
   }
-  .settings-row + .settings-row { border-top: 1px solid var(--border-subtle); }
+  .settings-row + .settings-row { border-top: var(--magi-hairline) solid var(--border-subtle); }
   .settings-row--stacked { flex-direction: column; align-items: stretch; }
   .settings-row-copy { min-width: 0; flex: 1; display: grid; gap: 3px; }
   .settings-row-title { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
@@ -331,7 +260,7 @@
     display: flex;
     gap: var(--space-4);
     margin-bottom: 4px;
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }
   .settings-subtab {
     padding: 8px 2px;
@@ -362,7 +291,7 @@
 
   .settings-chip {
     display: inline-flex; align-items: center; min-height: 18px; padding: 0 var(--space-2);
-    border: 1px solid var(--border); border-radius: 999px; background: transparent;
+    border: 0; border-radius: 999px; background: var(--surface-2);
     font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; font-weight: var(--font-normal, 400);
   }
   .settings-chip--ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
@@ -406,10 +335,6 @@
     width: 100%;
   }
   .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); align-items: flex-start; }
-  .toggle-switch { width: 32px; height: 18px; background: var(--secondary); border-radius: var(--radius-full); position: relative; transition: background var(--transition-fast); cursor: pointer; flex-shrink: 0; }
-  .toggle-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--primary-foreground); border-radius: var(--radius-full); transition: transform var(--transition-fast); }
-  .toggle-switch.active { background: var(--primary); }
-  .toggle-switch.active::after { transform: translateX(14px); }
 
   /* Profile 编辑器 - 公共部分（组件特有部分在 scoped 中）*/
   .profile-field-header { display: flex; justify-content: space-between; align-items: center; }
@@ -421,7 +346,7 @@
   .profile-add-btn { display: flex; align-items: center; justify-content: center; width: var(--btn-height-xs); height: var(--btn-height-xs); padding: 0; background: var(--primary); border: none; border-radius: var(--radius-sm); color: var(--primary-foreground); cursor: pointer; transition: all var(--transition-fast); }
   .profile-add-btn:hover { background: var(--primary-hover); }
 
-  .profile-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); min-height: var(--btn-height-lg); padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .profile-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); min-height: var(--btn-height-lg); padding: var(--space-3); background: var(--surface-2); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); }
   .profile-tag { display: inline-flex; align-items: center; gap: var(--space-2); height: var(--btn-height-xs); padding: 0 var(--space-3); font-size: var(--text-sm); background: var(--primary); border-radius: var(--radius-full); color: var(--primary-foreground); }
   .profile-tag-remove { display: flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; background: color-mix(in srgb, var(--primary-foreground) 18%, transparent); border: none; border-radius: var(--radius-full); color: var(--primary-foreground); cursor: pointer; transition: background var(--transition-fast); }
   .profile-tag-remove:hover { background: color-mix(in srgb, var(--primary-foreground) 30%, transparent); }
@@ -435,7 +360,7 @@
     margin-top: 5px;
     padding: var(--space-3) var(--space-4);
     background: var(--surface-1);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
   }
   .profile-save-hint {
@@ -450,7 +375,7 @@
 
   /* Skill 操作按钮 */
   .skill-actions .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error); color: var(--error); }
-  .skill-actions .btn-icon:not(.btn-icon--danger) { background: transparent; border: 1px solid var(--border); color: var(--foreground-muted); }
+  .skill-actions .btn-icon:not(.btn-icon--danger) { background: transparent; border: 0; color: var(--foreground-muted); }
   .skill-actions .btn-icon:not(.btn-icon--danger):hover:not(:disabled) { background: var(--primary-muted); border-color: var(--primary); color: var(--primary); }
   .skill-actions .btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -512,7 +437,6 @@
     .llm-config-field-row,
     .llm-config-field-row.has-thinking,
     .llm-config-field-row.has-thinking.has-level,
-    .llm-config-field-row.url-mode-row,
     .profile-categories-grid,
     .profile-two-columns,
     .profile-guidance-columns {
@@ -530,7 +454,7 @@
   .engine-list { display: flex; flex-direction: column; gap: var(--space-2); }
   .engine-card {
     display: flex; flex-direction: column; gap: var(--space-2);
-    padding: var(--space-3); border: 1px solid var(--border);
+    padding: var(--space-3); border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md); background: var(--surface);
     transition: border-color var(--transition-fast);
   }
@@ -538,14 +462,14 @@
   .engine-card.disabled { opacity: 0.55; }
   .engine-card-header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
   .engine-card-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .engine-card-name { font-size: var(--text-sm); font-weight: 500; color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .engine-card-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .engine-card-meta { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .engine-ref-count { margin-left: var(--space-2); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: 10px; }
   .engine-card-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
   .engine-card-toggle { display: flex; align-items: center; }
   .engine-select {
     height: var(--btn-height-sm); padding: 0 var(--space-2); font-size: var(--text-xs);
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm);
     color: var(--foreground); cursor: pointer; min-width: 100px; max-width: 160px;
   }
 
@@ -554,13 +478,20 @@
   .role-template-item {
     display: flex; justify-content: space-between; align-items: center;
     gap: var(--space-3); padding: var(--space-3);
-    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm);
     background: var(--surface); cursor: pointer; text-align: left; width: 100%;
     transition: background var(--transition-fast), border-color var(--transition-fast);
   }
   .role-template-item:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--primary); }
   .role-template-item:disabled { opacity: 0.45; cursor: not-allowed; }
   .role-template-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .role-template-item-name { font-size: var(--text-sm); font-weight: 500; color: var(--foreground); }
+  .role-template-item-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
   .role-template-item-desc { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .role-template-item-badge { font-size: 10px; padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
+
+  /* Nested rows share their parent edge. */
+  .settings-card .settings-rows { box-shadow: none; }
+  .settings-row-desc, .settings-section-desc, .settings-hint { text-wrap: pretty; }
+
+/* hidden 的内容页列表保活，但不参与布局或可访问性树。 */
+.settings-frame[hidden] { display: none; }

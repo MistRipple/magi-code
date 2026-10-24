@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
+  import Disclosure from './Disclosure.svelte';
   import {
     getNotifications,
     getUnreadNotificationCount,
@@ -87,17 +89,23 @@
     onOpenChange(false);
   }
 
-  function handleClearAll() {
+  async function handleClearAll() {
     if (!messagesState.bootstrapped || !hasNotificationContext) {
       return;
     }
+    const scope = `${messagesState.currentWorkspaceId}:${messagesState.currentSessionId}`;
+    if (!(await confirmMessage(i18n.t('overlay.clearIncidentsBody'), { title: i18n.t('notification.clearAll'), confirmLabel: i18n.t('notification.clearAll'), tone: 'danger' }))) return;
+    if (scope !== `${messagesState.currentWorkspaceId}:${messagesState.currentSessionId}`) return;
     clearAllNotifications();
   }
 
-  function handleRemove(id: string) {
+  async function handleRemove(id: string, anchor: HTMLElement) {
     if (!messagesState.bootstrapped || !hasNotificationContext) {
       return;
     }
+    const scope = `${messagesState.currentWorkspaceId}:${messagesState.currentSessionId}`;
+    if (!(await confirmMessage(i18n.t('overlay.deleteIncidentBody'), { title: i18n.t('notification.removeTitle'), confirmLabel: i18n.t('notification.removeTitle'), tone: 'danger', anchor }))) return;
+    if (scope !== `${messagesState.currentWorkspaceId}:${messagesState.currentSessionId}`) return;
     removeNotification(id);
   }
 
@@ -277,7 +285,7 @@
                     {formatTime(notif.timestamp)}
                   </span>
                 </div>
-                {#if expandedNotificationIds.has(notif.id)}
+                <Disclosure expanded={expandedNotificationIds.has(notif.id)}>
                   <div class="notif-details">
                     {#if notif.detail && notif.detail !== notif.message}
                       <pre>{notif.detail}</pre>
@@ -300,7 +308,7 @@
                       {/if}
                     </dl>
                   </div>
-                {/if}
+                </Disclosure>
               </div>
               <div class="notif-actions">
                 {#if hasDiagnosticDetails(notif)}
@@ -334,7 +342,7 @@
                 {/if}
                 <button
                   class="notif-action"
-                  onclick={() => handleRemove(notif.id)}
+                  onclick={(event) => void handleRemove(notif.id, event.currentTarget)}
                   title={i18n.t('notification.removeTitle')}
                   disabled={notificationStatus.isLoading}
                 >
@@ -359,7 +367,7 @@
     width: min(440px, calc(100vw - 24px));
     max-height: min(560px, calc(100vh - 24px));
     background: var(--dropdown-bg);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md, 6px);
     box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.3));
     z-index: var(--z-popover);
@@ -373,7 +381,7 @@
     justify-content: space-between;
     align-items: center;
     padding: var(--space-3, 8px) var(--space-4, 12px);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     flex-shrink: 0;
   }
 
@@ -396,12 +404,12 @@
     align-items: center;
     gap: var(--space-2, 4px);
     padding: var(--space-2, 6px) var(--space-3, 8px);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     flex-shrink: 0;
   }
 
   .filter-btn {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--surface-2);
     color: var(--foreground-muted);
     border-radius: 999px;
@@ -472,7 +480,7 @@
     padding: var(--space-2, 6px) var(--space-4, 12px);
     color: var(--error);
     font-size: var(--text-xs, 11px);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
 
   .spin {
@@ -540,7 +548,7 @@
   .notif-details {
     margin-top: var(--space-3, 8px);
     padding-top: var(--space-3, 8px);
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
   }
 
   .notif-details pre {
@@ -592,7 +600,7 @@
   .notif-count {
     font-size: 10px;
     color: var(--foreground-muted);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm, 4px);
     padding: 1px 6px;
   }

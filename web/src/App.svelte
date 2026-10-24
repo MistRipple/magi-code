@@ -501,7 +501,7 @@
 
   .bootstrap-title {
     font-size: 15px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     color: var(--foreground, #ccc);
     margin: 0;
   }

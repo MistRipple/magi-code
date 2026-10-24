@@ -1,4 +1,6 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import { onMount } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -29,6 +31,9 @@
   let saving = $state(false);
   let error = $state('');
   let status = $state('');
+  let baseline = '';
+  const draftKey = $derived(`plugin-settings:${pluginId}:${scope}`);
+  $effect(() => { if (!loading && baseline) saveViewDraft(draftKey, baseline, value, 'memory'); });
 
   const properties = $derived.by<SchemaProperty[]>(() => {
     const schema = manifest.settingsSchema;
@@ -116,6 +121,8 @@
       value = resource.value && typeof resource.value === 'object' && !Array.isArray(resource.value)
         ? { ...initialValue(), ...(resource.value as Record<string, unknown>) }
         : initialValue();
+      baseline = JSON.stringify({ version, value });
+      value = loadViewDraft(draftKey, baseline, value, 'memory');
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -131,6 +138,8 @@
     try {
       const resource = await writePluginSettings(pluginId, scope, version, value) as { version?: unknown; value?: unknown };
       version = typeof resource.version === 'number' ? resource.version : version + 1;
+      baseline = JSON.stringify({ version, value });
+      clearViewDraft(draftKey);
       status = i18n.t('settings.plugins.settings.saved');
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -164,14 +173,10 @@
             <span>{i18n.t('settings.plugins.settings.enabled')}</span>
           </label>
         {:else if property.enumValues.length > 0}
-          <select
-            class="form-input"
-            id={`plugin-setting-${pluginId}-${property.key}`}
+          <SelectField id={`plugin-setting-${pluginId}-${property.key}`}
             value={String(value[property.key] ?? property.enumValues[0] ?? '')}
-            onchange={(event) => updateValue(property, event.currentTarget.value)}
-          >
-            {#each property.enumValues as option (option)}<option value={option}>{option}</option>{/each}
-          </select>
+            label={property.title} options={property.enumValues.map(option => ({ value: option, label: option }))}
+            onchange={(next) => updateValue(property, next)} />
         {:else if property.type === 'array' || property.type === 'object'}
           <textarea
             class="form-input plugin-settings-json"

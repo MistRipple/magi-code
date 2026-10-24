@@ -287,7 +287,7 @@ assert.match(
 );
 assert.match(
   globalStyleSource,
-  /\.floating-overlay-control\s*\{[\s\S]*?opacity:\s*0\.46;[\s\S]*?background:\s*color-mix\([^;]+transparent\);[\s\S]*?border:\s*1px solid var\(--border\);[\s\S]*?backdrop-filter:\s*blur\(12px\);/,
+  /\.floating-overlay-control\s*\{[\s\S]*?opacity:\s*0\.46;[\s\S]*?background:\s*color-mix\([^;]+transparent\);[\s\S]*?box-shadow:\s*inset 0 0 0 var\(--magi-hairline\) var\(--border\)[\s\S]*?backdrop-filter:\s*blur\(12px\);/,
   '悬浮控件基类必须统一维护透明度、背景、边框与模糊效果',
 );
 assert.match(

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Disclosure from './Disclosure.svelte';
   import { formatDuration, formatElapsed } from '../lib/utils';
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { Message, TimelineRenderItem } from '../types/message';
@@ -244,7 +245,7 @@
     {/each}
     {#each disclosureBlocks as block (block.kind === 'phase' ? block.phase.key : block.key)}
       {#if block.kind === 'phase'}
-        {#if expanded}
+        <Disclosure expanded={expanded}>
         <ConversationPhase
           phase={block.phase}
           active={block.phase.key === activePhaseKey}
@@ -252,14 +253,14 @@
           {displayContext}
           {filePreviewScopeForItem}
         />
-        {/if}
+        </Disclosure>
       {:else if block.kind === 'agent-group'}
         <ConversationAgentGroup
           items={block.items}
           {filePreviewScopeForItem}
         />
       {:else if block.kind === 'tool-group'}
-        {#if expanded}
+        <Disclosure expanded={expanded}>
           <!-- 与思考 / 文字阶段同级：不再额外缩进一层、也不画引导线 -->
           <ConversationToolGroup
             items={block.items}
@@ -267,7 +268,7 @@
             {displayContext}
             {filePreviewScopeForItem}
           />
-        {/if}
+        </Disclosure>
       {:else}
       <section
           class="turn-promoted"
@@ -326,7 +327,7 @@
     gap: 8px;
     padding: 0;
     border: 0;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     border-radius: 0;
     background: transparent;
     color: var(--foreground-muted);

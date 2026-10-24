@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   /**
-   * 插件开发规范弹窗：加载随 daemon 发布的作者指南（Markdown），左侧章节目录、右侧限宽正文，
+   * 插件开发规范内容页：加载随 daemon 发布的作者指南（Markdown），左侧章节目录、右侧限宽正文，
    * 支持复制原文与导出 .md，方便交给其他 agent 阅读。
    */
   import { onMount } from 'svelte';
@@ -8,7 +9,7 @@
   import { fetchPluginGuide } from '../web/plugin-api';
   import Icon from './Icon.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
-  import Modal from './Modal.svelte';
+  import SettingsDetailPage from './SettingsDetailPage.svelte';
 
   interface Props { onClose: () => void; }
   let { onClose }: Props = $props();
@@ -16,6 +17,8 @@
   let guide = $state<string | null>(null);
   let loadError = $state('');
   let guideCopied = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
   let guideActive = $state(0);
   let guideScroller = $state<HTMLDivElement | null>(null);
 
@@ -73,7 +76,8 @@
       area.remove();
     }
     guideCopied = true;
-    window.setTimeout(() => { guideCopied = false; }, 2000);
+    clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => { guideCopied = false; }, 2500);
   }
 
   function exportGuide(): void {
@@ -88,17 +92,13 @@
   }
 </script>
 
-{#if loadError}
-  <Modal size="sm" closeOnEscape={true} closeOnBackdrop={true} {onClose}>
-    <p class="settings-hint error" role="alert">{loadError}</p>
-  </Modal>
-{:else if guide !== null}
-  <Modal size="xl" modalClass="plugin-guide-dialog" bodyClass="plugin-guide-modal-body" closeOnEscape={true} closeOnBackdrop={true} {onClose}>
+<!-- 加载、失败和正文共用同一个内容页，保留进入页面时的焦点恢复目标。 -->
+<SettingsDetailPage title={i18n.t('settings.plugins.guide.toggle')} pageClass="plugin-guide-page" bodyClass={guide !== null && !loadError ? 'plugin-guide-page-body' : ''} {onClose}>
     {#snippet header()}
       <div class="guide-header">
         <h3>{i18n.t('settings.plugins.guide.toggle')}</h3>
-        <div class="guide-actions">
-          <button class="guide-action" data-testid="plugin-guide-copy" onclick={() => void copyGuide()}>
+        {#if guide !== null && !loadError}<div class="guide-actions">
+          <button class="guide-action" data-copy-feedback={guideCopied} data-testid="plugin-guide-copy" onclick={() => void copyGuide()}>
             <Icon name={guideCopied ? 'check' : 'copy'} size={13} />
             <span>{guideCopied ? i18n.t('settings.plugins.guide.copied') : i18n.t('settings.plugins.guide.copy')}</span>
           </button>
@@ -106,12 +106,12 @@
             <Icon name="download" size={13} />
             <span>{i18n.t('settings.plugins.guide.export')}</span>
           </button>
-          <button class="modal-close" data-testid="plugin-guide-close" aria-label={i18n.t('settings.plugins.candidate.cancel')} onclick={onClose}>
-            <Icon name="close" size={18} />
-          </button>
-        </div>
+        </div>{/if}
       </div>
     {/snippet}
+    {#if loadError}
+      <p class="settings-hint error" role="alert">{loadError}</p>
+    {:else if guide !== null}
     <div class="plugin-guide" data-testid="plugin-guide">
       <nav class="guide-toc" aria-label={i18n.t('settings.plugins.guide.toc')}>
         {#each guideHeadings as heading, index (index)}
@@ -125,11 +125,13 @@
         </article>
       </div>
     </div>
-  </Modal>
-{/if}
+    {:else}
+    <p class="settings-hint" role="status">{i18n.t('common.loading')}</p>
+    {/if}
+</SettingsDetailPage>
 
 <style>
-  /* 右上角操作无底色，悬停才出现背景，与弹窗关闭按钮一致 */
+  /* 右上角操作无底色，悬停才出现背景，与页面返回按钮一致 */
   .guide-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
   .guide-header h3 { margin: 0; }
   .guide-actions { display: flex; gap: 6px; align-items: center; }
@@ -141,11 +143,11 @@
   .guide-action:hover { background: var(--surface-hover); color: var(--foreground); }
   .guide-action:focus { outline: none; }
 
-  /* 开发规范阅读布局：加宽弹窗，左侧章节目录，右侧限宽正文；长表格与代码块只在自身内部滚动，不撑出弹窗。 */
-  :global(.plugin-guide-dialog .modal-dialog) { width: min(1040px, 94vw) !important; max-width: 94vw !important; height: min(86vh, 860px); max-height: 86vh !important; }
-  :global(.modal-body.plugin-guide-modal-body) { padding: 0 !important; overflow: hidden; display: flex; min-height: 0; }
+  /* 开发规范阅读页：左侧章节目录、右侧正文；长表格与代码块只在自身内部滚动。 */
+
+  :global(.plugin-guide-page-body) { padding: 0; display: flex; min-height: 0; height: min(75vh, 800px); }
   .plugin-guide { display: grid; grid-template-columns: 208px minmax(0, 1fr); flex: 1; min-height: 0; min-width: 0; user-select: text; }
-  .guide-toc { display: flex; flex-direction: column; gap: 2px; padding: var(--space-3) var(--space-2); overflow-y: auto; border-right: 1px solid var(--border-subtle); }
+  .guide-toc { display: flex; flex-direction: column; gap: 2px; padding: var(--space-3) var(--space-2); overflow-y: auto; border-right: var(--magi-hairline) solid var(--border-subtle); }
   .guide-toc-item {
     text-align: left; padding: 6px 10px; border: 0; border-radius: var(--radius-sm); background: transparent;
     color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.4; cursor: pointer;
@@ -154,11 +156,11 @@
   .guide-toc-item.active { background: var(--primary-muted); color: var(--foreground); font-weight: var(--font-medium); }
   .guide-scroll { min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 28px 44px 56px; }
   .guide-article { max-width: 740px; margin: 0 auto; min-width: 0; }
-  .guide-lead { margin: 0 0 20px; padding: 10px 14px; border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.6; }
+  .guide-lead { margin: 0 0 20px; color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.6; }
   .guide-article :global(.markdown-content) { font-size: 13px; line-height: 1.8; min-width: 0; }
   .guide-article :global(.markdown-content p) { margin: 0 0 14px; }
   .guide-article :global(.markdown-content h1) { font-size: 22px; line-height: 1.3; margin: 0 0 16px; }
-  .guide-article :global(.markdown-content h2) { font-size: 16px; line-height: 1.4; margin: 40px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border-subtle); scroll-margin-top: 8px; }
+  .guide-article :global(.markdown-content h2) { font-size: 16px; line-height: 1.4; margin: 40px 0 14px; padding-bottom: 8px; border-bottom: var(--magi-hairline) solid var(--border-subtle); scroll-margin-top: 8px; }
   .guide-article :global(.markdown-content h3) { font-size: 14px; margin: 28px 0 10px; }
   .guide-article :global(.markdown-content ul),
   .guide-article :global(.markdown-content ol) { margin: 0 0 14px; padding-left: 22px; }

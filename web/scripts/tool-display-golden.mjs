@@ -107,7 +107,7 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /\.builtin-category-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?max-height:\s*348px;[\s\S]*?overflow-y:\s*auto;[\s\S]*?border:\s*1px solid var\(--border\);[\s\S]*?\.builtin-category-group \+ \.builtin-category-group\s*\{[\s\S]*?border-top:\s*1px solid var\(--border\);/,
+  /\.builtin-category-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?max-height:\s*348px;[\s\S]*?overflow-y:\s*auto;[\s\S]*?border:\s*var\(--magi-hairline\) solid var\(--border\);[\s\S]*?\.builtin-category-group \+ \.builtin-category-group\s*\{[\s\S]*?border-top:\s*var\(--magi-hairline\) solid var\(--border\);/,
   'built-in capability categories must use one compact list with separators instead of nested cards',
 );
 assert.match(
@@ -132,7 +132,7 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /\.capability-dependency-strip\s*\{[\s\S]*?border:\s*1px solid var\(--border\);[\s\S]*?\.command-environment-panel\s*\{[\s\S]*?width:\s*100%;[\s\S]*?border:\s*1px solid var\(--border\);/,
+  /\.capability-dependency-strip\s*\{[\s\S]*?border:\s*var\(--magi-hairline\) solid var\(--border\);[\s\S]*?\.command-environment-panel\s*\{[\s\S]*?width:\s*100%;[\s\S]*?border:\s*var\(--magi-hairline\) solid var\(--border\);/,
   'built-in tool dependency strip and command environment panel must share the same card material',
 );
 assert.doesNotMatch(
@@ -157,7 +157,7 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /\{#if mcpExpandedServer === server\.id\}[\s\S]*?class="mcp-tools-popover"[\s\S]*?class="mcp-tools-list"/,
+  /<Disclosure expanded=\{mcpExpandedServer === server\.id\}>[\s\S]*?class="mcp-tools-popover"[\s\S]*?class="mcp-tools-list"/,
   'MCP server rows must preserve the existing expanded tool-list presentation',
 );
 assert.match(

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import ts from 'typescript';
 import { aggregateUsageStatsForDisplay } from '../src/lib/usage-stats-aggregation.ts';
 
 const settingsStoreSource = await readFile(
@@ -26,6 +27,42 @@ const usageAggregationSource = await readFile(
   new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
 );
+
+// Exercise production form defaults, hydration and payloads without mounting the settings page.
+const settingsAst = ts.createSourceFile('settings-store.ts', settingsStoreSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+const storeFactory = settingsAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'createSettingsStore');
+const configHelpers = [
+  'createInteractiveConfig', 'createAuxiliaryConfig', 'createVisionConfig', 'createWorkerConfig',
+  'normalizeModelApiProtocol', 'normalizeOrchestratorFormConfig', 'normalizeAuxiliaryFormConfig',
+  'normalizeVisionFormConfig', 'normalizeWorkerFormConfig', 'buildBaseModelConfigPayload',
+  'buildOrchestratorConnectionConfigPayload', 'buildInteractiveModelConfigPayload', 'buildWorkerModelConfigPayload',
+];
+const helperSource = configHelpers.map(name => {
+  const node = storeFactory.body.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  assert.ok(node, `missing model config helper ${name}`);
+  return node.getText(settingsAst);
+}).join('\n');
+const helpers = new Function(ts.transpileModule(`${helperSource}\nreturn { ${configHelpers.join(', ')} };`, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+}).outputText)();
+for (const create of ['createInteractiveConfig', 'createAuxiliaryConfig', 'createVisionConfig', 'createWorkerConfig']) {
+  assert.equal(helpers[create]().apiProtocol, 'openai_responses', `${create} defaults to Responses`);
+}
+for (const protocol of ['openai_responses', 'openai_chat', 'anthropic_messages']) {
+  for (const hydrate of ['normalizeOrchestratorFormConfig', 'normalizeAuxiliaryFormConfig', 'normalizeVisionFormConfig', 'normalizeWorkerFormConfig']) {
+    assert.equal(helpers[hydrate]({ apiProtocol: protocol }).apiProtocol, protocol, 'loading existing config preserves its explicit protocol');
+  }
+}
+const payload = helpers.buildBaseModelConfigPayload({
+  baseUrl: 'https://gateway.example.com/v1', apiKey: 'test-key', model: 'test-model',
+  apiProtocol: 'openai_responses', discardedOption: 'discard',
+});
+assert.deepEqual(payload, {
+  baseUrl: 'https://gateway.example.com/v1', apiKey: 'test-key', model: 'test-model', apiProtocol: 'openai_responses',
+});
+assert.deepEqual(helpers.buildOrchestratorConnectionConfigPayload(payload), {
+  baseUrl: payload.baseUrl, apiKey: payload.apiKey, apiProtocol: payload.apiProtocol,
+}, 'main model connection payload contains only connection fields');
 
 assert.match(
   settingsStoreSource,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Disclosure from './Disclosure.svelte';
   import {
     mapTaskSemanticStatusToDisplayStatus,
     resolveTaskSemanticStatus,
@@ -983,9 +984,9 @@
                 <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
                 <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
               </button>
-              {#if recordExpanded}
+              <Disclosure expanded={recordExpanded}>
                 <pre class="runtime-diagnostics__record-detail">{item.detail}</pre>
-              {/if}
+              </Disclosure>
             </div>
           {/each}
         </div>
@@ -1036,7 +1037,7 @@
   .runtime-diagnostics {
     --runtime-status-color: var(--vscode-editorWidget-border, var(--border));
     margin: 0 12px;
-    border: 1px solid var(--vscode-editorWidget-border, var(--border));
+    border: var(--magi-hairline) solid var(--vscode-editorWidget-border, var(--border));
     border-left: 2px solid var(--runtime-status-color);
     border-radius: 8px;
     background: var(--vscode-editorWidget-background, var(--surface-2));
@@ -1102,13 +1103,13 @@
   }
 
   .summary__title {
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     flex: 0 0 auto;
   }
 
   .summary__badge {
     font-size: 10px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     padding: 1px 6px;
     border-radius: 3px;
   }
@@ -1157,7 +1158,7 @@
 
   .summary__meta {
     padding-left: 6px;
-    border-left: 1px solid var(--border-subtle);
+    border-left: var(--magi-hairline) solid var(--border-subtle);
     color: var(--foreground-muted);
     font-size: 10px;
     font-variant-numeric: tabular-nums;
@@ -1183,7 +1184,7 @@
     gap: 0;
     max-height: min(60vh, 560px);
     overflow-y: auto;
-    border: 1px solid var(--vscode-editorWidget-border, var(--border));
+    border: var(--magi-hairline) solid var(--vscode-editorWidget-border, var(--border));
     border-top: 0;
     border-left: 2px solid var(--runtime-status-color);
     border-radius: 0 0 8px 8px;
@@ -1200,7 +1201,7 @@
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
     gap: 0 14px;
     padding: 4px 0 8px;
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }
 
   .metric-card {
@@ -1232,7 +1233,7 @@
 
   .metric-card__value {
     font-size: 16px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
     line-height: 1.3;
     min-width: 0;
@@ -1308,7 +1309,7 @@
     gap: 5px;
     padding: 9px 0;
     border: 0;
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
     border-radius: 0;
     background: transparent;
   }
@@ -1323,7 +1324,7 @@
     margin: 3px 0 0 19px;
     padding: 7px 9px;
     border: 0;
-    border-left: 1px solid var(--border-subtle);
+    border-left: var(--magi-hairline) solid var(--border-subtle);
     background: color-mix(in srgb, var(--vscode-editor-background, var(--surface-1)) 68%, transparent);
     color: var(--vscode-foreground, var(--foreground));
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
@@ -1369,7 +1370,7 @@
 
   .runtime-diagnostics__ops-item {
     padding: 7px 0;
-    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -1422,7 +1423,7 @@
 
   .runtime-diagnostics__ops-title {
     font-size: 12px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     line-height: 1.4;
     min-width: 0;
     overflow-wrap: anywhere;
@@ -1472,7 +1473,7 @@
 
   .runtime-diagnostics__record-kind {
     flex: 0 0 auto;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     font-size: 11px;
   }
 

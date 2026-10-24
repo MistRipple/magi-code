@@ -390,7 +390,7 @@
     padding: 0 8px;
     font-size: 11px;
     background: transparent;
-    border-bottom: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
+    border-bottom: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.18));
   }
 
   .bar-address {
@@ -489,7 +489,7 @@
 
   .bar-action {
     padding: 1px 8px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: 6px;
     font-size: 11px;
     background: transparent;

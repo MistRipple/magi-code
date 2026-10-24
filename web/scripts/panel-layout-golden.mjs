@@ -246,8 +246,8 @@ assert.match(
 );
 assert.match(
   messageListSource,
-  /const userScrollDirection = deriveMessageScrollDirection\([\s\S]*?const userScroll = !isProgrammaticScroll[\s\S]*?else if \(userScrollDirection === 'up'\) \{[\s\S]*?nextAutoScroll = false;[\s\S]*?\} else if \(isNearBottom\)/,
-  '只有已确认的用户向上滚动才能退出自动跟随，普通 scroll 事件不得误判为用户操作',
+  /const userScrollDirection = deriveMessageScrollDirection\([\s\S]*?const userScroll = !isProgrammaticScroll[\s\S]*?else if \(userScrollDirection === 'up'\) \{[\s\S]*?nextAutoScroll = false;[\s\S]*?\} else if \(isNearBottom && userScrollDirection === 'down'\)/,
+  '只有向下滚回底部附近才恢复跟随，普通 scroll 事件不得覆盖用户阅读意图',
 );
 assert.match(
   messageListSource,
@@ -311,8 +311,8 @@ assert.match(
 );
 assert.match(
   gitContextControlSource,
-  /\.git-context-trigger\s*\{[\s\S]*?border:\s*1px solid var\(--border-subtle\);[\s\S]*?border-radius:\s*var\(--radius-full\);/,
-  'Git 快速入口必须保持与输入区一致的胶囊视觉',
+  /\.git-context-trigger\s*\{[\s\S]*?border:\s*0;[\s\S]*?border-radius:\s*var\(--radius-full\);/,
+  'Git 快速入口必须保持无嵌套描边的胶囊视觉',
 );
 assert.doesNotMatch(
   gitContextControlSource,
@@ -502,7 +502,7 @@ assert.match(
 );
 assert.match(
   settingsPanelSource,
-  /handleWindowKeydown[\s\S]*?closeAllModelDropdowns[\s\S]*?isTextEntry[\s\S]*?goBack/,
+  /handleWindowKeydown[\s\S]*?closeAllModelLists[\s\S]*?isTextEntry[\s\S]*?goBack/,
   'Esc 返回必须先让给下拉列表与正在输入的控件',
 );
 assert.match(

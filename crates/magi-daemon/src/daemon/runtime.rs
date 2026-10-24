@@ -26,7 +26,7 @@ use magi_conversation_runtime::{
     CanonicalTurnEventSink,
     execution_admission::ExecutionAdmissionController,
     model_config::{
-        NormalizedModelConfig, configured_role_engine_model_config,
+        NormalizedModelConfig, canonicalize_model_settings, configured_role_engine_model_config,
         resolve_orchestrator_model_config,
     },
     session_turn_finalize::{
@@ -1310,6 +1310,8 @@ impl DaemonRuntime {
             .map_err(|error| DaemonError::internal(format!("加载设置文件失败: {error}")))?;
         magi_api::recover_role_delete_transaction(&self.state_root, &settings_store)
             .map_err(|error| DaemonError::internal(format!("恢复代理角色删除事务失败: {error}")))?;
+        canonicalize_model_settings(&settings_store)
+            .map_err(|error| DaemonError::internal(format!("清理模型设置失败: {error}")))?;
         let appearance_library = Arc::new(
             magi_appearance::AppearanceLibrary::open(self.state_root.join("appearance"))
                 .map_err(|error| DaemonError::internal(format!("加载外观主题失败: {error}")))?,
@@ -1570,7 +1572,7 @@ impl DaemonRuntime {
         // 的 RoleTarget::Orchestrator 分支串联）：
         //   1. 测试场景 model_bridge_override 注入的 stub
         //   2. settings.json 的 `orchestrator` 段（前端「主对话/编排模型」表单写入位置，
-        //      携带 reasoningEffort / urlMode 全套字段，是业务模型的权威入口）
+        //      携带 reasoningEffort / apiProtocol 全套字段，是业务模型的权威入口）
         //   3. 此处 daemon bootstrap 注入的环境变量配置 client（MAGI_OPENAI_COMPAT_*）
         //      —— 仅在 settings.json 未配置 orchestrator 段时生效，
         //      用于开发/测试不带 UI 也能跑通的场景。
@@ -2462,7 +2464,6 @@ impl DaemonRuntime {
         };
         let mut section = serde_json::json!({
             "baseUrl": config.base_url,
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         });
         if let Some(api_key) = config.api_key {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   /**
    * 「Magi MCP 服务 → 活动」里的调用记录：分页浏览，可按客户端过滤，可清理。
    *
@@ -84,7 +85,7 @@
     const message = filterTokenId
       ? i18n.t('mcpServer.audit.clearClientConfirm', { client: filterName, count: String(total) })
       : i18n.t('mcpServer.audit.clearAllConfirm', { count: String(total) });
-    if (total === 0 || !(await confirmMessage(message, { tone: 'danger' }))) return;
+    if (total === 0 || !(await confirmMessage(message, { tone: 'danger', confirmLabel: i18n.t(filterTokenId ? 'mcpServer.audit.clearClient' : 'mcpServer.audit.clearAll') }))) return;
     busy = true;
     try {
       const result = await clearMcpServerAudit(filterTokenId || undefined);
@@ -130,15 +131,12 @@
   <p class="meta">{i18n.t('mcpServer.audit.hint')}</p>
 
   <div class="audit-tools">
-    <label class="field audit-filter">
+    <div class="field audit-filter">
       <span>{i18n.t('mcpServer.audit.filter')}</span>
-      <select bind:value={filterTokenId} onchange={changeFilter} data-mcp-audit-filter="1">
-        <option value="">{i18n.t('mcpServer.audit.filterAll')}</option>
-        {#each tokens as token (token.tokenId)}
-          <option value={token.tokenId}>{token.clientName} · {token.prefix}…</option>
-        {/each}
-      </select>
-    </label>
+      <SelectField bind:value={filterTokenId} onchange={(next) => { filterTokenId = next; changeFilter(); }} data-mcp-audit-filter="1"
+        label={i18n.t('mcpServer.audit.filter')}
+        options={[{ value: '', label: i18n.t('mcpServer.audit.filterAll') }, ...tokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${token.prefix}…` }))]} />
+    </div>
     <div class="action-row">
       {#if hasSession}
         <button type="button" data-mcp-audit-view-session="1" onclick={viewSession}>{i18n.t('mcpServer.audit.viewSession')}</button>
@@ -186,7 +184,7 @@
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.18));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.18));
     border-radius: 10px;
   }
 
@@ -221,9 +219,9 @@
     font-size: 11px;
   }
 
-  .field select {
+  .field :global(.select-field select) {
     padding: 4px 8px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: 6px;
     font-size: 12px;
     background: transparent;
@@ -269,7 +267,7 @@
     align-items: center;
     gap: 6px;
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .badge {
@@ -302,7 +300,7 @@
 
   button {
     padding: 5px 12px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: 8px;
     font-size: 12px;
     background: transparent;

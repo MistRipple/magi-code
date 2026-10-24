@@ -9,6 +9,21 @@ export const PANEL_LAYOUT = {
   previewFocusRatio: 2 / 3,
 } as const;
 
+/** Pointer geometry is measured inside the conversation/preview frame, excluding the sidebar. */
+export function previewSplitAt(clientX: number, frame: { left: number; right: number; width: number }): {
+  width: number;
+  collapse: boolean;
+} {
+  return {
+    width: Math.max(0, frame.right - clientX - PANEL_LAYOUT.previewHandleWidth / 2),
+    collapse: frame.width > 0 && (clientX - frame.left) / frame.width >= 0.82,
+  };
+}
+
+export function equalPreviewSplitWidth(frameWidth: number): number {
+  return Math.max(0, (frameWidth - PANEL_LAYOUT.previewHandleWidth) / 2);
+}
+
 export interface PanelLayoutInput {
   viewportWidth: number;
   sidebarWidth: number;

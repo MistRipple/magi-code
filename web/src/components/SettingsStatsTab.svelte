@@ -803,7 +803,7 @@
     padding: 0;
     color: var(--ind-foreground-secondary);
     background: transparent;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: 6px;
     cursor: pointer;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
@@ -828,13 +828,13 @@
     display: grid;
     grid-template-columns: minmax(220px, 1.35fr) minmax(140px, 0.8fr) minmax(250px, 1.15fr);
     gap: 0;
-    border: 1px solid var(--ind-border-card);
+    border: var(--magi-hairline) solid var(--ind-border-card);
     border-radius: 10px;
     overflow: hidden;
   }
   .insight-cell {
     padding: 11px 16px 12px;
-    border-right: 1px solid var(--ind-border-separator);
+    border-right: var(--magi-hairline) solid var(--ind-border-separator);
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -855,13 +855,13 @@
     align-items: center;
     gap: 6px;
     font-size: 10px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     letter-spacing: 0;
   }
   .insight-headline {
     font-size: 14px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground);
     letter-spacing: 0;
     white-space: nowrap;
@@ -870,7 +870,7 @@
   }
   .insight-cell:nth-child(2) .insight-headline {
     font-size: 16px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     font-variant-numeric: tabular-nums;
   }
   .insight-meta {
@@ -909,7 +909,7 @@
 
   /* ---------- Left: Agents List ---------- */
   .stats-left {
-    border: 1px solid var(--ind-border-card);
+    border: var(--magi-hairline) solid var(--ind-border-card);
     border-radius: 10px;
     overflow: hidden;
     display: flex;
@@ -921,12 +921,12 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 14px;
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
     gap: 10px;
   }
   .left-head-title {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground);
     letter-spacing: -0.01em;
     white-space: nowrap;
@@ -938,7 +938,7 @@
     padding: 2px;
     border-radius: 7px;
     background: color-mix(in srgb, var(--ind-foreground) 5%, transparent);
-    border: 1px solid var(--ind-border-separator);
+    border: var(--magi-hairline) solid var(--ind-border-separator);
     flex-shrink: 0;
   }
   .seg-pill {
@@ -946,7 +946,7 @@
     background: transparent;
     color: var(--ind-foreground-muted);
     font-size: 10.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     padding: 3px 9px;
     border-radius: 5px;
     cursor: pointer;
@@ -972,13 +972,13 @@
     grid-template-columns: 24px minmax(0, 1.2fr) 50px 50px 64px;
     padding: 6px 14px;
     font-size: 9px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     letter-spacing: 0.08em;
     color: var(--ind-foreground-soft);
     text-transform: uppercase;
     gap: 10px;
     background: color-mix(in srgb, var(--ind-foreground) 3%, transparent);
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
   }
   .col-head .num { text-align: right; }
   .stats-list {
@@ -992,7 +992,7 @@
     align-items: center;
     gap: 10px;
     padding: 9px 14px;
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
     cursor: pointer;
     transition: background 0.15s ease;
   }
@@ -1024,7 +1024,7 @@
   }
   .row-name-txt {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground);
     white-space: nowrap;
     overflow: hidden;
@@ -1036,7 +1036,7 @@
   }
   .badge-core {
     font-size: 7.5px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     padding: 1px 4px;
     border-radius: 4px;
     background: color-mix(in srgb, var(--ind-foreground) 8%, transparent);
@@ -1052,7 +1052,7 @@
   }
   .row-metric {
     font-size: 11.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
     color: var(--ind-foreground);
     letter-spacing: -0.02em;
@@ -1064,7 +1064,7 @@
 
   /* ---------- Right: Slice Detail ---------- */
   .stats-right {
-    border: 1px solid var(--ind-border-card);
+    border: var(--magi-hairline) solid var(--ind-border-card);
     border-radius: 10px;
     padding: 16px 18px;
     display: flex;
@@ -1079,7 +1079,7 @@
   }
   .slice-kicker {
     font-size: 9.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -1099,7 +1099,7 @@
   }
   .slice-title {
     font-size: 14.5px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     color: var(--ind-foreground);
     letter-spacing: -0.015em;
     white-space: nowrap;
@@ -1114,7 +1114,7 @@
     gap: 4px;
     padding: 2px 7px;
     font-size: 9.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     border-radius: 999px;
     background: color-mix(in srgb, var(--ind-foreground) 5%, transparent);
     color: var(--ind-foreground-secondary);
@@ -1143,8 +1143,8 @@
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 0;
-    border-top: 1px solid var(--ind-border-separator);
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-top: var(--magi-hairline) solid var(--ind-border-separator);
+    border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
     padding: 10px 0;
   }
   .kpi-block {
@@ -1152,20 +1152,20 @@
     flex-direction: column;
     gap: 2px;
     padding: 0 14px;
-    border-right: 1px solid var(--ind-border-separator);
+    border-right: var(--magi-hairline) solid var(--ind-border-separator);
   }
   .kpi-block:first-child { padding-left: 0; }
   .kpi-block:last-child { border-right: none; padding-right: 0; }
   .kpi-value {
     font-size: 18px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     font-variant-numeric: tabular-nums;
     color: var(--ind-foreground);
     letter-spacing: -0.4px;
   }
   .kpi-label {
     font-size: 9.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -1181,13 +1181,13 @@
     align-items: center;
     justify-content: space-between;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground-secondary);
   }
   .slice-section-head .small-note {
     font-size: 10px;
     color: var(--ind-foreground-muted);
-    font-weight: 500;
+    font-weight: var(--font-medium);
   }
   .bar-list {
     display: flex;
@@ -1195,10 +1195,6 @@
     gap: 8px;
   }
   .token-usage-note {
-    padding: 9px 10px;
-    border: 1px solid var(--ind-border-separator);
-    border-radius: 7px;
-    background: color-mix(in srgb, var(--ind-foreground) 2.5%, transparent);
     color: var(--ind-foreground-muted);
     font-size: 10.5px;
     line-height: 1.45;
@@ -1237,7 +1233,7 @@
     color: var(--ind-foreground-muted);
     text-align: right;
   }
-  .bar-meta .strong { color: var(--ind-foreground); font-weight: 600; }
+  .bar-meta .strong { color: var(--ind-foreground); font-weight: var(--font-semibold); }
   .bar-meta .dim { color: var(--ind-foreground-muted); }
 
   .breakdown-head,
@@ -1251,7 +1247,7 @@
     padding: 0 8px 4px;
     color: var(--ind-foreground-soft);
     font-size: 9px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -1345,7 +1341,7 @@
     .insight-cell:nth-child(3) {
       grid-column: 1 / -1;
       border-right: none;
-      border-top: 1px solid var(--ind-border-separator);
+      border-top: var(--magi-hairline) solid var(--ind-border-separator);
     }
     .stats-split {
       grid-template-columns: 1fr;

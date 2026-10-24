@@ -62,6 +62,7 @@
   const displayText = $derived(resolveConversationMessageText(message, i18n.t.bind(i18n)));
 
   let copied = $state(false);
+  let copyRevision = $state(0);
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   let browserAnnotationPreviewRequest = 0;
   let browserAnnotationPreviewError = $state('');
@@ -239,11 +240,12 @@
     if (!text) return;
     await navigator.clipboard.writeText(text);
     copied = true;
+    copyRevision += 1;
     if (copiedResetTimer) clearTimeout(copiedResetTimer);
     copiedResetTimer = setTimeout(() => {
       copied = false;
       copiedResetTimer = null;
-    }, 1500);
+    }, 2500);
   }
 
   // 获取代理执行信息（如果有）
@@ -554,8 +556,8 @@
           </button>
         {/if}
         {#if copyableText.trim()}
-          <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-            <Icon name={copied ? 'check' : 'copy'} size={14} />
+          <button type="button" class="message-action" class:copied onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
+            {#key copyRevision}<Icon name={copied ? 'check' : 'copy'} size={14} />{/key}
           </button>
         {/if}
       </div>
@@ -752,7 +754,7 @@
     display: block;
     margin-bottom: 2px;
     color: #fde68a;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
   }
 
   /* 用户气泡是固定蓝底，markdown 内部所有文本/标记/代码块都强制白色，
@@ -849,6 +851,11 @@
     color: var(--foreground);
   }
 
+  .message-action.copied :global(svg) {
+    animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
+      magi-feedback-fade 160ms 2340ms ease-out forwards;
+  }
+
   /* ===== 助手消息基础样式：默认纯正文，不带卡片壳 ===== */
   .message-item.assistant {
     position: relative;
@@ -873,7 +880,7 @@
     padding: var(--space-4);
     border-radius: var(--radius-lg);
     background: var(--assistant-message-bg);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-left-width: 3px;
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
@@ -911,7 +918,7 @@
     margin-bottom: var(--space-2);
     border-radius: var(--radius-md);
     background: var(--info-muted);
-    border: 1px solid color-mix(in srgb, var(--info) 40%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--info) 40%, transparent);
     font-size: var(--text-sm);
     color: var(--foreground);
   }
@@ -924,7 +931,7 @@
     min-width: 88px;
     padding: 6px 12px;
     border-radius: var(--radius-md);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--surface);
     color: var(--foreground);
     cursor: pointer;
@@ -944,7 +951,7 @@
   }
   .system-section-fold {
     margin: var(--space-1) 0;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--surface) 88%, var(--foreground) 12%);
     overflow: hidden;
@@ -967,7 +974,7 @@
     font-size: 11px;
     line-height: 1;
     color: var(--info);
-    border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--info) 45%, transparent);
     border-radius: 999px;
     padding: 3px 8px;
   }
@@ -985,7 +992,7 @@
     font-size: var(--text-xs);
   }
   .system-section-fold[open] .system-section-summary {
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
   .system-section-content {
     padding: var(--space-2) var(--space-3) var(--space-3);
@@ -1040,7 +1047,7 @@
     gap: 7px;
     max-width: min(480px, 100%);
     padding: 7px 9px;
-    border: 1px solid color-mix(in srgb, var(--info) 34%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--info) 34%, var(--border));
     border-radius: 6px;
     background: color-mix(in srgb, var(--info) 7%, var(--background));
     color: var(--foreground-secondary);
@@ -1063,7 +1070,7 @@
 
   .user-browser-node-selection-content strong {
     color: var(--foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .user-browser-node-selection-content a {
@@ -1079,7 +1086,7 @@
     max-width: min(360px, 100%);
     min-height: 28px;
     padding: 4px 8px;
-    border: 1px solid color-mix(in srgb, var(--info) 34%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--info) 34%, var(--border));
     border-radius: 6px;
     background: color-mix(in srgb, var(--info) 9%, var(--background));
     color: var(--foreground-secondary);
@@ -1107,7 +1114,7 @@
     background: var(--info);
     color: white;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     line-height: 1;
   }
 
@@ -1124,7 +1131,7 @@
     max-width: min(280px, 100%);
     min-height: 28px;
     padding: 4px 8px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 6px;
     background: color-mix(in srgb, var(--background-secondary) 88%, transparent);
     color: var(--foreground-secondary);
@@ -1156,7 +1163,7 @@
     border-radius: 8px;
     overflow: hidden;
     cursor: pointer;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--background);
     padding: 0;
     transition: transform 0.2s, box-shadow 0.2s;

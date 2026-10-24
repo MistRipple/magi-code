@@ -456,7 +456,7 @@
     height: 28px;
     background: var(--surface-2);
     backdrop-filter: blur(8px);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
     cursor: pointer;
     border-radius: var(--radius-sm);
@@ -500,7 +500,7 @@
   }
 
   .error-title {
-    font-weight: 500;
+    font-weight: var(--font-medium);
     font-size: var(--text-sm, 13px);
   }
 

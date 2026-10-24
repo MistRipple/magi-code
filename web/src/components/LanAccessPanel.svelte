@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import QRCode from 'qrcode';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -10,6 +11,9 @@
 
   let lanUrl = $state('');
   let copied = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  let tunnelCopyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => { clearTimeout(copyResetTimer); clearTimeout(tunnelCopyResetTimer); });
   let loading = $state(false);
   let lanInfoRequestSeq = 0;
   let qrSvg = $state('');
@@ -177,7 +181,7 @@
 
   async function copyTunnelUrl() {
     if (!tunnelAccessUrl) return;
-    try { await navigator.clipboard.writeText(tunnelAccessUrl); tunnelCopied = true; setTimeout(() => { tunnelCopied = false; }, 2000); }
+    try { await navigator.clipboard.writeText(tunnelAccessUrl); tunnelCopied = true; clearTimeout(tunnelCopyResetTimer); tunnelCopyResetTimer = setTimeout(() => { tunnelCopied = false; }, 2500); }
     catch { /* silent */ }
   }
 
@@ -197,7 +201,7 @@
 
   async function copyUrl() {
     if (!lanUrl) return;
-    try { await navigator.clipboard.writeText(lanUrl); copied = true; setTimeout(() => { copied = false; }, 2000); }
+    try { await navigator.clipboard.writeText(lanUrl); copied = true; clearTimeout(copyResetTimer); copyResetTimer = setTimeout(() => { copied = false; }, 2500); }
     catch { /* silent */ }
   }
 
@@ -232,7 +236,7 @@
       {#if lanUrl}
         <div class="url-row">
           <input class="url-input" type="text" value={lanUrl} readonly />
-          <button class="copy-btn" onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
+          <button class="copy-btn" class:copied data-copy-feedback={copied} onclick={copyUrl} title={copied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
             {#if copied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
@@ -254,7 +258,7 @@
       <div class="panel-body">
         <div class="url-row">
           <input class="url-input" type="text" value={tunnelAccessUrl} readonly />
-          <button class="copy-btn" onclick={copyTunnelUrl} title={tunnelCopied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
+          <button class="copy-btn" class:copied data-copy-feedback={tunnelCopied} onclick={copyTunnelUrl} title={tunnelCopied ? i18n.t('lanAccess.copied') : i18n.t('lanAccess.copy')}>
             {#if tunnelCopied}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
           </button>
         </div>
@@ -278,9 +282,9 @@
 
 
 <style>
-  .lan-access-panel { position: absolute; top: calc(100% + 8px); right: 0; width: 300px; max-height: 80vh; overflow-y: auto; background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); z-index: var(--z-popover); animation: panelSlideIn 0.15s ease-out; }
+  .lan-access-panel { position: absolute; top: calc(100% + 8px); right: 0; width: 300px; max-height: 80vh; overflow-y: auto; background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); z-index: var(--z-popover); animation: panelSlideIn 0.15s ease-out; }
   @keyframes panelSlideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
-  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: var(--magi-hairline) solid var(--border); }
   .panel-title { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
   .panel-close { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; background: transparent; border: none; border-radius: var(--radius-md); color: var(--foreground-muted); cursor: pointer; transition: all 0.15s; }
   .panel-close:hover { background: var(--surface-hover); color: var(--foreground); }
@@ -297,12 +301,12 @@
   .loading-dot:nth-child(3) { animation-delay: 0.3s; }
   @keyframes dotPulse { 0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1); } }
   .url-row { display: flex; gap: 6px; }
-  .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs); font-family: var(--font-mono); color: var(--foreground); background: var(--vscode-input-background, var(--surface-2)); border: 1px solid var(--border); border-radius: var(--radius-sm); outline: none; }
+  .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs); font-family: var(--font-mono); color: var(--foreground); background: var(--vscode-input-background, var(--surface-2)); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); outline: none; }
   .url-input:focus { border-color: var(--primary); }
   .copy-btn { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex-shrink: 0; background: var(--primary); border: none; border-radius: var(--radius-md); color: var(--primary-foreground); cursor: pointer; transition: opacity 0.15s; }
   .copy-btn:hover { opacity: 0.85; }
-  .tunnel-section { border-top: 1px solid var(--border); }
-  .tunnel-status { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: var(--text-xs); color: var(--foreground-muted); }
+  .tunnel-section { border-top: var(--magi-hairline) solid var(--border); }
+  .tunnel-status { font-weight: var(--font-normal); text-transform: none; letter-spacing: 0; font-size: var(--text-xs); color: var(--foreground-muted); }
   .tunnel-status.running { color: var(--success); }
   .tunnel-status.error { color: var(--error); }
   .tunnel-error { padding: 4px 14px; margin: 0; font-size: var(--text-xs); color: var(--error); line-height: 1.4; }

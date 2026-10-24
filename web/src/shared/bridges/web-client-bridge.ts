@@ -179,7 +179,7 @@ import {
   SESSION_NAVIGATION_TIMEOUT_MS,
   sessionNavigationState,
 } from '../session-navigation.svelte';
-import { resolveModelListFetchBlockReason } from '../model-governance';
+import { canFetchModelList } from '../model-governance';
 import type {
   Message,
   MessageBrowserNodeSelection,
@@ -4660,6 +4660,18 @@ function escapePreviewHtml(content: string): string {
     .replaceAll('>', '&gt;');
 }
 
+function previewWindowThemeStyles(): string {
+  const style = getComputedStyle(document.documentElement);
+  const tokens = [
+    '--background', '--foreground', '--foreground-muted', '--code-bg', '--border',
+    '--font-normal', '--font-semibold', '--magi-hairline',
+  ].map((name) => `${name}:${style.getPropertyValue(name)};`).join('');
+  return `:root { ${tokens} color-scheme: ${document.documentElement.classList.contains('theme-dark') ? 'dark' : 'light'}; }
+    body { font-weight: var(--font-normal); font-variant-numeric: tabular-nums; }
+    .title { font-weight: var(--font-semibold); }
+    p { text-wrap: pretty; }`;
+}
+
 function openPreviewWindow(title: string, subtitle: string, content: string, mode: 'file' | 'diff'): void {
   const popup = window.open('', '_blank', 'noopener,noreferrer');
   if (!popup) {
@@ -4677,13 +4689,12 @@ function openPreviewWindow(title: string, subtitle: string, content: string, mod
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapedTitle}</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+    ${previewWindowThemeStyles()}
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--background); color: var(--foreground); }
     .wrap { padding: 20px; }
-    .title { font-size: 20px; font-weight: 700; margin: 0 0 4px; }
-    .subtitle { font-size: 12px; color: #94a3b8; margin: 0 0 16px; }
-    pre { margin: 0; padding: 16px; border-radius: 12px; background: #111827; border: 1px solid rgba(148,163,184,.18); overflow: auto; line-height: 1.55; }
-    .diff pre { background: #0b1220; }
+    .title { font-size: 20px; margin: 0 0 4px; }
+    .subtitle { font-size: 12px; color: var(--foreground-muted); margin: 0 0 16px; }
+    pre { margin: 0; padding: 16px; border-radius: 12px; background: var(--code-bg); border: 0; box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); overflow: auto; line-height: 1.55; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
@@ -4712,11 +4723,11 @@ function openDiagramSvgPreview(title: string, svgContent: string): void {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapedTitle}</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { margin: 0; min-height: 100vh; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+    ${previewWindowThemeStyles()}
+    body { margin: 0; min-height: 100vh; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--background); color: var(--foreground); }
     .wrap { min-height: 100vh; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; }
-    .title { font-size: 20px; font-weight: 700; margin: 0 0 16px; }
-    .diagram { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto; padding: 16px; border: 1px solid rgba(148,163,184,.18); border-radius: 12px; background: #111827; }
+    .title { font-size: 20px; margin: 0 0 16px; }
+    .diagram { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto; padding: 16px; border: 0; box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); border-radius: 12px; background: var(--code-bg); }
     .diagram svg { max-width: 100%; height: auto; }
   </style>
 </head>
@@ -4962,13 +4973,10 @@ async function testAuxiliaryConnection(config: Record<string, unknown>): Promise
 }
 
 async function fetchModelList(config: Record<string, unknown>, target: string): Promise<void> {
-  const blockReason = resolveModelListFetchBlockReason(config);
-  if (blockReason) {
+  if (!canFetchModelList(config)) {
     emitBridgeInfoToast(
       i18n.t('settings.toast.action.fetchModelList'),
-      blockReason === 'full_url_mode'
-        ? i18n.t('config.toast.modelListUnsupportedInFullMode')
-        : i18n.t('config.toast.fillBaseUrlFirst'),
+      i18n.t('config.toast.fillBaseUrlFirst'),
     );
     return;
   }

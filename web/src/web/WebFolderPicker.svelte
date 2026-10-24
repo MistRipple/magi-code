@@ -355,7 +355,7 @@
   .mac-glass-header {
     flex-shrink: 0;
     background: transparent;
-    border-bottom: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
+    border-bottom: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
     z-index: 10;
   }
@@ -370,7 +370,7 @@
   .mac-title {
     margin: 0;
     font-size: 14px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--foreground);
     letter-spacing: -0.01em;
   }
@@ -419,7 +419,7 @@
     width: 28px;
     height: 28px;
     border-radius: 6px;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
@@ -447,7 +447,7 @@
     min-width: 64px;
     max-width: 112px;
     padding: 0 26px 0 10px;
-    border: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.12);
+    border: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.12);
     border-radius: 6px;
     background: rgba(var(--foreground-rgb, 100, 100, 100), 0.04);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23888' d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -456,7 +456,7 @@
     color: var(--foreground);
     font: inherit;
     font-size: 12px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     cursor: pointer;
     text-overflow: ellipsis;
     transition: background-color 0.15s ease, border-color 0.15s ease;
@@ -486,7 +486,7 @@
     display: flex;
     align-items: center;
     background: rgba(var(--foreground-rgb, 100, 100, 100), 0.04);
-    border: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.08);
+    border: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.08);
     border-radius: 8px;
     padding: 0 10px;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.02);
@@ -521,7 +521,7 @@
     background: transparent;
     color: var(--foreground);
     font-size: 13px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     cursor: pointer;
     transition: background 0.15s;
   }
@@ -545,7 +545,7 @@
     padding: 2px 6px;
     color: var(--foreground);
     font-size: 13px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .mac-path-input {
@@ -626,7 +626,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-weight: 500;
+    font-weight: var(--font-medium);
   }
 
   .mac-item-chevron {
@@ -680,7 +680,7 @@
     justify-content: space-between;
     padding: 12px 16px;
     background: transparent;
-    border-top: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
+    border-top: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
   }
 
   .mac-footer-left, .mac-footer-right {
@@ -707,7 +707,7 @@
     width: 14px;
     height: 14px;
     border-radius: 4px;
-    border: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.3);
+    border: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.3);
     position: relative;
     transition: all 0.2s;
   }
@@ -732,13 +732,13 @@
   .mac-selected-hint {
     font-size: 12px;
     color: var(--foreground-muted);
-    border-left: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
+    border-left: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
     padding-left: 12px;
   }
 
   .mac-selected-hint strong {
     color: var(--foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   /* 加载动画 */

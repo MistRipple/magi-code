@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
+  import Disclosure from './Disclosure.svelte';
   import {
     parseLeadingJson,
     resolveTerminalArgumentId,
@@ -360,7 +361,7 @@
   let followTail = $state(true);
 
   function nearTail(element: HTMLPreElement): boolean {
-    const threshold = 24;
+    const threshold = 40;
     return element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
   }
 
@@ -371,9 +372,11 @@
 
   $effect(() => {
     if (!outputElement || !showOutput || !isExpanded) return;
-    if (followTail || showStatusPulse) {
+    // Reading older output takes precedence over an active process.
+    const output = displayOutput;
+    if (followTail) {
       queueMicrotask(() => {
-        if (!outputElement) return;
+        if (!outputElement || !followTail || !isExpanded || output !== displayOutput) return;
         outputElement.scrollTop = outputElement.scrollHeight;
       });
     }
@@ -428,7 +431,7 @@
       </div>
     {/if}
 
-    {#if canToggle && !collapsed}
+    <Disclosure expanded={canToggle && !collapsed}>
       <div class="tool-content terminal-content" id={contentId}>
         <div class="terminal-meta-grid">
           {#if typeof terminalId === 'number'}
@@ -491,7 +494,7 @@
           </div>
         {/if}
       </div>
-    {/if}
+    </Disclosure>
   </div>
 {:else}
   <div
@@ -523,7 +526,7 @@
 
 <style>
   .tool-call {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     margin-top: var(--space-2);
     overflow: hidden;
@@ -616,23 +619,8 @@
 
   .tool-content {
     padding: var(--space-3);
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     background: var(--surface-2);
-    animation: slideDown 0.2s ease-out;
-    transform-origin: top;
-  }
-
-  @keyframes slideDown {
-    from {
-      opacity: 0;
-      max-height: 0;
-      transform: translateY(-8px);
-    }
-    to {
-      opacity: 1;
-      max-height: 700px;
-      transform: translateY(0);
-    }
   }
 
   .terminal-meta-grid {
@@ -665,7 +653,7 @@
     background: #0b0f14;
     color: #d7e3f4;
     border-radius: var(--radius-sm);
-    border: 1px solid rgba(132, 156, 182, 0.2);
+    border: var(--magi-hairline) solid rgba(132, 156, 182, 0.2);
     padding: var(--space-4);
     max-height: 320px;
     overflow: auto;

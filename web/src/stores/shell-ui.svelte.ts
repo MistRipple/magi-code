@@ -1,3 +1,4 @@
+import { hasOverlay } from '../lib/overlay-stack';
 /**
  * 工作台外壳的全局 UI 投影：当前显示哪个顶层视图、当前唯一的顶层弹出面板。
  * 只保存视图状态；业务事实仍由 daemon 提供。侧栏与 Header 共用这里，
@@ -55,13 +56,13 @@ export function closePopover(popover?: ShellPopover): void {
  */
 export function installShellPopoverDismiss(): () => void {
   const onPointerDown = (event: PointerEvent) => {
-    if (!shellUi.popover) return;
+    if (!shellUi.popover || hasOverlay()) return;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(`[data-shell-popover="${shellUi.popover}"]`)) return;
     shellUi.popover = null;
   };
   const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key === 'Escape' && shellUi.popover) {
+    if (event.key === 'Escape' && shellUi.popover && !hasOverlay()) {
       event.preventDefault();
       shellUi.popover = null;
     }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Disclosure from '../Disclosure.svelte';
   import type { Message, TimelineRenderItem } from '../../types/message';
   import type {
     AgentContextPackageDto,
@@ -489,7 +490,7 @@
         </span>
       </button>
 
-      {#if contextExpanded}
+      <Disclosure expanded={contextExpanded}>
         <div class="context-details">
           <div class="context-copy">
             <p>{contextPackage.summary}</p>
@@ -539,7 +540,7 @@
             {/if}
           </div>
         </div>
-      {/if}
+      </Disclosure>
     </section>
   {/if}
   <MessageList
@@ -564,7 +565,7 @@
     align-items: center;
     gap: 12px;
     padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     flex: 0 0 auto;
     font-size: 12px;
     color: var(--foreground-muted);
@@ -606,7 +607,7 @@
   .agent-capabilities strong {
     margin-right: 2px;
     color: var(--foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .agent-capabilities span {
@@ -619,7 +620,7 @@
   .context-observer {
     flex: 0 0 auto;
     margin: 8px 12px 0;
-    border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 82%, transparent);
     border-radius: 10px;
     background: color-mix(in srgb, var(--surface-2) 94%, transparent);
     overflow: hidden;
@@ -655,7 +656,7 @@
   .context-title {
     color: var(--foreground);
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .context-revision,
@@ -684,7 +685,7 @@
     max-height: min(42vh, 420px);
     overflow: auto;
     padding: 10px;
-    border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 72%, transparent);
     display: grid;
     gap: 12px;
     font-size: 12px;

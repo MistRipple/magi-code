@@ -184,16 +184,21 @@ function applyRootTheme(
   const muted = mix(background, foreground, mode === 'dark' ? 0.62 : 0.58);
   const contrastFactor = Math.max(0.2, Math.min(0.9, scheme.contrast / 100));
   const materialAlpha = pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.84 : 0.7;
+  // Derive all layers from the selected scheme, including custom themes.
+  const raised = mix(background, foreground, mode === 'dark' ? 0.045 : 0);
+  const floating = mix(background, foreground, mode === 'dark' ? 0.07 : 0);
+  const sidebar = mode === 'light' ? mix(background, foreground, 0.03) : background;
   const panel = rgba(background, effectiveWallpaperUrl ? materialAlpha : 1);
-  const elevated = rgba(background, effectiveWallpaperUrl ? Math.min(0.98, materialAlpha + 0.1) : 1);
-  const critical = rgba(background, effectiveWallpaperUrl ? 0.96 : 1);
-  const windowOverlay = rgba(background, effectiveWallpaperUrl
+  const mainPanel = rgba(raised, effectiveWallpaperUrl ? materialAlpha : 1);
+  const elevated = rgba(floating, effectiveWallpaperUrl ? Math.min(0.98, materialAlpha + 0.1) : 1);
+  const critical = rgba(raised, effectiveWallpaperUrl ? 0.96 : 1);
+  const windowOverlay = rgba(floating, effectiveWallpaperUrl
     ? pack.material === 'clear' ? 0.96 : pack.material === 'translucent' ? 0.78 : 0.68
     : 1);
-  const popoverOverlay = rgba(background, effectiveWallpaperUrl
+  const popoverOverlay = rgba(floating, effectiveWallpaperUrl
     ? pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.9 : 0.84
     : 1);
-  const criticalOverlay = rgba(background, effectiveWallpaperUrl ? 0.97 : 1);
+  const criticalOverlay = rgba(raised, effectiveWallpaperUrl ? 0.97 : 1);
   const primaryForeground = relativeLuminance(accent) > 0.44 ? '#111827' : '#FFFFFF';
 
   const variables: Record<string, string> = {
@@ -201,8 +206,8 @@ function applyRootTheme(
     '--foreground': scheme.foreground,
     '--foreground-rgb': foreground.join(', '),
     '--foreground-muted': toHex(muted),
-    '--border': rgba(foreground, 0.14 + contrastFactor * 0.12),
-    '--border-subtle': rgba(foreground, 0.06 + contrastFactor * 0.06),
+    '--border': rgba(foreground, 0.055 + contrastFactor * 0.055),
+    '--border-subtle': rgba(foreground, 0.025 + contrastFactor * 0.025),
     '--primary': scheme.accent,
     '--primary-rgb': accent.join(', '),
     '--primary-hover': toHex(mix(accent, foreground, 0.18)),
@@ -220,16 +225,16 @@ function applyRootTheme(
     '--dropdown-bg': elevated,
     '--glass-bg': elevated,
     '--code-bg': critical,
-    '--code-border': rgba(foreground, 0.14 + contrastFactor * 0.12),
+    '--code-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
     '--user-message-bg': rgba(accent, 0.16),
-    '--assistant-message-bg': panel,
+    '--assistant-message-bg': mainPanel,
     '--overlay': mode === 'dark' ? 'rgba(0, 0, 0, 0.58)' : 'rgba(15, 23, 42, 0.34)',
     '--overlay-heavy': mode === 'dark' ? 'rgba(0, 0, 0, 0.76)' : 'rgba(15, 23, 42, 0.52)',
     '--scrollbar-thumb': rgba(foreground, 0.16),
     '--scrollbar-thumb-hover': rgba(foreground, 0.28),
     '--magi-canvas': scheme.background,
-    '--magi-surface-sidebar': panel,
-    '--magi-surface-main': panel,
+    '--magi-surface-sidebar': rgba(sidebar, effectiveWallpaperUrl ? materialAlpha : 1),
+    '--magi-surface-main': mainPanel,
     '--magi-surface-right-pane': panel,
     '--magi-surface-dialog': elevated,
     '--magi-surface-popover': elevated,
@@ -248,13 +253,13 @@ function applyRootTheme(
     '--vscode-editor-foreground': scheme.foreground,
     '--vscode-foreground': scheme.foreground,
     '--vscode-descriptionForeground': toHex(muted),
-    '--vscode-panel-border': rgba(foreground, 0.14 + contrastFactor * 0.12),
-    '--vscode-widget-border': rgba(foreground, 0.14 + contrastFactor * 0.12),
+    '--vscode-panel-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
+    '--vscode-widget-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
     '--vscode-editorWidget-background': elevated,
-    '--vscode-editorWidget-border': rgba(foreground, 0.14 + contrastFactor * 0.12),
+    '--vscode-editorWidget-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
     '--vscode-dropdown-background': elevated,
     '--vscode-input-background': elevated,
-    '--vscode-input-border': rgba(foreground, 0.14 + contrastFactor * 0.12),
+    '--vscode-input-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
     '--vscode-textCodeBlock-background': critical,
     '--vscode-textLink-foreground': scheme.accent,
     '--vscode-focusBorder': scheme.accent,

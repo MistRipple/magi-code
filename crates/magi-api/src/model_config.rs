@@ -917,7 +917,6 @@ mod tests {
             "llm": {
                 "baseUrl": "http://localhost:8317/",
                 "model": "kiro-claude-sonnet-4-5-agentic",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             }
         }))

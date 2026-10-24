@@ -116,7 +116,7 @@
     gap: var(--space-2);
     color: var(--foreground);
     font-size: var(--text-xs);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .tool-approval-heading :global(svg),
@@ -148,7 +148,7 @@
   .approval-button {
     min-height: 28px;
     padding: 0 var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);
@@ -180,7 +180,7 @@
   .tool-approval-status,
   .tool-approval-error {
     font-size: var(--text-xs);
-    font-weight: 400;
+    font-weight: var(--font-normal);
   }
 
   .tool-approval-status {

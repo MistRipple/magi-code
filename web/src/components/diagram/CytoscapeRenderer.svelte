@@ -537,7 +537,7 @@
 
   .control-btn {
     background: var(--surface-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
   }
 
   .error {

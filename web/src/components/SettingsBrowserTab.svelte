@@ -736,8 +736,8 @@
     max-height: 280px;
     margin-top: 8px;
     overflow: auto;
-    border-top: 1px solid var(--border-subtle);
-    border-bottom: 1px solid var(--border-subtle);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }
   .resource-row {
     display: flex;
@@ -745,7 +745,7 @@
     gap: 10px;
     min-height: 52px;
     padding: 7px 2px;
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }
   .resource-row:last-child { border-bottom: 0; }
   .resource-row input { flex: 0 0 auto; width: 14px; height: 14px; accent-color: var(--primary); }
@@ -758,7 +758,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .resource-row-copy strong { color: var(--foreground); font-size: var(--text-xs); font-weight: 600; }
+  .resource-row-copy strong { color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-semibold); }
   .resource-row-copy .resource-page { margin-top: 2px; color: var(--foreground-muted); font-size: var(--text-xs); }
   .resource-row-copy small {
     margin-top: 2px;

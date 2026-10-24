@@ -1,4 +1,6 @@
 <script lang="ts">
+  import FileName from '../FileName.svelte';
+  import Disclosure from '../Disclosure.svelte';
   import type { ContentBlock } from '../../types/message';
   import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
@@ -120,7 +122,7 @@
 
 {#if change}
   <div class="tool-call" class:collapsed>
-    <button class="tool-header" onclick={toggle}>
+    <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
       <span class="chevron">
         <Icon name="chevron-right" size={12} />
       </span>
@@ -155,7 +157,7 @@
                 previewInRightPane(change.filePath);
               }
             }}
-          >{displayPath}</span>
+          ><FileName name={displayPath ?? ""} /></span>
         {:else}
           <FileSpan
             filepath={change.filePath}
@@ -188,7 +190,7 @@
       </span>
     </button>
 
-    {#if !collapsed}
+    <Disclosure expanded={!collapsed}>
       <div class="tool-content">
         {#if change.error}
           <div class="empty-diff-note error">{i18n.t('fileChangeCard.previewUnavailable')}</div>
@@ -230,14 +232,14 @@
           </div>
         {/if}
       </div>
-    {/if}
+    </Disclosure>
   </div>
 {/if}
 
 <style>
   /* 复用 ToolCall 卡片容器样式 */
   .tool-call {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     margin: var(--space-2, 8px) 0;
     overflow: hidden;
@@ -292,7 +294,7 @@
   }
 
   .stats-value {
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .stat-add {
@@ -305,7 +307,7 @@
 
   .stat-meta {
     color: var(--foreground-muted);
-    font-weight: 500;
+    font-weight: var(--font-medium);
   }
 
   .non-text-card {
@@ -314,14 +316,14 @@
     gap: var(--space-3, 12px);
     margin: var(--space-3, 12px);
     padding: var(--space-3, 12px);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-1, rgba(255, 255, 255, 0.02));
   }
 
   .non-text-title {
     font-size: var(--text-sm, 13px);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--foreground);
   }
 
@@ -343,7 +345,7 @@
   .non-text-section-label {
     color: var(--foreground-muted);
     font-size: var(--text-2xs, 11px);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     letter-spacing: 0.04em;
     text-transform: uppercase;
   }
@@ -351,7 +353,7 @@
   .non-text-snippet {
     margin: 0;
     padding: var(--space-2, 8px);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-2, rgba(0, 0, 0, 0.1));
     color: var(--foreground);
@@ -371,7 +373,9 @@
   }
 
   .empty-diff-note.error {
-    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+    padding: var(--space-3, 12px);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 40%, var(--border));
+    border-radius: var(--radius-sm);
     color: var(--error);
     background: color-mix(in srgb, var(--error) 10%, var(--surface-1));
   }
@@ -393,7 +397,7 @@
   .status-error { color: var(--error); }
 
   .tool-content {
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     background: var(--surface-2, rgba(0,0,0,0.1));
     animation: slideDown 0.2s ease-out;
     transform-origin: top;
@@ -401,13 +405,9 @@
 
   .empty-diff-note {
     margin: var(--space-3, 12px);
-    padding: var(--space-3, 12px);
-    border: 1px dashed var(--border);
-    border-radius: var(--radius-sm);
     color: var(--foreground-muted);
     font-size: var(--text-sm, 13px);
     line-height: 1.5;
-    background: var(--surface-1, rgba(255,255,255,0.02));
   }
 
   @keyframes slideDown {

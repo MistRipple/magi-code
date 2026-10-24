@@ -94,8 +94,8 @@ fn wallpaper(
 }
 
 pub fn builtin_themes() -> Vec<ThemeRecord> {
-    let light = scheme("#2563EB", "#FFFFFF", "#1F2937", 52);
-    let dark = scheme("#3B82F6", "#0F141B", "#E5E7EB", 62);
+    let light = scheme("#2563EB", "#FCFCFB", "#272725", 52);
+    let dark = scheme("#3B82F6", "#0B0B0A", "#E7E7E4", 62);
     vec![
         record(ThemePack {
             schema_version: THEME_SCHEMA_VERSION,

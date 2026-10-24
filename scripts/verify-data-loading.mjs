@@ -199,7 +199,7 @@ app.whenReady().then(()=>{const win=new BrowserWindow({show:false,webPreferences
   const modelUrl = '#model-config-orch-base-url';
   const savedUrl = suffix => `http://127.0.0.1:${provider.address().port}/${suffix}`;
   const saveConnection = suffix => json('/api/settings/orchestrator/save', {
-    baseUrl: savedUrl(suffix), apiKey: 'local-fixture', apiProtocol: 'openai_chat', urlMode: 'standard',
+    baseUrl: savedUrl(suffix), apiKey: 'local-fixture', apiProtocol: 'openai_chat',
   });
   const waitConnection = suffix => waitFor(() => page.evaluate(`document.querySelector('${modelUrl}')?.value === ${JSON.stringify(savedUrl(suffix))}`), `设置刷新 ${suffix}`);
   await click('[data-testid="sidebar-settings"]');

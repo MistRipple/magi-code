@@ -3,6 +3,7 @@
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { ThinkingBlock as ThinkingGroup, ThinkingSegment } from '../types/message';
   import Icon from './Icon.svelte';
+  import Disclosure from './Disclosure.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { resolveThinkingTitle } from '../lib/thinking-title';
@@ -54,7 +55,7 @@
     <span class="thinking-title">{title}</span>
   </button>
 
-  {#if !collapsed}
+  <Disclosure expanded={!collapsed}>
     <div class="thinking-content">
       {#each group.segments as segment (segment.segmentId)}
         <div class="thinking-segment" data-thinking-segment-id={segment.segmentId}>
@@ -70,12 +71,12 @@
         </div>
       {/each}
     </div>
-  {/if}
+  </Disclosure>
 </div>
 
 <style>
   .thinking-block {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     margin-top: var(--space-2);
     background: rgba(139, 92, 246, 0.05);
@@ -83,8 +84,7 @@
   }
 
   .thinking-block.streaming {
-    border-color: #a855f7;
-    box-shadow: 0 0 0 1px rgba(168, 85, 247, 0.2);
+    border-color: color-mix(in srgb, #a855f7 25%, var(--border));
   }
 
   .thinking-block.failed {
@@ -115,9 +115,8 @@
   }
 
   .thinking-content {
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     background: rgba(139, 92, 246, 0.02);
-    animation: expandContent 0.2s ease-out;
   }
 
   .thinking-segment {
@@ -125,12 +124,7 @@
   }
 
   .thinking-segment + .thinking-segment {
-    border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  }
-
-  @keyframes expandContent {
-    from { opacity: 0; transform: translateY(-8px); }
-    to { opacity: 1; transform: translateY(0); }
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 72%, transparent);
   }
 
   .thinking-body {

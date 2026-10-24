@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import SelectField from './SelectField.svelte';
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
+  import Modal from './Modal.svelte';
+  import SettingsDetailPage from './SettingsDetailPage.svelte';
+  import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -44,7 +48,6 @@
   let busyAction = $state('');
   let errorMessage = $state('');
   let pendingDelete = $state<ThemeRecord | null>(null);
-  let deleteDialogElement = $state<HTMLDivElement | null>(null);
   let importInput = $state<HTMLInputElement | null>(null);
   let wallpaperInput = $state<HTMLInputElement | null>(null);
   let wallpaperUrls = $state<Record<string, string>>({});
@@ -71,7 +74,7 @@
         errorMessage = error instanceof Error ? error.message : String(error);
       });
     }
-    return unsubscribe;
+    return () => { unsubscribe(); if (editorOpen) void restoreActiveAppearance(); };
   });
 
   $effect(() => {
@@ -152,6 +155,15 @@
     return `user.${slug}-${Date.now().toString(36)}`;
   }
 
+  let themeDraftKey = '';
+  let themeDraftBaseline = '';
+  function restoreThemeDraft(key: string, baseline: string) {
+    themeDraftKey = `theme:${key}`;
+    themeDraftBaseline = baseline;
+    draft = loadViewDraft(themeDraftKey, baseline, draft);
+  }
+  $effect(() => { if (editorOpen && draft && themeDraftKey) saveViewDraft(themeDraftKey, themeDraftBaseline, draft); });
+
   function beginCreate(base?: ThemeRecord): void {
     const source = base?.pack ?? runtime.activeTheme;
     if (!source) return;
@@ -162,6 +174,7 @@
     next.author = undefined;
     editingThemeId = null;
     draft = next;
+    restoreThemeDraft(`copy:${source.id}`, JSON.stringify(source));
     errorMessage = '';
     editorOpen = true;
   }
@@ -173,6 +186,7 @@
     }
     editingThemeId = record.pack.id;
     draft = clonePack(record.pack);
+    restoreThemeDraft(record.pack.id, JSON.stringify(record.pack));
     errorMessage = '';
     editorOpen = true;
   }
@@ -228,6 +242,7 @@
       if (snapshot.activeThemeId !== pack.id) {
         snapshot = await activateAppearanceTheme(pack.id, snapshot.revision);
       }
+      clearViewDraft(themeDraftKey);
       editorOpen = false;
       editingThemeId = null;
       draft = null;
@@ -240,8 +255,7 @@
     if (!library || !record.editable) return;
     errorMessage = '';
     pendingDelete = record;
-    await tick();
-    deleteDialogElement?.focus();
+
   }
 
   async function confirmRemoveTheme(): Promise<void> {
@@ -319,7 +333,8 @@
   }
 </script>
 
-<div class="appearance-tab settings-frame">
+<div class="appearance-tab">
+  <div class="settings-frame" hidden={editorOpen}>
   <div class="settings-section">
     <div class="settings-section-header">
       <div>
@@ -327,22 +342,9 @@
         <div class="settings-section-desc">{i18n.t('settings.locale.description')}</div>
       </div>
       <div class="settings-section-actions">
-        <select
-          class="form-input locale-select"
-          aria-label={i18n.t('settings.locale.label')}
-          value={i18n.locale}
-          onchange={(event) => {
-            const code = event.currentTarget.value;
-            // 失败时界面语言没变，把下拉恢复成实际语言。
-            if (isSupportedLocale(code)) {
-              void switchLocale(code).then((ok) => { if (!ok) event.currentTarget.value = i18n.locale; });
-            }
-          }}
-        >
-          {#each LOCALES as locale (locale.code)}
-            <option value={locale.code} lang={locale.code}>{locale.nativeName}</option>
-          {/each}
-        </select>
+        <SelectField value={i18n.locale} label={i18n.t('settings.locale.label')}
+          options={LOCALES.map(locale => ({ value: locale.code, label: locale.nativeName }))}
+          onchange={(code) => { if (isSupportedLocale(code)) void switchLocale(code); }} />
       </div>
     </div>
   </div>
@@ -463,13 +465,15 @@
 
   </div>
 
+  </div>
+
   {#if editorOpen && draft}
-    <div class="editor-overlay" role="presentation">
-      <section class="theme-editor" data-magi-surface="window" aria-label={editorTitle}>
+    <SettingsDetailPage title={editorTitle} showHeader={false} busy={Boolean(busyAction)} onClose={() => void closeEditor()}>
+      <section class="theme-editor" aria-label={editorTitle}>
         <header class="editor-header">
           <div>
             <h3>{editorTitle}</h3>
-            <p>{i18n.t('appearance.previewHint')}</p>
+            <p>{i18n.t('appearance.previewHint')} · {i18n.t('overlay.draftSession')}</p>
           </div>
           <button class="btn-icon btn-icon--sm" type="button" title={i18n.t('common.cancel')} onclick={() => void closeEditor()} disabled={Boolean(busyAction)}>
             <Icon name="close" size={14} />
@@ -504,7 +508,7 @@
                 <label><span class="form-label">{i18n.t('appearance.foreground')}</span><input class="control-color" type="color" bind:value={draft.schemes.light.foreground} /></label>
                 <label><span class="form-label">{i18n.t('appearance.accent')}</span><input class="control-color" type="color" bind:value={draft.schemes.light.accent} /></label>
               </div>
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.contrast')}</span><input class="control-range" type="range" min="20" max="90" bind:value={draft.schemes.light.contrast} /><output>{draft.schemes.light.contrast}</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.contrast')}</span><input class="control-range" type="range" min="20" max="90" aria-label={i18n.t('appearance.contrast')} aria-valuetext={String(draft.schemes.light.contrast)} bind:value={draft.schemes.light.contrast} /><output>{draft.schemes.light.contrast}</output></label>
             </div>
           {/if}
 
@@ -516,7 +520,7 @@
                 <label><span class="form-label">{i18n.t('appearance.foreground')}</span><input class="control-color" type="color" bind:value={draft.schemes.dark.foreground} /></label>
                 <label><span class="form-label">{i18n.t('appearance.accent')}</span><input class="control-color" type="color" bind:value={draft.schemes.dark.accent} /></label>
               </div>
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.contrast')}</span><input class="control-range" type="range" min="20" max="90" bind:value={draft.schemes.dark.contrast} /><output>{draft.schemes.dark.contrast}</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.contrast')}</span><input class="control-range" type="range" min="20" max="90" aria-label={i18n.t('appearance.contrast')} aria-valuetext={String(draft.schemes.dark.contrast)} bind:value={draft.schemes.dark.contrast} /><output>{draft.schemes.dark.contrast}</output></label>
             </div>
           {/if}
 
@@ -530,10 +534,10 @@
               </div>
             </div>
             {#if draft.wallpaper}
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.focusHorizontal')}</span><input class="control-range" type="range" min="0" max="1" step="0.01" bind:value={draft.wallpaper.focusX} /><output>{Math.round(draft.wallpaper.focusX * 100)}%</output></label>
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.focusVertical')}</span><input class="control-range" type="range" min="0" max="1" step="0.01" bind:value={draft.wallpaper.focusY} /><output>{Math.round(draft.wallpaper.focusY * 100)}%</output></label>
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.dim')}</span><input class="control-range" type="range" min="0" max="0.85" step="0.01" bind:value={draft.wallpaper.dim} /><output>{Math.round(draft.wallpaper.dim * 100)}%</output></label>
-              <label class="range-row"><span class="form-label">{i18n.t('appearance.blur')}</span><input class="control-range" type="range" min="0" max="24" step="1" bind:value={draft.wallpaper.blur} /><output>{draft.wallpaper.blur}px</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.focusHorizontal')}</span><input class="control-range" type="range" min="0" max="1" step="0.01" aria-label={i18n.t('appearance.focusHorizontal')} aria-valuetext={Math.round(draft.wallpaper.focusX * 100) + '%'} bind:value={draft.wallpaper.focusX} /><output>{Math.round(draft.wallpaper.focusX * 100)}%</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.focusVertical')}</span><input class="control-range" type="range" min="0" max="1" step="0.01" aria-label={i18n.t('appearance.focusVertical')} aria-valuetext={Math.round(draft.wallpaper.focusY * 100) + '%'} bind:value={draft.wallpaper.focusY} /><output>{Math.round(draft.wallpaper.focusY * 100)}%</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.dim')}</span><input class="control-range" type="range" min="0" max="0.85" step="0.01" aria-label={i18n.t('appearance.dim')} aria-valuetext={Math.round(draft.wallpaper.dim * 100) + '%'} bind:value={draft.wallpaper.dim} /><output>{Math.round(draft.wallpaper.dim * 100)}%</output></label>
+              <label class="range-row"><span class="form-label">{i18n.t('appearance.blur')}</span><input class="control-range" type="range" min="0" max="24" step="1" aria-label={i18n.t('appearance.blur')} aria-valuetext={draft.wallpaper.blur + 'px'} bind:value={draft.wallpaper.blur} /><output>{draft.wallpaper.blur}px</output></label>
             {/if}
           </div>
         </div>
@@ -546,40 +550,33 @@
           </button>
         </footer>
       </section>
-    </div>
+    </SettingsDetailPage>
   {/if}
 
   {#if pendingDelete}
-    <div class="confirm-overlay" role="presentation">
-      <div bind:this={deleteDialogElement} class="confirm-dialog" data-magi-surface="critical" role="alertdialog" tabindex="-1" aria-labelledby="appearance-delete-title" aria-describedby="appearance-delete-description">
-        <div class="confirm-icon"><Icon name="trash" size={18} /></div>
-        <div class="confirm-copy">
-          <h3 id="appearance-delete-title">{i18n.t('appearance.deleteTitle')}</h3>
-          <p id="appearance-delete-description">{i18n.t('appearance.deleteConfirm', { name: pendingDelete.pack.name })}</p>
-        </div>
-        {#if errorMessage}<div class="inline-alert inline-alert--error confirm-error" role="alert">{errorMessage}</div>{/if}
-        <footer class="confirm-actions">
-          <button class="btn btn--secondary btn--sm" type="button" onclick={() => { pendingDelete = null; errorMessage = ''; }} disabled={Boolean(busyAction)}>{i18n.t('common.cancel')}</button>
-          <button class="btn btn--danger btn--sm" type="button" onclick={() => void confirmRemoveTheme()} disabled={Boolean(busyAction)}>
-            {busyAction.startsWith('delete:') ? i18n.t('common.loading') : i18n.t('appearance.delete')}
-          </button>
-        </footer>
+    <Modal title={i18n.t('appearance.deleteTitle')} size="sm" closeOnEscape={!busyAction} onClose={() => { if (!busyAction) { pendingDelete = null; errorMessage = ''; } }}>
+      <div class="confirm-dialog" data-magi-surface="critical">
+        <p>{i18n.t('appearance.deleteConfirm', { name: pendingDelete.pack.name })}</p>
+        {#if errorMessage}<div class="inline-alert inline-alert--error" role="alert">{errorMessage}</div>{/if}
       </div>
-    </div>
+      {#snippet footer()}
+        <button class="btn btn--secondary btn--sm" onclick={() => { pendingDelete = null; errorMessage = ''; }} disabled={Boolean(busyAction)}>{i18n.t('common.cancel')}</button>
+        <button class="btn btn--error btn--sm" onclick={() => void confirmRemoveTheme()} disabled={Boolean(busyAction)}>{i18n.t('appearance.delete')}</button>
+      {/snippet}
+    </Modal>
   {/if}
 </div>
 
 <style>
-  .appearance-tab { position: relative; color: var(--foreground); }
+  .appearance-tab { position: relative; color: var(--foreground); display: flex; flex-direction: column; min-height: 0; }
   .theme-card-body, .editor-header, .editor-footer, .wallpaper-heading, .theme-actions, .wallpaper-actions { display: flex; align-items: center; }
   .theme-actions, .wallpaper-actions { gap: 8px; }
-  .locale-select { width: auto; min-width: 140px; }
   .theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 16px; }
-  .theme-card { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); }
+  .theme-card { min-width: 0; overflow: hidden; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-lg); }
   .theme-card.active { border-color: color-mix(in srgb, var(--primary) 72%, var(--border)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent); }
-  .theme-preview { position: relative; display: block; width: 100%; height: 104px; overflow: hidden; border: 0; border-bottom: 1px solid var(--border-subtle); cursor: pointer; }
+  .theme-preview { position: relative; display: block; width: 100%; height: 104px; overflow: hidden; border: 0; border-bottom: var(--magi-hairline) solid var(--border-subtle); cursor: pointer; }
   .preview-wallpaper { position: absolute; inset: -24px; background-repeat: no-repeat; background-size: cover; }
-  .preview-wallpaper-dim { position: absolute; inset: 0; background: #000; }
+  .preview-wallpaper-dim { position: absolute; inset: 0; background: #0b0b0a; }
   .preview-sidebar { position: absolute; z-index: 1; inset: 0 auto 0 0; width: 30%; }
   .preview-line { position: absolute; z-index: 1; left: 40%; top: 46%; width: 35%; height: 5px; border-radius: 2px; opacity: .62; }
   .preview-line--wide { top: 31%; width: 48%; opacity: .9; }
@@ -589,44 +586,36 @@
   .theme-meta { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
   .theme-meta strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); }
   .theme-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-2xs); }
-  .editor-overlay { position: absolute; inset: 0; z-index: 4; display: flex; justify-content: flex-end; background: color-mix(in srgb, var(--overlay) 65%, transparent); }
-  .theme-editor { width: min(680px, 100%); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--border); box-shadow: var(--shadow-xl); }
-  .editor-header { justify-content: space-between; gap: 12px; padding: 17px 20px; border-bottom: 1px solid var(--border); }
+  .theme-editor { width: 100%; display: flex; flex-direction: column; }
+  .editor-header { justify-content: space-between; gap: 12px; padding: 17px 20px; border-bottom: var(--magi-hairline) solid var(--border); }
   .editor-header h3 { margin: 0; font-size: var(--text-lg); }
   .editor-header p { margin: 4px 0 0; color: var(--foreground-muted); font-size: var(--text-xs); }
   .editor-content { flex: 1; min-height: 0; overflow: auto; padding: 0 20px; }
-  .editor-section { padding: 17px 0; border-bottom: 1px solid var(--border-subtle); }
+  .editor-section { padding: 17px 0; border-bottom: var(--magi-hairline) solid var(--border-subtle); }
   .editor-section:last-child { border-bottom: 0; }
   .editor-section--identity { max-width: 420px; }
   label { min-width: 0; }
   .editor-section .form-label, .section-label { display: block; margin-bottom: 7px; font-size: var(--text-xs); }
   .material-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .material-options button { min-width: 0; padding: 10px; text-align: left; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); color: var(--foreground); cursor: pointer; }
+  .material-options button { min-width: 0; padding: 10px; text-align: left; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); color: var(--foreground); cursor: pointer; }
   .material-options button.active { border-color: var(--primary); background: var(--primary-muted); }
   .material-options span, .material-options small { display: block; }
   .material-options small { margin-top: 4px; color: var(--foreground-muted); line-height: 1.35; }
   .color-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .color-grid label { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); }
+  .color-grid label { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 34px; padding: 0 9px; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); }
   .color-grid .form-label { margin: 0; }
-  .range-row { display: grid; grid-template-columns: 112px 1fr 48px; align-items: center; gap: 10px; margin-top: 13px; }
+  .range-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) 48px; align-items: center; gap: 10px; margin-top: 13px; }
   .range-row .form-label { margin: 0; }
-  .range-row output { color: var(--foreground-muted); font-size: var(--text-xs); text-align: right; }
+  .range-row output { color: var(--foreground-muted); font-size: var(--text-xs); text-align: right; font-variant-numeric: tabular-nums; }
   .wallpaper-heading { justify-content: space-between; gap: 16px; }
   .wallpaper-heading small { color: var(--foreground-muted); }
   .editor-error { margin: 0 20px 12px; }
-  .editor-footer { justify-content: flex-end; gap: 9px; padding: 13px 20px; border-top: 1px solid var(--border); }
-  .confirm-overlay { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; padding: 20px; background: color-mix(in srgb, var(--overlay) 72%, transparent); }
-  .confirm-dialog { width: min(400px, 100%); display: grid; grid-template-columns: 38px 1fr; gap: 12px; box-sizing: border-box; border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-xl); color: var(--foreground); }
-  .confirm-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: var(--radius-md); background: var(--error-muted); color: var(--error); }
-  .confirm-copy { min-width: 0; }
-  .confirm-copy h3 { margin: 0; font-size: var(--text-base); }
-  .confirm-copy p { margin: 7px 0 0; overflow-wrap: anywhere; color: var(--foreground-muted); font-size: var(--text-sm); line-height: 1.5; }
-  .confirm-error { grid-column: 1 / -1; }
-  .confirm-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+  .editor-footer { justify-content: flex-end; gap: 9px; padding: 13px 20px; border-top: var(--magi-hairline) solid var(--border); }
+  .confirm-dialog { color: var(--foreground); }
   @media (max-width: 720px) {
     .theme-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
     .material-options, .color-grid { grid-template-columns: 1fr; }
     .wallpaper-heading { align-items: flex-start; flex-direction: column; }
-    .range-row { grid-template-columns: 92px 1fr 42px; }
+    .range-row { grid-template-columns: 92px minmax(0, 1fr) 42px; }
   }
 </style>

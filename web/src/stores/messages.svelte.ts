@@ -1,3 +1,4 @@
+import type { ToastAction } from '../types/message';
 /**
  * 消息状态管理 - Svelte 5 Runes
  * 使用细粒度响应式实现高效的流式更新
@@ -677,6 +678,7 @@ const messageProjection = $derived.by(() => {
 });
 
 export interface ToastOptions {
+  action?: ToastAction;
   source?: string;
   actionRequired?: boolean;
   duration?: number;
@@ -684,6 +686,7 @@ export interface ToastOptions {
 }
 
 interface ToastRecord {
+  action?: ToastAction;
   id: string;
   type: string;
   title?: string;
@@ -2519,6 +2522,7 @@ export function addToast(type: string, message: string, title?: string, options?
     type,
     title,
     message,
+    action: options?.action,
     source: options?.source,
     actionRequired: options?.actionRequired,
     duration: options?.duration,

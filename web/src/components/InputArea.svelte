@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from './FileName.svelte';
   import { onMount, type Component } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { turnStoreState } from '../stores/turn-store.svelte';
@@ -37,6 +38,7 @@
   import GoalRunDrawers from './GoalRunDrawers.svelte';
   import { userQuestionState } from '../stores/user-question-store.svelte';
   import Modal from './Modal.svelte';
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import ContextUsageRing from './ContextUsageRing.svelte';
   import { projectSessionContextBudget } from '../lib/context-usage-ring';
   import { resolveUserMessageCommandLabel } from '../lib/user-message-command';
@@ -346,6 +348,9 @@
   let pickerSavingModel = $state<string | null>(null);
   let pickerSavingReasoning = $state<ReasoningEffort | null>(null);
   let pickerModels = $state<string[]>([]);
+  let modelSearch = $state('');
+  let workspaceSearch = $state('');
+  const filteredPickerModels = $derived(pickerModels.filter(model => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
   /**
    * 从 Web 加载的引擎（`apiProtocol = chatgpt_web`，A22）。
    *
@@ -406,11 +411,10 @@
       tokenLimit: configuredContextWindow,
     });
   });
-  const currentAccessProfileOption = $derived.by(() => (
-    accessProfileOptions.find((option) => option.value === selectedAccessProfile)
-    ?? accessProfileOptions[1]
-  ));
   const auxiliaryConfig = $derived.by(() => getAuxiliaryConfigSnapshot());
+  const currentAccessProfileOption = $derived(
+    accessProfileOptions.find(option => option.value === selectedAccessProfile) ?? accessProfileOptions[1]
+  );
   const auxiliaryEnhanceReady = $derived.by(() => hasUsableModelConfig(auxiliaryConfig));
   const enhanceButtonTitle = $derived.by(() => (
     auxiliaryEnhanceReady ? i18n.t('input.enhance.title') : i18n.t('input.enhance.disabled')
@@ -456,6 +460,10 @@
       : resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
   ));
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
+  const filteredPickerWebEngines = $derived(pickerWebEngines.filter(engine => `${engine.displayName} ${engine.id}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
+  const filteredWorkspaces = $derived(workspaceOptions.filter(workspace => `${workspace.name} ${workspace.rootPath}`.toLocaleLowerCase().includes(workspaceSearch.trim().toLocaleLowerCase())));
+  $effect(() => { if (!pickerOpen || pickerModels.length + pickerWebEngines.length <= 10) modelSearch = ''; });
+  $effect(() => { if (!workspacePickerOpen || workspaceOptions.length <= 10) workspaceSearch = ''; });
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
 
   function currentComposerReferenceScopeKey(): string {
@@ -573,6 +581,9 @@
   const MAX_INPUT_CHARS = 10000;
   let inputTextareaEl = $state<HTMLDivElement | null>(null);
   let isComposing = $state(false);
+  // Safari/Chromium 在 compositionend 后偶尔会再补发一次 Enter；这段
+  // 短暂保护期只吞掉该重复事件，不改变后续正常发送。
+  let compositionEndedAt = $state(0);
   let pendingCaretOffset = $state<number | null>(null);
   const sendButtonTitle = $derived.by(() => {
     if (sendPreparing) {
@@ -725,7 +736,10 @@
     });
   });
 
+  let composerUndoEpoch = 0;
+
   function clearComposerState(options: { preserveScopedDraft?: boolean } = {}) {
+    composerUndoEpoch += 1;
     if (!options.preserveScopedDraft && composerReferenceScopeKey) {
       scopedComposerDrafts.delete(composerReferenceScopeKey);
     }
@@ -1224,8 +1238,12 @@
 
   function startBrowserAnnotationEditing(annotation: SelectedBrowserAnnotation): void {
     editingBrowserAnnotation = annotation;
-    editingBrowserAnnotationComment = annotation.comment;
+    editingBrowserAnnotationComment = loadViewDraft(`annotation:${annotation.annotationId}`, annotation.comment, annotation.comment);
   }
+
+  $effect(() => {
+    if (editingBrowserAnnotation) saveViewDraft(`annotation:${editingBrowserAnnotation.annotationId}`, editingBrowserAnnotation.comment, editingBrowserAnnotationComment);
+  });
 
   function closeBrowserAnnotationEditing(): void {
     if (browserAnnotationSaving) return;
@@ -1244,6 +1262,7 @@
         item.annotationId === updated.annotationId ? updated : item
       ));
       window.dispatchEvent(new CustomEvent('magi:browserAnnotationUpdated', { detail: updated }));
+      clearViewDraft(`annotation:${annotation.annotationId}`);
       editingBrowserAnnotation = null;
       editingBrowserAnnotationComment = '';
       addToast('success', i18n.t('browser.annotation.updated'));
@@ -1414,7 +1433,6 @@
     pendingCaretOffset = null;
     queueMicrotask(() => setEditorCaretOffset(target));
   });
-
 
   function closeSlashMenu() {
     slashTriggerStart = null;
@@ -1634,10 +1652,27 @@
     queueMicrotask(focusEditor);
   }
 
+  function removeAnnotationReference(annotation: SelectedBrowserAnnotation) {
+    const scope = currentComposerReferenceScopeKey();
+    const epoch = composerUndoEpoch;
+    selectedBrowserAnnotations = selectedBrowserAnnotations.filter((item) => item.annotationId !== annotation.annotationId);
+    addToast('info', i18n.t('overlay.annotationRemoved'), undefined, { forceVisible: true, action: { label: i18n.t('overlay.undo'), run: () => {
+      if (composerUndoEpoch !== epoch || currentComposerReferenceScopeKey() !== scope || selectedBrowserAnnotations.some((item) => item.annotationId === annotation.annotationId)) return;
+      selectedBrowserAnnotations = [...selectedBrowserAnnotations, annotation];
+    } } });
+  }
+
   function removeContextReference(referenceId: string) {
+    const removed = selectedContextReferences.find((reference) => reference.id === referenceId);
+    const scope = currentComposerReferenceScopeKey();
+    const epoch = composerUndoEpoch;
     selectedContextReferences = selectedContextReferences.filter((reference) => (
       reference.id !== referenceId
     ));
+    if (removed) addToast('info', i18n.t('overlay.contextRemoved'), undefined, { forceVisible: true, action: { label: i18n.t('overlay.undo'), run: () => {
+      if (composerUndoEpoch !== epoch || currentComposerReferenceScopeKey() !== scope || selectedContextReferences.some((reference) => reference.id === removed.id)) return;
+      addContextReference(removed);
+    } } });
     queueMicrotask(focusEditor);
   }
 
@@ -1669,10 +1704,12 @@
 
   function handleCompositionStart() {
     isComposing = true;
+    compositionEndedAt = 0;
   }
 
   function handleCompositionEnd() {
     isComposing = false;
+    compositionEndedAt = Date.now();
     handleComposerInput();
   }
 
@@ -2130,12 +2167,16 @@
 
   // 处理键盘事件
   function handleKeydown(event: KeyboardEvent) {
-    // 部分按键事件不带组合态标记，组件收到 compositionstart 后同样必须让 IME 接管。
+    // IME 组合态优先于快捷键。
     if (isComposing || event.isComposing || event.keyCode === 229) return;
     if (isNewlineShortcut(event)) {
       event.preventDefault();
       closeSlashMenu();
       insertNewlineAtCursor();
+      return;
+    }
+    if (isEnterKey(event) && compositionEndedAt > 0 && Date.now() - compositionEndedAt < 500) {
+      event.preventDefault();
       return;
     }
     if (slashMenuOpen) {
@@ -2392,7 +2433,16 @@
 
   // 🔧 删除已选图片
   function removeImage(imageId: string) {
+    const removed = selectedImages.find((image) => image.id === imageId);
+    const scope = currentComposerReferenceScopeKey();
+    const epoch = composerUndoEpoch;
     selectedImages = selectedImages.filter(img => img.id !== imageId);
+    if (removed) addToast('info', i18n.t('overlay.imageRemoved'), undefined, { forceVisible: true, action: { label: i18n.t('overlay.undo'), run: () => {
+      if (composerUndoEpoch !== epoch || currentComposerReferenceScopeKey() !== scope || selectedImages.some((image) => image.id === removed.id)) return;
+      if (selectedImages.length + pendingImageReadCount >= MAX_COMPOSER_IMAGES) { addToast('warning', i18n.t('input.maxImages', { max: MAX_COMPOSER_IMAGES })); return; }
+      dropSessionCommandForAttachment();
+      selectedImages = [...selectedImages, removed];
+    } } });
   }
 
   // 🔧 清空所有图片
@@ -2532,9 +2582,8 @@
     if (!config || !canFetchModelList(config)) return '';
     const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
     const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
-    const urlMode = typeof config.urlMode === 'string' ? config.urlMode.trim() : '';
     const apiProtocol = typeof config.apiProtocol === 'string' ? config.apiProtocol.trim() : '';
-    return JSON.stringify({ baseUrl, apiKey, urlMode, apiProtocol });
+    return JSON.stringify({ baseUrl, apiKey, apiProtocol });
   }
 
   function applyDraftOrchestratorSessionPatch(patch: Record<string, unknown>) {
@@ -3149,7 +3198,7 @@
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
             <Icon name={reference.kind === 'directory' ? 'folder' : 'document'} size={11} />
-            <span class="ia-reference-chip-label">{reference.name}</span>
+            <span class="ia-reference-chip-label"><FileName name={reference.name} preserveExtension={reference.kind !== 'directory'} /></span>
             <button
               type="button"
               class="ia-reference-chip-remove"
@@ -3177,7 +3226,7 @@
             <button
               type="button"
               class="ia-reference-chip-remove"
-              onclick={() => { selectedBrowserAnnotations = selectedBrowserAnnotations.filter((item) => item.annotationId !== annotation.annotationId); }}
+              onclick={() => removeAnnotationReference(annotation)}
               title={i18n.t('browser.annotation.remove')}
               aria-label={i18n.t('browser.annotation.remove')}
             >
@@ -3482,6 +3531,7 @@
           <button
             type="button"
             class="ia-workspace-btn"
+            aria-haspopup="listbox"
             class:active={workspacePickerOpen}
             class:configured={composerWorkspace !== null}
             class:locked={!isDraftSession}
@@ -3502,22 +3552,26 @@
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (workspacePickerOpen = false)}></div>
-            <div class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="menu">
+            <div class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.workspace.title')}>
               <div class="ia-picker-header">{i18n.t('input.workspace.title')}</div>
+              {#if workspaceOptions.length > 10}<input type="search" class="form-input" bind:value={workspaceSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.workspace.title') })} />{/if}
               {#if workspaceOptions.length === 0}
                 <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
               {:else}
-                <div class="ia-picker-list">
-                  {#each workspaceOptions as workspace (workspace.workspaceId)}
+                <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.workspace.title')}>
+                  {#each filteredWorkspaces as workspace (workspace.workspaceId)}
                     <button
                       type="button"
                       class="ia-picker-item"
                       class:selected={composerWorkspace?.workspaceId === workspace.workspaceId}
+                      role="option" aria-selected={composerWorkspace?.workspaceId === workspace.workspaceId}
                       onclick={() => selectWorkspace(workspace.workspaceId)}
                     >
                       <span class="ia-picker-item-label">{workspace.name}</span>
                       <span class="ia-picker-item-desc">{workspace.rootPath}</span>
                     </button>
+                  {:else}
+                    <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
                   {/each}
                 </div>
               {/if}
@@ -3559,6 +3613,7 @@
               onclick={() => (accessProfilePickerOpen = !accessProfilePickerOpen)}
               disabled={sessionInputLocked || isInteractionBlocking}
               title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}。${i18n.t(currentAccessProfileOption.descriptionKey)}`}
+              aria-haspopup="listbox"
               aria-expanded={accessProfilePickerOpen}
               aria-label={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}`}
             >
@@ -3569,17 +3624,17 @@
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
-              <div class="ia-picker-popover ia-access-popover" data-magi-surface="popover" role="menu">
+              <div class="ia-picker-popover ia-access-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.access.title')}>
                 <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
-                <div class="ia-picker-list">
+                <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.access.title')}>
                   {#each accessProfileOptions as option (option.value)}
                     <button
                       type="button"
                       class="ia-picker-item ia-access-option ia-access-option--{option.value}"
                       class:selected={selectedAccessProfile === option.value}
                       onclick={() => selectAccessProfile(option.value)}
-                      role="menuitemradio"
-                      aria-checked={selectedAccessProfile === option.value}
+                      role="option"
+                      aria-selected={selectedAccessProfile === option.value}
                     >
                       <span class="ia-access-option-icon"><Icon name={option.icon} size={14} /></span>
                       <span class="ia-access-option-copy">
@@ -3623,6 +3678,7 @@
           <button
             type="button"
             class="ia-picker-btn ia-model-btn"
+            aria-haspopup="listbox"
             class:active={pickerOpen}
             class:configured={currentPickerModel !== ''}
             onclick={togglePicker}
@@ -3646,16 +3702,17 @@
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
-            <div class="ia-session-model-popover" data-magi-surface="popover" role="menu">
+            <div class="ia-session-model-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.mainModelPicker.header')}>
               {#if !currentSessionUsesWebEngine}
               <div class="ia-effort-section">
                 <div class="ia-picker-header">{i18n.t('input.mainModelPicker.reasoning.header')}</div>
-                <div class="ia-effort-strip">
+                <div class="ia-effort-strip" role="group" aria-label={i18n.t('input.mainModelPicker.reasoning.header')}>
                   {#each reasoningOptions as option (option.labelKey)}
                     <button
                       type="button"
                       class="ia-effort-option"
                       class:selected={currentPickerReasoningEffort === option.value}
+                      aria-pressed={currentPickerReasoningEffort === option.value}
                       onclick={() => void selectPickerReasoningEffort(option.value)}
                       disabled={pickerSavingReasoning !== null || pickerSavingModel !== null}
                     >
@@ -3683,6 +3740,9 @@
                     <Icon name="refresh" size={13} class={pickerLoading ? 'spinning' : ''} />
                   </button>
                 </div>
+                {#if pickerModels.length + pickerWebEngines.length > 10}
+                  <input type="search" class="form-input" bind:value={modelSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.mainModelPicker.header') })} />
+                {/if}
                 {#if pickerLoading}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
                 {:else if pickerError}
@@ -3697,12 +3757,16 @@
                 {:else if pickerModels.length === 0 && pickerWebEngines.length === 0}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
                 {:else}
-                  <div class="ia-picker-list">
-                    {#each pickerModels as model (model)}
+                  {#if filteredPickerModels.length === 0 && filteredPickerWebEngines.length === 0}
+                    <div class="ia-picker-status" role="status">{i18n.t('selection.empty')}</div>
+                  {/if}
+                  <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.mainModelPicker.header')}>
+                    {#each filteredPickerModels as model (model)}
                       <button
                         type="button"
                         class="ia-picker-item ia-picker-row"
                         class:selected={!currentPickerEngineId && currentPickerModel === model}
+                        role="option" aria-selected={!currentPickerEngineId && currentPickerModel === model}
                         onclick={() => void selectPickerModel(model)}
                         disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
                       >
@@ -3718,12 +3782,13 @@
                   {#if pickerWebEngines.length > 0}
                     <div class="ia-picker-divider"></div>
                     <div class="ia-picker-header">{i18n.t('input.mainModelPicker.webSection')}</div>
-                    <div class="ia-picker-list">
-                      {#each pickerWebEngines as engine (engine.id)}
+                    <div class="ia-picker-list" role="listbox" aria-label={i18n.t('input.mainModelPicker.webSection')}>
+                      {#each filteredPickerWebEngines as engine (engine.id)}
                         <button
                           type="button"
                           class="ia-picker-item ia-picker-row"
                           class:selected={currentPickerEngineId === engine.id}
+                          role="option" aria-selected={currentPickerEngineId === engine.id}
                           data-magi-web-engine-row={engine.id}
                           onclick={() => void selectPickerWebEngine(engine)}
                           disabled={pickerSavingModel !== null
@@ -3791,6 +3856,7 @@
                   type="button"
                   class="ia-web-mode-btn"
                   class:selected={webConversationMode === 'temporary'}
+                  aria-pressed={webConversationMode === 'temporary'}
                   data-web-model-mode-chip-option="temporary"
                   disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
                   title={i18n.t('webModel.mode.temporaryHint')}
@@ -3800,6 +3866,7 @@
                   type="button"
                   class="ia-web-mode-btn"
                   class:selected={webConversationMode === 'saved'}
+                  aria-pressed={webConversationMode === 'saved'}
                   data-web-model-mode-chip-option="saved"
                   disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
                   title={i18n.t('webModel.mode.savedHint')}
@@ -3935,11 +4002,13 @@
 {#if editingBrowserAnnotation}
   <Modal
     title={i18n.t('browser.annotation.editTitle')}
+    form
+    closeOnEscape={!browserAnnotationSaving}
     onClose={closeBrowserAnnotationEditing}
-    closeOnBackdrop={true}
     size="sm"
     modalClass="browser-annotation-edit-modal"
   >
+    <p class="settings-hint" role="status">{i18n.t('overlay.draftSession')}</p>
     <div class="browser-annotation-edit-form">
       <textarea
         bind:value={editingBrowserAnnotationComment}
@@ -4020,17 +4089,18 @@
     container-type: inline-size;
     max-height: 50vh;
     background: var(--vscode-input-background);
-    border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    border: 0;
     border-radius: var(--radius-xl);
-    box-shadow: var(--shadow-sm);
-    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint);
+    transition: box-shadow 180ms var(--magi-ease-ink), background 180ms ease;
     position: relative;
     /* 不使用 overflow:hidden — 允许模型下拉菜单溢出显示 */
   }
 
   .ia-wrapper:focus-within {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-muted);
+    box-shadow: inset 0 0 0 1px var(--magi-focus-ring),
+      0 0 0 2px color-mix(in srgb, var(--foreground) 7%, transparent),
+      0 0 0 4px color-mix(in srgb, var(--foreground) 3%, transparent);
   }
 
   .ia-editing-bar {
@@ -4041,7 +4111,7 @@
     gap: var(--space-3);
     min-height: 30px;
     padding: 4px var(--space-3);
-    border-bottom: 1px solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
     color: var(--foreground-secondary);
     font-size: var(--text-xs);
   }
@@ -4123,7 +4193,7 @@
   .ia-textarea[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
   .ia-textarea.has-images { min-height: 36px; }
 
-  .ia-textarea :global(.md-bold) { font-weight: 600; }
+  .ia-textarea :global(.md-bold) { font-weight: var(--font-semibold); }
   .ia-textarea :global(.md-italic) { font-style: italic; }
   .ia-textarea :global(.md-code) {
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
@@ -4133,7 +4203,7 @@
     padding: 0 3px;
   }
   .ia-textarea :global(.md-heading) {
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--primary, currentColor);
   }
   .ia-textarea :global(.md-quote) {
@@ -4141,7 +4211,7 @@
   }
   .ia-textarea :global(.md-list-marker) {
     color: var(--primary, currentColor);
-    font-weight: 500;
+    font-weight: var(--font-medium);
   }
 
   /* 操作栏 */
@@ -4222,7 +4292,7 @@
     width: 24px;
     padding: 0;
     background: transparent;
-    border: 1px solid var(--border-subtle);
+    border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     font-size: 11px;
@@ -4266,7 +4336,7 @@
     width: 28px;
     height: 28px;
     padding: 0;
-    border: 1px solid transparent;
+    border: 0;
     border-radius: var(--radius-full);
     background: transparent;
     color: var(--foreground-muted);
@@ -4286,6 +4356,7 @@
   .ia-add-wrap {
     flex: 0 0 auto;
   }
+
   .ia-access-btn-label {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4307,6 +4378,7 @@
     border-color: color-mix(in srgb, var(--warning) 38%, var(--border-subtle));
     color: color-mix(in srgb, var(--warning) 82%, var(--foreground));
   }
+  .ia-workspace-btn, .ia-model-btn { box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); }
   .ia-workspace-wrap {
     max-width: 190px;
   }
@@ -4323,7 +4395,7 @@
     min-width: 0;
     padding: 0 8px;
     background: transparent;
-    border: 1px solid var(--border-subtle);
+    border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     font-size: 11px;
@@ -4377,7 +4449,8 @@
     display: inline-flex;
     align-items: center;
     height: 24px;
-    border: 1px solid var(--border);
+    border: 0;
+    background: var(--surface-2);
     border-radius: var(--radius-full);
     overflow: hidden;
     font-size: 11px;
@@ -4399,7 +4472,7 @@
   .ia-web-mode-btn.selected {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
     color: var(--primary);
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
   }
   .ia-web-mode-btn:disabled {
     cursor: default;
@@ -4421,7 +4494,7 @@
     color: inherit;
     font-size: 10px;
     line-height: 16px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     white-space: nowrap;
   }
   .ia-workspace-btn {
@@ -4433,7 +4506,7 @@
     min-width: 0;
     padding: 0 8px;
     background: transparent;
-    border: 1px solid var(--border-subtle);
+    border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     font-size: 11px;
@@ -4473,28 +4546,29 @@
     right: 0;
     z-index: 31;
     width: 280px;
-    max-height: 360px;
+    max-height: 264px;
     overflow-y: auto;
     padding: 8px;
     background: color-mix(in srgb, var(--background) 100%, white 8%);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
-    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
-    border-radius: var(--radius-md);
-    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
+    border: 0;
+    border-radius: calc(var(--radius-sm) + 8px);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
   }
   .ia-add-popover {
+    border-radius: calc(var(--radius-sm) + 6px);
     left: 0;
     right: auto;
     width: min(380px, calc(100vw - 24px));
-    max-height: min(520px, 62vh);
+    max-height: min(264px, 62vh);
     padding: 6px;
   }
   .ia-add-group-label {
     padding: 7px 9px 4px;
     color: var(--foreground-muted);
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
   .ia-add-item {
     display: flex;
@@ -4544,7 +4618,7 @@
   .ia-add-item-label {
     flex: 0 0 auto;
     font-size: 13px;
-    font-weight: 520;
+    font-weight: calc(var(--font-medium) + 20);
     white-space: nowrap;
   }
   .ia-add-item-description {
@@ -4563,12 +4637,12 @@
     display: flex;
     flex-direction: column;
     width: min(280px, calc(100vw - 24px));
-    max-height: 420px;
+    max-height: 264px;
     padding: 8px;
     background: color-mix(in srgb, var(--background) 100%, white 8%);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
-    border: 1px solid color-mix(in srgb, var(--border) 70%, var(--foreground) 30%);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 70%, var(--foreground) 30%);
     border-radius: var(--radius-md);
     box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.22);
   }
@@ -4594,7 +4668,7 @@
     justify-content: center;
     padding: 0 6px;
     background: transparent;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-sm, 6px);
     color: var(--foreground);
     font-size: 12px;
@@ -4655,6 +4729,7 @@
     cursor: wait;
     opacity: 0.55;
   }
+
   .ia-picker-popover.ia-access-popover {
     box-sizing: border-box;
     width: min(248px, calc(100vw - 20px));
@@ -4682,7 +4757,7 @@
     gap: 7px;
     min-height: 42px;
     padding: 5px 7px;
-    border: 1px solid transparent;
+    border: 0;
     transition:
       background var(--transition-fast),
       border-color var(--transition-fast),
@@ -4740,12 +4815,10 @@
     line-height: 13px;
   }
   .ia-picker-item.ia-access-option.selected {
-    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 5%, transparent);
   }
   .ia-picker-item.ia-access-option--full_access.selected {
     background: color-mix(in srgb, var(--warning) 10%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
     color: var(--foreground);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 4%, transparent);
   }
@@ -4882,7 +4955,7 @@
     padding: 2px 10px;
     font-size: 11px;
     background: transparent;
-    border: 1px solid var(--border-subtle);
+    border: 0;
     border-radius: var(--radius-full);
     color: var(--foreground-muted);
     cursor: pointer;
@@ -4911,7 +4984,7 @@
     padding: 3px 6px 3px 10px;
     border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--primary) 16%, transparent);
-    border: 1px solid color-mix(in srgb, var(--primary) 38%, transparent);
+    border: 0;
     color: var(--primary);
     font-size: 12px;
     line-height: 1.2;
@@ -4936,10 +5009,13 @@
     background: var(--info);
     color: white;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     line-height: 1;
   }
   .ia-reference-chip-label {
+    display: inline-flex;
+    min-width: 0;
+    overflow: hidden;
     font-weight: var(--font-medium, 500);
     white-space: nowrap;
   }
@@ -4955,6 +5031,7 @@
     color: color-mix(in srgb, var(--success) 64%, var(--foreground-muted));
   }
   .ia-reference-chip-remove {
+    flex: 0 0 16px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4980,7 +5057,7 @@
     width: 100%;
     min-height: 92px;
     resize: vertical;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--background);
     color: var(--foreground);
@@ -4996,7 +5073,7 @@
   .browser-annotation-edit-actions button {
     min-height: 30px;
     padding: 0 10px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-1);
     color: var(--foreground);
@@ -5019,27 +5096,27 @@
     left: 8px;
     z-index: 31;
     width: min(420px, calc(100% - 16px));
-    max-height: 360px;
+    max-height: 264px;
     padding: 6px;
     background: color-mix(in srgb, var(--background) 100%, white 6%);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
-    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
-    border-radius: var(--radius-md);
-    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.25);
+    border: 0;
+    border-radius: calc(var(--radius-sm) + 6px);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.25);
   }
   .ia-slash-list {
     display: flex;
     flex-direction: column;
     gap: 1px;
-    max-height: 308px;
+    max-height: 264px;
     overflow-y: auto;
   }
   .ia-slash-group-label {
     padding: 6px 9px 4px;
     color: var(--foreground-muted);
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1;
   }
   .ia-slash-item.disabled {
@@ -5126,7 +5203,7 @@
     justify-content: center;
     color: var(--primary);
     font-size: var(--text-sm);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     background: color-mix(in srgb, var(--background) 82%, transparent);
     border-radius: inherit;
     pointer-events: none;
@@ -5148,7 +5225,7 @@
     display: inline-block;
     margin-right: 6px;
     color: var(--color-orchestrator);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .ia-queue-panel {
@@ -5205,7 +5282,7 @@
     }
 
     .ia-wrapper {
-      max-height: min(46vh, 340px);
+      max-height: min(46vh, 264px);
       border-radius: var(--radius-lg);
     }
 
@@ -5220,7 +5297,7 @@
 
     .ia-picker-popover {
       width: min(280px, calc(100vw - 24px));
-      max-height: min(360px, 56vh);
+      max-height: min(264px, 56vh);
     }
 
     .ia-session-model-popover {

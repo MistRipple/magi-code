@@ -140,7 +140,7 @@
   .wm-banner-action {
     flex: none;
     padding: 2px 10px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.3));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.3));
     border-radius: var(--radius-sm);
     font-size: var(--text-xs);
     background: transparent;

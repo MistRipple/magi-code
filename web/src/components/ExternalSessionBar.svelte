@@ -20,5 +20,5 @@
 
 <style>
   .external-bar { max-width: 860px; width: 100%; margin: 0 auto; padding: var(--space-3) var(--space-5) var(--space-4); box-sizing: border-box; }
-  .external-note { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-md); font-size: var(--text-xs); color: var(--foreground-muted); }
+  .external-note { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); font-size: var(--text-xs); color: var(--foreground-muted); }
 </style>

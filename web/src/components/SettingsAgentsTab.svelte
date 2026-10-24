@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
   import type { ProfessionalCapabilitySummary, RoleTemplate } from '../shared/types/role-templates';
   import { isAgentBindingOperational, resolveSelectableRegistryEngines } from '../shared/model-governance';
@@ -241,10 +242,20 @@
     return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
   }
 
+  let roleDraftKey = '';
+  let roleDraftBaseline = '';
+  function restoreRoleDraft(key: string) {
+    roleDraftKey = `role:${key}`;
+    roleDraftBaseline = JSON.stringify(draft);
+    draft = loadViewDraft(roleDraftKey, roleDraftBaseline, draft);
+  }
+  $effect(() => { if (editorOpen && roleDraftKey) saveViewDraft(roleDraftKey, roleDraftBaseline, draft); });
+
   function openCreateRole() {
     editorMode = 'create';
     editorError = '';
     draft = emptyDraft();
+    restoreRoleDraft('new');
     editorOpen = true;
   }
 
@@ -253,6 +264,7 @@
     editorMode = 'edit';
     editorError = '';
     draft = draftFromTemplate(template);
+    restoreRoleDraft(template.templateId);
     editorOpen = true;
   }
 
@@ -260,6 +272,7 @@
     editorMode = 'create';
     editorError = '';
     draft = draftFromTemplate(template, true);
+    restoreRoleDraft(`copy:${template.templateId}`);
     editorOpen = true;
   }
 
@@ -313,6 +326,7 @@
     editorBusy = true;
     try {
       await saveRole(payload, draft.roleRevision);
+      clearViewDraft(roleDraftKey);
       editorOpen = false;
     } catch (error) {
       editorError = error instanceof Error ? error.message : i18n.t('settings.agents.error.saveFallback');
@@ -325,7 +339,7 @@
     if (!template.deletable || template.roleRevision === undefined) return;
     if (!(await confirmMessage(i18n.t('settings.agents.confirmDelete', {
       name: resolveLocalizedTemplateDisplayName(template),
-    }), { tone: 'danger' }))) return;
+    }), { tone: 'danger', confirmLabel: i18n.t('overlay.deleteRole') }))) return;
     try {
       await deleteRole(template.templateId, template.roleRevision);
       selectedKey = null;
@@ -531,6 +545,7 @@
                   <p>{i18n.t('settings.agents.editor.description')}</p>
                 </div>
               </header>
+              <p class="settings-hint" role="status">{i18n.t('overlay.draftSession')}</p>
               <div class="role-editor-grid">
                 <label>{i18n.t('settings.agents.editor.displayName')}<input bind:this={roleEditorDisplayNameInput} bind:value={draft.displayName} placeholder={i18n.t('settings.agents.editor.displayNamePlaceholder')} /></label>
                 <label class="wide">{i18n.t('settings.agents.editor.roleDescription')}<input bind:value={draft.description} placeholder={i18n.t('settings.agents.editor.roleDescriptionPlaceholder')} /></label>
@@ -746,11 +761,11 @@
     padding: 14px 0 12px;
     margin-bottom: 2px;
   }
-  .toolbar-title { font-size: 14px; font-weight: 650; color: var(--ind-foreground); }
+  .toolbar-title { font-size: 14px; font-weight: calc(var(--font-semibold) + 50); color: var(--ind-foreground); }
   .toolbar-description { margin-top: 4px; color: var(--ind-foreground-soft); font-size: 12px; }
   .toolbar-actions, .detail-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .toolbar-button {
-    border: 1px solid var(--ind-border-separator);
+    border: var(--magi-hairline) solid var(--ind-border-separator);
     background: var(--ind-bg-control);
     color: var(--ind-foreground-secondary);
     border-radius: 7px;
@@ -778,7 +793,7 @@
     border-radius: 999px;
     padding: 3px 7px;
     font-size: 10px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
   .source-badge.source-builtin { color: var(--ind-foreground-soft); background: color-mix(in srgb, var(--ind-foreground) 7%, transparent); }
   .source-badge.source-user { color: var(--ind-tab-accent); background: color-mix(in srgb, var(--ind-tab-accent) 10%, transparent); }
@@ -792,7 +807,7 @@
   .role-editor {
     width: 100%;
     box-sizing: border-box;
-    border: 1px solid var(--ind-border-card-strong);
+    border: var(--magi-hairline) solid var(--ind-border-card-strong);
     border-radius: var(--radius-lg);
     background: color-mix(in srgb, var(--ind-bg-card-elevated) 92%, transparent);
     color: var(--ind-foreground);
@@ -829,24 +844,24 @@
     margin-bottom: 5px;
     color: var(--ind-tab-accent);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     letter-spacing: .04em;
   }
   .role-editor-header h2 { margin: 0; font-size: 18px; color: var(--ind-foreground); }
   .role-editor-header p { margin: 7px 0 0; color: var(--ind-foreground-soft); font-size: 12px; line-height: 1.5; }
   .role-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 20px; align-items: start; }
-  .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: 600; line-height: 1.35; }
-  .role-editor-grid input:not([type='checkbox']), .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: 1px solid var(--ind-border-control); border-radius: var(--radius-md); background: var(--ind-bg-control); color: var(--ind-foreground); padding: 9px 10px; font: inherit; font-size: 13px; line-height: 1.45; resize: vertical; }
+  .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: var(--font-semibold); line-height: 1.35; }
+  .role-editor-grid input:not([type='checkbox']), .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: var(--magi-hairline) solid var(--ind-border-control); border-radius: var(--radius-md); background: var(--ind-bg-control); color: var(--ind-foreground); padding: 9px 10px; font: inherit; font-size: 13px; line-height: 1.45; resize: vertical; }
   .role-editor-grid input:not([type='checkbox'])::placeholder, .role-editor-grid textarea::placeholder { color: var(--ind-foreground-soft); opacity: 1; }
   .role-editor-grid input:not([type='checkbox']):disabled { opacity: .65; cursor: not-allowed; }
-  .role-editor-grid input:focus, .role-editor-grid textarea:focus { outline: 2px solid color-mix(in srgb, var(--ind-tab-accent) 34%, transparent); outline-offset: 1px; }
+  .role-editor-grid input:focus, .role-editor-grid textarea:focus { outline: none; box-shadow: var(--magi-focus-shadow); }
   .role-editor-grid .wide { grid-column: 1 / -1; }
-  .role-editor-grid fieldset { min-width: 0; border: 1px solid var(--ind-border-control); border-radius: var(--radius-lg); padding: 12px 14px 14px; }
+  .role-editor-grid fieldset { min-width: 0; border: var(--magi-hairline) solid var(--ind-border-control); border-radius: var(--radius-lg); padding: 12px 14px 14px; }
   .checkbox-grid { display: flex; flex-wrap: wrap; gap: 9px 16px; margin-top: 8px; }
-  .checkbox-label { display: inline-flex !important; align-items: center; gap: 6px; font-weight: 500 !important; cursor: pointer; }
+  .checkbox-label { display: inline-flex !important; align-items: center; gap: 6px; font-weight: var(--font-medium) !important; cursor: pointer; }
   .checkbox-label input { width: auto; margin: 0; accent-color: var(--ind-tab-accent); }
   .role-editor-error { margin-top: 14px; padding: 9px 11px; border-radius: 7px; color: var(--error, #ff3b30); background: color-mix(in srgb, var(--error, #ff3b30) 9%, transparent); font-size: 12px; }
-  .role-editor-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--ind-border-separator); }
+  .role-editor-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 20px; padding-top: 16px; border-top: var(--magi-hairline) solid var(--ind-border-separator); }
 
   .agents-shell {
     display: grid;
@@ -864,7 +879,7 @@
     position: relative;
     overflow: hidden;
     scrollbar-width: none;
-    border-right: 1px solid var(--ind-border-separator);
+    border-right: var(--magi-hairline) solid var(--ind-border-separator);
     padding: 8px 14px 8px 0;
   }
   .agents-tabbar::-webkit-scrollbar { height: 0; }
@@ -890,7 +905,7 @@
     color: var(--ind-foreground-muted);
     font-family: inherit;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     letter-spacing: -0.005em;
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
@@ -902,7 +917,7 @@
   }
   .role-tab.active {
     color: var(--ind-foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
   .role-tab.active::before {
     content: '';
@@ -947,7 +962,7 @@
 
   .role-tab-subtitle {
     font-size: 11.5px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     line-height: 1.2;
     color: var(--ind-foreground-soft);
     overflow: hidden;
@@ -1010,11 +1025,11 @@
     align-items: center;
     justify-content: center;
     font-size: 11.5px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     font-variant-numeric: tabular-nums;
     color: var(--ind-tab-accent);
     background: color-mix(in srgb, var(--ind-tab-accent) 10%, var(--ind-bg-control));
-    border: 1px solid color-mix(in srgb, var(--ind-tab-accent) 22%, var(--ind-border-control));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--ind-tab-accent) 22%, var(--ind-border-control));
   }
 
   .domain-library .section-title {
@@ -1097,7 +1112,7 @@
   }
   .detail-title {
     font-size: 18px;
-    font-weight: 650;
+    font-weight: calc(var(--font-semibold) + 50);
     color: var(--ind-foreground);
     letter-spacing: -0.018em;
     white-space: nowrap;
@@ -1110,9 +1125,9 @@
     height: 22px;
     padding: 0 8px;
     border-radius: 999px;
-    border: 1px solid var(--ind-border-control);
+    border: var(--magi-hairline) solid var(--ind-border-control);
     font-size: 11.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1;
     color: var(--ind-foreground-secondary);
     background: var(--ind-bg-control);
@@ -1133,7 +1148,7 @@
   }
   .detail-kicker {
     font-size: 13px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     color: var(--ind-foreground-muted);
     letter-spacing: 0;
     white-space: nowrap;
@@ -1164,7 +1179,7 @@
   /* 与 SettingsModelTab.settings-section-title 对齐：14px / 700，常规文字色（非 uppercase microcopy） */
   .section-title {
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--font-bold);
     letter-spacing: 0;
     text-transform: none;
     color: var(--ind-foreground);
@@ -1220,10 +1235,10 @@
     padding: 0 12px;
     border-radius: 7px;
     font-size: 12.5px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     color: var(--ind-foreground-secondary);
     background: color-mix(in srgb, var(--ind-foreground) 5%, transparent);
-    border: 1px solid var(--ind-border-separator);
+    border: var(--magi-hairline) solid var(--ind-border-separator);
     letter-spacing: -0.005em;
   }
   .chip-insight-decision { color: var(--ind-tab-accent); border-color: color-mix(in srgb, var(--ind-tab-accent) 24%, transparent); background: color-mix(in srgb, var(--ind-tab-accent) 8%, transparent); }
@@ -1239,7 +1254,7 @@
     }
     .agents-tabbar {
       border-right: none;
-      border-bottom: 1px solid var(--ind-border-separator);
+      border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
       padding: 0 0 10px;
       overflow-x: auto;
     }
@@ -1289,7 +1304,7 @@
     }
     .engine-row {
       padding-top: 16px;
-      border-top: 1px solid var(--ind-border-separator);
+      border-top: var(--magi-hairline) solid var(--ind-border-separator);
     }
   }
 
@@ -1304,7 +1319,7 @@
     }
     .detail-masonry .detail-section {
       margin-bottom: 18px;
-      border-bottom: 1px solid var(--ind-border-separator);
+      border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
     }
     .detail-masonry .detail-section:last-child {
       margin-bottom: 0;

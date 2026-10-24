@@ -9,6 +9,8 @@
 import { i18n } from './i18n.svelte';
 
 export interface ConfirmRequest {
+  /** 轻量确认的触发按钮；不存在时使用阻塞 Modal。只保存本次界面引用。 */
+  anchor?: HTMLElement;
   title: string;
   message: string;
   confirmLabel: string;
@@ -39,17 +41,18 @@ export async function confirmAction(request: ConfirmRequest): Promise<boolean> {
 }
 
 /**
- * 只有一段说明文字的确认：标题和按钮用通用文案，取代 `window.confirm(message)` 的写法。
+ * 短确认：调用方必须提供动作化确认文案，可附带锚点显示为 Popconfirm。
  * 需要更具体的标题或按钮文字时使用 `confirmAction`。
  */
 export function confirmMessage(
   message: string,
-  options: { title?: string; confirmLabel?: string; tone?: 'default' | 'danger' } = {},
+  options: { title?: string; confirmLabel: string; tone?: 'default' | 'danger'; anchor?: HTMLElement },
 ): Promise<boolean> {
   return confirmAction({
+    anchor: options.anchor,
     title: options.title ?? i18n.t('common.confirmTitle'),
     message,
-    confirmLabel: options.confirmLabel ?? i18n.t('common.confirm'),
+    confirmLabel: options.confirmLabel,
     cancelLabel: i18n.t('common.cancel'),
     tone: options.tone ?? 'default',
   });

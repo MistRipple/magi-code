@@ -84,6 +84,7 @@
     max-width: 100%;
     overflow-wrap: anywhere;
     color: var(--foreground);
+    text-wrap: pretty;
   }
 
   .markdown-fallback {
@@ -107,8 +108,11 @@
   .markdown-content :global(h3),
   .markdown-content :global(h4) {
     margin: var(--spacing-md) 0 var(--spacing-sm) 0;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
+
+  .markdown-content :global(strong),
+  .markdown-content :global(b) { font-weight: var(--font-bold); }
 
   /* 标题字体大小适配消息内容，不宜过大 */
   .markdown-content :global(h1) { font-size: var(--text-lg); }
@@ -159,18 +163,18 @@
   .markdown-content :global(th),
   .markdown-content :global(td) {
     padding: var(--spacing-sm);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     text-align: left;
   }
 
   .markdown-content :global(th) {
     background: var(--code-bg);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .markdown-content :global(hr) {
     border: none;
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     margin: var(--spacing-md) 0;
   }
 
@@ -197,7 +201,7 @@
     border-radius: 3px;
     background: transparent;
     color: var(--foreground-muted);
-    vertical-align: text-bottom;
+    vertical-align: -0.125em;
     cursor: pointer;
     opacity: .68;
   }

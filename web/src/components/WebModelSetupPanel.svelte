@@ -140,7 +140,7 @@
 {/if}
 
 <style>
-  .setup-panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin: 0 0 8px; font-size: 12px; }
+  .setup-panel { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 12px; margin: 0 0 8px; font-size: 12px; }
   .setup-heading, .setup-heading strong, .setup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setup-heading { justify-content: space-between; }
   p { margin: 8px 0; line-height: 1.6; overflow-wrap: anywhere; }

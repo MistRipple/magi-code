@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { getToasts, removeToast as dismissToast } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
   import type { Toast } from '../types/message';
@@ -13,6 +14,8 @@
 
   // 跟踪已设置定时器的 toast ID
   const activeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  onDestroy(() => { for (const timer of activeTimers.values()) clearTimeout(timer); activeTimers.clear(); });
 
   // 移除 toast
   function removeToast(id: string) {
@@ -55,7 +58,7 @@
 
 <div class="toast-container">
   {#each toasts as toast (toast.id)}
-    <div class="toast" class:success={toast.type === 'success'} class:error={toast.type === 'error'} class:warning={toast.type === 'warning'}>
+    <div role="status" class="toast" class:success={toast.type === 'success'} class:error={toast.type === 'error'} class:warning={toast.type === 'warning'}>
       <div class="toast-icon">
         {#if toast.type === 'success'}
           <Icon name="check" size={16} />
@@ -73,6 +76,9 @@
         {/if}
         <div class="toast-message">{toast.message}</div>
       </div>
+      {#if toast.action}
+        <button type="button" class="toast-action" onclick={() => { removeToast(toast.id); void toast.action?.run(); }}>{toast.action.label}</button>
+      {/if}
       <button class="toast-close" onclick={() => removeToast(toast.id)} title={i18n.t('toastContainer.closeNotification')}>
         <Icon name="close" size={12} />
       </button>
@@ -98,7 +104,7 @@
     gap: var(--space-3);
     padding: var(--space-3) var(--space-4);
     background: var(--background);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     pointer-events: auto;
@@ -161,6 +167,9 @@
     overflow: hidden;
     word-break: break-word;
   }
+
+  .toast-action { border: 0; border-radius: var(--radius-sm); padding: 4px 8px; background: var(--surface-2); color: var(--foreground); cursor: pointer; white-space: nowrap; }
+  .toast-action:hover { background: var(--surface-hover); }
 
   .toast-close {
     flex-shrink: 0;

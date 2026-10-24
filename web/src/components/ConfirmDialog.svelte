@@ -1,11 +1,14 @@
 <script lang="ts">
   import { confirmDialogState, settleConfirm } from '../stores/confirm-dialog.svelte';
   import Modal from './Modal.svelte';
+  import Popconfirm from './Popconfirm.svelte';
 
   const request = $derived(confirmDialogState.request);
 </script>
 
-{#if request}
+{#if request?.anchor && !request.secondaryLabel}
+  <Popconfirm anchor={request.anchor} title={request.title} message={request.message} confirmLabel={request.confirmLabel} cancelLabel={request.cancelLabel} onConfirm={() => settleConfirm('confirm')} onCancel={() => settleConfirm('cancel')} />
+{:else if request}
   <Modal title={request.title} size="sm" onClose={() => settleConfirm('cancel')} closeOnBackdrop>
     <p class="confirm-message">{request.message}</p>
 
@@ -66,7 +69,7 @@
   }
 
   .confirm-btn--secondary {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     color: var(--foreground);
   }
 

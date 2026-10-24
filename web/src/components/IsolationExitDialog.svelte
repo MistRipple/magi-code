@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from './FileName.svelte';
   import type { IsolationMergeEntryDto } from '../shared/rust-backend-types';
   import { addToast } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -96,6 +97,7 @@
     size="md"
     onClose={closeIsolationExitDialog}
     closeOnBackdrop={!working}
+    closeOnEscape={!working}
   >
     {#if loading}
       <div class="exit-status">{i18n.t('isolation.exit.checking')}</div>
@@ -115,7 +117,7 @@
         {#each pending.slice(0, PREVIEW_LIMIT) as entry (entry.path)}
           <li title={entry.path}>
             <Icon name={entry.state === 'conflict' ? 'alert-triangle' : 'file-edit'} size={12} />
-            <span>{entry.path}</span>
+            <span><FileName name={entry.path} /></span>
           </li>
         {/each}
         {#if pending.length > PREVIEW_LIMIT}

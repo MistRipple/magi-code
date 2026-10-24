@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { getContext } from 'svelte';
+  import FileName from './FileName.svelte';
+  import { getContext, onDestroy } from 'svelte';
+  import Disclosure from './Disclosure.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
@@ -35,6 +37,9 @@
   // 状态
   let collapsed = $state(false);
   let copied = $state(false);
+  let copyRevision = $state(0);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
 
   // 语言名称映射
   const LANG_NAMES: Record<string, string> = {
@@ -114,7 +119,9 @@
     try {
       await navigator.clipboard.writeText(trimmedCode);
       copied = true;
-      setTimeout(() => { copied = false; }, 2000);
+      copyRevision += 1;
+      clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => { copied = false; }, 2500);
     } catch (e) {
       console.error('复制失败:', e);
     }
@@ -185,13 +192,14 @@
               }}
               onclick={previewFilepathClick}
               onkeydown={previewFilepathKeydown}
-            >{filepath}</span>
+            ><FileName name={filepath} /></span>
           {/if}
         </span>
       </button>
 
       {#if showCopyButton}
         <button class="copy-btn" onclick={copyCode} class:copied>
+          {#key copyRevision}
           {#if copied}
             <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
               <path d="M12.736 3.97a.733.733 0 0 1 1.047 0c.286.289.29.756.01 1.05L7.88 12.01a.733.733 0 0 1-1.065.02L3.217 8.384a.757.757 0 0 1 0-1.06.733.733 0 0 1 1.047 0l3.052 3.093 5.4-6.425z"/>
@@ -203,11 +211,12 @@
             </svg>
             <span>{i18n.t('codeBlock.copy')}</span>
           {/if}
+          {/key}
         </button>
       {/if}
     </div>
 
-    {#if !collapsed}
+    <Disclosure expanded={!collapsed}>
       <div class="code-content">
         {#if showLineNumbers}
           <div class="line-numbers">
@@ -230,7 +239,7 @@
           class="code-text {language ? `language-${language}` : ''}"
         >{@html highlightedHtml}</code></pre>
       </div>
-    {/if}
+    </Disclosure>
   </div>
 {/if}
 
@@ -238,7 +247,7 @@
   /* 与 tool-card 风格统一：左侧 3px accent 条 (info 蓝)，承载"格式卡片"的状态标识 */
   .code-block {
     position: relative;
-    border: 1px solid var(--code-border);
+    border: var(--magi-hairline) solid var(--code-border);
     border-radius: var(--radius-md);
     margin: var(--spacing-sm) 0;
     overflow: hidden;
@@ -250,7 +259,7 @@
   .code-header {
     justify-content: space-between;
     background: var(--code-header-bg);
-    border-bottom: 1px solid var(--code-border);
+    border-bottom: var(--magi-hairline) solid var(--code-border);
     user-select: none;
   }
 
@@ -277,6 +286,7 @@
   }
 
   .code-title {
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -293,6 +303,9 @@
   }
 
   .filepath {
+    display: inline-flex;
+    min-width: 0;
+    overflow: hidden;
     opacity: 0.6;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -322,7 +335,7 @@
     align-items: center;
     gap: 6px;
     background: transparent;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: 4px;
     padding: 2px 6px;
     color: var(--foreground-muted);
@@ -338,8 +351,12 @@
 
   .copy-btn.copied {
     color: var(--success);
-    border-color: var(--success);
-    background: color-mix(in srgb, var(--success) 10%, transparent);
+    background: transparent;
+  }
+
+  .copy-btn.copied :global(svg) {
+    animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
+      magi-feedback-fade 160ms 2340ms ease-out forwards;
   }
 
   /* 
@@ -366,7 +383,7 @@
     padding: var(--spacing-sm) 0;
     width: 40px;
     min-width: 40px;
-    border-right: 1px solid var(--border);
+    border-right: var(--magi-hairline) solid var(--border);
     text-align: right;
     user-select: none;
     background: var(--code-line-number-bg);

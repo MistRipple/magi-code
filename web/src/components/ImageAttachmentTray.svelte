@@ -187,14 +187,14 @@
     overflow: hidden;
     cursor: zoom-in;
     background: var(--surface-2);
-    border: 1px solid var(--border);
+    border: 0;
     border-radius: var(--radius-sm);
     transition: border-color var(--transition-fast), transform var(--transition-fast);
   }
 
   .image-tray-thumb:hover,
   .image-tray-thumb:focus-visible {
-    border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+    box-shadow: inset 0 0 0 2px var(--magi-focus-ring);
     outline: none;
   }
 
@@ -219,9 +219,9 @@
     color: var(--foreground);
     cursor: pointer;
     background: var(--surface-3, var(--surface-2));
-    border: 1px solid var(--border);
+    border: 0;
     border-radius: 50%;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+    box-shadow: none;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
 

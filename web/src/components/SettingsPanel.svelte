@@ -17,6 +17,7 @@ import PluginSettingsForm from './PluginSettingsForm.svelte';
 import { onMount, tick, untrack } from 'svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
+import SettingsDetailPage from './SettingsDetailPage.svelte';
 import Toggle from './Toggle.svelte';
 import { i18n } from '../stores/i18n.svelte';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
@@ -32,13 +33,13 @@ import {
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   import { shellUi } from '../stores/shell-ui.svelte';
-  
+
   interface Props {
     /** 当前是否显示。设置与工作台是同级视图：不显示时保活，只是不参与布局。 */
     active: boolean;
     onClose?: () => void;
   }
-  
+
   let { active, onClose }: Props = $props();
 
   const store = useSettingsStore({
@@ -146,8 +147,8 @@ import {
   // Esc = 返回，但要把 Esc 让给更内层的东西：嵌套弹窗（自行拦截）、打开的下拉列表、正在输入的控件。
   function handleWindowKeydown(event: KeyboardEvent): void {
     if (!active || event.key !== 'Escape' || event.defaultPrevented) return;
-    if (Object.values(store.modelDropdownOpen).some(Boolean)) {
-      store.closeAllModelDropdowns();
+    if (Object.values(store.modelListOpen).some(Boolean)) {
+      store.closeAllModelLists();
       event.preventDefault();
       return;
     }
@@ -289,7 +290,7 @@ import {
     </header>
 
       <!-- Tab 内容区域 -->
-      <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
+      <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelLists(); }}>
       {#if store.activeTab === 'appearance'}
         <SettingsAppearanceTab />
       {:else if store.activeTab === 'project'}
@@ -300,7 +301,7 @@ import {
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:visionConfig={store.visionConfig} visionBuiltinTextModelRules={store.visionBuiltinTextModelRules} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelListOpen={store.modelListOpen} modelListPosition={store.modelListPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} openModelList={store.openModelList} closeModelList={store.closeModelList} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
           {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay}
         />
       {:else if store.activeTab === 'agents'}
@@ -320,8 +321,436 @@ import {
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->
+        <div hidden={store.showMCPDialogState || store.showRepoDialogState || store.showSkillLibraryDialogState}>
         <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} builtinTools={store.builtinTools} builtinToolsLoading={store.builtinToolsLoading} capabilityDependencies={store.capabilityDependencies} commandEnvironment={store.commandEnvironment} commandEnvironmentLoading={store.commandEnvironmentLoading} skills={store.skills} skillUpdateAvailableCount={store.skillUpdateAvailableCount} skillUpdatesChecking={store.skillUpdatesChecking} skillUpdatingIds={store.skillUpdatingIds} skillTogglingIds={store.skillTogglingIds} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} refreshBuiltinToolCatalog={store.refreshBuiltinToolCatalog} refreshCommandEnvironment={store.refreshCommandEnvironment} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} checkSkillUpdates={store.checkSkillUpdates} updateSkill={store.updateSkill} toggleSkill={store.toggleSkill} updateAllSkills={store.updateAllSkills} rollbackSkill={store.rollbackSkill} deleteSkill={store.deleteSkill}
         />
+        </div>
+        {#if store.showMCPDialogState}
+          <SettingsDetailPage
+            title={store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}
+            busy={store.saveStatus.mcp === 'saving'}
+            onClose={store.closeMCPDialog}
+          >
+            {#snippet header()}
+              <div class="mcp-editor-title">
+                <h3>{store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}</h3>
+                <span>{i18n.t('settings.mcp.editorDesc')}</span>
+              </div>
+            {/snippet}
+            <p class="settings-hint" role="status">{i18n.t('overlay.draftMemory')}</p>
+            <div class="mcp-editor">
+              <div class="mcp-mode-switch" role="tablist" aria-label={i18n.t('settings.mcp.addMode')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={store.mcpDialogMode === 'form'}
+                  class:active={store.mcpDialogMode === 'form'}
+                  onclick={() => store.setMcpDialogMode('form')}
+                >
+                  {i18n.t('settings.mcp.formMode')}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={store.mcpDialogMode === 'json'}
+                  class:active={store.mcpDialogMode === 'json'}
+                  onclick={() => store.setMcpDialogMode('json')}
+                >
+                  {i18n.t('settings.mcp.jsonMode')}
+                </button>
+              </div>
+
+              {#if store.mcpDialogMode === 'form'}
+                <div class="mcp-form">
+                  <div class="mcp-form-grid">
+                    <div class="form-field">
+                      <label class="form-label" for="mcp-name">{i18n.t('settings.mcp.nameLabel')}</label>
+                      <input
+                        class="form-input"
+                        id="mcp-name"
+                        type="text"
+                        value={store.mcpFormDraft.name}
+                        placeholder={i18n.t('settings.mcp.namePlaceholder')}
+                        oninput={(event) => store.updateMcpFormField('name', event.currentTarget.value)}
+                      >
+                    </div>
+                    <div class="form-field">
+                      <span class="form-label mcp-field-label" id="mcp-transport-label">{i18n.t('settings.mcp.transportLabel')}</span>
+                      <div class="ui-segmented mcp-transport-switch" role="group" aria-labelledby="mcp-transport-label">
+                        <button
+                          class="ui-segmented__option"
+                          type="button"
+                          class:active={store.mcpFormDraft.type === 'stdio'}
+                          aria-pressed={store.mcpFormDraft.type === 'stdio'}
+                          onclick={() => store.updateMcpFormField('type', 'stdio')}
+                        >{i18n.t('settings.mcp.transportStdio')}</button>
+                        <button
+                          class="ui-segmented__option"
+                          type="button"
+                          class:active={store.mcpFormDraft.type === 'streamable-http'}
+                          aria-pressed={store.mcpFormDraft.type === 'streamable-http'}
+                          onclick={() => store.updateMcpFormField('type', 'streamable-http')}
+                        >{i18n.t('settings.mcp.transportHttp')}</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="mcp-form-options">
+                    <div class="mcp-timeout-field">
+                      <label class="form-label" for="mcp-timeout">{i18n.t('settings.mcp.timeoutLabel')}</label>
+                      <div class="mcp-input-suffix">
+                        <input
+                          class="form-input"
+                          id="mcp-timeout"
+                          type="number"
+                          min="1"
+                          max="300"
+                          step="1"
+                          value={store.mcpFormDraft.requestTimeoutSeconds}
+                          placeholder="30"
+                          oninput={(event) => store.updateMcpFormField('requestTimeoutSeconds', event.currentTarget.value)}
+                        >
+                        <span>{i18n.t('settings.mcp.seconds')}</span>
+                      </div>
+                    </div>
+                    <div class="mcp-enabled-field">
+                      <div>
+                        <strong>{i18n.t('settings.mcp.enabledLabel')}</strong>
+                        <span>{i18n.t('settings.mcp.enabledHint')}</span>
+                      </div>
+                      <Toggle
+                        checked={store.mcpFormDraft.enabled}
+                        ariaLabel={i18n.t('settings.mcp.enabledLabel')}
+                        onchange={(checked) => store.updateMcpFormField('enabled', checked)}
+                      />
+                    </div>
+                  </div>
+
+                  {#if store.mcpFormDraft.type === 'stdio'}
+                    <section class="mcp-form-section">
+                      <div class="mcp-section-heading">
+                        <div>
+                          <strong>{i18n.t('settings.mcp.stdioSection')}</strong>
+                          <span>{i18n.t('settings.mcp.stdioSectionDesc')}</span>
+                        </div>
+                      </div>
+                      <div class="form-field">
+                        <label class="form-label" for="mcp-command">{i18n.t('settings.mcp.commandLabel')}</label>
+                        <input
+                          class="form-input"
+                          id="mcp-command"
+                          type="text"
+                          value={store.mcpFormDraft.command}
+                          placeholder={i18n.t('settings.mcp.commandPlaceholder')}
+                          oninput={(event) => store.updateMcpFormField('command', event.currentTarget.value)}
+                        >
+                      </div>
+                      <div class="mcp-list-field">
+                        <div class="mcp-list-heading">
+                          <span>{i18n.t('settings.mcp.argsLabel')}</span>
+                          <button type="button" onclick={store.addMcpFormArg}>
+                            <Icon name="plus" size={13} />
+                            {i18n.t('settings.mcp.addArg')}
+                          </button>
+                        </div>
+                        {#if store.mcpFormDraft.args.length === 0}
+                          <div class="mcp-empty-row">{i18n.t('settings.mcp.noArgs')}</div>
+                        {:else}
+                          <div class="mcp-row-list">
+                            {#each store.mcpFormDraft.args as arg, index}
+                              <div class="mcp-value-row">
+                                <input
+                                  class="form-input"
+                                  type="text"
+                                  value={arg}
+                                  aria-label={i18n.t('settings.mcp.argIndex', { index: index + 1 })}
+                                  placeholder={i18n.t('settings.mcp.argPlaceholder')}
+                                  oninput={(event) => store.updateMcpFormArg(index, event.currentTarget.value)}
+                                >
+                                <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormArg(index)}>
+                                  <Icon name="close" size={14} />
+                                </button>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
+                      <div class="mcp-list-field">
+                        <div class="mcp-list-heading">
+                          <span>{i18n.t('settings.mcp.envLabel')}</span>
+                          <button type="button" onclick={() => store.addMcpFormKeyValue('env')}>
+                            <Icon name="plus" size={13} />
+                            {i18n.t('settings.mcp.addVariable')}
+                          </button>
+                        </div>
+                        {#if store.mcpFormDraft.env.length === 0}
+                          <div class="mcp-empty-row">{i18n.t('settings.mcp.noEnv')}</div>
+                        {:else}
+                          <div class="mcp-row-list">
+                            {#each store.mcpFormDraft.env as row, index}
+                              <div class="mcp-key-value-row">
+                                <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.keyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'key', event.currentTarget.value)}>
+                                <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.valuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'value', event.currentTarget.value)}>
+                                <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('env', index)}>
+                                  <Icon name="close" size={14} />
+                                </button>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
+                    </section>
+                  {:else}
+                    <section class="mcp-form-section">
+                      <div class="mcp-section-heading">
+                        <div>
+                          <strong>{i18n.t('settings.mcp.httpSection')}</strong>
+                          <span>{i18n.t('settings.mcp.httpSectionDesc')}</span>
+                        </div>
+                      </div>
+                      <div class="form-field">
+                        <label class="form-label" for="mcp-url">{i18n.t('settings.mcp.urlLabel')}</label>
+                        <input
+                          class="form-input"
+                          id="mcp-url"
+                          type="text"
+                          value={store.mcpFormDraft.url}
+                          placeholder="https://example.com/mcp"
+                          oninput={(event) => store.updateMcpFormField('url', event.currentTarget.value)}
+                        >
+                      </div>
+                      <div class="mcp-list-field">
+                        <div class="mcp-list-heading">
+                          <span>{i18n.t('settings.mcp.headersLabel')}</span>
+                          <button type="button" onclick={() => store.addMcpFormKeyValue('headers')}>
+                            <Icon name="plus" size={13} />
+                            {i18n.t('settings.mcp.addHeader')}
+                          </button>
+                        </div>
+                        {#if store.mcpFormDraft.headers.length === 0}
+                          <div class="mcp-empty-row">{i18n.t('settings.mcp.noHeaders')}</div>
+                        {:else}
+                          <div class="mcp-row-list">
+                            {#each store.mcpFormDraft.headers as row, index}
+                              <div class="mcp-key-value-row">
+                                <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.headerKeyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'key', event.currentTarget.value)}>
+                                <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.headerValuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'value', event.currentTarget.value)}>
+                                <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('headers', index)}>
+                                  <Icon name="close" size={14} />
+                                </button>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
+                    </section>
+                  {/if}
+                </div>
+              {:else}
+                <div class="mcp-json-editor form-field">
+                  <label class="form-label" for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
+                  <textarea class="form-textarea" id="mcp-json" rows="16" spellcheck="false" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
+                  <div class="mcp-json-help">{i18n.t('settings.mcp.jsonHelp')}</div>
+                </div>
+              {/if}
+
+              {#if store.mcpDialogError}
+                <div class="form-error mcp-form-error" role="alert">{store.mcpDialogError}</div>
+              {/if}
+            </div>
+            {#snippet footer()}
+              <button class="btn btn--secondary" onclick={store.closeMCPDialog}>{i18n.t('overlay.closeKeepDraft')}</button>
+              <button
+                class="btn btn--primary"
+                class:is-saving={store.saveStatus.mcp === 'saving'}
+                class:is-saved={store.saveStatus.mcp === 'saved'}
+                onclick={store.saveMCPServer}
+                disabled={store.saveStatus.mcp === 'saving'}
+              >
+                {#if store.saveStatus.mcp === 'saving'}
+                  <Icon name="refresh" size={14} />
+                  {i18n.t('settings.mcp.saving')}
+                {:else if store.saveStatus.mcp === 'saved'}
+                  <Icon name="check" size={14} />
+                  {i18n.t('settings.mcp.saved')}
+                {:else}
+                  {i18n.t('settings.mcp.save')}
+                {/if}
+              </button>
+            {/snippet}
+          </SettingsDetailPage>
+        {/if}
+        {#if store.showRepoDialogState}
+          <SettingsDetailPage
+            title={i18n.t('settings.repo.title')}
+            onClose={store.closeRepoDialog}
+          >
+            {#snippet header()}
+              <h3>{i18n.t('settings.repo.title')}</h3>
+            {/snippet}
+            <div class="repo-add-form" style="margin-bottom: 24px;">
+              <div class="form-field" style="flex: 1; margin-bottom: 0;">
+                <label class="form-label" for="repo-url">{i18n.t('settings.repo.urlLabel')}</label>
+                <input class="form-input" type="text" id="repo-url" placeholder={i18n.t('settings.repo.urlPlaceholder')} bind:value={store.repoAddUrl}>
+              </div>
+              <button class="btn btn--primary btn--sm" onclick={store.addRepository} disabled={store.repoAddLoading}>
+                <Icon name="plus" size={14} />
+                <span>{store.repoAddLoading ? i18n.t('settings.repo.adding') : i18n.t('settings.repo.add')}</span>
+              </button>
+            </div>
+            <div class="repo-list-heading">
+              <div class="repo-list-title">{i18n.t('settings.repo.addedRepos')}</div>
+              <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking || store.repositories.length === 0}>
+                <Icon name="refresh" size={13} />
+                <span>{i18n.t('settings.repo.refreshAll')}</span>
+              </button>
+            </div>
+            <div class="repo-manage-list">
+              {#if store.repositoriesLoading}
+                <div class="loading-state">
+                  <Icon name="refresh" size={24} />
+                  <span>{i18n.t('settings.repo.loading')}</span>
+                </div>
+              {:else if store.repositories.length === 0}
+                <div class="empty-state-sm">{i18n.t('settings.repo.noRepos')}</div>
+              {:else}
+                {#each store.repositories as repo (repo.id)}
+                  <div class="repo-item">
+                    <div class="repo-info">
+                      <div class="repo-name">{repo.name || repo.url}</div>
+                      <div class="repo-url">{repo.url}</div>
+                      <div class="repo-meta">
+                        <span>{i18n.t('settings.repo.skillCount', { count: repo.skillCount || 0 })}</span>
+                        {#if repo.commit}<span title={repo.commit}>{repo.commit.slice(0, 8)}</span>{/if}
+                        <span class:repo-ready={repo.syncStatus === 'ready'}>{repo.syncStatus === 'ready' ? i18n.t('settings.repo.ready') : i18n.t('settings.repo.notSynced')}</span>
+                      </div>
+                    </div>
+                    <div class="repo-actions">
+                      <button class="btn-icon btn-icon--sm" title={i18n.t('settings.repo.refresh')} onclick={() => store.refreshRepository(repo.id)} disabled={store.repositoryRefreshingIds.has(repo.id)}>
+                        <Icon name="refresh" size={14} />
+                      </button>
+                      <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.delete')} onclick={() => store.deleteRepository(repo.id)}>
+                        <Icon name="close" size={14} />
+                      </button>
+                    </div>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+            {#snippet footer()}
+              <button class="btn btn--secondary btn--sm" onclick={store.closeRepoDialog}>{i18n.t('settings.repo.close')}</button>
+            {/snippet}
+          </SettingsDetailPage>
+        {/if}
+        {#if store.showSkillLibraryDialogState}
+          <SettingsDetailPage
+            title={i18n.t('settings.skillLibrary.title')}
+            onClose={store.closeSkillLibraryDialog}
+          >
+            {#snippet header()}
+              <h3>{i18n.t('settings.skillLibrary.title')}</h3>
+            {/snippet}
+            <div class="skill-library-search">
+              <div class="skill-library-search-row form-field" style="margin-bottom: 0;">
+                <input class="form-input" type="text" placeholder={i18n.t('settings.skillLibrary.searchPlaceholder')} bind:value={store.skillSearchQuery}>
+                <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking}>
+                  <Icon name="refresh" size={14} />
+                  {i18n.t('settings.skillLibrary.checkUpdates')}
+                </button>
+                <button class="btn btn--secondary btn--sm" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
+                  {#if store.localSkillInstalling}
+                    <Icon name="refresh" size={14} />
+                    {i18n.t('settings.skillLibrary.importing')}
+                  {:else}
+                    <Icon name="plus" size={14} />
+                    {i18n.t('settings.skillLibrary.localImport')}
+                  {/if}
+                </button>
+              </div>
+            </div>
+            <div class="skill-library-list">
+              {#if store.localSkillInstallError}
+                <div class="skill-library-warning skill-library-error">
+                  <div class="skill-library-warning-title">{store.localSkillInstallError}</div>
+                </div>
+              {/if}
+              {#if store.skillLibraryFailedRepositoryCount > 0}
+                <div class="skill-library-warning">
+                  <div class="skill-library-warning-title">
+                    {i18n.t('settings.skillLibrary.failedRepos', { count: store.skillLibraryFailedRepositoryCount })}
+                  </div>
+                </div>
+              {/if}
+              {#if store.skillLibraryLoading}
+                <div class="loading-state">
+                  <Icon name="refresh" size={32} />
+                  <span>{i18n.t('settings.skillLibrary.loadingSkills')}</span>
+                </div>
+              {:else if store.filteredLibrarySkills.length === 0}
+                <div class="empty-state">
+                  <Icon name="tools" size={48} />
+                  <p>{i18n.t('settings.skillLibrary.noSkillsAvailable')}</p>
+                  <p class="empty-state-hint">{i18n.t('settings.skillLibrary.noSkillsHint')}</p>
+                </div>
+              {:else}
+                {#each Object.entries(store.skillsByRepo) as [_, repoData]}
+                  <div class="skill-repo-group">
+                    <div class="skill-repo-title">{i18n.t('settings.skillLibrary.repoSkillCount', { name: repoData.name, count: repoData.skills.length })}</div>
+                    {#each repoData.skills as skill}
+                      <div class="skill-library-item">
+                        <div class="skill-library-icon">
+                          <Icon name="tools" size={14} />
+                        </div>
+                        <div class="skill-library-info">
+                          <div class="skill-library-name-line">
+                            <div class="skill-library-name">{skill.name}</div>
+                            {#if skill.installed}
+                              <span class="skill-library-status" class:is-update={skill.updateAvailable}>
+                                {skill.updateAvailable ? i18n.t('settings.skillLibrary.updateAvailable') : i18n.t('settings.skillLibrary.installed')}
+                              </span>
+                            {/if}
+                          </div>
+                          <div class="skill-library-desc" title={skill.description || ''}>{skill.description || ''}</div>
+                          {#if skill.author || skill.version || skill.category}
+                            <div class="skill-library-meta">
+                              {#if skill.author}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.author', { name: skill.author })}</span>{/if}
+                              {#if skill.version}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.version', { version: skill.version })}</span>{/if}
+                              {#if skill.category}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.category', { category: skill.category })}</span>{/if}
+                            </div>
+                          {/if}
+                        </div>
+                        <div class="skill-library-actions">
+                          <button
+                            class="btn btn--sm"
+                            class:btn--primary={(!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName)}
+                            class:btn--secondary={!((!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName))}
+                            class:is-saving={store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
+                            onclick={() => skill.installed ? store.updateSkill(skill.fullName) : store.installSkill(skill.fullName)}
+                            disabled={(skill.installed && !skill.updateAvailable) || store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
+                          >
+                            {#if store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
+                              <Icon name="refresh" size={14} />
+                              {i18n.t('settings.skillLibrary.installing')}
+                            {:else if skill.installed && skill.updateAvailable}
+                              {skill.source === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}
+                            {:else if skill.installed}
+                              {i18n.t('settings.skillLibrary.installed')}
+                            {:else}
+                              {i18n.t('settings.skillLibrary.install')}
+                            {/if}
+                          </button>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                {/each}
+              {/if}
+            </div>
+            {#snippet footer()}
+              <button class="btn btn--secondary" onclick={store.closeSkillLibraryDialog}>{i18n.t('settings.skillLibrary.close')}</button>
+            {/snippet}
+          </SettingsDetailPage>
+        {/if}
       {:else if store.activeTab === 'browser'}
         <SettingsBrowserTab />
       {:else if store.activeTab === 'plugins'}
@@ -347,6 +776,7 @@ import {
 <!-- 输入对话框 -->
 {#if store.showInputDialog}
   <Modal
+    form
     size="sm"
     closeOnEscape={true}
     onClose={store.cancelInputDialog}
@@ -360,441 +790,6 @@ import {
     {#snippet footer()}
       <button class="btn btn--secondary btn--sm" onclick={store.cancelInputDialog}>{i18n.t('settings.dialog.cancel')}</button>
       <button class="btn btn--primary btn--sm" onclick={store.confirmInputDialog}>{i18n.t('settings.dialog.confirm')}</button>
-    {/snippet}
-  </Modal>
-{/if}
-
-<!-- MCP 对话框 -->
-{#if store.showMCPDialogState}
-  <Modal
-    size="lg"
-    closeOnEscape={true}
-    onClose={store.closeMCPDialog}
-  >
-    {#snippet header()}
-      <div class="mcp-editor-title">
-        <h3>{store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}</h3>
-        <span>{i18n.t('settings.mcp.editorDesc')}</span>
-      </div>
-      <button class="modal-close" type="button" onclick={store.closeMCPDialog} aria-label={i18n.t('settings.closeSettings')} title={i18n.t('settings.closeSettings')}>
-        <Icon name="close" size={18} />
-      </button>
-    {/snippet}
-    <div class="mcp-editor">
-      <div class="mcp-mode-switch" role="tablist" aria-label={i18n.t('settings.mcp.addMode')}>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={store.mcpDialogMode === 'form'}
-          class:active={store.mcpDialogMode === 'form'}
-          onclick={() => store.setMcpDialogMode('form')}
-        >
-          {i18n.t('settings.mcp.formMode')}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={store.mcpDialogMode === 'json'}
-          class:active={store.mcpDialogMode === 'json'}
-          onclick={() => store.setMcpDialogMode('json')}
-        >
-          {i18n.t('settings.mcp.jsonMode')}
-        </button>
-      </div>
-
-      {#if store.mcpDialogMode === 'form'}
-        <div class="mcp-form">
-          <div class="mcp-form-grid">
-            <div class="form-field">
-              <label class="form-label" for="mcp-name">{i18n.t('settings.mcp.nameLabel')}</label>
-              <input
-                class="form-input"
-                id="mcp-name"
-                type="text"
-                value={store.mcpFormDraft.name}
-                placeholder={i18n.t('settings.mcp.namePlaceholder')}
-                oninput={(event) => store.updateMcpFormField('name', event.currentTarget.value)}
-              >
-            </div>
-            <div class="form-field">
-              <span class="form-label mcp-field-label">{i18n.t('settings.mcp.transportLabel')}</span>
-              <div class="ui-segmented mcp-transport-switch">
-                <button
-                  class="ui-segmented__option"
-                  type="button"
-                  class:active={store.mcpFormDraft.type === 'stdio'}
-                  onclick={() => store.updateMcpFormField('type', 'stdio')}
-                >{i18n.t('settings.mcp.transportStdio')}</button>
-                <button
-                  class="ui-segmented__option"
-                  type="button"
-                  class:active={store.mcpFormDraft.type === 'streamable-http'}
-                  onclick={() => store.updateMcpFormField('type', 'streamable-http')}
-                >{i18n.t('settings.mcp.transportHttp')}</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="mcp-form-options">
-            <div class="mcp-timeout-field">
-              <label class="form-label" for="mcp-timeout">{i18n.t('settings.mcp.timeoutLabel')}</label>
-              <div class="mcp-input-suffix">
-                <input
-                  class="form-input"
-                  id="mcp-timeout"
-                  type="number"
-                  min="1"
-                  max="300"
-                  step="1"
-                  value={store.mcpFormDraft.requestTimeoutSeconds}
-                  placeholder="30"
-                  oninput={(event) => store.updateMcpFormField('requestTimeoutSeconds', event.currentTarget.value)}
-                >
-                <span>{i18n.t('settings.mcp.seconds')}</span>
-              </div>
-            </div>
-            <div class="mcp-enabled-field">
-              <div>
-                <strong>{i18n.t('settings.mcp.enabledLabel')}</strong>
-                <span>{i18n.t('settings.mcp.enabledHint')}</span>
-              </div>
-              <Toggle
-                checked={store.mcpFormDraft.enabled}
-                onchange={(checked) => store.updateMcpFormField('enabled', checked)}
-              />
-            </div>
-          </div>
-
-          {#if store.mcpFormDraft.type === 'stdio'}
-            <section class="mcp-form-section">
-              <div class="mcp-section-heading">
-                <div>
-                  <strong>{i18n.t('settings.mcp.stdioSection')}</strong>
-                  <span>{i18n.t('settings.mcp.stdioSectionDesc')}</span>
-                </div>
-              </div>
-              <div class="form-field">
-                <label class="form-label" for="mcp-command">{i18n.t('settings.mcp.commandLabel')}</label>
-                <input
-                  class="form-input"
-                  id="mcp-command"
-                  type="text"
-                  value={store.mcpFormDraft.command}
-                  placeholder={i18n.t('settings.mcp.commandPlaceholder')}
-                  oninput={(event) => store.updateMcpFormField('command', event.currentTarget.value)}
-                >
-              </div>
-              <div class="mcp-list-field">
-                <div class="mcp-list-heading">
-                  <span>{i18n.t('settings.mcp.argsLabel')}</span>
-                  <button type="button" onclick={store.addMcpFormArg}>
-                    <Icon name="plus" size={13} />
-                    {i18n.t('settings.mcp.addArg')}
-                  </button>
-                </div>
-                {#if store.mcpFormDraft.args.length === 0}
-                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noArgs')}</div>
-                {:else}
-                  <div class="mcp-row-list">
-                    {#each store.mcpFormDraft.args as arg, index}
-                      <div class="mcp-value-row">
-                        <input
-                          class="form-input"
-                          type="text"
-                          value={arg}
-                          aria-label={i18n.t('settings.mcp.argIndex', { index: index + 1 })}
-                          placeholder={i18n.t('settings.mcp.argPlaceholder')}
-                          oninput={(event) => store.updateMcpFormArg(index, event.currentTarget.value)}
-                        >
-                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormArg(index)}>
-                          <Icon name="close" size={14} />
-                        </button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-              <div class="mcp-list-field">
-                <div class="mcp-list-heading">
-                  <span>{i18n.t('settings.mcp.envLabel')}</span>
-                  <button type="button" onclick={() => store.addMcpFormKeyValue('env')}>
-                    <Icon name="plus" size={13} />
-                    {i18n.t('settings.mcp.addVariable')}
-                  </button>
-                </div>
-                {#if store.mcpFormDraft.env.length === 0}
-                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noEnv')}</div>
-                {:else}
-                  <div class="mcp-row-list">
-                    {#each store.mcpFormDraft.env as row, index}
-                      <div class="mcp-key-value-row">
-                        <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.keyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'key', event.currentTarget.value)}>
-                        <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.valuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'value', event.currentTarget.value)}>
-                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('env', index)}>
-                          <Icon name="close" size={14} />
-                        </button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </section>
-          {:else}
-            <section class="mcp-form-section">
-              <div class="mcp-section-heading">
-                <div>
-                  <strong>{i18n.t('settings.mcp.httpSection')}</strong>
-                  <span>{i18n.t('settings.mcp.httpSectionDesc')}</span>
-                </div>
-              </div>
-              <div class="form-field">
-                <label class="form-label" for="mcp-url">{i18n.t('settings.mcp.urlLabel')}</label>
-                <input
-                  class="form-input"
-                  id="mcp-url"
-                  type="text"
-                  value={store.mcpFormDraft.url}
-                  placeholder="https://example.com/mcp"
-                  oninput={(event) => store.updateMcpFormField('url', event.currentTarget.value)}
-                >
-              </div>
-              <div class="mcp-list-field">
-                <div class="mcp-list-heading">
-                  <span>{i18n.t('settings.mcp.headersLabel')}</span>
-                  <button type="button" onclick={() => store.addMcpFormKeyValue('headers')}>
-                    <Icon name="plus" size={13} />
-                    {i18n.t('settings.mcp.addHeader')}
-                  </button>
-                </div>
-                {#if store.mcpFormDraft.headers.length === 0}
-                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noHeaders')}</div>
-                {:else}
-                  <div class="mcp-row-list">
-                    {#each store.mcpFormDraft.headers as row, index}
-                      <div class="mcp-key-value-row">
-                        <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.headerKeyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'key', event.currentTarget.value)}>
-                        <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.headerValuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'value', event.currentTarget.value)}>
-                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('headers', index)}>
-                          <Icon name="close" size={14} />
-                        </button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </section>
-          {/if}
-        </div>
-      {:else}
-        <div class="mcp-json-editor form-field">
-          <label class="form-label" for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
-          <textarea class="form-textarea" id="mcp-json" rows="16" spellcheck="false" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
-          <div class="mcp-json-help">{i18n.t('settings.mcp.jsonHelp')}</div>
-        </div>
-      {/if}
-
-      {#if store.mcpDialogError}
-        <div class="form-error mcp-form-error" role="alert">{store.mcpDialogError}</div>
-      {/if}
-    </div>
-    {#snippet footer()}
-      <button class="btn btn--secondary" onclick={store.closeMCPDialog}>{i18n.t('settings.dialog.cancel')}</button>
-      <button
-        class="btn btn--primary"
-        class:is-saving={store.saveStatus.mcp === 'saving'}
-        class:is-saved={store.saveStatus.mcp === 'saved'}
-        onclick={store.saveMCPServer}
-        disabled={store.saveStatus.mcp === 'saving'}
-      >
-        {#if store.saveStatus.mcp === 'saving'}
-          <Icon name="refresh" size={14} />
-          {i18n.t('settings.mcp.saving')}
-        {:else if store.saveStatus.mcp === 'saved'}
-          <Icon name="check" size={14} />
-          {i18n.t('settings.mcp.saved')}
-        {:else}
-          {i18n.t('settings.mcp.save')}
-        {/if}
-      </button>
-    {/snippet}
-  </Modal>
-{/if}
-
-<!-- 仓库管理对话框 -->
-{#if store.showRepoDialogState}
-  <Modal
-    size="lg"
-    closeOnEscape={true}
-    onClose={store.closeRepoDialog}
-  >
-    {#snippet header()}
-      <h3>{i18n.t('settings.repo.title')}</h3>
-      <button class="modal-close" onclick={store.closeRepoDialog}>×</button>
-    {/snippet}
-    <div class="repo-add-form" style="margin-bottom: 24px;">
-      <div class="form-field" style="flex: 1; margin-bottom: 0;">
-        <label class="form-label" for="repo-url">{i18n.t('settings.repo.urlLabel')}</label>
-        <input class="form-input" type="text" id="repo-url" placeholder={i18n.t('settings.repo.urlPlaceholder')} bind:value={store.repoAddUrl}>
-      </div>
-      <button class="btn btn--primary btn--sm" onclick={store.addRepository} disabled={store.repoAddLoading}>
-        <Icon name="plus" size={14} />
-        <span>{store.repoAddLoading ? i18n.t('settings.repo.adding') : i18n.t('settings.repo.add')}</span>
-      </button>
-    </div>
-    <div class="repo-list-heading">
-      <div class="repo-list-title">{i18n.t('settings.repo.addedRepos')}</div>
-      <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking || store.repositories.length === 0}>
-        <Icon name="refresh" size={13} />
-        <span>{i18n.t('settings.repo.refreshAll')}</span>
-      </button>
-    </div>
-    <div class="repo-manage-list">
-      {#if store.repositoriesLoading}
-        <div class="loading-state">
-          <Icon name="refresh" size={24} />
-          <span>{i18n.t('settings.repo.loading')}</span>
-        </div>
-      {:else if store.repositories.length === 0}
-        <div class="empty-state-sm">{i18n.t('settings.repo.noRepos')}</div>
-      {:else}
-        {#each store.repositories as repo (repo.id)}
-          <div class="repo-item">
-            <div class="repo-info">
-              <div class="repo-name">{repo.name || repo.url}</div>
-              <div class="repo-url">{repo.url}</div>
-              <div class="repo-meta">
-                <span>{i18n.t('settings.repo.skillCount', { count: repo.skillCount || 0 })}</span>
-                {#if repo.commit}<span title={repo.commit}>{repo.commit.slice(0, 8)}</span>{/if}
-                <span class:repo-ready={repo.syncStatus === 'ready'}>{repo.syncStatus === 'ready' ? i18n.t('settings.repo.ready') : i18n.t('settings.repo.notSynced')}</span>
-              </div>
-            </div>
-            <div class="repo-actions">
-              <button class="btn-icon btn-icon--sm" title={i18n.t('settings.repo.refresh')} onclick={() => store.refreshRepository(repo.id)} disabled={store.repositoryRefreshingIds.has(repo.id)}>
-                <Icon name="refresh" size={14} />
-              </button>
-              <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.delete')} onclick={() => store.deleteRepository(repo.id)}>
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-          </div>
-        {/each}
-      {/if}
-    </div>
-    {#snippet footer()}
-      <button class="btn btn--secondary btn--sm" onclick={store.closeRepoDialog}>{i18n.t('settings.repo.close')}</button>
-    {/snippet}
-  </Modal>
-{/if}
-
-<!-- Skill 库对话框 -->
-{#if store.showSkillLibraryDialogState}
-  <Modal
-    size="lg"
-    closeOnEscape={true}
-    onClose={store.closeSkillLibraryDialog}
-  >
-    {#snippet header()}
-      <h3>{i18n.t('settings.skillLibrary.title')}</h3>
-      <button class="modal-close" onclick={store.closeSkillLibraryDialog}>×</button>
-    {/snippet}
-    <div class="skill-library-search">
-      <div class="skill-library-search-row form-field" style="margin-bottom: 0;">
-        <input class="form-input" type="text" placeholder={i18n.t('settings.skillLibrary.searchPlaceholder')} bind:value={store.skillSearchQuery}>
-        <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking}>
-          <Icon name="refresh" size={14} />
-          {i18n.t('settings.skillLibrary.checkUpdates')}
-        </button>
-        <button class="btn btn--secondary btn--sm" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
-          {#if store.localSkillInstalling}
-            <Icon name="refresh" size={14} />
-            {i18n.t('settings.skillLibrary.importing')}
-          {:else}
-            <Icon name="plus" size={14} />
-            {i18n.t('settings.skillLibrary.localImport')}
-          {/if}
-        </button>
-      </div>
-    </div>
-    <div class="skill-library-list">
-      {#if store.localSkillInstallError}
-        <div class="skill-library-warning skill-library-error">
-          <div class="skill-library-warning-title">{store.localSkillInstallError}</div>
-        </div>
-      {/if}
-      {#if store.skillLibraryFailedRepositoryCount > 0}
-        <div class="skill-library-warning">
-          <div class="skill-library-warning-title">
-            {i18n.t('settings.skillLibrary.failedRepos', { count: store.skillLibraryFailedRepositoryCount })}
-          </div>
-        </div>
-      {/if}
-      {#if store.skillLibraryLoading}
-        <div class="loading-state">
-          <Icon name="refresh" size={32} />
-          <span>{i18n.t('settings.skillLibrary.loadingSkills')}</span>
-        </div>
-      {:else if store.filteredLibrarySkills.length === 0}
-        <div class="empty-state">
-          <Icon name="tools" size={48} />
-          <p>{i18n.t('settings.skillLibrary.noSkillsAvailable')}</p>
-          <p class="empty-state-hint">{i18n.t('settings.skillLibrary.noSkillsHint')}</p>
-        </div>
-      {:else}
-        {#each Object.entries(store.skillsByRepo) as [_, repoData]}
-          <div class="skill-repo-group">
-            <div class="skill-repo-title">{i18n.t('settings.skillLibrary.repoSkillCount', { name: repoData.name, count: repoData.skills.length })}</div>
-            {#each repoData.skills as skill}
-              <div class="skill-library-item">
-                <div class="skill-library-icon">
-                  <Icon name="tools" size={14} />
-                </div>
-                <div class="skill-library-info">
-                  <div class="skill-library-name-line">
-                    <div class="skill-library-name">{skill.name}</div>
-                    {#if skill.installed}
-                      <span class="skill-library-status" class:is-update={skill.updateAvailable}>
-                        {skill.updateAvailable ? i18n.t('settings.skillLibrary.updateAvailable') : i18n.t('settings.skillLibrary.installed')}
-                      </span>
-                    {/if}
-                  </div>
-                  <div class="skill-library-desc" title={skill.description || ''}>{skill.description || ''}</div>
-                  {#if skill.author || skill.version || skill.category}
-                    <div class="skill-library-meta">
-                      {#if skill.author}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.author', { name: skill.author })}</span>{/if}
-                      {#if skill.version}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.version', { version: skill.version })}</span>{/if}
-                      {#if skill.category}<span class="skill-library-meta-item">{i18n.t('settings.skillLibrary.category', { category: skill.category })}</span>{/if}
-                    </div>
-                  {/if}
-                </div>
-                <div class="skill-library-actions">
-                  <button
-                    class="btn btn--sm"
-                    class:btn--primary={(!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName)}
-                    class:btn--secondary={!((!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName))}
-                    class:is-saving={store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
-                    onclick={() => skill.installed ? store.updateSkill(skill.fullName) : store.installSkill(skill.fullName)}
-                    disabled={(skill.installed && !skill.updateAvailable) || store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
-                  >
-                    {#if store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
-                      <Icon name="refresh" size={14} />
-                      {i18n.t('settings.skillLibrary.installing')}
-                    {:else if skill.installed && skill.updateAvailable}
-                      {skill.source === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}
-                    {:else if skill.installed}
-                      {i18n.t('settings.skillLibrary.installed')}
-                    {:else}
-                      {i18n.t('settings.skillLibrary.install')}
-                    {/if}
-                  </button>
-                </div>
-              </div>
-            {/each}
-          </div>
-        {/each}
-      {/if}
-    </div>
-    {#snippet footer()}
-      <button class="btn btn--secondary" onclick={store.closeSkillLibraryDialog}>{i18n.t('settings.skillLibrary.close')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -849,10 +844,10 @@ import {
   /* 代理模型 Tabs - 放在标题右侧 */
 
   /* 空状态 */
-  
-  
-  
-  
+
+
+
+
 
   /* 加载状态 */
   .loading-state {
@@ -907,7 +902,7 @@ import {
     align-items: center;
     gap: var(--space-5);
     width: 100%;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
   .mcp-mode-switch button {
     position: relative;
@@ -959,8 +954,8 @@ import {
     gap: var(--space-5);
     min-height: 36px;
     padding: var(--space-2) 0;
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
   .mcp-timeout-field,
   .mcp-enabled-field {
@@ -1001,7 +996,7 @@ import {
     gap: var(--space-3);
     min-width: 0;
     padding-left: var(--space-5);
-    border-left: 1px solid var(--border);
+    border-left: var(--magi-hairline) solid var(--border);
   }
   .mcp-enabled-field > div {
     display: flex;
@@ -1092,10 +1087,7 @@ import {
   .mcp-remove-row:hover { color: var(--error); background: color-mix(in srgb, var(--error) 8%, transparent); }
   .mcp-empty-row {
     min-height: 32px;
-    padding: 7px 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+    padding: 7px 0;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
   }
@@ -1117,7 +1109,7 @@ import {
   .mcp-form-error {
     margin-top: 0;
     padding: 8px 10px;
-    border: 1px solid color-mix(in srgb, var(--error) 35%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 35%, var(--border));
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--error) 7%, transparent);
   }
@@ -1134,7 +1126,7 @@ import {
     .mcp-enabled-field {
       justify-content: space-between;
       padding: var(--space-2) 0 0;
-      border-top: 1px solid var(--border);
+      border-top: var(--magi-hairline) solid var(--border);
       border-left: 0;
     }
     .mcp-enabled-field span { white-space: normal; }
@@ -1148,8 +1140,8 @@ import {
   .repo-add-form { display: flex; gap: 10px; align-items: flex-end; }
   .repo-add-form .form-field { flex: 1; margin-bottom: 0; }
   .repo-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-  .repo-list-title { font-size: 13px; font-weight: 600; color: var(--foreground); }
-  .repo-manage-list { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
+  .repo-list-title { font-size: 13px; font-weight: var(--font-semibold); color: var(--foreground); }
+  .repo-manage-list { display: flex; flex-direction: column; overflow: hidden; border: var(--magi-hairline) solid var(--border); border-radius: 8px; }
   .repo-item {
     display: grid;
     grid-template-columns: 1fr auto;
@@ -1157,7 +1149,7 @@ import {
     gap: 12px;
     padding: 10px 12px;
     background: color-mix(in srgb, var(--surface-1) 94%, transparent);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     transition: background 0.15s ease;
   }
   .repo-item:last-child { border-bottom: 0; }
@@ -1182,7 +1174,7 @@ import {
   .skill-library-warning {
     margin-bottom: var(--space-3);
     padding: var(--space-3);
-    border: 1px solid var(--warning);
+    border: var(--magi-hairline) solid var(--warning);
     background: color-mix(in srgb, var(--warning) 10%, var(--surface-1));
     border-radius: var(--radius-md);
   }
@@ -1209,7 +1201,7 @@ import {
     color: var(--foreground);
     margin-bottom: var(--space-3);
     padding-bottom: var(--space-2);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
   .skill-library-item {
     display: grid;
@@ -1218,7 +1210,7 @@ import {
     gap: 12px;
     padding: 10px 12px;
     background: color-mix(in srgb, var(--surface-1) 94%, transparent);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 6px;
     margin-bottom: 6px;
     transition: background 0.15s ease, border-color 0.15s ease;
@@ -1294,7 +1286,7 @@ import {
 
       :global(.web-workbench-shell--desktop) .settings-nav {
         border: 0;
-        border-right: 1px solid var(--border);
+        border-right: var(--magi-hairline) solid var(--border);
         border-radius: 0;
       }
 
@@ -1311,7 +1303,7 @@ import {
       min-height: 0;
       padding: var(--space-4);
       overflow-y: auto;
-      border: 1px solid var(--border);
+      border: var(--magi-hairline) solid var(--border);
       border-radius: var(--radius-lg);
       background: var(--magi-surface-sidebar);
     }
@@ -1417,7 +1409,7 @@ import {
       min-width: 0;
       min-height: 0;
       overflow: hidden;
-      border: 1px solid var(--border);
+      border: var(--magi-hairline) solid var(--border);
       border-radius: var(--radius-lg);
       background: var(--magi-surface-main);
     }
@@ -1430,13 +1422,13 @@ import {
       gap: var(--space-4);
       flex-shrink: 0;
       padding: 18px max(32px, calc((100% - 880px) / 2));
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+      border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--border) 60%, transparent);
     }
 
     .header-breadcrumbs h2 {
       margin: 0;
       font-size: 18px;
-      font-weight: 600;
+      font-weight: var(--font-semibold);
       color: var(--foreground);
       white-space: nowrap;
     }
@@ -1457,7 +1449,7 @@ import {
       min-width: 0;
       color: var(--foreground-muted);
       font-size: 12px;
-      font-weight: 500;
+      font-weight: var(--font-medium);
       line-height: 1.35;
     }
 
@@ -1492,7 +1484,7 @@ import {
      ========================================= */
 
   /* 统一主行动按钮 (Buttons) */
-  
+
   /* 窄屏：外壳去掉外边距，设置页变成整页——顶部是返回与横向滚动的分类，下面是内容。 */
   @media (max-width: 900px) {
     .settings-page {
@@ -1508,7 +1500,7 @@ import {
       padding: calc(var(--space-3) + env(safe-area-inset-top, 0px)) var(--space-3) var(--space-3);
       overflow: visible;
       border: none;
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+      border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--border) 60%, transparent);
       border-radius: 0;
     }
 

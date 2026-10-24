@@ -32,14 +32,6 @@ pub struct ExecutionBindingIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UrlMode {
-    Full,
-    Proxy,
-    Default,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Low,
     Medium,
@@ -55,7 +47,6 @@ pub struct ModelResolutionIdentity {
     pub resolved_model: String,
     pub canonical_base_url: String,
     pub base_url_fingerprint: String,
-    pub url_mode: UrlMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
     pub binding_revision: u32,
@@ -305,7 +296,6 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
-    pub url_mode: UrlMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 }

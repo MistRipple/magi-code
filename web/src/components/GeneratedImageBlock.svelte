@@ -115,7 +115,7 @@
     max-width: 100%;
     max-height: 560px;
     object-fit: contain;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-subtle);
   }
@@ -149,7 +149,7 @@
     max-height: 420px;
     margin: var(--space-2) 0 var(--space-3);
     overflow: hidden;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-subtle);
   }
@@ -170,7 +170,7 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 76%, transparent);
     border-radius: 999px;
     background: color-mix(in srgb, var(--surface-1) 88%, transparent);
     color: var(--foreground-muted);

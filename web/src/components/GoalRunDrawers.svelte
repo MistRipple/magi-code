@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import {
     addToast,
@@ -604,7 +605,7 @@
         {/if}
       </div>
 
-      {#if planDrawerExpanded}
+      <Disclosure expanded={planDrawerExpanded}>
         {#if currentPlanBlocked}
           <div class="plan-blocked-hint">
             <Icon name="alert-triangle" size={14} />
@@ -628,7 +629,7 @@
             </div>
           {/each}
         </div>
-      {/if}
+      </Disclosure>
     </section>
   {/if}
 
@@ -710,7 +711,7 @@
           </button>
         </div>
       </div>
-      {#if goalDrawerExpanded}
+      <Disclosure expanded={goalDrawerExpanded}>
         <div class="goal-detail">
           {#if isEditingGoal}
             <form class="goal-edit-form" onsubmit={(event) => { event.preventDefault(); void saveGoalObjective(); }}>
@@ -778,13 +779,13 @@
                 >
                   {i18n.t('goalPanel.note.evidenceCount', { count: goalNote.evidence.length })}
                 </button>
-                {#if goalEvidenceExpanded}
+                <Disclosure expanded={goalEvidenceExpanded}>
                   <ul class="goal-evidence-list">
                     {#each goalNote.evidence as ref (ref)}
                       <li>{ref}</li>
                     {/each}
                   </ul>
-                {/if}
+                </Disclosure>
               {/if}
             </div>
           {/if}
@@ -807,7 +808,7 @@
             </span>
           </div>
         </div>
-      {/if}
+      </Disclosure>
     </section>
   {/if}
 
@@ -1063,7 +1064,7 @@
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     min-width: 0;
-    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .goal-metric {
@@ -1074,7 +1075,7 @@
     min-width: 0;
     padding: 7px 6px;
     text-align: center;
-    border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    border-right: var(--magi-hairline) solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .goal-metric:last-child {
@@ -1100,7 +1101,7 @@
     min-height: 56px;
     max-height: 160px;
     padding: 6px var(--space-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--background);
     color: var(--foreground);
@@ -1149,7 +1150,7 @@
   .goal-edit-button {
     height: 26px;
     padding: 0 var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 40%, var(--border));
     border-radius: var(--radius-sm);
     background: var(--primary);
     color: var(--primary-foreground);
@@ -1190,7 +1191,7 @@
     align-items: flex-start;
     gap: 7px;
     padding: 8px 9px;
-    border: 1px solid color-mix(in srgb, var(--warning) 26%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--warning) 26%, transparent);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--warning) 7%, transparent);
     color: color-mix(in srgb, var(--warning) 78%, var(--foreground));
@@ -1244,7 +1245,7 @@
     gap: var(--space-2);
     min-height: 34px;
     padding: var(--space-1);
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-sm);
     color: var(--foreground);
   }

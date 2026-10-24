@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { Component } from 'svelte';
   import Icon from './Icon.svelte';
   import type { DiagramPayload } from '../lib/diagram-payload';
@@ -37,6 +38,8 @@
   let failedMessage = $state('');
   let requestedKind = $state<DiagramPayload['kind'] | null>(null);
   let copied = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
 
   function recordLoadError(kind: DiagramPayload['kind'], error: unknown): void {
     console.warn('[DiagramRenderer] diagram renderer load failed:', kind, error);
@@ -159,9 +162,10 @@
     try {
       await navigator.clipboard.writeText(previewText);
       copied = true;
-      setTimeout(() => {
+      clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
         copied = false;
-      }, 1600);
+      }, 2500);
     } catch (error) {
       console.error('[DiagramRenderer] 复制图表数据失败:', error);
     }
@@ -230,7 +234,7 @@
       </div>
       <div class="header-actions">
         <button
-          class="header-btn"
+          class="header-btn" class:copied data-copy-feedback={copied}
           onclick={copyPayload}
           disabled={!canCopyPayload}
           title={i18n.t('diagramRenderer.copyData')}
@@ -257,7 +261,7 @@
   .diagram-shell {
     overflow: hidden;
     margin: var(--space-2, 8px) 0;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1);
   }
@@ -268,7 +272,7 @@
     justify-content: space-between;
     gap: var(--space-3, 12px);
     padding: var(--space-2, 8px) var(--space-3, 12px);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     background: var(--surface-2);
   }
 
@@ -287,7 +291,7 @@
 
   .header-type {
     flex-shrink: 0;
-    font-weight: 500;
+    font-weight: var(--font-medium);
   }
 
   .header-title {

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
+  import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import { addToast, getActiveInteractionType, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -115,7 +117,7 @@
         commits: preview.incomingCommitCount,
         files: preview.changedPaths.length,
         paths: preview.changedPaths.slice(0, 8).join('\n') || '—',
-      }));
+      }), { confirmLabel: i18n.t('input.branch.merge') });
       if (!confirmed) return;
       const result = await runGitContextOperation('branchMerge', binding, () => (
         mergeWorkspaceBranch(target, false, currentGitExpectedContext(), binding)
@@ -139,7 +141,7 @@
     const confirmed = await confirmMessage(i18n.t(
       force ? 'input.branch.forceDeleteConfirm' : 'input.branch.deleteConfirm',
       { branch },
-    ), { tone: 'danger' });
+    ), { tone: 'danger', confirmLabel: i18n.t(force ? 'overlay.forceDeleteBranch' : 'input.branch.delete') });
     if (!confirmed) return;
     localError = null;
     try {
@@ -165,7 +167,7 @@
     if (interactionLocked || gitContextState.contextDrift) return;
     const separator = fullName.indexOf('/');
     if (separator <= 0 || separator >= fullName.length - 1) return;
-    if (!(await confirmMessage(i18n.t('input.branch.remoteDeleteConfirm', { branch: fullName }), { tone: 'danger' }))) return;
+    if (!(await confirmMessage(i18n.t('input.branch.remoteDeleteConfirm', { branch: fullName }), { tone: 'danger', confirmLabel: i18n.t('input.branch.deleteRemote') }))) return;
     const remote = fullName.slice(0, separator);
     const branch = fullName.slice(separator + 1);
     try {
@@ -215,7 +217,7 @@
     const confirmed = await confirmMessage(i18n.t(
       force ? 'input.branch.worktreeForceRemoveConfirm' : 'input.branch.worktreeRemoveConfirm',
       { path },
-    ), { tone: 'danger' });
+    ), { tone: 'danger', confirmLabel: i18n.t(force ? 'overlay.forceRemoveWorktree' : 'input.branch.worktreeRemove') });
     if (!confirmed) return;
     try {
       const result = await runGitContextOperation('worktreeRemove', binding, () => (
@@ -301,7 +303,7 @@
       <Icon name={advancedOpen ? 'chevron-up' : 'chevron-down'} size={12} />
     </button>
 
-    {#if advancedOpen}
+    <Disclosure expanded={advancedOpen}>
       <div class="git-advanced-content">
         <div class="git-section">
           <div class="git-section-title">{i18n.t('input.branch.localTitle')}</div>
@@ -343,10 +345,9 @@
         <div class="git-section">
           <div class="git-section-title">{i18n.t('input.branch.worktreeTitle')}</div>
           <div class="git-worktree-create">
-            <select bind:value={worktreeMode} disabled={interactionLocked || gitContextState.contextDrift}>
-              <option value="readOnly">{i18n.t('input.branch.worktreeReadOnly')}</option>
-              <option value="writable">{i18n.t('input.branch.worktreeWritable')}</option>
-            </select>
+            <SelectField bind:value={worktreeMode} disabled={interactionLocked || gitContextState.contextDrift}
+              label={i18n.t('input.branch.worktreeTitle')}
+              options={[{ value: 'readOnly', label: i18n.t('input.branch.worktreeReadOnly') }, { value: 'writable', label: i18n.t('input.branch.worktreeWritable') }]} />
             {#if worktreeMode === 'writable'}
               <input bind:value={worktreeBranch} placeholder={i18n.t('input.branch.worktreeBranchPlaceholder')} disabled={interactionLocked || gitContextState.contextDrift} />
             {/if}
@@ -377,12 +378,12 @@
           {/if}
         </div>
       </div>
-    {/if}
+    </Disclosure>
   </section>
 {/if}
 
 <style>
-  .git-repository-panel { flex: 0 0 auto; margin: var(--space-2); border: 1px solid var(--edits-row-border, var(--border-subtle)); border-radius: var(--radius-md); background: var(--edits-row-bg, var(--surface-1)); overflow: hidden; }
+  .git-repository-panel { flex: 0 0 auto; margin: var(--space-2); border: var(--magi-hairline) solid var(--edits-row-border, var(--border-subtle)); border-radius: var(--radius-md); background: var(--edits-row-bg, var(--surface-1)); overflow: hidden; }
   .git-repository-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; padding: 7px 10px; }
   .git-repository-identity { display: flex; align-items: center; gap: 9px; min-width: 0; }
   .git-repository-branch { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-medium); }
@@ -393,24 +394,24 @@
   .git-repository-stats button { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .git-repository-stats button:hover { background: var(--surface-hover); color: var(--foreground); }
   .git-repository-stats button.loading :global(svg) { animation: git-spin 900ms linear infinite; }
-  .git-advanced-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; height: 30px; padding: 0 10px; border: 0; border-top: 1px solid var(--border-subtle); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: var(--text-xs); }
+  .git-advanced-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; height: 30px; padding: 0 10px; border: 0; border-top: var(--magi-hairline) solid var(--border-subtle); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: var(--text-xs); }
   .git-advanced-toggle:hover { background: var(--surface-hover); color: var(--foreground); }
-  .git-advanced-content { display: flex; flex-direction: column; gap: 10px; max-height: 420px; padding: 10px; overflow-y: auto; border-top: 1px solid var(--border-subtle); }
+  .git-advanced-content { display: flex; flex-direction: column; gap: 10px; max-height: 420px; padding: 10px; overflow-y: auto; border-top: var(--magi-hairline) solid var(--border-subtle); }
   .git-section { min-width: 0; }
   .git-section-title { margin-bottom: 5px; color: var(--foreground-muted); font-size: var(--text-2xs); font-weight: var(--font-semibold); }
-  .git-list { display: flex; flex-direction: column; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); overflow: hidden; }
+  .git-list { display: flex; flex-direction: column; border: 0; border-radius: var(--radius-sm); overflow: hidden; }
   .git-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; padding: 5px 8px; background: transparent; }
-  .git-row + .git-row { border-top: 1px solid var(--border-subtle); }
+  .git-row + .git-row { border-top: var(--magi-hairline) solid var(--border-subtle); }
   .git-row-main { display: flex; flex-direction: column; min-width: 0; }
   .git-row-main > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-xs); }
   .git-row small, .git-row-main small { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: 10px; }
   .git-row-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; }
-  .git-row-actions button, .git-worktree-create button { height: 24px; padding: 0 7px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: 10px; }
+  .git-row-actions button, .git-worktree-create button { height: 24px; padding: 0 7px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: 10px; }
   .git-row-actions button:hover:not(:disabled), .git-worktree-create button:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
   .git-row-actions button.danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--error) 46%, var(--border-subtle)); color: var(--error); }
   button:disabled { cursor: not-allowed; opacity: 0.48; }
   .git-worktree-create { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
-  .git-worktree-create select, .git-worktree-create input { min-width: 130px; height: 26px; padding: 0 7px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--background); color: var(--foreground); font-size: 11px; }
+  .git-worktree-create input { min-width: 130px; height: 26px; padding: 0 7px; border: var(--magi-hairline) solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--background); color: var(--foreground); font-size: 11px; }
   .git-repository-error { margin: 0 10px 8px; padding: 6px 8px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); font-size: 11px; }
   .git-empty { padding: 9px; color: var(--foreground-muted); font-size: 11px; text-align: center; }
   @keyframes git-spin { to { transform: rotate(360deg); } }

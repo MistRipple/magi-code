@@ -19,7 +19,7 @@ assert.match(
 );
 assert.match(
   runtimePanelSource,
-  /aria-expanded=\{hasDetail \? recordExpanded : undefined\}[\s\S]*?\{#if recordExpanded\}[\s\S]*?runtime-diagnostics__record-detail/,
+  /aria-expanded=\{hasDetail \? recordExpanded : undefined\}[\s\S]*?<Disclosure expanded=\{recordExpanded\}>[\s\S]*?runtime-diagnostics__record-detail/,
   '运行记录详情只能在用户逐条展开后显示',
 );
 assert.doesNotMatch(

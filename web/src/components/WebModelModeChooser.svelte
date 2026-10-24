@@ -25,6 +25,9 @@
   let error = $state('');
   let conversations = $state<WebSavedConversation[]>([]);
   let binding = $state('');
+  let query = $state('');
+  const filteredConversations = $derived(conversations.filter(item =>
+    `${item.title} ${item.conversationId}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())));
 
   async function toggleList(): Promise<void> {
     if (listOpen) {
@@ -32,6 +35,7 @@
       return;
     }
     listOpen = true;
+    query = '';
     loading = true;
     error = '';
     try {
@@ -65,11 +69,12 @@
 
 <div class="wm-mode" data-web-model-mode={mode}>
   <div class="wm-mode-header">{i18n.t('webModel.mode.header')}</div>
-  <div class="wm-mode-strip" role="group">
+  <div class="wm-mode-strip" role="group" aria-label={i18n.t('webModel.mode.header')}>
     <button
       type="button"
       class="wm-mode-btn"
       class:selected={mode === 'temporary'}
+      aria-pressed={mode === 'temporary'}
       data-web-model-mode-option="temporary"
       {disabled}
       onclick={() => void onModeChange('temporary')}
@@ -78,6 +83,7 @@
       type="button"
       class="wm-mode-btn"
       class:selected={mode === 'saved'}
+      aria-pressed={mode === 'saved'}
       data-web-model-mode-option="saved"
       {disabled}
       onclick={() => void onModeChange('saved')}
@@ -90,6 +96,7 @@
     type="button"
     class="wm-history-btn"
     data-web-model-history="1"
+    aria-expanded={listOpen}
     {disabled}
     onclick={() => void toggleList()}
   >
@@ -97,7 +104,7 @@
     <Icon name="chevron-down" size={10} />
   </button>
   {#if listOpen}
-    <div class="wm-history" role="listbox">
+    <div class="wm-history" role="group" aria-label={i18n.t('webModel.saved.pick')}>
       {#if loading}
         <p class="wm-note">{i18n.t('webModel.saved.loading')}</p>
       {:else if error}
@@ -105,7 +112,11 @@
       {:else if conversations.length === 0}
         <p class="wm-note">{i18n.t('webModel.saved.empty')}</p>
       {:else}
-        {#each conversations as item (item.conversationId)}
+        {#if conversations.length > 10}
+          <input type="search" class="form-input" bind:value={query} placeholder={i18n.t('selection.search')}
+            aria-label={i18n.t('selection.searchFor', { label: i18n.t('webModel.saved.pick') })} />
+        {/if}
+        {#each filteredConversations as item (item.conversationId)}
           <button
             type="button"
             class="wm-history-item"
@@ -118,6 +129,8 @@
               <Icon name="loader" size={12} class="spinning" />
             {/if}
           </button>
+        {:else}
+          <p class="wm-note" role="status">{i18n.t('selection.empty')}</p>
         {/each}
       {/if}
     </div>
@@ -148,7 +161,7 @@
   .wm-history-btn,
   .wm-history-item {
     padding: 3px 10px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: var(--radius-sm);
     font-size: var(--text-xs);
     background: transparent;

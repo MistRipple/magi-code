@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../../lib/view-drafts';
+  import FileName from '../FileName.svelte';
   import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
   import AgentCursorOverlay, { type AgentCursorSignal } from './AgentCursorOverlay.svelte';
@@ -209,6 +211,7 @@
   let tooltipAnchorPreviousPriority = '';
   let tooltipText = $state('');
   let actionsMenuOpen = $state(false);
+  let annotationMenuSearch = $state('');
   let localViewportMode = $state<BrowserViewportMode>('auto');
   let localViewport = $state({ width: 1280, height: 800, deviceType: 'desktop' as BrowserDeviceType });
   // 保留输入框的原始字符串，避免无效的空值被 Number('') 转成 0，
@@ -225,6 +228,11 @@
   let latestDesktopSnapshotRevision = 0;
   let annotationSelection = $state<BrowserAnnotationSelection | null>(null);
   let annotationComment = $state('');
+  let annotationCommentDraftKey = '';
+  let annotationCommentBaseline = '';
+  $effect(() => {
+    if (annotationPhase === 'comment' && annotationCommentDraftKey) saveViewDraft(annotationCommentDraftKey, annotationCommentBaseline, annotationComment, 'memory');
+  });
   let annotationPhase = $state<'select' | 'comment' | null>(null);
   let annotationCaptureIdentity = $state<BrowserInspectIdentity | null>(null);
   let annotationCaptureGeneration = 0;
@@ -341,6 +349,9 @@
       isReferenceableBrowserAnnotation(annotation.status)
     )),
   );
+  $effect(() => { if (!actionsMenuOpen || savedAnnotations.length <= 10) annotationMenuSearch = ''; });
+  const annotationMenuItems = $derived(savedAnnotations.filter(annotation =>
+    `${annotation.sequence} ${annotation.comment}`.toLocaleLowerCase().includes(annotationMenuSearch.trim().toLocaleLowerCase())));
   const activeDownload = $derived.by<MagiDesktopBrowserDownloadSnapshot | null>(() => {
     if (!desktopRuntime) return null;
     const downloads = activeDownloads.filter((download) => download.tabId === tabId);
@@ -1280,7 +1291,9 @@
     const comment = annotationComment.trim();
     if (!tab || !selection || !comment || annotationPhase !== 'comment') return;
     void run(async () => {
+      const draftKey = annotationCommentDraftKey;
       const created = await createBrowserAnnotation(tab.tabId, selection, comment);
+      clearViewDraft(draftKey);
       await refreshSession(true);
       window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: created }));
       annotationSelection = null;
@@ -1571,7 +1584,9 @@
       }
       stopDesktopAnnotationCapture(binding);
       annotationSelection = selection;
-      annotationComment = '';
+      annotationCommentBaseline = JSON.stringify(selection);
+      annotationCommentDraftKey = `browser-comment:${activeTab?.tabId}:${selection.navigationRevision}`;
+      annotationComment = loadViewDraft(annotationCommentDraftKey, annotationCommentBaseline, '', 'memory');
       annotationPhase = 'comment';
       actionError = '';
       return;
@@ -2035,7 +2050,7 @@
       role="status"
       aria-label={i18n.t('browser.download.status')}
     >
-      <span class="browser-download-name" title={activeDownload.suggestedFilename}>{activeDownload.suggestedFilename}</span>
+      <span class="browser-download-name" title={activeDownload.suggestedFilename}><FileName name={activeDownload.suggestedFilename} /></span>
       {#if activeDownload.state === 'started' || activeDownload.state === 'progressing'}
         <span class="browser-download-state">{i18n.t('browser.download.progressing')}</span>
         {#if activeDownload.totalBytes}
@@ -2069,8 +2084,14 @@
         {#if savedAnnotations.length > 0}
           {#if compactToolbar}<div class="menu-divider" aria-hidden="true"></div>{/if}
           <div class="browser-actions-heading">{i18n.t('browser.annotation.history')}</div>
-          {#each savedAnnotations as annotation (annotation.annotationId)}
+          {#if savedAnnotations.length > 10}
+            <input class="form-input" type="search" bind:value={annotationMenuSearch} placeholder={i18n.t('selection.search')}
+              aria-label={i18n.t('selection.searchFor', { label: i18n.t('browser.annotation.history') })} />
+          {/if}
+          {#each annotationMenuItems as annotation (annotation.annotationId)}
             <button type="button" role="menuitem" onclick={() => selectSavedAnnotation(annotation)} title={annotation.comment}><span class="annotation-menu-number">{annotation.sequence}</span><span class="annotation-comment">{annotation.comment}</span></button>
+          {:else}
+            <p class="browser-actions-heading" role="status">{i18n.t('selection.empty')}</p>
           {/each}
         {/if}
       </div>
@@ -2138,7 +2159,7 @@
         </div>
       {/if}
       {#if annotationPhase === 'comment' && annotationSelection}
-        <div bind:this={annotationEditorElement} class="annotation-editor" style:position-anchor={surfaceAnchorName} popover="manual" role="dialog" aria-label={i18n.t('browser.annotation.title')}>
+        <div bind:this={annotationEditorElement} class="annotation-editor" style:position-anchor={surfaceAnchorName} popover="manual" role="dialog" data-overlay-kind="spatial-form" aria-label={i18n.t('browser.annotation.title')}>
           <textarea
             bind:this={annotationEditor}
             bind:value={annotationComment}
@@ -2189,7 +2210,7 @@
 <style>
   .browser-pane { container-type: inline-size; position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: transparent; }
   /* 工具栏固定在右栏内容区内，边框不改变内容槽的有效尺寸。 */
-  .browser-toolbar { position: relative; z-index: 10; isolation: isolate; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
+  .browser-toolbar { position: relative; z-index: 10; isolation: isolate; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: var(--magi-hairline) solid var(--border); flex-shrink: 0; overflow: visible; }
   .browser-toolbar-actions { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; }
   .icon-button, .address-submit { position: relative; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
@@ -2199,35 +2220,36 @@
   .flip :global(svg) { transform: scaleX(-1); }
   /* 原生 title 和普通伪元素都会落在 <webview> 后面；工具提示通过
      Popover Top Layer 从当前工具栏向下展示，仍由 Renderer DOM 管理。 */
-  .browser-toolbar-tooltip { position: fixed; top: calc(anchor(bottom) + 5px); left: anchor(right); z-index: var(--z-tooltip, 1200); max-width: min(240px, calc(100vw - 16px)); padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--glass-bg, var(--dropdown-bg)); box-shadow: var(--shadow-sm); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1.25; white-space: nowrap; pointer-events: none; transform: translateX(-100%); }
+  .browser-toolbar-tooltip { position: fixed; top: calc(anchor(bottom) + 5px); left: anchor(right); z-index: var(--z-tooltip, 1200); max-width: min(240px, calc(100vw - 16px)); padding: 4px 7px; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--glass-bg, var(--dropdown-bg)); box-shadow: var(--shadow-sm); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium, 500); line-height: 1.25; white-space: nowrap; pointer-events: none; transform: translateX(-100%); }
   .address-form { display: flex; flex: 1 1 0; min-width: 0; }
-  .address-form input { box-sizing: border-box; width: 100%; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-1); color: var(--foreground); font: inherit; }
-  .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: 1px solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
-  .record-address { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); }
+  .address-form input { box-sizing: border-box; width: 100%; min-width: 0; height: 27px; padding: 0 8px; border: var(--magi-hairline) solid var(--border); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-1); color: var(--foreground); font: inherit; }
+  .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: var(--magi-hairline) solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
+  .record-address { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; height: 27px; padding: 0 8px; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); }
   .record-address span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 顶部工具菜单是浏览器框架上的 Renderer 浮层，不属于页面内容的排版轨道。
      CSS Anchor Positioning 让它跟随真实工具栏位置，Popover Top Layer 解决
      Electron webview 原生合成层的遮挡，不需要任何浏览器内容坐标映射。 */
   .browser-actions-popover { position: fixed; top: calc(anchor(bottom) + 4px); left: calc(anchor(right) - 6px); z-index: 20; box-sizing: border-box; width: min(300px, calc(anchor-size(width) - 12px)); pointer-events: auto; transform: translateX(-100%); }
   .browser-actions-popover { width: max-content; min-width: min(200px, calc(anchor-size(width) - 12px)); max-width: min(280px, calc(anchor-size(width) - 12px)); }
-  .browser-actions-menu { box-sizing: border-box; width: 100%; overflow: hidden; padding: 7px; border: 1px solid var(--border); border-radius: 8px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
-  .browser-actions-popover .browser-actions-menu { width: 100%; max-height: min(420px, 60dvh); overflow-y: auto; scrollbar-width: thin; }
+  .browser-actions-menu { box-sizing: border-box; width: 100%; overflow: hidden; padding: 7px; border: var(--magi-hairline) solid var(--border); border-radius: 8px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .browser-actions-popover .browser-actions-menu { width: 100%; max-height: min(264px, 60dvh); overflow-y: auto; scrollbar-width: thin; }
   .browser-actions-menu > button { box-sizing: border-box; display: flex; align-items: center; justify-content: flex-start; gap: 8px; width: 100%; height: auto; min-height: 32px; padding: 6px 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); line-height: 1.4; cursor: pointer; text-align: left; }
   .browser-actions-menu > button > :global(svg) { flex: 0 0 14px; }
   .browser-actions-menu > button > span { min-width: 0; overflow-wrap: anywhere; text-align: left; }
   .browser-actions-menu > button:hover { background: var(--surface-hover); }
   .menu-divider { height: 1px; margin: 6px 3px; background: var(--border); }
-  .viewport-toolbar { box-sizing: border-box; display: grid; grid-template-columns: auto auto auto; justify-content: center; align-items: center; gap: 4px 8px; flex: 0 0 auto; padding: 5px 8px; border-bottom: 1px solid var(--border); background: var(--surface-1); font-size: 12px; }
-  .viewport-preset { box-sizing: border-box; width: 190px; max-width: 100%; min-width: 0; height: 28px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-overflow: ellipsis; }
+  .viewport-toolbar { box-sizing: border-box; display: grid; grid-template-columns: auto auto auto; justify-content: center; align-items: center; gap: 4px 8px; flex: 0 0 auto; padding: 5px 8px; border-bottom: var(--magi-hairline) solid var(--border); background: var(--surface-1); font-size: 12px; }
+  .viewport-preset { box-sizing: border-box; width: 190px; max-width: 100%; min-width: 0; height: 28px; padding: 0 5px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-overflow: ellipsis; }
   .viewport-edit-row, .viewport-custom { display: flex; align-items: center; gap: 6px; }
-  .viewport-custom input { box-sizing: border-box; min-width: 0; width: 64px; height: 28px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-align: center; font-variant-numeric: tabular-nums; }
-  .viewport-toolbar :is(select, input, button):focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+  .viewport-custom input { box-sizing: border-box; min-width: 0; width: 64px; height: 28px; padding: 0 5px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--background); color: var(--foreground); font: inherit; text-align: center; font-variant-numeric: tabular-nums; }
+  .viewport-toolbar :is(select, button):focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+  .viewport-toolbar input:focus-visible { outline: none; box-shadow: var(--magi-focus-shadow); }
   .viewport-custom input[aria-invalid="true"] { border-color: var(--error); }
   .viewport-dimension-separator, .viewport-unit { color: var(--foreground-muted); }
   .viewport-unit { font-size: 11px; }
   .viewport-preview-scale { color: var(--foreground-muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .viewport-input-error { grid-column: 1 / -1; color: var(--error); font-size: 11px; overflow-wrap: anywhere; }
-  .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: 700; }
+  .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: var(--font-bold); }
   .record-status { min-width: 0; max-width: 180px; overflow: hidden; color: var(--foreground-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
   .hand-back-button { color: var(--primary); background: var(--primary-muted); }
   .browser-actions-menu button:disabled { opacity: .45; cursor: default; }
@@ -2243,13 +2265,13 @@
   }
   @container (max-width: 360px) {
     .address-submit { display: none; }
-    .address-form input { border-right: 1px solid var(--border); border-radius: var(--radius-sm); }
+    .address-form input { border-right: var(--magi-hairline) solid var(--border); border-radius: var(--radius-sm); }
   }
-  .browser-download-panel { position: fixed; top: calc(anchor(bottom) - 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; transform: translateY(-100%); }
+  .browser-download-panel { position: fixed; top: calc(anchor(bottom) - 10px); left: calc(anchor(left) + 10px); z-index: 5; box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 30px; padding: 4px 6px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); pointer-events: auto; transform: translateY(-100%); }
   .browser-download-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
   .browser-download-state { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; white-space: nowrap; }
   .browser-download-bytes { flex: 0 0 auto; color: var(--foreground-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
+  .browser-download-panel button { flex: 0 0 auto; height: 22px; padding: 0 7px; border: 0; border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: 10px; cursor: pointer; }
   .browser-download-panel button:hover { background: var(--surface-hover); }
   .browser-surface-slot { position: relative; z-index: 0; display: flex; justify-content: center; align-items: flex-start; flex: 1; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-1); }
   .browser-viewport { display: flex; flex: 0 0 auto; min-width: 0; min-height: 0; overflow: hidden; }
@@ -2266,7 +2288,7 @@
      从而出现页面被截断、滚动条异常和截图范围错误。 */
   .browser-webview { display: flex; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: var(--magi-surface-right-pane); }
   .browser-placeholder-overlay { position: absolute; inset: 0; pointer-events: none; background: var(--surface-1); }
-  .browser-action-error { position: fixed; top: calc(anchor(top) + 10px); left: calc(anchor(left) + 10px); z-index: 6; box-sizing: border-box; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 34px; margin: 0; padding: 5px 6px 5px 8px; border: 1px solid color-mix(in srgb, var(--error) 45%, var(--border)); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); color: var(--foreground); pointer-events: auto; }
+  .browser-action-error { position: fixed; top: calc(anchor(top) + 10px); left: calc(anchor(left) + 10px); z-index: 6; box-sizing: border-box; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; width: min(420px, calc(anchor-size(width) - 20px)); min-height: 34px; margin: 0; padding: 5px 6px 5px 8px; border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 45%, var(--border)); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); color: var(--foreground); pointer-events: auto; }
   .browser-action-error > :global(svg) { color: var(--error); }
   .browser-action-error span { min-width: 0; overflow-wrap: anywhere; font-size: var(--text-xs); line-height: 1.35; }
   .browser-action-error button { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--foreground-muted); cursor: pointer; }
@@ -2276,28 +2298,28 @@
      呈现同一失败事实，避免普通 DOM 被原生 guest 合成层覆盖。 */
   .browser-page-error { position: fixed; top: anchor(top); left: anchor(left); width: anchor-size(width); height: anchor-size(height); box-sizing: border-box; display: grid; place-content: center; justify-items: center; gap: 9px; margin: 0; padding: 24px; border: 0; background: var(--surface-1); color: var(--foreground-muted); text-align: center; }
   .browser-page-error :global(svg) { color: var(--error); }
-  .browser-page-error strong { color: var(--foreground); font-size: var(--text-md); font-weight: 600; }
+  .browser-page-error strong { color: var(--foreground); font-size: var(--text-md); font-weight: var(--font-semibold); }
   .browser-page-error span { max-width: min(520px, 100%); overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-xs); }
-  .browser-page-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 4px; padding: 0 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
+  .browser-page-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 4px; padding: 0 10px; border: var(--magi-hairline) solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .browser-page-error button:hover:not(:disabled) { background: var(--surface-hover); }
   .browser-page-error button:disabled { cursor: default; opacity: .5; }
-  .annotation-editor { position: fixed; top: calc(anchor(bottom) - 12px); left: anchor(left); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); transform: translateY(-100%); }
-  .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
+  .annotation-editor { position: fixed; top: calc(anchor(bottom) - 12px); left: anchor(left); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); transform: translateY(-100%); }
+  .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
-  .annotation-editor-actions button { min-width: 58px; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }
+  .annotation-editor-actions button { min-width: 58px; height: 28px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }
   .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground); }
   .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
   .browser-placeholder { display: grid; flex: 1; place-items: center; padding: 20px; color: var(--foreground-muted); font-size: var(--text-sm); text-align: center; }
   .browser-placeholder.error { color: var(--error); }
   .browser-record { display: flex; flex: 1; flex-direction: column; align-items: center; gap: 9px; min-width: 0; padding: 44px 24px; color: var(--foreground-muted); text-align: center; }
-  .browser-record strong { max-width: 100%; color: var(--foreground); font-size: var(--text-md); font-weight: 600; overflow-wrap: anywhere; }
+  .browser-record strong { max-width: 100%; color: var(--foreground); font-size: var(--text-md); font-weight: var(--font-semibold); overflow-wrap: anywhere; }
   .browser-record-url { max-width: 100%; color: var(--foreground-muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
   .browser-record-description { max-width: 420px; font-size: var(--text-sm); line-height: 1.5; }
   .browser-record-annotations { display: grid; gap: 5px; width: min(420px, 100%); margin-top: 8px; }
-  .browser-record-annotation { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
+  .browser-record-annotation { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border: var(--magi-hairline) solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
   .browser-record-annotation:hover { background: var(--surface-hover); }
   .browser-record-annotation > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .browser-record-external { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 8px; padding: 0 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
+  .browser-record-external { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; margin-top: 8px; padding: 0 10px; border: var(--magi-hairline) solid var(--border); border-radius: 5px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .browser-record-external:hover:not(:disabled) { background: var(--surface-hover); }
   .browser-record-external:disabled { cursor: default; opacity: .45; }
 </style>

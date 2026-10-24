@@ -46,13 +46,13 @@
     margin-top: 10px;
     padding: 10px 12px;
     border-radius: 10px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--surface-2);
   }
 
   .retry-runtime-title {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--foreground);
   }
 

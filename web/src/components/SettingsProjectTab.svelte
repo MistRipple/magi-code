@@ -288,7 +288,7 @@
     gap: var(--space-2);
     height: 30px;
     padding: 0 var(--space-3);
-    border: 1px solid var(--ind-border-control, var(--border));
+    border: var(--magi-hairline) solid var(--ind-border-control, var(--border));
     border-radius: var(--radius-full);
     background: var(--ind-bg-control, transparent);
     color: var(--foreground);
@@ -342,7 +342,7 @@
     width: 300px;
     max-width: calc(100vw - 32px);
     padding: var(--space-4);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--dropdown-bg);
     box-shadow: var(--shadow-lg);
@@ -384,7 +384,7 @@
     flex-direction: column;
     gap: var(--space-2);
     padding-top: var(--space-3);
-    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 60%, transparent);
   }
 
   .about-status {

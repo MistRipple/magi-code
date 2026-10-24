@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   /**
    * 「设置 → MCP 服务」分类（MCP 服务插件激活后出现）。
    *
@@ -6,7 +7,7 @@
    * `/api/mcp-server/*`。令牌原文由 daemon 在本机保存，需要时通过“查看配置”重新取回；
    * 这里不落任何浏览器存储，收起面板或关闭提示卡后即丢弃。
    */
-  import { onMount, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
@@ -61,6 +62,8 @@
   /** 刚创建的令牌原文。只驻内存，用户点“我已保存”后丢弃。 */
   let freshSecret = $state('');
   let copiedKey = $state('');
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
 
   /** 直接对公网开放的表单。 */
   let directBindHost = $state('0.0.0.0');
@@ -233,7 +236,7 @@
   }
 
   async function clearNamedTunnel(): Promise<void> {
-    if (!(await confirmMessage(i18n.t('mcpServer.named.clearConfirm'), { tone: 'danger' }))) return;
+    if (!(await confirmMessage(i18n.t('mcpServer.named.clearConfirm'), { tone: 'danger', confirmLabel: i18n.t('mcpServer.named.clear') }))) return;
     return act(async () => {
       status = await clearMcpServerNamedTunnel();
       namedCheck = null;
@@ -281,7 +284,7 @@
   }
 
   async function startDirect(): Promise<void> {
-    if (!(await confirmMessage(i18n.t('mcpServer.direct.confirm'), { tone: 'danger' }))) return;
+    if (!(await confirmMessage(i18n.t('mcpServer.direct.confirm'), { tone: 'danger', confirmLabel: i18n.t('mcpServer.direct.start') }))) return;
     return act(async () => {
       const port = directPort.trim();
       status = await setMcpServerDirect({
@@ -312,7 +315,7 @@
   }
 
   async function toggleNetwork(enabled: boolean): Promise<void> {
-    if (enabled && !(await confirmMessage(i18n.t('mcpServer.network.confirm'), { tone: 'danger' }))) {
+    if (enabled && !(await confirmMessage(i18n.t('mcpServer.network.confirm'), { tone: 'danger', confirmLabel: i18n.t('mcpServer.network.enable') }))) {
       void refresh();
       return;
     }
@@ -391,7 +394,7 @@
   }
 
   async function rotate(token: McpServerToken): Promise<void> {
-    if (!(await confirmMessage(i18n.t('mcpServer.token.rotateConfirm', { client: token.clientName }), { tone: 'danger' }))) {
+    if (!(await confirmMessage(i18n.t('mcpServer.token.rotateConfirm', { client: token.clientName }), { tone: 'danger', confirmLabel: i18n.t('mcpServer.token.rotate') }))) {
       return;
     }
     return act(async () => {
@@ -404,7 +407,7 @@
   }
 
   async function revokeAll(): Promise<void> {
-    if (!(await confirmMessage(i18n.t('mcpServer.token.revokeAllConfirm'), { tone: 'danger' }))) return;
+    if (!(await confirmMessage(i18n.t('mcpServer.token.revokeAllConfirm'), { tone: 'danger', confirmLabel: i18n.t('mcpServer.token.revokeAll') }))) return;
     return act(async () => {
       status = await revokeAllMcpServerTokens();
       toggleViewOff();
@@ -417,9 +420,11 @@
     try {
       await navigator.clipboard.writeText(text);
       copiedKey = key;
-      window.setTimeout(() => {
-        if (copiedKey === key) copiedKey = '';
-      }, 1500);
+      clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        copiedKey = '';
+        copyResetTimer = undefined;
+      }, 2500);
     } catch {
       /* 剪贴板不可用时用户仍可手动选择文本 */
     }
@@ -557,6 +562,8 @@
     <label class="switch-line">
       <input
         type="checkbox"
+        role="switch"
+        class="control-switch"
         data-mcp-server-enabled="1"
         checked={status?.enabled ?? false}
         disabled={busy || status === null}
@@ -591,6 +598,8 @@
     <label class="switch-line">
       <input
         type="checkbox"
+        role="switch"
+        class="control-switch"
         data-mcp-network-enabled="1"
         checked={status?.network.enabled ?? false}
         disabled={busy || status === null || (!status.network.enabled && !hasNetworkToken)}
@@ -639,14 +648,11 @@
             </button>
           </div>
         {:else}
-          <label class="field">
+          <div class="field">
             <span>{i18n.t('mcpServer.quickAdd.token')}</span>
-            <select bind:value={quickAddTokenId} data-mcp-quick-add-token="1">
-              {#each remoteTokens as token (token.tokenId)}
-                <option value={token.tokenId}>{token.clientName} · {workspaceName(token.workspaceId)} · {token.prefix}…</option>
-              {/each}
-            </select>
-          </label>
+            <SelectField bind:value={quickAddTokenId} data-mcp-quick-add-token="1" label={i18n.t('mcpServer.quickAdd.token')}
+              options={remoteTokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${workspaceName(token.workspaceId)} · ${token.prefix}…` }))} />
+          </div>
           {#if quickAddToken}{@render workspaceBinding(quickAddToken.workspaceId)}{/if}
           {#if quickAddToken && !quickAddToken.hasSecret}
             <p class="meta" data-mcp-quick-add-no-secret="1">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
@@ -889,20 +895,17 @@
                   <input bind:value={editName} maxlength="60" data-mcp-edit-name="1" />
                 </label>
                 <p class="meta">{i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
-                <label class="field">
+                <div class="field">
                   <span>{i18n.t('mcpServer.token.approvalMode')}</span>
-                  <select bind:value={editApprovalMode} data-mcp-edit-approval-mode="1">
-                    {#each APPROVAL_MODES as option (option)}
-                      <option value={option}>{i18n.t(`mcpServer.token.approvalMode.${option}`)}</option>
-                    {/each}
-                  </select>
-                </label>
+                  <SelectField bind:value={editApprovalMode} data-mcp-edit-approval-mode="1" label={i18n.t('mcpServer.token.approvalMode')}
+                    options={APPROVAL_MODES.map(option => ({ value: option, label: i18n.t(`mcpServer.token.approvalMode.${option}`) }))} />
+                </div>
                 <label class="field">
                   <span>{i18n.t('mcpServer.token.editTtl')}</span>
                   <input bind:value={editTtl} inputmode="numeric" placeholder={i18n.t('mcpServer.token.editTtlKeep')} data-mcp-edit-ttl="1" />
                 </label>
                 <label class="switch-line">
-                  <input type="checkbox" bind:checked={editNetwork} />
+                  <input type="checkbox" role="switch" class="control-switch" bind:checked={editNetwork} />
                   <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
                 </label>
                 <p class="meta">{i18n.t('mcpServer.token.editEffect')}</p>
@@ -950,32 +953,24 @@
           maxlength="60"
         />
       </label>
-      <label class="field">
+      <div class="field">
         <span>{i18n.t('mcpServer.token.workspace')}</span>
-        <select bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}>
-          {#if workspaces.length === 0}
-            <option value="">{i18n.t('mcpServer.token.workspaceEmpty')}</option>
-          {/if}
-          {#each workspaces as workspace (workspace.workspaceId)}
-            <option value={workspace.workspaceId}>{workspace.name} · {workspace.rootPath}</option>
-          {/each}
-        </select>
-      </label>
+        <SelectField bind:value={workspaceId} data-mcp-workspace="1" disabled={workspaces.length === 0}
+          label={i18n.t('mcpServer.token.workspace')}
+          options={workspaces.length ? workspaces.map(workspace => ({ value: workspace.workspaceId, label: `${workspace.name} · ${workspace.rootPath}` })) : [{ value: '', label: i18n.t('mcpServer.token.workspaceEmpty') }]} />
+      </div>
       {#if workspaceId}{@render workspaceBinding(workspaceId)}{/if}
-      <label class="field">
+      <div class="field">
         <span>{i18n.t('mcpServer.token.approvalMode')}</span>
-        <select bind:value={approvalMode} data-mcp-approval-mode="1">
-          {#each APPROVAL_MODES as option (option)}
-            <option value={option}>{i18n.t(`mcpServer.token.approvalMode.${option}`)}</option>
-          {/each}
-        </select>
-      </label>
+        <SelectField bind:value={approvalMode} data-mcp-approval-mode="1" label={i18n.t('mcpServer.token.approvalMode')}
+                    options={APPROVAL_MODES.map(option => ({ value: option, label: i18n.t(`mcpServer.token.approvalMode.${option}`) }))} />
+      </div>
       <label class="field">
         <span>{i18n.t('mcpServer.token.ttl')}</span>
         <input type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
       </label>
       <label class="switch-line" data-mcp-allow-network="1">
-        <input type="checkbox" bind:checked={allowNetwork} />
+        <input type="checkbox" role="switch" class="control-switch" bind:checked={allowNetwork} />
         <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
       </label>
       <div class="action-row">
@@ -1003,21 +998,12 @@
         </button>
       </div>
     {:else}
-      <label class="field">
+      <div class="field">
         <span>{i18n.t('mcpServer.snippets.useToken')}</span>
-        <select
-          bind:value={connectTokenId}
-          onchange={() => { connectTokenTouched = true; }}
-          data-mcp-connect-token="1"
-        >
-          <option value="">{i18n.t('mcpServer.snippets.placeholderOption')}</option>
-          {#each connectTokens as token (token.tokenId)}
-            <option value={token.tokenId} disabled={!token.hasSecret}>
-              {token.clientName} · {workspaceName(token.workspaceId)} · {token.prefix}…{token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}
-            </option>
-          {/each}
-        </select>
-      </label>
+        <SelectField bind:value={connectTokenId} data-mcp-connect-token="1" onchange={(next) => { connectTokenId = next; connectTokenTouched = true; }}
+          label={i18n.t('mcpServer.snippets.useToken')}
+          options={[{ value: '', label: i18n.t('mcpServer.snippets.placeholderOption') }, ...connectTokens.map(token => ({ value: token.tokenId, label: `${token.clientName} · ${workspaceName(token.workspaceId)} · ${token.prefix}…${token.hasSecret ? '' : ` (${i18n.t('mcpServer.snippets.noSecretOption')})`}`, disabled: !token.hasSecret }))]} />
+      </div>
       {#if connectToken}{@render workspaceBinding(connectToken.workspaceId)}{/if}
       {#if connectTokens.some((token) => !token.hasSecret)}
         <p class="meta">{i18n.t('mcpServer.snippets.noSecretHint')}</p>
@@ -1055,6 +1041,8 @@
       <label class="switch-line">
         <input
           type="checkbox"
+          role="switch"
+          class="control-switch"
           data-mcp-external-save-content="1"
           checked={status?.external.saveContent ?? true}
           disabled={busy || status === null}
@@ -1063,19 +1051,13 @@
         <span>{i18n.t('mcpServer.external.saveContent')}</span>
       </label>
       <p class="meta">{i18n.t('mcpServer.external.saveContentHint')}</p>
-      <label class="field">
+      <div class="field">
         <span>{i18n.t('mcpServer.external.retention')}</span>
-        <select
-          data-mcp-external-retention="1"
-          value={String(status?.external.retentionDays ?? 30)}
-          disabled={busy || status === null}
-          onchange={(event) => void saveExternal({ retentionDays: Number((event.currentTarget as HTMLSelectElement).value) })}
-        >
-          {#each RETENTION_CHOICES as days (days)}
-            <option value={String(days)}>{days === 0 ? i18n.t('mcpServer.external.retentionForever') : i18n.t('mcpServer.external.retentionDays', { days: String(days) })}</option>
-          {/each}
-        </select>
-      </label>
+        <SelectField data-mcp-external-retention="1" value={String(status?.external.retentionDays ?? 30)}
+          label={i18n.t('mcpServer.external.retention')} disabled={busy || status === null}
+          onchange={(next) => void saveExternal({ retentionDays: Number(next) })}
+          options={RETENTION_CHOICES.map(days => ({ value: String(days), label: days === 0 ? i18n.t('mcpServer.external.retentionForever') : i18n.t('mcpServer.external.retentionDays', { days: String(days) }) }))} />
+      </div>
     </div>
     <SettingsMcpServerAudit tokens={status?.tokens ?? []} version={auditVersion} />
   {/if}
@@ -1110,7 +1092,7 @@
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 10px;
   }
 
@@ -1132,37 +1114,8 @@
     gap: 8px;
     font-size: 12px;
     cursor: pointer;
+    min-height: 24px;
   }
-
-  /* 复选框渲染成与全局 Toggle 一致的开关 */
-  .switch-line input[type='checkbox'] {
-    appearance: none;
-    position: relative;
-    flex: 0 0 auto;
-    width: 32px;
-    height: 18px;
-    margin: 0;
-    border-radius: 999px;
-    background: var(--foreground-muted);
-    opacity: 0.55;
-    cursor: pointer;
-    transition: background var(--transition-fast), opacity var(--transition-fast);
-  }
-  .switch-line input[type='checkbox']::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: #fff;
-    transition: transform var(--transition-fast);
-  }
-  .switch-line input[type='checkbox']:checked { background: var(--success); opacity: 1; }
-  .switch-line input[type='checkbox']:checked::after { transform: translateX(14px); }
-  .switch-line input[type='checkbox']:disabled { cursor: default; opacity: 0.35; }
-  .switch-line input[type='checkbox']:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
   .badge {
     padding: 0 8px;
@@ -1170,7 +1123,7 @@
     background: transparent;
     display: inline-flex;
     align-items: center;
-    border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--success) 40%, transparent);
     border-radius: 999px;
     font-size: var(--text-xs);
     color: var(--success);
@@ -1229,7 +1182,7 @@
     align-items: center;
     gap: 6px;
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .quick-add {
@@ -1237,7 +1190,7 @@
     flex-direction: column;
     gap: 8px;
     padding-top: 10px;
-    border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.14));
+    border-top: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.14));
   }
 
   .form-field-row {
@@ -1254,7 +1207,7 @@
 
   .field textarea {
     padding: 4px 8px;
-    border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.24));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
     border-radius: 6px;
     font-size: 12px;
     font-family: inherit;
@@ -1268,7 +1221,7 @@
     flex-direction: column;
     gap: 8px;
     padding-top: 10px;
-    border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.14));
+    border-top: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.14));
   }
 
   .secret-card {
@@ -1294,7 +1247,7 @@
     flex-direction: column;
     gap: 8px;
     padding-top: 8px;
-    border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.14));
+    border-top: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.14));
   }
 
   .field {
@@ -1305,17 +1258,17 @@
   }
 
   .field input,
-  .field select {
+  .field :global(.select-field select) {
     min-height: 28px;
     padding: 0 var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     font-size: var(--text-sm);
     background: var(--vscode-input-background);
     color: var(--foreground);
   }
   .field input:focus,
-  .field select:focus { outline: none; border-color: var(--primary); }
+  .field :global(.select-field select):focus { outline: none; border-color: var(--primary); }
 
   .snippet {
     display: flex;

@@ -67,7 +67,7 @@
 .lang-name,
 .thinking-title,
 .plan-title {
-  font-weight: 500;
+  font-weight: var(--font-medium);
   font-size: var(--text-sm);
   color: var(--foreground);
   white-space: nowrap;

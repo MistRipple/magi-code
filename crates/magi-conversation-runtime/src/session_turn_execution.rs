@@ -3413,7 +3413,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://main.example.com/v1",
                     "apiKey": "main-key",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
             )
@@ -3431,7 +3430,6 @@ mod tests {
                     "baseUrl": vision_base_url,
                     "apiKey": "vision-key",
                     "model": "vision-model",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                     "contextWindowTokens": 128000,
                     "textModelRules": []

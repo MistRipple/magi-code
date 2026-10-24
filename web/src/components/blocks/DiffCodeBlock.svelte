@@ -367,7 +367,7 @@
 <style>
   .diff-code-block {
     min-width: 0;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: var(--radius-md, 8px);
     background: var(--surface-1);
     color: var(--foreground);
@@ -408,8 +408,8 @@
     align-items: center;
     height: 20px;
     padding-left: 14px;
-    border-top: 1px solid var(--border-subtle);
-    border-bottom: 1px solid var(--border-subtle);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
     background: color-mix(in srgb, var(--info) 6%, var(--surface-1));
     color: var(--foreground-muted);
     user-select: none;
@@ -423,8 +423,8 @@
     min-height: 26px;
     padding: 0;
     border: none;
-    border-top: 1px solid var(--border-subtle);
-    border-bottom: 1px solid var(--border-subtle);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+    border-bottom: var(--magi-hairline) solid var(--border-subtle);
     background: color-mix(in srgb, var(--info) 8%, var(--surface-1));
     color: var(--foreground-muted);
     font: inherit;
@@ -442,7 +442,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border-right: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
+    border-right: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     color: var(--info);
     user-select: none;
   }
@@ -479,7 +479,7 @@
   .diff-line-number {
     display: block;
     padding: 0 10px 0 6px;
-    border-right: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
+    border-right: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     color: color-mix(in srgb, var(--foreground-muted) 72%, transparent);
     text-align: right;
     font-variant-numeric: tabular-nums;

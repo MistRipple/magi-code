@@ -25,15 +25,14 @@
     testStatus,
     fetchingModels,
     keyVisible = $bindable(),
-    modelDropdownOpen,
-    dropdownPosition,
+    modelListOpen,
+    modelListPosition,
     modelLists,
     roleTemplates,
     registryAgents,
     getBaseUrlPlaceholder,
-    shouldRecommendStandardUrlMode,
-    openModelDropdown,
-    closeModelDropdown,
+    openModelList,
+    closeModelList,
     fetchModelList,
     selectModel,
     saveModelConfig,
@@ -60,15 +59,14 @@
     testStatus: Record<string, string>;
     fetchingModels: Record<string, boolean>;
     keyVisible: Record<string, boolean>;
-    modelDropdownOpen: Record<string, boolean>;
-    dropdownPosition: any;
+    modelListOpen: Record<string, boolean>;
+    modelListPosition: any;
     modelLists: Record<string, string[]>;
     roleTemplates: RoleTemplate[];
     registryAgents: AgentBinding[];
     getBaseUrlPlaceholder: () => string;
-    shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
-    openModelDropdown: (type: string, target: HTMLElement) => void;
-    closeModelDropdown: (key: string) => void;
+    openModelList: (type: string, target: HTMLElement) => void;
+    closeModelList: (key: string) => void;
     fetchModelList: (type: 'orch' | 'comp' | 'vision' | 'image' | 'worker', statusKey: string) => void;
     selectModel: (type: string, model: string) => void;
     saveModelConfig: (type: 'orch' | 'comp' | 'vision' | 'image' | 'worker', statusKey: string) => void;
@@ -440,13 +438,12 @@
             {saveStatus}
             {testStatus}
             {fetchingModels}
-            {modelDropdownOpen}
-            {dropdownPosition}
+            {modelListOpen}
+            {modelListPosition}
             {modelLists}
             {getBaseUrlPlaceholder}
-            {shouldRecommendStandardUrlMode}
-            {openModelDropdown}
-            {closeModelDropdown}
+            {openModelList}
+            {closeModelList}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -467,13 +464,12 @@
             {saveStatus}
             {testStatus}
             {fetchingModels}
-            {modelDropdownOpen}
-            {dropdownPosition}
+            {modelListOpen}
+            {modelListPosition}
             {modelLists}
             {getBaseUrlPlaceholder}
-            {shouldRecommendStandardUrlMode}
-            {openModelDropdown}
-            {closeModelDropdown}
+            {openModelList}
+            {closeModelList}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -494,13 +490,12 @@
             {saveStatus}
             {testStatus}
             {fetchingModels}
-            {modelDropdownOpen}
-            {dropdownPosition}
+            {modelListOpen}
+            {modelListPosition}
             {modelLists}
             {getBaseUrlPlaceholder}
-            {shouldRecommendStandardUrlMode}
-            {openModelDropdown}
-            {closeModelDropdown}
+            {openModelList}
+            {closeModelList}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -522,13 +517,12 @@
             {saveStatus}
             {testStatus}
             {fetchingModels}
-            {modelDropdownOpen}
-            {dropdownPosition}
+            {modelListOpen}
+            {modelListPosition}
             {modelLists}
             {getBaseUrlPlaceholder}
-            {shouldRecommendStandardUrlMode}
-            {openModelDropdown}
-            {closeModelDropdown}
+            {openModelList}
+            {closeModelList}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -549,13 +543,12 @@
             {saveStatus}
             {testStatus}
             {fetchingModels}
-            {modelDropdownOpen}
-            {dropdownPosition}
+            {modelListOpen}
+            {modelListPosition}
             {modelLists}
             {getBaseUrlPlaceholder}
-            {shouldRecommendStandardUrlMode}
-            {openModelDropdown}
-            {closeModelDropdown}
+            {openModelList}
+            {closeModelList}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -738,7 +731,7 @@
     align-items: stretch;
     gap: 2px;
     min-width: max-content;
-    border-bottom: 1px solid var(--ind-border-separator);
+    border-bottom: var(--magi-hairline) solid var(--ind-border-separator);
   }
 
   .role-tab {
@@ -752,7 +745,7 @@
     color: var(--ind-foreground-muted);
     font-family: inherit;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     letter-spacing: -0.005em;
     cursor: pointer;
     transition: color 0.15s ease;
@@ -763,7 +756,7 @@
   }
   .role-tab.active {
     color: var(--ind-foreground);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
   .role-tab.active::after {
     content: '';
@@ -859,7 +852,7 @@
     outline: none;
     font-family: inherit;
     font-size: 13px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground);
     padding: 0;
     margin: 0;
@@ -938,7 +931,7 @@
   .engine-usage-list {
     display: flex;
     flex-direction: column;
-    border: 1px solid var(--ind-border-control, var(--border));
+    border: var(--magi-hairline) solid var(--ind-border-control, var(--border));
     border-radius: 8px;
     overflow: hidden;
   }
@@ -950,7 +943,7 @@
     padding: 12px 14px;
   }
   .engine-usage-row + .engine-usage-row {
-    border-top: 1px solid var(--ind-border-separator, var(--border-subtle, var(--border)));
+    border-top: var(--magi-hairline) solid var(--ind-border-separator, var(--border-subtle, var(--border)));
   }
   .engine-avatar {
     position: relative;
@@ -984,7 +977,7 @@
   }
   .engine-name {
     font-size: var(--text-sm);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     color: var(--ind-foreground, var(--foreground));
     line-height: 1.35;
     white-space: nowrap;

@@ -60,7 +60,7 @@
        用等量负外边距把它让出来，再由这里的 padding 重新分配。 */
     padding: var(--space-3) 0;
     margin-bottom: calc(var(--space-4) * -1);
-    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border) 60%, transparent);
   }
 
   .sidebar-footer-tools {

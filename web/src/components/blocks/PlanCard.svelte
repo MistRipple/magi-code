@@ -81,7 +81,7 @@
   /* 中性卡身，无左侧 accent 条；padding 由 plan-header（全局 SSoT）和 plan-body 各自管理 */
   .plan-card {
     background: var(--surface-1);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     margin: var(--space-2) 0;
   }

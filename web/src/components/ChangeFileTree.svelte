@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from './FileName.svelte';
   import FileTypeIcon from './FileTypeIcon.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -351,10 +352,10 @@
       <FileTypeIcon path={node.edit.filePath} size={15} />
       <span class="change-tree-file-name">
         {#if kind === 'rename' && oldName}
-          <span class="change-tree-old-name">{oldName}</span>
+          <span class="change-tree-old-name"><FileName name={oldName} /></span>
           <span class="change-tree-rename-arrow">→</span>
         {/if}
-        <span>{node.name}</span>
+        <FileName name={node.name} />
       </span>
       <div class="change-tree-file-meta">
         <span class="change-tree-file-tags">
@@ -412,7 +413,7 @@
     container-type: inline-size;
     overflow: hidden;
     padding: 3px 0;
-    border: 1px solid color-mix(in srgb, var(--border-subtle) 76%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 76%, transparent);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--background) 62%, var(--surface-1));
   }
@@ -510,6 +511,8 @@
     font-size: var(--text-sm);
   }
 
+  .change-tree-old-name { display: flex; min-width: 0; }
+
   .change-tree-old-name,
   .change-tree-rename-arrow {
     color: var(--foreground-muted);
@@ -541,7 +544,7 @@
     flex: 0 0 auto;
     align-items: center;
     padding: 1px 4px;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--surface-2) 60%, transparent);
     color: var(--foreground-muted);
@@ -598,7 +601,7 @@
     width: 20px;
     height: 20px;
     flex: 0 0 20px;
-    border: 1px solid currentColor;
+    border: var(--magi-hairline) solid currentColor;
     border-radius: 4px;
     font-size: 14px;
     font-weight: var(--font-semibold);
@@ -639,7 +642,7 @@
     justify-content: center;
     width: 22px;
     height: 22px;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);

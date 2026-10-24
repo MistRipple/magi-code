@@ -622,7 +622,6 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-session-should-not-own",
-                    "urlMode": "standard",
                     "model": "session-main",
                     "reasoningEffort": "xhigh",
                     "previousModel": "legacy-main",
@@ -637,7 +636,6 @@ mod tests {
         assert_eq!(section["reasoningEffort"], json!("xhigh"));
         assert!(section.get("baseUrl").is_none());
         assert!(section.get("apiKey").is_none());
-        assert!(section.get("urlMode").is_none());
         assert!(section.get("previousModel").is_none());
         assert!(section.get("modelSwitchPending").is_none());
         assert!(section.get("provider").is_none());

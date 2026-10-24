@@ -76,7 +76,7 @@
     bottom: calc(100% + 8px);
     left: 0;
     min-width: 168px;
-    max-height: min(60vh, 320px);
+    max-height: min(60vh, 264px);
     overflow-y: auto;
     margin: 0;
     padding: var(--space-1);
@@ -84,7 +84,7 @@
     background: var(--glass-bg);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-xl);
     z-index: var(--z-popover);

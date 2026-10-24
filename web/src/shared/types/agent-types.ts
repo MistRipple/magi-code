@@ -35,11 +35,6 @@ export type AnyAgentId = SystemAgentId | AgentId;
 export type ModelAutonomyCapability = 'C0' | 'C1' | 'C2' | 'C3';
 
 /**
- * URL 路径模式
- */
-export type UrlMode = 'standard' | 'full';
-
-/**
  * Token 使用统计
  */
 export interface TokenUsage {
@@ -52,7 +47,7 @@ export interface TokenUsage {
 /**
  * LLM 基础配置
  *
- * `urlMode` 只表达路径形态；`apiProtocol` 是请求协议的唯一事实源。
+ * `apiProtocol` 决定标准 API 端点和请求格式。
  */
 /** 走 HTTP 传输的连接协议：只有这三种。 */
 export type HttpModelApiProtocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
@@ -67,7 +62,6 @@ export type ModelApiProtocol = HttpModelApiProtocol | 'chatgpt_web';
 
 export interface LLMConfig {
   baseUrl: string;
-  urlMode: UrlMode;
   apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;

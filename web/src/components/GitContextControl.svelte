@@ -197,6 +197,7 @@
       class="git-context-trigger"
       class:active={open}
       title={controlTitle()}
+      aria-haspopup="listbox"
       aria-expanded={open}
       onclick={() => void toggle()}
     >
@@ -210,7 +211,7 @@
     </button>
 
     {#if open}
-      <div class="git-context-popover" data-magi-surface="popover" role="menu">
+      <div class="git-context-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.branch.searchPlaceholder')}>
         <div class="git-context-search">
           <Icon name="search" size={12} />
           <input bind:value={search} placeholder={i18n.t('input.branch.searchPlaceholder')} aria-label={i18n.t('input.branch.searchPlaceholder')} />
@@ -233,12 +234,14 @@
           </div>
         {/if}
 
-        <div class="git-context-list">
+        <div class="git-context-list" role="listbox" aria-label={i18n.t('input.branch.searchPlaceholder')}>
           {#each filteredBranches as branch (branch)}
             <button
               type="button"
               class="git-context-item"
               class:selected={gitContextState.currentBranch === branch}
+              role="option"
+              aria-selected={gitContextState.currentBranch === branch}
               disabled={interactionDisabled || gitContextState.contextDrift}
               title={branch}
               onclick={() => void selectBranch(branch)}
@@ -282,7 +285,7 @@
   .git-context-control { position: relative; flex: 0 1 auto; min-width: 0; max-width: 150px; }
   .git-context-trigger {
     position: relative; display: inline-flex; align-items: center; gap: 5px; width: max-content; min-width: 0; max-width: 100%; height: 24px; padding: 0 8px;
-    border: 1px solid var(--border-subtle); border-radius: var(--radius-full);
+    border: 0; border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--surface-1) 88%, transparent); color: var(--foreground-muted); cursor: pointer;
     transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
@@ -296,10 +299,12 @@
   .git-context-conflict { color: var(--error); font-size: 10px; font-weight: var(--font-semibold); }
   .git-context-popover {
     position: absolute; bottom: calc(100% + 7px); left: 0; z-index: 34; width: min(280px, calc(100vw - 24px));
-    padding: 6px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--dropdown-bg);
-    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.32);
+    padding: 6px; border: 0; border-radius: calc(var(--radius-sm) + 6px); background: var(--dropdown-bg);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 36px rgba(0, 0, 0, 0.32);
   }
-  .git-context-search { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 8px; border-bottom: 1px solid var(--border-subtle); color: var(--foreground-muted); }
+  .git-context-search { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 8px; border-bottom: var(--magi-hairline) solid var(--border-subtle); color: var(--foreground-muted); }
+  .git-context-search:focus-within { border-radius: var(--radius-sm); box-shadow: var(--magi-focus-shadow); }
+  .git-context-search input { box-shadow: none; }
   .git-context-search input, .git-context-create input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--foreground); font-size: 12px; }
   .git-context-list { max-height: 210px; overflow-y: auto; padding: 4px 0; }
   .git-context-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground); cursor: pointer; text-align: left; }
@@ -308,12 +313,12 @@
   .git-context-item:disabled { cursor: not-allowed; opacity: 0.52; }
   .git-context-warning, .git-context-error { display: flex; flex-direction: column; gap: 5px; margin: 5px 0; padding: 7px 8px; border-radius: var(--radius-sm); color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); font-size: 11px; line-height: 1.4; }
   .git-context-error { color: var(--error); background: color-mix(in srgb, var(--error) 10%, transparent); }
-  .git-context-warning button, .git-context-error button { align-self: flex-start; padding: 0; border: 0; border-bottom: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; font-size: 11px; }
-  .git-context-create { display: flex; gap: 6px; padding: 6px; border-top: 1px solid var(--border-subtle); }
-  .git-context-create input { height: 28px; padding: 0 7px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); }
+  .git-context-warning button, .git-context-error button { align-self: flex-start; padding: 0; border: 0; border-bottom: var(--magi-hairline) solid currentColor; background: transparent; color: inherit; cursor: pointer; font-size: 11px; }
+  .git-context-create { display: flex; gap: 6px; padding: 6px; border-top: var(--magi-hairline) solid var(--border-subtle); }
+  .git-context-create input { height: 28px; padding: 0 7px; border: var(--magi-hairline) solid var(--border-subtle); border-radius: var(--radius-sm); }
   .git-context-create button, .git-context-actions button { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: 11px; }
   .git-context-create button:hover:not(:disabled), .git-context-actions button:hover { background: var(--surface-hover); color: var(--foreground); }
-  .git-context-actions { display: flex; justify-content: space-between; gap: 4px; padding-top: 4px; border-top: 1px solid var(--border-subtle); }
+  .git-context-actions { display: flex; justify-content: space-between; gap: 4px; padding-top: 4px; border-top: var(--magi-hairline) solid var(--border-subtle); }
   .git-context-empty { padding: 12px 8px; color: var(--foreground-muted); font-size: 11px; text-align: center; }
   @media (max-width: 640px) {
     .git-context-popover { position: fixed; bottom: calc(44px + env(safe-area-inset-bottom)); left: 12px; width: calc(100vw - 24px); }

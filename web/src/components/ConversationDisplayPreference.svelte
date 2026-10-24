@@ -105,7 +105,7 @@
     padding: var(--space-3);
     /* 全局 button 样式是 nowrap；说明文字必须能换行，否则窄宽度下会溢出卡片。 */
     white-space: normal;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     color: var(--foreground);
     text-align: left;
@@ -164,7 +164,7 @@
     height: 20px;
     flex: 0 0 20px;
     margin-left: auto;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 50%;
     color: var(--primary);
   }

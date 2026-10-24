@@ -31,7 +31,7 @@
     padding: var(--space-3);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--assistant-message-bg) 88%, var(--surface) 12%);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-word;

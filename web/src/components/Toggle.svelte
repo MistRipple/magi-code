@@ -33,20 +33,28 @@
 <label class="toggle" class:disabled class:small={size === 'small'} {title}>
   <input
     type="checkbox"
+    role="switch"
     {checked}
     {disabled}
     aria-label={ariaLabel || title || undefined}
     onchange={handleChange}
   />
-  <span class="toggle-slider"></span>
+  <span class="toggle-slider control-switch" aria-hidden="true"></span>
 </label>
 
 <style>
   .toggle {
+    --switch-width: 36px;
+    --switch-height: 20px;
+    --switch-inset: 3px;
+    --switch-thumb: 14px;
     position: relative;
-    display: inline-block;
-    width: 36px;
-    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    width: var(--switch-width);
+    min-height: 24px;
     cursor: pointer;
     flex-shrink: 0;
   }
@@ -58,71 +66,26 @@
 
   .toggle input {
     opacity: 0;
-    width: 0;
-    height: 0;
     position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+    cursor: inherit;
   }
 
   .toggle-slider {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: var(--surface-3);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full, 9999px);
-    transition: all var(--transition-fast, 0.15s ease);
-  }
-
-  .toggle-slider::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 14px;
-    height: 14px;
-    background: var(--foreground-muted);
-    border-radius: var(--radius-full, 9999px);
-    transition: all var(--transition-fast, 0.15s ease);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-  }
-
-  .toggle:hover .toggle-slider {
-    border-color: var(--primary-muted);
-  }
-
-  /* 选中状态 */
-  .toggle input:checked + .toggle-slider {
-    background: var(--success);
-    border-color: var(--success);
-  }
-
-  .toggle input:checked + .toggle-slider::after {
-    left: 18px;
-    background: var(--primary-foreground);
-  }
-
-  /* 焦点状态（键盘导航可访问性） */
-  .toggle input:focus-visible + .toggle-slider {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
+    pointer-events: none;
   }
 
   /* small 尺寸 */
   .toggle.small {
-    width: 28px;
-    height: 16px;
-  }
-
-  .toggle.small .toggle-slider::after {
-    top: 1px;
-    left: 1px;
-    width: 12px;
-    height: 12px;
-  }
-
-  .toggle.small input:checked + .toggle-slider::after {
-    left: 13px;
+    --switch-width: 28px;
+    --switch-height: 16px;
+    --switch-inset: 2px;
+    --switch-thumb: 12px;
   }
 </style>

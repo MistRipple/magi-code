@@ -177,9 +177,6 @@ fn parse_fetch_models_config(
         .map_err(ApiError::InvalidInput)?;
     config.require_base_url().map_err(ApiError::InvalidInput)?;
     config.require_api_key().map_err(ApiError::InvalidInput)?;
-    config
-        .require_models_listable()
-        .map_err(ApiError::InvalidInput)?;
     Ok((config, request.target))
 }
 
@@ -852,7 +849,7 @@ fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> 
     normalized.require_model().map_err(ApiError::InvalidInput)?;
 
     let mut canonical = Map::new();
-    for field in ["baseUrl", "apiKey", "model", "urlMode", "apiProtocol"] {
+    for field in ["baseUrl", "apiKey", "model", "apiProtocol"] {
         if let Some(value) = config.get(field).cloned() {
             canonical.insert(field.to_string(), value);
         }
@@ -2080,7 +2077,6 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-4.1",
                 "baseUrl": "https://api.openai.com/v1",
-                "urlMode": "default"
             },
             "callIdentity": {
                 "callId": call_id,
@@ -2153,32 +2149,6 @@ mod tests {
                 "data: {\"delta\":\"pong\"}\n\n",
                 "event: response.completed\n",
                 "data: {\"response\":{\"status\":\"completed\"}}\n\n",
-            ),
-        )
-    }
-
-    async fn full_path_openai_probe_stub(
-        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-        headers: HeaderMap,
-        Json(payload): Json<Value>,
-    ) -> impl axum::response::IntoResponse {
-        assert_eq!(
-            uri.path_and_query().map(|value| value.as_str()),
-            Some("/custom/model/invoke/?api-version=2026-07-31")
-        );
-        assert_eq!(
-            headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer test-key")
-        );
-        assert_eq!(payload["model"], json!("custom-model"));
-        (
-            StatusCode::OK,
-            [(CONTENT_TYPE, "text/event-stream")],
-            concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
             ),
         )
     }
@@ -2293,7 +2263,6 @@ mod tests {
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "claude-sonnet-test",
-            "urlMode": "standard",
             "apiProtocol": "anthropic_messages"
         }))
         .expect("模型配置应符合当前协议");
@@ -2323,43 +2292,12 @@ mod tests {
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "gpt-5-test",
-            "urlMode": "standard",
             "apiProtocol": "openai_responses"
         }))
         .expect("模型配置应符合 Responses 协议");
         execute_connection_probe(&config)
             .await
             .expect("Responses probe should succeed");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn connection_probe_preserves_full_endpoint_path_and_query() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("stub listener should bind");
-        let endpoint = format!(
-            "http://{}/custom/model/invoke/?api-version=2026-07-31",
-            listener.local_addr().expect("stub addr should exist")
-        );
-        let app = Router::new().route("/custom/model/invoke/", post(full_path_openai_probe_stub));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("stub server should run");
-        });
-
-        let config = NormalizedModelConfig::from_settings_value(&json!({
-            "baseUrl": endpoint,
-            "apiKey": "test-key",
-            "model": "custom-model",
-            "urlMode": "full",
-            "apiProtocol": "openai_chat"
-        }))
-        .expect("完整路径模型配置应符合当前协议");
-        execute_connection_probe(&config)
-            .await
-            .expect("完整路径连接测试必须命中原始端点");
         server.abort();
     }
 
@@ -2383,7 +2321,6 @@ mod tests {
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "gpt-test",
-            "urlMode": "standard",
             "apiProtocol": "openai_chat"
         }))
         .await;
@@ -2420,7 +2357,6 @@ mod tests {
             Json(json!({
                 "baseUrl": base_url,
                 "apiKey": "test-key",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             })),
         )
@@ -2454,7 +2390,6 @@ mod tests {
                 config: json!({
                     "baseUrl": base_url,
                     "apiKey": "test-key",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orch".to_string(),
@@ -2482,7 +2417,6 @@ mod tests {
                 config: json!({
                     "baseUrl": base_url,
                     "apiKey": "test-key",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orch".to_string(),
@@ -2566,7 +2500,6 @@ mod tests {
                 "baseUrl": base_url,
                 "apiKey": "test-key",
                 "model": "gpt-test",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             })),
         )
@@ -2601,7 +2534,6 @@ mod tests {
                 "baseUrl": base_url,
                 "apiKey": "test-image-key",
                 "model": "gpt-image-test",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             })),
         )
@@ -2637,7 +2569,6 @@ mod tests {
                     "baseUrl": base_url,
                     "apiKey": "test-key",
                     "model": "gpt-test",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
                 target: "orchestrator".to_string(),
@@ -3313,7 +3244,6 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.current.example/v1",
                     "apiKey": "sk-current",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
             )
@@ -3326,7 +3256,6 @@ mod tests {
                     "baseUrl": "https://api.alias.example/v1",
                     "apiKey": "sk-alias",
                     "model": "alias-main",
-                    "urlMode": "standard"
                 }),
             )
             .unwrap();
@@ -3400,7 +3329,6 @@ mod tests {
                         "apiProtocol": "anthropic_messages",
                         "baseUrl": "https://api.anthropic.com",
                         "model": "claude-worker-test",
-                        "urlMode": "standard"
                     }
                 }),
             )
@@ -3416,7 +3344,6 @@ mod tests {
                         "apiProtocol": "openai_chat",
                         "baseUrl": "https://api.openai.com",
                         "model": "stale-openai-model",
-                        "urlMode": "standard"
                     }
                 }]),
             )
@@ -4197,7 +4124,6 @@ mod tests {
             Json(json!({
                 "baseUrl": "https://api.example.com/v1",
                 "apiKey": "sk-global",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat",
                 "sessionId": "session-a",
                 "workspaceId": "workspace-a"
@@ -4227,7 +4153,6 @@ mod tests {
             let mut config = json!({
                 "baseUrl": "https://api.example.com/v1",
                 "apiKey": "sk-global",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             });
             config[field] = json!("high");
@@ -4275,7 +4200,6 @@ mod tests {
                 "baseUrl": "https://cpa.example.com/v1",
                 "apiKey": "sk-image",
                 "model": "gpt-image-1",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat",
                 "reasoningEffort": "high",
                 "workspaceId": "workspace-ignored"
@@ -4289,7 +4213,6 @@ mod tests {
         assert_eq!(saved["baseUrl"], json!("https://cpa.example.com/v1"));
         assert_eq!(saved["apiKey"], json!("sk-image"));
         assert_eq!(saved["model"], json!("gpt-image-1"));
-        assert_eq!(saved["urlMode"], json!("standard"));
         assert!(saved.get("reasoningEffort").is_none());
         assert!(saved.get("workspaceId").is_none());
         assert_eq!(response["config"], saved);
@@ -4306,7 +4229,6 @@ mod tests {
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-worker",
                     "model": "worker-model",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                     "reasoningEffort": "high"
                 }
@@ -4327,7 +4249,6 @@ mod tests {
                 "baseUrl": "https://api.example.com/v1",
                 "apiKey": "sk-auxiliary",
                 "model": "auxiliary-model",
-                "urlMode": "standard",
                 "apiProtocol": "openai_responses"
             })),
         )
@@ -4349,7 +4270,6 @@ mod tests {
                 "baseUrl": "https://vision.example.com/v1",
                 "apiKey": "sk-vision",
                 "model": "vision-capable-model",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat",
                 "contextWindowTokens": 256000,
                 "textModelRules": [
@@ -4388,7 +4308,6 @@ mod tests {
                     "baseUrl": "https://old-vision.example.com/v1",
                     "apiKey": "old-key",
                     "model": "old-vision-model",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat",
                     "contextWindowTokens": 128000,
                     "textModelRules": []
@@ -4413,7 +4332,6 @@ mod tests {
                 "baseUrl": "https://new-vision.example.com/v1",
                 "apiKey": "new-key",
                 "model": "new-vision-model",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat",
                 "contextWindowTokens": 256000,
                 "textModelRules": [{"matchMode": "regex", "pattern": "("}]
@@ -4923,7 +4841,6 @@ mod tests {
                 json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
             )
@@ -4955,7 +4872,6 @@ mod tests {
                     "baseUrl": "https://api.example.com/v1",
                     "apiProtocol": "openai_chat",
                     "apiKey": "sk-global",
-                    "urlMode": "standard"
                 }),
             )
             .unwrap();
@@ -5046,7 +4962,6 @@ mod tests {
                 "baseUrl": "https://api.anthropic.com",
                 "apiKey": "test-key",
                 "model": "claude-sonnet-test",
-                "urlMode": "standard",
                 "apiProtocol": "anthropic_messages"
             }),
             target: "orch".to_string(),
@@ -5068,7 +4983,6 @@ mod tests {
             config: serde_json::json!({
                 "baseUrl": "http://127.0.0.1:8320/v1",
                 "apiKey": "test-key",
-                "urlMode": "standard",
                 "apiProtocol": "openai_chat"
             }),
             target: "orch".to_string(),
@@ -5082,32 +4996,7 @@ mod tests {
             "http://127.0.0.1:8320/v1"
         );
         assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
-        config
-            .require_models_listable()
-            .expect("standard url mode can list models");
         assert_eq!(target, "orch");
-    }
-
-    #[test]
-    fn fetch_models_config_rejects_full_url_mode() {
-        let error = parse_fetch_models_config(FetchModelsRequest {
-            config: serde_json::json!({
-                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
-                "apiKey": "test-key",
-                "urlMode": "full",
-                "apiProtocol": "openai_chat"
-            }),
-            target: "orch".to_string(),
-            workspace_id: None,
-        })
-        .expect_err("full path mode has no canonical models endpoint");
-
-        match error {
-            ApiError::InvalidInput(message) => {
-                assert!(message.contains("完整路径模式下不支持自动获取模型列表"));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
     }
 
     #[test]
@@ -5117,7 +5006,6 @@ mod tests {
                 "unexpected": "openai",
                 "baseUrl": "http://127.0.0.1:8320/v1",
                 "apiKey": "test-key",
-                "urlMode": "standard"
             }),
             target: "orch".to_string(),
             workspace_id: None,

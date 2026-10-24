@@ -68,7 +68,7 @@
     gap: var(--space-3);
     margin: var(--space-1) var(--space-1) var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border-subtle));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 28%, var(--border-subtle));
     border-radius: var(--radius-lg);
     background: color-mix(in srgb, var(--primary) 8%, transparent);
   }

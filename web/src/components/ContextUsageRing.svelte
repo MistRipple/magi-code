@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -280,14 +281,9 @@
                 if (event.key === 'Enter') void saveContextWindow();
               }}
             />
-            <select
-              bind:value={draftWindowUnit}
-              disabled={saving}
-              aria-label={i18n.t('input.contextRing.windowUnit')}
-            >
-              <option value="K">K</option>
-              <option value="M">M</option>
-            </select>
+            <SelectField bind:value={draftWindowUnit} disabled={saving}
+              label={i18n.t('input.contextRing.windowUnit')}
+              options={[{ value: 'K', label: 'K' }, { value: 'M', label: 'M' }]} />
             <button
               type="button"
               class="context-window-icon-button"
@@ -401,7 +397,7 @@
     max-height: min(70vh, 560px);
     overflow: auto;
     padding: 10px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--background);
     color: var(--foreground);
@@ -436,7 +432,7 @@
   .context-popover-title strong {
     color: var(--foreground);
     font-size: 12px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
     text-align: left;
   }
@@ -465,7 +461,7 @@
 
   .context-breakdown-heading {
     color: var(--foreground-muted);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .context-breakdown-empty {
@@ -523,7 +519,7 @@
 
   .context-budget-notes {
     padding-top: 5px;
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
     font-size: 11px;
   }
@@ -552,7 +548,7 @@
 
   .context-window-editor {
     padding-top: 8px;
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
   }
 
   .context-window-edit-button,
@@ -584,11 +580,10 @@
     gap: 4px;
   }
 
-  .context-window-input-row input,
-  .context-window-input-row select {
+  .context-window-input-row input {
     min-width: 0;
     height: 28px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-1);
     color: var(--foreground);
@@ -600,9 +595,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .context-window-input-row select {
-    padding: 0 4px;
-  }
 
   .context-window-icon-button {
     width: 22px;

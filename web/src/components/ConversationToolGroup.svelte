@@ -4,6 +4,7 @@
   import { untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
+  import Disclosure from './Disclosure.svelte';
   import MessageItem from './MessageItem.svelte';
   import { resolveConversationToolGroupLabel } from '../lib/conversation-disclosure';
 
@@ -47,7 +48,7 @@
     <span class="tool-group-label">{groupLabel}</span>
   </button>
 
-  {#if expanded}
+  <Disclosure {expanded}>
     <div class="tool-group-list summary-tool-flow" id={contentId}>
       {#each items as item (item.key)}
         <MessageItem
@@ -59,7 +60,7 @@
         />
       {/each}
     </div>
-  {/if}
+  </Disclosure>
 </section>
 
 <style>
@@ -191,7 +192,7 @@
     margin: 0 0 8px;
     padding: 7px 0 7px 8px;
     border-top: 0;
-    border-left: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+    border-left: var(--magi-hairline) solid color-mix(in srgb, var(--border) 76%, transparent);
     background: transparent;
   }
 

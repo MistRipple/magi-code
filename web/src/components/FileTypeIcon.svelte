@@ -38,13 +38,13 @@
     width: var(--file-type-icon-size, 14px);
     height: var(--file-type-icon-size, 14px);
     flex-shrink: 0;
-    border: 1px solid color-mix(in srgb, var(--file-type-color, var(--foreground-muted)) 62%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--file-type-color, var(--foreground-muted)) 62%, transparent);
     border-radius: 3px;
     background: color-mix(in srgb, var(--file-type-color, var(--foreground-muted)) 14%, transparent);
     color: var(--file-type-color, var(--foreground-muted));
     font-family: var(--font-mono);
     font-size: max(7px, calc(var(--file-type-icon-size, 14px) * 0.55));
-    font-weight: 700;
+    font-weight: var(--font-bold);
     letter-spacing: -0.08em;
     line-height: 1;
     text-align: center;

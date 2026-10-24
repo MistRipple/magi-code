@@ -10,17 +10,17 @@
      ========================================== */
 
   /* Web 默认主题变量：当不在 VS Code Webview 内运行时，仍然提供完整主题令牌 */
-  --vscode-sideBar-background: #15181f;
-  --vscode-sideBar-secondaryBackground: #11161d;
-  --vscode-editor-background: #0f141b;
-  --vscode-editor-background-rgb: 15, 20, 27;
+  --vscode-sideBar-background: #0b0b0a;
+  --vscode-sideBar-secondaryBackground: #151515;
+  --vscode-editor-background: #151515;
+  --vscode-editor-background-rgb: 21, 21, 21;
   --vscode-editor-foreground: #e5e7eb;
   --vscode-descriptionForeground: #98a2b3;
   --vscode-panel-border: #273142;
   --vscode-widget-border: #273142;
-  --vscode-editorWidget-background: #171d26;
+  --vscode-editorWidget-background: #1a1a19;
   --vscode-editorWidget-border: #273142;
-  --vscode-dropdown-background: #171d26;
+  --vscode-dropdown-background: #1a1a19;
   --vscode-foreground: #e5e7eb;
   --vscode-textLink-foreground: #60a5fa;
   --vscode-progressBar-background: #2563eb;
@@ -32,8 +32,8 @@
   --vscode-button-hoverBackground: #1d4ed8;
   --vscode-button-secondaryBackground: #1f2937;
   --vscode-button-secondaryHoverBackground: #273449;
-  --vscode-textCodeBlock-background: #111827;
-  --vscode-input-background: #111827;
+  --vscode-textCodeBlock-background: #151515;
+  --vscode-input-background: #1a1a19;
   --vscode-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --vscode-editor-font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
 
@@ -186,6 +186,15 @@
   --font-semibold: 600;
   --font-bold: 700;
 
+  --magi-hairline: 1px;
+  --magi-border-faint: color-mix(in srgb, var(--foreground) 6%, transparent);
+  --magi-focus-shadow: inset 0 0 0 1px var(--magi-focus-ring), 0 0 0 2px color-mix(in srgb, var(--foreground) 7%, transparent), 0 0 0 4px color-mix(in srgb, var(--foreground) 3%, transparent);
+  --magi-focus-ring: color-mix(in srgb, var(--primary) 34%, transparent);
+  --magi-ease-ink: cubic-bezier(.215, .61, .355, 1);
+  /* mass=1: panel stiffness/damping 1200/80; feedback 380/18. Samples: 25ms × 20. */
+  --magi-spring-damped: linear(0.0000, 0.2018, 0.4731, 0.6709, 0.7982, 0.8771, 0.9254, 0.9547, 0.9725, 0.9833, 0.9899, 0.9939, 0.9963, 0.9977, 0.9986, 0.9992, 0.9995, 0.9997, 0.9998, 0.9999, 1);
+  --magi-spring-bouncy: linear(0.0000, 0.1008, 0.3337, 0.6071, 0.8552, 1.0405, 1.1510, 1.1932, 1.1839, 1.1434, 1.0908, 1.0402, 1.0004, 0.9749, 0.9634, 0.9629, 0.9696, 0.9795, 0.9897, 0.9981, 1);
+
   /* 行高 */
   --leading-tight: 1.25;
   --leading-normal: 1.5;
@@ -283,10 +292,10 @@
    ========================================== */
 body.vscode-light,
 :root.theme-light {
-  --vscode-sideBar-background: #f5f7fb;
-  --vscode-sideBar-secondaryBackground: #ffffff;
-  --vscode-editor-background: #ffffff;
-  --vscode-editor-background-rgb: 255, 255, 255;
+  --vscode-sideBar-background: #f5f5f3;
+  --vscode-sideBar-secondaryBackground: #fcfcfb;
+  --vscode-editor-background: #fcfcfb;
+  --vscode-editor-background-rgb: 252, 252, 251;
   --vscode-editor-foreground: #1f2937;
   --foreground-rgb: 31, 41, 55;
   --vscode-descriptionForeground: #667085;
@@ -308,7 +317,7 @@ body.vscode-light,
   --vscode-button-secondaryBackground: #eef2f7;
   --vscode-button-secondaryHoverBackground: #e2e8f0;
   --vscode-textCodeBlock-background: #f3f4f6;
-  --vscode-input-background: #ffffff;
+  --vscode-input-background: #fcfcfb;
   --border-subtle: rgba(0, 0, 0, 0.08);
   --surface-1: rgba(0, 0, 0, 0.02);
   --surface-2: rgba(0, 0, 0, 0.04);
@@ -322,10 +331,20 @@ body.vscode-light,
   --diagram-connector: #475569;
   --diagram-node-bg: #ffffff;
   --diagram-node-text: #111827;
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
 }
 
 body.vscode-dark,
+body.theme-dark,
 :root.theme-dark {
+  /* Optical compensation for white-on-charcoal glow. */
+  --font-normal: 360;
+  --font-medium: 460;
+  --font-semibold: 560;
+  --font-bold: 660;
   --scrollbar-thumb: rgba(255, 255, 255, 0.15);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
 }
@@ -347,6 +366,8 @@ body {
   color-scheme: dark;
   font-family: var(--font-family);
   font-size: var(--font-size);
+  font-weight: var(--font-normal);
+  font-variant-numeric: tabular-nums;
   color: var(--foreground);
   background: var(--magi-canvas);
   -webkit-font-smoothing: antialiased;
@@ -499,7 +520,7 @@ body.theme-dark,
 
 
 /* 焦点样式 */
-:focus-visible {
+:focus-visible:not(input):not(textarea):not([contenteditable="true"]) {
   outline: 1px solid var(--vscode-focusBorder, color-mix(in srgb, var(--primary) 72%, white 8%));
   outline-offset: -1px;
 }
@@ -518,6 +539,7 @@ a:hover {
 button {
   font-family: inherit;
   font-size: inherit;
+  font-weight: var(--font-normal);
   cursor: pointer;
   border: none;
   background: transparent;
@@ -545,12 +567,35 @@ button:disabled {
   opacity: 0.5;
 }
 
+@media (min-resolution: 2dppx) {
+  :root { --magi-hairline: 0.5px; }
+}
+
+/* A DOM shield covers both preview guests and the conversation during divider drags.
+   It has no fill and does not participate in pane layout. */
+.panel-resize-shield::backdrop { background: transparent; }
+.panel-resize-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  width: auto;
+  height: auto;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* 右下角悬浮控件统一视觉外壳，组件仅维护尺寸、位置与内容。 */
 .floating-overlay-control {
   opacity: 0.46;
   background: color-mix(in srgb, var(--surface-2) 68%, transparent);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
+  border: 0;
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), var(--shadow-sm);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   cursor: pointer;
@@ -575,11 +620,13 @@ button:disabled {
 /* 输入框基础样式 */
 input,
 textarea {
+  font-weight: var(--font-normal);
   font-family: inherit;
   font-size: inherit;
   color: var(--foreground);
   background: var(--vscode-input-background);
-  border: 1px solid var(--vscode-input-border, var(--border));
+  border: 0;
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--vscode-input-border, var(--border));
   border-radius: var(--radius-sm);
   padding: var(--spacing-sm);
   resize: none;
@@ -587,8 +634,42 @@ textarea {
 
 input:focus,
 textarea:focus {
-  border-color: var(--vscode-focusBorder, var(--primary));
   outline: none;
+  box-shadow: var(--magi-focus-shadow);
+}
+
+/* Keep changing counters and timestamps from shifting their neighbours. */
+.notice-time,
+.user-timestamp,
+.message-runtime-text,
+.turn-runtime-elapsed-time,
+.approval-timer,
+.store-count,
+.store-item-version {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Inline icons sit on the text baseline instead of floating above it. */
+.markdown-content svg,
+.message-content svg,
+.conversation-thinking-text svg {
+  vertical-align: -0.125em;
+}
+
+@keyframes magi-feedback-pop {
+  from { transform: scale(.72); }
+  to { transform: scale(1); }
+}
+
+@keyframes magi-feedback-fade {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .copy-btn.copied svg,
+  .message-action.copied svg { animation: none !important; }
+  .web-workbench-shell .sidebar { transition: none !important; }
 }
 
 input::placeholder,
@@ -600,9 +681,10 @@ textarea::placeholder {
 code {
   font-family: var(--font-mono);
   font-size: 0.9em;
-  background: var(--code-bg);
-  padding: 2px 4px;
-  border-radius: var(--radius-sm);
+  /* 路径、端点、版本等只读值不自动变成标签；正文代码强调由 Markdown 负责。 */
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
 }
 
 pre {
@@ -763,7 +845,7 @@ pre code {
 .btn--error {
   background: transparent;
   color: var(--error);
-  border: 1px solid var(--error-muted);
+  border: 0;
 }
 
 .btn--error:hover {
@@ -778,7 +860,7 @@ pre code {
 }
 
 .btn--danger:hover {
-  background: color-mix(in srgb, var(--error) 88%, black);
+  background: color-mix(in srgb, var(--error) 88%, #151515);
 }
 
 .btn--ghost-danger {
@@ -847,12 +929,12 @@ pre code {
 
 .tab-bar--top {
   padding: 0 var(--space-4);
-  border-bottom: 1px solid var(--border);
+  border-bottom: var(--magi-hairline) solid var(--border);
 }
 
 .tab-bar--bottom {
   padding: 0 var(--space-4);
-  border-top: 1px solid var(--border);
+  border-top: var(--magi-hairline) solid var(--border);
 }
 
 .tab-item {
@@ -1046,7 +1128,7 @@ pre code {
 /* 标准卡片 */
 .magi-card {
   background: var(--surface-1);
-  border: 1px solid var(--border);
+  border: var(--magi-hairline) solid var(--border);
   border-radius: var(--radius-lg);
   padding: var(--space-4);
   display: flex;
@@ -1096,7 +1178,7 @@ pre code {
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   background: var(--surface-1);
-  border: 1px solid var(--border);
+  border: var(--magi-hairline) solid var(--border);
   border-radius: var(--radius-md);
   transition: background var(--transition-fast), border-color var(--transition-fast);
 }
@@ -1135,14 +1217,15 @@ pre code {
   font-size: var(--text-sm);
   color: var(--foreground);
   background: var(--vscode-input-background);
-  border: 1px solid var(--border);
+  border: 0;
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
   border-radius: var(--radius-sm);
   outline: none;
-  transition: border-color var(--transition-fast);
+  transition: box-shadow var(--transition-fast);
 }
 
 .form-input:focus {
-  border-color: var(--primary);
+  box-shadow: var(--magi-focus-shadow);
 }
 
 .form-input::placeholder {
@@ -1159,7 +1242,8 @@ pre code {
   line-height: 1.5;
   color: var(--foreground);
   background: var(--vscode-input-background);
-  border: 1px solid var(--border);
+  border: 0;
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
   border-radius: var(--radius-sm);
   outline: none;
   resize: vertical;
@@ -1168,7 +1252,7 @@ pre code {
 
 .form-textarea:focus {
   border-color: var(--primary);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+  box-shadow: var(--magi-focus-shadow);
 }
 
 .form-textarea::placeholder {
@@ -1180,14 +1264,16 @@ pre code {
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
   padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border: 0;
+  border-radius: calc(var(--radius-sm) + 2px);
   background: var(--surface-2);
 }
 
 .ui-segmented__option {
   min-width: 0;
-  height: var(--btn-height-sm);
+  /* 跟随轨道拉伸，避免较高的容器把固定高度按钮顶在上侧。 */
+  min-height: var(--btn-height-sm);
+  align-self: stretch;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1208,10 +1294,65 @@ pre code {
   box-shadow: var(--shadow-sm);
 }
 
+/* 开关轨道共用几何；内部描边不参与滑块定位，普通/高分屏保持同心。 */
+.control-switch {
+  appearance: none;
+  display: inline-block;
+  position: relative;
+  vertical-align: middle;
+  flex: 0 0 auto;
+  width: var(--switch-width, 36px);
+  height: var(--switch-height, 20px);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
+  cursor: pointer;
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+}
+.control-switch::after {
+  content: '';
+  position: absolute;
+  top: var(--switch-inset, 3px);
+  left: var(--switch-inset, 3px);
+  width: var(--switch-thumb, 14px);
+  height: var(--switch-thumb, 14px);
+  border-radius: var(--radius-full);
+  background: var(--foreground-muted);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+}
+.control-switch:checked,
+input:checked + .control-switch { background: var(--success); }
+.control-switch:checked::after,
+input:checked + .control-switch::after {
+  transform: translateX(calc(var(--switch-width, 36px) - var(--switch-height, 20px)));
+  background: var(--primary-foreground);
+}
+.control-switch:focus-visible,
+input:focus-visible + .control-switch { box-shadow: var(--magi-focus-shadow); }
+.control-switch:disabled { cursor: not-allowed; opacity: .5; }
+@media (prefers-reduced-motion: reduce) {
+  .control-switch, .control-switch::after { transition: none; }
+}
+
 .control-range {
   width: 100%;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
   accent-color: var(--primary);
+  cursor: pointer;
 }
+.control-range:focus { box-shadow: none; }
+.control-range:focus-visible { box-shadow: var(--magi-focus-shadow); }
+.control-range:disabled { cursor: not-allowed; opacity: .5; }
 
 .control-color {
   width: 22px;
@@ -1263,7 +1404,7 @@ pre code {
   width: 480px;
   max-width: 90vw;
   max-height: 80vh;
-  border: 1px solid var(--border);
+  border: var(--magi-hairline) solid var(--border);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-xl);
   display: flex;
@@ -1289,7 +1430,7 @@ pre code {
   align-items: center;
   justify-content: space-between;
   padding: var(--space-4);
-  border-bottom: 1px solid var(--border);
+  border-bottom: var(--magi-hairline) solid var(--border);
 }
 
 .modal-title {
@@ -1311,7 +1452,7 @@ pre code {
   justify-content: flex-end;
   gap: var(--space-3);
   padding: var(--space-4);
-  border-top: 1px solid var(--border);
+  border-top: var(--magi-hairline) solid var(--border);
 }
 
 /* 模态框关闭按钮 */
@@ -1467,7 +1608,7 @@ pre code {
 }
 
 .hljs-emphasis { font-style: italic; }
-.hljs-strong { font-weight: bold; }
+.hljs-strong { font-weight: var(--font-bold); }
 
 /* ---------- 浅色主题覆盖：GitHub Light palette ---------- */
 :root.theme-light .hljs-keyword,
@@ -1622,7 +1763,7 @@ body.vscode-light .hljs-params {
   box-sizing: border-box;
   width: calc(100% - var(--dock-inset) * 2);
   margin: 0 auto;
-  border: 1px solid color-mix(in srgb, var(--border) calc(78% - var(--dock-level, 1) * 7%), transparent);
+  border: var(--magi-hairline) solid color-mix(in srgb, var(--border) calc(78% - var(--dock-level, 1) * 7%), transparent);
   border-bottom: 0;
   border-radius: var(--radius-xl) var(--radius-xl) 0 0;
   background: color-mix(
@@ -1684,7 +1825,7 @@ body.vscode-light .hljs-params {
 }
 
 .dock-row + .dock-row {
-  border-top: 1px solid color-mix(in srgb, var(--border-subtle, var(--border)) 55%, transparent);
+  border-top: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle, var(--border)) 55%, transparent);
 }
 
 /* 文字操作：胶囊形幽灵按钮；主操作用 --primary，需要注意的用 --warn。 */
@@ -1773,4 +1914,15 @@ body.vscode-light .hljs-params {
   .dock-card {
     --dock-step: 8px;
   }
+}
+
+/* Shared prose and feedback also cover settings, diagnostics and plugin help. */
+p { text-wrap: pretty; }
+strong, b { font-weight: var(--font-bold); }
+[data-copy-feedback="true"] svg {
+  animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
+    magi-feedback-fade 160ms 2340ms ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-copy-feedback="true"] svg { animation: none; }
 }

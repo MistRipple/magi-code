@@ -25,7 +25,7 @@
 <style>
   svg {
     display: inline-block;
-    vertical-align: middle;
+    vertical-align: -0.125em;
     flex-shrink: 0;
   }
 </style>

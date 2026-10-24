@@ -112,7 +112,7 @@
   }
   async function revertChange(edit: Edit) {
     if (changeMutationPending || edit.revertible !== true) return;
-    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertChange', { file: edit.filePath }), { tone: 'danger' });
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertChange', { file: edit.filePath }), { tone: 'danger', confirmLabel: i18n.t('edits.actions.revertChange') });
     if (!confirmed) return;
     vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
@@ -123,13 +123,13 @@
   }
   async function revertAllChanges() {
     if (changeMutationPending || edits.length === 0 || !allEditsRevertible) return;
-    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertAll', { count: edits.length }), { tone: 'danger' });
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertAll', { count: edits.length }), { tone: 'danger', confirmLabel: i18n.t('edits.actions.revertAll') });
     if (!confirmed) return;
     vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   async function revertCurrentRound() {
     if (changeMutationPending || !latestExecutionGroupId || !currentRoundRevertible) return;
-    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertRound', { count: currentRoundEdits.length }), { tone: 'danger' });
+    const confirmed = await confirmMessage(i18n.t('edits.confirm.revertRound', { count: currentRoundEdits.length }), { tone: 'danger', confirmLabel: i18n.t('edits.group.revertRound') });
     if (!confirmed) return;
     vscode.postMessage({
       type: 'revertExecutionGroup',
@@ -450,7 +450,7 @@
     gap: 4px;
     height: 24px;
     padding: 0 8px;
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);

@@ -7271,7 +7271,6 @@ mod tests {
                 serde_json::json!({
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "test-key",
-                    "urlMode": "standard",
                     "apiProtocol": "openai_chat"
                 }),
             )

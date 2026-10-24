@@ -1,4 +1,8 @@
 <script lang="ts">
+  import Modal from './Modal.svelte';
+  import { confirmMessage } from '../stores/confirm-dialog.svelte';
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
+  import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
@@ -287,6 +291,17 @@
     return normalized.length > 80 ? `${normalized.slice(0, 80)}...` : normalized;
   }
 
+  let editorDraftKey = '';
+  let editorBaseline = '';
+  function restoreEditorDraft() {
+    editorDraftKey = `knowledge:${currentWorkspaceKey}:${editorKind}:${editorId ?? 'new'}`;
+    editorBaseline = JSON.stringify({ formTitle, formContent, formContext, formTags });
+    ({ formTitle, formContent, formContext, formTags } = loadViewDraft(editorDraftKey, editorBaseline, { formTitle, formContent, formContext, formTags }));
+  }
+  $effect(() => {
+    if (editorKind && editorDraftKey) saveViewDraft(editorDraftKey, editorBaseline, { formTitle, formContent, formContext, formTags });
+  });
+
   function closeEditor() {
     editorKind = null;
     editorId = null;
@@ -306,6 +321,7 @@
     formContext = '';
     formTags = '';
     formError = '';
+    restoreEditorDraft();
   }
 
   function editAdr(adr: ADR, e: Event) {
@@ -317,6 +333,7 @@
     formContext = '';
     formTags = joinTags(visibleTags(adr.tags));
     formError = '';
+    restoreEditorDraft();
   }
 
   function editFaq(faq: FAQ, e: Event) {
@@ -328,6 +345,7 @@
     formContext = '';
     formTags = joinTags(visibleTags(faq.tags));
     formError = '';
+    restoreEditorDraft();
   }
 
   function editLearning(learning: Learning, e: Event) {
@@ -339,6 +357,7 @@
     formContext = isGeneratedSourceRef(learning.context) ? '' : learning.context || '';
     formTags = joinTags(visibleTags(learning.tags));
     formError = '';
+    restoreEditorDraft();
   }
 
   function editorTitle(): string {
@@ -423,6 +442,7 @@
       if (!isCurrentKnowledgeWorkspaceRequest(request)) {
         return;
       }
+      clearViewDraft(editorDraftKey);
       closeEditor();
       refresh();
     } catch (error) {
@@ -820,12 +840,12 @@
 
   function deleteAdr(id: string, e: Event) {
     e.stopPropagation();
-    deleteKnowledgeEntry(id);
+    void deleteKnowledgeEntry(id, e.currentTarget as HTMLElement);
   }
 
   function deleteFaq(id: string, e: Event) {
     e.stopPropagation();
-    deleteKnowledgeEntry(id);
+    void deleteKnowledgeEntry(id, e.currentTarget as HTMLElement);
   }
 
   function toggleLearning(learning: Learning) {
@@ -834,10 +854,13 @@
 
   function deleteLearning(id: string, e: Event) {
     e.stopPropagation();
-    deleteKnowledgeEntry(id);
+    void deleteKnowledgeEntry(id, e.currentTarget as HTMLElement);
   }
 
-  function deleteKnowledgeEntry(id: string) {
+  async function deleteKnowledgeEntry(id: string, anchor: HTMLElement) {
+    const scope = currentWorkspaceKey;
+    if (!(await confirmMessage(i18n.t('overlay.deleteKnowledgeBody'), { title: i18n.t('overlay.deleteKnowledge'), confirmLabel: i18n.t('overlay.deleteKnowledge'), tone: 'danger', anchor }))) return;
+    if (scope !== currentWorkspaceKey) return;
     const request = currentKnowledgeWorkspaceRequest();
     if (isWebMode) {
       deleteAgentKnowledgeItem(id, knowledgeWorkspaceScope(request))
@@ -1037,6 +1060,7 @@
   {#if editorKind}
     <div class="kp-editor-card">
       <div class="kp-editor-title">{editorTitle()}</div>
+      <p class="settings-hint" role="status">{i18n.t('overlay.draftSession')}</p>
       {#if editorKind !== 'learning'}
         <label class="kp-editor-field">
           <span>{editorKind === 'faq' ? i18n.t('knowledge.form.question') : i18n.t('knowledge.form.title')}</span>
@@ -1076,21 +1100,15 @@
 
   <!-- 清空确认弹窗 -->
   {#if showClearConfirm}
-    <div class="kp-confirm-overlay" role="dialog">
+    <Modal title={i18n.t('knowledge.confirm.title')} size="sm" onClose={cancelClear}>
       <div class="kp-confirm-dialog" data-magi-surface="critical">
-        <div class="kp-confirm-icon">
-          <Icon name="warning" size={24} />
-        </div>
-        <div class="kp-confirm-title">{i18n.t('knowledge.confirm.title')}</div>
-        <p class="kp-confirm-desc">
-          {i18n.t('knowledge.confirm.desc', { fileCount, adrCount: adrs.length, faqCount: faqs.length, learningCount: learnings.length })}
-        </p>
-        <div class="kp-confirm-actions">
-          <button class="kp-confirm-btn kp-confirm-btn--cancel" onclick={cancelClear}>{i18n.t('knowledge.confirm.cancel')}</button>
-          <button class="kp-confirm-btn kp-confirm-btn--danger" onclick={executeClear}>{i18n.t('knowledge.confirm.confirm')}</button>
-        </div>
+        <p class="kp-confirm-desc">{i18n.t('knowledge.confirm.desc', { fileCount, adrCount: adrs.length, faqCount: faqs.length, learningCount: learnings.length })}</p>
       </div>
-    </div>
+      {#snippet footer()}
+        <button class="btn btn--secondary btn--sm" onclick={cancelClear}>{i18n.t('knowledge.confirm.cancel')}</button>
+        <button class="btn btn--error btn--sm" onclick={executeClear}>{i18n.t('knowledge.confirm.confirm')}</button>
+      {/snippet}
+    </Modal>
   {/if}
 
   <!-- 主内容区 -->
@@ -1276,7 +1294,7 @@
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
-              {#if isExpanded}
+              <Disclosure expanded={isExpanded}>
                 <div class="kp-card-body">
                   {#if adr.content}
                     <div class="kp-detail-block">
@@ -1291,7 +1309,7 @@
                     </div>
                   {/if}
                 </div>
-              {/if}
+              </Disclosure>
             </div>
           {/each}
         {/if}
@@ -1333,7 +1351,7 @@
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
-              {#if isExpanded}
+              <Disclosure expanded={isExpanded}>
                 <div class="kp-card-body">
                   {#if faq.answer}
                     <div class="kp-detail-block">
@@ -1348,7 +1366,7 @@
                     </div>
                   {/if}
                 </div>
-              {/if}
+              </Disclosure>
             </div>
           {/each}
         {/if}
@@ -1391,7 +1409,7 @@
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
-              {#if isExpanded}
+              <Disclosure expanded={isExpanded}>
                 <div class="kp-card-body">
                   <div class="kp-detail-block">
                     <p>{learning.content}</p>
@@ -1410,7 +1428,7 @@
                     </div>
                   {/if}
                 </div>
-              {/if}
+              </Disclosure>
             </div>
           {/each}
         {/if}
@@ -1547,8 +1565,12 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     color: var(--foreground-muted);
+  }
+
+  .kp-search-bar:focus-within {
+    box-shadow: var(--magi-focus-shadow);
   }
 
   .kp-search-input {
@@ -1558,6 +1580,7 @@
     color: var(--foreground);
     font-size: var(--text-sm);
     outline: none;
+    box-shadow: none;
     min-width: 0;
   }
 
@@ -1591,7 +1614,7 @@
     align-items: center;
     gap: var(--space-1);
     padding: 3px 10px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-full);
     background: var(--surface-1);
     color: var(--foreground-muted);
@@ -1609,7 +1632,7 @@
   .kp-editor-card {
     margin: 0 var(--space-3) var(--space-3);
     padding: var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1);
     display: flex;
@@ -1634,7 +1657,7 @@
   .kp-editor-input,
   .kp-editor-textarea {
     width: 100%;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-2);
     color: var(--foreground);
@@ -1663,7 +1686,7 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--error) 26%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 26%, var(--border));
     border-radius: var(--radius-sm);
     background: var(--error-muted);
     color: var(--error);
@@ -1678,7 +1701,7 @@
 
   .kp-editor-btn {
     padding: 5px 12px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);
@@ -1738,7 +1761,7 @@
     justify-content: space-around;
     padding: var(--space-3) var(--space-2);
     background: var(--surface-1);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
   }
 
@@ -1774,7 +1797,7 @@
     align-items: flex-start;
     gap: var(--space-2);
     padding: var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 22%, var(--border));
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
     color: var(--foreground-muted);
@@ -1847,7 +1870,7 @@
     background: var(--surface-2);
     color: var(--foreground);
     border-radius: var(--radius-full);
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
   }
 
   .kp-entry-list {
@@ -1956,7 +1979,7 @@
 
   /* ---- 卡片（ADR / FAQ 条目） ---- */
   .kp-card {
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1);
     overflow: hidden;
@@ -2074,7 +2097,7 @@
   /* ---- 卡片展开详情 ---- */
   .kp-card-body {
     padding: 0 var(--space-3) var(--space-3) calc(var(--space-3) + 3px + var(--space-2));
-    border-top: 1px solid var(--border);
+    border-top: var(--magi-hairline) solid var(--border);
   }
 
   .kp-detail-block {
@@ -2126,37 +2149,10 @@
   }
 
   /* ---- 确认弹窗 ---- */
-  .kp-confirm-overlay {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--overlay);
-    z-index: var(--z-modal);
-  }
 
-  .kp-confirm-dialog {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: var(--space-5);
-    max-width: 300px;
-    width: 90%;
-    box-shadow: var(--shadow-lg);
-    text-align: center;
-  }
+  .kp-confirm-dialog { color: var(--foreground); }
 
-  .kp-confirm-icon {
-    color: var(--warning);
-    margin-bottom: var(--space-3);
-  }
 
-  .kp-confirm-title {
-    font-size: var(--text-base);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-    margin-bottom: var(--space-2);
-  }
 
   .kp-confirm-desc {
     font-size: var(--text-sm);
@@ -2165,38 +2161,9 @@
     line-height: var(--leading-normal);
   }
 
-  .kp-confirm-actions {
-    display: flex;
-    justify-content: center;
-    gap: var(--space-3);
-  }
 
-  .kp-confirm-btn {
-    padding: var(--space-2) var(--space-5);
-    font-size: var(--text-sm);
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
 
-  .kp-confirm-btn--cancel {
-    background: transparent;
-    color: var(--foreground-muted);
-  }
 
-  .kp-confirm-btn--cancel:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
 
-  .kp-confirm-btn--danger {
-    background: var(--error);
-    border-color: var(--error);
-    color: white;
-  }
 
-  .kp-confirm-btn--danger:hover {
-    opacity: 0.9;
-  }
 </style>

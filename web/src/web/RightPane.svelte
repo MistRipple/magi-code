@@ -1,4 +1,5 @@
 <script lang="ts">
+  import FileName from '../components/FileName.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
@@ -1288,7 +1289,7 @@
               aria-label={i18n.t(agentOccupied ? 'browser.control.agentOccupied' : 'browser.control.released')}
             ></span>
           {/if}
-          <span class="right-pane-tab-label" class:mono={tab.kind === 'code'}>{tabLabel(tab)}</span>
+          <span class="right-pane-tab-label" class:mono={tab.kind === 'code'}>{#if tab.kind === 'code'}<FileName name={tabLabel(tab)} />{:else}{tabLabel(tab)}{/if}</span>
           <button
             type="button"
             class="right-pane-tab-close"
@@ -1357,7 +1358,7 @@
   <!-- 当前 code tab 的副标题：路径 + 文档预览操作 -->
   {#if activeTab && activeTab.kind === 'code'}
     <div class="right-pane-subbar">
-      <div class="right-pane-path" title={activeDisplayFilePath}>{displayPath}</div>
+      <div class="right-pane-path" title={activeDisplayFilePath}><FileName name={displayPath} /></div>
       {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
         <div class="right-pane-document-actions">
           {#if markdownFile}
@@ -1366,12 +1367,16 @@
                 type="button"
                 class="right-pane-document-mode"
                 class:active={documentMode === 'rendered'}
+                role="tab"
+                aria-selected={documentMode === 'rendered'}
                 onclick={() => setDocumentMode('rendered')}
               >{i18n.t('web.filePreviewRendered')}</button>
               <button
                 type="button"
                 class="right-pane-document-mode"
                 class:active={documentMode === 'raw'}
+                role="tab"
+                aria-selected={documentMode === 'raw'}
                 onclick={() => setDocumentMode('raw')}
               >{i18n.t('web.filePreviewRaw')}</button>
             </div>
@@ -1602,15 +1607,15 @@
 
 <style>
   .right-pane {
-    /* 与左侧 sidebar 同款卡片样式：1px border + radius-lg + surface-1 底，
-       overflow:hidden 用于让顶部 tabbar 的高亮条/底色被卡片圆角裁切，避免溢出 */
+    /* The pane owns its single inset perimeter; child actions remain borderless. */
     display: flex;
     position: relative;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
     height: 100%;
-    border: 1px solid var(--border);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
     border-radius: var(--radius-lg);
     background: var(--magi-surface-right-pane);
     overflow: hidden;
@@ -1710,8 +1715,8 @@
     min-width: min(168px, 100%);
     box-sizing: border-box;
     padding: 4px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border: var(--magi-hairline) solid var(--border);
+    border-radius: calc(var(--radius-sm) + 4px);
     background: var(--dropdown-bg);
     box-shadow: var(--shadow-lg);
   }
@@ -1751,7 +1756,7 @@
   }
 
   .right-pane-add-menu-item--separated {
-    border-top: 1px solid var(--border-subtle);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
     margin-top: 4px;
     padding-top: 8px;
   }
@@ -1821,7 +1826,7 @@
     font-weight: var(--font-medium);
     cursor: pointer;
     position: relative;
-    border-right: 1px solid var(--border-subtle);
+    border-right: var(--magi-hairline) solid var(--border-subtle);
     transition: background var(--transition-fast), color var(--transition-fast);
   }
 
@@ -1859,7 +1864,7 @@
     flex: 1;
     min-width: 0;
   }
-  .right-pane-tab-label.mono { font-family: var(--font-mono); font-size: var(--text-xs); }
+  .right-pane-tab-label.mono { display: flex; font-family: var(--font-mono); font-size: var(--text-xs); }
 
   .browser-control-status {
     width: 7px;
@@ -1908,11 +1913,12 @@
     justify-content: space-between;
     gap: var(--space-3);
     padding: 6px var(--space-4);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--magi-hairline) solid var(--border);
     flex-shrink: 0;
   }
 
   .right-pane-path {
+    display: flex;
     min-width: 0;
     flex: 1;
     overflow: hidden;
@@ -2156,7 +2162,7 @@
     gap: var(--space-1);
     padding: 4px 6px;
     background: var(--surface-overlay, rgba(20, 20, 22, 0.82));
-    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+    border: var(--magi-hairline) solid var(--border-subtle, rgba(255, 255, 255, 0.12));
     border-radius: var(--radius-md, 8px);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
     backdrop-filter: blur(6px);
@@ -2220,7 +2226,7 @@
   .right-pane-summary-content {
     margin: 0;
     padding: var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--surface-1) 82%, var(--background));
     color: var(--foreground);
@@ -2235,11 +2241,7 @@
 
   .right-pane-notice {
     margin-bottom: var(--space-3);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-md);
-    border: 1px solid color-mix(in srgb, var(--warning, #f59e0b) 30%, var(--border));
-    background: color-mix(in srgb, var(--warning, #f59e0b) 10%, transparent);
-    color: var(--foreground);
+    color: var(--foreground-muted);
     font-size: var(--text-xs);
   }
 </style>

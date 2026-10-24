@@ -926,10 +926,13 @@ export interface ChangeMutationStatus {
   updatedAt?: number;
 }
 
+// Toast 操作仅存在于当前 Renderer，不参与协议或持久化。
+export interface ToastAction { label: string; run: () => void | Promise<void>; }
 // Toast 通知
 export type ToastType = 'info' | 'success' | 'warning' | 'error';
 
 export interface Toast {
+  action?: ToastAction;
   id: string;
   type: ToastType;
   title?: string;

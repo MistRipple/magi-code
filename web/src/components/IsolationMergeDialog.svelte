@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
+  import FileName from './FileName.svelte';
   import type {
     IsolationConflictResolutionDto,
     IsolationMergeEntryDto,
@@ -27,6 +29,11 @@
   let excluded = $state<Set<string>>(new Set());
   let resolutions = $state<Record<string, IsolationConflictResolutionDto>>({});
   let loadedFor = '';
+  let mergeDraftKey = '';
+  let mergeDraftBaseline = '';
+  $effect(() => {
+    if (isolationMergeDialogState.open && !loading && mergeDraftKey) saveViewDraft(mergeDraftKey, mergeDraftBaseline, { excluded: [...excluded], resolutions }, 'memory');
+  });
 
   const summary = $derived(summarizeMergePlan(entries));
   const request = $derived(buildMergeRequest(entries, { excluded, resolutions }));
@@ -39,8 +46,11 @@
       const plan = await loadIsolationMergePlan(sessionId, isolationMergeDialogState.binding);
       if (isolationMergeDialogState.sessionId !== sessionId) return;
       entries = plan.entries;
-      excluded = new Set();
-      resolutions = {};
+      mergeDraftKey = `merge:${JSON.stringify(isolationMergeDialogState.binding)}:${sessionId}`;
+      mergeDraftBaseline = JSON.stringify(plan.entries);
+      const draft = loadViewDraft(mergeDraftKey, mergeDraftBaseline, { excluded: [] as string[], resolutions: {} as Record<string, IsolationConflictResolutionDto> }, 'memory');
+      excluded = new Set(draft.excluded);
+      resolutions = draft.resolutions;
     } catch (error) {
       loadError = error instanceof Error && error.message ? error.message : i18n.t('isolation.merge.loadFailed');
       entries = [];
@@ -81,6 +91,7 @@
         isolationMergeDialogState.binding,
         { paths: request.paths, resolutions: request.resolutions },
       );
+      clearViewDraft(mergeDraftKey);
       const applied = outcome.applied.length;
       const left = outcome.unresolved.length + outcome.failed.length;
       if (outcome.failed.length > 0) {
@@ -134,7 +145,8 @@
     title={i18n.t('isolation.merge.title')}
     size="lg"
     onClose={closeIsolationMergeDialog}
-    closeOnBackdrop={!applying}
+    form
+    closeOnEscape={!applying}
     bodyClass="isolation-merge-body"
   >
     {#if isolationMergeDialogState.exitAfterMerge}
@@ -175,7 +187,7 @@
               <span class="merge-action merge-action--{entry.action}" title={i18n.t(`isolation.merge.action.${entry.action}`)}>
                 <Icon name={actionIcon(entry.action)} size={12} />
               </span>
-              <span class="merge-path" title={entry.path}>{entry.path}</span>
+              <span class="merge-path" title={entry.path}><FileName name={entry.path} /></span>
               <span
                 class="merge-state merge-state--{entry.state}"
               >
@@ -379,7 +391,7 @@
   .merge-choice {
     height: 24px;
     padding: 0 10px;
-    border: 1px solid var(--border-subtle);
+    border: var(--magi-hairline) solid var(--border-subtle);
     border-radius: 999px;
     background: transparent;
     color: var(--foreground-muted);

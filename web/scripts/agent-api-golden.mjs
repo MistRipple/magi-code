@@ -484,7 +484,6 @@ await withGoldenViteServer(async (server) => {
       baseUrl: 'https://cpa.example.com/v1',
       apiKey: 'sk-image',
       model: 'gpt-image-1',
-      urlMode: 'standard',
     };
     await agentApi.saveAgentImageGenerationConfig(imageConfig);
     await agentApi.testAgentImageGenerationConnection(imageConfig);

@@ -28,6 +28,10 @@
   let focusedTurnId = $state('');
   let selectedTurnId = $state('');
   let menuOpen = $state(false);
+  let menuSearch = $state('');
+  const menuItems = $derived(items.filter(item => `${item.index} ${item.summary}`
+    .toLocaleLowerCase().includes(menuSearch.trim().toLocaleLowerCase())));
+  $effect(() => { if (!menuOpen || items.length <= 10) menuSearch = ''; });
   let positionFrame = 0;
   let activeTurnFrame = 0;
   let layoutFrame = 0;
@@ -377,9 +381,14 @@
 
     <div class="turn-navigation-capsule" class:open={menuOpen} bind:this={capsuleRef}>
       {#if menuOpen}
-        <div class="turn-navigation-menu" data-magi-surface="popover" role="menu">
+        <div class="turn-navigation-menu" data-magi-surface="popover" role="group" aria-label={i18n.t('messageList.turnNavigation.menuTitle')}>
           <div class="turn-navigation-menu-title">{i18n.t('messageList.turnNavigation.menuTitle')}</div>
-          {#each items as item (item.turnId)}
+          {#if items.length > 10}
+            <input type="search" class="form-input" bind:value={menuSearch} placeholder={i18n.t('selection.search')}
+              aria-label={i18n.t('selection.searchFor', { label: i18n.t('messageList.turnNavigation.menuTitle') })} />
+          {/if}
+          <div role="menu">
+          {#each menuItems as item (item.turnId)}
             <button
               type="button"
               class="turn-navigation-menu-item"
@@ -401,6 +410,7 @@
               </span>
             </button>
           {/each}
+          </div>
         </div>
       {/if}
       <button
@@ -543,7 +553,7 @@
     left: 40px;
     width: min(320px, calc(100vw - 100px));
     padding: var(--space-3) var(--space-4);
-    border: 1px solid var(--border-strong);
+    border: var(--magi-hairline) solid var(--border-strong);
     border-radius: var(--radius-lg);
     background: var(--dropdown-bg, var(--surface-2));
     box-shadow: var(--shadow-lg);
@@ -628,10 +638,10 @@
     right: 0;
     bottom: 52px;
     width: min(340px, calc(100vw - 30px));
-    max-height: 410px;
+    max-height: 264px;
     overflow: auto;
     padding: var(--space-2);
-    border: 1px solid var(--border-strong);
+    border: var(--magi-hairline) solid var(--border-strong);
     border-radius: var(--radius-lg);
     background: var(--dropdown-bg, var(--surface-2));
     box-shadow: var(--shadow-lg);

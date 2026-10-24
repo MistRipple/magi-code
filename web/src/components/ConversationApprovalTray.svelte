@@ -32,7 +32,7 @@
   .conversation-approval-item {
     min-width: 0;
     padding: var(--space-3);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface-1);
   }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -16,6 +17,8 @@
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let popover = $state<{ top: number; left: number; width: number; maxHeight: number } | null>(null);
   let copySuccess = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copyResetTimer));
 
   const normalizedText = $derived(typeof text === 'string' ? text.trim() : '');
   const inlineText = $derived(normalizedText.replace(/\s+/g, ' ').trim());
@@ -60,7 +63,8 @@
     try {
       await navigator.clipboard.writeText(normalizedText);
       copySuccess = true;
-      setTimeout(() => { copySuccess = false; }, 2000);
+      clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => { copySuccess = false; }, 2500);
     } catch (error) {
       console.error('复制详情失败:', error);
     }
@@ -103,7 +107,7 @@
       <div class="error-popover-header">
         <span class="error-popover-title">{i18n.t('errorDetail.title')}</span>
         <div class="error-popover-actions">
-          <button class="error-popover-btn" onclick={copyText} type="button" title={copySuccess ? i18n.t('errorDetail.copied') : i18n.t('errorDetail.copy')}>
+          <button class="error-popover-btn" class:copied={copySuccess} data-copy-feedback={copySuccess} onclick={copyText} type="button" title={copySuccess ? i18n.t('errorDetail.copied') : i18n.t('errorDetail.copy')}>
             <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
           </button>
           <button class="error-popover-btn" onclick={() => closePopover()} type="button" title={i18n.t('errorDetail.close')}>
@@ -124,9 +128,9 @@
   .error-popover-btn { width: 24px; height: 24px; }
   .error-more-btn:hover { color: var(--primary-hover); }
   .error-more-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--radius-xs); }
-  .error-popover-btn { border: 1px solid var(--border); background: var(--surface-2); color: var(--foreground-muted); border-radius: var(--radius-sm); }
+  .error-popover-btn { border: var(--magi-hairline) solid var(--border); background: var(--surface-2); color: var(--foreground-muted); border-radius: var(--radius-sm); }
   .error-popover-btn:hover { background: var(--surface-hover); color: var(--foreground); }
-  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--background); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
+  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--background); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
   .error-popover-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .error-popover-title { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
   .error-popover-actions { display: flex; align-items: center; gap: var(--space-2); }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import ts from 'typescript';
 import { access, readFile } from 'node:fs/promises';
 
 const settingsTabs = await readFile(new URL('../src/lib/settings-tabs.ts', import.meta.url), 'utf8');
@@ -53,7 +54,7 @@ const desktopShell = await readFile(new URL('../src/DesktopAppShell.svelte', imp
 assert.match(desktopShell, /desktop-titlebar[\s\S]*?--magi-surface-main[\s\S]*?-webkit-app-region: drag/, '桌面标题栏必须共享工作台主题材质并支持拖动');
 assert.doesNotMatch(desktopAppearance + desktopPreload + desktopMain, /@tauri-apps|getCurrentWebviewWindow/, '外观链路不得保留 Tauri 实现');
 assert.match(runtime, /--magi-surface-dialog[\s\S]*?--magi-surface-popover[\s\S]*?--magi-surface-critical[\s\S]*?--magi-window-overlay[\s\S]*?--magi-popover-overlay[\s\S]*?--magi-critical-overlay/, '主题必须提供完整的语义材质表面');
-assert.match(runtime, /'--magi-surface-sidebar': panel[\s\S]*?'--magi-surface-main': panel[\s\S]*?'--magi-surface-right-pane': panel/, '三栏结构面板必须共享同一主题材质令牌');
+assert.match(runtime, /'--magi-surface-sidebar': rgba\(sidebar, effectiveWallpaperUrl \? materialAlpha : 1\)[\s\S]*?'--magi-surface-main': mainPanel[\s\S]*?'--magi-surface-right-pane': panel/, '三栏表面由同一权威主题派生微色阶，并共享壁纸材质透明度');
 assert.doesNotMatch(runtime, /desktopShellBackground|--magi-desktop-shell-background/, '主题运行时不得保留已移除的第四层 Desktop 外壳背景令牌');
 assert.match(runtime, /const effectiveWallpaperUrl = wallpaperUrl/, 'Desktop App Renderer 必须由主 Renderer 统一绘制整窗壁纸');
 assert.match(mainWeb, /desktopSurface === 'app'[\s\S]*?magiDesktopSurface/, 'Desktop App 必须显式声明 Surface 身份以应用统一材质策略');
@@ -88,16 +89,15 @@ assert.match(
   /\.settings-nav\s*\{[\s\S]*?background:\s*var\(--magi-surface-sidebar\);[\s\S]*?\.settings-main\s*\{[\s\S]*?background:\s*var\(--magi-surface-main\);/,
   '设置页与工作台同级，导航与内容必须复用侧栏和主区域的主题材质，而不是自带一层窗口材质'
 );
-assert.match(settingsAppearance, /theme-editor" data-magi-surface="window"[\s\S]*?confirm-dialog" data-magi-surface="critical"/, '主题编辑与关键确认必须使用对应语义材质');
-assert.match(modelConfigForm, /model-dropdown"[\s\S]*?data-magi-surface="popover"/, '模型选择浮层必须接入统一悬浮材质');
+assert.match(settingsAppearance, /SettingsDetailPage title=\{editorTitle\}[\s\S]*?confirm-dialog" data-magi-surface="critical"/, '主题编辑必须在内容页切换，关键确认继续使用关键材质');
+assert.match(modelConfigForm, /model-select-list"[\s\S]*?data-magi-surface="popover"/, '模型选择浮层必须接入统一悬浮材质');
 assert.match(modelConfigForm, /function portalToBody[\s\S]*?document\.body\.appendChild\(node\)/, '模型选择浮层必须挂载到页面根层，不能受设置窗口坐标系与裁切影响');
-assert.match(modelConfigForm, /use:portalToBody[\s\S]*?class="model-dropdown"/, '模型选择列表必须通过统一根层 portal 渲染');
+assert.match(modelConfigForm, /use:portalToBody[\s\S]*?class="model-select-list"/, '模型选择列表必须通过统一根层 portal 渲染');
 assert.match(modelConfigForm, /addEventListener\('scroll', handleScroll, true\)/, '模型选择浮层必须在任意滚动容器滚动时关闭，避免脱离锚点');
 assert.match(enginePicker, /engine-picker-popup"[\s\S]*?data-magi-surface="popover"/, '代理模型选择浮层必须接入统一悬浮材质');
 assert.match(knowledgePanel, /kp-confirm-dialog" data-magi-surface="critical"/, '知识库关键确认必须接入统一关键材质');
 assert.match(runtimeStatePanel, /runtime-diagnostics__content" data-magi-surface="popover"/, '运行态展开面板必须接入统一悬浮材质');
 assert.doesNotMatch(settingsAppearance, /\.(primary-button|secondary-button|icon-button|danger-button|segmented-control)\s*\{/, '主题页不得重复定义基础控件样式');
-assert.match(modelConfigForm, /ui-segmented url-mode-switch/, '模型 URL 模式必须复用全局分段控件');
 assert.match(settingsPanel, /ui-segmented mcp-transport-switch/, 'MCP 传输模式必须复用全局分段控件');
 assert.match(settingsPanel, /class="form-input"[\s\S]*?class="form-textarea"/, '设置弹窗必须显式复用全局表单控件');
 const settingsSafeguard = await readFile(new URL('../src/components/SettingsSafeguardTab.svelte', import.meta.url), 'utf8');
@@ -141,3 +141,42 @@ await assert.rejects(
 );
 
 console.log('appearance golden checks passed');
+
+const runtimeAst = ts.createSourceFile('runtime.ts', runtime, ts.ScriptTarget.Latest, true);
+const projectionFunctions = ['applyRootTheme', 'parseHex', 'mix', 'toHex', 'rgba', 'relativeLuminance'];
+const projectionSource = projectionFunctions.map(name => {
+  const declaration = runtimeAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  assert.ok(declaration, `missing theme projection ${name}`);
+  return declaration.getText(runtimeAst);
+}).join('\n');
+const project = new Function(ts.transpileModule(`
+  let mode: 'light' | 'dark';
+  const variables = new Map<string, string>();
+  const classList = { add() {}, remove() {} };
+  const document = {
+    documentElement: { classList, dataset: {}, style: { setProperty(name: string, value: string) { variables.set(name, value); } } },
+    body: { classList },
+  };
+  ${projectionSource}
+  return (targetMode, scheme, wallpaper = '') => {
+    mode = targetMode;
+    variables.clear();
+    applyRootTheme({ id: 'test', material: 'clear' }, scheme, wallpaper);
+    return Object.fromEntries(variables);
+  };
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText)();
+const darkProjection = project('dark', { background: '#0B0B0A', foreground: '#E7E7E4', accent: '#3B82F6', contrast: 62 });
+const lightProjection = project('light', { background: '#FCFCFB', foreground: '#272725', accent: '#2563EB', contrast: 52 });
+assert.equal(darkProjection['--magi-surface-sidebar'], 'rgba(11, 11, 10, 1.000)');
+assert.equal(lightProjection['--magi-surface-sidebar'], 'rgba(246, 246, 245, 1.000)');
+for (const projection of [darkProjection, lightProjection]) {
+  assert.notEqual(projection['--magi-surface-main'], projection['--magi-surface-sidebar']);
+  const alpha = Number(projection['--border'].match(/, ([\d.]+)\)$/)[1]);
+  assert.ok(alpha > 0.05 && alpha < 0.11, 'neutral dividers remain subtle and visible');
+}
+const custom = project('dark', { background: '#102030', foreground: '#E0E8F0', accent: '#40B090', contrast: 70 }, 'blob:test');
+assert.equal(custom['--magi-canvas'], '#102030', 'custom theme background stays authoritative');
+assert.equal(custom['--primary'], '#40B090', 'custom accents stay authoritative');
+assert.ok(custom['--magi-surface-main'].endsWith('0.980)'));
+assert.ok(custom['--magi-surface-sidebar'].endsWith('0.980)'));
+console.log('appearance surface projection scenarios passed');

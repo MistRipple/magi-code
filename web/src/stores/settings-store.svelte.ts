@@ -1,3 +1,4 @@
+import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
 import { getClientKind, vscode } from "../lib/vscode-bridge";
 import { onMount, untrack } from "svelte";
 import type { StandardMessage } from "../shared/protocol/message-protocol";
@@ -90,9 +91,7 @@ import {
   setModelStatus,
 } from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
-import {
-  resolveModelListFetchBlockReason,
-} from "../shared/model-governance";
+import { canFetchModelList } from "../shared/model-governance";
 import { normalizeToolRuntimeStatus } from "../shared/tool-catalog";
 import {
   convertMcpFormDraft,
@@ -104,7 +103,6 @@ import {
   type NormalizedMcpServerDraft,
 } from "../shared/mcp-config";
 
-export type UrlMode = "standard" | "full";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export interface TextModelRule {
@@ -114,7 +112,6 @@ export interface TextModelRule {
 
 export interface BaseModelFormConfig {
   baseUrl: string;
-  urlMode: UrlMode;
   apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;
@@ -132,7 +129,6 @@ type ModelConfigTarget = "orch" | "comp" | "vision" | "image" | "worker";
 
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
-  urlMode: UrlMode;
   apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;
@@ -372,9 +368,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       const target = e.target as HTMLElement;
       if (
         !target?.closest?.(".model-combobox") &&
-        !target?.closest?.(".model-dropdown")
+        !target?.closest?.(".model-select-list")
       ) {
-        closeAllModelDropdowns();
+        closeAllModelLists();
       }
     };
     window.addEventListener("click", handler);
@@ -401,8 +397,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   ): InteractiveModelFormConfig {
     return {
       baseUrl: "",
-      urlMode: "standard",
-      apiProtocol: "openai_chat",
+      apiProtocol: "openai_responses",
       apiKey: "",
       model: "",
       reasoningEffort: "medium",
@@ -415,8 +410,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   ): BaseModelFormConfig {
     return {
       baseUrl: "",
-      urlMode: "standard",
-      apiProtocol: "openai_chat",
+      apiProtocol: "openai_responses",
       apiKey: "",
       model: "",
       ...overrides,
@@ -445,14 +439,10 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     };
   }
 
-  function normalizeUrlMode(value: unknown): UrlMode {
-    return value === "full" ? "full" : "standard";
-  }
-
   function normalizeModelApiProtocol(value: unknown): HttpModelApiProtocol {
-    if (value === "openai_responses") return "openai_responses";
+    if (value === "openai_chat") return "openai_chat";
     if (value === "anthropic_messages") return "anthropic_messages";
-    return "openai_chat";
+    return "openai_responses";
   }
 
   function buildBaseModelConfigPayload(
@@ -460,7 +450,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   ): BaseModelConfigPayload {
     return {
       baseUrl: config.baseUrl,
-      urlMode: config.urlMode,
       apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
       model: config.model,
@@ -495,7 +484,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   ): Omit<BaseModelConfigPayload, "model"> {
     return {
       baseUrl: config.baseUrl,
-      urlMode: config.urlMode,
       apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
     };
@@ -573,7 +561,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   function normalizeOrchestratorFormConfig(config: any): InteractiveModelFormConfig {
     return createInteractiveConfig({
       baseUrl: config?.baseUrl || "",
-      urlMode: normalizeUrlMode(config?.urlMode),
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
       model: "",
@@ -584,7 +571,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   function normalizeAuxiliaryFormConfig(config: any): BaseModelFormConfig {
     return createAuxiliaryConfig({
       baseUrl: config?.baseUrl || "",
-      urlMode: normalizeUrlMode(config?.urlMode),
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
       model: config?.model || "",
@@ -603,7 +589,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     const contextWindowTokens = Number(config?.contextWindowTokens);
     return createVisionConfig({
       baseUrl: config?.baseUrl || "",
-      urlMode: normalizeUrlMode(config?.urlMode),
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
       model: config?.model || "",
@@ -617,7 +602,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   function normalizeWorkerFormConfig(config: any): WorkerModelFormConfig {
     return createWorkerConfig({
       baseUrl: config?.baseUrl || "",
-      urlMode: normalizeUrlMode(config?.urlMode),
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
       model: config?.model || "",
@@ -637,25 +621,6 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   function getBaseUrlPlaceholder(): string {
     return "https://api.openai.com/v1";
-  }
-
-  function normalizeBaseUrlForHint(baseUrl: string): string {
-    return typeof baseUrl === "string"
-      ? baseUrl.trim().replace(/\/+$/, "").toLowerCase()
-      : "";
-  }
-
-  function shouldRecommendStandardUrlMode(baseUrl: string): boolean {
-    const normalized = normalizeBaseUrlForHint(baseUrl);
-    if (!normalized) {
-      return false;
-    }
-    // 这些 baseUrl 是“标准兼容形”端点：应作为根地址交给后端按模型名派生协议，
-    // 因此推荐使用 standard 模式而非 full（避免把整条 URL 原样透传）。
-    return (
-      normalized === "https://api.openai.com/v1" ||
-      normalized === "https://api.lkeap.cloud.tencent.com/coding/v3"
-    );
   }
 
   // 测试连接状态: 'idle' | 'testing' | 'success' | 'error'
@@ -685,7 +650,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     image: false,
   });
   // 模型下拉是否展开
-  let modelDropdownOpen = $state<Record<string, boolean>>({
+  let modelListOpen = $state<Record<string, boolean>>({
     orch: false,
     comp: false,
     vision: false,
@@ -693,32 +658,32 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   });
 
   // 模型下拉的 fixed 定位坐标（用于突破 overflow 容器限制）
-  let dropdownPosition = $state({ top: 0, left: 0, width: 0 });
+  let modelListPosition = $state({ top: 0, left: 0, width: 0 });
 
-  function openModelDropdown(key: string, inputEl: EventTarget | null) {
+  function openModelList(key: string, inputEl: EventTarget | null) {
     const el = inputEl as HTMLElement;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    dropdownPosition = { top: rect.bottom, left: rect.left, width: rect.width };
-    modelDropdownOpen[key] = true;
-    modelDropdownOpen = { ...modelDropdownOpen };
+    modelListPosition = { top: rect.bottom, left: rect.left, width: rect.width };
+    modelListOpen[key] = true;
+    modelListOpen = { ...modelListOpen };
   }
 
-  function closeAllModelDropdowns() {
+  function closeAllModelLists() {
     let changed = false;
-    for (const key of Object.keys(modelDropdownOpen)) {
-      if (modelDropdownOpen[key]) {
-        modelDropdownOpen[key] = false;
+    for (const key of Object.keys(modelListOpen)) {
+      if (modelListOpen[key]) {
+        modelListOpen[key] = false;
         changed = true;
       }
     }
-    if (changed) modelDropdownOpen = { ...modelDropdownOpen };
+    if (changed) modelListOpen = { ...modelListOpen };
   }
 
-  function closeModelDropdown(key: string) {
-    if (!modelDropdownOpen[key]) return;
-    modelDropdownOpen[key] = false;
-    modelDropdownOpen = { ...modelDropdownOpen };
+  function closeModelList(key: string) {
+    if (!modelListOpen[key]) return;
+    modelListOpen[key] = false;
+    modelListOpen = { ...modelListOpen };
   }
 
   function buildModelListSignature(config: Partial<BaseModelFormConfig> | undefined): string {
@@ -728,21 +693,20 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     return JSON.stringify({
       baseUrl: typeof config.baseUrl === "string" ? config.baseUrl.trim() : "",
       apiKey: typeof config.apiKey === "string" ? config.apiKey.trim() : "",
-      urlMode: config.urlMode || "standard",
-      apiProtocol: config.apiProtocol || "openai_chat",
+      apiProtocol: config.apiProtocol || "openai_responses",
     });
   }
 
   function clearModelListState(key: string) {
     const hadModels = Array.isArray(modelLists[key]) && modelLists[key].length > 0;
-    const dropdownOpen = modelDropdownOpen[key] === true;
+    const dropdownOpen = modelListOpen[key] === true;
     if (!hadModels && !dropdownOpen) {
       return;
     }
     modelLists[key] = [];
     modelLists = { ...modelLists };
-    modelDropdownOpen[key] = false;
-    modelDropdownOpen = { ...modelDropdownOpen };
+    modelListOpen[key] = false;
+    modelListOpen = { ...modelListOpen };
   }
 
   function syncModelListSignature(key: string, signature: string) {
@@ -781,14 +745,14 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         if (liveWorkerKeys.has(key)) continue;
         delete modelListSignatures[key];
         delete modelLists[key];
-        delete modelDropdownOpen[key];
+        delete modelListOpen[key];
         delete fetchingModels[key];
         changed = true;
       }
       if (changed) {
         modelListSignatures = { ...modelListSignatures };
         modelLists = { ...modelLists };
-        modelDropdownOpen = { ...modelDropdownOpen };
+        modelListOpen = { ...modelListOpen };
         fetchingModels = { ...fetchingModels };
       }
     });
@@ -1008,7 +972,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   // 破坏性操作：用应用统一的确认对话框，确认后才执行 action。
   async function confirmThen(title: string, message: string, action: () => Promise<void>): Promise<void> {
-    if (await confirmMessage(message, { title, tone: "danger" })) {
+    if (await confirmMessage(message, { title, confirmLabel: title, tone: "danger" })) {
       await action();
     }
   }
@@ -2168,13 +2132,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     if (!key || !currentConfig) return;
     const config = cloneModelFormConfig(currentConfig);
 
-    const blockReason = resolveModelListFetchBlockReason(config);
-    if (blockReason) {
-      notifySettingsInfo(
-        blockReason === "full_url_mode"
-          ? i18n.t("config.toast.modelListUnsupportedInFullMode")
-          : i18n.t("config.toast.fillBaseUrlFirst"),
-      );
+    if (!canFetchModelList(config)) {
+      notifySettingsInfo(i18n.t("config.toast.fillBaseUrlFirst"));
       return;
     }
 
@@ -2202,8 +2161,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       modelLists[key] = result.models;
       modelLists = { ...modelLists };
       if (result.models.length > 0 && modelConfigTab === key) {
-        modelDropdownOpen[key] = true;
-        modelDropdownOpen = { ...modelDropdownOpen };
+        modelListOpen[key] = true;
+        modelListOpen = { ...modelListOpen };
       }
       notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"));
     } catch (e) {
@@ -2230,8 +2189,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     } else if (workerConfigs[target]) {
       workerConfigs[target].model = model;
     }
-    modelDropdownOpen[target] = false;
-    modelDropdownOpen = { ...modelDropdownOpen };
+    modelListOpen[target] = false;
+    modelListOpen = { ...modelListOpen };
   }
 
   function resetTestStatus(key: string, requestSequence: number) {
@@ -2524,6 +2483,13 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     return entries as Array<[string, Record<string, unknown>]>;
   }
 
+  let mcpDraftKey = '';
+  let mcpDraftBaseline = '';
+  $effect(() => {
+    if (!showMCPDialogState || !mcpDraftKey) return;
+    saveViewDraft(mcpDraftKey, mcpDraftBaseline, { mode: mcpDialogMode, json: mcpDialogJson, form: mcpFormDraft }, 'memory');
+  });
+
   function openMCPDialog(server: MCPServer | null = null) {
     currentEditingMCPServer = server;
     mcpDialogIsEdit = server !== null;
@@ -2533,10 +2499,18 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     const config = server ? getMcpServerConfig(server) : { type: "stdio", enabled: true };
     mcpFormDraft = createMcpFormDraft(name, config);
     mcpDialogJson = serializeMcpServerDocument(name, config);
+    mcpDraftKey = `mcp:${currentSettingsBootstrapBindingKey()}:${server?.id ?? 'new'}`;
+    mcpDraftBaseline = JSON.stringify(config);
+    const restored = loadViewDraft(mcpDraftKey, mcpDraftBaseline, { mode: mcpDialogMode, json: mcpDialogJson, form: mcpFormDraft }, 'memory');
+    mcpDialogMode = restored.mode;
+    mcpDialogJson = restored.json;
+    mcpFormDraft = restored.form;
     showMCPDialogState = true;
   }
 
   function closeMCPDialog() {
+    if (saveStatus.mcp === "saving") return;
+    saveViewDraft(mcpDraftKey, mcpDraftBaseline, { mode: mcpDialogMode, json: mcpDialogJson, form: mcpFormDraft }, 'memory');
     showMCPDialogState = false;
     currentEditingMCPServer = null;
     mcpDialogMode = "form";
@@ -2668,6 +2642,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       notifySettingsSuccess(i18n.t("settings.toast.mcpConfigSaved"));
       resetSaveStatus("mcp");
       closeMCPDialog();
+      clearViewDraft(mcpDraftKey);
     } catch (error) {
       saveStatus.mcp = "idle";
       saveStatus = { ...saveStatus };
@@ -2846,13 +2821,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
 
   function openRepoDialog() {
     showRepoDialogState = true;
-    repoAddUrl = "";
     repositoriesLoading = false;
   }
 
   function closeRepoDialog() {
     showRepoDialogState = false;
-    repoAddUrl = "";
     repoAddLoading = false;
     repositoriesLoading = false;
   }
@@ -3837,7 +3810,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     if (!rule) return;
     if (
       rule.enabled
-      && !(await confirmMessage(i18n.t("settings.safeguard.disableConfirm", { pattern: rule.pattern }), { tone: "danger" }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.disableConfirm", { pattern: rule.pattern }), { tone: 'danger', confirmLabel: i18n.t('overlay.disableRule') }))
     ) {
       return;
     }
@@ -3859,7 +3832,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     if (rule.action === normalizedAction) return;
     if (
       safetyActionPrecedence(normalizedAction) < safetyActionPrecedence(rule.action)
-      && !(await confirmMessage(i18n.t("settings.safeguard.downgradeConfirm", { pattern: rule.pattern }), { tone: "danger" }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.downgradeConfirm", { pattern: rule.pattern }), { tone: 'danger', confirmLabel: i18n.t('overlay.lowerProtection') }))
     ) {
       return;
     }
@@ -3877,7 +3850,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     const rule = safeguardRules[index];
     if (
       rule
-      && !(await confirmMessage(i18n.t("settings.safeguard.removeConfirm", { pattern: rule.pattern }), { tone: "danger" }))
+      && !(await confirmMessage(i18n.t("settings.safeguard.removeConfirm", { pattern: rule.pattern }), { tone: 'danger', confirmLabel: i18n.t('overlay.deleteRule') }))
     ) {
       return;
     }
@@ -4126,11 +4099,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     get fetchingModels() {
       return fetchingModels;
     },
-    get modelDropdownOpen() {
-      return modelDropdownOpen;
+    get modelListOpen() {
+      return modelListOpen;
     },
-    get dropdownPosition() {
-      return dropdownPosition;
+    get modelListPosition() {
+      return modelListPosition;
     },
     get saveStatus() {
       return saveStatus;
@@ -4353,10 +4326,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       return skillsByRepo;
     },
     getBaseUrlPlaceholder,
-    shouldRecommendStandardUrlMode,
-    openModelDropdown,
-    closeAllModelDropdowns,
-    closeModelDropdown,
+    openModelList,
+    closeAllModelLists,
+    closeModelList,
     getStatusClass,
     getStatusText,
     getWorkerStats,

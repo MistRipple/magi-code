@@ -1,4 +1,4 @@
-use crate::{BridgeClientError, BridgeErrorLayer, EndpointUrlMode};
+use crate::{BridgeClientError, BridgeErrorLayer};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{io::Read, time::Duration};
@@ -26,7 +26,6 @@ pub struct HttpImageGenerationClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
-    url_mode: EndpointUrlMode,
 }
 
 #[derive(Clone, Debug)]
@@ -54,17 +53,11 @@ struct ParsedImageGenerationResponse {
 }
 
 impl HttpImageGenerationClient {
-    pub fn new(
-        base_url: String,
-        api_key: Option<String>,
-        model: String,
-        url_mode: EndpointUrlMode,
-    ) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
         Self {
             base_url,
             api_key,
             model,
-            url_mode,
         }
     }
 
@@ -88,8 +81,8 @@ impl HttpImageGenerationClient {
         if model.is_empty() {
             return Err(protocol_error("image model is empty"));
         }
-        let url = build_image_generation_url(&self.base_url, self.url_mode)
-            .map_err(|reason| protocol_error(&reason))?;
+        let url =
+            build_image_generation_url(&self.base_url).map_err(|reason| protocol_error(&reason))?;
         let profile = image_generation_provider_profile(model);
         let mut body = json!({
             "model": model,
@@ -220,16 +213,13 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
     left
 }
 
-fn build_image_generation_url(base_url: &str, url_mode: EndpointUrlMode) -> Result<String, String> {
+fn build_image_generation_url(base_url: &str) -> Result<String, String> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
         return Err("image generation base_url is empty".to_string());
     }
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err("image generation base_url must use http or https".to_string());
-    }
-    if url_mode == EndpointUrlMode::Full {
-        return Ok(trimmed.to_string());
     }
     let normalized = trimmed.trim_end_matches('/');
     if normalized.ends_with("/v1") {

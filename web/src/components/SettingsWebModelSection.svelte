@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   /**
    * 「设置 → GPT Web」独立分类。
    *
@@ -275,7 +276,7 @@
     errorMessage = '';
     try {
       await refreshWebModelRuntime();
-      if (slotOwner?.active && !(await confirmMessage(i18n.t('webModel.stop.confirmBody'), { tone: 'danger' }))) return;
+      if (slotOwner?.active && !(await confirmMessage(i18n.t('webModel.stop.confirmBody'), { tone: 'danger', confirmLabel: i18n.t('overlay.stopWebModel') }))) return;
       await stopWebModel();
       markWebModelStoppedByUser(true);
       await refreshWebModelRuntime();
@@ -359,7 +360,7 @@
   /** 会改动用户 ChatGPT 账号里的连接器设置：必须经用户确认。 */
   async function configureConnector(): Promise<void> {
     if (connectorBusy) return;
-    if (!(await confirmMessage(i18n.t('webModel.connector.confirmBody')))) return;
+    if (!(await confirmMessage(i18n.t('webModel.connector.confirmBody'), { confirmLabel: i18n.t('webModel.connector.configure') }))) return;
     connectorBusy = true;
     errorMessage = '';
     try {
@@ -401,7 +402,7 @@
       addToast('warning', i18n.t('settings.browser.webModel.needDesktop'));
       return;
     }
-    if (!(await confirmMessage(i18n.t('webModel.clearData.confirmBody'), { tone: 'danger' }))) return;
+    if (!(await confirmMessage(i18n.t('webModel.clearData.confirmBody'), { tone: 'danger', confirmLabel: i18n.t('overlay.clearWebData') }))) return;
     clearing = true;
     errorMessage = '';
     try {
@@ -638,17 +639,11 @@
       <div class="settings-row">
         <div class="settings-row-copy"><label class="settings-row-title" for="web-model-tool-profile">{i18n.t('webModel.tunnel.toolProfile')}</label></div>
         <div class="wm-control">
-          <select
-            id="web-model-tool-profile"
-            class="form-input"
-            bind:value={toolProfile}
+          <SelectField id="web-model-tool-profile" bind:value={toolProfile}
+            label={i18n.t('webModel.tunnel.toolProfile')}
             data-web-model-tool-profile="1"
-            onchange={() => void applyToolPolicy({ toolProfile })}
-          >
-            <option value="read_only">{i18n.t('webModel.tunnel.profile.readOnly')}</option>
-            <option value="edit">{i18n.t('webModel.tunnel.profile.edit')}</option>
-            <option value="edit_trusted">{i18n.t('webModel.tunnel.profile.editTrusted')}</option>
-          </select>
+            options={[{ value: 'read_only', label: i18n.t('webModel.tunnel.profile.readOnly') }, { value: 'edit', label: i18n.t('webModel.tunnel.profile.edit') }, { value: 'edit_trusted', label: i18n.t('webModel.tunnel.profile.editTrusted') }]}
+            onchange={(next) => { toolProfile = next; void applyToolPolicy({ toolProfile: next }); }} />
         </div>
       </div>
 
@@ -658,17 +653,11 @@
           <span class="settings-row-desc">{i18n.t(`webModel.tunnel.approval.${approvalMode}Hint`)}</span>
         </div>
         <div class="wm-control">
-          <select
-            id="web-model-approval-mode"
-            class="form-input"
-            bind:value={approvalMode}
+          <SelectField id="web-model-approval-mode" bind:value={approvalMode}
+            label={i18n.t('webModel.tunnel.approvalMode')}
             data-web-model-approval-mode="1"
-            onchange={() => void applyToolPolicy({ approvalMode })}
-          >
-            <option value="ask">{i18n.t('webModel.tunnel.approval.ask')}</option>
-            <option value="always">{i18n.t('webModel.tunnel.approval.always')}</option>
-            <option value="deny">{i18n.t('webModel.tunnel.approval.deny')}</option>
-          </select>
+            options={[{ value: 'ask', label: i18n.t('webModel.tunnel.approval.ask') }, { value: 'always', label: i18n.t('webModel.tunnel.approval.always') }, { value: 'deny', label: i18n.t('webModel.tunnel.approval.deny') }]}
+            onchange={(next) => { approvalMode = next; void applyToolPolicy({ approvalMode: next }); }} />
         </div>
       </div>
 
@@ -765,7 +754,7 @@
   .wm-fine { color: var(--foreground-muted); opacity: 0.85; }
   .wm-actions-start { margin-top: 10px; }
   .wm-form-actions { justify-content: flex-end; }
-  .wm-nested { border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0; }
+  .wm-nested { border: 0; border-top: var(--magi-hairline) solid var(--border-subtle); border-radius: 0; }
 
   /* 折叠分组：标题行本身就是一行，右侧是状态文字和展开箭头。 */
   .web-model-settings .tools-group > summary { padding: 14px; flex-wrap: wrap; cursor: pointer; list-style: none; }

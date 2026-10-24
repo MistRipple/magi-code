@@ -1,8 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::types::{
-    ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, ReasoningEffort, UrlMode,
-};
+use crate::types::{ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, ReasoningEffort};
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -64,11 +62,6 @@ pub fn build_model_resolution_identity(
         .account_fingerprint
         .clone()
         .or_else(|| fingerprint_secret(model_config.api_key.as_deref()));
-    let url_mode_str = match model_config.url_mode {
-        UrlMode::Full => "full",
-        UrlMode::Proxy => "proxy",
-        UrlMode::Default => "default",
-    };
     let reasoning_effort_str = match model_config.reasoning_effort {
         Some(ReasoningEffort::Low) => "low",
         Some(ReasoningEffort::Medium) => "medium",
@@ -79,7 +72,8 @@ pub fn build_model_resolution_identity(
     let identity_parts = [
         model_config.provider.as_str(),
         &canonical_base_url,
-        url_mode_str,
+        // 保持已持久化的标准连接身份哈希格式，避免历史用量分裂。
+        "default",
         account_fingerprint.as_deref().unwrap_or(""),
         &resolved,
         reasoning_effort_str,
@@ -96,7 +90,6 @@ pub fn build_model_resolution_identity(
         resolved_model: resolved,
         canonical_base_url,
         base_url_fingerprint,
-        url_mode: model_config.url_mode,
         account_fingerprint,
         binding_revision: execution_binding.binding_revision,
         reasoning_effort: model_config.reasoning_effort,

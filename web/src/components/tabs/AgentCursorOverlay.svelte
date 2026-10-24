@@ -365,7 +365,7 @@
     color: var(--primary-foreground, #fff);
     font-family: var(--font-sans, inherit);
     font-size: 11px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1;
     white-space: nowrap;
     transition: transform 160ms ease-out;
@@ -378,8 +378,8 @@
     align-items: center;
     gap: 3px;
     padding-left: 5px;
-    border-left: 1px solid color-mix(in srgb, var(--primary-foreground, #fff) 35%, transparent);
-    font-weight: 500;
+    border-left: var(--magi-hairline) solid color-mix(in srgb, var(--primary-foreground, #fff) 35%, transparent);
+    font-weight: var(--font-medium);
     opacity: 0.92;
     animation: agent-cursor-label-in 160ms ease-out;
   }

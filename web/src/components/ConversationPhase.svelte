@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import Disclosure from './Disclosure.svelte';
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { TimelineRenderItem } from '../types/message';
   import {
@@ -123,7 +124,7 @@
     </div>
   {/if}
 
-  {#if expanded && expandable}
+  <Disclosure expanded={expanded && expandable}>
     <div
       class="conversation-phase-content"
       class:body-only={presentation.bodyOnly}
@@ -159,7 +160,7 @@
         </div>
       {/each}
     </div>
-  {/if}
+  </Disclosure>
 </section>
 
 <style>
@@ -276,7 +277,7 @@
     gap: 0;
     min-width: 0;
     padding: 0 0 1px 8px;
-    border-left: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+    border-left: var(--magi-hairline) solid color-mix(in srgb, var(--border) 74%, transparent);
   }
 
   /* 只有正文时不画过程用的左侧引导线和缩进，外观与最终回答一致。 */

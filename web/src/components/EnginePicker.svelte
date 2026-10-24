@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { ModelEngine } from '../shared/types/registry-types';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -31,7 +32,10 @@
     ...engines.map((e: ModelEngine) => ({ id: e.id, kind: 'engine' as const, engine: e })),
   ]);
 
-  const currentIdx = $derived(options.findIndex((o: Option) => o.id === value));
+  let query = $state('');
+  const filteredOptions = $derived(options.filter(option =>
+    `${option.id} ${option.id ? getDisplayName(option.id) : i18n.t('settings.agents.inheritOrchestrator')} ${option.engine?.llm?.baseUrl ?? ''}`
+      .toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())));
 
   const triggerLabel = $derived.by(() => {
     if (!value) return i18n.t('settings.agents.inheritOrchestrator');
@@ -64,13 +68,25 @@
   let dropUp = $state(false);
   let triggerEl: HTMLButtonElement | undefined = $state();
   let popupEl: HTMLDivElement | undefined = $state();
+  const pickerId = $props.id();
+
+  $effect(() => { if (!open || options.length <= 10) query = ''; });
+
+  $effect(() => {
+    if (open) popupEl?.querySelector<HTMLElement>(`[data-option-index="${activeIdx}"]`)?.scrollIntoView({ block: 'nearest' });
+  });
 
   function toggle() {
     if (disabled) return;
     open = !open;
     if (open) {
-      activeIdx = currentIdx >= 0 ? currentIdx : 0;
-      queueMicrotask(maybeFlip);
+      query = '';
+      activeIdx = Math.max(0, options.findIndex(option => option.id === value));
+      void tick().then(() => {
+        if (!open) return;
+        maybeFlip();
+        popupEl?.querySelector<HTMLInputElement>('input[type="search"]')?.focus();
+      });
     }
   }
 
@@ -80,7 +96,7 @@
   }
 
   function pick(idx: number) {
-    const opt = options[idx];
+    const opt = filteredOptions[idx];
     if (!opt) return;
     if (opt.id !== value) onchange(opt.id);
     open = false;
@@ -101,12 +117,14 @@
 
   function onListKey(ev: KeyboardEvent) {
     if (!open) return;
-    const last = options.length - 1;
+    if (ev.isComposing || ev.keyCode === 229) return;
+    const editingSearch = ev.target instanceof HTMLInputElement;
+    const last = filteredOptions.length - 1;
     if (ev.key === 'Escape') { ev.preventDefault(); close(); triggerEl?.focus(); return; }
     if (ev.key === 'ArrowDown') { ev.preventDefault(); activeIdx = activeIdx >= last ? 0 : activeIdx + 1; return; }
     if (ev.key === 'ArrowUp') { ev.preventDefault(); activeIdx = activeIdx <= 0 ? last : activeIdx - 1; return; }
-    if (ev.key === 'Home') { ev.preventDefault(); activeIdx = 0; return; }
-    if (ev.key === 'End') { ev.preventDefault(); activeIdx = last; return; }
+    if (ev.key === 'Home' && !editingSearch) { ev.preventDefault(); activeIdx = 0; return; }
+    if (ev.key === 'End' && !editingSearch) { ev.preventDefault(); activeIdx = last; return; }
     if (ev.key === 'Enter') { ev.preventDefault(); pick(activeIdx); return; }
     if (ev.key === 'Tab') { close(); return; }
   }
@@ -149,6 +167,10 @@
     onclick={toggle}
     onkeydown={onTriggerKey}
     aria-haspopup="listbox"
+    role="combobox"
+    aria-label={i18n.t('settings.agents.sectionEngine')}
+    aria-controls={open ? pickerId : undefined}
+    aria-activedescendant={open && filteredOptions[activeIdx] ? `${pickerId}-${activeIdx}` : undefined}
     aria-expanded={open}
     {disabled}
   >
@@ -168,14 +190,22 @@
       class="engine-picker-popup"
       class:drop-up={dropUp}
       data-magi-surface="popover"
-      role="listbox"
+      role="group"
+      aria-label={i18n.t('settings.agents.sectionEngine')}
       tabindex="-1"
-      onkeydown={onListKey}
     >
-      <div class="group-label">{i18n.t('settings.agents.groupDefault')}</div>
-      {#each options as opt, i (opt.id || '__inherit__')}
-        {#if i === 1}
-          <div class="group-sep" role="separator"></div>
+      {#if options.length > 10}
+        <input type="search" class="form-input" bind:value={query}
+          oninput={() => { activeIdx = 0; }} onkeydown={onListKey}
+          role="combobox" aria-expanded="true" aria-controls={pickerId}
+          aria-activedescendant={filteredOptions[activeIdx] ? `${pickerId}-${activeIdx}` : undefined}
+          placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('settings.agents.sectionEngine') })} />
+      {/if}
+      <div id={pickerId} role="listbox" tabindex="-1" onkeydown={onListKey} aria-label={i18n.t('settings.agents.sectionEngine')}>
+      {#each filteredOptions as opt, i (opt.id || '__inherit__')}
+        {#if opt.kind === 'inherit'}
+          <div class="group-label" role="presentation">{i18n.t('settings.agents.groupDefault')}</div>
+        {:else if i === 0 || filteredOptions[i - 1].kind === 'inherit'}
           <div class="group-label">{i18n.t('settings.agents.groupCustom')}</div>
         {/if}
         {@const isSelected = opt.id === value}
@@ -187,6 +217,8 @@
           class:selected={isSelected}
           class:active={isActive}
           role="option"
+          id={`${pickerId}-${i}`}
+          data-option-index={i}
           aria-selected={isSelected}
           tabindex="-1"
           onmouseenter={() => (activeIdx = i)}
@@ -215,7 +247,10 @@
             <Icon name="check" size={10} class="opt-check" />
           {/if}
         </button>
+      {:else}
+        <p class="group-label" role="status">{i18n.t('selection.empty')}</p>
       {/each}
+      </div>
     </div>
   {/if}
 </div>
@@ -233,7 +268,7 @@
     width: 100%;
     min-height: 34px;
     background: var(--ind-bg-control);
-    border: 1px solid var(--ind-border-control);
+    border: var(--magi-hairline) solid var(--ind-border-control);
     border-radius: 8px;
     display: flex;
     align-items: center;
@@ -289,7 +324,7 @@
   }
   .trigger-label {
     font-size: 12px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     color: var(--ind-foreground);
     line-height: 1.25;
     white-space: nowrap;
@@ -312,7 +347,7 @@
     left: 0;
     right: 0;
     z-index: 50;
-    border: 1px solid var(--ind-border-separator);
+    border: var(--magi-hairline) solid var(--ind-border-separator);
     border-radius: 10px;
     padding: 4px;
     max-height: 260px;
@@ -331,18 +366,12 @@
 
   .group-label {
     font-size: 10.5px;
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--ind-foreground-muted);
     padding: 6px 10px 4px;
   }
-  .group-sep {
-    height: 1px;
-    background: var(--ind-border-separator);
-    margin: 3px 6px;
-  }
-
   /* ---------- Options ---------- */
   .engine-option {
     display: flex;
@@ -395,7 +424,7 @@
   .opt-dot--status-error { background: var(--error, #ff3b30); }
   .opt-dot--status-not_configured {
     background: transparent;
-    border: 1px solid color-mix(in srgb, var(--ind-foreground-soft) 60%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--ind-foreground-soft) 60%, transparent);
     width: 9px;
     height: 9px;
     box-sizing: border-box;
@@ -410,7 +439,7 @@
   }
   .opt-name {
     font-size: 12px;
-    font-weight: 500;
+    font-weight: var(--font-medium);
     line-height: 1.3;
     white-space: nowrap;
     overflow: hidden;

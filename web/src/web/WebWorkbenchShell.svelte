@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
+  import { beginPanelResize } from '../lib/panel-resize';
+  import { imeEnterGuard } from '../lib/ime-enter-guard';
   import ToastContainer from '../components/ToastContainer.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { setWebSidebarContext } from './sidebar-context';
@@ -143,6 +145,8 @@ import {
   } from '../stores/workspace-onboarding.svelte';
   import {
     PANEL_LAYOUT,
+    previewSplitAt,
+    equalPreviewSplitWidth,
     resolvePanelLayout,
     resolvePreviewPanelWidthBounds,
     resolvePanelVisibility,
@@ -229,7 +233,7 @@ import {
   let workbenchElement = $state<HTMLElement | null>(null);
   let pendingDesktopRightPaneWidth: number | null = null;
   let desktopRightPaneResizeFrame: number | null = null;
-  let desktopRightPaneResizeCancel: (() => void) | null = null;
+  let panelResizeCancel: (() => void) | null = null;
   let desktopSnapshotEpoch = '';
   let desktopSnapshotRevision = -1;
   type DesktopVisibilityTarget = {
@@ -1593,68 +1597,52 @@ import {
   }
 
   function startSidebarResize(event: PointerEvent): void {
-    if (sidebarIsDrawer) {
-      return;
-    }
+    if (sidebarIsDrawer || event.button !== 0 || event.isPrimary === false) return;
     const sidebarRect = sidebarElement?.getBoundingClientRect();
     if (!sidebarRect || sidebarRect.width <= 0) return;
-    event.preventDefault();
+    panelResizeCancel?.();
+    const initialWidth = sidebarWidth;
     isSidebarResizing = true;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      sidebarWidth = clampSidebarWidth(moveEvent.clientX - sidebarRect.left);
-    };
-    const handlePointerUp = () => {
-      isSidebarResizing = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      if (sidebarWidth) {
-        persistSidebarWidth(sidebarWidth);
-      }
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
+    panelResizeCancel = beginPanelResize(event, {
+      move: (next) => { sidebarWidth = clampSidebarWidth(next.clientX - sidebarRect.left); },
+      finish: (cancelled) => {
+        isSidebarResizing = false;
+        panelResizeCancel = null;
+        if (cancelled) sidebarWidth = initialWidth;
+        else if (sidebarWidth) persistSidebarWidth(sidebarWidth);
+      },
+    });
   }
 
   function resetPreviewPanelWidth(): void {
-    previewPanelWidth = clampPreviewPanelWidth(DEFAULT_PREVIEW_PANEL_WIDTH);
+    const frame = workbenchContentElement?.getBoundingClientRect();
+    if (!frame) return;
+    previewPanelWidth = clampPreviewPanelWidth(equalPreviewSplitWidth(frame.width));
     persistPreviewPanelWidth(previewPanelWidth);
   }
 
   function startPreviewPanelResize(event: PointerEvent): void {
-    if (previewIsOverlay) {
-      return;
-    }
-    const shellRect = workbenchElement?.getBoundingClientRect();
-    if (!shellRect || shellRect.width <= 0) return;
-    event.preventDefault();
+    if (previewIsOverlay || event.button !== 0 || event.isPrimary === false) return;
+    const frame = workbenchContentElement?.getBoundingClientRect();
+    if (!frame || frame.width <= 0) return;
+    panelResizeCancel?.();
+    const initialWidth = previewPanelWidth;
+    let collapse = false;
     isPreviewPanelResizing = true;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      previewPanelWidth = clampPreviewPanelWidth(
-        shellRect.right - moveEvent.clientX,
-      );
-    };
-    const handlePointerUp = () => {
-      isPreviewPanelResizing = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      if (previewPanelWidth) {
-        persistPreviewPanelWidth(previewPanelWidth);
-      }
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
+    panelResizeCancel = beginPanelResize(event, {
+      move: (next) => {
+        const split = previewSplitAt(next.clientX, frame);
+        collapse = split.collapse;
+        previewPanelWidth = clampPreviewPanelWidth(split.width);
+      },
+      finish: (cancelled) => {
+        isPreviewPanelResizing = false;
+        panelResizeCancel = null;
+        if (cancelled || collapse) previewPanelWidth = initialWidth;
+        else if (previewPanelWidth) persistPreviewPanelWidth(previewPanelWidth);
+        if (!cancelled && collapse) requestRightPaneVisibility(false);
+      },
+    });
   }
 
   function submitPendingDesktopRightPaneWidth(): void {
@@ -1667,22 +1655,21 @@ import {
   }
 
   function resetDesktopRightPaneWidth(): void {
-    if (!desktopAppSurface) return;
-    void window.magiDesktop?.submitLayoutIntent({ type: 'right_pane_reset_width' })
-      .catch((error) => console.warn('[WebWorkbenchShell] 重置桌面右栏宽度失败:', error));
+    const frame = workbenchContentElement?.getBoundingClientRect();
+    if (!desktopAppSurface || !frame) return;
+    void window.magiDesktop?.submitLayoutIntent({
+      type: 'right_pane_width', width: equalPreviewSplitWidth(frame.width),
+    }).catch((error) => console.warn('[WebWorkbenchShell] 重置桌面右栏宽度失败:', error));
   }
 
   function startDesktopRightPaneResize(event: PointerEvent): void {
-    if (!desktopAppSurface) return;
-    if (!window.magiDesktop) return;
-    const handle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-    if (!handle) return;
-    const rightPaneElement = workbenchElement?.querySelector('.desktop-right-pane-column');
-    const rightPaneRect = rightPaneElement?.getBoundingClientRect();
-    if (!rightPaneRect || rightPaneRect.width <= 0) return;
-    // Main 与 Renderer 使用同一个定义：这里的宽度只代表右栏内容轨道，
-    // 分隔条和 shell 外边距不再混入拖动值。
-    const widthBounds = resolvePreviewPanelWidthBounds({
+    if (!desktopAppSurface || !window.magiDesktop || event.button !== 0 || event.isPrimary === false) return;
+    const frame = workbenchContentElement?.getBoundingClientRect();
+    const rightPaneRect = workbenchElement?.querySelector('.desktop-right-pane-column')?.getBoundingClientRect();
+    if (!frame || !rightPaneRect || rightPaneRect.width <= 0) return;
+    panelResizeCancel?.();
+    // Main remains the width authority; the renderer only submits the existing layout intent.
+    const bounds = resolvePreviewPanelWidthBounds({
       viewportWidth: workbenchElement?.getBoundingClientRect().width ?? viewportWidth,
       sidebarWidth: effectiveSidebarWidth,
       sidebarVisible: panelVisibility.sidebarVisible,
@@ -1690,58 +1677,27 @@ import {
       previewOverlay: false,
       desktopSurface: true,
     });
-    const minWidth = widthBounds.minWidth;
-    const maxWidth = widthBounds.maxWidth;
-    const initialWidth = Math.round(
-      rightPaneRect.width,
-    );
-    if (!initialWidth) return;
-    event.preventDefault();
-    desktopRightPaneResizeCancel?.();
+    const initialWidth = Math.round(rightPaneRect.width);
+    let collapse = false;
     isPreviewPanelResizing = true;
-    const initialRight = rightPaneRect.right;
-    const pointerId = event.pointerId;
-    let stopped = false;
-    try {
-      handle.setPointerCapture(pointerId);
-    } catch {
-      // 指针捕获不是所有桌面 WebView 都支持，窗口级监听仍是唯一拖拽事件源。
-    }
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    const move = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== pointerId) return;
-      pendingDesktopRightPaneWidth = Math.min(
-        maxWidth,
-        Math.max(minWidth, initialRight - moveEvent.clientX),
-      );
-      if (desktopRightPaneResizeFrame === null) {
-        desktopRightPaneResizeFrame = requestAnimationFrame(submitPendingDesktopRightPaneWidth);
-      }
-    };
-    const stop = (stopEvent?: PointerEvent) => {
-      if (stopEvent && stopEvent.pointerId !== pointerId) return;
-      if (stopped) return;
-      stopped = true;
-      if (desktopRightPaneResizeCancel) desktopRightPaneResizeCancel = null;
-      isPreviewPanelResizing = false;
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', stop);
-      window.removeEventListener('pointercancel', stop);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      if (desktopRightPaneResizeFrame !== null) cancelAnimationFrame(desktopRightPaneResizeFrame);
-      submitPendingDesktopRightPaneWidth();
-      try {
-        if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
-      } catch {
-        // 捕获未建立时无需释放。
-      }
-    };
-    desktopRightPaneResizeCancel = () => stop();
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', stop);
-    window.addEventListener('pointercancel', stop);
+    panelResizeCancel = beginPanelResize(event, {
+      move: (next) => {
+        const split = previewSplitAt(next.clientX, frame);
+        collapse = split.collapse;
+        pendingDesktopRightPaneWidth = Math.min(bounds.maxWidth, Math.max(bounds.minWidth, split.width));
+        if (desktopRightPaneResizeFrame === null) {
+          desktopRightPaneResizeFrame = requestAnimationFrame(submitPendingDesktopRightPaneWidth);
+        }
+      },
+      finish: (cancelled) => {
+        isPreviewPanelResizing = false;
+        panelResizeCancel = null;
+        if (desktopRightPaneResizeFrame !== null) cancelAnimationFrame(desktopRightPaneResizeFrame);
+        if (cancelled || collapse) pendingDesktopRightPaneWidth = initialWidth;
+        submitPendingDesktopRightPaneWidth();
+        if (!cancelled && collapse) requestRightPaneVisibility(false);
+      },
+    });
   }
 
   /**
@@ -2916,7 +2872,7 @@ import {
         cancelAnimationFrame(desktopRightPaneResizeFrame);
         desktopRightPaneResizeFrame = null;
       }
-      desktopRightPaneResizeCancel?.();
+      panelResizeCancel?.();
     };
   });
 
@@ -3086,6 +3042,7 @@ import {
         )
       : null;
     return () => {
+      panelResizeCancel?.();
       stopPopoverDismiss();
       if (webModelProjectionTimer !== null) window.clearInterval(webModelProjectionTimer);
       desktopDropDisposed = true;
@@ -3105,6 +3062,11 @@ import {
       }
       clearSidebarTooltip();
     };
+  });
+
+  onMount(() => {
+    // Include body portals and sibling dialogs in the same IME shortcut boundary.
+    return imeEnterGuard(document.body).destroy;
   });
 
   onMount(() => {
@@ -3981,7 +3943,7 @@ import {
     gap: 8px;
     max-width: min(320px, 90%);
     padding: 10px 14px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--dropdown-bg);
     color: var(--foreground);
@@ -4002,7 +3964,7 @@ import {
     min-height: 0;
     padding: var(--space-4);
     border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--magi-surface-sidebar);
     overflow: visible;
   }
@@ -4078,7 +4040,7 @@ import {
     z-index: var(--z-tooltip, 1200);
     max-width: min(260px, calc(100vw - 16px));
     padding: 4px 8px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--magi-surface-popover, var(--dropdown-bg));
     box-shadow: var(--shadow-md);
@@ -4462,7 +4424,7 @@ import {
     align-items: center;
     justify-content: center;
     gap: var(--space-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--magi-surface-main);
     color: var(--foreground-muted);
@@ -4830,7 +4792,7 @@ import {
     min-width: 0;
     height: 24px;
     padding: 0 6px;
-    border: 1px solid var(--border-focus);
+    border: var(--magi-hairline) solid var(--border-focus);
     border-radius: var(--radius-sm);
     outline: none;
     background: var(--surface);
@@ -4866,7 +4828,7 @@ import {
   .sidebar-error {
     padding: var(--space-3);
     border-radius: var(--radius-md);
-    border: 1px solid rgba(239, 68, 68, 0.3);
+    border: var(--magi-hairline) solid rgba(239, 68, 68, 0.3);
     background: var(--error-muted);
     color: var(--foreground);
     font-size: var(--text-base);
@@ -4909,7 +4871,8 @@ import {
        外层 .web-workbench-shell 已用 isolation: isolate 做了一层隔离。 */
     min-width: 0;
     min-height: 0;
-    border: 1px solid var(--border);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
     border-radius: var(--radius-lg);
     overflow: hidden;
   }
@@ -4924,6 +4887,7 @@ import {
     justify-content: center;
     transition: background var(--transition-fast);
     z-index: 2;
+    touch-action: none;
   }
 
   /* 桌面端：侧栏 / 中栏 / 右栏（或设置页）直接相连并贴住窗口边缘，
@@ -4937,7 +4901,7 @@ import {
 
   .web-workbench-shell--desktop .sidebar {
     border: 0;
-    border-right: 1px solid var(--border);
+    border-right: var(--magi-hairline) solid var(--border);
     border-image: var(--pane-divider-gradient) 1;
     border-radius: 0;
     background: var(--magi-surface-sidebar);
@@ -4950,6 +4914,7 @@ import {
 
   .web-workbench-shell--desktop .workbench-app-pane {
     border: 0;
+    box-shadow: none;
     border-radius: 0;
     background: transparent;
   }
@@ -5013,7 +4978,7 @@ import {
     max-width: 320px;
     z-index: var(--z-overlay-sidebar);
     transform: translateX(calc(-100% - 16px));
-    transition: transform var(--transition-normal);
+    transition: transform 500ms var(--magi-spring-damped);
     box-shadow: var(--shadow-lg);
     overflow: hidden;
   }
@@ -5042,7 +5007,7 @@ import {
     inset: 0;
     z-index: var(--z-overlay-preview);
     border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     background: var(--background);
     box-shadow: var(--shadow-lg);
   }
@@ -5066,7 +5031,7 @@ import {
     margin-top: var(--space-3);
     padding: var(--space-3);
     border-radius: var(--radius-md);
-    border: 1px solid color-mix(in srgb, var(--error) 40%, var(--border));
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 40%, var(--border));
     background: color-mix(in srgb, var(--error) 8%, var(--surface-1));
     color: var(--foreground);
     font-size: var(--text-sm);

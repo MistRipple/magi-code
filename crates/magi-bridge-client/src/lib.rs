@@ -1,7 +1,6 @@
 pub mod cache_boundary;
 mod clients;
 mod dispatch;
-mod endpoint_url;
 mod executor_capabilities;
 mod executor_receipt;
 pub mod final_text_policy;
@@ -26,7 +25,6 @@ pub use clients::{
     JsonRpcModelBridgeClient,
 };
 pub use dispatch::BridgeDispatchRuntime;
-pub use endpoint_url::EndpointUrlMode;
 pub use executor_capabilities::{
     native_executor_capabilities, text_executor_capabilities, validate_executor_request,
     validate_executor_response,

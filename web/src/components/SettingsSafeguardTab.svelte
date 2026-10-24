@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SelectField from './SelectField.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
@@ -113,17 +114,10 @@
                         onchange={() => toggleSafeguardRule(index)}
                       />
                       <code class="safeguard-rule-pattern">{rule.pattern}</code>
-                      <select
-                        class="safeguard-action-select"
-                        data-action={rule.action}
-                        value={rule.action}
-                        aria-label={i18n.t('settings.safeguard.actionLabel')}
-                        onchange={(e) => updateSafeguardRuleAction(index, e.currentTarget.value)}
-                      >
-                        {#each SAFEGUARD_ACTIONS as action}
-                          <option value={action}>{getSafeguardActionLabel(action)}</option>
-                        {/each}
-                      </select>
+                      <SelectField data-action={rule.action} value={rule.action}
+                        label={i18n.t('settings.safeguard.actionLabel')}
+                        options={SAFEGUARD_ACTIONS.map(action => ({ value: action, label: getSafeguardActionLabel(action) }))}
+                        onchange={(action) => updateSafeguardRuleAction(index, action)} />
                       {#if category === 'custom'}
                         <button
                           type="button"
@@ -179,12 +173,12 @@
 
   .rules-save-status.error { color: var(--danger); }
 
-  .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: 11px; font-weight: normal; font-variant-numeric: tabular-nums; }
+  .safeguard-tab-count { padding: 0 6px; border-radius: 9px; background: color-mix(in srgb, var(--foreground) 10%, transparent); font-size: 11px; font-weight: var(--font-normal); font-variant-numeric: tabular-nums; }
 
   .safeguard-policy-note {
     margin-top: 8px;
     padding: 8px 10px;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
@@ -205,7 +199,7 @@
     list-style: none;
     margin: 0;
     padding: 0;
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     overflow: hidden;
   }
@@ -218,7 +212,7 @@
     padding: 4px var(--space-3);
   }
 
-  .safeguard-rule + .safeguard-rule { border-top: 1px solid var(--border-subtle, var(--border)); }
+  .safeguard-rule + .safeguard-rule { border-top: var(--magi-hairline) solid var(--border-subtle, var(--border)); }
 
   .safeguard-rule-pattern {
     flex: 1;
@@ -236,28 +230,6 @@
     text-decoration: line-through;
   }
 
-  .safeguard-action-select {
-    flex-shrink: 0;
-    appearance: none;
-    padding: 3px 22px 3px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background-color: transparent;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0.5 0.5 4 4 7.5 0.5' fill='none' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 7px center;
-    color: var(--foreground);
-    font-family: var(--font-sans, sans-serif);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .safeguard-action-select:hover { border-color: var(--foreground-muted); }
-  .safeguard-action-select:focus-visible { outline: 1px solid var(--primary); outline-offset: 1px; }
-
-  /* 动作强度一眼可辨：阻断最强用危险色，审计只记录用弱化色。 */
-  .safeguard-action-select[data-action='hard_block'] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
-  .safeguard-action-select[data-action='audit_only'] { color: var(--foreground-muted); }
 
   .safeguard-add-row { display: flex; align-items: stretch; gap: 8px; margin-top: 8px; }
   /* 添加按钮与输入框等高：btn--sm 自带固定高度，这里让它随行拉伸。 */

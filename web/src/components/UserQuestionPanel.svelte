@@ -294,7 +294,7 @@
     background: var(--primary-muted);
     color: var(--primary);
     font-size: var(--text-xs);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1.5;
     min-width: 0;
     max-width: 100%;
@@ -338,7 +338,7 @@
   .uq-step.active {
     background: var(--vscode-input-background);
     color: var(--primary);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
   }
 
@@ -371,7 +371,7 @@
     margin: 0;
     color: var(--foreground);
     font-size: var(--text-sm);
-    font-weight: 600;
+    font-weight: var(--font-semibold);
     line-height: 1.45;
     overflow-wrap: anywhere;
   }
@@ -379,7 +379,7 @@
   .uq-tag {
     flex: 0 0 auto;
     padding: 0 var(--space-2);
-    border: 1px solid var(--border);
+    border: var(--magi-hairline) solid var(--border);
     border-radius: 999px;
     color: var(--foreground-muted);
     font-size: 10px;
@@ -400,7 +400,7 @@
     gap: var(--space-2);
     width: 100%;
     padding: 4px var(--space-2);
-    border: 1px solid transparent;
+    border: var(--magi-hairline) solid transparent;
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--foreground);
@@ -496,7 +496,7 @@
   }
 
   .uq-option.checked .uq-label {
-    font-weight: 600;
+    font-weight: var(--font-semibold);
   }
 
   .uq-desc {
@@ -512,7 +512,7 @@
     flex: 0 0 auto;
     min-width: 18px;
     padding: 0 4px;
-    border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 80%, transparent);
     border-radius: 4px;
     color: var(--foreground-muted);
     font: inherit;
@@ -530,7 +530,7 @@
     width: calc(100% - 14px - var(--space-2));
     padding: var(--space-1) 0;
     border: 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--primary) 55%, transparent);
+    border-bottom: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 55%, transparent);
     background: transparent;
     color: var(--foreground);
     font: inherit;
