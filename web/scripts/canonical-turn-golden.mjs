@@ -184,6 +184,8 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertHistoricalAgentSpawnStatusUsesCanonicalChildStatus(reducer, projection);
+  assertIncrementalAgentStatusRefreshesUnchangedSpawn(reducer, projection);
+  assertResumedAgentStatusRefreshesOriginalSpawn(reducer, projection);
   assertSidechainApprovalAndArtifactArePromoted(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
@@ -1641,6 +1643,56 @@ function assertHistoricalAgentSpawnStatusUsesCanonicalChildStatus(reducer, proje
     'completed',
     '历史主线代理卡片必须从同一 turn 的 child task_status 恢复终态，不能回退显示 started/running',
   );
+}
+
+function assertIncrementalAgentStatusRefreshesUnchangedSpawn(reducer, projection) {
+  for (const [status, expected] of [['completed', 'completed'], ['failed', 'failed'], ['cancelled', 'killed']]) {
+    const c = baseCase(`agent-status-${status}`, `session-agent-${status}`, `turn-agent-${status}`, 9530);
+    const spawn = agentSpawnTool(c, 2, 'spawn', 'call-spawn', 'executor', '状态验证', 'child', 'running');
+    spawn.itemVersion = 1;
+    spawn.tool.result = { status: 'started', child_task_id: 'child' };
+    const child = item(c, 3, 'child-status', 'task_status', 'running', {
+      itemVersion: 1, worker: { taskId: 'child', roleId: 'executor' },
+    });
+    const before = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [user(c, 1, '执行'), spawn, child])]);
+    const previous = projection.buildCanonicalTimelineProjection(before);
+    const settled = { ...child, status, itemVersion: 2, updatedAt: child.updatedAt + 1 };
+    const result = reducer.reduceCanonicalTurnEvent(before, event(c, 1, 'turn_item_upsert', { item: settled }));
+    assert.equal(result.error, undefined);
+    const updated = projection.updateCanonicalTimelineProjection(previous, result.state, [c.turnId]);
+    const oldSpawn = findArtifactByTurnItemId(previous, 'spawn');
+    const newSpawn = findArtifactByTurnItemId(updated, 'spawn');
+    assert.equal(oldSpawn.message.metadata.agentChildStatus, 'running');
+    assert.equal(newSpawn.message.metadata.agentChildStatus, expected, '只更新子任务时，也必须刷新派发卡片');
+    assert.notEqual(newSpawn, oldSpawn, '派发 item 版本不变时不能复用旧状态缓存');
+    assert.equal(result.state.turns[0].status, 'running', '子任务终态不能擅自结束主轮次');
+  }
+}
+
+function assertResumedAgentStatusRefreshesOriginalSpawn(reducer, projection) {
+  const c = baseCase('agent-source', 'session-agent-resume', 'turn-agent-source', 9535);
+  const spawn = agentSpawnTool(c, 2, 'spawn', 'call-spawn', 'executor', '独立代理', 'child', 'running');
+  spawn.itemVersion = 1;
+  spawn.tool.result = { status: 'started', child_task_id: 'child' };
+  const parent = turn(c, 'cancelled', [spawn], { completedAt: 9540 });
+  const old = { ...c, turnId: 'interrupted-agent', turnSeq: 9541 };
+  const next = { ...c, turnId: 'continued-agent', turnSeq: 9542 };
+  const binding = { agentExecution: { taskId: 'child' } };
+  const interrupted = turn(old, 'interrupted', [], { metadata: binding, completedAt: 9542 });
+  const resumed = turn(next, 'running', [], { metadata: binding });
+  const before = reducer.replaceCanonicalTurns(c.sessionId, [parent, interrupted, resumed]);
+  const previous = projection.buildCanonicalTimelineProjection(before);
+  assert.equal(findArtifactByTurnItemId(previous, 'spawn').message.metadata.agentChildStatus, 'running');
+  const settled = turn(next, 'completed', [], { metadata: binding, completedAt: 9550 });
+  const result = reducer.reduceCanonicalTurnEvent(before, event(next, 1, 'turn_completed', { turn: settled }));
+  assert.equal(result.error, undefined);
+  const updated = projection.updateCanonicalTimelineProjection(previous, result.state, [next.turnId]);
+  const metadata = findArtifactByTurnItemId(updated, 'spawn').message.metadata;
+  assert.equal(metadata.agentChildStatus, 'completed', '独立代理完成必须刷新其他轮次的原派发卡片');
+  assert.equal(metadata.agentChildStatusUpdatedAt, 9550);
+  assert.equal(result.state.turns.find((turn) => turn.turnId === c.turnId).status, 'cancelled', '原主线保持取消事实');
+  const reloaded = projection.buildCanonicalTimelineProjection(reducer.replaceCanonicalTurns(c.sessionId, result.state.turns));
+  assert.equal(findArtifactByTurnItemId(reloaded, 'spawn').message.metadata.agentChildStatus, 'completed', '历史加载使用最近一次代理执行状态');
 }
 
 function assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems) {

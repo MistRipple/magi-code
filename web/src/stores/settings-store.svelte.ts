@@ -358,7 +358,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   // 全局用户规则
   let userRules = $state("");
 
-  // 所有对话区域的呈现模式。默认保持原始风格，摘要风格同步作用于 thread 与 task 面板。
+  // 所有对话区域的呈现模式。默认使用详细模式，摘要模式同步作用于 thread 与 task 面板。
   let conversationDisplayMode = $state<ConversationDisplayMode>("original");
   let persistedConversationDisplayMode = $state<ConversationDisplayMode>("original");
   let conversationDisplaySaveStatus = $state<"idle" | "saving" | "saved" | "error">("idle");

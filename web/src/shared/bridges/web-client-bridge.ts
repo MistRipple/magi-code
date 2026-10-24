@@ -284,6 +284,7 @@ type SessionSummaryRefreshTarget =
   | { scope: 'personal'; key: 'personal' }
   | { scope: 'workspace'; key: string; workspaceId: string; workspacePath: string };
 const sessionSummaryRefreshTargets = new Map<string, SessionSummaryRefreshTarget>();
+const sessionSummaryRefreshRevisions = new Map<string, number>();
 const inFlightChangeMutationScopes = new Set<string>();
 
 function invalidateBootstrapRequests(): void {
@@ -1662,6 +1663,8 @@ function scheduleSessionSummaryRefresh(
   target: SessionSummaryRefreshTarget = currentSessionSummaryRefreshTarget(),
 ): void {
   sessionSummaryRefreshTargets.set(target.key, target);
+  // 通知到达即使旧读取失效，不等防抖结束；新读取也不等待旧请求。
+  sessionSummaryRefreshRevisions.set(target.key, (sessionSummaryRefreshRevisions.get(target.key) ?? 0) + 1);
   if (sessionSummaryRefreshTimer) {
     return;
   }
@@ -1670,10 +1673,12 @@ function scheduleSessionSummaryRefresh(
     const targets = Array.from(sessionSummaryRefreshTargets.values());
     sessionSummaryRefreshTargets.clear();
     for (const refreshTarget of targets) {
+      const revision = sessionSummaryRefreshRevisions.get(refreshTarget.key);
       const request = refreshTarget.scope === 'workspace'
         ? getWorkspaceSessions(refreshTarget.workspaceId, refreshTarget.workspacePath)
         : getPersonalSessions();
       void request.then((snapshot) => {
+        if (revision !== sessionSummaryRefreshRevisions.get(refreshTarget.key)) return;
         if (snapshot.runtimeEpoch !== currentRuntimeEpoch) return;
         emitDataMessage('sessionsUpdated', {
           allowRuntimeEpochChange: true,
@@ -1683,6 +1688,7 @@ function scheduleSessionSummaryRefresh(
           eventStreamNextSequence: snapshot.eventStreamNextSequence,
         });
       }).catch((error) => {
+        if (revision !== sessionSummaryRefreshRevisions.get(refreshTarget.key)) return;
         reportExpectedRecoveryFailure(
           i18n.t('bridge.action.syncMessages'),
           `[web-client-bridge] 会话事件后刷新会话列表失败(${reason}, ${refreshTarget.key}):`,

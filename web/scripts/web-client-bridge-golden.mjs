@@ -1248,6 +1248,42 @@ await withGoldenViteServer(async (server) => {
     runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE - 1,
   }, { mirrorCurrentProjection: false }), false, '旧快照不得清除后台新目录');
 
+  // 目录读进行中又收到停止通知：新读取不等待旧请求，迟到 running 快照不能提交。
+  const slowDirectory = deferred();
+  const directorySnapshot = (isRunning) => ({
+    runtimeEpoch: RUNTIME_EPOCH, eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+    workspace: { workspaceId: directoryWorkspaceId, rootPath: '/tmp/never-opened' },
+    sessions: [{ sessionId: directorySessionId, title: '后台新标题', createdAt: ACCEPTED_AT,
+      updatedAt: ACCEPTED_AT + 1, messageCount: 2, isRunning }],
+  });
+  const directoryUpdates = [];
+  const stopWatchingDirectory = bridge.onMessage((message) => {
+    const data = message.message?.data;
+    if (data?.dataType === 'sessionsUpdated' && data.payload.workspaceId === directoryWorkspaceId) {
+      directoryUpdates.push(data.payload);
+    }
+  });
+  const notifyDirectory = () => recoveredStream.onmessage?.({ data: JSON.stringify({
+    event_id: 'directory-race', event_type: 'session.directory.changed', category: 'domain',
+    sequence: 0, occurred_at: ACCEPTED_AT, workspace_id: directoryWorkspaceId,
+    session_id: directorySessionId, payload: { scope: 'workspace', workspace_id: directoryWorkspaceId },
+  }) });
+  const beforeDirectoryRace = workspaceSessionsRequestCount;
+  workspaceSessionsInterceptors.push(() => slowDirectory.promise);
+  notifyDirectory();
+  await waitFor(() => workspaceSessionsRequestCount === beforeDirectoryRace + 1, '启动慢目录读取');
+  workspaceSessionsInterceptors.push(() => jsonResponse(directorySnapshot(false)));
+  notifyDirectory();
+  await waitFor(() => directoryUpdates.length > 0, '新读取不能被旧目录慢请求阻塞');
+  assert.equal(workspaceSessionsRequestCount, beforeDirectoryRace + 2);
+  slowDirectory.resolve(jsonResponse(directorySnapshot(true)));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(directoryUpdates.length, 1, '读取期间有新通知时不能发布过期快照');
+  assert.equal(directoryUpdates[0].sessions[0].isRunning, false, '状态灯必须收敛到停止事实');
+  assert.equal(messagesStore.messagesState.workspaceSessionProjections[directoryWorkspaceId].sessions[0].isRunning, false,
+    '相同事件游标的迟到响应也不能把状态灯抬回运行中');
+  stopWatchingDirectory();
+
   const liveAcceptedRequestId = 'request-live-accepted';
   const liveAcceptedResponse = deferred();
   sessionTurnInterceptors.push(() => liveAcceptedResponse.promise);

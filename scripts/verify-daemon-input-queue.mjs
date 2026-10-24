@@ -187,6 +187,14 @@ async function reloadPage() {
   await loaded;
 }
 
+async function captureAgentLayout(name) {
+  const output = process.env.MAGI_AGENT_LAYOUT_ARTIFACTS;
+  if (!output) return;
+  await mkdir(output, { recursive: true });
+  const screenshot = await page.call('Page.captureScreenshot', {format:'png'});
+  await writeFile(join(output, `${name}.png`), Buffer.from(screenshot.data, 'base64'));
+}
+
 async function startDaemon() {
   daemon = spawn("./scripts/dev-daemon.sh", [], {
     cwd: root, detached: true, stdio: ["ignore", "pipe", "pipe"],
@@ -242,6 +250,7 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.equal(pending.disabled, false, pending.title);
   const sessionId = await page.evaluate(`document.querySelector('#recent-session-content .session-item.active[data-session-id]')?.getAttribute('data-session-id')`);
   assert.ok(sessionId, "队列验收需要当前真实会话身份");
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-running-dot.running')`), '运行中的会话显示运行灯');
   const readQueue = async () => {
     const response = await fetch(`${origin}/api/session/queue?sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(response.status, 200);
@@ -378,6 +387,8 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.ok(replacementTurns[2].items.some(item => item.kind === 'user_message' && item.content.includes('REPLACE_FIFO')));
   assert.equal((await queue()).length, 0);
 
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-session-id="${sessionId}"] .session-running-dot:not(.running)')`), '停止并换轮完成后，个人会话运行灯熄灭');
+
   const readGoal = async () => {
     const response = await fetch(`${origin}/api/goals/current?scope=personal&sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(response.status, 200);
@@ -468,6 +479,30 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
     input.textContent = '';
     input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
   })()`);
+  await waitFor(() => page.evaluate(`!!document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')`), '完整模式显示代理任务');
+  await captureAgentLayout('agent-original');
+  await page.call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+  assert.ok(await page.evaluate(`(() => {
+    const card = document.querySelector('[data-agent-task-id="${agent.agentRunId}"]');
+    const rect = card?.getBoundingClientRect();
+    return rect && rect.left >= 0 && rect.right <= innerWidth && card.scrollWidth <= card.clientWidth
+      && card.innerText.includes('运行中') && card.innerText.includes('查看详情');
+  })()`), '详细模式窄屏保留状态与详情入口且不溢出');
+  await captureAgentLayout('agent-original-narrow');
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await post('settings/update', {key:'conversationDisplayMode',value:'summary'});
+  await reloadPage();
+  await waitFor(() => page.evaluate(`document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.classList.contains('compact-agent')`), '摘要模式直接显示紧凑代理任务行');
+  assert.equal(await page.evaluate(`!!document.querySelector('.agent-group-header')`), false, '不再叠加代理组折叠入口');
+  assert.ok(await page.evaluate(`document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.innerText.includes('运行中')`), '任务状态文字直接可见');
+  await captureAgentLayout('agent-summary');
+  await page.call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+  await waitFor(() => page.evaluate(`(() => {
+    const rect = document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.getBoundingClientRect();
+    return rect && rect.left >= 0 && rect.right <= innerWidth;
+  })()`), '窄屏代理任务行不溢出');
+  await captureAgentLayout('agent-summary-narrow');
+  await page.call('Emulation.clearDeviceMetricsOverride');
   await waitFor(() => page.evaluate(`(() => {
     const card = document.querySelector('[data-agent-task-id="${agent.agentRunId}"]');
     if (!card || card.disabled) return false;
@@ -527,9 +562,16 @@ app.whenReady().then(() => { const win = new BrowserWindow({ show: false, webPre
   assert.equal(requests.length, requestsBeforeRestart + 1, '恢复只请求一次模型，不重复派发代理');
   assert.equal(history.canonicalTurns.find(turn => turn.turnId === accepted.turnId)?.status, 'cancelled');
   assert.ok(history.canonicalTurns.some(turn => turn.status === 'completed' && turn.items.some(item => item.content?.includes('WEB_AGENT_NEXT_DONE'))));
+  await waitFor(() => page.evaluate(`document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.classList.contains('status-success')`), '独立代理完成后，派发卡片停止闪烁并显示成功');
+  await send('WEB_AGENT_NEXT 完成后再次核对历史代理状态。');
+  await waitFor(() => requests.length === requestsBeforeRestart + 2, '完成后的新主线请求');
+  await waitFor(() => page.evaluate(`!document.querySelector('[data-testid="input-stop-button"]') && document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.classList.contains('status-success')`), '新主线替换当前运行投影后，历史代理卡片仍显示成功');
+  await reloadPage();
+  await waitFor(() => page.evaluate(`document.querySelector('[data-agent-task-id="${agent.agentRunId}"]')?.classList.contains('status-success')`), '重新加载历史会话后，代理卡片保留真实终态');
+  await captureAgentLayout('agent-summary-completed');
   assert.deepEqual(errors, []);
   process.stdout.write(JSON.stringify({ passed: true, health, providerRequests: requests.length,
-    checks: ["编辑前原输入留在队列", "保存保持输入身份和 FIFO", "领取后保存返回 409 并保留草稿", "路径绑定消息可用解析后 ID 保存编辑", "task 引导可点击", "重载保留待处理输入", "补充在原 Turn 下一步消费", "下一轮 FIFO 消费", "发送后队列无残留", "用户消息无重复", "未知用量不阻止目标执行", "大量用量只做统计", "目标完成且无预算 DTO 或配置", "Web 停止并改做优先于普通队列", "原执行先取消并结算", "Web 显式转交原代理", "父轮停止及换轮不停止已转交代理", "SIGKILL 后 Web 显式继续原代理", "原中断记录和新主线保持终态", "详情跨主线读取原 Task 结果", "继续只创建新 Turn，不重复派发代理"] }, null, 2) + "\n");
+    checks: ["编辑前原输入留在队列", "保存保持输入身份和 FIFO", "领取后保存返回 409 并保留草稿", "路径绑定消息可用解析后 ID 保存编辑", "task 引导可点击", "重载保留待处理输入", "补充在原 Turn 下一步消费", "下一轮 FIFO 消费", "发送后队列无残留", "用户消息无重复", "未知用量不阻止目标执行", "大量用量只做统计", "目标完成且无预算 DTO 或配置", "Web 停止并改做优先于普通队列", "原执行先取消并结算", "Web 显式转交原代理", "父轮停止及换轮不停止已转交代理", "SIGKILL 后 Web 显式继续原代理", "原中断记录和新主线保持终态", "详情跨主线读取原 Task 结果", "继续只创建新 Turn，不重复派发代理", "会话运行灯随停止与换轮收敛", "独立继续完成同步原派发卡片", "新主线不覆盖历史代理终态", "重载保留代理卡片终态"] }, null, 2) + "\n");
 } catch (error) {
   process.stderr.write(JSON.stringify(await page?.evaluate("document.body.innerText.slice(-4000)").catch(() => null)) + "\n");
   process.stderr.write(`${logs.slice(-12000)}\n`);

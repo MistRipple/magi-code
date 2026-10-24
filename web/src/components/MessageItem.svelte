@@ -615,7 +615,11 @@
             {@const blockIsStreaming = block.type === 'thinking'
               ? (isStreaming && i === presentationBlocks.length - 1)
               : isStreaming}
-            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} {presentationRole} />
+            <BlockRenderer
+              {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} {presentationRole}
+              agentChildStatus={message.metadata?.agentChildStatus}
+              agentChildStatusUpdatedAt={message.metadata?.agentChildStatusUpdatedAt}
+            />
           {/each}
         {:else if message.content}
           <MarkdownContent content={displayText} {isStreaming} {filePreviewScope} />

@@ -256,8 +256,6 @@
       {:else if block.kind === 'agent-group'}
         <ConversationAgentGroup
           items={block.items}
-          {readOnly}
-          {displayContext}
           {filePreviewScopeForItem}
         />
       {:else if block.kind === 'tool-group'}

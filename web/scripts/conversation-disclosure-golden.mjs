@@ -172,6 +172,16 @@ await withGoldenViteServer(async (server) => {
   const extendedKeys = streamKeys(process(textItem('x'), a, textItem('y'), b));
   assert.deepEqual(extendedKeys.slice(0, prefixKeys.length), prefixKeys, '追加条目后，已有条目的 key 保持不变');
 
+  const spawn = (key) => ({ item: toolItem(key, 'agent_spawn'), role: 'delegation' });
+  const parallel = disclosure.buildConversationStreamEntries([spawn('agent-a'), spawn('agent-b')]);
+  assert.deepEqual(parallel.map((entry) => entry.key), ['agent-group:agent-a']);
+  assert.deepEqual(parallel[0].items.map((item) => item.key), ['agent-a', 'agent-b'], '连续委派显示为同一组任务行');
+  const sequential = disclosure.buildConversationStreamEntries([spawn('agent-a'), ...process(textItem('between')), spawn('agent-b')]);
+  assert.deepEqual(sequential.map((entry) => entry.key), ['agent-group:agent-a', 'event:between', 'agent-group:agent-b'],
+    '后续阶段的代理不能提前汇总到前一阶段');
+  assert.deepEqual(sequential[0].items.map((item) => item.key), ['agent-a']);
+  assert.equal(sequential[0].key, parallel[0].key, '代理追加后原任务行保持稳定身份');
+
   // ---- 向用户提问：自己就是一行「向你提问」，不套进「完成操作」之类的泛称分组，也不并入前后的工具组 ----
   const q = toolItem('q', 'ask_user_question', { question: '选哪个？' });
   const questionEntries = disclosure.buildConversationStreamEntries(process(a, q, b));
@@ -461,6 +471,18 @@ await withGoldenViteServer(async (server) => {
     const collapsedTurn = turnHtml();
     assert.doesNotMatch(collapsedTurn, /data-conversation-phase=/u, '整轮收起时，思考和工具一样收在「已处理」里');
     assert.match(collapsedTurn, /turn-disclosure-header/u, '有思考时整轮折叠标题存在，用来展开它');
+    const collapsedWithAgent = turnHtml([{ key: 'delegation', message: message({
+      id: 'delegation', type: 'tool_call', content: '', source: 'orchestrator',
+      metadata: { conversationPresentationRole: 'delegation', agentChildStatus: 'completed' },
+      blocks: [{ id: 'delegation-block', type: 'tool_call', toolCall: {
+        name: 'agent_spawn', status: 'success', arguments: { display_name: '独立核验' },
+        result: { status: 'started', child_task_id: 'child-visible' },
+      } }],
+    }) }]);
+    assert.match(collapsedWithAgent, /data-agent-task-id="child-visible"/u, '整轮收起后仍可进入代理详情');
+    assert.match(collapsedWithAgent, /独立核验/u);
+    assert.match(collapsedWithAgent, /答案是 3 小时。/u, '任务入口与最终回答同时保留');
+    assert.doesNotMatch(collapsedWithAgent, /data-conversation-phase=/u, '保留代理入口不应展开普通过程');
     const expandedTurn = renderTurn(turnComponent.default, {
       props: {
         turnId: 'turn-2',

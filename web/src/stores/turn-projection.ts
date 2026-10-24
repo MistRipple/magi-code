@@ -27,6 +27,7 @@ import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
 import { buildCanonicalToolFileChangeBlocks } from '../lib/canonical-tool-file-change';
 import { mapStandardBlocks } from '../lib/message-utils';
 import { parseToolPayloadRecord } from '../lib/tool-error-payload';
+import { normalizeAgentChildStatus, type AgentChildState } from '../lib/agent-child-status';
 import {
   inferConversationPresentationRole,
   isPromotedSidechainMessage,
@@ -52,54 +53,24 @@ interface TurnPresentation {
   readonly presentationSeq: ReadonlyMap<string, number>;
   /** 预计算的「总耗时」锚点 itemId；turn 未终态或无 responseDurationMs 时为 undefined。 */
   readonly responseDurationAnchorItemId: string | undefined;
-  /** 当前 turn 中已知的子代理终态，供主线历史代理卡片复用权威事实。 */
-  readonly agentChildStatuses: ReadonlyMap<string, AgentChildStatus>;
+  /** 当前会话已知的子代理执行状态，包含独立继续的 Turn。 */
+  readonly agentChildStatuses: ReadonlyMap<string, AgentChildState>;
 }
-
-type AgentChildStatus = 'queued' | 'running' | 'completed' | 'failed' | 'killed' | 'degraded';
 
 function canonicalToolName(name: string): string {
   const segments = name.trim().toLowerCase().split(/[.:/]/u).filter(Boolean);
   return segments.at(-1) || name.trim().toLowerCase();
 }
 
-function normalizeAgentChildStatus(value: unknown): AgentChildStatus | undefined {
-  if (typeof value !== 'string') return undefined;
-  switch (value.trim().toLowerCase()) {
-    case 'pending':
-    case 'queued':
-      return 'queued';
-    case 'running':
-    case 'started':
-      return 'running';
-    case 'completed':
-    case 'succeeded':
-    case 'success':
-      return 'completed';
-    case 'failed':
-    case 'missing':
-      return 'failed';
-    case 'killed':
-    case 'cancelled':
-    case 'canceled':
-      return 'killed';
-    case 'degraded':
-    case 'blocked':
-      return 'degraded';
-    default:
-      return undefined;
-  }
-}
-
-function collectAgentChildStatuses(turn: CanonicalTurn): ReadonlyMap<string, AgentChildStatus> {
-  const taskStatuses = new Map<string, AgentChildStatus>();
-  const waitStatuses = new Map<string, AgentChildStatus>();
+function collectAgentChildStatuses(turn: CanonicalTurn): ReadonlyMap<string, AgentChildState> {
+  const taskStatuses = new Map<string, AgentChildState>();
+  const waitStatuses = new Map<string, AgentChildState>();
 
   for (const item of turn.items) {
     const taskId = normalizeCanonicalTaskId(item);
     if (item.kind === 'task_status' && taskId) {
       const status = normalizeAgentChildStatus(item.status);
-      if (status) taskStatuses.set(taskId, status);
+      if (status) taskStatuses.set(taskId, { status, updatedAt: item.updatedAt });
       continue;
     }
     if (item.kind !== 'tool_call' || canonicalToolName(item.tool?.name || '') !== 'agent_wait') {
@@ -116,15 +87,31 @@ function collectAgentChildStatuses(turn: CanonicalTurn): ReadonlyMap<string, Age
         : '';
       if (!childTaskId) continue;
       const status = normalizeAgentChildStatus(record.child_status) || normalizeAgentChildStatus(record.status);
-      if (status) waitStatuses.set(childTaskId, status);
+      if (status) waitStatuses.set(childTaskId, { status, updatedAt: item.updatedAt });
     }
   }
 
   // task_status 是本地 TaskStore 的事实；agent_wait 仅作为历史数据或尚未写入
   // task_status 时的补充来源。两者合并后，主线代理卡片不再依赖当前 root projection。
-  const merged = new Map<string, AgentChildStatus>(waitStatuses);
+  const merged = new Map<string, AgentChildState>(waitStatuses);
   for (const [taskId, status] of taskStatuses) merged.set(taskId, status);
   return merged;
+}
+
+/** 同一 Task 可在独立 Turn 中继续，按轮次读取最新执行事实，不改写原轮次。 */
+function collectSessionAgentChildStatuses(turns: readonly CanonicalTurn[]): ReadonlyMap<string, AgentChildState> {
+  const statuses = new Map<string, AgentChildState>();
+  for (const turn of [...turns].sort((left, right) => left.turnSeq - right.turnSeq)) {
+    for (const [taskId, state] of collectAgentChildStatuses(turn)) statuses.set(taskId, state);
+    const binding = turn.metadata?.agentExecution as { taskId?: unknown } | undefined;
+    if (typeof binding?.taskId !== 'string') continue;
+    const status = turn.status === 'interrupted' ? 'failed' : normalizeAgentChildStatus(turn.status);
+    if (status) statuses.set(binding.taskId, {
+      status,
+      updatedAt: turn.completedAt ?? turn.items.reduce((latest, item) => Math.max(latest, item.updatedAt), turn.acceptedAt),
+    });
+  }
+  return statuses;
 }
 
 function normalizeSessionId(value: string | null | undefined): string {
@@ -660,7 +647,7 @@ function buildMessage(
         return typeof value === 'string' ? value.trim() : '';
       })()
     : '';
-  const agentChildStatus = agentChildTaskId
+  const agentChildState = agentChildTaskId
     ? presentation.agentChildStatuses.get(agentChildTaskId)
     : undefined;
   // 流式态对 assistant 的 text 与 thinking 都成立：
@@ -739,7 +726,7 @@ function buildMessage(
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
       // metadata.taskId 是 RightPane agent run tab 按代理过滤 timeline 的唯一信号。
       ...(taskId ? { taskId } : {}),
-      ...(agentChildStatus ? { agentChildStatus } : {}),
+      ...(agentChildState ? { agentChildStatus: agentChildState.status, agentChildStatusUpdatedAt: agentChildState.updatedAt } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
       // 轮次状态也属于渲染输入：轮次从 pending 变为终态时，没有变化的条目（例如用户消息）
@@ -750,6 +737,8 @@ function buildMessage(
         item.status,
         turn.status,
         turn.completedAt ?? 0,
+        agentChildState?.status ?? '',
+        agentChildState?.updatedAt ?? 0,
         inputDelivery ?? '',
         content.length,
         blocks?.length ?? 0,
@@ -840,7 +829,7 @@ function requirePresentationSeq(presentation: TurnPresentation, item: CanonicalT
  *
  * 单一模型轮次内同 kind 多 item 保持原 `item_seq` 顺序，确保增量稳定性。
  */
-function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
+function buildTurnPresentation(turn: CanonicalTurn, agentChildStatuses: ReadonlyMap<string, AgentChildState>): TurnPresentation {
   const sorted = turn.items
     .slice()
     .sort((left, right) =>
@@ -917,7 +906,7 @@ function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
     orderedItems: ordered,
     presentationSeq,
     responseDurationAnchorItemId,
-    agentChildStatuses: collectAgentChildStatuses(turn),
+    agentChildStatuses,
   };
 }
 
@@ -948,8 +937,8 @@ function buildArtifact(
   };
 }
 
-function buildTurnProjectionArtifacts(turn: CanonicalTurn): Array<TimelineProjectionArtifact | null> {
-  const presentation = buildTurnPresentation(turn);
+function buildTurnProjectionArtifacts(turn: CanonicalTurn, agentChildStatuses: ReadonlyMap<string, AgentChildState>): Array<TimelineProjectionArtifact | null> {
+  const presentation = buildTurnPresentation(turn, agentChildStatuses);
   // 遍历 presentation.orderedItems（已按呈现序排好），不再用 turn.items 原顺序——
   // 虽然下游 collapseArtifactsByStableCard 仍会按 displayOrder 总排序，但用
   // orderedItems 让数据流意图更显式：呈现序在这里就已经固定。
@@ -1223,9 +1212,10 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
   if (!sessionId) {
     return null;
   }
+  const agentChildStatuses = collectSessionAgentChildStatuses(state.turns);
   const artifacts = projectStableArtifacts(state.turns
     .filter((turn) => turn.status !== 'superseded')
-    .flatMap((turn) => buildTurnProjectionArtifacts(turn))
+    .flatMap((turn) => buildTurnProjectionArtifacts(turn, agentChildStatuses))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
   // 主时间线承接 root agent artifacts，并提升子代理中必须由用户处理的授权、
@@ -1315,7 +1305,20 @@ export function updateCanonicalTimelineProjection(
   if (!previous || previous.sessionId !== state.sessionId || changedTurnIds.length === 0) {
     return buildCanonicalTimelineProjection(state);
   }
+  const agentChildStatuses = collectSessionAgentChildStatuses(state.turns);
   const changedTurnIdSet = new Set(changedTurnIds);
+  // 独立代理的新 Turn 会改变旧派发卡片；增量重建必须包含这些依赖方。
+  for (const artifact of previous.artifacts) {
+    const block = artifact.message.blocks?.find((block) => canonicalToolName(block.toolCall?.name || '') === 'agent_spawn');
+    if (!block) continue;
+    const taskId = parseToolPayloadRecord(block.toolCall?.result)?.child_task_id;
+    if (typeof taskId !== 'string') continue;
+    const child = agentChildStatuses.get(taskId.trim());
+    if (child?.status !== artifact.message.metadata?.agentChildStatus
+      || child?.updatedAt !== artifact.message.metadata?.agentChildStatusUpdatedAt) {
+      changedTurnIdSet.add(artifactTurnId(artifact));
+    }
+  }
   const previousById = new Map<string, TimelineProjectionArtifact>();
   const retained: TimelineProjectionArtifact[] = [];
   for (const artifact of previous.artifacts) {
@@ -1328,7 +1331,7 @@ export function updateCanonicalTimelineProjection(
   const changed = projectStableArtifacts(state.turns
     .filter((turn) => changedTurnIdSet.has(turn.turnId))
     .filter((turn) => turn.status !== 'superseded')
-    .flatMap((turn) => buildTurnProjectionArtifacts(turn))
+    .flatMap((turn) => buildTurnProjectionArtifacts(turn, agentChildStatuses))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact)))
     .map((artifact) => reuseEquivalentArtifact(previousById, artifact));
   const artifacts = mergeSortedArtifacts(retained, changed);

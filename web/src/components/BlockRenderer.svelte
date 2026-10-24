@@ -10,6 +10,8 @@
     readOnly?: boolean;
     filePreviewScope?: FilePreviewScope;
     presentationRole?: ConversationPresentationRole;
+    agentChildStatus?: unknown;
+    agentChildStatusUpdatedAt?: unknown;
   }
 
   let {
@@ -18,6 +20,8 @@
     readOnly = false,
     filePreviewScope = undefined,
     presentationRole = 'process',
+    agentChildStatus,
+    agentChildStatusUpdatedAt,
   }: Props = $props();
 
   // 🔧 防御性检查：确保 block 有效且有 type 属性
@@ -26,5 +30,5 @@
 </script>
 
 {#if Renderer}
-  <Renderer {block} {isStreaming} {readOnly} {filePreviewScope} {presentationRole} />
+  <Renderer {block} {isStreaming} {readOnly} {filePreviewScope} {presentationRole} {agentChildStatus} {agentChildStatusUpdatedAt} />
 {/if}

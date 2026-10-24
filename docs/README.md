@@ -74,7 +74,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [Magi 插件系统：需求与方案设计](./plugin-system-requirements-design.md)：统一安装、授权、生命周期、版本化资源、插件工具与工作流、会话引擎路由、隔离视图、第一方 GPT Web/MCP 服务插件壳及插件中心已接入；平台验证、取消结算与通用 Browser surface 的限制见 §10.1。作者合同见[插件作者指南](./plugin-authoring.md)。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [内置工具的失败合同](./builtin-tool-failure-contract.md)：工具失败时必须告诉模型什么、暂态重试的唯一负责层、结构化错误字段，以及文件、shell 与后台进程、web、搜索、Git、update_plan 等内置工具的具体约定。
-- [对话展示：完整模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
+- [对话展示：详细模式与摘要模式](./conversation-display-modes.md)：两种显示模式共用的事实投影、摘要模式折叠与分组规则、工具卡片状态（含结果未确认）与流式稳定性约束。
 - [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。

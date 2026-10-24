@@ -21,7 +21,7 @@ export interface ConversationPresentationEntry {
 }
 
 /**
- * 把一轮里按呈现角色标注好的条目组织成摘要模式的过程流：委派合并成一个代理组，
+ * 把一轮里按呈现角色标注好的条目组织成摘要模式的过程流：连续委派合并成代理组，
  * 产物和待处理交互单独成块，连续工具调用合并成工具组，其余文字作为事件。
  *
  * 结果只依赖每个条目之前的内容：流式追加新条目时，已经产生的条目不会消失或改变 key，
@@ -31,10 +31,7 @@ export function buildConversationStreamEntries(
   presentationItems: ConversationPresentationEntry[],
 ): ConversationStreamEntry[] {
   const result: ConversationStreamEntry[] = [];
-  const delegationItems = presentationItems
-    .filter((entry) => entry.role === 'delegation')
-    .map((entry) => entry.item);
-  let agentGroupEmitted = false;
+  let delegationItems: TimelineRenderItem[] = [];
   let toolGroupItems: TimelineRenderItem[] = [];
 
   const flushToolGroup = () => {
@@ -46,21 +43,20 @@ export function buildConversationStreamEntries(
     });
     toolGroupItems = [];
   };
+  const flushAgentGroup = () => {
+    if (delegationItems.length === 0) return;
+    result.push({ kind: 'agent-group', key: `agent-group:${delegationItems[0].key}`, items: delegationItems });
+    delegationItems = [];
+  };
 
   for (const entry of presentationItems) {
     if (entry.role === 'final') continue;
     if (entry.role === 'delegation') {
       flushToolGroup();
-      if (!agentGroupEmitted) {
-        result.push({
-          kind: 'agent-group',
-          key: `agent-group:${entry.item.key}`,
-          items: delegationItems,
-        });
-        agentGroupEmitted = true;
-      }
+      delegationItems.push(entry.item);
       continue;
     }
+    flushAgentGroup();
     if (entry.role === 'artifact' || entry.role === 'attention') {
       flushToolGroup();
       result.push({
@@ -92,6 +88,7 @@ export function buildConversationStreamEntries(
     result.push({ kind: 'event', key: `event:${entry.item.key}`, item: entry.item });
   }
   flushToolGroup();
+  flushAgentGroup();
   return result;
 }
 

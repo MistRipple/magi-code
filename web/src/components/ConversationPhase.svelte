@@ -134,7 +134,7 @@
           {#if detail.kind === 'compact'}
             <ConversationProcessRow item={detail.entry.item} />
           {:else if detail.kind === 'rich' && detail.entry.item.message.type === 'thinking'}
-            <!-- 思考：摘要风格只缩进显示思考文字，状态由阶段标题表达，不再嵌一张原始风格的思考卡片 -->
+            <!-- 思考：摘要模式只缩进显示思考文字，状态由阶段标题表达，不再嵌一张详细模式的思考卡片 -->
             <ConversationThinkingText
               message={detail.entry.item.message}
               filePreviewScope={filePreviewScopeForItem(detail.entry.item)}

@@ -257,6 +257,74 @@ await withGoldenViteServer(async (server) => {
   const { render } = await server.ssrLoadModule('svelte/server');
   const failureCard = await server.ssrLoadModule('/src/components/ModelFailureCard.svelte');
   const toolCall = await server.ssrLoadModule('/src/components/ToolCall.svelte');
+  const messageItem = await server.ssrLoadModule('/src/components/MessageItem.svelte');
+  const { resolveAgentChildStatus } = await server.ssrLoadModule('/src/lib/agent-child-status.ts');
+  const staleProjection = { root_task: { task_id: 'root' }, agents: [], tasks: [{ task_id: 'child', status: 'failed', updated_at: 100 }] };
+  assert.equal(resolveAgentChildStatus(staleProjection, 'child', 'completed', 200), 'completed', '旧失败快照不能覆盖独立继续后的完成状态');
+  staleProjection.tasks[0] = { task_id: 'child', status: 'running', updated_at: 300 };
+  assert.equal(resolveAgentChildStatus(staleProjection, 'child', 'completed', 200), 'running', '较新的 TaskStore 执行事实优先于旧完成记录');
+  // 从完整 MessageItem 入口验证 metadata 经 BlockRenderer、ToolCallRenderer 到达卡片。
+  for (const [childStatus, visualStatus] of [
+    ['completed', 'success'], ['failed', 'error'], ['killed', 'error'],
+    ['degraded', 'degraded'], ['queued', 'pending'], ['running', 'running'],
+  ]) {
+    const markup = render(messageItem.default, { props: {
+      message: {
+        id: `spawn-${childStatus}`, role: 'assistant', source: 'orchestrator', agent: 'orchestrator',
+        type: 'tool_call', content: '', timestamp: 1,
+        metadata: { canonical: true, agentChildStatus: childStatus },
+        blocks: [{ id: 'spawn-block', type: 'tool_call', content: '', toolCall: {
+          id: 'spawn-call', name: 'agent_spawn', status: 'success', arguments: {},
+          result: JSON.stringify({ status: 'started', child_task_id: 'historical-child' }),
+        } }],
+      },
+      filePreviewScope: { sessionId: 'historical-session', workspaceId: '' },
+    } }).body;
+    assert.ok(markup.includes(`agent-spawn-card status-${visualStatus}`), `${childStatus} 必须渲染真实子任务状态`);
+    if (!['running', 'queued'].includes(childStatus)) assert.doesNotMatch(markup, /status-dot pulsing/);
+  }
+  const recoveredCard = render(toolCall.default, { props: {
+    name: 'agent_spawn', status: 'success', agentChildStatus: 'completed',
+    output: { status: 'failed', child_task_id: 'recovered-child' },
+  } }).body;
+  assert.match(recoveredCard, /agent-spawn-card status-success/);
+  assert.doesNotMatch(recoveredCard, /class="agent-spawn-error"/, '恢复成功后不再显示旧派发回执中的失败提示');
+  const agentGroup = await server.ssrLoadModule('/src/components/ConversationAgentGroup.svelte');
+  const failedGroup = render(agentGroup.default, { props: {
+    items: [{ key: 'failed-spawn', message: { blocks: [{ toolCall: {
+      name: 'agent_spawn', status: 'success', result: { status: 'failed' },
+    } }] } }],
+    filePreviewScopeForItem: () => ({ sessionId: 'historical-session', workspaceId: '' }),
+  } }).body;
+  assert.match(failedGroup, /agent-spawn-card status-error/, '摘要代理行显示真实失败状态');
+  assert.doesNotMatch(failedGroup, /agent-group-header|aria-expanded/, '单个代理直接显示任务行，不再增加分组折叠');
+  assert.match(failedGroup, /compact-agent/, '摘要模式复用紧凑任务行');
+  const multipleAgents = render(agentGroup.default, { props: {
+    items: ['completed', 'running'].map((agentChildStatus, index) => ({ key: `agent-${index}`, message: {
+      metadata: { agentChildStatus }, blocks: [{ id: `block-${index}`, type: 'tool_call', toolCall: {
+        name: 'agent_spawn', status: 'success', arguments: { display_name: `任务 ${index}`, role: 'executor' },
+        result: { status: 'started', child_task_id: `child-${index}` },
+      } }],
+    } })),
+    filePreviewScopeForItem: () => ({ sessionId: 'historical-session', workspaceId: '' }),
+  } }).body;
+  assert.match(multipleAgents, /2 个代理/);
+  assert.match(multipleAgents, /任务 0/);
+  assert.match(multipleAgents, /任务 1/);
+  assert.match(multipleAgents, /status-success/);
+  assert.match(multipleAgents, /status-running/);
+  assert.doesNotMatch(multipleAgents, /class="agent-spawn-role"|查看详情<|aria-expanded/, '摘要不重复角色标签、详情文案和折叠层');
+  const originalAgent = render(toolCall.default, { props: {
+    name: 'agent_spawn', status: 'success', agentChildStatus: 'completed',
+    input: { display_name: '检查数据加载', role: 'explorer' },
+    output: { status: 'started', child_task_id: 'existing-child' },
+  } }).body;
+  assert.match(originalAgent, /agent-spawn-role/, '详细模式保留角色标识，与右侧代理详情对应');
+  assert.match(originalAgent, /查看详情/, '详细模式保留详情操作的无障碍说明');
+  assert.match(originalAgent, /<span[^>]*>已完成<\/span>/, '详细模式直接显示文字状态，不要求用户辨认颜色');
+  assert.doesNotMatch(originalAgent, /agent-spawn-role-badge/, '角色身份无需额外的胶囊色块');
+  assert.doesNotMatch(originalAgent, /compact-agent/, '详细模式保留任务卡片外观');
+  assert.match(originalAgent, /data-agent-task-id="existing-child"/, '两种风格均打开原 Task');
   for (const [errorCode, errorMessage] of [
     ['file_patch_no_match', '目标内容与当前文件不匹配，请重新读取文件后再修改'],
     ['file_patch_ambiguous_match', '目标内容在当前文件中不是唯一匹配，请增加上下文后重试'],

@@ -6,7 +6,7 @@
     durationMs: number;
     completedAt?: number | null;
     hasContent?: boolean;
-    /** 摘要风格的轮次标题已经显示耗时时关闭，避免同一数字在标题和底部各出现一次。 */
+    /** 摘要模式的轮次标题已经显示耗时时关闭，避免同一数字在标题和底部各出现一次。 */
     showDuration?: boolean;
   }
 

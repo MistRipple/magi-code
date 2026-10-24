@@ -19,9 +19,12 @@
     block: ContentBlock;
     filePreviewScope?: FilePreviewScope;
     presentationRole?: ConversationPresentationRole;
+    compactAgent?: boolean;
+    agentChildStatus?: unknown;
+    agentChildStatusUpdatedAt?: unknown;
   }
 
-  let { block, filePreviewScope = undefined, presentationRole = 'process' }: Props = $props();
+  let { block, filePreviewScope = undefined, presentationRole = 'process', compactAgent = false, agentChildStatus, agentChildStatusUpdatedAt }: Props = $props();
 
   // 历史分页会把超长工具输出截成开头一段；用户点击后按需取回完整内容，只在本卡片内生效，
   // 不改写会话事实。
@@ -101,6 +104,8 @@
     standardized={block.toolCall?.standardized}
     {filePreviewScope}
     {presentationRole}
+    {agentChildStatus} {agentChildStatusUpdatedAt}
+    {compactAgent}
     duration={typeof block.toolCall?.durationMs === 'number'
       ? block.toolCall.durationMs
       : (block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined)}

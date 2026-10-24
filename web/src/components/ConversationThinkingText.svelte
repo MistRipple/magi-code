@@ -10,7 +10,7 @@
 
   let { message, filePreviewScope = undefined }: Props = $props();
 
-  // 摘要风格的思考正文：阶段标题已经说明「思考中 / 已思考」，这里不再套一层带标题、
+  // 摘要模式的思考正文：阶段标题已经说明「思考中 / 已思考」，这里不再套一层带标题、
   // 边框和折叠按钮的卡片，只把思考文字按过程正文的样子缩进显示。
   const segments = $derived.by<ThinkingSegment[]>(() => {
     const result: ThinkingSegment[] = [];
