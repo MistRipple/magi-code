@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import Disclosure from './Disclosure.svelte';
   import {
     parseLeadingJson,
@@ -213,6 +214,7 @@
     ) {
       return i18n.t('terminalSession.status.error');
     }
+    if (classValue === 'unconfirmed') return i18n.t('toolCall.status.unconfirmed');
     if (classValue === 'success') return i18n.t('terminalSession.status.success');
     if (classValue === 'error') return i18n.t('terminalSession.status.error');
     if (classValue === 'pending') return i18n.t('terminalSession.status.pending');
@@ -275,6 +277,7 @@
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
 
   const statusClass = $derived.by(() => {
+    if (status === 'unconfirmed') return 'unconfirmed';
     if (normalizedStatus.includes('cancel')) return 'cancelled';
     if (
       normalizedStatus.includes('fail')
@@ -301,7 +304,7 @@
   const displayModeLabel = $derived(displayMode ? terminalModeLabel(displayMode) : '');
   const displayPhaseLabel = $derived(displayPhase ? terminalPhaseLabel(displayPhase) : '');
 
-  const showStatusPulse = $derived(statusClass === 'running' || statusClass === 'pending');
+  const duration = $derived(toolCall?.durationMs ?? (toolCall?.startTime && toolCall.endTime ? toolCall.endTime - toolCall.startTime : undefined));
   const toolNameLabel = $derived(i18n.t('toolCall.displayName.shell'));
   const titleText = $derived(
     typeof terminalId === 'number'
@@ -385,7 +388,7 @@
 
 {#if isExpandable}
   <div
-    class="tool-call terminal-call"
+    class="message-card tool-call terminal-call"
     class:collapsed={canToggle && collapsed}
     data-status={statusClass}
     data-tool-name={toolCall?.name || ''}
@@ -398,21 +401,12 @@
         aria-expanded={!collapsed}
         aria-controls={contentId}
       >
-        <span class="chevron">
-          <Icon name="chevron-right" size={12} />
-        </span>
         <span class="tool-icon"><Icon name="terminal" size={14} /></span>
         <span class="tool-title">
           <span class="tool-name">{toolNameLabel}</span>
           <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
         </span>
-        <span class="tool-status status-{statusClass}" title={displayStatusLabel} aria-label={displayStatusLabel}>
-          {#if showStatusPulse}
-            <span class="status-dot pulsing"></span>
-          {:else}
-            <span class="status-dot"></span>
-          {/if}
-        </span>
+        <ToolCardMeta status={statusClass} label={displayStatusLabel} expanded={canToggle ? !collapsed : undefined} {duration} />
       </button>
     {:else}
       <div class="tool-header terminal-header-flat">
@@ -421,13 +415,7 @@
           <span class="tool-name">{toolNameLabel}</span>
           <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
         </span>
-        <span class="tool-status status-{statusClass}" title={displayStatusLabel} aria-label={displayStatusLabel}>
-          {#if showStatusPulse}
-            <span class="status-dot pulsing"></span>
-          {:else}
-            <span class="status-dot"></span>
-          {/if}
-        </span>
+        <ToolCardMeta status={statusClass} label={displayStatusLabel} expanded={canToggle ? !collapsed : undefined} {duration} />
       </div>
     {/if}
 
@@ -498,7 +486,7 @@
   </div>
 {:else}
   <div
-    class="tool-call terminal-call"
+    class="message-card tool-call terminal-call"
     data-status={statusClass}
     data-tool-name={toolCall?.name || ''}
     data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
@@ -509,32 +497,17 @@
         <span class="tool-name">{toolNameLabel}</span>
         <span class="tool-summary" title={titleText}>{titleText}</span>
       </span>
-      <span
-        class="tool-status status-{statusClass}"
-        title={displayStatusLabel}
-        aria-label={displayStatusLabel}
-      >
-        {#if showStatusPulse}
-          <span class="status-dot pulsing"></span>
-        {:else}
-          <span class="status-dot"></span>
-        {/if}
-      </span>
+      <ToolCardMeta status={statusClass} label={displayStatusLabel} expanded={canToggle ? !collapsed : undefined} {duration} />
     </div>
   </div>
 {/if}
 
 <style>
   .tool-call {
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
     margin-top: var(--space-2);
     overflow: hidden;
-    background: var(--surface-1);
   }
 
-  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
-     terminal-header-flat 是不可点击的扁平模式，需要覆盖共享 cursor 与 hover */
   .terminal-header-flat {
     cursor: default;
   }
@@ -543,7 +516,6 @@
     background: transparent;
   }
 
-  /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
     display: flex;
     color: var(--foreground-muted);
@@ -569,58 +541,10 @@
     flex: 1;
   }
 
-  .tool-status {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    flex-shrink: 0;
-  }
-
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  .status-dot.pulsing {
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  .status-pending {
-    color: var(--warning);
-  }
-
-  .status-running {
-    color: var(--info);
-  }
-
-  .status-success {
-    color: var(--success);
-  }
-
-  .status-error {
-    color: var(--error);
-  }
-
-  .status-cancelled {
-    color: var(--foreground-muted);
-  }
-
-  @keyframes pulse {
-    0%,
-    100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.3;
-    }
-  }
-
   .tool-content {
-    padding: var(--space-3);
+    padding: 12px var(--tool-card-padding) 14px;
     border-top: var(--magi-hairline) solid var(--border);
-    background: var(--surface-2);
+    background: transparent;
   }
 
   .terminal-meta-grid {
@@ -650,10 +574,10 @@
 
   .terminal-output {
     margin-top: var(--space-2);
-    background: #0b0f14;
-    color: #d7e3f4;
+    background: var(--code-bg);
+    color: var(--foreground);
     border-radius: var(--radius-sm);
-    border: var(--magi-hairline) solid rgba(132, 156, 182, 0.2);
+    border: 0;
     padding: var(--space-4);
     max-height: 320px;
     overflow: auto;
@@ -665,7 +589,7 @@
   }
 
   .terminal-empty {
-    color: #8ea0b6;
+    color: var(--foreground-muted);
   }
 
   .terminal-hint {
@@ -691,7 +615,4 @@
     color: var(--foreground-muted);
   }
 
-  .terminal-call[data-status='error'] {
-    border-color: var(--error);
-  }
 </style>

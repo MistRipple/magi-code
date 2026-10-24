@@ -3,6 +3,7 @@
   import { i18n } from '../../stores/i18n.svelte';
 
   interface Props {
+    embedded?: boolean;
     diff?: string | null;
     originalContent?: string | null;
     currentContent?: string | null;
@@ -55,7 +56,7 @@
     sql: 'sql', graphql: 'graphql', dockerfile: 'dockerfile',
   };
 
-  let {
+  let { embedded = false,
     diff = '',
     originalContent = null,
     currentContent = null,
@@ -317,7 +318,7 @@
   });
 </script>
 
-<div class="diff-code-block" class:fill aria-label={ariaLabel || undefined}>
+<div class="diff-code-block" class:embedded class:fill aria-label={ariaLabel || undefined}>
   <div class="diff-code-scroll">
     <div class="diff-code-content">
       {#each sections as section, sectionIndex (section.id)}
@@ -341,6 +342,7 @@
               {#each section.lines as line (line.id)}
                 <div class="diff-line diff-line--{line.kind}">
                   <span class="diff-line-number" aria-hidden="true">{displayLineNumber(line)}</span>
+                  <span class="diff-line-mark">{line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ''}</span>
                   <code class="diff-line-code language-{sourceLanguage}">{@html renderedLine(line)}</code>
                 </div>
               {/each}
@@ -354,6 +356,7 @@
             {#each section.hunk.lines as line (line.id)}
               <div class="diff-line diff-line--{line.kind}">
                 <span class="diff-line-number" aria-hidden="true">{displayLineNumber(line)}</span>
+                  <span class="diff-line-mark">{line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ''}</span>
                 <code class="diff-line-code language-{sourceLanguage}">{@html renderedLine(line)}</code>
               </div>
             {/each}
@@ -367,12 +370,15 @@
 <style>
   .diff-code-block {
     min-width: 0;
-    border: var(--magi-hairline) solid var(--border-subtle);
-    border-radius: var(--radius-md, 8px);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
+    border-radius: var(--tool-card-radius);
     background: var(--surface-1);
     color: var(--foreground);
     overflow: hidden;
   }
+
+  .diff-code-block.embedded { box-shadow:none; border:0; border-radius:0; background:transparent; }
 
   .diff-code-block.fill {
     display: flex;
@@ -385,7 +391,7 @@
     min-width: 0;
     max-height: min(60vh, 640px);
     overflow: auto;
-    background: color-mix(in srgb, var(--surface-1) 94%, black);
+    background: var(--code-bg);
     color: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-xs, 11px);
@@ -454,20 +460,20 @@
 
   .diff-line {
     display: grid;
-    grid-template-columns: 58px minmax(max-content, 1fr);
+    grid-template-columns: 42px 18px minmax(max-content, 1fr);
     width: 100%;
     min-width: max-content;
     min-height: 1.55em;
   }
 
   .diff-line--addition {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 84%, transparent);
+    background: color-mix(in srgb, var(--success) 6%, transparent);
+
   }
 
   .diff-line--deletion {
-    background: color-mix(in srgb, var(--error) 15%, transparent);
-    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--error) 84%, transparent);
+    background: color-mix(in srgb, var(--error) 6%, transparent);
+
   }
 
   .diff-line--meta {
@@ -493,6 +499,10 @@
   .diff-line--deletion .diff-line-number {
     color: var(--error);
   }
+
+  .diff-line-mark { color:var(--foreground-muted); text-align:center; user-select:none; }
+  .diff-line--addition .diff-line-mark { color:var(--success); }
+  .diff-line--deletion .diff-line-mark { color:var(--error); }
 
   .diff-line-code {
     display: block;

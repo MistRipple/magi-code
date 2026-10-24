@@ -1,9 +1,12 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
+  import type { ConversationPresentationRole } from '../../lib/conversation-presentation';
   import FileName from '../FileName.svelte';
   import Disclosure from '../Disclosure.svelte';
   import type { ContentBlock } from '../../types/message';
   import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
+  import ToolCardMeta from '../ToolCardMeta.svelte';
   import ToolOriginBadge from '../ToolOriginBadge.svelte';
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
@@ -15,14 +18,16 @@
 
   interface Props {
     block: ContentBlock;
+    presentationRole?: ConversationPresentationRole;
     filePreviewScope?: FilePreviewScope;
   }
 
-  let { block, filePreviewScope = undefined }: Props = $props();
+  let { block, filePreviewScope = undefined, presentationRole = 'process' }: Props = $props();
   const change = $derived(block.fileChange);
 
-  // 默认折叠，与 ToolCall 保持一致
-  let collapsed = $state(true);
+  // Artifact cards stay visible in both modes; later updates never replace a manual choice.
+  let collapsed = $state(untrack(() => presentationRole !== 'artifact'));
+  const contentId = $props.id();
 
   function toggle() {
     collapsed = !collapsed;
@@ -121,19 +126,14 @@
 </script>
 
 {#if change}
-  <div class="tool-call" class:collapsed>
-    <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
-      <span class="chevron">
-        <Icon name="chevron-right" size={12} />
-      </span>
-
+  <div class="message-card tool-call" class:collapsed>
+    <button class="tool-header" onclick={toggle} aria-expanded={!collapsed} aria-controls={contentId}>
       <span class="tool-icon">
         <Icon name={changeIcon} size={14} />
       </span>
 
       <span class="tool-title">
         <span class="tool-name">{changeLabel}</span>
-        <ToolOriginBadge origin={change.origin} />
         {#if change.changeType === 'rename' && change.oldPath}
           <span
             class="rename-path"
@@ -169,6 +169,8 @@
         {/if}
       </span>
 
+      <ToolCardMeta status={change.error ? 'error' : 'success'} label={i18n.t(change.error ? 'terminalSession.status.error' : 'terminalSession.status.success')} expanded={!collapsed}>
+        <ToolOriginBadge origin={change.origin} />
       {#if hasStatsBadge && isText}
         <span class="stats-badge">
           {#if additionsCount > 0}
@@ -185,13 +187,11 @@
         </span>
       {/if}
 
-      <span class="tool-status" class:status-success={!change.error} class:status-error={!!change.error}>
-        <span class="status-dot"></span>
-      </span>
+      </ToolCardMeta>
     </button>
 
     <Disclosure expanded={!collapsed}>
-      <div class="tool-content">
+      <div class="tool-content" id={contentId}>
         {#if change.error}
           <div class="empty-diff-note error">{i18n.t('fileChangeCard.previewUnavailable')}</div>
         {:else if !isText}
@@ -225,7 +225,7 @@
             {/if}
           </div>
         {:else if hasDiff}
-          <DiffCodeBlock diff={change.diff} ariaLabel={change.filePath} />
+          <DiffCodeBlock embedded diff={change.diff} ariaLabel={change.filePath} />
         {:else}
           <div class="empty-diff-note">
             {emptyDiffNote}
@@ -239,16 +239,11 @@
 <style>
   /* 复用 ToolCall 卡片容器样式 */
   .tool-call {
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
     margin: var(--space-2, 8px) 0;
     overflow: hidden;
-    background: var(--surface-1, rgba(255,255,255,0.02));
   }
 
-  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css */
 
-  /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
     display: flex;
     color: var(--foreground-muted);
@@ -286,9 +281,9 @@
     font-size: var(--text-xs, 11px);
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
-    padding: 1px 6px;
+    padding: 0;
     border-radius: 4px;
-    background: var(--surface-2, rgba(0,0,0,0.15));
+    background: transparent;
     white-space: nowrap;
     flex-shrink: 0;
   }
@@ -314,11 +309,11 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-3, 12px);
-    margin: var(--space-3, 12px);
-    padding: var(--space-3, 12px);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+    margin: 0;
+    padding: 12px var(--tool-card-padding) 14px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
   }
 
   .non-text-title {
@@ -353,8 +348,8 @@
   .non-text-snippet {
     margin: 0;
     padding: var(--space-2, 8px);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
+    border: 0;
+    border-radius: 4px;
     background: var(--surface-2, rgba(0, 0, 0, 0.1));
     color: var(--foreground);
     font-family: var(--font-mono);
@@ -373,34 +368,16 @@
   }
 
   .empty-diff-note.error {
-    padding: var(--space-3, 12px);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 40%, var(--border));
-    border-radius: var(--radius-sm);
+    padding: 0;
+    border: 0;
+    border-radius: 0;
     color: var(--error);
-    background: color-mix(in srgb, var(--error) 10%, var(--surface-1));
+    background: transparent;
   }
-
-  .tool-status {
-    display: flex;
-    align-items: center;
-    flex-shrink: 0;
-  }
-
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  .status-success { color: var(--success); }
-  .status-error { color: var(--error); }
 
   .tool-content {
     border-top: var(--magi-hairline) solid var(--border);
-    background: var(--surface-2, rgba(0,0,0,0.1));
-    animation: slideDown 0.2s ease-out;
-    transform-origin: top;
+    background: transparent;
   }
 
   .empty-diff-note {
@@ -408,11 +385,6 @@
     color: var(--foreground-muted);
     font-size: var(--text-sm, 13px);
     line-height: 1.5;
-  }
-
-  @keyframes slideDown {
-    from { opacity: 0; transform: translateY(-8px); }
-    to { opacity: 1; transform: translateY(0); }
   }
 
 </style>

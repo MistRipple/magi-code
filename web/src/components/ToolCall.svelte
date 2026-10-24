@@ -2,6 +2,7 @@
   import type { ToolCallStatus, ToolOrigin } from '../types/message';
   import ToolOriginBadge from './ToolOriginBadge.svelte';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
@@ -91,6 +92,7 @@
     error,
     standardized,
     status = 'success',
+    duration,
     filepath,
     filePreviewScope = undefined,
     presentationRole = 'process',
@@ -364,7 +366,6 @@
   const agentSpawnStatusInfo = $derived(visualStatusInfo(agentSpawnVisualStatus));
   const agentSpawnFailed = $derived(agentSpawnVisualStatus === 'error');
   const agentSpawnDegraded = $derived(agentSpawnVisualStatus === 'degraded');
-  const agentSpawnRunning = $derived(agentSpawnVisualStatus === 'running' || agentSpawnVisualStatus === 'pending');
   const agentSpawnCreationFailed = $derived(agentSpawnFailed && !agentSpawnDisplay?.childTaskId);
 
   function agentSpawnFailureStageLabel(stage: string | undefined): string {
@@ -410,7 +411,6 @@
       workspacePath: filePreviewScope?.workspacePath ?? messagesState.currentWorkspacePath,
     });
   }
-
 
   // 目录/文件只读工具：只需紧凑 header
   const isCompactReadOnlyTool = $derived(name === 'file_read');
@@ -464,11 +464,12 @@
   // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
   // 被紧凑卡片规则吞掉；授权状态会自动展开到卡片内容区。
   const canExpand = $derived(
-    hasContent && (Boolean(toolApproval) || (!isCompactReadOnlyTool && !isCompactMutation)),
+    hasContent && (Boolean(toolApproval) || hasError || outcomeUnconfirmed || (!isCompactReadOnlyTool && !isCompactMutation)),
   );
   const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
+  const instanceId = $props.id();
   const detailId = $derived(
-    id ? `tool-call-detail-${id.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined,
+    id ? `tool-call-detail-${id.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : `tool-call-detail-${instanceId}`,
   );
   const detailVisible = $derived(canExpand && !collapsed);
   const inputText = $derived(detailVisible ? formatToolInput(input) : '');
@@ -936,8 +937,7 @@
   </span>
 
   <span class="tool-title">
-    <span class="tool-name">{toolDisplayName}</span>
-    <ToolOriginBadge {origin} />
+    <span class="tool-name" title={toolDisplayName}>{toolDisplayName}</span>
     {#if status === 'error' && errorDiagnosis}
       <span class="error-tag error-{errorDiagnosis.category}" title={errorDiagnosis.ownerLabel}>
         {errorDiagnosis.categoryLabel}
@@ -956,17 +956,7 @@
     {/if}
   </span>
 
-  <span
-    class="tool-status status-{statusInfo.class}"
-    title={toolStatusLabel(visualStatus)}
-    aria-label={toolStatusLabel(visualStatus)}
-  >
-    {#if status === 'running' || status === 'pending'}
-      <span class="status-dot pulsing"></span>
-    {:else}
-      <span class="status-dot"></span>
-    {/if}
-  </span>
+  <ToolCardMeta status={statusInfo.class} label={toolStatusLabel(visualStatus)} expanded={canExpand ? !collapsed : undefined} {duration}><ToolOriginBadge {origin} /></ToolCardMeta>
 {/snippet}
 
 {#if isAgentSpawn && agentSpawnDisplay}
@@ -974,7 +964,7 @@
   {@const canOpen = !!display.childTaskId}
   <button
     type="button"
-    class="agent-spawn-card status-{agentSpawnStatusInfo.class}"
+    class="message-card agent-spawn-card status-{agentSpawnStatusInfo.class}"
     class:compact-agent={compactAgent}
     aria-label={[display.title, toolStatusLabel(agentSpawnVisualStatus), canOpen ? i18n.t('toolCall.agentSpawn.viewDetails') : ''].filter(Boolean).join(', ')}
     class:clickable={canOpen}
@@ -1022,39 +1012,14 @@
         {/if}
       {/if}
     </span>
-    <span class="agent-spawn-meta">
-      <span
-        class="tool-status status-{agentSpawnStatusInfo.class}"
-        title={toolStatusLabel(agentSpawnVisualStatus)}
-        aria-label={toolStatusLabel(agentSpawnVisualStatus)}
-      >
-        {#if agentSpawnRunning}
-          <span class="status-dot pulsing"></span>
-        {:else}
-          <span class="status-dot"></span>
-        {/if}
-        <span>{toolStatusLabel(agentSpawnVisualStatus)}</span>
-      </span>
-      {#if canOpen}
-        <span class="agent-spawn-cta" aria-hidden="true">
-          {#if !compactAgent}{i18n.t('toolCall.agentSpawn.viewDetails')}{/if}
-          <Icon name="chevron-right" size={12} />
-        </span>
-      {:else if agentSpawnDegraded}
-        <span class="agent-spawn-cta agent-spawn-cta-degraded">{i18n.t('toolCall.agentSpawn.mainlineHandling')}</span>
-      {:else if agentSpawnRunning}
-        <span class="agent-spawn-cta agent-spawn-cta-pending">{i18n.t('toolCall.agentSpawn.dispatching')}</span>
-      {:else if agentSpawnCreationFailed}
-        <span class="agent-spawn-cta agent-spawn-cta-failed">{i18n.t('toolCall.agentSpawn.notCreated')}</span>
-      {/if}
-    </span>
+    <ToolCardMeta status={agentSpawnStatusInfo.class} label={toolStatusLabel(agentSpawnVisualStatus)} expanded={canOpen ? false : undefined} {duration} />
   </button>
 {:else if isFileMutationTool && status === 'success'}
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
 {:else}
   {#if shouldRenderCard}
     <div
-      class="tool-call"
+      class="message-card tool-call"
       class:collapsed={canExpand && collapsed}
       class:has-error={hasError && !outcomeUnconfirmed}
       class:has-warning={outcomeUnconfirmed}
@@ -1070,9 +1035,6 @@
           aria-expanded={!collapsed}
           aria-controls={detailId}
         >
-          <span class="chevron">
-            <Icon name="chevron-right" size={12} />
-          </span>
           {@render headerContent()}
         </button>
       {:else}
@@ -1260,19 +1222,8 @@
 
 <style>
   .tool-call {
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
     margin-top: var(--space-2);
     overflow: hidden;
-    background: var(--surface-1);
-  }
-
-  .tool-call.has-error {
-    border-color: var(--error);
-  }
-
-  .tool-call.has-warning {
-    border-color: var(--warning);
   }
 
   /* 文件变更工具：紧凑 header-only 卡片，不可展开 */
@@ -1287,13 +1238,10 @@
     margin-top: var(--space-2);
   }
 
-  /* header 共享规范（高度/padding/字号/accent 条/chevron）见 styles/tool-card.css；
-     此处仅保留 ToolCall 特有的 clickable 变体 */
   .file-mutation-header.clickable {
     cursor: pointer;
   }
 
-  /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
     display: flex;
     color: var(--foreground-muted);
@@ -1319,102 +1267,21 @@
     flex: 1;
   }
 
-  .error-tag {
-    display: inline-flex;
-    align-items: center;
-    padding: 1px 6px;
-    border-radius: 999px;
-    border: var(--magi-hairline) solid transparent;
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    font-weight: var(--font-medium);
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .error-model_input {
-    color: var(--warning);
-    border-color: rgba(245, 158, 11, 0.45);
-    background: rgba(245, 158, 11, 0.12);
-  }
-
-  .error-context_stale {
-    color: var(--info);
-    border-color: rgba(59, 130, 246, 0.45);
-    background: rgba(59, 130, 246, 0.12);
-  }
-
-  .error-permission {
-    color: var(--warning);
-    border-color: rgba(234, 179, 8, 0.45);
-    background: rgba(234, 179, 8, 0.12);
-  }
-
-  .error-policy {
-    color: var(--warning);
-    border-color: rgba(249, 115, 22, 0.45);
-    background: rgba(249, 115, 22, 0.12);
-  }
-
-  .error-model_output {
-    color: var(--warning);
-    border-color: rgba(14, 165, 233, 0.45);
-    background: rgba(14, 165, 233, 0.12);
-  }
-
-  .error-workspace_write {
-    color: var(--error);
-    border-color: rgba(220, 38, 38, 0.45);
-    background: rgba(220, 38, 38, 0.12);
-  }
-
-  .error-runtime {
-    color: var(--error);
-    border-color: rgba(239, 68, 68, 0.45);
-    background: rgba(239, 68, 68, 0.12);
-  }
-
-  .tool-status {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    flex-shrink: 0;
-  }
-
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  .status-dot.pulsing {
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  .status-pending { color: var(--warning); }
-  .status-running { color: var(--info); }
-  .status-success { color: var(--success); }
-  .status-error { color: var(--error); }
-  .status-cancelled { color: var(--foreground-muted); }
-  .status-unconfirmed { color: var(--warning); }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
+  .error-tag { display:inline-flex; padding:0; font-size:var(--text-xs); line-height:1.4; white-space:nowrap; flex-shrink:0; color:var(--foreground-muted); }
+  .error-model_input,.error-permission,.error-policy,.error-model_output { color:var(--warning); }
+  .error-context_stale { color:var(--info); }
+  .error-workspace_write,.error-runtime { color:var(--error); }
 
   .tool-content {
-    padding: var(--space-3);
+    padding: 12px var(--tool-card-padding) 14px;
     border-top: var(--magi-hairline) solid var(--border);
-    background: var(--surface-2);
+    background: transparent;
   }
 
   .tool-content.diagram-content {
     padding: 0;
     background: var(--code-bg);
   }
-
 
   .tool-section { margin-top: var(--space-3); }
   .tool-section:first-child { margin-top: 0; }
@@ -1564,12 +1431,12 @@
 
   .error-content {
     color: var(--error);
-    background: rgba(239, 68, 68, 0.1);
+    background: transparent;
   }
 
   .tool-section.unconfirmed .error-content {
     color: var(--warning);
-    background: var(--warning-muted);
+    background: transparent;
   }
 
   .diagnosis-owner {
@@ -1578,10 +1445,12 @@
   }
 
   .error-hint {
+    background: transparent;
+    box-shadow: none;
     margin-top: var(--space-3);
-    padding: var(--space-3);
-    border-radius: var(--radius-sm);
-    border: 1px dashed var(--border);
+    padding: 0;
+    border-radius: 0;
+    border: 0;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: 1.5;
@@ -1617,13 +1486,10 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    padding: var(--space-3);
+    padding: 12px var(--tool-card-padding);
     margin-top: var(--space-2);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
     color: inherit;
-    transition: border-color var(--transition-fast), background var(--transition-fast);
+    transition: background-color var(--transition-fast);
   }
 
   .agent-spawn-card:disabled {
@@ -1634,18 +1500,12 @@
     cursor: pointer;
   }
 
+  .agent-spawn-card:focus-visible { outline:0; box-shadow:inset 0 0 0 1.5px var(--primary); }
+
+  .status-degraded .agent-spawn-error { color:var(--warning); }
+
   .agent-spawn-card.clickable:hover {
-    border-color: var(--info);
     background: var(--surface-hover);
-  }
-
-  .agent-spawn-card.status-error:not(.compact-agent) {
-    border-color: var(--error);
-  }
-
-  .agent-spawn-card.status-degraded:not(.compact-agent) {
-    border-color: color-mix(in srgb, var(--warning) 48%, var(--border));
-    background: color-mix(in srgb, var(--warning) 6%, var(--surface-1));
   }
 
   .agent-spawn-icon {
@@ -1717,52 +1577,11 @@
     color: var(--foreground-secondary);
   }
 
-  .agent-spawn-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    flex-shrink: 0;
-  }
-
-  .agent-spawn-cta {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    white-space: nowrap;
-  }
-
-  .agent-spawn-card.clickable:hover .agent-spawn-cta {
-    color: var(--info);
-  }
-
-  .agent-spawn-cta-pending {
-    font-style: italic;
-  }
-
-  .agent-spawn-cta-failed {
-    color: var(--error);
-  }
-
-  .agent-spawn-cta-degraded {
-    color: var(--warning);
-  }
-
-  .agent-spawn-card:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-  }
-
-  .status-degraded .agent-spawn-error {
-    color: var(--warning);
-  }
-
   .agent-spawn-card.compact-agent {
     gap: var(--space-2);
     margin-top: 0;
-    padding: 8px 4px;
+    padding: 8px var(--tool-card-padding);
+    box-shadow: none;
     border: 0;
     border-radius: 0;
     background: transparent;
@@ -1778,7 +1597,6 @@
       align-items: flex-start;
       gap: 2px;
     }
-    .agent-spawn-meta { gap: 4px; }
   }
 
   .uq-summary {

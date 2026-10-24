@@ -3,10 +3,10 @@
   import type { TimelineRenderItem } from '../types/message';
   import { untrack } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import Disclosure from './Disclosure.svelte';
   import MessageItem from './MessageItem.svelte';
-  import { resolveConversationToolGroupLabel } from '../lib/conversation-disclosure';
+  import { resolveConversationToolGroupLabel, resolveConversationToolGroupStatus } from '../lib/conversation-disclosure';
 
   interface Props {
     items: TimelineRenderItem[];
@@ -42,10 +42,8 @@
     aria-controls={contentId}
     onclick={toggle}
   >
-    <span class="tool-group-chevron" class:rotated={expanded}>
-      <Icon name="chevron-right" size={12} />
-    </span>
     <span class="tool-group-label">{groupLabel}</span>
+    <ToolCardMeta status={resolveConversationToolGroupStatus(items)} {expanded} />
   </button>
 
   <Disclosure {expanded}>
@@ -74,7 +72,7 @@
     width: 100%;
     min-height: 28px;
     gap: 7px;
-    padding: 0;
+    padding: 0 var(--tool-card-padding);
     border: 0;
     background: transparent;
     color: var(--foreground-muted);
@@ -92,14 +90,6 @@
     outline-offset: 3px;
   }
 
-  .tool-group-chevron {
-    display: inline-flex;
-    flex: 0 0 12px;
-    color: var(--foreground-muted);
-    opacity: 0.62;
-    transition: transform var(--transition-fast), opacity var(--transition-fast);
-  }
-
   .tool-group-label {
     flex: 1 1 auto;
     min-width: 0;
@@ -111,19 +101,9 @@
     white-space: nowrap;
   }
 
-  .tool-group-header:hover .tool-group-chevron,
-  .tool-group-header:focus-visible .tool-group-chevron,
-  .tool-group-chevron.rotated {
-    opacity: 1;
-  }
-
-  .tool-group-chevron.rotated {
-    transform: rotate(90deg);
-  }
-
   .tool-group-list {
     margin: 0;
-    padding: 0 0 1px 8px;
+    padding: 0 0 1px;
     border-left: 0;
   }
 
@@ -147,7 +127,7 @@
   :global(.conversation-turn .summary-tool-flow .tool-header) {
     min-height: 34px;
     gap: 8px;
-    padding: 4px 0;
+    padding: 6px var(--tool-card-padding);
     transition: color var(--transition-fast);
   }
 
@@ -172,22 +152,6 @@
     border-radius: var(--radius-sm);
   }
 
-  :global(.conversation-turn .summary-tool-flow .chevron) {
-    flex: 0 0 12px;
-    color: var(--foreground-muted);
-  }
-
-  :global(.conversation-turn .summary-tool-flow .tool-icon) {
-    flex: 0 0 14px;
-    color: var(--foreground-muted);
-    opacity: 0.78;
-  }
-
-  :global(.conversation-turn .summary-tool-flow .status-dot) {
-    width: 6px;
-    height: 6px;
-  }
-
   :global(.conversation-turn .summary-tool-flow .tool-content) {
     margin: 0 0 8px;
     padding: 7px 0 7px 8px;
@@ -209,7 +173,7 @@
     }
 
     .tool-group-list {
-      padding-left: 6px;
+      padding-left: 0;
     }
 
     :global(.conversation-turn .summary-tool-flow .tool-content) {

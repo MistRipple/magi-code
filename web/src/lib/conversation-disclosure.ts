@@ -415,6 +415,13 @@ function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+/** Summary color comes from the same canonical outcomes as detailed tool rows. */
+export function resolveConversationToolGroupStatus(items: TimelineRenderItem[]): ToolCallStatus {
+  const statuses = items.map(toolStatus);
+  return (['error', 'unconfirmed', 'running', 'pending', 'cancelled', 'success'] as const)
+    .find((status) => statuses.includes(status)) ?? 'success';
+}
+
 export function resolveConversationToolGroupLabel(
   items: TimelineRenderItem[],
   translate: ConversationTranslate,

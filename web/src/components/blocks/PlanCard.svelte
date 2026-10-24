@@ -15,7 +15,7 @@
 </script>
 
 {#if plan}
-  <div class="plan-card">
+  <div class="message-card plan-card">
     <div class="plan-header">
       <span class="plan-title">
         <Icon name="note" size={14} />
@@ -78,11 +78,7 @@
 {/if}
 
 <style>
-  /* 中性卡身，无左侧 accent 条；padding 由 plan-header（全局 SSoT）和 plan-body 各自管理 */
   .plan-card {
-    background: var(--surface-1);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
     margin: var(--space-2) 0;
   }
 
@@ -97,7 +93,7 @@
 
   /* plan-body：承载所有 header 以下内容的 padding */
   .plan-body {
-    padding: var(--space-2) var(--space-4) var(--space-4);
+    padding: 0 var(--tool-card-padding) 14px;
   }
 
   .plan-goal {
@@ -112,8 +108,6 @@
 
   .section-title {
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
     color: var(--foreground-muted);
     margin-bottom: var(--space-1);
   }
@@ -136,10 +130,8 @@
     display: inline-flex;
     align-items: center;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: 4px;
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
   }
 
   .risk-badge.low {

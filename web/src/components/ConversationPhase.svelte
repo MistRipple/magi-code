@@ -10,7 +10,7 @@
     type ConversationPhase as ConversationPhaseModel,
   } from '../lib/conversation-disclosure';
   import { i18n } from '../stores/i18n.svelte';
-  import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import MessageItem from './MessageItem.svelte';
   import ConversationProcessRow from './ConversationProcessRow.svelte';
   import ConversationThinkingText from './ConversationThinkingText.svelte';
@@ -102,25 +102,13 @@
       aria-controls={contentId}
       onclick={toggle}
     >
-      <span class="conversation-phase-chevron" class:rotated={expanded}>
-        <Icon name="chevron-right" size={12} />
-      </span>
       <span class="conversation-phase-label" title={summary}>{headerLabel}</span>
-      {#if active}
-        <span class="conversation-phase-live" aria-label={i18n.t('messageList.turnDisclosure.processing')}>
-          <span class="conversation-phase-live-dot"></span>
-        </span>
-      {/if}
+      <ToolCardMeta status={active ? 'running' : undefined} label={headerLabel} {expanded} />
     </button>
   {:else}
     <div class="conversation-phase-header conversation-phase-header--static">
-      <span class="conversation-phase-marker" aria-hidden="true"></span>
       <span class="conversation-phase-label" title={summary}>{headerLabel}</span>
-      {#if active}
-        <span class="conversation-phase-live" aria-label={i18n.t('messageList.turnDisclosure.processing')}>
-          <span class="conversation-phase-live-dot"></span>
-        </span>
-      {/if}
+      <ToolCardMeta status={active ? 'running' : undefined} label={headerLabel} />
     </div>
   {/if}
 
@@ -175,7 +163,7 @@
     width: 100%;
     min-height: 28px;
     gap: 7px;
-    padding: 0;
+    padding: 0 var(--tool-card-padding);
     border: 0;
     border-radius: 0;
     background: transparent;
@@ -205,44 +193,6 @@
     color: var(--foreground-muted);
   }
 
-  /* 与过程行同款的中性节点，保证静态标题与可展开标题左侧对齐。 */
-  .conversation-phase-marker {
-    position: relative;
-    flex: 0 0 12px;
-    width: 12px;
-    height: 18px;
-  }
-
-  .conversation-phase-marker::before {
-    content: '';
-    position: absolute;
-    top: 7px;
-    left: 4px;
-    width: 4px;
-    height: 4px;
-    border-radius: 50%;
-    background: currentColor;
-    opacity: 0.52;
-  }
-
-  .conversation-phase-chevron {
-    display: inline-flex;
-    flex: 0 0 12px;
-    color: currentColor;
-    opacity: 0.68;
-    transition: transform var(--transition-fast), opacity var(--transition-fast);
-  }
-
-  .conversation-phase-chevron.rotated,
-  .conversation-phase-header:hover .conversation-phase-chevron,
-  .conversation-phase-header:focus-visible .conversation-phase-chevron {
-    opacity: 1;
-  }
-
-  .conversation-phase-chevron.rotated {
-    transform: rotate(90deg);
-  }
-
   .conversation-phase-label {
     min-width: 0;
     overflow: hidden;
@@ -251,24 +201,6 @@
     line-height: 1.3;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .conversation-phase-live {
-    display: inline-flex;
-    flex: 0 0 auto;
-    align-items: center;
-    justify-content: center;
-    width: 12px;
-    height: 12px;
-    margin-left: auto;
-  }
-
-  .conversation-phase-live-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--success);
-    animation: conversation-phase-pulse 1.5s ease-in-out infinite;
   }
 
   .conversation-phase-content {
@@ -298,12 +230,6 @@
   @keyframes conversation-phase-pulse {
     50% {
       opacity: 0.35;
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .conversation-phase-live-dot {
-      animation: none;
     }
   }
 

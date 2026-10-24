@@ -10,6 +10,7 @@
   import { getAgentMessageItem } from '../web/agent-api';
   import { valueToDisplayText } from '../stores/turn-projection';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import Disclosure from './Disclosure.svelte';
   import ToolCall from './ToolCall.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
@@ -28,6 +29,8 @@
   let loading = $state('');
   let error = $state('');
   $effect(() => { if (!manual && wasLive && !live) expanded = false; wasLive = live; });
+  const contentId = $props.id();
+  const overallStatus = $derived(snapshot.steps.some((step) => step.status === 'failed') ? 'error' : snapshot.steps.some((step) => step.status === 'blocked') ? 'pending' : live ? 'running' : snapshot.steps.some((step) => step.status === 'canceled') ? 'cancelled' : 'success');
   const label = (status: ExecutionStepStatus) => i18n.t(`executionSteps.status.${status}`);
   function icon(status: ExecutionStepStatus): IconName {
     return status === 'completed' ? 'check' : status === 'running' ? 'loader' : status === 'blocked' || status === 'failed' ? 'alert-triangle' : status === 'canceled' ? 'close' : 'circle';
@@ -55,19 +58,19 @@
   }
 </script>
 
-<section class="execution-steps" data-testid="execution-steps" aria-label={i18n.t('executionSteps.title')}>
-  <button class="execution-steps-header" type="button" aria-expanded={expanded} onclick={() => { manual = true; expanded = !expanded; }}>
+<section class="message-card execution-steps" data-testid="execution-steps" aria-label={i18n.t('executionSteps.title')}>
+  <button class="execution-steps-header" type="button" aria-expanded={expanded} aria-controls={contentId} onclick={() => { manual = true; expanded = !expanded; }}>
     <span class="execution-steps-title"><Icon name="list" size={14} /> {i18n.t('executionSteps.title')}</span>
-    <span class="execution-steps-count">{completed} / {snapshot.steps.length}<Icon name={expanded ? 'chevron-down' : 'chevron-right'} size={13} /></span>
+    <ToolCardMeta status={overallStatus} label={i18n.t(`terminalSession.status.${overallStatus}`)} {expanded}><span class="execution-steps-count">{completed} / {snapshot.steps.length}</span></ToolCardMeta>
   </button>
   <Disclosure {expanded}>
-    <ol>
+    <ol id={contentId}>
       {#each snapshot.steps as step (step.stepId)}
         <li class:running={step.status === 'running'} class:completed={step.status === 'completed'} class:problem={step.status === 'blocked' || step.status === 'failed'}>
           <button class="step-button" type="button" aria-expanded={!!selected[step.stepId]} onclick={() => toggleStep(step.stepId)}>
             <span class="step-icon" aria-label={label(step.status)}><Icon name={icon(step.status)} size={15} class={step.status === 'running' ? 'spinning' : ''} /></span>
             <span class="step-copy"><span class="step-title">{step.title}</span>{#if step.reason}<span class="step-reason">{step.reason}</span>{/if}</span>
-            <span class="step-status">{label(step.status)}</span>
+            <ToolCardMeta status={step.status === 'completed' ? 'success' : step.status === 'failed' ? 'error' : step.status === 'canceled' ? 'cancelled' : step.status === 'blocked' ? 'pending' : step.status} label={label(step.status)} expanded={!!selected[step.stepId]} />
           </button>
           <Disclosure expanded={!!selected[step.stepId]}>
             <div class="step-details">
@@ -87,18 +90,18 @@
   </Disclosure>
 </section>
 <style>
-  .execution-steps { margin: 8px 0 12px; padding: 10px 12px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; }
-  .execution-steps-header { border:0; background:none; width:100%; padding:0; display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--foreground-muted); font-size:12px; cursor:pointer; text-align:left; }
+  .execution-steps { margin: 8px 0 12px; padding: 0; }
+  .execution-steps-header { border:0; background:none; width:100%; padding:9px var(--tool-card-padding); min-height:42px; display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--foreground-muted); font-size:12px; cursor:pointer; text-align:left; }
   .execution-steps-title { display:flex; gap:6px; align-items:center; color:var(--foreground); font-weight:var(--font-semibold); }
   .execution-steps-count { display:flex; align-items:center; gap:8px; font-variant-numeric:tabular-nums; }
-  ol { list-style:none; padding:0; margin:10px 0 0; display:flex; flex-direction:column; gap:7px; }
+  ol { list-style:none; padding:0 var(--tool-card-padding) 14px; margin:6px 0 0; display:flex; flex-direction:column; gap:7px; }
   li { color:var(--foreground-muted); font-size:13px; line-height:1.45; }
   li.running { color:var(--foreground); } li.problem { color:var(--error); }
-  .step-button { display:flex; width:100%; gap:8px; align-items:flex-start; border:0; background:none; padding:0; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+  .step-button { display:flex; width:100%; gap:8px; align-items:center; border:0; background:none; padding:0; color:inherit; font:inherit; text-align:left; cursor:pointer; }
   .step-icon { width:16px; display:inline-flex; justify-content:center; padding-top:2px; flex-shrink:0; } li.running .step-icon { color:var(--primary); } li.completed .step-icon { color:var(--success); }
-  .step-copy { display:flex; flex-direction:column; min-width:0; flex:1; } .step-title { overflow-wrap:anywhere; } .step-reason { color:var(--foreground-muted); font-size: var(--text-xs); white-space:pre-wrap; } .step-status { font-size: var(--text-xs); white-space:nowrap; }
+  .step-copy { display:flex; flex-direction:column; min-width:0; flex:1; } .step-title { overflow-wrap:anywhere; } .step-reason { color:var(--foreground-muted); font-size: var(--text-xs); white-space:pre-wrap; }
   .step-details { margin:8px 0 5px 24px; display:flex; flex-direction:column; gap:6px; color:var(--foreground-muted); font-size:12px; }
   .agent-link { background:none; border:0; color:var(--primary); padding:0; cursor:pointer; text-align:left; }
   button:focus-visible { outline:2px solid var(--primary); outline-offset:3px; border-radius:3px; }
-  @media (max-width:480px) { .step-status { display:none; } }
+
 </style>

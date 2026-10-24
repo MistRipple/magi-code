@@ -12,7 +12,7 @@
     turnStoreState,
   } from '../stores/turn-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
   import ConversationAgentGroup from './ConversationAgentGroup.svelte';
@@ -214,10 +214,10 @@
         aria-controls={`turn-process-${turnId}`}
         onclick={toggle}
       >
-        <span class="turn-disclosure-label">{disclosureLabel}</span>
-        <span class="turn-disclosure-chevron" class:rotated={expanded}>
-          <Icon name="chevron-right" size={14} />
-        </span>
+        <span class="turn-disclosure-label">{i18n.t(isLive ? 'messageList.turnDisclosure.processing' : 'messageList.turnDisclosure.processed')}</span>
+        <ToolCardMeta status={isLive ? 'running' : undefined} label={disclosureLabel} {expanded}>
+          {#if durationLabel}<span class="turn-duration">{durationLabel}</span>{/if}
+        </ToolCardMeta>
       </button>
 
     </section>
@@ -325,7 +325,7 @@
     width: 100%;
     min-height: 38px;
     gap: 8px;
-    padding: 0;
+    padding: 0 var(--tool-card-padding);
     border: 0;
     border-bottom: var(--magi-hairline) solid var(--border);
     border-radius: 0;
@@ -358,16 +358,7 @@
     font-weight: var(--font-medium);
   }
 
-  .turn-disclosure-chevron {
-    display: inline-flex;
-    flex: 0 0 auto;
-    transition: transform var(--transition-fast), color var(--transition-fast);
-  }
-
-  .turn-disclosure-chevron.rotated {
-    transform: rotate(90deg);
-    color: var(--foreground);
-  }
+  .turn-duration { white-space: nowrap; font-variant-numeric: tabular-nums; }
 
   .turn-earlier-steps {
     display: flex;
@@ -406,6 +397,8 @@
   .turn-runtime-row :global(.turn-runtime-indicator) {
     margin-left: 0;
   }
+
+  .conversation-turn > :global(.message-item.assistant) { padding-inline:0; }
 
   .turn-promoted {
     min-width: 0;

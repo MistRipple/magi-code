@@ -4,6 +4,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import {
     dispatchWebModelAction,
     webModelFailureAction,
@@ -116,14 +117,16 @@
   });
 </script>
 
-<section class="model-failure" data-model-failure-code={failure.code}>
+<section class="message-card model-failure" data-model-failure-code={failure.code}>
   <header class="model-failure-header">
     <span class="model-failure-title">
       <Icon name="alert-triangle" size={16} />
       {title}
     </span>
+    <ToolCardMeta status="error" label={title}>
     <button
       type="button"
+      aria-label={copied ? i18n.t('messageItem.modelFailure.copied') : i18n.t('messageItem.modelFailure.copy')}
       class="model-failure-copy" class:copied data-copy-feedback={copied}
       onclick={() => void copyFailure()}
       title={copied
@@ -132,6 +135,7 @@
     >
       <Icon name={copied ? 'check' : 'copy'} size={14} />
     </button>
+    </ToolCardMeta>
   </header>
 
   <p class="model-failure-summary">{failure.summary}</p>
@@ -179,10 +183,10 @@
     width: 100%;
     max-width: none;
     box-sizing: border-box;
-    padding: var(--space-3) var(--space-4);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 42%, var(--border));
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--error) 7%, var(--surface));
+    padding: 9px var(--tool-card-padding) 14px;
+    border:0;
+    border-radius: var(--tool-card-radius);
+    background:var(--surface-1);
     color: var(--foreground);
     text-align: left;
   }
@@ -270,7 +274,7 @@
 
   .model-failure-action {
     padding: 4px 12px;
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 42%, var(--border));
+    border:0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground);

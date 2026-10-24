@@ -256,9 +256,11 @@
     }
   });
   const usesCardShell = $derived.by(() => (
-    isInteraction
-    || shouldCollapseSystemSection
-    || messageTypeRequiresCardShell
+    !modelFailure && !toolCallFailure && (
+      isInteraction
+      || shouldCollapseSystemSection
+      || messageTypeRequiresCardShell
+    )
   ));
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
   const turnItemKind = $derived.by(() => {
@@ -419,7 +421,7 @@
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
 {#if executionSteps}
-  <div data-message-id={message.id}><ExecutionSteps snapshot={executionSteps} sessionId={(filePreviewScope?.sessionId || (typeof message.metadata?.sessionId === 'string' ? message.metadata.sessionId : ''))} {filePreviewScope} /></div>
+  <div class="execution-steps-message" data-message-id={message.id}><ExecutionSteps snapshot={executionSteps} sessionId={(filePreviewScope?.sessionId || (typeof message.metadata?.sessionId === 'string' ? message.metadata.sessionId : ''))} {filePreviewScope} /></div>
 {:else if isNotice && noticeText && noticeText.trim()}
   <div
     class="system-notice {noticeType}"
@@ -846,6 +848,9 @@
     animation: magi-feedback-pop 500ms var(--magi-spring-bouncy),
       magi-feedback-fade 160ms 2340ms ease-out forwards;
   }
+
+  .execution-steps-message { min-width:0; padding-inline:var(--space-4); }
+  :global(.conversation-turn) .execution-steps-message { padding-inline:0; }
 
   /* ===== 助手消息基础样式：默认纯正文，不带卡片壳 ===== */
   .message-item.assistant {

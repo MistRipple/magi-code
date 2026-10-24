@@ -1,20 +1,16 @@
-/* ============================================
-   格式卡片 header 共享视觉规范（single source of truth）
-   ----------------------------------------------
-   覆盖以下使用同一 header 设计语言的组件：
-     - ToolCall.svelte       (.tool-header / .file-mutation-header)
-     - TerminalSessionCard   (.tool-header)
-     - FileChangeCard        (.tool-header)
-     - CodeBlock             (.code-header)
-     - ThinkingBlock         (.thinking-header)
-     - PlanCard              (.plan-header)
-
-   Svelte scoped CSS 隔离每个组件的私有样式，跨组件统一的尺寸/字体/padding/
-   chevron 等"接口级"规范必须落在全局样式中，组件内不允许重复定义同名属性，
-   避免漂移。背景色（surface）是唯一允许各组件保留差异化的点。
-   ============================================ */
-
-/* ---------- 1. header 容器尺寸/布局 ---------- */
+/* Shared card geometry. Facts and disclosure state remain owned by each renderer. */
+:root {
+  --tool-card-radius: 10px;
+  --tool-card-padding: 13px;
+  --tool-card-outline: color-mix(in srgb, var(--foreground) 9%, transparent);
+}
+:is(.tool-call, .thinking-block, .plan-card, .code-block, .diagram-shell, .execution-steps, .agent-spawn-card) {
+  min-width: 0;
+  border: 0;
+  border-radius: var(--tool-card-radius);
+  box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
+  background: var(--surface-1);
+}
 .tool-header,
 .file-mutation-header,
 .code-header,
@@ -22,86 +18,62 @@
 .plan-header {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: 8px;
   width: 100%;
-  min-height: 36px;
-  padding: var(--space-2) var(--space-4);
+  min-height: 42px;
+  padding: 9px var(--tool-card-padding);
   background: transparent;
-  border: none;
+  border: 0;
   text-align: left;
+  color: var(--foreground);
+  font: inherit;
   cursor: pointer;
-  transition: background var(--transition-fast);
+  transition: background-color var(--transition-fast);
   box-sizing: border-box;
 }
-
-.tool-header:hover,
-.code-header:hover,
-.thinking-header:hover,
-.plan-header:hover {
-  background: var(--surface-hover);
+:is(.tool-header, .code-header, .thinking-header):hover { background: var(--surface-hover); }
+:is(.tool-header, .thinking-header):focus-visible {
+  outline: 0;
+  box-shadow: inset 0 0 0 1.5px var(--primary);
+  border-radius: var(--tool-card-radius);
 }
-
-/* 折叠态只提示“可展开”，不把整行染成选中背景；保留 cursor 与标题/箭头反馈。 */
-.tool-call.collapsed .tool-header:hover,
-.code-block.collapsed .code-header:hover,
-.thinking-block.collapsed .thinking-header:hover,
-.plan-card.collapsed .plan-header:hover {
-  background: transparent;
-}
-
-/* file-mutation-header 默认无 hover（不可展开），但需要保持等高 */
-.file-mutation-header {
-  cursor: default;
-}
-
-/* 代码块标题栏是紧凑变体：正文往往只有一两行，沿用卡片的 36px 标题会让标题比内容还高。
-   其余卡片（工具、思考、计划）保持统一高度。 */
-.code-header {
-  min-height: 28px;
-  padding: 2px var(--space-3);
-  gap: var(--space-2);
-}
-
-/* ---------- 2. header 标题字体规范 ---------- */
-.tool-name,
-.lang-name,
-.thinking-title,
-.plan-title {
+.file-mutation-header, .plan-header { cursor: default; }
+.code-header { min-height: 36px; padding: 6px var(--tool-card-padding); }
+.tool-name, .lang-name, .thinking-title, .plan-title {
   font-weight: var(--font-medium);
   font-size: var(--text-sm);
   color: var(--foreground);
   white-space: nowrap;
-  flex-shrink: 0;
 }
+.tool-name { flex-shrink:0; max-width:50%; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tool-header > .tool-icon,.thinking-header > .thinking-icon { display:flex; align-items:center; justify-content:center; flex:0 0 15px; color:var(--foreground-muted); }
+/* Summary removes the material, while retaining the same metadata columns and targets. */
+.conversation-turn .summary-tool-flow :is(.tool-call,.thinking-block) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.conversation-turn .summary-tool-flow .tool-header { min-height:34px; padding:6px var(--tool-card-padding); }
+.conversation-turn .summary-tool-flow .tool-content { box-shadow:none; }
+.conversation-turn :is(.conversation-phase-header,.tool-group-header) { padding-inline:var(--tool-card-padding); }
+.conversation-turn :is(.conversation-phase-header,.tool-group-header):focus-visible { outline:0; box-shadow:inset 0 0 0 1px var(--primary); border-radius:6px; }
+@media(max-width:560px) { :root { --tool-card-padding:11px; } }
+@media(prefers-reduced-motion:reduce) { :is(.tool-header,.code-header,.thinking-header) { transition:none; } }
+/* A single internal contour, no layout-changing borders or colored edge strips. */
+.message-card {
+  position:relative;
+  min-width:0;
+  border:0;
+  border-radius:var(--tool-card-radius);
+  background:var(--surface-1);
+  box-shadow:inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
+  container-type:inline-size;
+}
+.message-card :is(.tool-content,.thinking-content,.plan-body) { text-wrap:pretty; }
+.conversation-turn .summary-tool-flow .message-card { box-shadow:none; }
+.tool-content .diagram-shell,.tool-content .diff-code-block { box-shadow:none; border:0; border-radius:0; margin:0; }
 
-/* ---------- 3. chevron 弱化 ---------- */
-.tool-call .chevron,
-.code-block .chevron,
-.thinking-block .chevron,
-.plan-card .chevron {
-  display: flex;
-  color: var(--foreground-muted);
-  opacity: 0.5;
-  transition: transform var(--transition-fast), opacity var(--transition-fast);
-}
-
-.tool-call .tool-header:hover .chevron,
-.tool-call:not(.collapsed) .chevron,
-.code-block .code-header:hover .chevron,
-.code-block:not(.collapsed) .chevron,
-.thinking-block .thinking-header:hover .chevron,
-.thinking-block:not(.collapsed) .chevron {
-  opacity: 1;
-}
-
-.tool-call.collapsed .chevron,
-.code-block.collapsed .chevron,
-.thinking-block.collapsed .chevron {
-  transform: rotate(0deg);
-}
-
-.tool-call:not(.collapsed) .chevron,
-.code-block:not(.collapsed) .chevron,
-.thinking-block:not(.collapsed) .chevron {
-  transform: rotate(90deg);
-}
+.message-card .tool-title .filespan { min-width:0; background:transparent; padding:0; }
+.message-card .tool-title .filespan:hover { background:var(--surface-hover); }
+.message-card .tool-title .filespan-name { color:var(--foreground-muted); }

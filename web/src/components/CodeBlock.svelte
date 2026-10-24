@@ -1,5 +1,7 @@
 <script lang="ts">
   import FileName from './FileName.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
+  import Icon from './Icon.svelte';
   import { getContext, onDestroy } from 'svelte';
   import Disclosure from './Disclosure.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
@@ -33,6 +35,8 @@
     showCopyButton = true,
     isStreaming = false,
   }: Props = $props();
+
+  const contentId = $props.id();
 
   // 状态
   let collapsed = $state(false);
@@ -157,15 +161,10 @@
 {#if diagramPayload && !isStreaming}
   <DiagramRenderer payload={diagramPayload} />
 {:else}
-  <div class="code-block" class:collapsed>
+  <div class="message-card code-block" class:collapsed>
     <!-- 普通代码块（或流式中的图表代码） -->
     <div class="code-header">
-      <button class="header-left" onclick={toggle}>
-        <span class="chevron">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/>
-          </svg>
-        </span>
+      <button class="header-left" onclick={toggle} aria-expanded={!collapsed} aria-controls={contentId}>
 
         <span class="code-icon">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -197,27 +196,20 @@
         </span>
       </button>
 
-      {#if showCopyButton}
-        <button class="copy-btn" onclick={copyCode} class:copied>
-          {#key copyRevision}
-          {#if copied}
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M12.736 3.97a.733.733 0 0 1 1.047 0c.286.289.29.756.01 1.05L7.88 12.01a.733.733 0 0 1-1.065.02L3.217 8.384a.757.757 0 0 1 0-1.06.733.733 0 0 1 1.047 0l3.052 3.093 5.4-6.425z"/>
-            </svg>
-            <span>{i18n.t('codeBlock.copied')}</span>
-          {:else}
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M4 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1h1v1a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h1v1H2z"/>
-            </svg>
-            <span>{i18n.t('codeBlock.copy')}</span>
-          {/if}
-          {/key}
+      <div class="code-actions">
+        {#if showCopyButton}
+          <button class="copy-btn" onclick={copyCode} class:copied aria-label={i18n.t(copied ? 'codeBlock.copied' : 'codeBlock.copy')} title={i18n.t(copied ? 'codeBlock.copied' : 'codeBlock.copy')}>
+            {#key copyRevision}<Icon name={copied ? 'check' : 'copy'} size={14} />{/key}
+          </button>
+        {/if}
+        <button class="code-disclosure" onclick={toggle} aria-expanded={!collapsed} aria-controls={contentId} aria-label={langName}>
+          <ToolCardMeta expanded={!collapsed} />
         </button>
-      {/if}
+      </div>
     </div>
 
     <Disclosure expanded={!collapsed}>
-      <div class="code-content">
+      <div class="code-content" id={contentId}>
         {#if showLineNumbers}
           <div class="line-numbers">
             {#each lines as _, i}
@@ -244,21 +236,16 @@
 {/if}
 
 <style>
-  /* 与 tool-card 风格统一：左侧 3px accent 条 (info 蓝)，承载"格式卡片"的状态标识 */
   .code-block {
     position: relative;
-    border: var(--magi-hairline) solid var(--code-border);
-    border-radius: var(--radius-md);
+
     margin: var(--spacing-sm) 0;
     overflow: hidden;
-    background: var(--code-bg);
   }
 
-  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
-     CodeBlock 特有：header 底部有分隔线 + 独立 header 背景色 */
   .code-header {
     justify-content: space-between;
-    background: var(--code-header-bg);
+    background: transparent;
     border-bottom: var(--magi-hairline) solid var(--code-border);
     user-select: none;
   }
@@ -279,6 +266,9 @@
     outline: none;
   }
 
+  .code-actions { display:flex; align-items:center; gap:8px; flex:none; }
+  .code-disclosure { display:flex; align-items:center; min-height:26px; padding:0; border:0; background:transparent; cursor:pointer; color:var(--foreground-muted); }
+  .header-left:focus-visible,.code-disclosure:focus-visible,.copy-btn:focus-visible { outline:0; box-shadow:inset 0 0 0 1px var(--primary); border-radius:4px; }
   .code-icon {
     display: flex;
     align-items: center;
@@ -293,13 +283,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  /* lang-name 字号字重与 .tool-name 共享见 styles/tool-card.css；
-     仅保留 uppercase 作为代码语言标签的语义区分 */
-  .lang-name {
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
   }
 
   .filepath {
@@ -335,13 +318,16 @@
     align-items: center;
     gap: 6px;
     background: transparent;
-    border: var(--magi-hairline) solid transparent;
+    border: 0;
     border-radius: 4px;
-    padding: 2px 6px;
+    padding: 0;
+    width: 26px;
+    height: 26px;
+    justify-content: center;
     color: var(--foreground-muted);
     font-size: var(--font-size-xs);
     cursor: pointer;
-    transition: all 0.2s;
+    transition: color var(--transition-fast), background-color var(--transition-fast);
   }
 
   .copy-btn:hover {

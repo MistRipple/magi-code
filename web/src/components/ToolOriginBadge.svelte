@@ -18,9 +18,7 @@
 <style>
   .tool-origin {
     flex: 0 0 auto;
-    padding: 0 6px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: 9px;
+    padding: 0;
     font-size: var(--text-xs);
     line-height: 16px;
     color: var(--foreground-muted);

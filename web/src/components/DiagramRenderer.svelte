@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { Component } from 'svelte';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import type { DiagramPayload } from '../lib/diagram-payload';
   import { postMessage } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
@@ -223,7 +224,7 @@
 {#if embedded}
   {@render rendererContent()}
 {:else}
-  <div class="diagram-shell">
+  <div class="message-card diagram-shell">
     <div class="diagram-header">
       <div class="header-left">
         <Icon name="git-branch" size={14} />
@@ -232,12 +233,13 @@
           <span class="header-title">{displayTitle}</span>
         {/if}
       </div>
-      <div class="header-actions">
+      <ToolCardMeta>
         <button
           class="header-btn" class:copied data-copy-feedback={copied}
           onclick={copyPayload}
           disabled={!canCopyPayload}
           title={i18n.t('diagramRenderer.copyData')}
+          aria-label={i18n.t(copied ? 'codeBlock.copied' : 'diagramRenderer.copyData')}
         >
           <Icon name={copied ? 'check' : 'copy'} size={14} />
         </button>
@@ -246,10 +248,11 @@
           onclick={openPreview}
           disabled={!canCopyPayload}
           title={i18n.t('diagramRenderer.openInNewTab')}
+          aria-label={i18n.t('diagramRenderer.openInNewTab')}
         >
           <Icon name="external-link" size={14} />
         </button>
-      </div>
+      </ToolCardMeta>
     </div>
     <div class="diagram-body">
       {@render rendererContent()}
@@ -261,9 +264,6 @@
   .diagram-shell {
     overflow: hidden;
     margin: var(--space-2, 8px) 0;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
   }
 
   .diagram-header {
@@ -271,9 +271,10 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--space-3, 12px);
-    padding: var(--space-2, 8px) var(--space-3, 12px);
+    min-height:42px;
+    padding:9px var(--tool-card-padding);
     border-bottom: var(--magi-hairline) solid var(--border);
-    background: var(--surface-2);
+    background:transparent;
   }
 
   .header-left {
@@ -281,7 +282,7 @@
     min-width: 0;
     align-items: center;
     gap: var(--space-2, 8px);
-    color: var(--info);
+    color:var(--foreground-muted);
   }
 
   .header-type,
@@ -300,13 +301,6 @@
     color: var(--foreground);
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .header-actions {
-    display: flex;
-    flex-shrink: 0;
-    align-items: center;
-    gap: 4px;
   }
 
   .header-btn {

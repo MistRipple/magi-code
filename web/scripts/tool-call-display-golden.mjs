@@ -76,7 +76,7 @@ assert.match(
 );
 assert.match(
   toolCallSource,
-  /const canExpand = \$derived\([\s\S]*?Boolean\(toolApproval\) \|\| \(!isCompactReadOnlyTool && !isCompactMutation\)/,
+  /const canExpand = \$derived\([\s\S]*?Boolean\(toolApproval\) \|\| hasError \|\| outcomeUnconfirmed \|\| \(!isCompactReadOnlyTool && !isCompactMutation\)/,
   '紧凑文件工具出现待授权状态时必须保留可展开的授权动作',
 );
 
@@ -185,8 +185,8 @@ assert.doesNotMatch(
 );
 assert.match(
   conversationToolGroupSource,
-  /\.tool-group-list\s*\{[\s\S]*?padding:\s*0 0 1px 8px;[\s\S]*?border-left:\s*0;/,
-  '工具组内容只允许一级紧凑缩进，不能叠加第二条装饰线',
+  /\.tool-group-list\s*\{[\s\S]*?padding:\s*0 0 1px;[\s\S]*?border-left:\s*0;/,
+  '工具组不得增加水平偏移，右侧状态和箭头应与同层卡片保持共同列',
 );
 assert.doesNotMatch(
   conversationProcessRowSource,
@@ -283,6 +283,12 @@ await withGoldenViteServer(async (server) => {
     assert.ok(markup.includes(`agent-spawn-card status-${visualStatus}`), `${childStatus} 必须渲染真实子任务状态`);
     if (!['running', 'queued'].includes(childStatus)) assert.doesNotMatch(markup, /status-dot pulsing/);
   }
+  const compactReadFailure = render(toolCall.default, { props: {
+    name:'file_read', id:'compact-read-failure', status:'error',
+    input:{path:'missing.ts'}, error:'读取路径失败：路径不存在',
+  } }).body;
+  assert.match(compactReadFailure, /aria-expanded="false" aria-controls="tool-call-detail-compact-read-failure"/, '只读工具失败后可展开诊断，不会丢失错误详情');
+  assert.match(compactReadFailure, /status-error/, '只读失败仍保留红点');
   const recoveredCard = render(toolCall.default, { props: {
     name: 'agent_spawn', status: 'success', agentChildStatus: 'completed',
     output: { status: 'failed', child_task_id: 'recovered-child' },
@@ -321,7 +327,8 @@ await withGoldenViteServer(async (server) => {
   } }).body;
   assert.match(originalAgent, /agent-spawn-role/, '详细模式保留角色标识，与右侧代理详情对应');
   assert.match(originalAgent, /查看详情/, '详细模式保留详情操作的无障碍说明');
-  assert.match(originalAgent, /<span[^>]*>已完成<\/span>/, '详细模式直接显示文字状态，不要求用户辨认颜色');
+  assert.match(originalAgent, /role="img" aria-label="已完成"/, '详细模式用圆点显示状态，并保留可读的无障碍说明');
+  assert.doesNotMatch(originalAgent, /<span[^>]*>已完成<\/span>/, '状态不重复显示可见文字');
   assert.doesNotMatch(originalAgent, /agent-spawn-role-badge/, '角色身份无需额外的胶囊色块');
   assert.doesNotMatch(originalAgent, /compact-agent/, '详细模式保留任务卡片外观');
   assert.match(originalAgent, /data-agent-task-id="existing-child"/, '两种风格均打开原 Task');
@@ -484,7 +491,7 @@ await withGoldenViteServer(async (server) => {
     },
   }).body;
   assert.doesNotMatch(failedTerminalMarkup, /终端会话 #0|data-terminal-id="0"/);
-  assert.match(failedTerminalMarkup, /class="tool-call terminal-call [^"]*collapsed"/);
+  assert.match(failedTerminalMarkup, /class="[^"]*\btool-call terminal-call [^"]*\bcollapsed"/);
   assert.match(failedTerminalMarkup, /npm test -- --runInBand/);
   assert.match(failedTerminalMarkup, /测试命令参数无效/);
   assert.doesNotMatch(

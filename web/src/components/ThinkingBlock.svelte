@@ -3,6 +3,7 @@
   import type { FilePreviewScope } from '../lib/file-reference';
   import type { ThinkingBlock as ThinkingGroup, ThinkingSegment } from '../types/message';
   import Icon from './Icon.svelte';
+  import ToolCardMeta from './ToolCardMeta.svelte';
   import Disclosure from './Disclosure.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -29,13 +30,17 @@
     return segment.status === 'pending' || segment.status === 'running';
   }
 
+  const visualStatus = $derived(group.isStreaming ? 'running' : group.status === 'failed' ? 'error' : group.status === 'blocked' ? 'pending' : group.status === 'cancelled' ? 'cancelled' : 'success');
+  const instanceId = $props.id();
+  const contentId = `thinking-${instanceId}`;
+
   function toggle() {
     collapsed = !collapsed;
   }
 </script>
 
 <div
-  class="thinking-block"
+  class="message-card thinking-block"
   class:collapsed
   class:streaming={group.isStreaming}
   class:failed={group.status === 'failed'}
@@ -43,20 +48,17 @@
   data-thinking-group-id={group.groupId}
   data-thinking-segment-count={group.segments.length}
 >
-  <button class="thinking-header" onclick={toggle}>
-    <span class="chevron">
-      <Icon name="chevron-right" size={12} />
-    </span>
-
+  <button class="thinking-header" onclick={toggle} aria-expanded={!collapsed} aria-controls={contentId}>
     <span class="thinking-icon">
       <Icon name="clock" size={14} />
     </span>
 
     <span class="thinking-title">{title}</span>
+    <ToolCardMeta status={visualStatus} label={title} expanded={!collapsed} />
   </button>
 
   <Disclosure expanded={!collapsed}>
-    <div class="thinking-content">
+    <div class="thinking-content" id={contentId}>
       {#each group.segments as segment (segment.segmentId)}
         <div class="thinking-segment" data-thinking-segment-id={segment.segmentId}>
           {#if segment.content.trim()}
@@ -76,35 +78,18 @@
 
 <style>
   .thinking-block {
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
     margin-top: var(--space-2);
-    background: rgba(139, 92, 246, 0.05);
+
     overflow: hidden;
   }
 
-  .thinking-block.streaming {
-    border-color: color-mix(in srgb, #a855f7 25%, var(--border));
-  }
-
-  .thinking-block.failed {
-    border-color: color-mix(in srgb, var(--error) 55%, var(--border));
-  }
-
-  .thinking-block.interrupted {
-    border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
-  }
-
-  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
-     ThinkingBlock 特有：hover 用紫色 brand 而非通用 surface-hover */
   .thinking-header:hover {
-    background: rgba(139, 92, 246, 0.1);
+    background: var(--surface-hover);
   }
 
-  /* icon 保留紫色 brand 作为思考类型识别色（accent 条已用同色，形成视觉呼应） */
   .thinking-icon {
     display: flex;
-    color: #a855f7;
+    color: var(--foreground-muted);
   }
 
   .thinking-title {
@@ -116,7 +101,7 @@
 
   .thinking-content {
     border-top: var(--magi-hairline) solid var(--border);
-    background: rgba(139, 92, 246, 0.02);
+    background: transparent;
   }
 
   .thinking-segment {
@@ -133,12 +118,4 @@
     color: var(--foreground-muted);
   }
 
-  /* 流式动画 */
-  .streaming .thinking-icon {
-    animation: spin 2s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
 </style>

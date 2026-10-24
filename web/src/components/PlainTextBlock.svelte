@@ -29,9 +29,10 @@
   .plain-text-block {
     margin: var(--spacing-sm) 0;
     padding: var(--space-3);
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--assistant-message-bg) 88%, var(--surface) 12%);
-    border: var(--magi-hairline) solid var(--border);
+    border-radius: var(--tool-card-radius);
+    background: var(--code-bg);
+    border: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-word;

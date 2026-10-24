@@ -89,6 +89,10 @@ await withGoldenViteServer(async (server) => {
       blocks: [{ id: `${key}-b`, type: 'tool_call', toolCall: { id: key, name, arguments: args, status } }],
     }),
   });
+  assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'running')]), 'running');
+  assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'success'), toolItem('b', 'web_fetch', {}, 'error')]), 'error');
+  assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'unconfirmed')]), 'unconfirmed');
+  assert.equal(disclosure.resolveConversationToolGroupStatus([toolItem('a', 'web_fetch', {}, 'cancelled')]), 'cancelled');
   const groupLabel = (items) => disclosure.resolveConversationToolGroupLabel(items, zhTranslate);
   for (const [name, args] of [['file_read', {}], ['shell_exec', {}], ['search_text', {}], ['file_write', {}]]) {
     const text = groupLabel([toolItem('t', name, args)]);

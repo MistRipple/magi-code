@@ -148,7 +148,7 @@
   .approval-button {
     min-height: 28px;
     padding: 0 var(--space-3);
-    border: var(--magi-hairline) solid var(--border);
+    border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);

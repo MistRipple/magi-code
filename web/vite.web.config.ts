@@ -73,6 +73,7 @@ export default defineConfig(({ mode }) => {
       exclude: ['mermaid'],
       include: [
         '@braintree/sanitize-url',
+        'elkjs/lib/elk.bundled.js',
         '@xterm/addon-fit',
         '@xterm/xterm',
         'cytoscape-cose-bilkent',
