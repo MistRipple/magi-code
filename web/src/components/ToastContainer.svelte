@@ -96,6 +96,7 @@
     gap: var(--space-3);
     z-index: var(--z-toast);
     pointer-events: none;
+    max-width: calc(100vw - 2 * var(--space-4));
   }
 
   .toast {
@@ -109,7 +110,8 @@
     box-shadow: var(--shadow-lg);
     pointer-events: auto;
     animation: slideIn var(--duration-normal) var(--ease-out);
-    max-width: 320px;
+    max-width: min(400px, 100%);
+    min-width: 0;
   }
 
   @keyframes slideIn {

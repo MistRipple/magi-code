@@ -1015,6 +1015,8 @@
 
 <style>
   .runtime-diagnostics-slot {
+    container-type: inline-size;
+    container-name: runtime-panel;
     position: absolute;
     inset: 0 0 auto;
     height: 0;
@@ -1461,7 +1463,7 @@
     color: var(--vscode-editorError-foreground, var(--error));
   }
 
-  @media (max-width: 640px) {
+  @container runtime-panel (max-width: 640px) {
     .runtime-diagnostics {
       margin: 6px 8px 0;
     }

@@ -145,11 +145,12 @@
 
   /* 开发规范阅读页：左侧章节目录、右侧正文；长表格与代码块只在自身内部滚动。 */
 
-  :global(.plugin-guide-page-body) { padding: 0; display: flex; min-height: 0; height: min(75vh, 800px); }
+  :global(.plugin-guide-page) { overflow: hidden; min-height: 0; }
+  :global(.plugin-guide-page .plugin-guide-page-body) { container-type: inline-size; container-name: plugin-guide; padding: 0; display: flex; min-height: 0; flex: 1 1 0; }
   .plugin-guide { display: grid; grid-template-columns: 208px minmax(0, 1fr); flex: 1; min-height: 0; min-width: 0; user-select: text; }
   .guide-toc { display: flex; flex-direction: column; gap: 2px; padding: var(--space-3) var(--space-2); overflow-y: auto; border-right: var(--magi-hairline) solid var(--border-subtle); }
   .guide-toc-item {
-    text-align: left; padding: 6px 10px; border: 0; border-radius: var(--radius-sm); background: transparent;
+    overflow-wrap: anywhere; text-align: left; padding: 6px 10px; border: 0; border-radius: var(--radius-sm); background: transparent;
     color: var(--foreground-muted); font-size: var(--text-xs); line-height: 1.4; cursor: pointer;
   }
   .guide-toc-item:hover { background: var(--surface-hover); color: var(--foreground); }
@@ -171,10 +172,11 @@
   .guide-article :global(.markdown-content code) { overflow-wrap: anywhere; }
   .guide-article :global(.markdown-content td:first-child code) { white-space: nowrap; overflow-wrap: normal; }
   /* 规范里的代码块都是几行的短片段：自动换行并隐藏行号，不让长注释被截断。 */
-  .guide-article :global(.markdown-content .code-pre) { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .guide-article :global(.markdown-content .code-pre),
+  .guide-article :global(.markdown-content .code-text) { white-space: pre-wrap; overflow-wrap: anywhere; }
   .guide-article :global(.markdown-content .line-numbers) { display: none; }
   .guide-article :global(.markdown-content .code-block) { margin: 16px 0; max-width: 100%; }
-  @media (max-width: 820px) {
+  @container plugin-guide (max-width: 760px) {
     .plugin-guide { grid-template-columns: minmax(0, 1fr); }
     .guide-toc { display: none; }
     .guide-scroll { padding: 20px 20px 40px; }

@@ -20,7 +20,6 @@
     key: string;
     name: string;
     children: TreeNode[];
-    statusKinds: EditType[];
   }
 
   interface FileNode {
@@ -101,19 +100,12 @@
     return edit.type ?? 'modify';
   }
 
-  function addStatusKind(directory: DirectoryNode, kind: EditType): void {
-    if (!directory.statusKinds.includes(kind)) {
-      directory.statusKinds.push(kind);
-    }
-  }
-
   function buildTree(sourceEdits: readonly Edit[], rootPath: string): DirectoryNode {
     const root: DirectoryNode = {
       kind: 'directory',
       key: '__change_tree_root__',
       name: '',
       children: [],
-      statusKinds: [],
     };
     const directories = new Map<string, DirectoryNode>();
     directories.set('', root);
@@ -130,10 +122,8 @@
 
     for (const [relativePath, edit] of latestEditsByPath) {
       const segments = relativePath.split('/').filter(Boolean);
-      const kind = editKind(edit);
       let parent = root;
       let parentKey = '';
-      addStatusKind(root, kind);
 
       for (const segment of segments.slice(0, -1)) {
         parentKey = parentKey ? `${parentKey}/${segment}` : segment;
@@ -144,12 +134,10 @@
             key: parentKey,
             name: segment,
             children: [],
-            statusKinds: [],
           };
           directories.set(parentKey, directory);
           parent.children.push(directory);
         }
-        addStatusKind(directory, kind);
         parent = directory;
       }
 
@@ -184,19 +172,6 @@
       keys.push(child.key, ...collectDirectoryKeys(child));
     }
     return keys;
-  }
-
-  function statusClass(kinds: readonly EditType[]): string {
-    return kinds.length === 1 ? kinds[0] : 'mixed';
-  }
-
-  function statusGlyph(kind: EditType): string {
-    switch (kind) {
-      case 'add': return '+';
-      case 'delete': return '−';
-      case 'rename': return '↗';
-      default: return '•';
-    }
   }
 
   function statusLabel(kind: EditType): string {
@@ -249,14 +224,14 @@
     }
   }
 
-  function editActorPresentation(edit: Edit): { kind: 'mainline' | 'agent' | 'external'; label: string; title: string } | null {
+  function editActorPresentation(edit: Edit): { label: string; title: string } | null {
     if (edit.sourceKind === 'tool') {
       return edit.workerId?.trim()
-        ? { kind: 'agent', label: i18n.t('edits.actor.agent'), title: i18n.t('edits.actor.agentTitle') }
-        : { kind: 'mainline', label: i18n.t('edits.actor.mainline'), title: i18n.t('edits.actor.mainlineTitle') };
+        ? { label: i18n.t('edits.actor.agent'), title: i18n.t('edits.actor.agentTitle') }
+        : { label: i18n.t('edits.actor.mainline'), title: i18n.t('edits.actor.mainlineTitle') };
     }
     if (edit.sourceKind === 'watcher' || edit.sourceKind === 'external') {
-      return { kind: 'external', label: i18n.t('edits.actor.external'), title: i18n.t('edits.actor.externalTitle') };
+      return { label: i18n.t('edits.actor.external'), title: i18n.t('edits.actor.externalTitle') };
     }
     return null;
   }
@@ -310,15 +285,10 @@
         title={node.name}
       >
         <span class="change-tree-chevron" class:expanded aria-hidden="true">
-          <Icon name="chevronDown" size={11} />
+          <Icon name="chevronDown" size={12} />
         </span>
         <Icon name="folder" size={14} class="change-tree-folder-icon" />
         <span class="change-tree-directory-name">{node.name}</span>
-        <span
-          class={`change-tree-status change-tree-status--${statusClass(node.statusKinds)}`}
-          title={i18n.t('edits.tree.directoryChanged')}
-          aria-hidden="true"
-        >•</span>
       </button>
       {#if expanded}
         <div class="change-tree-children" role="group">
@@ -348,28 +318,32 @@
       onclick={openFile.bind(null, node.edit)}
       onkeydown={(event) => handleFileKeydown(event, node.edit)}
     >
-      <span class="change-tree-chevron-spacer" aria-hidden="true"></span>
-      <FileTypeIcon path={node.edit.filePath} size={15} />
-      <span class="change-tree-file-name">
-        {#if kind === 'rename' && oldName}
-          <span class="change-tree-old-name"><FileName name={oldName} /></span>
-          <span class="change-tree-rename-arrow">→</span>
-        {/if}
-        <FileName name={node.name} />
-      </span>
-      <div class="change-tree-file-meta">
-        <span class="change-tree-file-tags">
-          {#if actor}
-            <span class="change-tree-tag change-tree-tag--{actor.kind}" title={actor.title}>{actor.label}</span>
+      <div class="change-tree-file-identity">
+        <span class="change-tree-chevron-spacer" aria-hidden="true"></span>
+        <FileTypeIcon path={node.edit.filePath} size={14} />
+        <span class="change-tree-file-name">
+          {#if kind === 'rename' && oldName}
+            <span class="change-tree-old-name"><FileName name={oldName} /></span>
+            <span class="change-tree-rename-arrow"><Icon name="arrow-right" size={12} /></span>
           {/if}
-          {#if contentKind !== 'text'}
-            <span class="change-tree-tag" title={contentKindLabel(contentKind)}>{contentKindLabel(contentKind)}</span>
-          {/if}
-          {#if node.edit.hasError}
-            <span class="change-tree-tag change-tree-tag--error" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
-          {/if}
+          <FileName name={node.name} />
         </span>
-        <span class={`change-tree-status change-tree-status--${kind}`} title={statusLabel(kind)}>{statusGlyph(kind)}</span>
+        {#if actor || contentKind !== 'text' || node.edit.hasError}
+          <span class="change-tree-file-tags">
+            {#if actor}
+              <span class="change-tree-tag" title={actor.title}>{actor.label}</span>
+            {/if}
+            {#if contentKind !== 'text'}
+              <span class="change-tree-tag" title={contentKindLabel(contentKind)}>{contentKindLabel(contentKind)}</span>
+            {/if}
+            {#if node.edit.hasError}
+              <span class="change-tree-tag change-tree-tag--error" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
+            {/if}
+          </span>
+        {/if}
+      </div>
+      <div class="change-tree-file-meta">
+        <span class={`change-tree-status change-tree-status--${kind}`}>{statusLabel(kind)}</span>
         {#if lineStats}
           <span
             class="change-tree-file-stats change-tree-file-stats--lines"
@@ -378,7 +352,7 @@
             <span class="stat-add">+{lineStats.additions}</span>
             <span class="stat-del">−{lineStats.deletions}</span>
           </span>
-        {:else}
+        {:else if stats}
           <span class="change-tree-file-stats" aria-label={stats || undefined}>{stats}</span>
         {/if}
         <div class="change-tree-actions">
@@ -390,7 +364,7 @@
             aria-label={i18n.t('edits.actions.approveChange')}
             onclick={(event) => { event.stopPropagation(); onApprove(node.edit); }}
           >
-            <Icon name="check" size={13} />
+            <Icon name="check" size={14} />
           </button>
           <button
             type="button"
@@ -400,7 +374,7 @@
             aria-label={node.edit.revertible === true ? i18n.t('edits.actions.revertChange') : i18n.t('edits.actions.revertUnavailable')}
             onclick={(event) => { event.stopPropagation(); onRevert(node.edit); }}
           >
-            <Icon name="undo" size={13} />
+            <Icon name="undo" size={14} />
           </button>
         </div>
       </div>
@@ -411,11 +385,12 @@
 <style>
   .change-file-tree {
     container-type: inline-size;
+    container-name: change-tree;
     overflow: hidden;
-    padding: 3px 0;
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 76%, transparent);
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--background) 62%, var(--surface-1));
+    padding: 4px;
+    border-radius: calc(var(--radius-sm) + 4px);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border-subtle);
+    background: transparent;
   }
 
   .change-tree-row {
@@ -426,8 +401,9 @@
     width: 100%;
     min-width: 0;
     min-height: 34px;
-    padding: 5px 8px 5px calc(8px + var(--change-tree-depth, 0) * 18px);
+    padding: 4px 8px 4px calc(8px + var(--change-tree-depth, 0) * 16px);
     border: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground);
     text-align: left;
@@ -501,12 +477,21 @@
   }
 
   .change-tree-directory-name {
+    font-size: var(--text-sm);
+    color: var(--foreground-muted);
+  }
+
+  .change-tree-file-identity {
+    display: flex;
     flex: 1 1 auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
   }
 
   .change-tree-file-name {
     display: inline-flex;
-    flex: 1 1 auto;
+    flex: 0 1 auto;
     gap: 4px;
     font-size: var(--text-sm);
   }
@@ -521,11 +506,10 @@
 
   .change-tree-file-meta {
     display: inline-flex;
-    width: 172px;
-    flex: 0 0 172px;
+    flex: 0 0 auto;
     align-items: center;
-    justify-content: flex-start;
-    gap: 4px;
+    justify-content: flex-end;
+    gap: 12px;
     margin-left: auto;
   }
 
@@ -533,48 +517,22 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    width: auto;
-    max-width: 72px;
+    flex-wrap: wrap;
+    flex: 0 1 auto;
     min-width: 0;
-    overflow: hidden;
   }
 
   .change-tree-tag {
     display: inline-flex;
     flex: 0 0 auto;
     align-items: center;
-    padding: 1px 4px;
-    border: var(--magi-hairline) solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--surface-2) 60%, transparent);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
-    font-weight: var(--font-medium);
     line-height: 1.35;
   }
 
   .change-tree-tag--error {
-    border-color: color-mix(in srgb, var(--error) 35%, var(--border-subtle));
-    background: color-mix(in srgb, var(--error) 18%, transparent);
     color: var(--error);
-  }
-
-  .change-tree-tag--mainline {
-    border-color: color-mix(in srgb, var(--info) 42%, var(--border-subtle));
-    background: color-mix(in srgb, var(--info) 16%, transparent);
-    color: var(--info);
-  }
-
-  .change-tree-tag--external {
-    border-color: color-mix(in srgb, var(--warning) 44%, var(--border-subtle));
-    background: color-mix(in srgb, var(--warning) 16%, transparent);
-    color: var(--warning);
-  }
-
-  .change-tree-tag--agent {
-    border-color: color-mix(in srgb, var(--color-orchestrator) 42%, var(--border-subtle));
-    background: color-mix(in srgb, var(--color-orchestrator) 16%, transparent);
-    color: var(--color-orchestrator);
   }
 
   .change-tree-file-stats {
@@ -586,9 +544,11 @@
   }
 
   .change-tree-file-stats--lines {
-    display: inline-flex;
+    display: inline-grid;
+    grid-template-columns: minmax(4ch, auto) minmax(4ch, auto);
     align-items: center;
-    gap: 4px;
+    gap: 8px;
+    text-align: right;
   }
 
   .stat-add { color: var(--success); }
@@ -598,51 +558,39 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: 20px;
-    flex: 0 0 20px;
-    border: var(--magi-hairline) solid currentColor;
-    border-radius: 4px;
-    font-size: 14px;
-    font-weight: var(--font-semibold);
+    font-size: var(--text-xs);
     line-height: 1;
-  }
-
-  .change-tree-row--directory .change-tree-status {
-    width: auto;
-    height: auto;
-    margin-left: auto;
-    border: 0;
-    font-size: 16px;
   }
 
   .change-tree-status--add { color: var(--success); }
   .change-tree-status--modify { color: var(--warning); }
   .change-tree-status--delete { color: var(--error); }
   .change-tree-status--rename { color: var(--info); }
-  .change-tree-status--mixed { color: var(--warning); }
 
   .change-tree-actions {
     display: inline-flex;
-    width: 44px;
-    justify-content: flex-start;
+    flex: 0 0 auto;
+    justify-content: flex-end;
     gap: 2px;
     opacity: 0;
+    pointer-events: none;
     transition: opacity var(--transition-fast);
   }
 
   .change-tree-row--file:hover .change-tree-actions,
   .change-tree-row--file:focus-within .change-tree-actions {
     opacity: 1;
+    pointer-events: auto;
   }
 
   .change-tree-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
-    border: var(--magi-hairline) solid transparent;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);
@@ -650,7 +598,6 @@
   }
 
   .change-tree-action:hover:not(:disabled) {
-    border-color: var(--border-subtle);
     background: var(--surface-hover);
     color: var(--foreground);
   }
@@ -666,17 +613,34 @@
   @media (hover: none) {
     .change-tree-actions {
       opacity: 1;
+      pointer-events: auto;
     }
   }
 
-  @container (max-width: 520px) {
-    .change-tree-file-meta {
-      width: auto;
-      flex-basis: auto;
+  @container change-tree (max-width: 620px) {
+    .change-tree-row--file {
+      flex-wrap: wrap;
+      gap: 2px 8px;
     }
 
-    .change-tree-file-tags {
-      display: none;
+    .change-tree-file-identity { flex-basis: 100%; }
+
+    .change-tree-file-meta {
+      margin-left: 42px;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-start;
     }
+
+    .change-tree-actions { margin-left: auto; opacity: 1; pointer-events: auto; }
+  }
+
+  @container change-tree (max-width: 420px) {
+    .change-tree-row { padding-left: calc(4px + min(var(--change-tree-depth, 0), 4) * 10px); }
+    .change-tree-file-identity { flex-wrap: wrap; }
+    .change-tree-file-name { flex: 1 1 0; }
+    .change-tree-file-tags { flex-basis: 100%; margin-left: 42px; }
   }
 </style>

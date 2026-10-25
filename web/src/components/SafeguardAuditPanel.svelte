@@ -181,13 +181,13 @@
   .audit-list { list-style: none; margin: 0; padding: 0; border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
   .audit-item { padding: var(--space-2) var(--space-3); display: flex; flex-direction: column; gap: 4px; }
   .audit-item + .audit-item { border-top: var(--magi-hairline) solid var(--border-subtle, var(--border)); }
-  .audit-item-head { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+  .audit-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
   .audit-decision { flex-shrink: 0; padding: 1px 8px; border-radius: 10px; font-size: var(--text-xs); background: color-mix(in srgb, var(--foreground) 10%, transparent); }
   .audit-decision[data-decision='hard_block'] { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
   .audit-decision[data-decision='audit_only'] { color: var(--foreground-muted); }
   .audit-tool { min-width: 0; font-family: var(--font-mono, monospace); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .audit-time { margin-left: auto; flex-shrink: 0; color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
   .audit-rules { display: flex; flex-wrap: wrap; gap: 4px; }
-  .audit-rules code { padding: 0 6px; border-radius: 4px; font-size: 12px; background: color-mix(in srgb, var(--foreground) 8%, transparent); }
-  .audit-meta { display: flex; flex-wrap: wrap; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--text-xs); }
+  .audit-rules code { max-width: 100%; overflow-wrap: anywhere; padding: 0 6px; border-radius: 4px; font-size: 12px; background: color-mix(in srgb, var(--foreground) 8%, transparent); }
+  .audit-meta { overflow-wrap: anywhere; display: flex; flex-wrap: wrap; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--text-xs); }
 </style>

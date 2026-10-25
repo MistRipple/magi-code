@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { icons, type IconName } from '../lib/icons';
+  import { icons, iconStyle, type IconName } from '../lib/icons';
 
   interface Props {
     name: IconName;
@@ -13,11 +13,19 @@
 </script>
 
 <svg 
-  viewBox="0 0 16 16" 
+  viewBox={iconStyle.viewBox}
   width={size} 
   height={size} 
-  fill="currentColor"
-  class={className}
+  fill={iconStyle.fill}
+  stroke={iconStyle.stroke}
+  stroke-width={iconStyle.strokeWidth}
+  stroke-linecap={iconStyle.strokeLinecap}
+  stroke-linejoin={iconStyle.strokeLinejoin}
+  style={`fill:${iconStyle.fill};stroke:${iconStyle.stroke};stroke-width:${iconStyle.strokeWidth};stroke-linecap:${iconStyle.strokeLinecap};stroke-linejoin:${iconStyle.strokeLinejoin}`}
+  class={`magi-icon ${className}`}
+  data-icon={name}
+  aria-hidden="true"
+  focusable="false"
 >
   {@html pathData}
 </svg>

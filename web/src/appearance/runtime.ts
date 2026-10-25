@@ -185,9 +185,10 @@ function applyRootTheme(
   const contrastFactor = Math.max(0.2, Math.min(0.9, scheme.contrast / 100));
   const materialAlpha = pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.84 : 0.7;
   // Derive all layers from the selected scheme, including custom themes.
-  const raised = mix(background, foreground, mode === 'dark' ? 0.045 : 0);
+  const raised = mix(background, foreground, mode === 'dark' ? 0.045 : 0.012);
   const floating = mix(background, foreground, mode === 'dark' ? 0.07 : 0);
-  const sidebar = mode === 'light' ? mix(background, foreground, 0.03) : background;
+  const sidebar = mode === 'light' ? mix(background, foreground, 0.035) : background;
+  const composer = mode === 'light' ? background : mix(background, foreground, 0.075);
   const panel = rgba(background, effectiveWallpaperUrl ? materialAlpha : 1);
   const mainPanel = rgba(raised, effectiveWallpaperUrl ? materialAlpha : 1);
   const elevated = rgba(floating, effectiveWallpaperUrl ? Math.min(0.98, materialAlpha + 0.1) : 1);
@@ -221,12 +222,12 @@ function applyRootTheme(
     '--surface-3': rgba(foreground, 0.06 + contrastFactor * 0.035),
     '--surface-hover': rgba(foreground, 0.07 + contrastFactor * 0.035),
     '--surface-active': rgba(foreground, 0.1 + contrastFactor * 0.04),
-    '--surface-selected': rgba(accent, 0.15),
+    '--surface-selected': rgba(foreground, mode === 'dark' ? 0.09 : 0.07),
     '--dropdown-bg': elevated,
     '--glass-bg': elevated,
     '--code-bg': critical,
     '--code-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
-    '--user-message-bg': rgba(accent, 0.16),
+    '--user-message-bg': rgba(foreground, mode === 'dark' ? 0.09 : 0.065),
     '--assistant-message-bg': mainPanel,
     '--overlay': mode === 'dark' ? 'rgba(0, 0, 0, 0.58)' : 'rgba(15, 23, 42, 0.34)',
     '--overlay-heavy': mode === 'dark' ? 'rgba(0, 0, 0, 0.76)' : 'rgba(15, 23, 42, 0.52)',
@@ -235,6 +236,7 @@ function applyRootTheme(
     '--magi-canvas': scheme.background,
     '--magi-surface-sidebar': rgba(sidebar, effectiveWallpaperUrl ? materialAlpha : 1),
     '--magi-surface-main': mainPanel,
+    '--magi-surface-composer': rgba(composer, effectiveWallpaperUrl ? materialAlpha : 1),
     '--magi-surface-right-pane': panel,
     '--magi-surface-dialog': elevated,
     '--magi-surface-popover': elevated,

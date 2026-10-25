@@ -1114,7 +1114,7 @@ import {
     background: color-mix(in srgb, var(--error) 7%, transparent);
   }
 
-  @media (max-width: 640px) {
+  @container settings-content (max-width: 640px) {
     .mcp-form-grid { grid-template-columns: 1fr; }
     .mcp-form-options {
       align-items: stretch;

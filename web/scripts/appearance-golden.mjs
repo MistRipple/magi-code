@@ -167,10 +167,15 @@ const project = new Function(ts.transpileModule(`
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText)();
 const darkProjection = project('dark', { background: '#0B0B0A', foreground: '#E7E7E4', accent: '#3B82F6', contrast: 62 });
 const lightProjection = project('light', { background: '#FCFCFB', foreground: '#272725', accent: '#2563EB', contrast: 52 });
+const messageCss = await readFile(new URL('../src/styles/messages.css', import.meta.url), 'utf8');
+assert.doesNotMatch(messageCss, /--msg-user-bg|--msg-user-border|\.user-content\s*\{[^}]*background:/, '消息共享样式不能覆盖组件从主题消费的用户气泡底色');
 assert.equal(darkProjection['--magi-surface-sidebar'], 'rgba(11, 11, 10, 1.000)');
-assert.equal(lightProjection['--magi-surface-sidebar'], 'rgba(246, 246, 245, 1.000)');
+assert.equal(lightProjection['--magi-surface-sidebar'], 'rgba(245, 245, 244, 1.000)');
+assert.equal(lightProjection['--magi-surface-main'], 'rgba(249, 249, 248, 1.000)');
+assert.equal(lightProjection['--magi-surface-composer'], 'rgba(252, 252, 251, 1.000)');
 for (const projection of [darkProjection, lightProjection]) {
   assert.notEqual(projection['--magi-surface-main'], projection['--magi-surface-sidebar']);
+  assert.notEqual(projection['--magi-surface-composer'], projection['--magi-surface-main'], '输入表面应独立于正文，避免浅色输入框消失或深色层级反转');
   const alpha = Number(projection['--border'].match(/, ([\d.]+)\)$/)[1]);
   assert.ok(alpha > 0.05 && alpha < 0.11, 'neutral dividers remain subtle and visible');
 }
@@ -179,4 +184,5 @@ assert.equal(custom['--magi-canvas'], '#102030', 'custom theme background stays 
 assert.equal(custom['--primary'], '#40B090', 'custom accents stay authoritative');
 assert.ok(custom['--magi-surface-main'].endsWith('0.980)'));
 assert.ok(custom['--magi-surface-sidebar'].endsWith('0.980)'));
+assert.ok(custom['--magi-surface-composer'].endsWith('0.980)'));
 console.log('appearance surface projection scenarios passed');

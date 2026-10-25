@@ -1,5 +1,37 @@
 # Magi UI 核对与修复记录
 
+## 2026-10-24：变更中心布局与文件行
+
+仓库上下文、待确认总工具栏、本轮摘要与文件树共用自适应内容列（最大 1200px），统一左右对齐和间距。全部批准/全部还原放在总工具栏；撤销本轮仍归本轮，沿用原范围、禁用、确认及 mutation 入口。仓库卡片和文件树去掉叠加底色，保留单层细描边；仓库摘要允许换行。
+
+文件行将来源移到文件名旁，以次级文字表达；新增/修改/删除/重命名改为文字状态，增删数量按数字对齐，尾部移除固定 172px 宽度。批准/还原保留两枚 26px 点击区域，鼠标悬停或键盘聚焦时显示，触屏及窄栏常显，显隐不推动统计位置。窄容器拆分文件身份行与统计操作行，保留来源、错误、文件类型和名称后缀。删除目录尾部重复状态点及其聚合字段、旧 glyph 函数、彩色来源徽章样式和不用的中英文文案。
+
+验证：`check` 0 errors / 0 warnings；`test:panel-layout`、`test:right-pane`、`test:session-isolation` 和生产构建通过。在 daemon 的实际静态构建页面以 62 个真实变更验收 1200px 内容列、560px/499px 分屏（文件树宽 513px/452px），文件行横向溢出均为 0；键盘 Tab 可聚焦批准按钮，Enter 打开原 diff 预览并正确选中文件。没有执行批准或还原。临时预览 tab 已关闭并恢复右侧原 tab；为避开既有 82% 自动收起阈值，恢复为接近原比例的宽主栏。截图：`target/ui-edits-2026-10-24/desktop.png`、`narrow.png`。本次未做物理手机及 Windows/Linux 包验收，未改业务事实或数据合同。
+
+## 2026-10-24：侧栏、正文与输入框配色层级
+
+参考用户提供的 Codex 桌面截图，调整现有外观运行时的中性色阶，不增加主题配置或另一套配色来源。内置浅色主题的侧栏为 `#F5F5F4`，正文为 `#F9F9F8`，输入框为 `#FCFCFB`；内置深色分别为 `#0B0B0A`、`#151514`、`#1C1C1A`。新增语义输入表面 `--magi-surface-composer`，输入框沿原轮廓增加轻阴影，保留焦点反馈。自定义主题继续从其背景与前景派生，壁纸主题沿用原材质透明度。
+
+会话选中态和用户气泡改为中性底色，用户正文使用主题前景，命令提示保留强调色；移除 `messages.css` 中覆盖用户气泡的蓝色规则及无用 `--msg-user-bg` / `--msg-user-border`，避免主题与共享样式互相覆盖。原有图标与其他未提交改动保留。
+
+验证：`check` 0 errors / 0 warnings，`test:appearance`（浅色、深色、自定义主题/透明度投影）、`test:conversation-disclosure`、生产构建和 `git diff --check` 通过。在实际 daemon 的静态构建页面检查浅色、深色和「海岸晨光」壁纸主题，读取真实计算样式并检查完整会话、用户气泡和输入框；结束后恢复原深色主题。截图保存在 `target/ui-color-2026-10-24/` 下的 `light.png`、`dark.png`、`wallpaper.png`。未打包或进行 Windows/Linux 桌面验收。
+
+## 2026-10-24：详情内容宽度自适应
+
+异常记录原为 440px 面板，展开内容与按钮共处一行，真实页面堆栈仅获得 303px。现改为 Grid：摘要和操作在首行，详情在下一行跨越内容与操作列；窄容器将操作独立成行。面板理想宽度随视口变化（52vw，440–800px），最终宽度受锚点到右侧视口边缘的剩余空间约束；原有窄屏全宽承载和弹出方向保持。诊断字段按最长标签自动对齐，窄容器上下排列；堆栈增加内边距、自动换行，高度受窗口约束并允许滚动。
+
+共用 `Disclosure` 的内容列改为 `minmax(0, 1fr)`，内外层允许收缩，覆盖工具、代码、终端、知识及设置详情的共用展开边界。会话内 `ErrorDetailPopover` 同样采用弹性理想宽度并保持原有视口定位。没有全局强制内容撑满；设置阅读列上限、图片比例和紧凑菜单保留各自语义。现有侧栏开始拖动时会关闭 shell popover，因此不为已关闭面板新增 ResizeObserver。
+
+验证：`check` 0 errors / 0 warnings，生产 `build` 通过；`test:conversation-disclosure`、`test:notification-runtime`、`test:tool-call-display`、`test:appearance`、`test:runtime-state` 通过。实际 daemon 页面检查 1439px、1280px、2552px 桌面宽度和 Edge 390×844 响应式仿真，异常面板与后代无横向溢出；桌面详情实测 697px / 749px，窄屏面板 366px / 详情 310px。真实展开 Shell 工具卡片，展开层与内部宽度一致，无横向撑破。侧栏拖动沿既有行为关闭面板，并已恢复原 320px 侧栏。未新增 Windows/Linux 桌面包或物理手机验收；会话内错误详情入口仅核对源码和构建。
+
+截图：`target/ui-adaptive-width-2026-10-24/notification-adaptive.png`、`notification-390.png`。独立演示原型改动继续保留，不作为生产验收证据。
+
+同类面板补查：代理中心、上下文用量、局域网访问面板按原有打开方向约束到锚点一侧的实际可用宽度，共用 `panel-width.ts`；只在打开时监听窗口、滚动和祖先尺寸变化，关闭时清理。工作副本菜单按内容取宽并限制边界；MCP 工具描述、外部审批提示和 Toast 同样补充视口边界及长文本处理，保留现有弹出方案与下拉交互。
+
+运行诊断、Git、知识图谱、外观和 MCP 表单改为按内容容器断点适配；插件详情、设置详情、MCP 审计及安全审计允许长字段或操作换行。插件指南按正文容器收起目录，代码换行、表格局部滚动。真实窄屏验收中另发现 Git 长路径超出行边界，已限制到行宽并复验。未调整有意保留的阅读列上限、紧凑菜单或图像尺寸。
+
+补查验证：Web 全量回归通过；最终再次运行 `check`（0 errors / 0 warnings）及 `test:chat-interaction`、`test:context-ring`、`test:active-agent-center`、`test:session-isolation`、`test:runtime-state`、`test:conversation-disclosure`、`test:notification-runtime` 均通过，`git diff --check` 通过。新增截图：`context-panel.png`、`context-390.png`、`git-390.png`、`guide-390.png`（同目录）。真实页面完成后恢复桌面视口；上述源码覆盖不等同于每种面板均已进行跨平台桌面包验收。
+
 ## 2026-10-24：desktop-agent-ui 参考核对与全范围收敛
 
 参考 [Ludi-Herry/desktop-agent-ui](https://github.com/Ludi-Herry/desktop-agent-ui/tree/44653f97065f71de662a07d1aa4547870962b029)，阅读入口、Agent 交互、组件动效、桌面经验和验收清单。将其作为设计参考，不作为业务授权或第二套工程规则。本轮排除弹窗、浮层承载、方向及定位改造；保留 Magi 现有下拉，尤其主对话权限、模型和推理级别。
@@ -170,3 +202,56 @@
 `npm --prefix web run check` 为 0 errors / 0 warnings，生产构建通过。定向 `test:composer-input`（59 场景）、`test:appearance`、`test:context-ring`、`test:mcp-server`、`test:web-model`、`test:settings-store`、`test:overlay-interaction`、`test:turn-navigation`、`test:right-pane-browser` 通过。轮次回归原先硬编码旧布局边框，已更新为检查现行 inset 描边；未为测试恢复旧样式。Web 改动的 `git diff --check` 通过。
 
 真实 daemon 页面验收：主对话权限按钮展开三个候选，当前值保持不变；配置页请求协议与推理级别均为原生下拉。代理引擎共 12 项，未过滤面板实测 260px 且可滚动；搜索“演示引擎 09”只显示对应引擎，搜索无匹配有明确提示；Esc 关闭候选、设置页保持打开、焦点回到“代理引擎”，重开恢复 12 项。主对话模型搜索无匹配时保留原模型与推理级别。未保存或修改模型绑定、权限、令牌等真实配置。截图：`target/ui-audit-2026-10-24/selection-search-final.png`。其他条件入口以源码与上述定向回归核对；未宣称全部状态均已逐一真实操作，也未运行 Windows / Linux 发行包验收。
+
+## 知识库布局整理
+
+分类导航与全库操作分轨，搜索与新增独立；正文、编辑区共用一个滚动容器，打开编辑区时滚动到可见位置。概览宽栏分两列、窄栏单列，入口文件默认展示 6 项并可展开全部，最近知识可直接打开。ADR / FAQ / 经验使用原生展开按钮，编辑、删除是同级操作；去除色条、重复套边框与过多详情缩进，日期用辅助文字，窄栏操作换行。图谱按容器宽度适配，保留现有 Select 与关系审阅入口。
+
+本轮通过 `check`（0 errors / 0 warnings）、`build`、`test:right-pane`、`test:appearance`、`git diff --check`。真实 daemon 页面使用已有工作区的 10 条经验、511 条关系检查了桌面分栏、宽栏及 390px 视口：键盘空格展开、搜索无匹配、编辑打开与取消、入口文件 6/43 项切换、最近记录跳转正常，检查的正文/详情容器无横向溢出。没有提交知识写入、关系审阅、删除或清空操作；ADR / FAQ 当前为空，非空展示由共用布局源码和 Svelte 检查覆盖，未宣称逐种真实数据验收。截图位于 `target/ui-audit-2026-10-24/knowledge-desktop.jpg` 与 `knowledge-mobile.jpg`。本轮未验证 Windows/Linux 发行包。
+
+
+## 统一图标库收尾（2026-10-25）
+
+- 自有 UI 图形收敛到 `Icon.svelte` / `lib/icons.ts`，统一 24×24 坐标、1.75 描边、圆头圆角、无填充。模型设置关闭、输入区模型选中、图片预览关闭、角色返回、文件重命名箭头已移除字符替代图标。
+- 文件身份统一到 `FileTypeIcon`：补齐上下文引用、知识入口与图谱文件节点、右栏文件 Tab / 元信息、完整工作台与静态卡片 Demo 的附件和文件结果；操作/状态图标沿原语义保留。
+- 知识、Mermaid、Graphviz、目录选择加载图形改为共享 `loader`，保留原布局和加载状态归属。
+- 静态卡片 Demo 的 SVG symbol 与绘制属性来自同一 `icons` / `iconStyle`；文件图标直接挂载正式 Svelte 组件。
+- 例外仅包含文件品牌轮廓、上下文/下载进度环、代理指针、图表/插画及宿主品牌资源。操作系统原生控件和第三方插件/网页不由工作台覆盖。
+- 自动门禁：`test:icon-library` 解析全部 Svelte 模板，检测独立 SVG、字符图标及不存在的静态图标名称；`test:file-type` 检测后缀/特殊文件名归属和所有类型的浅深色定义。
+
+- 本轮验证：`check`（0 错误、0 警告）、生产 `build`、`test:icon-library`、`test:file-type`、`test:file-reference`、`test:right-pane`、`test:tool-call-display`、`test:mermaid-source`、`test:chat-interaction` 通过。真实浏览器访问 daemon 38123：12 个设置分类逐页渲染并检查 SVG 绘制属性，无独立填充/描边覆盖；文件树/右栏文件标签、工作台 Demo、静态卡片 Demo 已核验。发现右栏 `filepath` 为宿主编码引用，已使用现有 `displayPath` 做类型识别并复验 Markdown / Rust 图标。浅深色 Demo 均核验，示例图表保持独立尺寸。Electron 原生窗口未另行启动；应用/托盘品牌资源未改。
+
+### 图标改造过期内容清理
+
+全仓引用核对后删除无调用的 `circleOutline`、`taskRunning` 旧别名；保留仍用于用户角色元数据的 `bug` 及有独立语义的库图形。删除静态卡片页废弃皮肤按钮 `.theme`（含窄屏规则）、字段标签与未使用文本样式，移除与后置规则重复的摘要换行定义；修正文档中的别名示例，并将图标验收记录归回本节。旧文件类型映射、字符图标和独立 SVG 的移除保留在本次改造差异中。许可证、专用图形和三个用途不同的 Demo 入口继续保留。
+
+本次清理验证：生产 `build` 通过，`check` 0 errors / 0 warnings，`test:icon-library`（128 组件、548 处引用、105 个名称）、`test:file-type`（59 类、566 后缀、65 特殊文件名）及 `git diff --check` 通过。本次为源码与构建检查，未重复执行真实 UI 验收。
+
+## 容器高度与内部滚动复核
+
+复核 `web/src` 的组件、工作台和共享样式中的固定高度、最大高度及滚动链路。图谱审阅列原来随详情拉高，但列表限制在 612px；现改为列表用弹性剩余高度，图谱画布与内部 Cytoscape 同步增长。窄栏按视口分配队列高度，列表填满标题下方空间。插件中心移除 600px 上限，以可收缩 Grid 轨道填满设置内容区，左右独立滚动；插件指南移除正文 800px 上限，标题与返回入口固定，正文承接剩余高度。工作区/上下文/本地技能共用的文件选择器移除内部 520px 高度，列表继承模态框分配空间；共享模态框与内容页保留头尾尺寸，正文可收缩滚动。
+
+| 复核范围 | 处理结论 |
+| --- | --- |
+| 知识图谱、插件中心、插件指南、文件选择器 | 修正容器和内容各自指定高度造成的约束冲突 |
+| 变更列表、文件树、右栏代码/代理/终端、通知列表 | 沿现有弹性布局与 `min-height: 0` 滚动链路，没有同类内部固定限高造成留白的结构 |
+| Select/命令菜单、输入区队列、审批/目标卡片、诊断浮层、消息工具/代码/图表预览、图片 | 自然流或受限预览，保留自身限高及比例，不强制填满主窗口 |
+
+真实 daemon 页面验证高窗口（1440×1500）、矮窗口（1280×600）、窄屏（390×844）：高窗口审阅列表为 1053px，画布为 697px，分别与列底部、Renderer 底部对齐；矮窗口插件面板收缩至 262px，详情内部滚动；指南正文从 1256px 收缩至 356px；文件选择器跟随模态框从 478px 增长到移动网页全屏内容的 812px，底部操作保持可见。窄栏队列 337px，标题下列表 275px，无底部闲置空间。没有执行知识审阅、插件安装/卸载或目录提交。
+
+本轮通过 `check`（0 errors / 0 warnings）、`build`、`test:panel-layout`、`test:overlay-interaction`、`test:appearance`、`test:workspace-onboarding`。截图：`target/ui-audit-2026-10-24/knowledge-adaptive-height.jpg`。未验收 Windows/Linux 发行包；复核结论针对当前源码和上述实际页面。
+
+### 全项目补查（2026-10-25）
+
+继续核对工作台、设置分类、共享模态框、右栏各类型及 Desktop 宿主中的高度来源与滚动链路，补齐以下遗漏：
+
+- 右栏大文本首尾摘要移除 260px 限高，两个摘要按剩余高度分配空间，各自滚动；保留标题与元信息。
+- 设置页内置工具、MCP 工具列表、Skill 正文与包含文件、浏览器资源列表改为自然内容高度，由设置页统一滚动；移除无调用的 124px 旧卡片样式和失去滚动容器的专用滚动条规则。
+- 隔离合并文件列表移除 420px / 52vh 内部限高，由共享模态框正文承担滚动，避免移动网页全屏模态框中列表提前结束。
+- 菜单、输入区队列、消息工具预览、诊断片段、图片比例和浏览器显式视口继续保留用途明确的限制；右栏 Diff 的填充模式已取消内部预览限高，无需重复实现。
+
+本次 `check`（0 errors / 0 warnings）、生产 `build`、`test:panel-layout`、`test:skill-detail`、`test:session-isolation`、`test:right-pane`、`test:overlay-interaction`、`test:browser-settings`、`test:appearance` 和 `git diff --check` 通过。真实 daemon 开发页面在 1440×1500、1280×600、390×844 视口补验：内置工具列表 743px（窄屏 1011px）、MCP 列表 542px、Skill 正文 1351px（矮窗口 1444px）、浏览器资源列表 566px，均无内部最大高度并交由页面滚动；高窗口图谱审阅列 1114px，画布与 Cytoscape 底部对齐，窄屏队列随视口缩至 338px。截图：`target/ui-height-audit-2026-10-25/knowledge-tall.png`。已恢复原视口、对话页和右栏显示。大文本摘要与合并列表本次以源码、检查和既有回归验证，未触发真实文件合并，未做发行包及 Windows/Linux 验收。
+
+## 提交 main 前验证（2026-10-25）
+
+本批次 Web 改动提交前，`npm --prefix web test` 全部通过；本批次最终源码已通过 `check`（0 errors / 0 warnings）、生产 `build` 与 `git diff --check`。未新增桌面包、Windows/Linux 或真实业务写操作验收；最新 main 的真实界面验证由用户继续进行。

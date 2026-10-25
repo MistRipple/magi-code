@@ -43,7 +43,9 @@
     const boundaryRect = boundary?.getBoundingClientRect();
     if (flyout && boundaryRect) {
       const top = Math.max(VIEWPORT_MARGIN, anchorRect.top);
-      panelStyle = `left:${boundaryRect.right + FLYOUT_GAP}px;top:${top}px;max-height:${Math.min(MAX_PANEL_HEIGHT, window.innerHeight - top - VIEWPORT_MARGIN)}px;`;
+      const left = boundaryRect.right + FLYOUT_GAP;
+      const availableWidth = Math.max(0, window.innerWidth - left - VIEWPORT_MARGIN);
+      panelStyle = `left:${left}px;top:${top}px;--notification-available-width:${availableWidth}px;max-height:${Math.min(MAX_PANEL_HEIGHT, window.innerHeight - top - VIEWPORT_MARGIN)}px;`;
       return;
     }
     const top = anchorRect.bottom + FLYOUT_GAP;
@@ -285,30 +287,6 @@
                     {formatTime(notif.timestamp)}
                   </span>
                 </div>
-                <Disclosure expanded={expandedNotificationIds.has(notif.id)}>
-                  <div class="notif-details">
-                    {#if notif.detail && notif.detail !== notif.message}
-                      <pre>{notif.detail}</pre>
-                    {/if}
-                    <dl>
-                      {#if notif.errorCode}
-                        <div><dt>{i18n.t('notification.errorCode')}</dt><dd>{notif.errorCode}</dd></div>
-                      {/if}
-                      {#if notif.failureStage}
-                        <div><dt>{i18n.t('notification.failureStage')}</dt><dd>{notif.failureStage}</dd></div>
-                      {/if}
-                      {#if notif.taskId}
-                        <div><dt>{i18n.t('notification.taskId')}</dt><dd>{notif.taskId}</dd></div>
-                      {/if}
-                      {#if notif.requestId}
-                        <div><dt>{i18n.t('notification.requestId')}</dt><dd>{notif.requestId}</dd></div>
-                      {/if}
-                      {#if notif.source}
-                        <div><dt>{i18n.t('notification.source')}</dt><dd>{notif.source}</dd></div>
-                      {/if}
-                    </dl>
-                  </div>
-                </Disclosure>
               </div>
               <div class="notif-actions">
                 {#if hasDiagnosticDetails(notif)}
@@ -349,6 +327,32 @@
                   <Icon name="close" size={10} />
                 </button>
               </div>
+              <div class="notif-expansion">
+                <Disclosure expanded={expandedNotificationIds.has(notif.id)}>
+                  <div class="notif-details">
+                    {#if notif.detail && notif.detail !== notif.message}
+                      <pre>{notif.detail}</pre>
+                    {/if}
+                    <dl>
+                      {#if notif.errorCode}
+                        <div><dt>{i18n.t('notification.errorCode')}</dt><dd>{notif.errorCode}</dd></div>
+                      {/if}
+                      {#if notif.failureStage}
+                        <div><dt>{i18n.t('notification.failureStage')}</dt><dd>{notif.failureStage}</dd></div>
+                      {/if}
+                      {#if notif.taskId}
+                        <div><dt>{i18n.t('notification.taskId')}</dt><dd>{notif.taskId}</dd></div>
+                      {/if}
+                      {#if notif.requestId}
+                        <div><dt>{i18n.t('notification.requestId')}</dt><dd>{notif.requestId}</dd></div>
+                      {/if}
+                      {#if notif.source}
+                        <div><dt>{i18n.t('notification.source')}</dt><dd>{notif.source}</dd></div>
+                      {/if}
+                    </dl>
+                  </div>
+                </Disclosure>
+              </div>
             </div>
           {/each}
         {/if}
@@ -364,7 +368,9 @@
 
   .notification-panel {
     position: fixed;
-    width: min(440px, calc(100vw - 24px));
+    width: min(clamp(440px, 52vw, 800px), var(--notification-available-width, calc(100vw - 24px)));
+    container-type: inline-size;
+    container-name: notification-panel;
     max-height: min(560px, calc(100vh - 24px));
     background: var(--dropdown-bg);
     border: var(--magi-hairline) solid var(--border);
@@ -386,7 +392,7 @@
   }
 
   .panel-title {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     font-weight: var(--font-semibold, 600);
     color: var(--foreground-muted);
     text-transform: uppercase;
@@ -413,7 +419,7 @@
     background: var(--surface-2);
     color: var(--foreground-muted);
     border-radius: 999px;
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     padding: 3px 8px;
     cursor: pointer;
     transition: all var(--transition-fast, 0.15s);
@@ -434,7 +440,7 @@
     background: transparent;
     border: none;
     color: var(--foreground-muted);
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     cursor: pointer;
     padding: 2px 6px;
     border-radius: var(--radius-sm, 4px);
@@ -452,6 +458,8 @@
   }
 
   .notification-list {
+    min-width: 0;
+    min-height: 0;
     overflow-y: auto;
     flex: 1;
     padding: var(--space-2, 4px) 0;
@@ -479,7 +487,7 @@
     gap: var(--space-2, 4px);
     padding: var(--space-2, 6px) var(--space-4, 12px);
     color: var(--error);
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     border-bottom: var(--magi-hairline) solid var(--border);
   }
 
@@ -493,9 +501,10 @@
   }
 
   .notification-item {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-3, 8px);
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: var(--space-3, 8px);
     padding: var(--space-3, 8px) var(--space-4, 12px);
     transition: background var(--transition-fast, 0.15s);
     position: relative;
@@ -525,7 +534,11 @@
   .type-info .notif-icon { color: var(--primary, #007acc); }
 
   .notif-content {
-    flex: 1;
+    min-width: 0;
+  }
+
+  .notif-expansion {
+    grid-column: 2 / -1;
     min-width: 0;
   }
 
@@ -553,31 +566,31 @@
 
   .notif-details pre {
     margin: 0 0 var(--space-3, 8px);
-    max-height: 180px;
+    padding: var(--space-3, 8px);
+    max-width: 100%;
+    max-height: min(320px, 45dvh);
     overflow: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     font-family: var(--font-mono);
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     line-height: 1.5;
     color: var(--foreground);
   }
 
   .notif-details dl {
     display: grid;
-    gap: 4px;
+    grid-template-columns: fit-content(30%) minmax(0, 1fr);
+    gap: 4px var(--space-3, 8px);
     margin: 0;
-  }
-
-  .notif-details dl div {
-    display: grid;
-    grid-template-columns: 82px minmax(0, 1fr);
-    gap: var(--space-2, 6px);
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     line-height: 1.45;
   }
 
+  .notif-details dl div { display: contents; }
+
   .notif-details dt {
+    overflow-wrap: anywhere;
     color: var(--foreground-muted);
   }
 
@@ -606,7 +619,7 @@
   }
 
   .notif-time {
-    font-size: var(--text-xs, 11px);
+    font-size: var(--text-xs, 12px);
     color: var(--foreground-muted);
   }
 
@@ -645,5 +658,12 @@
   .notif-action:disabled {
     cursor: default;
     opacity: 0.45;
+  }
+
+  @container notification-panel (max-width: 420px) {
+    .notification-item { grid-template-columns: 18px minmax(0, 1fr); }
+    .notif-actions { grid-column: 2; margin-top: 4px; }
+    .notif-details dl { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .notif-details dl div { display: grid; gap: 2px; }
   }
 </style>

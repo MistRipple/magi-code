@@ -26,7 +26,7 @@
 | `DiagramRenderer` / `GeneratedImageBlock` | 图表、生成中/已生成图片使用统一表面和状态栏 | 产物保持可见；图表仍使用原渲染器、预览与复制入口 |
 | `ModelFailureCard` | 错误诊断使用单层卡身，保留恢复动作 | 最终错误仍可见，不藏入已完成的过程 |
 | `ToolApprovalAction` / 提问历史 | 保留原授权/提问入口和动作语义 | 待处理授权保持可见，提问历史为独立交互行 |
-| `ConversationTurn` / `ConversationToolGroup` | — | 整轮、阶段与工具组共用右侧列；保留原有分组、稳定 key 和手动展开逻辑 |
+| `ConversationTurn` / `ConversationToolGroup` | — | 整轮处理提示左对齐；阶段与工具组共用右侧尾栏；保留原有分组、稳定 key 和手动展开逻辑 |
 
 ## 本次发现并修复
 
@@ -61,3 +61,9 @@
 本次真实链路使用本地受控模型响应来稳定覆盖状态，文件读取、Shell、权限接纳和消息持久化均由真实 daemon 执行。没有调用外部模型服务。没有执行全仓测试、重新打包发行版或验证 Windows/Linux 宿主；本次没有修改这些宿主或 wire schema。
 
 本机截图与测量记录保存在当前聊天的 `tool-card-standardization` 可视化目录：`matrix.json`、`electron-detailed.png`、`electron-summary.png` 及组件清单截图。
+
+## 合入 main 的复核（2026-10-25）
+
+整合 main 的统一图标、主题层级和容器自适应改动；文件身份完整保留 main 的 59 类目录、566 后缀和 65 个特殊文件名，`FileTypeIcon` 继续使用主题字重。代码卡片同时保留共享线性图标、右侧折叠箭头和固定尺寸复制回执。摘要整轮提示仍独立左对齐；没有改变 daemon 事实、授权入口或用户手动展开的所有权。
+
+合并后的类型检查为 0 errors / 1 warning（main 已有的 MCP 服务页 `.card h4` 未使用选择器）；生产构建通过。Web 全量 `npm --prefix web test` 及工具展示、过程折叠、图像预览、聊天交互、文件引用、Mermaid、图标库和文件类型定向回归通过，`git diff --check` 通过。此前真实浏览器和 Electron 验收属于上文对应版本，本次合并未重复执行真实 UI 验收。

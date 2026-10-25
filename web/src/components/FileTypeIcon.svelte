@@ -44,7 +44,7 @@
     background: color-mix(in srgb, var(--file-type-color) 12%, transparent);
     font-family: var(--font-mono, monospace);
     font-size: max(7px, calc(var(--file-type-icon-size, 14px) * .5));
-    font-weight: 600;
+    font-weight: var(--font-semibold, 600);
     letter-spacing: -.06em;
   }
   .file-type-brand { display:block; flex:none; }

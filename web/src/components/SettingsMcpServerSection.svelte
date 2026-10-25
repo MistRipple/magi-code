@@ -521,19 +521,21 @@
   });
 </script>
 
-{#snippet workspaceBinding(id: string)}
+{#snippet workspaceBinding(id: string, showHint = true)}
   {@const workspace = workspaces.find((entry) => entry.workspaceId === id)}
   <p class="meta ui-meta" data-mcp-bound-workspace={id}>
     <span>{i18n.t('mcpServer.token.boundWorkspace', { workspace: workspaceName(id) })}</span>
     <code>{workspace?.rootPath ?? i18n.t('mcpServer.token.workspaceUnavailable')}</code>
   </p>
-  <p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>
+  {#if showHint}<p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>{/if}
 {/snippet}
 
 <section class="mcp-server-section" data-mcp-server="1">
-  <div>
+  <div class="settings-section-header">
+    <div>
     <div class="settings-section-title">{i18n.t('mcpServer.title')}</div>
     <div class="settings-section-desc">{i18n.t('mcpServer.desc')}</div>
+    </div>
   </div>
 
   {#if loadError}
@@ -558,7 +560,7 @@
   </div>
 
   {#if tab === 'connect'}
-  <div class="card" data-mcp-server-status="1">
+  <div class="settings-card mcp-card" data-mcp-server-status="1">
     <label class="switch-line">
       <input
         type="checkbox"
@@ -570,7 +572,7 @@
         onchange={(event) => void toggleEnabled((event.currentTarget as HTMLInputElement).checked)}
       />
       <span>{i18n.t('mcpServer.enable')}</span>
-      <span class="badge" class:badge--off={!status?.running}>
+      <span class="settings-chip settings-chip--ok" class:badge--off={!status?.running}>
         {status?.running ? i18n.t('mcpServer.status.running') : i18n.t('mcpServer.status.stopped')}
       </span>
     </label>
@@ -587,7 +589,7 @@
   {/if}
 
   {#if tab === 'remote'}
-  <div class="card" data-mcp-server-network="1">
+  <div class="settings-card mcp-card" data-mcp-server-network="1">
     <h4>{i18n.t('mcpServer.network.section')}</h4>
     <p class="meta">{i18n.t('mcpServer.network.desc')}</p>
     <p class="meta" data-mcp-network-mode={status?.network.mode ?? 'quick'}>
@@ -606,14 +608,14 @@
         onchange={(event) => void toggleNetwork((event.currentTarget as HTMLInputElement).checked)}
       />
       <span>{i18n.t('mcpServer.network.enable')}</span>
-      <span class="badge" class:badge--off={networkTunnelStatus !== 'running'}>
+      <span class="settings-chip settings-chip--ok" class:badge--off={networkTunnelStatus !== 'running'}>
         {i18n.t(`mcpServer.network.status.${networkTunnelStatus}`)}
       </span>
     </label>
     {#if status && !status.network.enabled && !hasNetworkToken}
       <p class="meta">{i18n.t('mcpServer.network.needToken')}</p>
       <div class="action-row">
-        <button type="button" class="primary-action" data-mcp-go-clients-network="1" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
+        <button type="button" class="btn btn--sm btn--primary" data-mcp-go-clients-network="1" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
           {i18n.t('mcpServer.snippets.goCreate')}
         </button>
       </div>
@@ -621,7 +623,7 @@
     {#if status?.network.mcpUrl}
       <div class="snippet-head">
         <span class="meta">{i18n.t('mcpServer.network.url')}</span>
-        <button type="button" onclick={() => void copy('network-url', status?.network.mcpUrl ?? '')}>
+        <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy('network-url', status?.network.mcpUrl ?? '')}>
           {copiedKey === 'network-url' ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
         </button>
       </div>
@@ -643,7 +645,7 @@
         {#if remoteTokens.length === 0}
           <p class="meta">{i18n.t('mcpServer.network.needToken')}</p>
           <div class="action-row">
-            <button type="button" class="primary-action" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
+            <button type="button" class="btn btn--sm btn--primary" onclick={() => { tab = 'clients'; showCreate = true; allowNetwork = true; }}>
               {i18n.t('mcpServer.snippets.goCreate')}
             </button>
           </div>
@@ -660,7 +662,7 @@
             {@const secretValue = authorizationOf(quickAddSnippets)}
             <div class="snippet">
               <div class="snippet-head">
-                <span class="row-title">{i18n.t('mcpServer.quickAdd.form')}</span>
+                <span class="settings-row-title">{i18n.t('mcpServer.quickAdd.form')}</span>
               </div>
               {#each [
                 { key: 'qa-url', label: i18n.t('mcpServer.quickAdd.fieldUrl'), value: remoteMcpUrl ?? '' },
@@ -670,7 +672,7 @@
                 <div class="form-field-row">
                   <span class="meta">{field.label}</span>
                   <code class="secret" data-mcp-quick-add-field={field.key}>{field.value}</code>
-                  <button type="button" onclick={() => void copy(field.key, field.value)}>
+                  <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy(field.key, field.value)}>
                     {copiedKey === field.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
                   </button>
                 </div>
@@ -684,8 +686,8 @@
             ] as entry (entry.key)}
               <div class="snippet">
                 <div class="snippet-head">
-                  <span class="row-title">{entry.label}</span>
-                  <button type="button" data-mcp-quick-add-copy={entry.key} onclick={() => void copy(entry.key, entry.text)}>
+                  <span class="settings-row-title">{entry.label}</span>
+                  <button class="btn btn--sm btn--secondary" type="button" data-mcp-quick-add-copy={entry.key} onclick={() => void copy(entry.key, entry.text)}>
                     {copiedKey === entry.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
                   </button>
                 </div>
@@ -703,13 +705,13 @@
       <p class="meta">{i18n.t('mcpServer.named.desc')}</p>
       <p class="meta" data-mcp-named-assist="1">{i18n.t('mcpServer.named.assist')}</p>
       {#if namedMode}
-        <p class="meta"><span class="badge">{i18n.t('mcpServer.named.configured', { hostname: status?.network.namedHostname ?? '' })}</span></p>
+        <p class="meta"><span class="settings-chip settings-chip--ok">{i18n.t('mcpServer.named.configured', { hostname: status?.network.namedHostname ?? '' })}</span></p>
         <p class="meta">{i18n.t('mcpServer.named.tokenHidden')} {i18n.t('mcpServer.named.autoRestore')}</p>
         <div class="action-row">
-          <button type="button" data-mcp-named-verify="1" disabled={busy} onclick={() => void checkNamedTunnel()}>
+          <button class="btn btn--sm btn--secondary" type="button" data-mcp-named-verify="1" disabled={busy} onclick={() => void checkNamedTunnel()}>
             {i18n.t('mcpServer.named.verify')}
           </button>
-          <button type="button" class="danger" disabled={busy} onclick={() => void clearNamedTunnel()}>
+          <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void clearNamedTunnel()}>
             {i18n.t('mcpServer.named.clear')}
           </button>
         </div>
@@ -722,15 +724,15 @@
       <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveNamedTunnel(); }}>
         <label class="field">
           <span>{i18n.t('mcpServer.named.hostname')}</span>
-          <input bind:value={namedHostname} placeholder="mcp.example.com" autocomplete="off" data-mcp-named-hostname="1" />
+          <input class="form-input" bind:value={namedHostname} placeholder="mcp.example.com" autocomplete="off" data-mcp-named-hostname="1" />
         </label>
         <label class="field">
           <span>{i18n.t('mcpServer.named.token')}</span>
-          <input type="password" bind:value={namedToken} placeholder={i18n.t('mcpServer.named.tokenPlaceholder')} autocomplete="off" data-mcp-named-token="1" />
+          <input class="form-input" type="password" bind:value={namedToken} placeholder={i18n.t('mcpServer.named.tokenPlaceholder')} autocomplete="off" data-mcp-named-token="1" />
         </label>
         <p class="meta">{i18n.t('mcpServer.named.portHint', { port: String(status?.port ?? '') })}</p>
         <div class="action-row">
-          <button type="submit" class="primary-action" disabled={!canSaveNamed}>
+          <button type="submit" class="btn btn--sm btn--primary" disabled={!canSaveNamed}>
             {namedMode ? i18n.t('mcpServer.named.replace') : i18n.t('mcpServer.named.save')}
           </button>
         </div>
@@ -738,7 +740,7 @@
     </div>
   </div>
 
-  <div class="card" data-mcp-server-direct="1">
+  <div class="settings-card mcp-card" data-mcp-server-direct="1">
     <h4>{i18n.t('mcpServer.direct.section')}</h4>
     <p class="meta">{i18n.t('mcpServer.direct.desc')}</p>
     <p class="meta risk-note" data-mcp-direct-risk="1">{i18n.t('mcpServer.direct.risk')}</p>
@@ -747,7 +749,7 @@
     {/if}
     {#if status?.direct.enabled}
       <p class="meta">
-        <span class="badge" class:badge--off={!status.direct.listening}>
+        <span class="settings-chip settings-chip--ok" class:badge--off={!status.direct.listening}>
           {status.direct.listening ? i18n.t('mcpServer.direct.listening') : i18n.t('mcpServer.direct.notListening')}
         </span>
         {i18n.t('mcpServer.direct.bind', { host: status.direct.bindHost, port: String(status.port ?? '') })}
@@ -755,7 +757,7 @@
       {#if status.direct.mcpUrl}
         <div class="snippet-head">
           <span class="meta">{i18n.t('mcpServer.direct.url')}</span>
-          <button type="button" onclick={() => void copy('direct-url', status?.direct.mcpUrl ?? '')}>
+          <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy('direct-url', status?.direct.mcpUrl ?? '')}>
             {copiedKey === 'direct-url' ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
           </button>
         </div>
@@ -764,10 +766,10 @@
       <p class="meta">{i18n.t('mcpServer.direct.firewall', { port: String(status.port ?? '') })}</p>
       <p class="meta">{i18n.t('mcpServer.direct.autoRestore')}</p>
       <div class="action-row">
-        <button type="button" class="danger" data-mcp-direct-stop="1" disabled={busy} onclick={() => void stopDirect()}>
+        <button type="button" class="btn btn--sm btn--error" data-mcp-direct-stop="1" disabled={busy} onclick={() => void stopDirect()}>
           {i18n.t('mcpServer.direct.stop')}
         </button>
-        <button type="button" disabled={busy} onclick={editDirect}>{i18n.t('mcpServer.direct.edit')}</button>
+        <button class="btn btn--sm btn--secondary" type="button" disabled={busy} onclick={editDirect}>{i18n.t('mcpServer.direct.edit')}</button>
       </div>
     {/if}
     {#if !hasNetworkToken}
@@ -776,19 +778,19 @@
     <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void startDirect(); }}>
       <label class="field">
         <span>{i18n.t('mcpServer.direct.publicHosts')}</span>
-        <textarea rows="2" bind:value={directPublicHosts} placeholder="203.0.113.5&#10;mcp.example.com" data-mcp-direct-hosts="1"></textarea>
+        <textarea class="form-input" rows="2" bind:value={directPublicHosts} placeholder="203.0.113.5&#10;mcp.example.com" data-mcp-direct-hosts="1"></textarea>
       </label>
       <label class="field">
         <span>{i18n.t('mcpServer.direct.bindHost')}</span>
-        <input bind:value={directBindHost} autocomplete="off" data-mcp-direct-bind="1" />
+        <input class="form-input" bind:value={directBindHost} autocomplete="off" data-mcp-direct-bind="1" />
       </label>
       <p class="meta">{i18n.t('mcpServer.direct.bindHint')}</p>
       <label class="field">
         <span>{i18n.t('mcpServer.direct.port')}</span>
-        <input bind:value={directPort} inputmode="numeric" placeholder={status?.port ? String(status.port) : ''} data-mcp-direct-port="1" />
+        <input class="form-input" bind:value={directPort} inputmode="numeric" placeholder={status?.port ? String(status.port) : ''} data-mcp-direct-port="1" />
       </label>
       <div class="action-row">
-        <button type="submit" class="primary-action" data-mcp-direct-start="1" disabled={!canStartDirect}>
+        <button type="submit" class="btn btn--sm btn--primary" data-mcp-direct-start="1" disabled={!canStartDirect}>
           {status?.direct.enabled ? i18n.t('mcpServer.direct.apply') : i18n.t('mcpServer.direct.start')}
         </button>
       </div>
@@ -798,19 +800,27 @@
   {/if}
 
   {#if tab === 'clients'}
-  <div class="card" data-mcp-server-tokens="1">
-    <h4>{i18n.t('mcpServer.token.section')}</h4>
+  <div class="settings-card mcp-card" data-mcp-server-tokens="1">
+    <div class="clients-header">
+      <h4>{i18n.t('mcpServer.token.section')}</h4>
+      {#if !showCreate}
+        <button type="button" class="btn btn--sm btn--primary" data-mcp-create-open="1" onclick={() => { showCreate = true; }}>
+          {i18n.t('mcpServer.token.new')}
+        </button>
+      {/if}
+    </div>
     <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
+    <p class="meta">{i18n.t('mcpServer.token.workspaceFixedHint')}</p>
 
     {#if freshSecret}
       <div class="secret-card" data-mcp-fresh-secret="1" role="status">
         <p class="meta">{i18n.t('mcpServer.token.created')}</p>
         <code class="secret">{freshSecret}</code>
         <div class="action-row">
-          <button type="button" class="primary-action" onclick={() => void copy('secret', freshSecret)}>
+          <button type="button" class="btn btn--sm btn--primary" onclick={() => void copy('secret', freshSecret)}>
             {copiedKey === 'secret' ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
           </button>
-          <button type="button" onclick={() => { freshSecret = ''; }}>{i18n.t('mcpServer.token.dismiss')}</button>
+          <button class="btn btn--sm btn--secondary" type="button" onclick={() => { freshSecret = ''; }}>{i18n.t('mcpServer.token.dismiss')}</button>
         </div>
       </div>
     {/if}
@@ -820,36 +830,36 @@
     {:else if status}
       <ul class="rows">
         {#each visibleTokens as token (token.tokenId)}
-          <li data-mcp-token={token.tokenId} class:inactive={!token.active}>
-            <div class="row-main">
-              <span class="row-title">
+          <li class="token-row" data-mcp-token={token.tokenId} class:inactive={!token.active}>
+            <div class="settings-row-copy">
+              <span class="settings-row-title">
                 {token.clientName}
                 <code>{token.prefix}…</code>
-                <span class="badge" data-mcp-token-approval-mode={token.approvalMode}>{i18n.t(`mcpServer.token.approvalModeShort.${token.approvalMode}`)}</span>
-                {#if token.network}<span class="badge" data-mcp-token-network="1">{i18n.t('mcpServer.token.networkBadge')}</span>{/if}
-                {#if tokenStateLabel(token)}<span class="badge badge--off">{tokenStateLabel(token)}</span>{/if}
+                <span class="settings-chip settings-chip--ok" data-mcp-token-approval-mode={token.approvalMode}>{i18n.t(`mcpServer.token.approvalModeShort.${token.approvalMode}`)}</span>
+                {#if token.network}<span class="settings-chip settings-chip--ok" data-mcp-token-network="1">{i18n.t('mcpServer.token.networkBadge')}</span>{/if}
+                {#if tokenStateLabel(token)}<span class="settings-chip badge--off">{tokenStateLabel(token)}</span>{/if}
               </span>
               {#if !token.workspaceAvailable}
                 <p class="meta">{i18n.t('mcpServer.token.workspaceRestoreHint')}</p>
               {/if}
-              {@render workspaceBinding(token.workspaceId)}
+              {@render workspaceBinding(token.workspaceId, false)}
               <span class="meta ui-meta">
                 <span>{token.expiresAtMs === null ? i18n.t('mcpServer.token.neverExpires') : i18n.t('mcpServer.token.expiresAt', { time: formatTime(token.expiresAtMs) })}</span>
                 <span>{token.lastUsedAtMs === null ? i18n.t('mcpServer.token.neverUsed') : i18n.t('mcpServer.token.lastUsed', { time: formatTime(token.lastUsedAtMs) })}</span>
               </span>
             </div>
             {#if token.state !== 'revoked'}
-              <div class="action-row">
-                <button type="button" data-mcp-token-view={token.tokenId} disabled={busy || token.state !== 'active'} onclick={() => void toggleView(token)}>
+              <div class="action-row token-actions">
+                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-view={token.tokenId} disabled={busy || token.state !== 'active'} onclick={() => void toggleView(token)}>
                   {viewingTokenId === token.tokenId ? i18n.t('mcpServer.token.hide') : i18n.t('mcpServer.token.view')}
                 </button>
-                <button type="button" data-mcp-token-edit={token.tokenId} disabled={busy || token.attribution !== 'external'} onclick={() => startEdit(token)}>
+                <button class="btn btn--sm btn--secondary" type="button" data-mcp-token-edit={token.tokenId} disabled={busy || token.attribution !== 'external'} onclick={() => startEdit(token)}>
                   {i18n.t('mcpServer.token.edit')}
                 </button>
-                <button type="button" disabled={busy || token.attribution !== 'external' || token.state !== 'active'} onclick={() => void rotate(token)}>
+                <button class="btn btn--sm btn--secondary" type="button" disabled={busy || token.attribution !== 'external' || token.state !== 'active'} onclick={() => void rotate(token)}>
                   {i18n.t('mcpServer.token.rotate')}
                 </button>
-                <button type="button" class="danger" disabled={busy} onclick={() => void revoke(token)}>
+                <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void revoke(token)}>
                   {i18n.t('mcpServer.token.revoke')}
                 </button>
               </div>
@@ -857,11 +867,11 @@
           </li>
           {#if viewingTokenId === token.tokenId}
             <li class="detail" data-mcp-token-detail={token.tokenId}>
-              {@render workspaceBinding(token.workspaceId)}
+              {@render workspaceBinding(token.workspaceId, false)}
               {#if viewingSecret}
                 <div class="snippet-head">
-                  <span class="row-title">{i18n.t('mcpServer.token.secret')}</span>
-                  <button type="button" onclick={() => void copy(`secret-${token.tokenId}`, viewingSecret ?? '')}>
+                  <span class="settings-row-title">{i18n.t('mcpServer.token.secret')}</span>
+                  <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy(`secret-${token.tokenId}`, viewingSecret ?? '')}>
                     {copiedKey === `secret-${token.tokenId}` ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
                   </button>
                 </div>
@@ -874,8 +884,8 @@
                 {#each snippetEntries(viewingSnippets) as entry (entry.key)}
                   <div class="snippet">
                     <div class="snippet-head">
-                      <span class="row-title">{entry.label}</span>
-                      <button type="button" onclick={() => void copy(`${entry.key}-${token.tokenId}`, entry.text)}>
+                      <span class="settings-row-title">{entry.label}</span>
+                      <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy(`${entry.key}-${token.tokenId}`, entry.text)}>
                         {copiedKey === `${entry.key}-${token.tokenId}` ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
                       </button>
                     </div>
@@ -892,7 +902,7 @@
               <form class="create-form edit-form" onsubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
                 <label class="field">
                   <span>{i18n.t('mcpServer.token.clientName')}</span>
-                  <input bind:value={editName} maxlength="60" data-mcp-edit-name="1" />
+                  <input class="form-input" bind:value={editName} maxlength="60" data-mcp-edit-name="1" />
                 </label>
                 <p class="meta">{i18n.t('mcpServer.token.editWorkspaceFixed', { workspace: workspaceName(token.workspaceId) })}</p>
                 <div class="field">
@@ -902,7 +912,7 @@
                 </div>
                 <label class="field">
                   <span>{i18n.t('mcpServer.token.editTtl')}</span>
-                  <input bind:value={editTtl} inputmode="numeric" placeholder={i18n.t('mcpServer.token.editTtlKeep')} data-mcp-edit-ttl="1" />
+                  <input class="form-input" bind:value={editTtl} inputmode="numeric" placeholder={i18n.t('mcpServer.token.editTtlKeep')} data-mcp-edit-ttl="1" />
                 </label>
                 <label class="switch-line">
                   <input type="checkbox" role="switch" class="control-switch" bind:checked={editNetwork} />
@@ -910,17 +920,18 @@
                 </label>
                 <p class="meta">{i18n.t('mcpServer.token.editEffect')}</p>
                 <div class="action-row">
-                  <button type="submit" class="primary-action" disabled={!canSaveEdit}>{i18n.t('mcpServer.token.save')}</button>
-                  <button type="button" onclick={cancelEdit}>{i18n.t('mcpServer.token.cancel')}</button>
+                  <button type="submit" class="btn btn--sm btn--primary" disabled={!canSaveEdit}>{i18n.t('mcpServer.token.save')}</button>
+                  <button class="btn btn--sm btn--secondary" type="button" onclick={cancelEdit}>{i18n.t('mcpServer.token.cancel')}</button>
                 </div>
               </form>
             </li>
           {/if}
         {/each}
       </ul>
+      <div class="clients-footer">
       {#if inactiveTokenCount > 0}
         <div class="action-row">
-          <button type="button" data-mcp-toggle-inactive="1" onclick={() => { showInactive = !showInactive; }}>
+          <button class="btn btn--sm btn--secondary" type="button" data-mcp-toggle-inactive="1" onclick={() => { showInactive = !showInactive; }}>
             {showInactive
               ? i18n.t('mcpServer.token.hideInactive')
               : i18n.t('mcpServer.token.showInactive', { count: String(inactiveTokenCount) })}
@@ -929,24 +940,19 @@
       {/if}
       {#if status.tokens.some((token) => token.active)}
         <div class="action-row">
-          <button type="button" class="danger" disabled={busy} onclick={() => void revokeAll()}>
+          <button type="button" class="btn btn--sm btn--error" disabled={busy} onclick={() => void revokeAll()}>
             {i18n.t('mcpServer.token.revokeAll')}
           </button>
         </div>
       {/if}
+      </div>
     {/if}
 
-    {#if !showCreate}
-      <div class="action-row">
-        <button type="button" class="primary-action" data-mcp-create-open="1" onclick={() => { showCreate = true; }}>
-          {i18n.t('mcpServer.token.new')}
-        </button>
-      </div>
-    {:else}
+    {#if showCreate}
     <form class="create-form" onsubmit={(event) => { event.preventDefault(); void createToken(); }}>
       <label class="field">
         <span>{i18n.t('mcpServer.token.clientName')}</span>
-        <input
+        <input class="form-input"
           bind:value={clientName}
           data-mcp-client-name="1"
           placeholder={i18n.t('mcpServer.token.clientNamePlaceholder')}
@@ -967,17 +973,17 @@
       </div>
       <label class="field">
         <span>{i18n.t('mcpServer.token.ttl')}</span>
-        <input type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
+        <input class="form-input" type="number" min="0" max="3650" step="1" bind:value={ttlDays} data-mcp-ttl="1" />
       </label>
       <label class="switch-line" data-mcp-allow-network="1">
         <input type="checkbox" role="switch" class="control-switch" bind:checked={allowNetwork} />
         <span>{i18n.t('mcpServer.token.allowNetwork')}</span>
       </label>
       <div class="action-row">
-        <button type="submit" class="primary-action" data-mcp-create="1" disabled={!canCreate}>
+        <button type="submit" class="btn btn--sm btn--primary" data-mcp-create="1" disabled={!canCreate}>
           {i18n.t('mcpServer.token.create')}
         </button>
-        <button type="button" onclick={() => { showCreate = false; }}>{i18n.t('mcpServer.token.cancel')}</button>
+        <button class="btn btn--sm btn--secondary" type="button" onclick={() => { showCreate = false; }}>{i18n.t('mcpServer.token.cancel')}</button>
       </div>
     </form>
     {/if}
@@ -986,14 +992,14 @@
   {/if}
 
   {#if tab === 'connect'}
-  <div class="card" data-mcp-server-snippets="1">
+  <div class="settings-card mcp-card" data-mcp-server-snippets="1">
     <h4>{i18n.t('mcpServer.snippets.section')}</h4>
     <p class="meta" data-mcp-token-origin="1">{i18n.t('mcpServer.snippets.hint')}</p>
     <p class="meta">{i18n.t('mcpServer.token.sharedSessionHint')}</p>
     {#if connectTokens.length === 0}
       <p class="meta" data-mcp-no-tokens="1">{i18n.t('mcpServer.snippets.noTokens')}</p>
       <div class="action-row">
-        <button type="button" class="primary-action" data-mcp-go-clients="1" onclick={() => { tab = 'clients'; showCreate = true; }}>
+        <button type="button" class="btn btn--sm btn--primary" data-mcp-go-clients="1" onclick={() => { tab = 'clients'; showCreate = true; }}>
           {i18n.t('mcpServer.snippets.goCreate')}
         </button>
       </div>
@@ -1020,8 +1026,8 @@
       {#each snippetEntries(snippets) as entry (entry.key)}
         <div class="snippet">
           <div class="snippet-head">
-            <span class="row-title">{entry.label}</span>
-            <button type="button" onclick={() => void copy(entry.key, entry.text)}>
+            <span class="settings-row-title">{entry.label}</span>
+            <button class="btn btn--sm btn--secondary" type="button" onclick={() => void copy(entry.key, entry.text)}>
               {copiedKey === entry.key ? i18n.t('mcpServer.token.copied') : i18n.t('mcpServer.token.copy')}
             </button>
           </div>
@@ -1035,7 +1041,7 @@
   {/if}
 
   {#if tab === 'activity'}
-    <div class="card" data-mcp-server-external="1">
+    <div class="settings-card mcp-card" data-mcp-server-external="1">
       <h4>{i18n.t('mcpServer.external.section')}</h4>
       <p class="meta">{i18n.t('mcpServer.external.desc')}</p>
       <label class="switch-line">
@@ -1087,14 +1093,6 @@
     color: #fff;
   }
 
-  .card {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 12px 14px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: 10px;
-  }
 
   .card h4 {
     margin: 0;
@@ -1117,22 +1115,7 @@
     min-height: 24px;
   }
 
-  .badge {
-    padding: 0 8px;
-    min-height: 18px;
-    background: transparent;
-    display: inline-flex;
-    align-items: center;
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--success) 40%, transparent);
-    border-radius: 999px;
-    font-size: var(--text-xs);
-    color: var(--success);
-  }
 
-  .badge--off {
-    border-color: var(--border);
-    color: var(--foreground-muted);
-  }
 
   .rows {
     display: flex;
@@ -1169,21 +1152,7 @@
     opacity: 0.55;
   }
 
-  .row-main {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    min-width: 0;
-  }
 
-  .row-title {
-    display: inline-flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: var(--font-semibold);
-  }
 
   .quick-add {
     display: flex;
@@ -1296,38 +1265,6 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-  }
-
-  /* 与全局 .btn--secondary / .btn--primary / .btn--sm 同一形态 */
-  button:not(.settings-subtab) {
-    height: var(--btn-height-sm);
-    padding: 0 var(--space-3);
-    border: none;
-    border-radius: var(--radius-sm);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    background: var(--secondary);
-    color: var(--foreground);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  button:not(.settings-subtab):hover:not(:disabled) { background: var(--secondary-hover); }
-
-  button.primary-action {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-
-  button.primary-action:hover:not(:disabled) { background: var(--primary-hover, var(--primary)); }
-
-  button.danger {
-    color: var(--error);
-  }
-
-  button:disabled {
-    cursor: default;
-    opacity: 0.45;
   }
 
   .status-message {

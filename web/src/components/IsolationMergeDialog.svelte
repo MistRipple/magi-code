@@ -277,10 +277,8 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    max-height: min(52vh, 420px);
     margin: 0;
     padding: 0;
-    overflow-y: auto;
     list-style: none;
   }
 

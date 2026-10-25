@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { constrainPanelWidth } from '../lib/panel-width';
   import SelectField from './SelectField.svelte';
   import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
   import { i18n } from '../stores/i18n.svelte';
@@ -210,6 +211,7 @@
   <div
     id={popoverId}
     class="ia-context-popover"
+    use:constrainPanelWidth={{ align: 'end', active: pinned }}
     class:visible={pinned}
     data-magi-surface="popover"
     role="tooltip"
@@ -392,7 +394,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: min(200px, calc(100vw - 24px));
+    width: min(clamp(240px, 28vw, 360px), var(--panel-available-width, calc(100vw - 24px)));
     box-sizing: border-box;
     max-height: min(70vh, 560px);
     overflow: auto;
@@ -496,9 +498,7 @@
   .context-breakdown-name {
     grid-column: 2 / 4;
     grid-row: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
 
   .context-breakdown-tokens {

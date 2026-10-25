@@ -647,7 +647,7 @@
     aria-label={i18n.t('messageItem.imagePreviewClose')}
   >
     <div class="image-preview-content" role="document">
-      <span class="image-preview-close" aria-hidden="true">×</span>
+      <span class="image-preview-close" aria-hidden="true"><Icon name="close" size={24} /></span>
       <img src={previewImageUrl} alt={i18n.t('messageItem.imagePreviewAlt')} class="image-preview-img" />
     </div>
   </button>
@@ -725,8 +725,8 @@
   }
 
   .user-content {
-    background: var(--primary);
-    color: white;
+    background: var(--user-message-bg);
+    color: var(--foreground);
     padding: var(--space-3) var(--space-4);
     border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
     font-size: var(--text-base);
@@ -746,19 +746,18 @@
   .user-command-text {
     display: block;
     margin-bottom: 2px;
-    color: #fde68a;
+    color: var(--primary);
     font-weight: calc(var(--font-semibold) + 50);
   }
 
-  /* 用户气泡是固定蓝底，markdown 内部所有文本/标记/代码块都强制白色，
-     不随主题变化——避免浅色模式下文字与蓝底对比度过低。 */
+  /* 用户内容跟随主题前景色，代码仅增加一层轻微的中性底色。 */
   .user-content :global(.markdown-content),
   .user-content :global(.markdown-content *) {
     color: inherit;
   }
   .user-content :global(.markdown-content code),
   .user-content :global(.markdown-content pre) {
-    background: rgba(255, 255, 255, 0.18);
+    background: color-mix(in srgb, var(--foreground) 6%, transparent);
     color: inherit;
   }
   .user-content :global(.markdown-content a) {
@@ -1210,7 +1209,6 @@
     background: transparent;
     border: none;
     color: white;
-    font-size: 32px;
     width: 40px;
     height: 40px;
     display: flex;

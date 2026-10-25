@@ -47,6 +47,7 @@
   --magi-canvas: var(--background);
   --magi-surface-sidebar: var(--background);
   --magi-surface-main: var(--background);
+  --magi-surface-composer: var(--vscode-input-background);
   --magi-surface-right-pane: var(--background);
   --magi-surface-dialog: var(--background);
   --magi-surface-popover: var(--dropdown-bg);
@@ -1083,7 +1084,6 @@ pre code {
 .empty-state__icon svg {
   width: 100%;
   height: 100%;
-  fill: currentColor;
 }
 
 .empty-state__title {
@@ -1424,6 +1424,7 @@ input:focus-visible + .control-switch { box-shadow: var(--magi-focus-shadow); }
 }
 
 .modal-header {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1440,11 +1441,13 @@ input:focus-visible + .control-switch { box-shadow: var(--magi-focus-shadow); }
 
 .modal-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: var(--space-4);
 }
 
 .modal-footer {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -1742,9 +1745,16 @@ body.vscode-light .hljs-params {
 }
 
 
-/* Folder Picker Modal */
-.folder-picker-modal .modal-body {
+/* 文件选择器的列表继承对话框分配的高度；移动端跟随既有全屏模态框。 */
+.modal-dialog:has(.mac-finder-container) {
+  height: 80dvh;
+}
+.modal-body:has(> .mac-finder-container) {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   padding: 0;
+  overflow: hidden;
 }
 
 

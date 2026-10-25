@@ -645,10 +645,9 @@
   }
 
   // MCP 工具描述 hover 浮层：默认右侧弹出；按钮 + 浮层共同构成 hover 区域，移出即消失
-  const DESC_POPOVER_WIDTH = 320;
   const DESC_POPOVER_MAX_HEIGHT = 240;
   const DESC_CLOSE_GRACE_MS = 120;
-  let descAnchor = $state<{ x: number; y: number; description: string } | null>(null);
+  let descAnchor = $state<{ x: number; y: number; width: number; description: string } | null>(null);
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
 
   function clearCloseTimer() {
@@ -671,10 +670,11 @@
     const btn = e.currentTarget as HTMLElement;
     const rect = btn.getBoundingClientRect();
     const gutter = 8;
+    const width = Math.min(480, Math.max(280, window.innerWidth * 0.3), window.innerWidth - gutter * 2);
     // 默认按钮右侧弹出；右侧不够则回落到左侧
     let left = rect.right + 8;
-    if (left + DESC_POPOVER_WIDTH + gutter > window.innerWidth) {
-      left = rect.left - DESC_POPOVER_WIDTH - 8;
+    if (left + width + gutter > window.innerWidth) {
+      left = rect.left - width - 8;
     }
     if (left < gutter) left = gutter;
     // 垂直对齐按钮中线，再按底部/顶部边界 clamp
@@ -684,9 +684,11 @@
       top = window.innerHeight - DESC_POPOVER_MAX_HEIGHT - gutter;
     }
     if (top < gutter) top = gutter;
-    descAnchor = { x: left, y: top, description };
+    descAnchor = { x: left, y: top, width, description };
   }
 </script>
+
+<svelte:window onresize={() => { descAnchor = null; }} />
 
 <div class="apple-manager tools-manager">
   <div class="apple-scroller-proxy">
@@ -1173,7 +1175,7 @@
   <div
     class="mcp-tool-desc-popover"
     data-magi-surface="popover"
-    style="top: {descAnchor.y}px; left: {descAnchor.x}px;"
+    style="top: {descAnchor.y}px; left: {descAnchor.x}px; width: {descAnchor.width}px;"
     role="tooltip"
     onmouseenter={clearCloseTimer}
     onmouseleave={scheduleClose}
@@ -1212,22 +1214,6 @@
     flex: 0 0 auto;
     overflow: visible;
     padding-right: 0;
-  }
-
-  .builtin-category-list::-webkit-scrollbar {
-    width: 10px;
-  }
-
-  .builtin-category-list::-webkit-scrollbar-track {
-    background: color-mix(in srgb, var(--surface-2) 58%, transparent);
-    border-radius: 999px;
-  }
-
-  .builtin-category-list::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb);
-    border-radius: 999px;
-    border: 2px solid color-mix(in srgb, var(--surface-1) 88%, transparent);
-    background-clip: content-box;
   }
 
   .tools-fixed-panel .apple-grid {
@@ -1371,12 +1357,6 @@
   .builtin-category-list {
     display: flex;
     flex-direction: column;
-    max-height: 348px;
-    overflow-x: hidden;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    scrollbar-color: var(--scrollbar-thumb) transparent;
-    scrollbar-width: thin;
     border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
   }
@@ -1760,48 +1740,6 @@
     text-align: center;
   }
 
-  /* Apply consistent tile classes */
-  .apple-tile {
-    background: rgba(255, 255, 255, 0.92);
-    border: var(--magi-hairline) solid rgba(60, 60, 67, 0.16);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.05);
-    border-radius: 12px;
-    padding: 14px 18px 18px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    height: 124px;
-    box-sizing: border-box;
-    transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
-    position: relative;
-    z-index: 1;
-  }
-
-  .apple-tile:hover {
-    border-color: rgba(60, 60, 67, 0.2);
-    background: #ffffff;
-    z-index: 5;
-  }
-
-  :global(body.theme-dark) .apple-tile,
-  :global(body.vscode-dark) .apple-tile,
-  :global(:root.theme-dark) .apple-tile {
-    background: rgba(255, 255, 255, 0.04);
-    border-color: rgba(255, 255, 255, 0.14);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.05);
-  }
-
-  :global(body.theme-dark) .apple-tile:hover,
-  :global(body.vscode-dark) .apple-tile:hover,
-  :global(:root.theme-dark) .apple-tile:hover {
-    border-color: rgba(255, 255, 255, 0.20);
-    background: rgba(255, 255, 255, 0.07);
-  }
-
-  .apple-tile.expanded {
-    z-index: 100;
-  }
-
   .avatar-squircle {
     width: 24px;
     height: 24px;
@@ -1852,9 +1790,6 @@
   .mcp-tools-list {
     display: flex;
     flex-direction: column;
-    max-height: min(280px, 42vh);
-    overflow-y: auto;
-    overscroll-behavior: contain;
     padding: 5px;
   }
 
@@ -1938,8 +1873,8 @@
   /* MCP 工具描述浮层气泡：fixed 定位，已在脚本中按视口边界 clamp */
   .mcp-tool-desc-popover {
     position: fixed;
-    width: 320px;
-    max-height: 240px;
+    max-width: calc(100vw - 16px);
+    max-height: min(240px, calc(100dvh - 16px));
     overflow-y: auto;
     padding: 10px 12px;
     background: var(--background);
@@ -2054,8 +1989,8 @@
   .skill-detail-meta dt { color: var(--foreground-muted); }
   .skill-detail-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
   .skill-detail-body {
-    max-height: 360px;
-    overflow: auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
     padding: 10px 12px;
     border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
@@ -2064,7 +1999,7 @@
   }
   .skill-detail-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.55; color: var(--foreground); }
   .skill-detail-files-title { margin-bottom: 4px; font-size: var(--text-xs); font-weight: var(--font-semibold); color: var(--foreground-muted); }
-  .skill-detail-files ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow: auto; }
+  .skill-detail-files ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
   .skill-detail-files li { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
   .skill-detail-files code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }
   .skill-detail-files li span { flex: 0 0 auto; color: var(--foreground-muted); }

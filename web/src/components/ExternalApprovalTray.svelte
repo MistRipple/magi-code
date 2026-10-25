@@ -53,7 +53,9 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: min(360px, calc(100vw - 32px));
+    width: min(clamp(320px, 36vw, 520px), calc(100vw - 32px));
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
     padding: 12px 14px;
     border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.28));
     border-radius: 12px;
@@ -82,6 +84,7 @@
   }
 
   .meta {
+    overflow-wrap: anywhere;
     font-size: var(--text-xs);
     opacity: 0.66;
   }

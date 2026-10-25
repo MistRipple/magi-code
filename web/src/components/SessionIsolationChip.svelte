@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { constrainPanelWidth } from '../lib/panel-width';
   import type { ComposerWorkspaceOption } from '../stores/composer-workspace.svelte';
   import { addToast } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -115,7 +116,7 @@
     </button>
 
     {#if open && isolation}
-      <div class="session-isolation-popover" data-magi-surface="popover" role="menu">
+      <div class="session-isolation-popover" use:constrainPanelWidth={{ align: 'start' }} data-magi-surface="popover" role="menu">
         <div class="session-isolation-heading">{i18n.t('isolation.chip.menuTitle')}</div>
         <button type="button" class="session-isolation-item" role="menuitem" onclick={openMerge}>
           <Icon name="git-merge" size={12} />
@@ -184,7 +185,9 @@
     bottom: calc(100% + 7px);
     left: 0;
     z-index: 34;
-    width: 200px;
+    width: max-content;
+    min-width: min(200px, var(--panel-available-width, calc(100vw - 24px)));
+    max-width: var(--panel-available-width, calc(100vw - 24px));
     padding: 6px;
     border: 0;
     border-radius: calc(var(--radius-sm) + 6px);

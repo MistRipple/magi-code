@@ -328,7 +328,7 @@
     </div>
   {/if}
 
-  <div class="settings-section">
+  <div class="settings-section store-section">
     <div class="settings-section-header">
       <div>
         <div class="settings-section-title">{i18n.t('settings.plugins.store.title')}</div>
@@ -526,6 +526,7 @@
 {/if}
 
 <style>
+  .store-section { display: flex; flex: 1 0 auto; flex-direction: column; min-height: 0; }
   .store-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0 var(--space-2); }
   .store-search { width: 240px; max-width: 100%; }
   .store-filters { margin-bottom: 0; border-bottom: 0; }
@@ -533,7 +534,7 @@
   .store-count { margin-left: 2px; color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
 
   /* 左右分栏：整体是一块带边框的面板，左侧列表独立滚动，右侧显示所选插件。 */
-  .store { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: min(600px, 68vh); min-height: 380px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; overflow: hidden; }
+  .store { display: grid; grid-template-columns: 300px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); flex: 1 1 0; min-height: 180px; border: var(--magi-hairline) solid var(--border); border-radius: 10px; overflow: hidden; }
   .store-list { display: flex; flex-direction: column; min-height: 0; border-right: var(--magi-hairline) solid var(--border); }
   .store-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 6px 8px; }
   .store-group { display: flex; align-items: center; justify-content: space-between; padding: 12px 8px 4px; font-size: var(--text-xs); font-weight: var(--font-medium); color: var(--foreground-muted); letter-spacing: 0.02em; }
@@ -555,8 +556,8 @@
   .store-pager-actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
   .store-detail { min-width: 0; min-height: 0; overflow-y: auto; }
   @container settings-content (max-width: 720px) {
-    .store { grid-template-columns: minmax(0, 1fr); height: auto; }
-    .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); max-height: 320px; }
+    .store { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; flex: 1 0 auto; }
+    .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); max-height: 40dvh; min-height: 180px; }
   }
   .plugin-perm { display: grid; gap: var(--space-2); }
   .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }

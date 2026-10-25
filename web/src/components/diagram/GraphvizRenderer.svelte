@@ -119,7 +119,7 @@
   <div class="graphviz-content">
     {#if isRendering}
       <div class="loading">
-        <span class="spinner"></span>
+        <span class="spinner"><Icon name="loader" size={24} /></span>
         <span>{i18n.t('diagramRenderer.rendering')}</span>
       </div>
     {:else if error}
@@ -250,11 +250,10 @@
   }
 
   .spinner {
+    display: inline-flex;
+    color: var(--primary);
     width: 24px;
     height: 24px;
-    border: 2px solid var(--border);
-    border-top-color: var(--primary);
-    border-radius: 50%;
     animation: spin 1s linear infinite;
   }
 

@@ -9,6 +9,8 @@
   import { MessageCategory } from '../shared/protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
+  import FileName from './FileName.svelte';
+  import FileTypeIcon from './FileTypeIcon.svelte';
   import KnowledgeGraphPanel from './KnowledgeGraphPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getState, messagesState } from '../stores/messages.svelte';
@@ -108,12 +110,15 @@
   let faqs = $state<FAQ[]>([]);
   let learnings = $state<Learning[]>([]);
   let searchQuery = $state('');
+  let showAllEntryPoints = $state(false);
   type EditableKnowledgeKind = 'adr' | 'faq' | 'learning';
 
   let expandedAdrId = $state<string | null>(null);
   let expandedFaqId = $state<string | null>(null);
   let expandedLearningId = $state<string | null>(null);
   let showClearConfirm = $state(false);
+  let editorElement = $state<HTMLDivElement | null>(null);
+  $effect(() => { editorElement?.scrollIntoView({ block: 'nearest' }); });
   let editorKind = $state<EditableKnowledgeKind | null>(null);
   let editorId = $state<string | null>(null);
   let formTitle = $state('');
@@ -211,6 +216,7 @@
   function openKnowledgeRecord(knowledgeId: string): void {
     const id = knowledgeId.trim();
     if (!id) return;
+    searchQuery = '';
     if (adrs.some((item) => item.id === id)) {
       currentTab = 'adr';
       expandedAdrId = id;
@@ -930,6 +936,7 @@
       return;
     }
     lastWorkspaceKey = nextWorkspaceKey;
+    showAllEntryPoints = false;
     knowledgeWorkspaceGeneration += 1;
     knowledgeLoadRequestSeq += 1;
     hasRequestedKnowledge = false;
@@ -989,37 +996,38 @@
 </script>
 
 <div class="panel-content-scrollable knowledge-panel">
-  <!-- 头部：Tab 栏 -->
-  <div class="kp-tabs-bar">
-    <button class="kp-tab" class:active={currentTab === 'overview'} onclick={() => switchTab('overview')}>
-      <Icon name="stats" size={13} />
-      <span>{i18n.t('knowledge.tabs.overview')}</span>
-    </button>
-    <button class="kp-tab" class:active={currentTab === 'adr'} onclick={() => switchTab('adr')}>
-      <Icon name="document" size={13} />
-      <span>{i18n.t('knowledge.tabs.adr')}</span>
-      {#if adrs.length > 0}
-        <span class="kp-tab-count">{adrs.length}</span>
-      {/if}
-    </button>
-    <button class="kp-tab" class:active={currentTab === 'faq'} onclick={() => switchTab('faq')}>
-      <Icon name="question" size={13} />
-      <span>{i18n.t('knowledge.tabs.faq')}</span>
-      {#if faqs.length > 0}
-        <span class="kp-tab-count">{faqs.length}</span>
-      {/if}
-    </button>
-    <button class="kp-tab" class:active={currentTab === 'learning'} onclick={() => switchTab('learning')}>
-      <Icon name="lightbulb" size={13} />
-      <span>{i18n.t('knowledge.tabs.learning')}</span>
-      {#if learnings.length > 0}
-        <span class="kp-tab-count">{learnings.length}</span>
-      {/if}
-    </button>
-    <button class="kp-tab" class:active={currentTab === 'graph'} onclick={() => switchTab('graph')}>
-      <Icon name="git-branch" size={13} />
-      <span>{i18n.t('knowledge.tabs.graph')}</span>
-    </button>
+  <div class="kp-toolbar">
+    <nav class="kp-tabs-bar" aria-label={i18n.t('knowledge.navigation')}>
+      <button class="kp-tab" aria-current={currentTab === 'overview' ? 'page' : undefined} class:active={currentTab === 'overview'} onclick={() => switchTab('overview')}>
+        <Icon name="stats" size={13} />
+        <span>{i18n.t('knowledge.tabs.overview')}</span>
+      </button>
+      <button class="kp-tab" aria-current={currentTab === 'adr' ? 'page' : undefined} class:active={currentTab === 'adr'} onclick={() => switchTab('adr')}>
+        <Icon name="document" size={13} />
+        <span>{i18n.t('knowledge.tabs.adr')}</span>
+        {#if adrs.length > 0}
+          <span class="kp-tab-count">{adrs.length}</span>
+        {/if}
+      </button>
+      <button class="kp-tab" aria-current={currentTab === 'faq' ? 'page' : undefined} class:active={currentTab === 'faq'} onclick={() => switchTab('faq')}>
+        <Icon name="question" size={13} />
+        <span>{i18n.t('knowledge.tabs.faq')}</span>
+        {#if faqs.length > 0}
+          <span class="kp-tab-count">{faqs.length}</span>
+        {/if}
+      </button>
+      <button class="kp-tab" aria-current={currentTab === 'learning' ? 'page' : undefined} class:active={currentTab === 'learning'} onclick={() => switchTab('learning')}>
+        <Icon name="lightbulb" size={13} />
+        <span>{i18n.t('knowledge.tabs.learning')}</span>
+        {#if learnings.length > 0}
+          <span class="kp-tab-count">{learnings.length}</span>
+        {/if}
+      </button>
+      <button class="kp-tab" aria-current={currentTab === 'graph' ? 'page' : undefined} class:active={currentTab === 'graph'} onclick={() => switchTab('graph')}>
+        <Icon name="git-branch" size={13} />
+        <span>{i18n.t('knowledge.tabs.graph')}</span>
+      </button>
+    </nav>
     <div class="kp-tab-actions">
       <button class="kp-icon-btn" onclick={refresh} disabled={isLoading} title={i18n.t('knowledge.actions.refreshTitle')}>
         <Icon name="refresh" size={14} class={isLoading ? 'spinning' : ''} />
@@ -1035,66 +1043,28 @@
     </div>
   </div>
 
-  <!-- 搜索栏（Tab 下方独立行） -->
+  <!-- 搜索与新增操作分开，输入框独立获得焦点样式。 -->
   {#if currentTab !== 'overview' && currentTab !== 'graph'}
-    <div class="kp-search-bar">
-      <Icon name="search" size={13} />
-      <input
-        type="text"
-        class="kp-search-input"
-        placeholder={currentTab === 'adr' ? i18n.t('knowledge.search.adrPlaceholder') : currentTab === 'faq' ? i18n.t('knowledge.search.faqPlaceholder') : i18n.t('knowledge.search.learningPlaceholder')}
-        bind:value={searchQuery}
-      />
-      {#if searchQuery}
-        <button class="kp-search-clear" onclick={() => searchQuery = ''}>
-          <Icon name="close" size={12} />
-        </button>
-      {/if}
+    <div class="kp-list-toolbar">
+      <div class="kp-search-bar">
+        <Icon name="search" size={13} />
+        <input
+          type="text"
+          class="kp-search-input"
+          placeholder={currentTab === 'adr' ? i18n.t('knowledge.search.adrPlaceholder') : currentTab === 'faq' ? i18n.t('knowledge.search.faqPlaceholder') : i18n.t('knowledge.search.learningPlaceholder')}
+          aria-label={currentTab === 'adr' ? i18n.t('knowledge.search.adrPlaceholder') : currentTab === 'faq' ? i18n.t('knowledge.search.faqPlaceholder') : i18n.t('knowledge.search.learningPlaceholder')}
+          bind:value={searchQuery}
+        />
+        {#if searchQuery}
+          <button aria-label={i18n.t('knowledge.search.clear')} class="kp-search-clear" onclick={() => searchQuery = ''}>
+            <Icon name="close" size={12} />
+          </button>
+        {/if}
+      </div>
       <button class="kp-add-btn" onclick={() => openCreateEditor(currentTab as EditableKnowledgeKind)}>
         <Icon name="plus" size={12} />
         <span>{i18n.t('knowledge.actions.add')}</span>
       </button>
-    </div>
-  {/if}
-
-  {#if editorKind}
-    <div class="kp-editor-card">
-      <div class="kp-editor-title">{editorTitle()}</div>
-      <p class="settings-hint" role="status">{i18n.t('overlay.draftSession')}</p>
-      {#if editorKind !== 'learning'}
-        <label class="kp-editor-field">
-          <span>{editorKind === 'faq' ? i18n.t('knowledge.form.question') : i18n.t('knowledge.form.title')}</span>
-          <input class="kp-editor-input" bind:value={formTitle} />
-        </label>
-      {/if}
-      <label class="kp-editor-field">
-        <span>{editorKind === 'faq' ? i18n.t('knowledge.form.answer') : i18n.t('knowledge.form.content')}</span>
-        <textarea class="kp-editor-textarea" bind:value={formContent} rows="4"></textarea>
-      </label>
-      {#if editorKind === 'learning'}
-        <label class="kp-editor-field">
-          <span>{i18n.t('knowledge.form.context')}</span>
-          <input class="kp-editor-input" bind:value={formContext} />
-        </label>
-      {/if}
-      <label class="kp-editor-field">
-        <span>{i18n.t('knowledge.form.tags')}</span>
-        <input class="kp-editor-input" bind:value={formTags} placeholder={i18n.t('knowledge.form.tagsPlaceholder')} />
-      </label>
-      {#if formError}
-        <div class="kp-editor-error">{formError}</div>
-      {/if}
-      <div class="kp-editor-actions">
-        <button class="kp-editor-btn" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
-        <button class="kp-editor-btn kp-editor-btn--primary" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if loadError}
-    <div class="kp-load-error">
-      <Icon name="warning" size={14} />
-      <span>{loadError}</span>
     </div>
   {/if}
 
@@ -1113,9 +1083,50 @@
 
   <!-- 主内容区 -->
   <div class="kp-content">
+    {#if editorKind}
+      <div class="kp-editor-card" bind:this={editorElement}>
+        <div class="kp-editor-title">{editorTitle()}</div>
+        <p class="settings-hint" role="status">{i18n.t('overlay.draftSession')}</p>
+        {#if editorKind !== 'learning'}
+          <label class="kp-editor-field">
+            <span>{editorKind === 'faq' ? i18n.t('knowledge.form.question') : i18n.t('knowledge.form.title')}</span>
+            <input class="kp-editor-input" bind:value={formTitle} />
+          </label>
+        {/if}
+        <label class="kp-editor-field">
+          <span>{editorKind === 'faq' ? i18n.t('knowledge.form.answer') : i18n.t('knowledge.form.content')}</span>
+          <textarea class="kp-editor-textarea" bind:value={formContent} rows="4"></textarea>
+        </label>
+        {#if editorKind === 'learning'}
+          <label class="kp-editor-field">
+            <span>{i18n.t('knowledge.form.context')}</span>
+            <input class="kp-editor-input" bind:value={formContext} />
+          </label>
+        {/if}
+        <label class="kp-editor-field">
+          <span>{i18n.t('knowledge.form.tags')}</span>
+          <input class="kp-editor-input" bind:value={formTags} placeholder={i18n.t('knowledge.form.tagsPlaceholder')} />
+        </label>
+        {#if formError}
+          <div class="kp-editor-error">{formError}</div>
+        {/if}
+        <div class="kp-editor-actions">
+          <button class="kp-editor-btn" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
+          <button class="kp-editor-btn kp-editor-btn--primary" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if loadError}
+      <div class="kp-load-error">
+        <Icon name="warning" size={14} />
+        <span>{loadError}</span>
+      </div>
+    {/if}
+
     {#if isLoading}
       <div class="kp-loading">
-        <div class="kp-spinner"></div>
+        <span class="kp-spinner"><Icon name="loader" size={20} /></span>
         <span>{i18n.t('knowledge.loading')}</span>
       </div>
     {:else if currentTab === 'overview'}
@@ -1127,22 +1138,18 @@
             <span class="kp-stat-value">{fileCount.toLocaleString()}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.files')}</span>
           </div>
-          <div class="kp-stat-divider"></div>
           <div class="kp-stat">
             <span class="kp-stat-value">{totalLines.toLocaleString()}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.lines')}</span>
           </div>
-          <div class="kp-stat-divider"></div>
           <div class="kp-stat">
             <span class="kp-stat-value">{adrs.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.adr')}</span>
           </div>
-          <div class="kp-stat-divider"></div>
           <div class="kp-stat">
             <span class="kp-stat-value">{faqs.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.faq')}</span>
           </div>
-          <div class="kp-stat-divider"></div>
           <div class="kp-stat">
             <span class="kp-stat-value">{learnings.length}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.tabs.learning')}</span>
@@ -1180,18 +1187,24 @@
               <span>{i18n.t('knowledge.overview.entryPoints')}</span>
             </h4>
             <div class="kp-entry-list">
-              {#each normalizedCodeIndex.entryPoints as entry}
+              {#each (showAllEntryPoints ? normalizedCodeIndex.entryPoints : normalizedCodeIndex.entryPoints.slice(0, 6)) as entry}
                 <button
                   type="button"
-                  class="kp-entry-item kp-entry-item--clickable"
+                  class="kp-entry-item"
                   onclick={() => previewEntryPoint(entry)}
                   title={i18n.t('rightPane.previewFile', { path: entry })}
                 >
-                  <Icon name="file-text" size={12} />
-                  <span>{entry}</span>
+                  <FileTypeIcon path={entry} size={14} />
+                  <FileName name={entry} />
                 </button>
               {/each}
             </div>
+            {#if normalizedCodeIndex.entryPoints.length > 6}
+              <button class="kp-section-link kp-entry-more" aria-expanded={showAllEntryPoints} onclick={() => showAllEntryPoints = !showAllEntryPoints}>
+                {i18n.t(showAllEntryPoints ? 'knowledge.overview.showLess' : 'knowledge.overview.viewAll')}
+                <span>({normalizedCodeIndex.entryPoints.length})</span>
+              </button>
+            {/if}
           </div>
         {/if}
 
@@ -1205,13 +1218,13 @@
             </h4>
             {#each adrs.slice(0, 3) as adr (adr.id)}
               {@const adrDate = formatKnowledgeDate(adr.updatedAt)}
-              <div class="kp-preview-item">
-                <span class="kp-preview-dot default"></span>
+              <button type="button" class="kp-preview-item" onclick={() => openKnowledgeRecord(adr.id)}>
+                <Icon name="document" size={14} />
                 <span class="kp-preview-text">{adr.title}</span>
                 {#if adrDate}
                   <span class="kp-preview-date">{adrDate}</span>
                 {/if}
-              </div>
+              </button>
             {/each}
           </div>
         {/if}
@@ -1225,13 +1238,13 @@
             </h4>
             {#each learnings.slice(0, 3) as learning (learning.id)}
               {@const learningDate = formatKnowledgeDate(learning.updatedAt ?? learning.createdAt)}
-              <div class="kp-preview-item">
-                <span class="kp-preview-dot learning"></span>
+              <button type="button" class="kp-preview-item" onclick={() => openKnowledgeRecord(learning.id)}>
+                <Icon name="lightbulb" size={14} />
                 <span class="kp-preview-text">{formatLearningTitle(learning.content)}</span>
                 {#if learningDate}
                   <span class="kp-preview-date">{learningDate}</span>
                 {/if}
-              </div>
+              </button>
             {/each}
           </div>
         {/if}
@@ -1264,8 +1277,12 @@
         {#if filteredAdrs.length === 0}
           <div class="kp-empty">
             <Icon name="document" size={28} />
-            <div class="kp-empty-title">{i18n.t('knowledge.adr.emptyTitle')}</div>
-            <div class="kp-empty-hint">{i18n.t('knowledge.adr.emptyHint')}</div>
+            <div class="kp-empty-title">{i18n.t(searchQuery.trim() ? 'knowledge.search.noResults' : 'knowledge.adr.emptyTitle')}</div>
+            {#if searchQuery.trim()}
+              <button class="kp-section-link" onclick={() => searchQuery = ''}>{i18n.t('knowledge.search.clear')}</button>
+            {:else}
+              <div class="kp-empty-hint">{i18n.t('knowledge.adr.emptyHint')}</div>
+            {/if}
           </div>
         {:else}
           {#each filteredAdrs as adr (adr.id)}
@@ -1273,25 +1290,24 @@
             {@const adrDate = formatKnowledgeDate(adr.updatedAt)}
             {@const adrTags = visibleTags(adr.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
-              <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleAdr(adr)} onkeydown={(e) => e.key === 'Enter' && toggleAdr(adr)}>
-                <span class="kp-card-indicator default"></span>
-                <div class="kp-card-main">
-                  <span class="kp-card-title">{adr.title}</span>
-                  {#if !isExpanded && adr.content}
-                    <p class="kp-card-preview">{adr.content}</p>
-                  {/if}
-                </div>
-                <div class="kp-card-meta">
+              <div class="kp-card-header">
+                <button type="button" class="kp-card-toggle" aria-expanded={isExpanded} onclick={() => toggleAdr(adr)}>
+                  <div class="kp-card-main">
+                    <span class="kp-card-title">{adr.title}</span>
+                    {#if !isExpanded && adr.content}
+                      <p class="kp-card-preview">{adr.content}</p>
+                    {/if}
+                    {#if adrDate}<span class="kp-card-date">{adrDate}</span>{/if}
+                  </div>
+                  <span class="kp-card-chevron"><Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} /></span>
+                </button>
+                <div class="kp-card-actions">
                   <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editAdr(adr, e)}>
-                    <Icon name="edit" size={12} />
+                    <Icon name="edit" size={14} />
                   </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.adr.deleteTitle')} onclick={(e) => deleteAdr(adr.id, e)}>
-                    <Icon name="trash" size={12} />
+                    <Icon name="trash" size={14} />
                   </button>
-                  {#if adrDate}
-                    <span class="kp-category-badge">{adrDate}</span>
-                  {/if}
-                  <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
               <Disclosure expanded={isExpanded}>
@@ -1321,8 +1337,12 @@
         {#if filteredFaqs.length === 0}
           <div class="kp-empty">
             <Icon name="question" size={28} />
-            <div class="kp-empty-title">{i18n.t('knowledge.faq.emptyTitle')}</div>
-            <div class="kp-empty-hint">{i18n.t('knowledge.faq.emptyHint')}</div>
+            <div class="kp-empty-title">{i18n.t(searchQuery.trim() ? 'knowledge.search.noResults' : 'knowledge.faq.emptyTitle')}</div>
+            {#if searchQuery.trim()}
+              <button class="kp-section-link" onclick={() => searchQuery = ''}>{i18n.t('knowledge.search.clear')}</button>
+            {:else}
+              <div class="kp-empty-hint">{i18n.t('knowledge.faq.emptyHint')}</div>
+            {/if}
           </div>
         {:else}
           {#each filteredFaqs as faq (faq.id)}
@@ -1330,25 +1350,24 @@
             {@const faqDate = formatKnowledgeDate(faq.updatedAt)}
             {@const faqTags = visibleTags(faq.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
-              <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleFaq(faq)} onkeydown={(e) => e.key === 'Enter' && toggleFaq(faq)}>
-                <span class="kp-card-indicator faq"></span>
-                <div class="kp-card-main">
-                  <span class="kp-card-title">{faq.question}</span>
-                  {#if !isExpanded && faq.answer}
-                    <p class="kp-card-preview">{faq.answer}</p>
-                  {/if}
-                </div>
-                <div class="kp-card-meta">
+              <div class="kp-card-header">
+                <button type="button" class="kp-card-toggle" aria-expanded={isExpanded} onclick={() => toggleFaq(faq)}>
+                  <div class="kp-card-main">
+                    <span class="kp-card-title">{faq.question}</span>
+                    {#if !isExpanded && faq.answer}
+                      <p class="kp-card-preview">{faq.answer}</p>
+                    {/if}
+                    {#if faqDate}<span class="kp-card-date">{faqDate}</span>{/if}
+                  </div>
+                  <span class="kp-card-chevron"><Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} /></span>
+                </button>
+                <div class="kp-card-actions">
                   <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editFaq(faq, e)}>
-                    <Icon name="edit" size={12} />
+                    <Icon name="edit" size={14} />
                   </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.faq.deleteTitle')} onclick={(e) => deleteFaq(faq.id, e)}>
-                    <Icon name="trash" size={12} />
+                    <Icon name="trash" size={14} />
                   </button>
-                  {#if faqDate}
-                    <span class="kp-category-badge">{faqDate}</span>
-                  {/if}
-                  <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
               <Disclosure expanded={isExpanded}>
@@ -1378,8 +1397,12 @@
         {#if filteredLearnings.length === 0}
           <div class="kp-empty">
             <Icon name="lightbulb" size={28} />
-            <div class="kp-empty-title">{i18n.t('knowledge.learning.emptyTitle')}</div>
-            <div class="kp-empty-hint">{i18n.t('knowledge.learning.emptyHint')}</div>
+            <div class="kp-empty-title">{i18n.t(searchQuery.trim() ? 'knowledge.search.noResults' : 'knowledge.learning.emptyTitle')}</div>
+            {#if searchQuery.trim()}
+              <button class="kp-section-link" onclick={() => searchQuery = ''}>{i18n.t('knowledge.search.clear')}</button>
+            {:else}
+              <div class="kp-empty-hint">{i18n.t('knowledge.learning.emptyHint')}</div>
+            {/if}
           </div>
         {:else}
           {#each filteredLearnings as learning (learning.id)}
@@ -1388,25 +1411,24 @@
             {@const learningDate = formatKnowledgeDate(learning.updatedAt ?? learning.createdAt)}
             {@const learningTags = visibleTags(learning.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
-              <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleLearning(learning)} onkeydown={(e) => e.key === 'Enter' && toggleLearning(learning)}>
-                <span class="kp-card-indicator learning"></span>
-                <div class="kp-card-main">
-                  <span class="kp-card-title">{formatLearningTitle(learning.content)}</span>
-                  {#if !isExpanded && learningSource}
-                    <p class="kp-card-preview">{learningSource}</p>
-                  {/if}
-                </div>
-                <div class="kp-card-meta">
+              <div class="kp-card-header">
+                <button type="button" class="kp-card-toggle" aria-expanded={isExpanded} onclick={() => toggleLearning(learning)}>
+                  <div class="kp-card-main">
+                    <span class="kp-card-title">{formatLearningTitle(learning.content)}</span>
+                    {#if !isExpanded && learningSource}
+                      <p class="kp-card-preview">{learningSource}</p>
+                    {/if}
+                    {#if learningDate}<span class="kp-card-date">{learningDate}</span>{/if}
+                  </div>
+                  <span class="kp-card-chevron"><Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} /></span>
+                </button>
+                <div class="kp-card-actions">
                   <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editLearning(learning, e)}>
-                    <Icon name="edit" size={12} />
+                    <Icon name="edit" size={14} />
                   </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.learning.deleteTitle')} onclick={(e) => deleteLearning(learning.id, e)}>
-                    <Icon name="trash" size={12} />
+                    <Icon name="trash" size={14} />
                   </button>
-                  {#if learningDate}
-                    <span class="kp-category-badge">{learningDate}</span>
-                  {/if}
-                  <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
               <Disclosure expanded={isExpanded}>
@@ -1438,732 +1460,272 @@
 </div>
 
 <style>
-  /* ============================================
-     KnowledgePanel - 知识库面板
-     设计参考: Linear/Notion 知识管理界面
-     适配 VSCode 侧边栏窄面板约束
-     ============================================ */
-
   .knowledge-panel {
-    /* panel-content-scrollable 已经包含了 padding, flex, overflow */
+    container: knowledge-layout / inline-size;
+    min-width: 0;
+    gap: var(--space-4);
+    overflow: hidden;
     background: transparent;
-    padding-top: 0;
   }
 
-  /* ---- Tab 栏（Apple HIG 分段式胶囊风格） ----
-     Tab 栏本身保持透明，消费面板/桌面宿主提供的底层材质；只有
-     hover 和 active 状态为控件提供局部的半透明反馈。 */
-  .kp-tabs-bar {
+  .kp-toolbar, .kp-list-toolbar {
     display: flex;
     align-items: center;
-    gap: var(--space-1);
-    padding: var(--space-3) 0;
-    border-bottom: none;
-    position: sticky;
-    top: 0;
-    background: transparent;
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
-    z-index: var(--z-sticky);
-    margin-bottom: var(--space-2);
+    gap: var(--space-3);
+    min-width: 0;
+    flex-shrink: 0;
+  }
+
+  .kp-toolbar { border-bottom: var(--magi-hairline) solid var(--border); }
+  .kp-tabs-bar {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    gap: var(--space-3);
+    overflow-x: auto;
+    scrollbar-width: thin;
   }
 
   .kp-tab {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-2);
-    padding: 6px 12px;
-    font-size: var(--text-sm);
-    color: var(--foreground-muted);
+    flex-shrink: 0;
+    gap: var(--space-1);
+    min-height: 36px;
+    padding: 6px 2px;
+    border: 0;
+    border-radius: 0;
+    box-shadow: inset 0 -2px transparent;
     background: transparent;
-    border: none;
-    border-radius: var(--radius-full);
-    cursor: pointer;
-    transition: all var(--transition-fast);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
     white-space: nowrap;
-    height: 28px;
+    cursor: pointer;
   }
-
-  .kp-tab:hover {
-    color: var(--foreground);
-    background: var(--surface-hover);
-  }
-
+  .kp-tab:hover { color: var(--foreground); }
   .kp-tab.active {
     color: var(--foreground);
-    background: color-mix(in srgb, var(--surface-active) 55%, transparent);
+    box-shadow: inset 0 -2px var(--foreground);
     font-weight: var(--font-semibold);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent);
   }
-
   .kp-tab-count {
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    min-width: 18px;
-    height: 18px;
-    line-height: 18px;
-    text-align: center;
-    padding: 0 5px;
-    background: color-mix(in srgb, var(--foreground) 10%, transparent);
     color: var(--foreground-muted);
-    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
-
-  .kp-tab.active .kp-tab-count {
-    background: var(--foreground);
-    color: var(--background);
-  }
-
-  .kp-tab-actions {
-    display: flex;
-    gap: var(--space-1);
-    margin-left: auto;
-  }
-
-  .kp-icon-btn {
+  .kp-tab-actions, .kp-card-actions { display: flex; flex-shrink: 0; gap: var(--space-1); }
+  .kp-icon-btn, .kp-card-action, .kp-card-delete, .kp-search-clear {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
     padding: 0;
-    background: transparent;
-    border: none;
+    border: 0;
     border-radius: var(--radius-sm);
+    background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
-    transition: all var(--transition-fast);
   }
-
-  .kp-icon-btn:hover:not(:disabled) {
+  .kp-icon-btn:hover:not(:disabled), .kp-card-action:hover, .kp-search-clear:hover {
     background: var(--surface-hover);
     color: var(--foreground);
   }
-
-  .kp-icon-btn:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-
-  .kp-icon-btn--danger:hover:not(:disabled) {
+  .kp-icon-btn--danger:hover:not(:disabled), .kp-card-delete:hover {
     background: var(--error-muted);
     color: var(--error);
   }
-
-  :global(.spinning) {
-    animation: kp-spin 1s linear infinite;
-  }
-
-  @keyframes kp-spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-
-  /* ---- 搜索栏 ---- */
+  .kp-icon-btn:disabled, .kp-editor-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .kp-search-bar {
     display: flex;
     align-items: center;
+    flex: 1;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border-bottom: var(--magi-hairline) solid var(--border);
+    min-width: 0;
+    min-height: 32px;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
+    background: var(--surface-1);
     color: var(--foreground-muted);
   }
-
-  .kp-search-bar:focus-within {
-    box-shadow: var(--magi-focus-shadow);
-  }
-
+  .kp-search-bar:focus-within { box-shadow: var(--magi-focus-shadow); }
   .kp-search-input {
-    flex: 1;
-    border: none;
+    width: 100%;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    box-shadow: none;
     background: transparent;
     color: var(--foreground);
     font-size: var(--text-sm);
-    outline: none;
-    box-shadow: none;
-    min-width: 0;
   }
-
-  .kp-search-input::placeholder {
-    color: var(--foreground-muted);
-    opacity: 0.6;
-  }
-
-  .kp-search-clear {
+  .kp-search-input::placeholder { color: var(--foreground-muted); }
+  .kp-search-clear { width: 24px; height: 24px; }
+  .kp-add-btn, .kp-editor-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 18px;
-    height: 18px;
-    padding: 0;
-    background: var(--surface-3);
-    border: none;
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .kp-search-clear:hover {
-    background: var(--surface-active);
-    color: var(--foreground);
-  }
-
-  .kp-add-btn {
-    display: inline-flex;
-    align-items: center;
+    flex-shrink: 0;
     gap: var(--space-1);
-    padding: 3px 10px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-full);
-    background: var(--surface-1);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .kp-add-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-    border-color: var(--foreground-muted);
-  }
-
-  .kp-editor-card {
-    margin: 0 var(--space-3) var(--space-3);
-    padding: var(--space-3);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
-
-  .kp-editor-title {
-    font-size: var(--text-sm);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-  }
-
-  .kp-editor-field {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-  }
-
-  .kp-editor-input,
-  .kp-editor-textarea {
-    width: 100%;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-2);
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    padding: 6px 8px;
-    outline: none;
-  }
-
-  .kp-editor-textarea {
-    resize: vertical;
-    min-height: 86px;
-  }
-
-  .kp-editor-input:focus,
-  .kp-editor-textarea:focus {
-    border-color: var(--primary);
-  }
-
-  .kp-editor-error {
-    color: var(--error);
-    font-size: var(--text-xs);
-  }
-
-  .kp-load-error {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--error) 26%, var(--border));
-    border-radius: var(--radius-sm);
-    background: var(--error-muted);
-    color: var(--error);
-    font-size: var(--text-xs);
-  }
-
-  .kp-editor-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-  }
-
-  .kp-editor-btn {
-    padding: 5px 12px;
-    border: var(--magi-hairline) solid var(--border);
+    min-height: 32px;
+    padding: 5px 10px;
+    border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--foreground-muted);
+    color: var(--foreground);
     font-size: var(--text-xs);
     cursor: pointer;
   }
-
+  .kp-add-btn:hover, .kp-editor-btn:hover:not(:disabled) { background: var(--surface-hover); }
   .kp-editor-btn--primary {
     background: var(--primary);
-    border-color: var(--primary);
-    color: white;
+    color: var(--primary-foreground);
   }
-
-  .kp-editor-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  .kp-editor-btn--primary:hover:not(:disabled) { background: var(--primary-hover, var(--primary)); }
+  .kp-editor-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-width: 0;
+    margin-bottom: var(--space-4);
+    padding: var(--space-4);
+    border-radius: var(--radius-md);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
   }
-
-
-  /* ---- 主内容区 ---- */
-  .kp-content {
-    flex: 1;
-    overflow-y: auto;
+  .kp-editor-title { color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-semibold); }
+  .kp-editor-field { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; color: var(--foreground-muted); font-size: var(--text-xs); }
+  .kp-editor-input, .kp-editor-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    padding: 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    outline: 0;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font-size: var(--text-sm);
+  }
+  .kp-editor-textarea { resize: vertical; min-height: 110px; }
+  .kp-editor-input:focus-visible, .kp-editor-textarea:focus-visible { box-shadow: var(--magi-focus-shadow); }
+  .kp-editor-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--space-2); }
+  .kp-editor-error { color: var(--error); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .kp-load-error, .kp-index-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
     padding: var(--space-3);
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
   }
-
-  .kp-loading {
+  .kp-load-error { margin-bottom: var(--space-4); background: var(--error-muted); color: var(--error); }
+  .kp-index-notice { grid-column: 1 / -1; }
+  .kp-index-notice.failed { background: var(--warning-muted); color: var(--warning); }
+  .kp-index-notice-text { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+  .kp-index-notice-title { color: var(--foreground); font-weight: var(--font-medium); }
+  .kp-index-notice-hint { line-height: var(--leading-normal); }
+  .kp-content { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
+  .kp-loading, .kp-empty {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: var(--space-3);
-    height: 200px;
+    min-height: 200px;
+    padding: var(--space-5);
     color: var(--foreground-muted);
     font-size: var(--text-sm);
+    text-align: center;
+    overflow-wrap: anywhere;
   }
-
   .kp-spinner {
+    display: inline-flex;
+    color: var(--primary);
     width: 20px;
     height: 20px;
-    border: 2px solid var(--border);
-    border-top-color: var(--primary);
-    border-radius: var(--radius-full);
     animation: kp-spin 1s linear infinite;
   }
-
-  /* ---- 概览 ---- */
-  .kp-overview {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-4);
-  }
-
+  :global(.kp-icon-btn .spinning) { animation: kp-spin 1s linear infinite; }
+  @keyframes kp-spin { to { transform: rotate(360deg); } }
+  .kp-overview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: var(--space-6); }
   .kp-stats-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-around;
-    padding: var(--space-3) var(--space-2);
-    background: var(--surface-1);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-  }
-
-  .kp-stat {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-  }
-
-  .kp-stat-value {
-    font-size: var(--text-md);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .kp-stat-label {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .kp-stat-divider {
-    width: 1px;
-    height: 24px;
-    background: var(--border);
-  }
-
-  .kp-index-notice {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-2);
-    padding: var(--space-3);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--primary) 22%, var(--border));
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
-    color: var(--foreground-muted);
-  }
-
-  .kp-index-notice.failed {
-    border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
-    background: color-mix(in srgb, var(--warning) 9%, var(--surface-1));
-  }
-
-  .kp-index-notice-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  .kp-index-notice-title {
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-  }
-
-  .kp-index-notice-hint {
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.4;
-  }
-
-  .kp-section {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .kp-section-title {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-    margin: 0;
-  }
-
-  .kp-section-link {
-    margin-left: auto;
-    font-size: var(--text-xs);
-    font-weight: var(--font-normal);
-    color: var(--primary);
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 0;
-  }
-
-  .kp-section-link:hover {
-    text-decoration: underline;
-  }
-
-  .kp-tech-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-  }
-
-  .kp-tech-badge {
-    font-size: var(--text-xs);
-    padding: 2px 8px;
-    background: var(--surface-2);
-    color: var(--foreground);
-    border-radius: var(--radius-full);
-    border: var(--magi-hairline) solid var(--border-subtle);
-  }
-
-  .kp-entry-list {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .kp-entry-item {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    padding: var(--space-2) var(--space-3);
-    background: var(--surface-1);
-    border-radius: var(--radius-sm);
-    font-family: var(--font-mono);
-  }
-
-  /* 入口文件可点击变体：复用 .kp-entry-item 视觉，叠加 button reset + hover 反馈 */
-  .kp-entry-item--clickable {
-    width: 100%;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-  .kp-entry-item--clickable:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-  .kp-entry-item--clickable:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-  }
-
-  /* 概览预览条目 */
-  .kp-preview-item {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    font-size: var(--text-sm);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-  }
-
-  .kp-preview-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: var(--radius-full);
-    flex-shrink: 0;
-  }
-
-  .kp-preview-dot.default { background: var(--foreground-muted); opacity: 0.4; }
-  .kp-preview-dot.learning { background: var(--warning); opacity: 0.75; }
-
-  .kp-preview-text {
-    flex: 1;
-    min-width: 0;
-    color: var(--foreground);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .kp-preview-date {
-    flex: 0 0 auto;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* ---- 列表 ---- */
-  .kp-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .kp-empty {
-    /* 复用全局 .empty-state 模式，这里只保留特有调整 */
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
     gap: var(--space-3);
-    padding: var(--space-8) var(--space-4);
-    color: var(--foreground-muted);
-    text-align: center;
-    opacity: 0.7;
+    padding-bottom: var(--space-5);
+    border-bottom: var(--magi-hairline) solid var(--border);
   }
-
-  .kp-empty-title {
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-    opacity: 0.8;
-  }
-
-  .kp-empty-hint {
-    font-size: var(--text-xs);
-    opacity: 0.6;
-  }
-
-  /* ---- 卡片（ADR / FAQ 条目） ---- */
-  .kp-card {
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
-    overflow: hidden;
-    transition: border-color var(--transition-fast);
-  }
-
-  .kp-card:hover {
-    border-color: var(--foreground-muted);
-  }
-
-  .kp-card.expanded {
-    border-color: var(--primary);
-  }
-
-  .kp-card-header {
+  .kp-stat { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); min-width: 0; }
+  .kp-stat-value { color: var(--foreground); font-size: var(--text-lg); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .kp-stat-label { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .kp-section { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+  .kp-section-title { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin: 0 0 var(--space-1); color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-semibold); }
+  .kp-section-link { margin-left: auto; padding: 2px 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); font-weight: var(--font-normal); cursor: pointer; }
+  .kp-section-link:hover { color: var(--foreground); text-decoration: underline; }
+  .kp-empty .kp-section-link { margin-left: 0; }
+  .kp-tech-grid, .kp-tag-list { display: flex; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
+  .kp-tech-badge, .kp-tag { max-width: 100%; padding: 2px 7px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--foreground-muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .kp-entry-list { display: flex; flex-direction: column; gap: var(--space-1); }
+  .kp-entry-item, .kp-preview-item {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     gap: var(--space-2);
-    padding: var(--space-3);
-    cursor: pointer;
     width: 100%;
-    text-align: left;
-    background: transparent;
-    border: none;
-    color: inherit;
-  }
-
-  .kp-card-header:hover .kp-card-delete,
-  .kp-card-header:hover .kp-card-action {
-    opacity: 1;
-  }
-
-  .kp-card-indicator {
-    width: 3px;
-    min-height: 20px;
-    border-radius: 2px;
-    flex-shrink: 0;
-    margin-top: 2px;
-  }
-
-  .kp-card-indicator.default { background: var(--border); }
-  .kp-card-indicator.faq { background: var(--color-gemini); }
-  .kp-card-indicator.learning { background: var(--warning); }
-
-  .kp-card-main {
-    flex: 1 1 auto;
     min-width: 0;
-    overflow: hidden;
-  }
-
-  .kp-card-title {
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-    display: -webkit-box;
-    line-height: var(--leading-normal);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    overflow-wrap: anywhere;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-  }
-
-  .kp-card-preview {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    margin: 4px 0 0;
-    line-height: var(--leading-normal);
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .kp-card-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex: 0 0 auto;
-    color: var(--foreground-muted);
-    min-width: max-content;
-    margin-left: auto;
-  }
-
-  .kp-card-delete,
-  .kp-card-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    padding: 0;
+    padding: 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
-    border: none;
-    border-radius: var(--radius-sm);
     color: var(--foreground-muted);
+    font-size: var(--text-sm);
+    text-align: left;
     cursor: pointer;
-    opacity: 0.7;
-    flex-shrink: 0;
-    transition: all var(--transition-fast);
   }
-
-  .kp-card-action:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
-  .kp-card-delete:hover {
-    background: var(--error-muted);
-    color: var(--error);
-  }
-
-  /* ---- 卡片展开详情 ---- */
-  .kp-card-body {
-    padding: 0 var(--space-3) var(--space-3) calc(var(--space-3) + 3px + var(--space-2));
-    border-top: var(--magi-hairline) solid var(--border);
-  }
-
-  .kp-detail-block {
-    margin-top: var(--space-3);
-  }
-
-  .kp-detail-block h5 {
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-    margin: 0 0 var(--space-2) 0;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    opacity: 0.7;
-  }
-
-  .kp-detail-block p {
-    font-size: var(--text-sm);
-    color: var(--foreground-muted);
-    margin: 0;
-    line-height: var(--leading-relaxed);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .kp-tag-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    margin-top: var(--space-3);
-  }
-
-  .kp-tag {
-    font-size: var(--text-xs);
-    padding: 1px 6px;
-    background: var(--surface-2);
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-  }
-
-  /* ---- 分类徽章 ---- */
-  .kp-category-badge {
-    font-size: var(--text-xs);
-    padding: 1px 6px;
-    background: var(--surface-2);
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-    white-space: nowrap;
-  }
-
-  /* ---- 确认弹窗 ---- */
-
+  .kp-entry-more { align-self: flex-start; margin-left: 8px; }
+  .kp-entry-item { font-family: var(--font-mono); font-size: var(--text-xs); }
+  .kp-entry-item:hover, .kp-preview-item:hover { background: var(--surface-hover); color: var(--foreground); }
+  .kp-preview-text { flex: 1; min-width: 0; overflow: hidden; color: var(--foreground); text-overflow: ellipsis; white-space: nowrap; }
+  .kp-preview-date, .kp-card-date { color: var(--foreground-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+  .kp-preview-date { flex-shrink: 0; }
+  .kp-list { display: flex; flex-direction: column; gap: var(--space-3); }
+  .kp-empty-title { color: var(--foreground); font-weight: var(--font-medium); }
+  .kp-empty-hint { font-size: var(--text-xs); line-height: var(--leading-normal); }
+  .kp-card { min-width: 0; border-radius: var(--radius-md); box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); }
+  .kp-card.expanded { box-shadow: inset 0 0 0 var(--magi-hairline) color-mix(in srgb, var(--foreground) 28%, var(--border)); }
+  /* 展开按钮跨整行，独立操作占中间轨道；箭头始终位于最右。 */
+  .kp-card-header { display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: start; gap: var(--space-2); padding: var(--space-3); }
+  .kp-card-toggle { display: grid; grid-column: 1 / -1; grid-row: 1; grid-template-columns: subgrid; align-items: start; gap: var(--space-2); min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; white-space: normal; cursor: pointer; }
+  .kp-card-main { grid-column: 1; min-width: 0; }
+  .kp-card-actions { grid-column: 2; grid-row: 1; z-index: 1; }
+  .kp-card-title { display: -webkit-box; overflow: hidden; color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-medium); line-height: var(--leading-normal); overflow-wrap: anywhere; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
+  .kp-card.expanded .kp-card-title { display: block; }
+  .kp-card-preview { display: -webkit-box; overflow: hidden; margin: 4px 0 0; color: var(--foreground-muted); font-size: var(--text-xs); line-height: var(--leading-normal); overflow-wrap: anywhere; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
+  .kp-card-date { display: block; margin-top: var(--space-1); }
+  .kp-card-chevron { grid-column: 3; display: inline-flex; align-items: center; min-height: 28px; color: var(--foreground-muted); }
+  .kp-card-body { min-width: 0; padding: var(--space-3); border-top: var(--magi-hairline) solid var(--border); }
+  .kp-detail-block + .kp-detail-block, .kp-tag-list { margin-top: var(--space-3); }
+  .kp-detail-block h5 { margin: 0 0 var(--space-2); color: var(--foreground); font-size: var(--text-xs); font-weight: var(--font-medium); }
+  .kp-detail-block p { margin: 0; color: var(--foreground-muted); font-size: var(--text-sm); line-height: var(--leading-relaxed); white-space: pre-wrap; overflow-wrap: anywhere; }
   .kp-confirm-dialog { color: var(--foreground); }
+  .kp-confirm-desc { margin: 0 0 var(--space-5); color: var(--foreground-muted); font-size: var(--text-sm); line-height: var(--leading-normal); }
 
-
-
-  .kp-confirm-desc {
-    font-size: var(--text-sm);
-    color: var(--foreground-muted);
-    margin: 0 0 var(--space-5) 0;
-    line-height: var(--leading-normal);
+  @container knowledge-layout (max-width: 640px) {
+    .kp-overview { grid-template-columns: minmax(0, 1fr); gap: var(--space-5); }
   }
-
-
-
-
-
-
+  @container knowledge-layout (max-width: 360px) {
+    .kp-tabs-bar { gap: var(--space-2); }
+    .kp-tab { font-size: var(--text-xs); }
+    .kp-card-header { grid-template-columns: minmax(0, 1fr) 14px; }
+    .kp-card-chevron { grid-column: 2; }
+    .kp-card-actions { grid-column: 1 / -1; grid-row: 2; justify-self: end; }
+    .kp-list-toolbar { flex-wrap: wrap; }
+    .kp-search-bar { flex-basis: 100%; }
+    .kp-add-btn { margin-left: auto; }
+  }
 </style>

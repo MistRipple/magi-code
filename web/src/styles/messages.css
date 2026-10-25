@@ -3,10 +3,6 @@
    ============================================ */
 
 :root {
-  /* 用户消息 */
-  --msg-user-bg: var(--primary);
-  --msg-user-border: var(--primary);
-
   /* 编排者消息 */
   --msg-orchestrator-bg: var(--surface-1);
   --msg-orchestrator-border: var(--border);
@@ -61,10 +57,6 @@
 .message-item.user {
   background: transparent;
   border: none;
-}
-
-.message-item.user[data-source="user"] .user-content {
-  background: var(--msg-user-bg);
 }
 
 /* ========== 用户消息发送动画 ========== */

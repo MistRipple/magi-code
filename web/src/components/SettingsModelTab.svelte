@@ -396,7 +396,7 @@
                       e.stopPropagation();
                       deleteEngine(item.id);
                     }}
-                  >×</span>
+                  ><Icon name="close" size={12} /></span>
                 {/if}
               </button>
             {/each}

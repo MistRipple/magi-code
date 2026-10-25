@@ -176,13 +176,13 @@
 <style>
   .pane { display: grid; align-content: start; gap: var(--space-4); padding: var(--space-5); min-width: 0; user-select: text; }
   .pane-title { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
-  .pane-title h3 { margin: 0; font-size: 20px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); }
+  .pane-title h3 { overflow-wrap: anywhere; min-width: 0; margin: 0; font-size: 20px; font-weight: calc(var(--font-semibold) + 50); color: var(--foreground); }
   .pane-id { margin-top: 6px; color: var(--foreground-muted); overflow-wrap: anywhere; }
   .pane-desc { margin: 0; color: var(--foreground); font-size: var(--text-sm); line-height: 1.6; }
   .pane-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
   .pane-facts { margin: 0; display: grid; gap: 8px; }
-  .pane-facts > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: var(--space-3); align-items: baseline; }
-  .pane-facts dt { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .pane-facts > div { display: grid; grid-template-columns: fit-content(30%) minmax(0, 1fr); gap: var(--space-3); align-items: baseline; }
+  .pane-facts dt { overflow-wrap: anywhere; color: var(--foreground-muted); font-size: var(--text-xs); }
   .pane-facts dd { margin: 0; font-size: var(--text-xs); color: var(--foreground); overflow-wrap: anywhere; display: flex; gap: 8px; flex-wrap: wrap; }
   .pane-facts dd > *, .pane-scopes .settings-row-copy { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
   .pane-scope { flex-wrap: wrap; }
