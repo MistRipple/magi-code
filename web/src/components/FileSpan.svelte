@@ -1,7 +1,6 @@
 <script lang="ts">
   import FileName from './FileName.svelte';
-  import Icon from './Icon.svelte';
-  import type { IconName } from '../lib/icons';
+  import FileTypeIcon from './FileTypeIcon.svelte';
   import type { FilePreviewScope } from '../lib/file-reference';
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
 
@@ -37,37 +36,6 @@
     return separatorIndex >= 0 ? filepath.slice(0, separatorIndex) : '';
   });
 
-  // 获取文件扩展名图标
-  function getFileIcon(path: string): IconName {
-    const ext = path.split('.').pop()?.toLowerCase();
-    const iconMap: Record<string, IconName> = {
-      'ts': 'code',
-      'tsx': 'code',
-      'js': 'code',
-      'jsx': 'code',
-      'svelte': 'code',
-      'vue': 'code',
-      'py': 'code',
-      'go': 'code',
-      'rs': 'code',
-      'java': 'code',
-      'md': 'document',
-      'json': 'file-text',
-      'css': 'code',
-      'scss': 'code',
-      'html': 'code',
-      'yaml': 'settings',
-      'yml': 'settings',
-      'toml': 'settings',
-      'sh': 'terminal',
-      'bash': 'terminal',
-      'sql': 'file-text',
-    };
-    return iconMap[ext || ''] || 'file';
-  }
-
-  const fileIcon = $derived(getFileIcon(filepath));
-
   function handleClick(e: MouseEvent) {
     if (clickable && onClick) {
       e.stopPropagation();
@@ -101,7 +69,7 @@
   >
     {#if showIcon}
       <span class="filespan-icon">
-        <Icon name={fileIcon} size={14} />
+        <FileTypeIcon path={filepath} size={14} />
       </span>
     {/if}
     <span class="filespan-name"><FileName name={filename} /></span>
@@ -117,7 +85,7 @@
   >
     {#if showIcon}
       <span class="filespan-icon">
-        <Icon name={fileIcon} size={14} />
+        <FileTypeIcon path={filepath} size={14} />
       </span>
     {/if}
     <span class="filespan-name"><FileName name={filename} /></span>

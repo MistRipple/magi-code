@@ -186,7 +186,7 @@
     padding: 9px var(--tool-card-padding) 14px;
     border:0;
     border-radius: var(--tool-card-radius);
-    background:var(--surface-1);
+    background:var(--tool-card-background);
     color: var(--foreground);
     text-align: left;
   }

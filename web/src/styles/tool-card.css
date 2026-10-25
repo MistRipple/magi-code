@@ -3,13 +3,17 @@
   --tool-card-radius: 10px;
   --tool-card-padding: 13px;
   --tool-card-outline: color-mix(in srgb, var(--foreground) 9%, transparent);
+  --tool-card-background: var(--surface-1);
+}
+:root.theme-light {
+  --tool-card-background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
 }
 :is(.tool-call, .thinking-block, .plan-card, .code-block, .diagram-shell, .execution-steps, .agent-spawn-card) {
   min-width: 0;
   border: 0;
   border-radius: var(--tool-card-radius);
   box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
-  background: var(--surface-1);
+  background: var(--tool-card-background);
 }
 .tool-header,
 .file-mutation-header,
@@ -66,7 +70,7 @@
   min-width:0;
   border:0;
   border-radius:var(--tool-card-radius);
-  background:var(--surface-1);
+  background:var(--tool-card-background);
   box-shadow:inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
   container-type:inline-size;
 }

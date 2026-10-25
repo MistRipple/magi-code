@@ -16,16 +16,18 @@
     ? `${(duration / 1000).toFixed(1)} s` : '');
 </script>
 
+{#if children || elapsed || status || expanded !== undefined}
 <span class="tool-card-meta">
   {@render children?.()}
   {#if elapsed}<span class="tool-card-duration" title={`${i18n.t('toolCall.duration')} ${elapsed}`}>{elapsed}</span>{/if}
-  <span class="tool-card-status-slot">
-    {#if status}<span class="tool-status status-{status}" role="img" aria-label={statusLabel} title={statusLabel}><span class="status-dot" class:pulsing={status === 'running' || status === 'pending'}></span></span>{/if}
-  </span>
-  <span class="tool-card-chevron-slot" aria-hidden="true">
-    {#if expanded !== undefined}<span class="tool-card-chevron" class:expanded><Icon name="chevron-right" size={12} /></span>{/if}
-  </span>
+  {#if status}
+    <span class="tool-card-status-slot"><span class="tool-status status-{status}" role="img" aria-label={statusLabel} title={statusLabel}><span class="status-dot" class:pulsing={status === 'running' || status === 'pending'}></span></span></span>
+  {/if}
+  {#if expanded !== undefined}
+    <span class="tool-card-chevron-slot" aria-hidden="true"><span class="tool-card-chevron" class:expanded><Icon name="chevron-right" size={12} /></span></span>
+  {/if}
 </span>
+{/if}
 
 <style>
   .tool-card-meta { display:inline-flex; align-items:center; justify-content:flex-end; gap:8px; flex:0 0 auto; margin-left:auto; color:var(--foreground-muted); font-size:var(--text-xs); font-weight:var(--font-normal); line-height:1; font-variant-numeric:tabular-nums; }

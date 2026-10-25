@@ -3,12 +3,14 @@ import type { IconName } from './icons';
 
 export type FileTypeVisualKind =
   | 'svelte'
+  | 'vue'
   | 'typescript'
   | 'javascript'
   | 'rust'
   | 'python'
   | 'go'
   | 'java'
+  | 'kotlin'
   | 'markdown'
   | 'json'
   | 'html'
@@ -22,29 +24,29 @@ export type FileTypeVisualKind =
   | 'env'
   | 'text'
   | 'image'
+  | 'pdf'
   | 'binary'
   | 'generic';
 
 export interface FileTypeVisual {
   kind: FileTypeVisualKind;
-  glyph?: string;
   icon?: IconName;
   label: string;
 }
 
 const FILE_NAME_VISUALS: Record<string, FileTypeVisual> = {
-  dockerfile: { kind: 'docker', glyph: '▣', label: 'Dockerfile' },
-  '.gitignore': { kind: 'git', glyph: '◆', label: 'Git ignore' },
-  '.gitattributes': { kind: 'git', glyph: '◆', label: 'Git attributes' },
-  '.gitmodules': { kind: 'git', glyph: '◆', label: 'Git modules' },
-  '.env': { kind: 'env', glyph: '●', label: 'Environment file' },
-  '.env.local': { kind: 'env', glyph: '●', label: 'Local environment file' },
-  'cargo.toml': { kind: 'rust', glyph: 'R', label: 'Rust manifest' },
-  'cargo.lock': { kind: 'rust', glyph: 'R', label: 'Rust lockfile' },
-  'package.json': { kind: 'json', glyph: '{}', label: 'JSON file' },
-  'package-lock.json': { kind: 'json', glyph: '{}', label: 'JSON lockfile' },
-  'pnpm-lock.yaml': { kind: 'yaml', glyph: 'YML', label: 'YAML lockfile' },
-  'yarn.lock': { kind: 'generic', glyph: 'L', label: 'Lockfile' },
+  dockerfile: { kind: 'docker', icon: 'settings', label: 'Dockerfile' },
+  '.gitignore': { kind: 'git', icon: 'git-branch', label: 'Git ignore' },
+  '.gitattributes': { kind: 'git', icon: 'git-branch', label: 'Git attributes' },
+  '.gitmodules': { kind: 'git', icon: 'git-branch', label: 'Git modules' },
+  '.env': { kind: 'env', icon: 'file', label: 'Environment file' },
+  '.env.local': { kind: 'env', icon: 'file', label: 'Local environment file' },
+  'cargo.toml': { kind: 'rust', icon: 'code', label: 'Rust manifest' },
+  'cargo.lock': { kind: 'rust', icon: 'code', label: 'Rust lockfile' },
+  'package.json': { kind: 'json', icon: 'code', label: 'JSON file' },
+  'package-lock.json': { kind: 'json', icon: 'code', label: 'JSON lockfile' },
+  'pnpm-lock.yaml': { kind: 'yaml', icon: 'settings', label: 'YAML lockfile' },
+  'yarn.lock': { kind: 'generic', icon: 'file', label: 'Lockfile' },
   license: { kind: 'text', icon: 'file-text', label: 'License text file' },
   notice: { kind: 'text', icon: 'file-text', label: 'Notice text file' },
   authors: { kind: 'text', icon: 'file-text', label: 'Authors text file' },
@@ -55,41 +57,41 @@ const FILE_NAME_VISUALS: Record<string, FileTypeVisual> = {
 };
 
 const EXTENSION_VISUALS: Record<string, FileTypeVisual> = {
-  svelte: { kind: 'svelte', glyph: 'S', label: 'Svelte file' },
-  vue: { kind: 'svelte', glyph: 'V', label: 'Vue file' },
-  ts: { kind: 'typescript', glyph: 'TS', label: 'TypeScript file' },
-  tsx: { kind: 'typescript', glyph: 'TS', label: 'TypeScript React file' },
-  js: { kind: 'javascript', glyph: 'JS', label: 'JavaScript file' },
-  jsx: { kind: 'javascript', glyph: 'JS', label: 'JavaScript React file' },
-  mjs: { kind: 'javascript', glyph: 'JS', label: 'JavaScript module' },
-  cjs: { kind: 'javascript', glyph: 'JS', label: 'CommonJS module' },
-  rs: { kind: 'rust', glyph: 'R', label: 'Rust file' },
-  py: { kind: 'python', glyph: 'PY', label: 'Python file' },
-  go: { kind: 'go', glyph: 'GO', label: 'Go file' },
-  java: { kind: 'java', glyph: 'J', label: 'Java file' },
-  kt: { kind: 'java', glyph: 'K', label: 'Kotlin file' },
-  kts: { kind: 'java', glyph: 'K', label: 'Kotlin script' },
-  md: { kind: 'markdown', glyph: 'M↓', label: 'Markdown file' },
-  markdown: { kind: 'markdown', glyph: 'M↓', label: 'Markdown file' },
-  mdx: { kind: 'markdown', glyph: 'M↓', label: 'MDX file' },
-  json: { kind: 'json', glyph: '{}', label: 'JSON file' },
-  jsonc: { kind: 'json', glyph: '{}', label: 'JSON with comments file' },
-  html: { kind: 'html', glyph: '#', label: 'HTML file' },
-  htm: { kind: 'html', glyph: '#', label: 'HTML file' },
-  xml: { kind: 'html', glyph: '<>', label: 'XML file' },
-  css: { kind: 'css', glyph: '#', label: 'CSS file' },
-  scss: { kind: 'css', glyph: '#', label: 'SCSS file' },
-  sass: { kind: 'css', glyph: '#', label: 'Sass file' },
-  less: { kind: 'css', glyph: '#', label: 'Less file' },
-  yaml: { kind: 'yaml', glyph: 'YML', label: 'YAML file' },
-  yml: { kind: 'yaml', glyph: 'YML', label: 'YAML file' },
-  toml: { kind: 'toml', glyph: 'T', label: 'TOML file' },
-  ini: { kind: 'toml', glyph: 'INI', label: 'INI file' },
-  sh: { kind: 'shell', glyph: '$', label: 'Shell script' },
-  bash: { kind: 'shell', glyph: '$', label: 'Bash script' },
-  zsh: { kind: 'shell', glyph: '$', label: 'Zsh script' },
-  fish: { kind: 'shell', glyph: '$', label: 'Fish script' },
-  sql: { kind: 'sql', glyph: 'SQL', label: 'SQL file' },
+  svelte: { kind: 'svelte', icon: 'code', label: 'Svelte file' },
+  vue: { kind: 'vue', icon: 'code', label: 'Vue file' },
+  ts: { kind: 'typescript', icon: 'code', label: 'TypeScript file' },
+  tsx: { kind: 'typescript', icon: 'code', label: 'TypeScript React file' },
+  js: { kind: 'javascript', icon: 'code', label: 'JavaScript file' },
+  jsx: { kind: 'javascript', icon: 'code', label: 'JavaScript React file' },
+  mjs: { kind: 'javascript', icon: 'code', label: 'JavaScript module' },
+  cjs: { kind: 'javascript', icon: 'code', label: 'CommonJS module' },
+  rs: { kind: 'rust', icon: 'code', label: 'Rust file' },
+  py: { kind: 'python', icon: 'code', label: 'Python file' },
+  go: { kind: 'go', icon: 'code', label: 'Go file' },
+  java: { kind: 'java', icon: 'code', label: 'Java file' },
+  kt: { kind: 'kotlin', icon: 'code', label: 'Kotlin file' },
+  kts: { kind: 'kotlin', icon: 'code', label: 'Kotlin script' },
+  md: { kind: 'markdown', icon: 'file-text', label: 'Markdown file' },
+  markdown: { kind: 'markdown', icon: 'file-text', label: 'Markdown file' },
+  mdx: { kind: 'markdown', icon: 'file-text', label: 'MDX file' },
+  json: { kind: 'json', icon: 'code', label: 'JSON file' },
+  jsonc: { kind: 'json', icon: 'code', label: 'JSON with comments file' },
+  html: { kind: 'html', icon: 'code', label: 'HTML file' },
+  htm: { kind: 'html', icon: 'code', label: 'HTML file' },
+  xml: { kind: 'html', icon: 'code', label: 'XML file' },
+  css: { kind: 'css', icon: 'code', label: 'CSS file' },
+  scss: { kind: 'css', icon: 'code', label: 'SCSS file' },
+  sass: { kind: 'css', icon: 'code', label: 'Sass file' },
+  less: { kind: 'css', icon: 'code', label: 'Less file' },
+  yaml: { kind: 'yaml', icon: 'settings', label: 'YAML file' },
+  yml: { kind: 'yaml', icon: 'settings', label: 'YAML file' },
+  toml: { kind: 'toml', icon: 'settings', label: 'TOML file' },
+  ini: { kind: 'toml', icon: 'settings', label: 'INI file' },
+  sh: { kind: 'shell', icon: 'terminal', label: 'Shell script' },
+  bash: { kind: 'shell', icon: 'terminal', label: 'Bash script' },
+  zsh: { kind: 'shell', icon: 'terminal', label: 'Zsh script' },
+  fish: { kind: 'shell', icon: 'terminal', label: 'Fish script' },
+  sql: { kind: 'sql', icon: 'database', label: 'SQL file' },
   txt: { kind: 'text', icon: 'file-text', label: 'Text file' },
   text: { kind: 'text', icon: 'file-text', label: 'Text file' },
   log: { kind: 'text', icon: 'file-text', label: 'Log file' },
@@ -98,15 +100,15 @@ const EXTENSION_VISUALS: Record<string, FileTypeVisual> = {
   rst: { kind: 'text', icon: 'file-text', label: 'reStructuredText file' },
   adoc: { kind: 'text', icon: 'file-text', label: 'AsciiDoc file' },
   nfo: { kind: 'text', icon: 'file-text', label: 'Text information file' },
-  png: { kind: 'image', glyph: '▧', label: 'Image file' },
-  jpg: { kind: 'image', glyph: '▧', label: 'Image file' },
-  jpeg: { kind: 'image', glyph: '▧', label: 'Image file' },
-  gif: { kind: 'image', glyph: '▧', label: 'Image file' },
-  webp: { kind: 'image', glyph: '▧', label: 'Image file' },
-  svg: { kind: 'image', glyph: '◇', label: 'SVG image' },
-  pdf: { kind: 'binary', glyph: 'PDF', label: 'PDF file' },
-  zip: { kind: 'binary', glyph: 'ZIP', label: 'Archive file' },
-  gz: { kind: 'binary', glyph: 'ZIP', label: 'Compressed archive' },
+  png: { kind: 'image', icon: 'eye', label: 'Image file' },
+  jpg: { kind: 'image', icon: 'eye', label: 'Image file' },
+  jpeg: { kind: 'image', icon: 'eye', label: 'Image file' },
+  gif: { kind: 'image', icon: 'eye', label: 'Image file' },
+  webp: { kind: 'image', icon: 'eye', label: 'Image file' },
+  svg: { kind: 'image', icon: 'eye', label: 'SVG image' },
+  pdf: { kind: 'pdf', icon: 'file-text', label: 'PDF file' },
+  zip: { kind: 'binary', icon: 'file', label: 'Archive file' },
+  gz: { kind: 'binary', icon: 'file', label: 'Compressed archive' },
 };
 
 function baseName(path: string): string {
@@ -115,7 +117,9 @@ function baseName(path: string): string {
 
 export function getFileTypeVisual(path: string): FileTypeVisual {
   const name = baseName(path);
-  const exact = FILE_NAME_VISUALS[name];
+  const exact = FILE_NAME_VISUALS[name]
+    ?? (name.startsWith('.env.') ? FILE_NAME_VISUALS['.env'] : undefined)
+    ?? (name.startsWith('dockerfile.') ? FILE_NAME_VISUALS.dockerfile : undefined);
   if (exact) {
     return exact;
   }

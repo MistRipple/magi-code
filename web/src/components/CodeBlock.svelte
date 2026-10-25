@@ -267,7 +267,8 @@
   }
 
   .code-actions { display:flex; align-items:center; gap:8px; flex:none; }
-  .code-disclosure { display:flex; align-items:center; min-height:26px; padding:0; border:0; background:transparent; cursor:pointer; color:var(--foreground-muted); }
+  .code-disclosure { position:relative; display:flex; align-items:center; min-height:26px; padding:0; border:0; background:transparent; cursor:pointer; color:var(--foreground-muted); }
+  .code-disclosure::before { content:''; position:absolute; inset:0 -6px; }
   .header-left:focus-visible,.code-disclosure:focus-visible,.copy-btn:focus-visible { outline:0; box-shadow:inset 0 0 0 1px var(--primary); border-radius:4px; }
   .code-icon {
     display: flex;
