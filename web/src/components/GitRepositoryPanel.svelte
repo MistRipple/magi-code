@@ -383,13 +383,14 @@
 {/if}
 
 <style>
-  .git-repository-panel { flex: 0 0 auto; margin: var(--space-2); border: var(--magi-hairline) solid var(--edits-row-border, var(--border-subtle)); border-radius: var(--radius-md); background: var(--edits-row-bg, var(--surface-1)); overflow: hidden; }
-  .git-repository-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; padding: 7px 10px; }
+  .git-repository-panel { container-type: inline-size; container-name: git-repository; flex: 0 0 auto; margin: 0; border-radius: var(--radius-md); box-shadow: inset 0 0 0 var(--magi-hairline) var(--border-subtle); background: transparent; overflow: hidden; }
+  .git-repository-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-height: 48px; padding: 12px; }
   .git-repository-identity { display: flex; align-items: center; gap: 9px; min-width: 0; }
-  .git-repository-branch { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-medium); }
+  .git-repository-identity > div { min-width: 0; }
+  .git-repository-branch { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-sm); font-weight: var(--font-medium); }
   .git-repository-kicker { margin-bottom: 1px; color: var(--foreground-muted); font-size: var(--text-xs); font-weight: var(--font-semibold); }
   .git-repository-status { margin-top: 2px; color: var(--foreground-muted); font-size: var(--text-xs); }
-  .git-repository-stats { display: inline-flex; align-items: center; gap: 7px; font-size: var(--text-xs); font-weight: var(--font-semibold); }
+  .git-repository-stats { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-size: var(--text-xs); font-variant-numeric: tabular-nums; font-weight: var(--font-semibold); }
   .git-repository-stats .add { color: var(--success); } .git-repository-stats .del { color: var(--error); }
   .git-repository-stats button { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .git-repository-stats button:hover { background: var(--surface-hover); color: var(--foreground); }
@@ -402,9 +403,9 @@
   .git-list { display: flex; flex-direction: column; border: 0; border-radius: var(--radius-sm); overflow: hidden; }
   .git-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; padding: 5px 8px; background: transparent; }
   .git-row + .git-row { border-top: var(--magi-hairline) solid var(--border-subtle); }
-  .git-row-main { display: flex; flex-direction: column; min-width: 0; }
+  .git-row-main { max-width: 100%; display: flex; flex-direction: column; min-width: 0; }
   .git-row-main > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-xs); }
-  .git-row small, .git-row-main small { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); }
+  .git-row small, .git-row-main small { max-width: min(360px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); }
   .git-row-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; }
   .git-row-actions button, .git-worktree-create button { height: 24px; padding: 0 7px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: var(--text-xs); }
   .git-row-actions button:hover:not(:disabled), .git-worktree-create button:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
@@ -415,9 +416,7 @@
   .git-repository-error { margin: 0 10px 8px; padding: 6px 8px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); font-size: var(--text-xs); }
   .git-empty { padding: 9px; color: var(--foreground-muted); font-size: var(--text-xs); text-align: center; }
   @keyframes git-spin { to { transform: rotate(360deg); } }
-  @media (max-width: 640px) {
-    .git-repository-panel { margin: 6px; }
-    .git-repository-branch { max-width: 180px; }
+  @container git-repository (max-width: 640px) {
     .git-advanced-content { max-height: 52vh; }
     .git-row { align-items: flex-start; flex-direction: column; }
   }

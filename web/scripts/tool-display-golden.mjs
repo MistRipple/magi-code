@@ -107,7 +107,7 @@ assert.match(
 );
 assert.match(
   settingsToolsSource,
-  /\.builtin-category-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?max-height:\s*348px;[\s\S]*?overflow-y:\s*auto;[\s\S]*?border:\s*var\(--magi-hairline\) solid var\(--border\);[\s\S]*?\.builtin-category-group \+ \.builtin-category-group\s*\{[\s\S]*?border-top:\s*var\(--magi-hairline\) solid var\(--border\);/,
+  /\.builtin-category-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?border:\s*var\(--magi-hairline\) solid var\(--border\);[\s\S]*?\.builtin-category-group \+ \.builtin-category-group\s*\{[\s\S]*?border-top:\s*var\(--magi-hairline\) solid var\(--border\);/,
   'built-in capability categories must use one compact list with separators instead of nested cards',
 );
 assert.match(
@@ -165,8 +165,9 @@ assert.match(
   /class="mcp-tools-heading"[\s\S]*?class="mcp-tools-count"[\s\S]*?class="mcp-tool-identity"[\s\S]*?class="mcp-tool-description"/,
   'expanded MCP tool lists must expose a compact count and readable tool descriptions',
 );
-assert.match(
-  settingsToolsSource,
-  /\.mcp-tools-list\s*\{[\s\S]*?max-height:\s*min\(280px, 42vh\);[\s\S]*?overflow-y:\s*auto;[\s\S]*?overscroll-behavior:\s*contain;/,
-  'expanded MCP tool lists must scroll independently when a server exposes many tools',
-);
+for (const selector of ['builtin-category-list', 'mcp-tools-list', 'skill-detail-body']) {
+  const body = settingsToolsSource.match(new RegExp(`\\.${selector}\\s*\\{([^}]+)\\}`))?.[1];
+  assert.ok(body, `${selector} must keep its content layout`);
+  assert.doesNotMatch(body, /(?:max-)?height\s*:|overflow(?:-y)?\s*:\s*(?:auto|scroll)/,
+    `${selector} must use the settings page scroll area instead of a nested height cap`);
+}

@@ -534,7 +534,7 @@
             >
               <div class="role-editor-back-row">
                 <button type="button" class="editor-back-button" onclick={closeEditor} disabled={editorBusy}>
-                  <span aria-hidden="true">←</span>
+                  <Icon name="chevron-left" size={14} />
                   {i18n.t('settings.agents.editor.back')}
                 </button>
               </div>

@@ -1,5 +1,6 @@
 <script lang="ts">
   import FileName from '../components/FileName.svelte';
+  import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
@@ -1079,8 +1080,7 @@
     return tab.label;
   }
 
-  function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' | 'globe' | 'terminal' {
-    if (tab.kind === 'code') return 'file-text';
+  function tabIcon(tab: RightPaneTab): 'chevron-right' | 'globe' | 'terminal' {
     if (tab.kind === 'browser') return 'globe';
     if (tab.kind === 'webSession') return 'globe';
     return tab.kind === 'terminal' ? 'terminal' : 'chevron-right';
@@ -1278,7 +1278,11 @@
           onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleTabClick(tab.id); } }}
         >
           <span class="right-pane-tab-icon" aria-hidden="true">
-            <Icon name={tabIcon(tab)} size={12} />
+            {#if tab.kind === 'code'}
+              <FileTypeIcon path={(tab.payload as CodeTabPayload).displayPath ?? (tab.payload as CodeTabPayload).filepath} size={14} />
+            {:else}
+              <Icon name={tabIcon(tab)} size={12} />
+            {/if}
           </span>
           {#if tab.kind === 'browser'}
             {@const agentOccupied = (tab.payload as BrowserTabPayload).agentOccupied}
@@ -1400,6 +1404,7 @@
   <div
     class="right-pane-body"
     class:right-pane-body--code={codeMode}
+    class:right-pane-body--large-text={largeTextFile}
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
     class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
     class:right-pane-body--web-model={activeTab?.kind === 'webSession'}
@@ -1490,7 +1495,7 @@
       </div>
     {:else if wordFile}
       <div class="right-pane-state">
-        <Icon name="document" size={22} />
+        <FileTypeIcon path={activeDisplayFilePath} size={22} />
         <span>{i18n.t('web.filePreviewUnsupportedWord')}</span>
       </div>
     {:else if imageFile}
@@ -1527,7 +1532,7 @@
       </div>
     {:else if binaryFile}
       <div class="right-pane-state right-pane-state--metadata">
-        <Icon name="file" size={22} />
+        <FileTypeIcon path={activeDisplayFilePath} size={22} />
         <span>{i18n.t('web.filePreviewUnsupportedBinary')}</span>
         <span class="right-pane-meta-line">{i18n.t('edits.nonText.size')}: {formatSize(activeCodePayload?.size)}</span>
         {#if activeCodePayload?.mime}
@@ -1552,13 +1557,13 @@
       </div>
     {:else if symlinkFile}
       <div class="right-pane-state right-pane-state--metadata">
-        <Icon name="file" size={22} />
+        <FileTypeIcon path={activeDisplayFilePath} size={22} />
         <span>{i18n.t('edits.nonText.symlinkTitle')}</span>
         <span class="right-pane-meta-line">{i18n.t('edits.nonText.target')}: {activeCodePayload?.symlinkTarget ?? '-'}</span>
       </div>
     {:else if specialFile}
       <div class="right-pane-state right-pane-state--metadata">
-        <Icon name="file" size={22} />
+        <FileTypeIcon path={activeDisplayFilePath} size={22} />
         <span>{i18n.t('edits.nonText.specialTitle')}</span>
         <span class="right-pane-meta-line">{i18n.t('edits.nonText.specialHint')}</span>
       </div>
@@ -1984,6 +1989,11 @@
     padding: var(--space-4);
   }
 
+  .right-pane-body--large-text {
+    display: flex;
+    flex-direction: column;
+  }
+
   .right-pane-body--code {
     display: flex;
     flex-direction: column;
@@ -2204,12 +2214,16 @@
   }
 
   .right-pane-large-text {
+    flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
   }
 
   .right-pane-summary-section {
+    flex: 1;
+    min-height: 100px;
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -2224,6 +2238,8 @@
   }
 
   .right-pane-summary-content {
+    flex: 1 1 0;
+    min-height: 0;
     margin: 0;
     padding: var(--space-3);
     border: var(--magi-hairline) solid var(--border);
@@ -2233,7 +2249,6 @@
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     line-height: 1.6;
-    max-height: 260px;
     overflow: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;

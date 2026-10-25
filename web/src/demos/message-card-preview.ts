@@ -1,10 +1,51 @@
 // 独立视觉 Demo：复用正式主题投影，只预览，不调用主题激活/保存接口。
+import './card-preview.css';
+import { mount } from 'svelte';
+import FileTypeIcon from '../components/FileTypeIcon.svelte';
+import { icons, iconStyle, type IconName } from '../lib/icons';
 import {
   initializeAppearanceRuntime,
   getAppearanceRuntimeSnapshot,
   previewAppearanceTheme,
   restoreActiveAppearance,
 } from '../appearance/runtime';
+
+const demoIcons: Record<string, IconName> = {
+  spark: 'sparkles', check: 'check', chevron: 'chevron-right', copy: 'copy',
+  code: 'code', file: 'file-text', search: 'search', terminal: 'terminal',
+  list: 'list', branch: 'git-branch', shield: 'shield', alert: 'warning',
+  loader: 'loader', image: 'image', agent: 'bot', diagram: 'layers',
+  question: 'question', clock: 'clock', external: 'external-link', pause: 'pause',
+};
+// Static review markup consumes the same drawing contract as Icon.svelte.
+for (const use of document.querySelectorAll<SVGUseElement>('svg use')) {
+  const svg = use.closest('svg');
+  if (!svg) continue;
+  const id = use.getAttribute('href')?.slice(1) ?? '';
+  const name = demoIcons[id];
+  if (!name) continue;
+  svg.classList.add('magi-icon', 'demo-icon');
+  svg.dataset.icon = name;
+  svg.setAttribute('viewBox', iconStyle.viewBox);
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  svg.style.fill = iconStyle.fill;
+  svg.style.stroke = iconStyle.stroke;
+  svg.style.strokeWidth = String(iconStyle.strokeWidth);
+  svg.style.strokeLinecap = iconStyle.strokeLinecap;
+  svg.style.strokeLinejoin = iconStyle.strokeLinejoin;
+}
+
+const definitions = document.querySelector('#demo-icon-definitions');
+if (definitions) {
+  definitions.innerHTML = Object.entries(demoIcons).map(([id, name]) =>
+    `<symbol id="${id}" viewBox="${iconStyle.viewBox}"><g fill="${iconStyle.fill}" stroke="${iconStyle.stroke}" stroke-width="${iconStyle.strokeWidth}" stroke-linecap="${iconStyle.strokeLinecap}" stroke-linejoin="${iconStyle.strokeLinejoin}">${icons[name]}</g></symbol>`,
+  ).join('');
+}
+
+for (const target of document.querySelectorAll<HTMLElement>('[data-file-icon]')) {
+  mount(FileTypeIcon, { target, props: { path: target.dataset.fileIcon!, size: 14 } });
+}
 
 const selector = document.querySelector<HTMLSelectElement>('#skin-select')!;
 const badge = document.querySelector<HTMLElement>('#skin-badge')!;

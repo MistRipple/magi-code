@@ -87,6 +87,53 @@ await withGoldenViteServer(async server => {
     ['README', 'README', ''], ['file.', 'file.', ''],
   ]) assert.deepEqual(splitFileName(name), { stem, extension });
 
+  // Anchored panels keep their opening edge and release observers/listeners on close.
+  {
+    const { constrainPanelWidth } = await server.ssrLoadModule('/src/lib/panel-width.ts');
+    const previous = { window: globalThis.window, HTMLElement: globalThis.HTMLElement, ResizeObserver: globalThis.ResizeObserver };
+    const listeners = new Map();
+    let observer;
+    class Anchor {
+      parentElement = null;
+      rect = { left: 220, right: 250 };
+      getBoundingClientRect() { return this.rect; }
+    }
+    globalThis.HTMLElement = Anchor;
+    globalThis.window = {
+      innerWidth: 800,
+      addEventListener: (type, callback) => listeners.set(type, callback),
+      removeEventListener: (type) => listeners.delete(type),
+    };
+    globalThis.ResizeObserver = class {
+      constructor(callback) { this.callback = callback; observer = this; }
+      observe() {}
+      disconnect() { this.disconnected = true; }
+    };
+    try {
+      const anchor = new Anchor();
+      let available;
+      const panel = { offsetParent: anchor, parentElement: anchor, style: { setProperty(_key, value) { available = value; } } };
+      const action = constrainPanelWidth(panel, { align: 'end' });
+      assert.equal(available, '238px', 'right-aligned panel must stop at the left viewport gutter');
+      anchor.rect.right = 180;
+      observer.callback();
+      assert.equal(available, '168px', 'moving a parent pane recomputes remaining width');
+      action.update({ align: 'start' });
+      assert.equal(available, '568px');
+      window.innerWidth = 390;
+      listeners.get('resize')();
+      assert.equal(available, '158px', 'left-aligned panel must fit a narrow viewport');
+      action.update({ align: 'end', active: false });
+      assert.equal(listeners.size, 0, 'hidden/fixed mobile panels retain no width listeners');
+      assert.equal(observer.disconnected, true);
+      action.destroy();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
+      }
+    }
+  }
+
   const frame = { left: 320, right: 1520, width: 1200 };
   assert.deepEqual(previewSplitAt(920, frame), { width: 596, collapse: false });
   assert.equal(equalPreviewSplitWidth(1200), 596);

@@ -122,7 +122,7 @@
   });
 </script>
 
-<div class="card" data-mcp-server-audit="1">
+<div class="settings-card mcp-card" data-mcp-server-audit="1">
   <div class="audit-head">
     <h4>{i18n.t('mcpServer.audit.section')}</h4>
     <span class="meta" data-mcp-audit-total="1">{i18n.t('mcpServer.audit.total', { count: String(total) })}</span>
@@ -139,10 +139,10 @@
     </div>
     <div class="action-row">
       {#if hasSession}
-        <button type="button" data-mcp-audit-view-session="1" onclick={viewSession}>{i18n.t('mcpServer.audit.viewSession')}</button>
+        <button class="btn btn--sm btn--secondary" type="button" data-mcp-audit-view-session="1" onclick={viewSession}>{i18n.t('mcpServer.audit.viewSession')}</button>
       {/if}
-      <button type="button" disabled={busy} onclick={() => void load()}>{i18n.t('mcpServer.audit.refresh')}</button>
-      <button type="button" class="danger" data-mcp-audit-clear="1" disabled={busy || total === 0} onclick={() => void clearRecords()}>
+      <button class="btn btn--sm btn--secondary" type="button" disabled={busy} onclick={() => void load()}>{i18n.t('mcpServer.audit.refresh')}</button>
+      <button type="button" class="btn btn--sm btn--error" data-mcp-audit-clear="1" disabled={busy || total === 0} onclick={() => void clearRecords()}>
         {filterTokenId ? i18n.t('mcpServer.audit.clearClient') : i18n.t('mcpServer.audit.clearAll')}
       </button>
     </div>
@@ -154,10 +154,10 @@
     <ul class="rows">
       {#each entries as entry, index (`${entry.atMs}-${entry.tokenId}-${offset + index}`)}
         <li>
-          <div class="row-main">
-            <span class="row-title">
+          <div class="settings-row-copy">
+            <span class="settings-row-title">
               <code>{actionLabel(entry.tool)}</code>
-              <span class="badge" class:badge--off={entry.outcome !== 'succeeded'}>
+              <span class="settings-chip settings-chip--ok" class:badge--off={entry.outcome !== 'succeeded'}>
                 {i18n.t(`mcpServer.audit.outcome.${entry.outcome}`)}
               </span>
             </span>
@@ -171,22 +171,14 @@
       {/each}
     </ul>
     <div class="pager" data-mcp-audit-pager="1">
-      <button type="button" disabled={offset === 0} onclick={() => go(-1)}>{i18n.t('mcpServer.audit.prev')}</button>
+      <button class="btn btn--sm btn--secondary" type="button" disabled={offset === 0} onclick={() => go(-1)}>{i18n.t('mcpServer.audit.prev')}</button>
       <span class="meta">{i18n.t('mcpServer.audit.page', { page: String(pageIndex), pages: String(pageCount) })}</span>
-      <button type="button" disabled={pageIndex >= pageCount} onclick={() => go(1)}>{i18n.t('mcpServer.audit.next')}</button>
+      <button class="btn btn--sm btn--secondary" type="button" disabled={pageIndex >= pageCount} onclick={() => go(1)}>{i18n.t('mcpServer.audit.next')}</button>
     </div>
   {/if}
 </div>
 
 <style>
-  .card {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 12px 14px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.18));
-    border-radius: 10px;
-  }
 
   .audit-head {
     display: flex;
@@ -209,7 +201,8 @@
   }
 
   .audit-filter {
-    min-width: 180px;
+    min-width: min(180px, 100%);
+    max-width: 100%;
   }
 
   .field {
@@ -246,6 +239,7 @@
 
   .rows li {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
@@ -254,35 +248,9 @@
     background: var(--surface-muted, rgba(127, 127, 127, 0.08));
   }
 
-  .row-main {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    min-width: 0;
-  }
 
-  .row-title {
-    display: inline-flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: var(--font-semibold);
-  }
 
-  .badge {
-    padding: 1px 6px;
-    border-radius: 999px;
-    font-size: var(--text-xs);
-    background: var(--accent-soft, rgba(80, 140, 255, 0.16));
-    color: var(--accent-strong, #3b6fd4);
-  }
 
-  .badge--off {
-    background: var(--surface-muted, rgba(127, 127, 127, 0.14));
-    color: inherit;
-    opacity: 0.8;
-  }
 
   .pager {
     display: flex;
@@ -298,22 +266,4 @@
     gap: 8px;
   }
 
-  button {
-    padding: 5px 12px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 8px;
-    font-size: 12px;
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
-  }
-
-  button.danger {
-    color: var(--danger, #c53f4f);
-  }
-
-  button:disabled {
-    cursor: default;
-    opacity: 0.45;
-  }
 </style>

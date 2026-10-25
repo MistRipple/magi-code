@@ -568,7 +568,7 @@
 </div>
 
 <style>
-  .appearance-tab { position: relative; color: var(--foreground); display: flex; flex-direction: column; min-height: 0; }
+  .appearance-tab { container-type: inline-size; container-name: appearance-tab; position: relative; color: var(--foreground); display: flex; flex-direction: column; min-height: 0; }
   .theme-card-body, .editor-header, .editor-footer, .wallpaper-heading, .theme-actions, .wallpaper-actions { display: flex; align-items: center; }
   .theme-actions, .wallpaper-actions { gap: 8px; }
   .theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 16px; }
@@ -612,7 +612,7 @@
   .editor-error { margin: 0 20px 12px; }
   .editor-footer { justify-content: flex-end; gap: 9px; padding: 13px 20px; border-top: var(--magi-hairline) solid var(--border); }
   .confirm-dialog { color: var(--foreground); }
-  @media (max-width: 720px) {
+  @container appearance-tab (max-width: 720px) {
     .theme-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
     .material-options, .color-grid { grid-template-columns: 1fr; }
     .wallpaper-heading { align-items: flex-start; flex-direction: column; }

@@ -33,7 +33,7 @@
   function updatePopoverPosition() {
     if (!triggerEl) return;
     const rect = triggerEl.getBoundingClientRect();
-    const width = Math.min(560, window.innerWidth - 24);
+    const width = Math.min(800, Math.max(440, window.innerWidth * 0.52), window.innerWidth - 24);
     const maxHeight = Math.min(360, window.innerHeight - 24);
     const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.left));
     const preferredTop = rect.bottom + 8;

@@ -733,9 +733,7 @@
   }
   .plugin-link-btn:disabled { cursor: default; opacity: 0.42; }
   .resource-list {
-    max-height: 280px;
     margin-top: 8px;
-    overflow: auto;
     border-top: var(--magi-hairline) solid var(--border-subtle);
     border-bottom: var(--magi-hairline) solid var(--border-subtle);
   }

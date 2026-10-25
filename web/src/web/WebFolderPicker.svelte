@@ -216,11 +216,14 @@
           <Icon name="chevron-up" size={16} />
         </button>
         {#if roots.length > 1}
-          <select class="mac-root-select" aria-label={i18n.t('web.folderPickerManualPath')} onchange={handleRootChange} disabled={loading}>
-            {#each roots as root (root.pathRef)}
-              <option value={root.pathRef}>{root.name}</option>
-            {/each}
-          </select>
+          <span class="mac-root-select-wrap">
+            <select class="mac-root-select" aria-label={i18n.t('web.folderPickerManualPath')} onchange={handleRootChange} disabled={loading}>
+              {#each roots as root (root.pathRef)}
+                <option value={root.pathRef}>{root.name}</option>
+              {/each}
+            </select>
+            <span class="mac-root-select-chevron"><Icon name="chevron-down" size={12} /></span>
+          </span>
         {/if}
       </div>
 
@@ -274,7 +277,7 @@
   <div class="mac-list-area">
     {#if loading}
       <div class="mac-empty-state">
-        <div class="mac-spinner"></div>
+        <span class="mac-spinner"><Icon name="loader" size={24} /></span>
         <div class="mac-empty-text">{i18n.t('web.folderPickerLoading')}</div>
       </div>
     {:else if error}
@@ -343,7 +346,8 @@
   .mac-finder-container {
     display: flex;
     flex-direction: column;
-    height: 520px;
+    flex: 1;
+    min-height: 0;
     min-width: 0;
     /* Modal 已提供窗口材质，内容和上下栏只负责布局。 */
     background: transparent;
@@ -441,6 +445,8 @@
     color: var(--primary);
   }
 
+  .mac-root-select-wrap { position: relative; display: inline-flex; }
+  .mac-root-select-chevron { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: flex; color: var(--foreground-muted); pointer-events: none; }
   .mac-root-select {
     appearance: none;
     height: 28px;
@@ -450,9 +456,6 @@
     border: var(--magi-hairline) solid rgba(var(--foreground-rgb, 100, 100, 100), 0.12);
     border-radius: 6px;
     background: rgba(var(--foreground-rgb, 100, 100, 100), 0.04);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23888' d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 9px center;
     color: var(--foreground);
     font: inherit;
     font-size: 12px;
@@ -568,6 +571,7 @@
   /* 列表区域 */
   .mac-list-area {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     position: relative;
   }
@@ -743,11 +747,10 @@
 
   /* 加载动画 */
   .mac-spinner {
+    display: inline-flex;
+    color: var(--primary);
     width: 24px;
     height: 24px;
-    border: 2px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
-    border-top-color: var(--primary);
-    border-radius: 50%;
     animation: mac-spin 1s linear infinite;
     margin-bottom: 12px;
   }

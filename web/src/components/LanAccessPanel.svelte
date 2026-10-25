@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { constrainPanelWidth } from '../lib/panel-width';
   import { onDestroy } from 'svelte';
   import QRCode from 'qrcode';
   import Icon from './Icon.svelte';
@@ -208,7 +209,7 @@
 </script>
 
 {#if visible}
-<div class="lan-access-panel" data-magi-surface="popover">
+<div class="lan-access-panel" use:constrainPanelWidth={{ align: 'end' }} data-magi-surface="popover">
   <div class="panel-header">
     <span class="panel-title">{i18n.t('lanAccess.title')}</span>
     <button
@@ -282,7 +283,7 @@
 
 
 <style>
-  .lan-access-panel { position: absolute; top: calc(100% + 8px); right: 0; width: 300px; max-height: 80vh; overflow-y: auto; background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); z-index: var(--z-popover); animation: panelSlideIn 0.15s ease-out; }
+  .lan-access-panel { position: absolute; top: calc(100% + 8px); right: 0; width: min(clamp(280px, 28vw, 360px), var(--panel-available-width, calc(100vw - 24px))); max-height: 80vh; overflow-y: auto; background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); z-index: var(--z-popover); animation: panelSlideIn 0.15s ease-out; }
   @keyframes panelSlideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
   .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: var(--magi-hairline) solid var(--border); }
   .panel-title { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { constrainPanelWidth } from '../lib/panel-width';
   import Disclosure from './Disclosure.svelte';
   import { onMount } from 'svelte';
   import type {
@@ -468,7 +469,7 @@
         aria-label={i18n.t('common.close')}
         onclick={() => expanded = false}
       ></button>
-      <section class="agent-center-panel" data-magi-surface="popover" aria-label={i18n.t('activeAgentCenter.title')}>
+      <section class="agent-center-panel" use:constrainPanelWidth={{ align: 'end', active: !mobile }} data-magi-surface="popover" aria-label={i18n.t('activeAgentCenter.title')}>
         <header class="panel-header">
           <span class="panel-heading">
             <strong>{i18n.t('activeAgentCenter.title')}</strong>
@@ -683,7 +684,7 @@
     position: absolute;
     top: 40px;
     right: 0;
-    width: min(334px, calc(100vw - 40px));
+    width: min(clamp(334px, 34vw, 560px), var(--panel-available-width, calc(100vw - 40px)));
     max-height: min(600px, calc(100vh - 150px));
     display: flex;
     flex-direction: column;
@@ -768,6 +769,7 @@
   }
 
   .panel-content {
+    min-width: 0;
     min-height: 0;
     overflow-y: auto;
     padding: 6px;

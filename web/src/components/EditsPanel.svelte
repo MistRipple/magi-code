@@ -264,113 +264,134 @@
 </script>
 
 <div class="panel-content-scrollable edits-panel">
-  <IsolationBanner />
-  <!-- 仓库面板描述的是主工作区的 Git 状态；隔离会话在自己的副本里，这里不显示。 -->
-  {#if !sessionIsolated}
-    <GitRepositoryPanel />
-  {/if}
-  <div class="changes-section-label">{i18n.t('edits.section.pendingChanges')}</div>
-  {#if edits.length === 0}
-    <div class="empty-state">
-      <Icon name="file-edit" size={32} />
-      <div class="empty-text">{i18n.t('edits.empty.title')}</div>
-      <div class="empty-hint">{i18n.t('edits.empty.hint')}</div>
-    </div>
-  {:else}
-    <div class="edits-main">
-      {#if hasGroups}
-        <div class="group-section">
-          <div class="group-header">
-            <span class="group-label">{i18n.t('edits.group.earlierPending')}</span>
-            <span class="group-count">{i18n.t('edits.group.earlierPendingCount', { count: earlierPendingEdits.length })}</span>
-          </div>
-          <ChangeFileTree
-            edits={earlierPendingEdits}
-            workspacePath={messagesState.currentWorkspacePath || ''}
-            activeFilePath={activeCodeFilePath}
-            changeMutationPending={changeMutationPending}
-            onOpen={viewDiff}
-            onApprove={approveChange}
-            onRevert={revertChange}
-          />
+  <div class="edits-content">
+    <IsolationBanner />
+    <!-- 仓库面板描述的是主工作区的 Git 状态；隔离会话在自己的副本里，这里不显示。 -->
+    {#if !sessionIsolated}
+      <GitRepositoryPanel />
+    {/if}
+    <div class="changes-toolbar">
+      <h2 class="changes-section-label">{i18n.t('edits.section.pendingChanges')}</h2>
+      {#if edits.length > 0}
+        <div class="group-actions">
+          <button
+            type="button"
+            class="group-action approve"
+            disabled={changeMutationPending}
+            title={sessionIsolated ? i18n.t('edits.isolated.approveAllTitle') : i18n.t('edits.actions.approveAllTitle')}
+            onclick={approveAllChanges}
+          >
+            <Icon name={sessionIsolated ? 'git-merge' : 'check'} size={12} />
+            <span>{sessionIsolated ? i18n.t('edits.isolated.approveAll') : i18n.t('edits.actions.approveAll')}</span>
+          </button>
+          <button
+            type="button"
+            class="group-action revert"
+            disabled={changeMutationPending || !allEditsRevertible}
+            title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
+            onclick={revertAllChanges}
+          >
+            <Icon name="undo" size={12} />
+            <span>{i18n.t('edits.actions.revertAll')}</span>
+          </button>
         </div>
       {/if}
+    </div>
+    {#if edits.length === 0}
+      <div class="empty-state">
+        <Icon name="file-edit" size={32} />
+        <div class="empty-text">{i18n.t('edits.empty.title')}</div>
+        <div class="empty-hint">{i18n.t('edits.empty.hint')}</div>
+      </div>
+    {:else}
+      <div class="edits-main">
+        {#if hasGroups}
+          <div class="group-section">
+            <div class="group-header">
+              <span class="group-label">{i18n.t('edits.group.earlierPending')}</span>
+              <span class="group-count">{i18n.t('edits.group.earlierPendingCount', { count: earlierPendingEdits.length })}</span>
+            </div>
+            <ChangeFileTree
+              edits={earlierPendingEdits}
+              workspacePath={messagesState.currentWorkspacePath || ''}
+              activeFilePath={activeCodeFilePath}
+              changeMutationPending={changeMutationPending}
+              onOpen={viewDiff}
+              onApprove={approveChange}
+              onRevert={revertChange}
+            />
+          </div>
+        {/if}
 
-      <div class="group-section">
-        {#if displayedCurrentEdits.length > 0}
-          <div class="group-header current-round">
-            <span class="group-label">{i18n.t('edits.group.currentRound')}</span>
-            <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: displayedCurrentEdits.length })}</span>
-            <span
-              class="group-diff-summary"
-              aria-label={i18n.t('edits.group.currentRoundSummary', {
-                count: displayedCurrentEdits.length,
-                additions: currentRoundTotals.additions,
-                deletions: currentRoundTotals.deletions,
-              })}
-            >
-              <span class="stat-add">+{currentRoundTotals.additions}</span>
-              <span class="stat-del">-{currentRoundTotals.deletions}</span>
-            </span>
-            <div class="group-actions">
-              <button
-                type="button"
-                class="group-action approve"
-                disabled={changeMutationPending}
-                title={sessionIsolated ? i18n.t('edits.isolated.approveAllTitle') : i18n.t('edits.actions.approveAllTitle')}
-                onclick={approveAllChanges}
+        <div class="group-section">
+          {#if displayedCurrentEdits.length > 0}
+            <div class="group-header current-round">
+              <span class="group-label">{i18n.t('edits.group.currentRound')}</span>
+              <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: displayedCurrentEdits.length })}</span>
+              <span
+                class="group-diff-summary"
+                aria-label={i18n.t('edits.group.currentRoundSummary', {
+                  count: displayedCurrentEdits.length,
+                  additions: currentRoundTotals.additions,
+                  deletions: currentRoundTotals.deletions,
+                })}
               >
-                <Icon name={sessionIsolated ? 'git-merge' : 'check'} size={12} />
-                <span>{sessionIsolated ? i18n.t('edits.isolated.approveAll') : i18n.t('edits.actions.approveAll')}</span>
-              </button>
-              <button
-                type="button"
-                class="group-action revert"
-                disabled={changeMutationPending || !allEditsRevertible}
-                title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
-                onclick={revertAllChanges}
-              >
-                <Icon name="undo" size={12} />
-                <span>{i18n.t('edits.actions.revertAll')}</span>
-              </button>
+                <span class="stat-add">+{currentRoundTotals.additions}</span>
+                <span class="stat-del">-{currentRoundTotals.deletions}</span>
+              </span>
               {#if currentRoundEdits.length > 0 && latestExecutionGroupId}
-                <button
-                  type="button"
-                  class="group-action revert"
-                  disabled={changeMutationPending || !currentRoundRevertible}
-                  title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
-                  onclick={revertCurrentRound}
-                >
-                  <Icon name="undo" size={12} />
-                  <span>{i18n.t('edits.group.revertRound')}</span>
-                </button>
+                <div class="group-actions">
+                  <button
+                    type="button"
+                    class="group-action revert"
+                    disabled={changeMutationPending || !currentRoundRevertible}
+                    title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
+                    onclick={revertCurrentRound}
+                  >
+                    <Icon name="undo" size={12} />
+                    <span>{i18n.t('edits.group.revertRound')}</span>
+                  </button>
+                </div>
               {/if}
             </div>
-          </div>
-          <ChangeFileTree
-            edits={displayedCurrentEdits}
-            workspacePath={messagesState.currentWorkspacePath || ''}
-            activeFilePath={activeCodeFilePath}
-            changeMutationPending={changeMutationPending}
-            onOpen={viewDiff}
-            onApprove={approveChange}
-            onRevert={revertChange}
-          />
-        {/if}
+            <ChangeFileTree
+              edits={displayedCurrentEdits}
+              workspacePath={messagesState.currentWorkspacePath || ''}
+              activeFilePath={activeCodeFilePath}
+              changeMutationPending={changeMutationPending}
+              onOpen={viewDiff}
+              onApprove={approveChange}
+              onRevert={revertChange}
+            />
+          {/if}
+        </div>
       </div>
-    </div>
-  {/if}
+    {/if}
+  </div>
 </div>
 
 <style>
   .edits-panel {
+    container-type: inline-size;
+    container-name: edits-panel;
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
     overflow: hidden;
-    padding: var(--space-2);
+    padding: 16px;
     background: transparent;
+  }
+
+  .edits-content {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 1200px;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    margin-inline: auto;
   }
 
   .edits-panel * {
@@ -393,11 +414,20 @@
   }
 
   .changes-section-label {
+    margin: 0;
     flex: 0 0 auto;
-    padding: 4px calc(var(--space-2) + var(--space-1)) 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
+    color: var(--foreground);
+    font-size: var(--text-sm);
     font-weight: var(--font-semibold);
+  }
+
+  .changes-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px 16px;
+    padding-block: 16px 12px;
   }
 
   .empty-text {
@@ -416,7 +446,7 @@
     min-width: 0;
     min-height: 0;
     overflow: auto;
-    padding: var(--space-2);
+    padding: 0 0 8px;
   }
 
   .edits-main::-webkit-scrollbar {
@@ -439,6 +469,7 @@
     display: inline-flex;
     flex: 0 0 auto;
     align-items: center;
+    flex-wrap: wrap;
     gap: 2px;
     margin-left: auto;
   }
@@ -448,31 +479,28 @@
     align-items: center;
     justify-content: center;
     gap: 4px;
-    height: 24px;
+    min-height: 28px;
     padding: 0 8px;
-    border: var(--magi-hairline) solid transparent;
+    border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
     font-size: var(--text-xs);
     font-weight: var(--font-medium);
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
   .group-action.approve {
-    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
     background: var(--primary-muted);
     color: var(--primary);
   }
 
   .group-action.approve:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--primary) 44%, transparent);
     background: color-mix(in srgb, var(--primary) 22%, transparent);
   }
 
   .group-action.revert:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--error) 35%, transparent);
     background: color-mix(in srgb, var(--error) 10%, transparent);
     color: var(--error);
   }
@@ -492,11 +520,11 @@
 
   .group-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
-    min-height: 28px;
-    margin: 0 0 4px;
-    padding: 0 var(--space-1);
+    min-height: 36px;
+    padding: 4px 8px;
   }
 
   .group-label {
@@ -508,7 +536,6 @@
   .group-count {
     color: var(--foreground-muted);
     font-size: var(--text-xs);
-    opacity: 0.72;
   }
 
   .group-diff-summary {
@@ -523,22 +550,11 @@
 
   .stat-add { color: var(--success); }
   .stat-del { color: var(--error); }
-  @media (max-width: 768px) {
-    .edits-panel {
-      padding: var(--space-2);
-    }
-
-    .group-header.current-round {
-      flex-wrap: wrap;
-    }
-
-    .group-actions {
-      margin-left: auto;
-    }
-
+  @container edits-panel (max-width: 640px) {
+    .changes-toolbar { gap: 8px; }
+    .changes-toolbar > .group-actions { flex-basis: 100%; margin-left: 0; }
     .group-action {
       padding-inline: 6px;
     }
-
   }
 </style>

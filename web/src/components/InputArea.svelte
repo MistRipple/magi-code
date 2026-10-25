@@ -1,5 +1,6 @@
 <script lang="ts">
   import FileName from './FileName.svelte';
+  import FileTypeIcon from './FileTypeIcon.svelte';
   import { onMount, type Component } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { turnStoreState } from '../stores/turn-store.svelte';
@@ -3189,7 +3190,11 @@
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
-            <Icon name={reference.kind === 'directory' ? 'folder' : 'document'} size={11} />
+            {#if reference.kind === 'directory'}
+              <Icon name="folder" size={14} />
+            {:else}
+              <FileTypeIcon path={reference.name} size={14} />
+            {/if}
             <span class="ia-reference-chip-label"><FileName name={reference.name} preserveExtension={reference.kind !== 'directory'} /></span>
             <button
               type="button"
@@ -3766,7 +3771,7 @@
                         {#if pickerSavingModel === model}
                           <Icon name="loader" size={12} class="spinning" />
                         {:else if !currentPickerEngineId && currentPickerModel === model}
-                          <span class="ia-picker-check">✓</span>
+                          <span class="ia-picker-check"><Icon name="check" size={13} /></span>
                         {/if}
                       </button>
                     {/each}
@@ -3799,7 +3804,7 @@
                           {#if pickerSavingModel === engine.id}
                             <Icon name="loader" size={12} class="spinning" />
                           {:else if currentPickerEngineId === engine.id}
-                            <span class="ia-picker-check">✓</span>
+                            <span class="ia-picker-check"><Icon name="check" size={13} /></span>
                           {/if}
                         </button>
                       {/each}
@@ -4082,10 +4087,11 @@
     container-name: magi-composer;
     container-type: inline-size;
     max-height: 50vh;
-    background: var(--vscode-input-background);
+    background: var(--magi-surface-composer);
     border: 0;
     border-radius: var(--radius-xl);
-    box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border),
+      0 2px 12px rgba(var(--foreground-rgb), 0.035);
     transition: box-shadow 180ms var(--magi-ease-ink), background 180ms ease;
     position: relative;
     /* 不使用 overflow:hidden — 允许模型下拉菜单溢出显示 */
@@ -4882,6 +4888,8 @@
     min-width: 0;
   }
   .ia-picker-check {
+    display: inline-flex;
+    align-items: center;
     flex: 0 0 auto;
     color: var(--primary);
     font-size: 13px;

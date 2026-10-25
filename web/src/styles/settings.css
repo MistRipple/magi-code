@@ -38,6 +38,7 @@
   }
   /* 每个 Tab 的根容器自动撑满内容区域 */
   .settings-tab-content > * {
+    min-width: 0;
     flex: 1 1 auto;
     min-height: 0;
   }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import FileName from './FileName.svelte';
+  import Icon from './Icon.svelte';
   import { getContext, onDestroy } from 'svelte';
   import Disclosure from './Disclosure.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
@@ -162,15 +163,11 @@
     <div class="code-header">
       <button class="header-left" onclick={toggle}>
         <span class="chevron">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z"/>
-          </svg>
+          <Icon name="chevron-right" size={12} />
         </span>
 
         <span class="code-icon">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M5.854 4.854a.5.5 0 1 0-.708-.708l-3.5 3.5a.5.5 0 0 0 0 .708l3.5 3.5a.5.5 0 0 0 .708-.708L2.707 8l3.147-3.146zm4.292 0a.5.5 0 0 1 .708-.708l3.5 3.5a.5.5 0 0 1 0 .708l-3.5 3.5a.5.5 0 0 1-.708-.708L13.293 8l-3.147-3.146z"/>
-          </svg>
+          <Icon name="code" size={14} />
         </span>
 
         <span class="code-title">
@@ -201,14 +198,10 @@
         <button class="copy-btn" onclick={copyCode} class:copied>
           {#key copyRevision}
           {#if copied}
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M12.736 3.97a.733.733 0 0 1 1.047 0c.286.289.29.756.01 1.05L7.88 12.01a.733.733 0 0 1-1.065.02L3.217 8.384a.757.757 0 0 1 0-1.06.733.733 0 0 1 1.047 0l3.052 3.093 5.4-6.425z"/>
-            </svg>
+            <Icon name="check" size={12} />
             <span>{i18n.t('codeBlock.copied')}</span>
           {:else}
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M4 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1h1v1a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h1v1H2z"/>
-            </svg>
+            <Icon name="copy" size={12} />
             <span>{i18n.t('codeBlock.copy')}</span>
           {/if}
           {/key}

@@ -27,11 +27,14 @@
 <style>
   .disclosure {
     display: grid;
+    min-width: 0;
+    max-width: 100%;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: 0fr;
     transition: grid-template-rows 260ms var(--magi-ease-ink);
   }
   .disclosure.open { grid-template-rows: 1fr; }
-  .disclosure-inner { min-height: 0; overflow: hidden; }
+  .disclosure-inner { min-width: 0; min-height: 0; overflow: hidden; }
   @starting-style { .disclosure.open { grid-template-rows: 0fr; } }
   @media (prefers-reduced-motion: reduce) {
     .disclosure { transition: none; }
