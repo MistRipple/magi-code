@@ -1691,11 +1691,7 @@ async fn enhance_prompt(
         request.workspace_path.as_deref(),
     )?;
     let session_id = scope.session_id().cloned();
-    let workspace_id = scope
-        .workspace_id()
-        .cloned()
-        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
-    let workspace_binding = Some(workspace_id);
+    let workspace_binding = scope.workspace_id().cloned();
     let Some(client) = resolve_target_for_role(
         Some(&state.settings_store),
         None,
@@ -2057,6 +2053,101 @@ mod tests {
         assert_eq!(
             payload["message"],
             "辅助模型未配置，无法增强提示词；请在设置中配置 auxiliary 模型"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_enhance_supports_personal_and_workspace_drafts_and_sessions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(|| async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "请整理项目结构并说明各模块职责。"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}
+                    }))
+                })),
+            ).await.unwrap();
+        });
+        let root = unique_temp_dir("magi-prompt-enhance-scopes");
+        let state = build_state_with_workspace_root(&root, "enhance-workspace");
+        state
+            .settings_store
+            .set_section(
+                "auxiliary",
+                serde_json::json!({
+                    "baseUrl": format!("http://{address}/v1"),
+                    "apiProtocol": "openai_chat", "apiKey": "fixture", "model": "enhance-fixture"
+                }),
+            )
+            .unwrap();
+        state
+            .session_store
+            .create_session(SessionId::new("enhance-personal"), "个人会话")
+            .unwrap();
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("enhance-project"),
+                "项目会话",
+                Some("enhance-workspace".into()),
+            )
+            .unwrap();
+        for mut request in [
+            serde_json::json!({}),
+            serde_json::json!({"sessionId": "enhance-personal"}),
+            serde_json::json!({"workspaceId": "enhance-workspace"}),
+            serde_json::json!({"workspaceId": "enhance-workspace", "sessionId": "enhance-project"}),
+        ] {
+            request["prompt"] = serde_json::json!("整理项目");
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/prompt/enhance")
+                        .method("POST")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{request}");
+            assert_eq!(
+                read_json_response(response).await["enhancedPrompt"],
+                "请整理项目结构并说明各模块职责。"
+            );
+        }
+        let usage = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "model.usage.recorded")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2, "仅已绑定会话的强化调用归入会话用量");
+        assert!(usage.iter().any(|event| event.session_id
+            == Some(SessionId::new("enhance-personal"))
+            && event.workspace_id.is_none()));
+        assert!(usage.iter().any(|event| event.session_id
+            == Some(SessionId::new("enhance-project"))
+            && event.workspace_id == Some(WorkspaceId::new("enhance-workspace"))));
+        provider.abort();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_enhance_personal_draft_reaches_auxiliary_configuration_validation() {
+        let error = enhance_prompt(
+            State(build_state()),
+            Json(serde_json::from_value(serde_json::json!({"prompt": "整理想法"})).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ApiError::InvalidInput(message) if message.contains("辅助模型未配置"))
         );
     }
 
