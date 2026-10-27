@@ -2485,14 +2485,14 @@ async function waitForAssistant(page, text, label) {
   }
 }
 
-async function expandLatestAgentGroup(page) {
+async function ensureLatestAgentGroupVisible(page) {
   await waitFor(() => page.evaluate(`(() => {
     const group = [...document.querySelectorAll('.conversation-agent-group')].at(-1);
     const button = group?.querySelector('.agent-group-header');
-    if (!button) return false;
-    if (button.getAttribute('aria-expanded') !== 'true') button.click();
+    if (!group) return false;
+    if (button && button.getAttribute('aria-expanded') !== 'true') button.click();
     return true;
-  })()`), "展开本轮代理组");
+  })()`), "本轮代理组可见");
 }
 
 async function gitFixtureCommand(repositoryRoot, args) {
@@ -3502,7 +3502,7 @@ try {
       turns.at(-1)?.querySelector('.turn-disclosure-header')?.click();
     })()`);
   }
-  await expandLatestAgentGroup(page);
+  await ensureLatestAgentGroupVisible(page);
   const agentSpawnCard = await waitFor(async () => {
     const state = await rendererState(page);
     return state.agentCenter.agentCards.length > 0 ? state : null;

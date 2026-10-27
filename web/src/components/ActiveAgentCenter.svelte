@@ -17,7 +17,8 @@
     resolveAgentProjectionPin,
     shouldShowActiveAgentCenter,
   } from '../lib/active-agent-center';
-  import { getAgentVisualInfo } from '../lib/agent-colors';
+  import { getAgentBrandInfo, getAgentRunColor } from '../lib/agent-colors';
+  import { agentModelLabel } from '../lib/agent-model-display';
   import { resolveAgentDisplayName } from '../lib/agent-role-utils';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
@@ -192,14 +193,16 @@
     };
   });
 
-  function roleColorToken(role: string): string | undefined {
-    const normalizedRole = role.trim();
-    if (!normalizedRole) return undefined;
-    return enabledAgents.find((agent) => agent.templateId.trim() === normalizedRole)?.colorToken;
+  function agentVisual(agent: AgentProjectionDto) {
+    return {
+      ...getAgentBrandInfo(agent.role, (key) => i18n.t(key)),
+      ...getAgentRunColor(agent.agentRunId),
+    };
   }
 
-  function agentVisual(agent: AgentProjectionDto) {
-    return getAgentVisualInfo(agent.role, roleColorToken(agent.role), (key) => i18n.t(key));
+  function modelLabel(agent: AgentProjectionDto): string {
+    const task = pinnedProjection?.tasks.find((task) => task.task_id === agent.agentRunId);
+    return agentModelLabel(task?.executor_binding?.model_selection, (key) => i18n.t(key)) || agent.model || '';
   }
 
   function agentDisplayName(agent: AgentProjectionDto): string {
@@ -392,11 +395,9 @@
   async function openAgent(agent: AgentProjectionDto): Promise<void> {
     const sessionId = currentSessionId?.trim() ?? '';
     if (!sessionId) return;
-    const visual = agentVisual(agent);
     selectAgentRun(sessionId, agent.agentRunId, currentWorkspaceId, currentWorkspacePath);
     openAgentTab(sessionId, agent.agentRunId, {
       label: agentDisplayName(agent),
-      accentToken: visual.color,
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,
     });
@@ -410,6 +411,7 @@
 {#snippet agentRow(agent: AgentProjectionDto)}
   {@const visual = agentVisual(agent)}
   {@const icon = statusIcon(agent)}
+  {@const model = modelLabel(agent)}
   <button
     type="button"
     class:selected={agentRunState.selectedAgentRunId === agent.agentRunId}
@@ -426,6 +428,7 @@
         <strong>{agentDisplayName(agent)}</strong>
         <span>{agentRoleLabel(agent)}</span>
       </span>
+      {#if model}<span class="agent-goal" title={model}>{model}</span>{/if}
       <span class="agent-goal">{agent.goal}</span>
       {#if agent.queueReason}
         <span class="agent-diagnostic">{agent.queueReason}</span>
@@ -991,10 +994,11 @@
     padding: 7px;
     border: 0;
     border-radius: var(--radius-md);
-    background: transparent;
+    background: color-mix(in srgb, var(--agent-color) 4%, var(--dropdown-bg));
     color: var(--foreground);
     text-align: left;
     cursor: pointer;
+    box-shadow: inset 2px 0 var(--agent-color);
   }
 
   .agent-row:hover {

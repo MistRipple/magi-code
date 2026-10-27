@@ -3,6 +3,7 @@
   import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
+  import { getAgentRunColor } from '../lib/agent-colors';
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
@@ -1049,24 +1050,11 @@
   );
 
   // ============ Tab 视觉 ============
-  // 代理 tab 的 label / accentToken 由 ToolCall 触发 openAgentTab 时一次性写入；
-  // RightPane 不再二次按 roleId 反查 registry —— tab 本身即为视觉真源。
+  // 原 Task 身份决定识别色，已恢复的 Tab 也与主对话及运行中心一致。
 
   function tabAccent(tab: RightPaneTab): string {
     if (tab.kind === 'agent') {
-      const accent = tab.accentToken?.trim();
-      if (!accent) return 'var(--accent)';
-      if (
-        accent.startsWith('var(')
-        || accent.startsWith('#')
-        || accent.startsWith('rgb(')
-        || accent.startsWith('rgba(')
-        || accent.startsWith('hsl(')
-        || accent.startsWith('hsla(')
-      ) {
-        return accent;
-      }
-      return `var(--${accent})`;
+      return getAgentRunColor((tab.payload as AgentTabPayload).agentRunId).color;
     }
     return 'var(--info)';
   }
@@ -1231,7 +1219,7 @@
   }
 </script>
 
-<aside class="right-pane" aria-label={i18n.t('rightPane.title')}>
+<aside class="right-pane" data-magi-surface={overlay ? 'window' : undefined} aria-label={i18n.t('rightPane.title')}>
   <!-- 顶部 Tab 条；右栏折叠入口由工作台外壳固定在窗口右上角。 -->
   <header class="right-pane-tabbar" class:right-pane-tabbar--overlay={overlay}>
     {#if overlay}

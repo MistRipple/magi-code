@@ -205,7 +205,7 @@ assert.doesNotMatch(
 );
 assert.match(
   toolCallSource,
-  /getAgentVisualInfo\(role, undefined, \(key\) => i18n\.t\(key\)\)/,
+  /getAgentBrandInfo\(role, \(key\) => i18n\.t\(key\)\)/,
   'agent_spawn 角色角标必须通过当前语言翻译，不能直接展示英文模板名',
 );
 
@@ -296,7 +296,7 @@ await withGoldenViteServer(async (server) => {
   assert.equal(resolveAgentChildStatus(staleProjection, 'child', 'completed', 200), 'running', '较新的 TaskStore 执行事实优先于旧完成记录');
   // 从完整 MessageItem 入口验证 metadata 经 BlockRenderer、ToolCallRenderer 到达卡片。
   for (const [childStatus, visualStatus] of [
-    ['completed', 'success'], ['failed', 'error'], ['killed', 'error'],
+    ['completed', 'success'], ['failed', 'error'], ['killed', 'cancelled'],
     ['degraded', 'degraded'], ['queued', 'pending'], ['running', 'running'],
   ]) {
     const markup = render(messageItem.default, { props: {
@@ -317,6 +317,47 @@ await withGoldenViteServer(async (server) => {
   const selectedAgent = render(toolCall.default, {props:{name:'agent_spawn',status:'success',output:{status:'started',child_task_id:'selected-child',model_selection:{model:'glm-fixture',effective_effort:'max'}}}}).body;
   assert.match(selectedAgent, /glm-fixture/, '派发卡片展示服务端固定模型');
   assert.match(selectedAgent, /最高|Max/, '派发卡片展示服务端实际强度');
+  const { getAgentRunColor } = await server.ssrLoadModule('/src/lib/agent-colors.ts');
+  const { agentModelLabel } = await server.ssrLoadModule('/src/lib/agent-model-display.ts');
+  const { i18n } = await server.ssrLoadModule('/src/stores/i18n.svelte.ts');
+  const translate = (key) => i18n.t(key);
+  assert.deepEqual(getAgentRunColor('selected-child'), getAgentRunColor('selected-child'), '同一 Task 识别色固定');
+  assert.notDeepEqual(getAgentRunColor('child-0'), getAgentRunColor('child-1'), '多个同角色代理按 Task 区分颜色');
+  assert.equal(agentModelLabel({ model: 'historical' }, translate), 'historical', '历史未记录等级时不编造默认等级');
+  assert.equal(agentModelLabel({ model: 'historical', effective_effort: 'future-level' }, translate), 'historical');
+  assert.equal(agentModelLabel(null, translate), '', '缺少模型快照时不使用当前角色配置补写');
+  for (const compactAgent of [false, true]) {
+    for (const effort of ['none', 'low', 'max', null]) {
+      const label = agentModelLabel({ model: 'snapshot-model', effective_effort: effort }, translate);
+      const props = {
+        name: 'agent_spawn', compactAgent, status: 'success',
+        input: { role: 'explorer', reasoning_effort: 'high' },
+        output: JSON.stringify({ status: 'started', child_task_id: 'selected-child', model_selection: { model: 'snapshot-model', effective_effort: effort } }),
+      };
+      const markup = render(toolCall.default, { props }).body;
+      assert.ok(markup.includes(label), '两种模式展示回执的模型与实际强度，不能拿请求强度代替');
+      assert.ok(markup.includes(`--agent-accent: ${getAgentRunColor('selected-child').color}`));
+      assert.match(markup, /data-agent-task-id="selected-child"/, '颜色和详情保持原 Task 身份');
+      const stopped = render(toolCall.default, { props: { ...props, agentChildStatus: 'killed' } }).body;
+      assert.match(stopped, /status-cancelled/);
+      assert.match(stopped, /data-icon="stop"/);
+      assert.doesNotMatch(stopped, /代理运行失败|spinning/, '已停止不显示运行或失败状态');
+    }
+  }
+  const { getAgentRunState } = await server.ssrLoadModule('/src/stores/agent-run-store.svelte.ts');
+  const projectionState = getAgentRunState('model-snapshot-session', '');
+  projectionState.projection = {
+    root_task: { task_id: 'snapshot-root' }, agents: [],
+    tasks: [{ task_id: 'snapshot-child', status: 'completed', executor_binding: { model_selection: { model: 'persisted-model', effective_effort: 'low' } } }],
+  };
+  const snapshotCard = render(toolCall.default, { props: {
+    name: 'agent_spawn', status: 'success',
+    filePreviewScope: { sessionId: 'model-snapshot-session', workspaceId: '' },
+    output: { status: 'started', child_task_id: 'snapshot-child' },
+  } }).body;
+  assert.match(snapshotCard, /persisted-model/, '派发回执缺少模型时可读取同一 Task 的已存快照');
+  assert.match(snapshotCard, /status-success/, '补充模型信息不能覆盖任务终态');
+  projectionState.projection = null;
   const compactReadFailure = render(toolCall.default, { props: {
     name:'file_read', id:'compact-read-failure', status:'error',
     input:{path:'missing.ts'}, error:'读取路径失败：路径不存在',
@@ -361,8 +402,8 @@ await withGoldenViteServer(async (server) => {
   } }).body;
   assert.match(originalAgent, /agent-spawn-role/, '详细模式保留角色标识，与右侧代理详情对应');
   assert.match(originalAgent, /查看详情/, '详细模式保留详情操作的无障碍说明');
-  assert.match(originalAgent, /role="img" aria-label="已完成"/, '详细模式用圆点显示状态，并保留可读的无障碍说明');
-  assert.doesNotMatch(originalAgent, /<span[^>]*>已完成<\/span>/, '状态不重复显示可见文字');
+  assert.match(originalAgent, /data-icon="check-circle"/, '代理完成状态使用独立形状标识');
+  assert.match(originalAgent, /<span[^>]*>已完成<\/span>/, '代理状态可直接阅读，不依赖颜色');
   assert.doesNotMatch(originalAgent, /agent-spawn-role-badge/, '角色身份无需额外的胶囊色块');
   assert.doesNotMatch(originalAgent, /compact-agent/, '详细模式保留任务卡片外观');
   assert.match(originalAgent, /data-agent-task-id="existing-child"/, '两种风格均打开原 Task');

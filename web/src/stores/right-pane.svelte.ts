@@ -153,8 +153,6 @@ export interface RightPaneTab {
   kind: RightPaneTabKind;
   /** Tab 标题（如代理名称 / 文件名）；展示用，可后续更新 */
   label: string;
-  /** 强调色，可传 CSS 颜色值或 token 名（如 'color-claude'）；null 表示无强调色 */
-  accentToken: string | null;
   payload: RightPaneTabPayload;
   /** 最近激活时间，用于关闭活动 Tab 后选择恢复目标。 */
   lastActivatedAt: number;
@@ -588,7 +586,6 @@ function upsertTab(
   kind: RightPaneTabKind,
   payload: RightPaneTabPayload,
   label: string,
-  accentToken: string | null,
   activate = true,
 ): RightPaneTab | null {
   rightPaneState.activeScopeKey = scopeKey;
@@ -612,7 +609,6 @@ function upsertTab(
 
   if (existing) {
     existing.label = label;
-    existing.accentToken = accentToken;
     const browserPayloadUnchanged = kind === 'browser'
       && existing.kind === 'browser'
       && sameBrowserTabPayload(
@@ -636,7 +632,6 @@ function upsertTab(
     id,
     kind,
     label,
-    accentToken,
     payload,
     lastActivatedAt: timestamp,
   };
@@ -753,7 +748,6 @@ export function openAgentTab(
   options?: {
     label?: string;
     displayPath?: string;
-    accentToken?: string | null;
     workspaceId?: string | null;
     workspacePath?: string | null;
   },
@@ -773,7 +767,6 @@ export function openAgentTab(
     return;
   }
   const label = options?.label?.trim() || trimmedAgentRunId;
-  const accentToken = options?.accentToken ?? null;
   rightPaneState.activeWorkspaceId = workspaceId;
   rightPaneState.activeSessionId = normalizedSession;
   upsertTab(
@@ -786,7 +779,6 @@ export function openAgentTab(
       sessionId: normalizedSession,
     },
     label,
-    accentToken,
   );
 }
 
@@ -866,7 +858,6 @@ export function openCodeTab(
       imageDataUrl: options?.imageDataUrl,
     },
     label,
-    null,
   );
 }
 
@@ -913,7 +904,6 @@ export function openBrowserTab(
       sessionId,
     },
     options.label?.trim() || 'Browser',
-    null,
   );
 }
 
@@ -1014,7 +1004,6 @@ export function openTerminalTab(options: {
       sessionId,
     },
     'Terminal',
-    null,
   );
   return terminalTabId;
 }
@@ -1046,7 +1035,6 @@ export function openPluginTab(options: {
       sessionId: normalizeSessionId(options.sessionId),
     },
     options.label.trim() || pluginId,
-    'plugin',
   );
   return tab?.id ?? null;
 }
@@ -1144,7 +1132,6 @@ export function synchronizeBrowserTabs(
         sessionId: normalizedSessionId,
       },
       label,
-      null,
       false,
     );
   }
@@ -1461,7 +1448,6 @@ function ensureWebModelTab(
     id: WEB_MODEL_TAB_ID,
     kind: 'webSession',
     label: '',
-    accentToken: null,
     payload: {
       browserSessionId,
       homeTabId: homeHost.tabId,

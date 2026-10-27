@@ -265,7 +265,6 @@ await withGoldenViteServer(async (server) => {
     id: 'terminal:draft-terminal',
     kind: 'terminal',
     label: 'Terminal',
-    accentToken: null,
     payload: { terminalTabId: 'draft-terminal', workspaceId: 'workspace-draft', sessionId: '' },
     lastActivatedAt: 1,
   }];

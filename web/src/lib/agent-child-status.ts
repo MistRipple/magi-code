@@ -21,7 +21,8 @@ export function agentChildVisualStatus(status: AgentChildStatus | undefined): To
   switch (status) {
     case 'queued': return 'pending';
     case 'completed': return 'success';
-    case 'failed': case 'killed': return 'error';
+    case 'failed': return 'error';
+    case 'killed': return 'cancelled';
     default: return status;
   }
 }

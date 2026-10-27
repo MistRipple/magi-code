@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { constrainPanelWidth } from '../lib/panel-width';
   import SelectField from './SelectField.svelte';
   import type { ContextUsageBreakdown } from '../lib/context-usage-breakdown';
@@ -66,7 +67,8 @@
 
   const view = $derived(resolveRingView(input));
   const tooltip = $derived(buildRingTooltip(input, (key, params) => i18n.t(key, params)));
-  const detailItems = $derived(buildRingDetailItems(input, (key, params) => i18n.t(key, params)));
+  const compactionItems = $derived(buildRingDetailItems(input, (key, params) => i18n.t(key, params))
+    .filter(item => item.key === 'compaction'));
   const breakdownRows = $derived.by(() => {
     const categories = [
       ['messages', 'input.contextRing.category.messages', contextBreakdown?.conversationTokens ?? 0],
@@ -95,6 +97,9 @@
   const popoverId = `context-usage-ring-${Math.random().toString(36).slice(2)}`;
 
   let rootEl = $state<HTMLSpanElement | null>(null);
+  let ringButton = $state<HTMLButtonElement | null>(null);
+  let windowInput = $state<HTMLInputElement | null>(null);
+  let editButton = $state<HTMLButtonElement | null>(null);
   let pinned = $state(false);
   let editing = $state(false);
   let draftWindowValue = $state('');
@@ -113,11 +118,14 @@
     }
     saveError = '';
     editing = true;
+    void tick().then(() => { windowInput?.focus(); windowInput?.select(); });
   }
 
   function cancelEditing() {
+    if (saving) return;
     editing = false;
     saveError = '';
+    void tick().then(() => editButton?.focus());
   }
 
   async function saveContextWindow() {
@@ -134,6 +142,7 @@
     try {
       await onSaveContextWindow(tokens);
       editing = false;
+      void tick().then(() => editButton?.focus());
     } catch (error) {
       console.warn('[ContextUsageRing] 保存模型上下文窗口失败:', error);
       saveError = error instanceof Error && error.message.trim()
@@ -151,10 +160,14 @@
 
   function handleKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (saving) return;
       if (editing) {
         cancelEditing();
       } else {
         pinned = false;
+        ringButton?.focus();
       }
     }
   }
@@ -182,11 +195,13 @@
     class="ia-context-ring tone-{view.tone}"
     class:estimating={measurement === 'estimated'}
     data-testid="context-usage-ring"
+    bind:this={ringButton}
     onclick={toggleDetails}
     onkeydown={handleKeydown}
     title={i18n.t('input.contextRing.label')}
     aria-label={tooltip}
     aria-expanded={pinned}
+    aria-haspopup="dialog"
     aria-controls={popoverId}
   >
     <svg viewBox="0 0 18 18" width="18" height="18" aria-hidden="true">
@@ -214,34 +229,33 @@
     use:constrainPanelWidth={{ align: 'end', active: pinned }}
     class:visible={pinned}
     data-magi-surface="popover"
-    role="tooltip"
+    role="dialog"
+    aria-label={i18n.t('input.contextRing.label')}
+    tabindex="-1"
+    onkeydown={handleKeydown}
   >
     <div class="context-popover-title">
       <span>{i18n.t('input.contextRing.label')}</span>
-      <strong>
-        {#if view.hasData && tokenUsed != null && tokenLimit != null}
-          {formatRingTokens(tokenUsed)} / {formatRingTokens(tokenLimit)} ({view.labelText})
-        {:else}
-          {view.labelText}
-        {/if}
-      </strong>
+      {#if view.hasData}<strong class="context-usage-percent tone-{view.tone}">{view.labelText}</strong>{/if}
     </div>
     {#if view.hasData}
-      {#if hasBreakdown}
-        <div class="context-breakdown-bar" role="img" aria-label={i18n.t('input.contextRing.breakdown')}>
-          {#each breakdownRows as row (row.key)}
-            <span class="context-breakdown-segment category-{row.key}" style={`width:${row.width}%`}></span>
-          {/each}
-        </div>
-      {/if}
-      <div class="context-popover-list">
-        {#each detailItems as item (item.key)}
-          <span>{item.text}</span>
-        {/each}
+      <div class="context-usage-summary">
+        <strong>{formatRingTokens(tokenUsed)}</strong>
+        <span>/ {formatRingTokens(tokenLimit)}</span>
       </div>
+      <div class="context-usage-track tone-{view.tone}" aria-hidden="true">
+        <span style:width={`${view.clampedRatio * 100}%`}></span>
+      </div>
+      <div class="context-usage-remaining">{i18n.t('input.contextRing.remaining', { value: formatRingTokens(remainingTokens) })}</div>
+      {#if measurement === 'estimated'}<p class="context-note">{i18n.t('input.contextRing.estimated')}</p>{/if}
       {#if hasBreakdown}
         <div class="context-breakdown-section">
           <div class="context-breakdown-heading">{i18n.t('input.contextRing.breakdown')}</div>
+          <div class="context-breakdown-bar" role="img" aria-label={i18n.t('input.contextRing.breakdown')}>
+            {#each breakdownRows as row (row.key)}
+              <span class="context-breakdown-segment category-{row.key}" style={`width:${row.width}%`}></span>
+            {/each}
+          </div>
           <div class="context-breakdown-list">
             {#each breakdownRows as row (row.key)}
               <div class="context-breakdown-row">
@@ -253,15 +267,16 @@
             {/each}
           </div>
         </div>
-      {:else}
-        <div class="context-breakdown-empty">{i18n.t('input.contextRing.breakdownUnavailable')}</div>
       {/if}
+      {#each compactionItems as item (item.key)}<p class="context-note">{item.text}</p>{/each}
       {#if responseReserveTokens != null || recoveryBufferTokens != null || proactiveThresholdTokens != null}
         <div class="context-budget-notes">
           <div class="context-breakdown-heading">{i18n.t('input.contextRing.budget')}</div>
-          {#if responseReserveTokens != null}<span>{i18n.t('input.contextRing.outputReserve', { value: formatRingTokens(responseReserveTokens) })}</span>{/if}
-          {#if recoveryBufferTokens != null}<span>{i18n.t('input.contextRing.recoveryBuffer', { value: formatRingTokens(recoveryBufferTokens) })}</span>{/if}
-          {#if proactiveThresholdTokens != null}<span>{i18n.t('input.contextRing.compactionThreshold', { value: formatRingTokens(proactiveThresholdTokens) })}</span>{/if}
+          <dl class="context-budget-list">
+            {#if responseReserveTokens != null}<div><dt>{i18n.t('input.contextRing.outputReserve')}</dt><dd>{formatRingTokens(responseReserveTokens)}</dd></div>{/if}
+            {#if recoveryBufferTokens != null}<div><dt>{i18n.t('input.contextRing.recoveryBuffer')}</dt><dd>{formatRingTokens(recoveryBufferTokens)}</dd></div>{/if}
+            {#if proactiveThresholdTokens != null}<div><dt>{i18n.t('input.contextRing.compactionThreshold')}</dt><dd>{formatRingTokens(proactiveThresholdTokens)}</dd></div>{/if}
+          </dl>
         </div>
       {/if}
     {:else}
@@ -270,8 +285,11 @@
     {#if onSaveContextWindow && model}
       <div class="context-window-editor">
         {#if editing}
+          <label class="context-window-label" for={`${popoverId}-window`}>{i18n.t('input.contextRing.configuredWindow')}</label>
           <div class="context-window-input-row">
             <input
+              id={`${popoverId}-window`}
+              bind:this={windowInput}
               type="number"
               min={draftWindowUnit === 'M' ? 0.016 : 16}
               max={draftWindowUnit === 'M' ? 10 : 10000}
@@ -303,16 +321,16 @@
               onclick={cancelEditing}
             ><Icon name="x" size={13} /></button>
           </div>
-          {#if saveError}<span class="context-window-error">{saveError}</span>{/if}
+          {#if saveError}<span class="context-window-error" role="alert">{saveError}</span>{/if}
         {:else}
-          <button
-            type="button"
-            class="context-window-edit-button"
-            onclick={beginEditing}
-          >
-            <Icon name="edit" size={12} />
-            <span>{i18n.t('input.contextRing.edit')}</span>
-          </button>
+          <div class="context-window-setting">
+            <span>{i18n.t('input.contextRing.configuredWindow')}</span>
+            <strong>{formatRingTokens(configuredTokenLimit ?? tokenLimit)}</strong>
+            <button type="button" class="context-window-icon-button" bind:this={editButton}
+              title={i18n.t('input.contextRing.edit')} aria-label={i18n.t('input.contextRing.edit')} onclick={beginEditing}>
+              <Icon name="edit" size={13} />
+            </button>
+          </div>
         {/if}
       </div>
     {/if}
@@ -387,12 +405,12 @@
     z-index: var(--z-popover);
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    width: min(clamp(240px, 28vw, 360px), var(--panel-available-width, calc(100vw - 24px)));
+    gap: 6px;
+    width: min(300px, var(--panel-available-width, calc(100vw - 24px)));
     box-sizing: border-box;
     max-height: min(70vh, 560px);
     overflow: auto;
-    padding: 10px;
+    padding: 12px;
     border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-md);
     background: var(--background);
@@ -417,21 +435,14 @@
     transform: translateY(0);
   }
 
-  .context-popover-title {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 3px;
-    color: var(--foreground-muted);
-  }
-
-  .context-popover-title strong {
-    color: var(--foreground);
-    font-size: 12px;
-    font-weight: var(--font-semibold);
-    font-variant-numeric: tabular-nums;
-    text-align: left;
-  }
+  .context-popover-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--foreground-muted); }
+  .context-usage-percent { color: var(--primary); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
+  .context-usage-summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px; color: var(--foreground-muted); font-variant-numeric: tabular-nums; }
+  .context-usage-summary strong { color: var(--foreground); font-size: 18px; line-height: 1.25; font-weight: var(--font-semibold); }
+  .context-usage-track { height: 5px; overflow: hidden; border-radius: var(--radius-full); background: var(--surface-3); }
+  .context-usage-track > span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width var(--transition-fast); }
+  .context-usage-remaining { color: var(--foreground-muted); font-variant-numeric: tabular-nums; }
+  .context-note { margin: 0; color: var(--foreground-muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 
   .context-breakdown-bar {
     display: flex;
@@ -460,63 +471,22 @@
     font-weight: var(--font-semibold);
   }
 
-  .context-breakdown-empty {
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-  }
-
   .context-breakdown-list {
     display: flex;
     flex-direction: column;
     gap: 3px;
   }
 
-  .context-breakdown-row {
-    display: grid;
-    grid-template-columns: 9px minmax(0, 1fr) auto;
-    grid-template-rows: auto auto;
-    align-items: center;
-    column-gap: 7px;
-    row-gap: 1px;
-    min-height: 27px;
-  }
-
-  .context-breakdown-swatch {
-    width: 9px;
-    height: 9px;
-    border-radius: 2px;
-    grid-column: 1;
-    grid-row: 1;
-  }
-
-  .context-breakdown-name {
-    grid-column: 2 / 4;
-    grid-row: 1;
-    overflow-wrap: anywhere;
-  }
-
-  .context-breakdown-tokens {
-    grid-column: 2;
-    grid-row: 2;
-    color: var(--foreground-muted);
-    text-align: left;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .context-breakdown-percent {
-    grid-column: 3;
-    grid-row: 2;
-    color: var(--foreground-muted);
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .context-budget-notes {
-    padding-top: 5px;
-    border-top: var(--magi-hairline) solid var(--border);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-  }
+  .context-breakdown-row { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto auto; align-items: baseline; gap: 7px; min-height: 20px; }
+  .context-breakdown-swatch { width: 7px; height: 7px; border-radius: 2px; align-self: center; }
+  .context-breakdown-name { overflow-wrap: anywhere; }
+  .context-breakdown-tokens, .context-breakdown-percent { color: var(--foreground-muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .context-breakdown-percent { min-width: 3ch; }
+  .context-breakdown-section, .context-budget-notes { margin-top: 2px; padding-top: 8px; border-top: var(--magi-hairline) solid var(--border); }
+  .context-budget-list { display: flex; flex-direction: column; gap: 5px; margin: 0; }
+  .context-budget-list > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .context-budget-list dt { color: var(--foreground-muted); overflow-wrap: anywhere; }
+  .context-budget-list dd { margin: 0; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 
   .category-messages { background: #3b82f6; }
   .category-images { background: #22d3ee; }
@@ -529,13 +499,6 @@
   .category-skill-tools { background: #c084fc; }
   .category-other-tools { background: #78716c; }
 
-  .context-popover-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    color: var(--foreground);
-  }
-
   .context-popover-empty {
     color: var(--foreground-muted);
   }
@@ -545,7 +508,6 @@
     border-top: var(--magi-hairline) solid var(--border);
   }
 
-  .context-window-edit-button,
   .context-window-icon-button {
     display: inline-flex;
     align-items: center;
@@ -557,19 +519,13 @@
     cursor: pointer;
   }
 
-  .context-window-edit-button {
-    gap: 5px;
-    padding: 2px 0;
-  }
-
-  .context-window-edit-button:hover,
-  .context-window-icon-button:hover:not(:disabled) {
-    color: var(--foreground);
-  }
+  .context-window-label { display: block; margin-bottom: 6px; color: var(--foreground-muted); }
+  .context-window-setting { display: flex; align-items: center; gap: 8px; color: var(--foreground-muted); }
+  .context-window-setting strong { margin-left: auto; color: var(--foreground); font-weight: var(--font-medium); font-variant-numeric: tabular-nums; }
 
   .context-window-input-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 40px 22px 22px;
+    grid-template-columns: minmax(0, 1fr) 52px 28px 28px;
     align-items: center;
     gap: 4px;
   }
@@ -584,14 +540,16 @@
     font: inherit;
   }
 
+  .context-window-input-row :global(.select-field select) { height: 28px; min-height: 28px; padding: 0 7px; font-size: inherit; }
+
   .context-window-input-row input {
     padding: 0 7px;
     font-variant-numeric: tabular-nums;
   }
 
   .context-window-icon-button {
-    width: 22px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     padding: 0;
     border-radius: var(--radius-sm);
   }
@@ -610,6 +568,11 @@
     margin-top: 5px;
     color: var(--error);
   }
+
+  .context-usage-percent:is(.tone-notice, .tone-warning) { color: var(--warning); }
+  .context-usage-percent.tone-danger { color: var(--error); }
+  .context-usage-track:is(.tone-notice, .tone-warning) > span { background: var(--warning); }
+  .context-usage-track.tone-danger > span { background: var(--error); }
 
   .tone-notice .ring-fill { stroke: var(--warning, #d6a700); }
   .tone-warning .ring-fill { stroke: var(--warning, #e08600); }

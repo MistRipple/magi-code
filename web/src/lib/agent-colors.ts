@@ -55,6 +55,18 @@ function hashString(str: string): number {
   return Math.abs(hash);
 }
 
+/** 子代理运行的识别色：按原 Task 身份固定，重绘、继续与切换展示模式时不变。 */
+export function getAgentRunColor(taskId: string): AgentColorPair {
+  const color = RUN_COLOR_POOL[hashString(taskId) % RUN_COLOR_POOL.length];
+  return { color, muted: `color-mix(in srgb, ${color} 15%, transparent)` };
+}
+
+// 运行身份与角色品牌、红绿终态分别表达，避免一整张卡片看起来处于错误状态。
+const RUN_COLOR_POOL = [
+  '#5b8def', '#a78bfa', '#2ba99b', '#db9c42', '#db7ba9', '#69a9c9',
+  '#8687d9', '#a69557', '#78a47a', '#bd84d6', '#d99170', '#8d9eaf',
+];
+
 /**
  * 获取 agent 的颜色对
  * @param agentId - agent 标识符

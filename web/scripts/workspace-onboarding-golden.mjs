@@ -7,6 +7,25 @@ globalThis.$state = (value) => value;
 await withGoldenViteServer(async (server) => {
   const onboarding = await server.ssrLoadModule('/src/stores/workspace-onboarding.svelte.ts');
   const sessionActivity = await server.ssrLoadModule('/src/lib/session-activity-indicator.ts');
+  const { workspacePathHints } = await server.ssrLoadModule('/src/lib/workspace-display.ts');
+  const workspace = (workspaceId, name, rootPath) => ({ workspaceId, name, rootPath });
+  assert.deepEqual(workspacePathHints([workspace('a', 'magi', '/code/magi')]), {});
+  assert.deepEqual(workspacePathHints([
+    workspace('a', 'workspace', '/tmp/original/workspace'),
+    workspace('b', 'workspace', '/tmp/isolated/workspace'),
+  ]), { a: 'original', b: 'isolated' });
+  assert.deepEqual(workspacePathHints([
+    workspace('a', 'workspace', '/projects/one/shared/workspace/'),
+    workspace('b', 'workspace', '/projects/two/shared/workspace'),
+  ]), { a: 'one/shared', b: 'two/shared' });
+  assert.deepEqual(workspacePathHints([
+    workspace('a', 'repo', 'C:\\dev\\repo'),
+    workspace('b', 'repo', 'D:\\dev\\repo'),
+  ]), { a: 'C:/dev', b: 'D:/dev' });
+  assert.deepEqual(workspacePathHints([
+    workspace('a', 'Project', '/code/frontend'),
+    workspace('b', 'Project', '/code/backend'),
+  ]), { a: 'frontend', b: 'backend' });
 
   assert.equal(onboarding.workspaceOnboardingState.open, false);
   assert.equal(onboarding.workspaceOnboardingState.origin, null);
@@ -157,8 +176,8 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /@media \(max-width: 900px\)[\s\S]*?\.row-action,[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
-  '抽屉和窄屏布局必须常显工作空间新会话按钮',
+  /@media \(hover: none\), \(pointer: coarse\)[\s\S]*?\.row-action,[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
+  '触控设备必须常显工作空间操作，不能仅按窗口宽度把鼠标设备当成触屏',
 );
 assert.match(
   inputAreaSource,

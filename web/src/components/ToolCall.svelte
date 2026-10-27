@@ -20,7 +20,8 @@
   import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import { agentChildVisualStatus, resolveAgentChildStatus } from '../lib/agent-child-status';
-  import { getAgentVisualInfo } from '../lib/agent-colors';
+  import { getAgentBrandInfo, getAgentRunColor } from '../lib/agent-colors';
+  import { agentModelDisplay } from '../lib/agent-model-display';
   import { parseToolIdentity } from '../lib/tool-identity';
   import { parseUserQuestionResult } from '../shared/user-question';
   import { isUserQuestionPending } from '../stores/user-question-store.svelte';
@@ -227,10 +228,9 @@
   const isAgentSpawn = $derived(name === 'agent_spawn');
 
   interface AgentSpawnDisplay {
-    modelLabel: string;
     /** 代理展示名（首选 output.title，回退到 input.display_name） */
     title: string;
-    /** 代理角色（如 executor / explorer / tester），用于角标与色 token */
+    /** 代理角色（如 executor / explorer / tester），用于图标与角色名称 */
     role: string;
     /** 代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
     childTaskId: string | undefined;
@@ -277,14 +277,7 @@
         ? outputStatus
         : undefined;
 
-    const selection = parseToolPayloadRecord(parsedOutput?.model_selection);
-    const model = typeof selection?.model === 'string' ? selection.model : '';
-    const effort = selection?.effective_effort;
-    const effortLabel = typeof effort === 'string' && ['none','minimal','low','medium','high','xhigh','max','ultra'].includes(effort)
-      ? i18n.t(`input.mainModelPicker.reasoning.${effort}`)
-      : i18n.t('input.mainModelPicker.reasoning.providerDefault');
     return {
-      modelLabel: model ? `${model} · ${effortLabel}` : '',
       title: outputTitle || inputTitle || i18n.t('toolCall.agentSpawn.defaultTitle'),
       role: outputRole || inputRole || '',
       childTaskId: outputChildId || undefined,
@@ -300,20 +293,32 @@
   const agentSpawnRoleVisual = $derived.by(() => {
     const role = agentSpawnDisplay?.role;
     if (!role) return null;
-    return getAgentVisualInfo(role, undefined, (key) => i18n.t(key));
+    return getAgentBrandInfo(role, (key) => i18n.t(key));
+  });
+
+  const agentSpawnColor = $derived(getAgentRunColor(agentSpawnDisplay?.childTaskId || id || agentSpawnDisplay?.title || name));
+  const agentSpawnProjection = $derived(isAgentSpawn ? getAgentRunState(
+    filePreviewScope?.sessionId || getCurrentSessionId(),
+    filePreviewScope?.workspaceId ?? messagesState.currentWorkspaceId,
+  ).projection : null);
+  const agentSpawnModel = $derived.by(() => {
+    if (!isAgentSpawn) return agentModelDisplay(null, (key) => i18n.t(key));
+    const receipt = parseToolPayloadRecord(parseToolPayloadRecord(output)?.model_selection);
+    const taskId = agentSpawnDisplay?.childTaskId;
+    const task = agentSpawnProjection?.root_task.task_id === taskId
+      ? agentSpawnProjection?.root_task
+      : agentSpawnProjection?.tasks.find((task) => task.task_id === taskId);
+    return agentModelDisplay(receipt ?? task?.executor_binding?.model_selection, (key) => i18n.t(key));
   });
 
   const agentSpawnVisualStatus = $derived.by((): VisualToolStatus => {
-    const projection = getAgentRunState(
-      filePreviewScope?.sessionId || getCurrentSessionId(),
-      filePreviewScope?.workspaceId ?? messagesState.currentWorkspaceId,
-    ).projection;
     const childStatus = agentChildVisualStatus(resolveAgentChildStatus(
-      projection, agentSpawnDisplay?.childTaskId || '', agentChildStatus, agentChildStatusUpdatedAt,
+      agentSpawnProjection, agentSpawnDisplay?.childTaskId || '', agentChildStatus, agentChildStatusUpdatedAt,
     ));
     if (childStatus) return childStatus;
     if (agentSpawnDisplay?.outcome === 'queued') return 'pending';
-    if (agentSpawnDisplay?.outcome === 'rejected' || agentSpawnDisplay?.outcome === 'failed' || agentSpawnDisplay?.outcome === 'killed') return 'error';
+    if (agentSpawnDisplay?.outcome === 'killed') return 'cancelled';
+    if (agentSpawnDisplay?.outcome === 'rejected' || agentSpawnDisplay?.outcome === 'failed') return 'error';
     if (agentSpawnDisplay?.outcome === 'degraded') return 'degraded';
     if (agentSpawnDisplay?.outcome === 'started') return 'running';
     if (agentSpawnDisplay?.outcome === 'succeeded' || agentSpawnDisplay?.outcome === 'completed') return 'success';
@@ -321,6 +326,17 @@
   });
 
   const agentSpawnStatusInfo = $derived(visualStatusInfo(agentSpawnVisualStatus));
+  const agentSpawnStatusIcon = $derived<IconName>(
+    agentSpawnVisualStatus === 'running' ? 'loader'
+    : agentSpawnVisualStatus === 'pending' ? 'clock'
+    : agentSpawnVisualStatus === 'success' ? 'check-circle'
+    : agentSpawnVisualStatus === 'error' ? 'x-circle'
+    : agentSpawnVisualStatus === 'cancelled' ? 'stop' : 'alert-triangle',
+  );
+  const agentSpawnStatusLabel = $derived(agentSpawnVisualStatus === 'error'
+    ? i18n.t('activeAgentCenter.status.failed')
+    : agentSpawnVisualStatus === 'degraded' ? i18n.t('activeAgentCenter.status.degraded')
+    : toolStatusLabel(agentSpawnVisualStatus));
   const agentSpawnFailed = $derived(agentSpawnVisualStatus === 'error');
   const agentSpawnDegraded = $derived(agentSpawnVisualStatus === 'degraded');
   const agentSpawnCreationFailed = $derived(agentSpawnFailed && !agentSpawnDisplay?.childTaskId);
@@ -363,7 +379,6 @@
     if (!display || !display.childTaskId) return;
     openAgentTab(filePreviewScope?.sessionId || getCurrentSessionId(), display.childTaskId, {
       label: display.title,
-      accentToken: agentSpawnRoleVisual?.color ?? null,
       workspaceId: filePreviewScope?.workspaceId ?? messagesState.currentWorkspaceId,
       workspacePath: filePreviewScope?.workspacePath ?? messagesState.currentWorkspacePath,
     });
@@ -923,7 +938,8 @@
     type="button"
     class="message-card agent-spawn-card status-{agentSpawnStatusInfo.class}"
     class:compact-agent={compactAgent}
-    aria-label={[display.title, toolStatusLabel(agentSpawnVisualStatus), canOpen ? i18n.t('toolCall.agentSpawn.viewDetails') : ''].filter(Boolean).join(', ')}
+    style="--agent-accent: {agentSpawnColor.color};"
+    aria-label={[display.title, agentSpawnModel.label, agentSpawnStatusLabel, canOpen ? i18n.t('toolCall.agentSpawn.viewDetails') : ''].filter(Boolean).join(', ')}
     class:clickable={canOpen}
     disabled={!canOpen}
     onclick={canOpen ? () => openAgentSpawnTab(display) : undefined}
@@ -932,19 +948,24 @@
     data-agent-task-id={display.childTaskId || undefined}
   >
     <span class="agent-spawn-icon">
-      <Icon name={compactAgent ? 'bot' : (agentSpawnRoleVisual?.icon ?? 'bot')} size={compactAgent ? 14 : 16} />
+      <Icon name={agentSpawnRoleVisual?.icon ?? 'bot'} size={14} />
     </span>
     <span class="agent-spawn-body">
       <span class="agent-spawn-title-line">
         <span class="agent-spawn-title" title={display.title}>{display.title}</span>
         {#if agentSpawnRoleVisual && !compactAgent}
-          <span class="agent-spawn-role" style="color: {agentSpawnRoleVisual.color};">
+          <span class="agent-spawn-role">
             {agentSpawnRoleVisual.label}
           </span>
         {/if}
       </span>
-      {#if display.modelLabel}<span class="agent-spawn-model ui-meta" title={display.modelLabel}>{display.modelLabel}</span>{/if}
-      {#if agentSpawnFailed || agentSpawnDegraded}
+      {#if agentSpawnModel.model}
+        <span class="agent-spawn-model" title={agentSpawnModel.label}>
+          <span class="agent-spawn-model-name">{agentSpawnModel.model}</span>
+          {#if agentSpawnModel.effort}<span class="agent-spawn-effort">· {agentSpawnModel.effort}</span>{/if}
+        </span>
+      {/if}
+      {#if agentSpawnCreationFailed || ((agentSpawnFailed || agentSpawnDegraded) && display.error)}
         <span class="agent-spawn-error">
           {agentSpawnDegraded
             ? i18n.t('toolCall.agentSpawn.degraded')
@@ -970,7 +991,11 @@
         {/if}
       {/if}
     </span>
-    <ToolCardMeta status={agentSpawnStatusInfo.class} label={toolStatusLabel(agentSpawnVisualStatus)} expanded={canOpen ? false : undefined} {duration} />
+    <span class="agent-spawn-state" title={agentSpawnDegraded ? i18n.t('toolCall.agentSpawn.degraded') : agentSpawnStatusLabel}>
+      <Icon name={agentSpawnStatusIcon} size={12} class={agentSpawnVisualStatus === 'running' ? 'spinning' : ''} />
+      <span>{agentSpawnStatusLabel}</span>
+    </span>
+    {#if canOpen}<span class="agent-spawn-chevron"><Icon name="chevron-right" size={12} /></span>{/if}
   </button>
 {:else if isFileMutationTool && status === 'success'}
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
@@ -1435,44 +1460,43 @@
     border-top: 1px dashed var(--border);
   }
 
-  /* 详细模式沿用工具卡片；摘要模式在同一组件内收敛为任务行。 */
+  /* 识别色属于 Task；状态仍独立使用语义色。两种模式复用同一入口。 */
   .agent-spawn-card {
     width: 100%;
+    box-sizing: border-box;
     appearance: none;
     font: inherit;
     text-align: left;
     display: flex;
     align-items: center;
-    gap: var(--space-3);
-    padding: 12px var(--tool-card-padding);
+    gap: 8px;
+    padding: 8px 10px 8px 12px;
     margin-top: var(--space-2);
-    color: inherit;
+    color: var(--foreground);
+    border: 0;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--agent-accent) 5%, var(--magi-surface-main));
+    box-shadow: none;
     transition: background-color var(--transition-fast);
   }
 
-  .agent-spawn-card:disabled {
-    opacity: 1;
+  .agent-spawn-card::before {
+    content: '';
+    position: absolute;
+    inset: 7px auto 7px 0;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--agent-accent);
   }
 
-  .agent-spawn-card.clickable {
-    cursor: pointer;
-  }
-
-  .agent-spawn-card:focus-visible { outline:0; box-shadow:inset 0 0 0 1.5px var(--primary); }
-
-  .status-degraded .agent-spawn-error { color:var(--warning); }
-
-  .agent-spawn-card.clickable:hover {
-    background: var(--surface-hover);
-  }
+  .agent-spawn-card:disabled { opacity: 1; }
+  .agent-spawn-card.clickable { cursor: pointer; }
+  .agent-spawn-card:focus-visible { outline: 0; box-shadow: inset 0 0 0 1.5px var(--primary); }
+  .agent-spawn-card.clickable:hover { background: color-mix(in srgb, var(--agent-accent) 10%, var(--magi-surface-main)); }
 
   .agent-spawn-icon {
     display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    color: var(--foreground-muted);
+    color: color-mix(in srgb, var(--agent-accent) 75%, var(--foreground));
     flex-shrink: 0;
   }
 
@@ -1484,80 +1508,62 @@
     min-width: 0;
   }
 
-  .agent-spawn-model { color: var(--foreground-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  .agent-spawn-title-line {
+  .agent-spawn-model {
     display: flex;
-    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--space-2);
-    min-width: 0;
+    gap: 4px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+    white-space: nowrap;
   }
+  .agent-spawn-model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .agent-spawn-effort { flex-shrink: 0; }
 
+  .agent-spawn-title-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
   .agent-spawn-title {
     font-size: var(--text-sm);
     font-weight: var(--font-medium);
-    color: var(--foreground);
     line-height: 1.45;
-    white-space: normal;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
   }
 
-  .agent-spawn-role {
+  .agent-spawn-role { flex-shrink: 0; color: var(--foreground-muted); font-size: var(--text-xs); }
+  .agent-spawn-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     flex-shrink: 0;
-    max-width: 100%;
+    color: var(--foreground-muted);
     font-size: var(--text-xs);
-    line-height: 1.4;
-    white-space: normal;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
   }
+  .status-running .agent-spawn-state { color: var(--info); }
+  .status-error .agent-spawn-state { color: var(--error); }
+  .status-degraded .agent-spawn-state,
+  .status-pending .agent-spawn-state { color: var(--warning); }
+  .agent-spawn-chevron { display: flex; color: var(--foreground-muted); flex-shrink: 0; }
 
-  .agent-spawn-error {
-    font-size: var(--text-xs);
-    color: var(--error);
-    white-space: normal;
-    overflow-wrap: anywhere;
-    min-width: 0;
-  }
-
+  .agent-spawn-error { color: var(--error); }
+  .status-degraded .agent-spawn-error { color: var(--warning); }
+  .agent-spawn-error,
   .agent-spawn-diagnostic,
   .agent-spawn-instruction {
     font-size: var(--text-xs);
     line-height: 1.45;
-    color: var(--foreground-muted);
-    /* 卡片本身是 button（全局 nowrap）；失败说明要在卡片内换行。 */
     white-space: normal;
     overflow-wrap: anywhere;
+    min-width: 0;
   }
+  .agent-spawn-diagnostic { color: var(--foreground-muted); }
+  .agent-spawn-instruction { color: var(--foreground-secondary); }
 
-  .agent-spawn-instruction {
-    color: var(--foreground-secondary);
-  }
-
-  .agent-spawn-card.compact-agent {
-    gap: var(--space-2);
-    margin-top: 0;
-    padding: 8px var(--tool-card-padding);
-    box-shadow: none;
-    border: 0;
-    border-radius: 0;
-    background: transparent;
-  }
-
-  .compact-agent .agent-spawn-title {
-    white-space: nowrap;
-  }
-
-  @media (max-width: 480px) {
-    .agent-spawn-card:not(.compact-agent) .agent-spawn-title-line {
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 2px;
-    }
-  }
+  .agent-spawn-card.compact-agent { margin-top: 4px; padding-block: 6px; }
+  @container (max-width: 360px) { .agent-spawn-role { display: none; } }
+  @media (prefers-reduced-motion: reduce) { .agent-spawn-card { transition: none; } }
 
   .uq-summary {
     display: flex;

@@ -5,6 +5,7 @@
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
   import { recentSessionList } from '../lib/recent-sessions';
+  import { workspacePathHints } from '../lib/workspace-display';
   import { beginPanelResize } from '../lib/panel-resize';
   import { imeEnterGuard } from '../lib/ime-enter-guard';
   import ToastContainer from '../components/ToastContainer.svelte';
@@ -183,6 +184,7 @@ import {
   let agentRecovering = $state(false);
   let agentBaseUrl = $state('');
   let workspaces = $state<AgentWorkspaceSummary[]>([]);
+  const workspaceHints = $derived(workspacePathHints(workspaces));
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
@@ -3155,6 +3157,7 @@ import {
   <aside
     bind:this={sidebarElement}
     class="sidebar"
+    data-magi-surface={sidebarIsDrawer ? 'window' : undefined}
     class:workbench-view--away={shellUi.settingsOpen}
     inert={shellUi.settingsOpen}
     class:sidebar--open={sidebarIsDrawer && sidebarOpen}
@@ -3285,7 +3288,7 @@ import {
           <div class="workspace-tree">
             {#each workspaces as workspace (workspace.workspaceId)}
               <div class="workspace-node">
-                <div class="workspace-row">
+                <div class="workspace-row" class:active={workspace.workspaceId === selectedWorkspaceId}>
                   <button
                     type="button"
                     class="workspace-header-btn"
@@ -3295,6 +3298,7 @@ import {
                     }}
                     class:active={workspace.workspaceId === selectedWorkspaceId}
                     aria-expanded={!!expandedWorkspaceIds[workspace.workspaceId]}
+                    aria-current={workspace.workspaceId === selectedWorkspaceId ? 'true' : undefined}
                     data-workspace-id={workspace.workspaceId}
                     title={workspace.rootPath}
                     onclick={() => toggleWorkspaceExpansion(workspace)}
@@ -3307,7 +3311,10 @@ import {
                       <Icon name="chevronDown" size={10} />
                     </span>
                     <Icon name="folder" size={12} class="workspace-folder-icon" />
-                    <span class="workspace-name">{workspace.name}</span>
+                    <span class="workspace-label">
+                      <span class="workspace-name">{workspace.name}</span>
+                      {#if workspaceHints[workspace.workspaceId]}<span class="workspace-path">{workspaceHints[workspace.workspaceId]}</span>{/if}
+                    </span>
                     {#if externalAwaitingCount(workspace.workspaceId) > 0}
                       <span class="workspace-attention" data-testid="workspace-external-attention" title={i18n.t('externalSession.awaitingShort', { count: externalAwaitingCount(workspace.workspaceId) })} aria-hidden="true"></span>
                     {/if}
@@ -3315,6 +3322,7 @@ import {
                   <button
                     type="button"
                     class="btn-icon btn-icon--sm row-action"
+                    data-workspace-action="new"
                     data-tooltip={i18n.t('web.newWorkspaceSessionTitle')}
                     title={i18n.t('web.newWorkspaceSessionTitle')}
                     aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
@@ -3329,6 +3337,7 @@ import {
                   <button
                     type="button"
                     class="btn-icon btn-icon--sm btn-icon--danger row-action"
+                    data-workspace-action="remove"
                     title={i18n.t('web.removeWorkspaceTitle')}
                     aria-label={i18n.t('web.removeWorkspaceAria', { name: workspace.name })}
                     onclick={(event) => {
@@ -4366,6 +4375,7 @@ import {
   }
 
   .workspace-row {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 2px;
@@ -4377,11 +4387,25 @@ import {
     background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
   }
 
+  .workspace-row.active {
+    background: var(--surface-hover);
+  }
+
   /* 行内操作：默认隐藏，仅悬停该行或该按钮获得键盘可见焦点时出现。
      不用 focus-within：鼠标点击后行会保留焦点，操作不能因此持续显示。 */
   .row-action {
+    position: absolute;
+    right: 4px;
+    width: 24px;
+    height: 24px;
     opacity: 0;
     pointer-events: none;
+  }
+
+  .row-action[data-workspace-action="new"] { right: 30px; }
+
+  .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn {
+    padding-right: 60px;
   }
 
   .workspace-row:hover .row-action,
@@ -4392,10 +4416,6 @@ import {
 
   .workspace-row:hover .row-action:disabled {
     opacity: 0.35;
-  }
-
-  .workspace-row .row-action:last-child {
-    margin-right: 4px;
   }
 
   /* 分区标题行右侧的工具组：平时收敛，悬停标题行或聚焦其中按钮时出现。 */
@@ -4482,7 +4502,9 @@ import {
     gap: 6px;
     flex: 1;
     min-width: 0;
-    padding: 4px 6px;
+    min-height: 32px;
+    padding: 6px 8px;
+    border-radius: inherit;
     border: none;
     background: transparent;
     color: var(--foreground-muted);
@@ -4525,12 +4547,14 @@ import {
   }
 
   .workspace-name {
-    flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  .workspace-label { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+  .workspace-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: var(--text-xs); font-weight: var(--font-normal); }
 
   .workspace-attention {
     flex: 0 0 auto;
@@ -5111,7 +5135,6 @@ import {
     z-index: var(--z-overlay-preview);
     border-radius: var(--radius-lg);
     border: var(--magi-hairline) solid var(--border);
-    background: var(--background);
     box-shadow: var(--shadow-lg);
   }
 
@@ -5177,7 +5200,6 @@ import {
         calc(var(--space-4) + env(safe-area-inset-top))
         var(--space-4)
         calc(var(--space-4) + env(safe-area-inset-bottom));
-      background: var(--vscode-sideBar-secondaryBackground, var(--background));
       contain: layout paint style;
     }
 
@@ -5189,32 +5211,9 @@ import {
       gap: var(--space-2);
     }
 
-    /* 触控设备没有悬停：行内操作与标题工具常驻，目标放大。 */
-    .row-action,
-    .section-title-tools {
-      opacity: 1;
-      pointer-events: auto;
-    }
-
-    .row-action:disabled {
-      opacity: 0.35;
-    }
-
-    .row-action,
-    .section-title-tools :global(.btn-icon),
-    .sidebar-header-tools :global(.btn-icon) {
-      width: 36px;
-      height: 36px;
-    }
-
     .sidebar-nav-item {
       height: 40px;
       font-size: var(--text-base);
-    }
-
-    .workspace-tree {
-      padding-right: 0;
-      gap: var(--space-3);
     }
 
     /* 抽屉本身已有不透明底；头部、分区、选中项只叠透明色，不再各带一块底色。 */
@@ -5222,7 +5221,6 @@ import {
       background: color-mix(in srgb, var(--info) 10%, transparent);
     }
 
-    .workspace-header-btn,
     .session-item {
       padding: 8px 10px;
       font-size: var(--text-base);
@@ -5253,10 +5251,22 @@ import {
       gap: var(--space-2);
     }
 
-    .workspace-header-btn,
     .session-item {
       padding: 8px 10px;
     }
+  }
+
+  /* 触控能力决定操作是否常驻，窄桌面窗口仍使用紧凑鼠标布局。 */
+  @media (hover: none), (pointer: coarse) {
+    .row-action,
+    .section-title-tools { opacity: 1; pointer-events: auto; }
+    .row-action { position: static; flex-shrink: 0; }
+    .row-action:disabled { opacity: 0.35; }
+    .row-action,
+    .section-title-tools :global(.btn-icon),
+    .sidebar-header-tools :global(.btn-icon) { width: 36px; height: 36px; }
+    .workspace-header-btn { min-height: 40px; }
+    .workspace-row:is(:hover, :has(.row-action:focus-visible)) .workspace-header-btn { padding-right: 8px; }
   }
 
   :global(html.magi-web-drawer-open),

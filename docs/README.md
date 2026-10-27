@@ -56,6 +56,8 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 ## 目标与代理运行设计
 
+- [项目与多源文件夹改造任务计划](project-multi-root-task-plan.md)：独立后续任务；规划项目下统一会话、多本机目录、权限、Git/隔离、迁移与验收。当前仅完成规划，尚未实施。
+
 - [子代理唤起设计与改造](subagent-delegation-design.md)：默认主线执行、四种委派目的、派发前决策合同、唯一预检和验收边界。
 - [运行时改造收敛审计](runtime-consolidation-audit.md)：当前变更范围、移除项、冻结项和继续修改门槛。
 

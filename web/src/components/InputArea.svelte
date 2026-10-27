@@ -3712,6 +3712,7 @@
                       onclick={() => selectAccessProfile(option.value)}
                       role="option"
                       aria-selected={selectedAccessProfile === option.value}
+                      title={i18n.t(option.descriptionKey)}
                     >
                       <span class="ia-access-option-icon"><Icon name={option.icon} size={14} /></span>
                       <span class="ia-access-option-copy">
@@ -4811,9 +4812,8 @@
 
   .ia-picker-popover.ia-access-popover {
     box-sizing: border-box;
-    width: min(248px, calc(100vw - 20px));
-    min-width: min(224px, calc(100vw - 20px));
-    max-width: 248px;
+    width: min(288px, calc(100vw - 20px));
+    min-width: 0;
     padding: 5px;
   }
   .ia-access-popover .ia-picker-list {
@@ -4881,7 +4881,9 @@
   .ia-access-option .ia-picker-item-desc {
     font-size: var(--text-xs);
     line-height: 1.25;
-    overflow-wrap: break-word;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .ia-access-recommended {
     flex: 0 0 auto;
@@ -5372,7 +5374,7 @@
       right: 10px;
       bottom: calc(44px + env(safe-area-inset-bottom));
       left: auto;
-      width: min(248px, calc(100vw - 20px));
+      width: min(288px, calc(100vw - 20px));
       min-width: 0;
     }
 

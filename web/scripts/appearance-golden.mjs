@@ -83,6 +83,10 @@ assert.doesNotMatch(settingsAppearance, /window\.confirm/, '主题删除必须�
 assert.match(globalCss, /\.btn-icon[\s\S]*?\.btn[\s\S]*?\.form-input[\s\S]*?\.form-textarea[\s\S]*?\.ui-segmented[\s\S]*?\.control-range[\s\S]*?\.inline-alert/, '基础控件必须由全局 primitives 统一定义');
 assert.match(settingsAppearance, /btn btn--primary[\s\S]*?form-input[\s\S]*?control-color[\s\S]*?control-range/, '主题页必须复用全局按钮、表单、颜色和范围控件');
 assert.match(globalCss, /\[data-magi-surface\][\s\S]*?var\(--magi-wallpaper-image\)[\s\S]*?background-attachment: scroll, fixed/, '独立窗口必须通过全局材质 primitive 复用同一视口背景');
+assert.match(globalCss, /\[data-magi-surface\]\s*\{[^}]*background-color: var\(--magi-canvas\) !important;/, '覆盖材质必须有不透明主题底层，不能让后方正文穿透');
+assert.match(workbenchShell, /<aside\s[^>]*class="sidebar"[^>]*data-magi-surface=\{sidebarIsDrawer \? 'window' : undefined\}/, '侧栏只在抽屉覆盖模式使用独立浮层材质');
+const rightPane = await readFile(new URL('../src/web/RightPane.svelte', import.meta.url), 'utf8');
+assert.match(rightPane, /<aside class="right-pane" data-magi-surface=\{overlay \? 'window' : undefined\}/, '右栏只在覆盖模式隔离后方内容，并排时保留三栏材质');
 assert.match(modal, /data-magi-surface="window"/, '通用 Modal 必须接入统一窗口材质');
 assert.match(
   settingsPanel,
@@ -158,10 +162,10 @@ const project = new Function(ts.transpileModule(`
     body: { classList },
   };
   ${projectionSource}
-  return (targetMode, scheme, wallpaper = '') => {
+  return (targetMode, scheme, wallpaper = '', material = 'clear') => {
     mode = targetMode;
     variables.clear();
-    applyRootTheme({ id: 'test', material: 'clear' }, scheme, wallpaper);
+    applyRootTheme({ id: 'test', material }, scheme, wallpaper);
     return Object.fromEntries(variables);
   };
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText)();
@@ -185,4 +189,12 @@ assert.equal(custom['--primary'], '#40B090', 'custom accents stay authoritative'
 assert.ok(custom['--magi-surface-main'].endsWith('0.980)'));
 assert.ok(custom['--magi-surface-sidebar'].endsWith('0.980)'));
 assert.ok(custom['--magi-surface-composer'].endsWith('0.980)'));
+for (const material of ['clear', 'translucent', 'immersive']) {
+  for (const mode of ['light', 'dark']) {
+    const projection = project(mode, { background: '#102030', foreground: '#E0E8F0', accent: '#40B090', contrast: 70 }, 'blob:test', material);
+    assert.equal(projection['--magi-canvas'], '#102030', `${mode}/${material} 覆盖材质的底色必须始终不透明`);
+    assert.match(projection['--magi-wallpaper-image'], /blob:test/, '不透明隔离不能丢弃用户壁纸');
+    assert.ok(projection['--magi-window-overlay'].startsWith('rgba('), '主题材质仍以本层壁纸为背景合成');
+  }
+}
 console.log('appearance surface projection scenarios passed');
