@@ -254,6 +254,7 @@ mod tests {
 
     fn params() -> LlmMessageParams {
         LlmMessageParams {
+            reasoning_capability: None,
             messages: vec![LlmMessage {
                 role: "assistant".to_string(),
                 content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolUse {

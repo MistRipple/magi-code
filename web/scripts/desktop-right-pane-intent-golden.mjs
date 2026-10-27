@@ -38,7 +38,7 @@ assert.match(
   /\(authoritySnapshot\) => \{[\s\S]*?if \(!sameDesktopPanelTarget\(currentDesktopPanelTarget\(\), request\)\) return;[\s\S]*?revealTabId: browser\.tabId/u,
   '旧 Authority 回调不得用 revealTabId 覆盖更新的 Tab 意图',
 );
-assert.match(shell, /openWorkspaceHtmlInRightPaneBrowser\(\{/u);
+assert.match(shell, /openHtmlFileInRightPaneBrowser\(\{/u);
 assert.match(
   shell,
   /window\.addEventListener\(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser as EventListener\)/u,

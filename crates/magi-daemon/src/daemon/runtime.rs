@@ -2033,30 +2033,9 @@ impl DaemonRuntime {
         // runner manager 的旧快照，把合法的 queued Turn 错误收口为失败。
         let completion_state = state.clone();
         completion_notifier.set_observer(move |notification| {
-            let Some(session_id) = notification.session_id.as_ref() else {
-                return;
-            };
-            if matches!(
-                notification.status,
-                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
-            ) {
-                completion_state.release_finished_task_resources(session_id, &notification.task_id);
-            }
-            let Some(turn_id) = notification.turn_id.as_deref() else {
-                return;
-            };
-            let runner_status = match notification.status {
-                TaskStatus::Completed => "completed",
-                TaskStatus::Failed => "failed",
-                TaskStatus::Killed => "killed",
-                _ => return,
-            };
-            magi_api::task_turn_finalize::schedule_background_session_task_turn_finalize(
-                completion_state.clone(),
-                session_id.clone(),
-                notification.root_task_id.clone(),
-                runner_status,
-                turn_id.to_string(),
+            magi_api::task_turn_finalize::handle_task_completion_notification(
+                &completion_state,
+                notification,
             );
         });
 

@@ -183,7 +183,7 @@
 
   const hideUserCommandContent = $derived(isUser && isWebModelSetupCommand(message.metadata));
   const userCommandLabel = $derived(hideUserCommandContent
-    ? i18n.t(`webModel.setup.userAction.${['start', 'continue', 'confirm_connector', 'cancel'].includes(message.content?.trim()) ? message.content.trim() : 'start'}`)
+    ? i18n.t(`webModel.setup.userAction.${['start', 'continue', 'retry_tunnel', 'confirm_connector', 'cancel'].includes(message.content?.trim()) ? message.content.trim() : 'start'}`)
     : resolveUserMessageCommandLabel(message.metadata));
 
   function resolveBlockRenderKey(
@@ -746,8 +746,6 @@
   .user-command-text {
     display: block;
     margin-bottom: 2px;
-    color: var(--primary);
-    font-weight: calc(var(--font-semibold) + 50);
   }
 
   /* 用户内容跟随主题前景色，代码仅增加一层轻微的中性底色。 */
@@ -765,23 +763,23 @@
     text-decoration: underline;
   }
 
-  /* 时间与操作按钮浮在气泡正下方：脱离文档流，悬停时不占位，不推动下面的消息。
-     容器保持透明，让底层对话材质连续；仅操作按钮在交互时显示局部反馈。 */
+  /* 操作行始终在文档流内占位，悬停只改变可见性，不覆盖下一条消息或推动内容。 */
   .user-time {
-    position: absolute;
-    right: var(--space-4);
-    top: calc(100% - var(--space-3) + 2px);
-    z-index: 2;
-    height: 22px;
+    align-self: stretch;
+    flex: 0 0 auto;
+    min-height: 22px;
+    margin-top: 2px;
     padding: 0 6px;
     border-radius: var(--radius-sm);
     background: transparent;
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: flex-end;
     gap: 10px;
+    row-gap: var(--space-2);
     opacity: 0;
     visibility: hidden;
     pointer-events: none;
@@ -805,6 +803,15 @@
     pointer-events: auto;
     transform: translateY(0);
     transition-delay: 0s;
+  }
+
+  @media (hover: none) {
+    .user-time {
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
+      transform: none;
+    }
   }
 
   .user-actions {
@@ -848,16 +855,15 @@
       magi-feedback-fade 160ms 2340ms ease-out forwards;
   }
 
-  .execution-steps-message { min-width:0; padding-inline:var(--space-4); }
-  :global(.conversation-turn) .execution-steps-message { padding-inline:0; }
+  .execution-steps-message { min-width:0; }
 
   /* ===== 助手消息基础样式：默认纯正文，不带卡片壳 ===== */
   .message-item.assistant {
     position: relative;
     display: flex;
     flex-direction: column;
-    /* 左右内边距对称，与用户气泡、输入框共用消息列的同一条居中轴 */
-    padding: 0 var(--space-4);
+    /* The message list owns the outer gutter for text, tools and standalone runtime rows. */
+    padding: 0;
     flex-shrink: 0;
     height: auto;
     overflow: visible;
@@ -880,7 +886,7 @@
   }
 
   /* 主角色连续消息紧凑间距（orchestrator 在主对话区，代理在右侧 tab 中） */
-  .message-item.assistant.plain-shell:not(.inline-guest) {
+  :global(.message-item.assistant) + .message-item.assistant.plain-shell:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
   }
 

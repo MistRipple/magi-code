@@ -121,6 +121,7 @@ pub struct GitWorktree {
 #[serde(rename_all = "camelCase")]
 pub struct SessionCodeContext {
     pub session_id: String,
+    /// 既有持久合同：空值表示个人会话，按 session + 仓库根区分基线。
     pub workspace_id: String,
     pub execution_root: PathBuf,
     #[serde(default)]
@@ -198,7 +199,13 @@ impl SessionCodeContext {
 /// 进程内权威 session → code context 注册表；持久化由宿主负责。
 #[derive(Clone, Default)]
 pub struct SessionCodeContextRegistry {
-    contexts: Arc<RwLock<HashMap<String, SessionCodeContext>>>,
+    contexts: Arc<RwLock<HashMap<SessionContextKey, SessionCodeContext>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SessionContextKey {
+    Project(String),
+    Repository { session_id: String, root: PathBuf },
 }
 
 impl SessionCodeContextRegistry {
@@ -206,8 +213,28 @@ impl SessionCodeContextRegistry {
         self.contexts
             .read()
             .expect("session code context read lock poisoned")
-            .get(session_id)
+            .get(&SessionContextKey::Project(session_id.to_string()))
             .cloned()
+    }
+
+    /// 个人会话按实际仓库分别保存 Git 基线，不改变会话默认 cwd 或项目归属。
+    pub fn get_repository(&self, session_id: &str, root: &Path) -> Option<SessionCodeContext> {
+        self.contexts
+            .read()
+            .expect("context lock")
+            .get(&Self::context_key(session_id, "", root))
+            .cloned()
+    }
+
+    fn context_key(session_id: &str, workspace_id: &str, root: &Path) -> SessionContextKey {
+        if workspace_id.is_empty() {
+            SessionContextKey::Repository {
+                session_id: session_id.to_string(),
+                root: canonical_or_original(root),
+            }
+        } else {
+            SessionContextKey::Project(session_id.to_string())
+        }
     }
 
     pub fn all(&self) -> Vec<SessionCodeContext> {
@@ -218,7 +245,11 @@ impl SessionCodeContextRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        contexts.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        contexts.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.execution_root.cmp(&right.execution_root))
+        });
         contexts
     }
 
@@ -245,16 +276,26 @@ impl SessionCodeContextRegistry {
                     .retain(|root| !same_path(root, &path));
                 released += 1;
             }
-            target.insert(context.session_id.clone(), context);
+            target.insert(
+                Self::context_key(
+                    &context.session_id,
+                    &context.workspace_id,
+                    &context.execution_root,
+                ),
+                context,
+            );
         }
         released
     }
 
     pub fn remove(&self, session_id: &str) -> Option<SessionCodeContext> {
-        self.contexts
+        let mut contexts = self
+            .contexts
             .write()
-            .expect("session code context write lock poisoned")
-            .remove(session_id)
+            .expect("session code context write lock poisoned");
+        let main = contexts.remove(&SessionContextKey::Project(session_id.to_string()));
+        contexts.retain(|_, context| context.session_id != session_id);
+        main
     }
 
     /// 只刷新观测值，不接受外部 branch/HEAD 变化为新的期望基线。
@@ -324,7 +365,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -355,7 +396,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -388,7 +429,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -419,7 +460,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -450,7 +491,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -487,7 +528,7 @@ impl SessionCodeContextRegistry {
             .write()
             .expect("session code context write lock poisoned");
         let context = contexts
-            .get_mut(session_id)
+            .get_mut(&SessionContextKey::Project(session_id.to_string()))
             .ok_or_else(|| SessionContextError::Missing {
                 session_id: session_id.to_string(),
             })?;
@@ -539,30 +580,33 @@ impl SessionCodeContextRegistry {
             .contexts
             .write()
             .expect("session code context write lock poisoned");
-        let context =
-            contexts
-                .entry(session_id.to_string())
-                .or_insert_with(|| SessionCodeContext {
-                    session_id: session_id.to_string(),
-                    workspace_id: workspace_id.to_string(),
-                    execution_root: observation.worktree_path.clone(),
-                    runtime_workspace_roots: runtime_workspace_roots.clone(),
-                    context_revision: 0,
-                    git: SessionGitContext {
-                        repository_root: observation.repository_root.clone(),
-                        git_common_dir: observation.git_common_dir.clone(),
-                        worktree_path: observation.worktree_path.clone(),
-                        worktree_git_dir: observation.worktree_git_dir.clone(),
-                        desired_ref: observation.branch.clone(),
-                        base_head: observation.head.clone(),
-                        observed_branch: observation.branch.clone(),
-                        observed_head: observation.head.clone(),
-                        upstream: observation.upstream.clone(),
-                        dirty: observation.dirty.clone(),
-                        lease_generation: 0,
-                    },
-                    agent_worktrees: Vec::new(),
-                });
+        let context = contexts
+            .entry(Self::context_key(
+                session_id,
+                workspace_id,
+                &observation.worktree_path,
+            ))
+            .or_insert_with(|| SessionCodeContext {
+                session_id: session_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                execution_root: observation.worktree_path.clone(),
+                runtime_workspace_roots: runtime_workspace_roots.clone(),
+                context_revision: 0,
+                git: SessionGitContext {
+                    repository_root: observation.repository_root.clone(),
+                    git_common_dir: observation.git_common_dir.clone(),
+                    worktree_path: observation.worktree_path.clone(),
+                    worktree_git_dir: observation.worktree_git_dir.clone(),
+                    desired_ref: observation.branch.clone(),
+                    base_head: observation.head.clone(),
+                    observed_branch: observation.branch.clone(),
+                    observed_head: observation.head.clone(),
+                    upstream: observation.upstream.clone(),
+                    dirty: observation.dirty.clone(),
+                    lease_generation: 0,
+                },
+                agent_worktrees: Vec::new(),
+            });
         let old_observed_branch = context.git.observed_branch.clone();
         let old_observed_head = context.git.observed_head.clone();
         let old_worktree = context.git.worktree_path.clone();

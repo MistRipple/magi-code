@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { withGoldenViteServer } from './golden-vite.mjs';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
 const statusSource = fs.readFileSync(path.resolve('src/components/DesktopUpdateStatus.svelte'), 'utf8');
@@ -366,4 +367,4 @@ await withGoldenViteServer(async (server) => {
   }
 
   console.log('desktop updater golden replay passed');
-});
+}, { plugins: [svelte()] });

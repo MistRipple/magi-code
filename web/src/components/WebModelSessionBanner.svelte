@@ -1,10 +1,11 @@
 <script lang="ts">
   /**
    * GPT Web 会话状态条：网页对话已失效、已保存对话冲突 / 失效、被其他会话占用、标题未同步、
-   * 项目工具不可用。所有结论来自 daemon 的事实（见 `resolveWebSessionBanner`），这里只负责
+   * 工具通道不可用。所有结论来自 daemon 的事实（见 `resolveWebSessionBanner`），这里只负责
    * 轮询占用者、展示与派发显式动作。
    */
   import { onMount } from 'svelte';
+  import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { dispatchWebModelAction } from '../web/web-model-actions';
   import { refreshWebModelRuntime } from '../web/web-model-session-projection';
@@ -19,7 +20,6 @@
     turnActive: boolean;
     toolsAvailable: boolean | null;
     toolsDetail?: string;
-    workspaceRequired: boolean;
     /** 发送必然被 daemon 拒绝时为 true，父组件据此禁用发送。 */
     blocksSend?: boolean;
     infoStatus?: WebSessionBanner | null;
@@ -34,7 +34,6 @@
     turnActive,
     toolsAvailable,
     toolsDetail,
-    workspaceRequired,
     blocksSend = $bindable(false),
     infoStatus = $bindable(null),
     onOwnershipLost,
@@ -83,7 +82,6 @@
     runtimeFresh,
     toolsAvailable,
     toolsDetail,
-    workspaceRequired,
   }));
 
   $effect(() => {
@@ -104,9 +102,14 @@
     data-web-model-banner={banner.id}
     role="status"
   >
-    <span class="wm-banner-text">{i18n.t(banner.textKey, banner.params)}</span>
+    <div class="wm-banner-copy">
+      <span class="wm-banner-icon" aria-hidden="true">
+        <Icon name={banner.tone === 'warning' ? 'warning' : 'info'} size={14} />
+      </span>
+      <span class="wm-banner-text">{i18n.t(banner.textKey, banner.params)}</span>
+    </div>
     {#if banner.action}
-      <button type="button" class="wm-banner-action" onclick={runAction}>
+      <button type="button" class="btn btn--sm btn--ghost wm-banner-action" onclick={runAction}>
         {i18n.t(banner.action.labelKey)}
       </button>
     {/if}
@@ -116,35 +119,56 @@
 <style>
   .wm-banner {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    margin: 0 0 6px;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 4px 12px;
+    margin: 0 0 8px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-1);
     font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+    color: var(--foreground);
+    min-width: 0;
   }
 
   .wm-banner.warning {
-    color: var(--foreground);
-    background: var(--warning-soft, rgba(220, 150, 40, 0.16));
+    border-color: color-mix(in srgb, var(--warning) 25%, var(--border));
+    background: color-mix(in srgb, var(--warning) 6%, transparent);
+  }
+
+  .wm-banner-copy {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex: 1 1 360px;
+    min-width: 0;
+    padding-block: 3px;
+  }
+
+  .wm-banner-icon {
+    display: inline-flex;
+    flex: 0 0 14px;
+    margin-top: 2px;
+  }
+
+  .wm-banner.warning .wm-banner-icon {
+    color: var(--warning);
   }
 
   .wm-banner-text {
     min-width: 0;
     line-height: 1.5;
+    overflow-wrap: anywhere;
   }
 
   .wm-banner-action {
-    flex: none;
-    padding: 2px 10px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.3));
-    border-radius: var(--radius-sm);
-    font-size: var(--text-xs);
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
+    flex: 0 1 auto;
+    max-width: 100%;
+    height: auto;
+    min-height: 24px;
+    margin-left: 22px;
+    color: var(--primary);
+    white-space: normal;
   }
 </style>

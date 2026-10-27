@@ -1587,6 +1587,7 @@ mod tests {
         let request = OpenAiResponsesAdapter
             .build_request(
                 &LlmMessageParams {
+                    reasoning_capability: None,
                     messages: vec![
                         LlmMessage {
                             role: "assistant".to_string(),

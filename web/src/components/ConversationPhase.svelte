@@ -222,16 +222,6 @@
     min-width: 0;
   }
 
-  /* 完整渲染的过程正文与紧凑行对齐：去掉助手消息自带的横向内边距。 */
-  .turn-process-entry :global(.message-item.assistant) {
-    padding-inline: 0;
-  }
-
-  @keyframes conversation-phase-pulse {
-    50% {
-      opacity: 0.35;
-    }
-  }
 
   @media (max-width: 560px) {
     .conversation-phase-header {

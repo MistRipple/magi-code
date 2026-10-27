@@ -1,11 +1,10 @@
-export type OrchestratorReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type OrchestratorReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
-export const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: OrchestratorReasoningEffort = 'medium';
 
 export function normalizeOrchestratorReasoningEffort(
   value: unknown,
 ): OrchestratorReasoningEffort | null {
-  return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh'
+  return value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max' || value === 'ultra'
     ? value
     : null;
 }
@@ -13,10 +12,12 @@ export function normalizeOrchestratorReasoningEffort(
 export function resolveOrchestratorReasoningEffort(
   sessionConfig: Record<string, unknown> | null | undefined,
   effectiveConfig: Record<string, unknown> | null | undefined,
-): OrchestratorReasoningEffort {
+): OrchestratorReasoningEffort | null {
+  if (sessionConfig && Object.hasOwn(sessionConfig, 'reasoningEffort') && sessionConfig.reasoningEffort === null) return null;
+  if (!sessionConfig?.reasoningEffort && effectiveConfig && Object.hasOwn(effectiveConfig, 'reasoningEffort') && effectiveConfig.reasoningEffort === null) return null;
   return normalizeOrchestratorReasoningEffort(sessionConfig?.reasoningEffort)
     ?? normalizeOrchestratorReasoningEffort(effectiveConfig?.reasoningEffort)
-    ?? DEFAULT_ORCHESTRATOR_REASONING_EFFORT;
+    ?? null;
 }
 
 export function resolveOrchestratorModel(
@@ -37,7 +38,7 @@ export function resolveOrchestratorModel(
 
 export function withOrchestratorReasoningEffort(
   currentConfig: Record<string, unknown>,
-  reasoningEffort: OrchestratorReasoningEffort,
+  reasoningEffort: OrchestratorReasoningEffort | null,
   patch: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {

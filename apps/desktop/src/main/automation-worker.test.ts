@@ -8,7 +8,7 @@ import {
 } from "@magi/desktop-browser-contracts";
 import type { UtilityProcess } from "electron";
 import type { BrowserSurfaceManager } from "./browser-surface-manager.js";
-import { AutomationWorker } from "./automation-worker.js";
+import { AutomationWorker, workerTimeout } from "./automation-worker.js";
 import { BrowserSideEffectStartedError } from "./browser-side-effect.js";
 
 const binding: BrowserSurfaceBinding = {
@@ -22,6 +22,19 @@ const binding: BrowserSurfaceBinding = {
   browser_context_id: "partition-test",
   navigation_revision: 1,
 };
+
+test("GPT Web 配置命令的等待时间覆盖 Worker 的完整操作窗口", () => {
+  const control = { mode: "agent", lease_id: "lease", fence: 1 } as const;
+  assert.equal(workerTimeout({
+    type: "web_configure_connector",
+    payload: { tab_id: binding.tab_id, control, name: "Magi", tunnel_id: "tunnel-test" },
+  }), 100_000);
+  assert.equal(workerTimeout({
+    type: "web_platform_setup",
+    payload: { tab_id: binding.tab_id, control, action: "prepare_runtime_key" },
+  }), 100_000);
+  assert.equal(workerTimeout({ type: "ping" }), 30_000);
+});
 
 class FakeUtilityProcess extends EventEmitter {
   readonly messages: MainToWorkerMessage[] = [];

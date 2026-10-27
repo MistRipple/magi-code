@@ -820,8 +820,9 @@ export function openCodeTab(
   if (!trimmedFilepath) {
     return;
   }
-  const workspaceId = normalizeWorkspaceId(options?.workspaceId)
-    || rightPaneState.activeWorkspaceId;
+  const workspaceId = Object.prototype.hasOwnProperty.call(options ?? {}, 'workspaceId')
+    ? normalizeWorkspaceId(options?.workspaceId)
+    : rightPaneState.activeWorkspaceId;
   const requestedSession = Object.prototype.hasOwnProperty.call(options ?? {}, 'sessionId')
     ? normalizeSessionId(options?.sessionId)
     : normalizeSessionId(sessionId);

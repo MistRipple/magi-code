@@ -92,7 +92,7 @@ worktree，也就不需要这把租约。机制、触发条件和合并语义见
 
 ## 3. 结构化能力
 
-所有请求只接受已注册 workspace。携带 `sessionId` 时还校验 session/workspace 归属。
+项目管理 HTTP 请求只接受已注册 workspace。携带 `sessionId` 时还校验 session/workspace 归属。模型工具另外支持无项目会话的仓库资源：使用 `repositoryPath` 选择工作树根目录，省略时检查本会话默认目录；不会注册项目或继承项目记忆。执行端复用同一 GitService、仓库租约、CAS 与持久化注册表，具体作用域见 [无项目会话架构](personal-session-architecture.md)。
 
 | 能力 | 调用入口 | 关键约束 |
 |---|---|---|

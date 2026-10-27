@@ -35,9 +35,34 @@ pub struct ModelUsageBinding {
     binding_revision: u32,
     role: UsageSourceRole,
     phase: UsagePhase,
+    model_config: Option<LlmConfig>,
 }
 
 impl ModelUsageBinding {
+    pub(crate) fn with_task_model(
+        mut self,
+        task: &magi_core::Task,
+        settings: Option<&Arc<SettingsStore>>,
+    ) -> Result<Self, String> {
+        if let Some(selection) = task
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.model_selection.as_ref())
+        {
+            self.engine_id = selection
+                .engine_id
+                .clone()
+                .unwrap_or_else(|| "orchestrator".into());
+            self.binding_revision = selection.binding_revision;
+            self.model_config = crate::model_config::frozen_agent_model_config(
+                settings.ok_or("缺少子代理模型连接")?,
+                selection,
+            )?
+            .to_usage_llm_config();
+        }
+        Ok(self)
+    }
+
     pub fn tracks_active_context(&self) -> bool {
         self.role == UsageSourceRole::Orchestrator
     }
@@ -170,6 +195,7 @@ pub struct AuxiliaryModelUsageContext<'a> {
 
 pub fn auxiliary_model_usage_binding(phase: UsagePhase) -> ModelUsageBinding {
     ModelUsageBinding {
+        model_config: None,
         template_id: "auxiliary".to_string(),
         engine_id: "auxiliary".to_string(),
         binding_revision: 0,
@@ -180,6 +206,7 @@ pub fn auxiliary_model_usage_binding(phase: UsagePhase) -> ModelUsageBinding {
 
 pub fn image_generation_model_usage_binding() -> ModelUsageBinding {
     ModelUsageBinding {
+        model_config: None,
         template_id: "imageGeneration".to_string(),
         engine_id: "imageGeneration".to_string(),
         binding_revision: 0,
@@ -190,6 +217,7 @@ pub fn image_generation_model_usage_binding() -> ModelUsageBinding {
 
 pub fn vision_model_usage_binding() -> ModelUsageBinding {
     ModelUsageBinding {
+        model_config: None,
         template_id: "vision".to_string(),
         engine_id: "vision".to_string(),
         binding_revision: 0,
@@ -255,6 +283,7 @@ pub fn invoke_auxiliary_model_with_usage(
 
 pub fn session_turn_model_usage_binding(use_tools: bool) -> ModelUsageBinding {
     ModelUsageBinding {
+        model_config: None,
         template_id: "orchestrator".to_string(),
         engine_id: "orchestrator".to_string(),
         binding_revision: 0,
@@ -270,6 +299,7 @@ pub fn session_turn_model_usage_binding(use_tools: bool) -> ModelUsageBinding {
 pub fn model_usage_binding_for_worker(worker: &WorkerInfo, is_primary: bool) -> ModelUsageBinding {
     if is_primary {
         return ModelUsageBinding {
+            model_config: None,
             template_id: "orchestrator".to_string(),
             engine_id: "orchestrator".to_string(),
             binding_revision: 0,
@@ -278,6 +308,7 @@ pub fn model_usage_binding_for_worker(worker: &WorkerInfo, is_primary: bool) -> 
         };
     }
     ModelUsageBinding {
+        model_config: None,
         template_id: worker.role.clone(),
         engine_id: worker.worker_id.to_string(),
         binding_revision: 0,
@@ -669,6 +700,9 @@ fn usage_model_config_for_binding(
     binding: &ModelUsageBinding,
     session_id: &SessionId,
 ) -> Option<LlmConfig> {
+    if let Some(config) = binding.model_config.as_ref() {
+        return Some(config.clone());
+    }
     let store = settings_store?;
     match binding.role {
         UsageSourceRole::Worker => {
@@ -681,8 +715,8 @@ fn usage_model_config_for_binding(
             if let Some(config) = workers
                 .get(&binding.engine_id)
                 .or_else(|| workers.get(&binding.template_id))
-                .and_then(
-                    |value| match NormalizedModelConfig::from_settings_value(value) {
+                .and_then(|value| {
+                    match NormalizedModelConfig::from_settings_with_catalog(store, value) {
                         Ok(config) => Some(config),
                         Err(error) => {
                             tracing::warn!(
@@ -693,8 +727,8 @@ fn usage_model_config_for_binding(
                             );
                             None
                         }
-                    },
-                )
+                    }
+                })
                 .and_then(|config| config.to_usage_llm_config())
             {
                 return Some(config);
@@ -702,7 +736,7 @@ fn usage_model_config_for_binding(
         }
         UsageSourceRole::Auxiliary => {
             let config = store.get_section("auxiliary");
-            match NormalizedModelConfig::from_settings_value(&config) {
+            match NormalizedModelConfig::from_settings_with_catalog(store, &config) {
                 Ok(config) => {
                     if let Some(config) = config.to_usage_llm_config() {
                         return Some(config);
@@ -716,7 +750,7 @@ fn usage_model_config_for_binding(
         }
         UsageSourceRole::ImageGeneration => {
             let config = store.get_section("imageGeneration");
-            match NormalizedModelConfig::from_settings_value(&config) {
+            match NormalizedModelConfig::from_settings_with_catalog(store, &config) {
                 Ok(config) => return config.to_usage_llm_config(),
                 Err(error) => {
                     tracing::warn!(error = %error, "图片模型配置无效，跳过用量身份归因");
@@ -726,7 +760,7 @@ fn usage_model_config_for_binding(
         }
         UsageSourceRole::Vision => {
             let config = store.get_section(crate::model_config::VISION_MODEL_SECTION);
-            match NormalizedModelConfig::from_settings_value(&config) {
+            match NormalizedModelConfig::from_settings_with_catalog(store, &config) {
                 Ok(config) => return config.to_usage_llm_config(),
                 Err(error) => {
                     tracing::warn!(error = %error, "vision 模型配置无效，跳过用量身份归因");
@@ -1034,7 +1068,7 @@ mod tests {
                 &session_id,
                 "orchestrator",
                 json!({
-                    "model": "gpt-session-test",
+                    "model": "gpt-5.6-sol",
                     "reasoningEffort": "high"
                 }),
             )
@@ -1076,7 +1110,7 @@ mod tests {
         assert_eq!(usage_event.payload["workspaceId"], json!("workspace-1"));
         assert_eq!(
             usage_event.payload["modelConfig"]["model"],
-            json!("gpt-session-test")
+            json!("gpt-5.6-sol")
         );
         assert_eq!(
             usage_event.payload["modelConfig"]["reasoningEffort"],
@@ -1094,7 +1128,7 @@ mod tests {
         assert_eq!(context_event.payload["projected_request_tokens"], json!(3));
         assert_eq!(
             context_event.payload["resolved_model"],
-            json!("gpt-session-test")
+            json!("gpt-5.6-sol")
         );
     }
 

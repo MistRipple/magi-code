@@ -49,11 +49,19 @@ export function formatTraceableTime(
 /**
  * 格式化持续时间
  */
-export function formatDuration(ms: number): string {
-  const totalSeconds = ms <= 0 ? 0 : Math.floor(ms / 1000);
+type TimeTranslator = (key: string, vars?: Record<string, string | number>) => string;
+
+export function formatDuration(ms: number, translate?: TimeTranslator): string {
+  const totalSeconds = !Number.isFinite(ms) || ms <= 0 ? 0 : Math.floor(ms / 1000);
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
+
+  if (translate) {
+    if (ms > 0 && ms < 1000) return translate('time.duration.lessThanSecond');
+    const key = hours > 0 ? 'hoursMinutesSeconds' : minutes > 0 ? 'minutesSeconds' : 'seconds';
+    return translate(`time.duration.${key}`, { hours, minutes, seconds });
+  }
 
   if (hours > 0) {
     return `${hours}h${String(minutes).padStart(2, '0')}m${seconds}s`;
@@ -62,6 +70,20 @@ export function formatDuration(ms: number): string {
     return `${minutes}m${seconds}s`;
   }
   return `${seconds}s`;
+}
+
+/** 完成回执始终显示完整本地日期，格式由界面语言决定。 */
+export function formatCompletedTime(timestamp: number, translate: TimeTranslator): string {
+  if (!Number.isFinite(timestamp)) return '--';
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return '--';
+  const pad2 = (value: number) => String(value).padStart(2, '0');
+  return translate('time.completedAt', {
+    year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate(),
+    hour: date.getHours(), minute: date.getMinutes(),
+    month2: pad2(date.getMonth() + 1), day2: pad2(date.getDate()),
+    hour2: pad2(date.getHours()), minute2: pad2(date.getMinutes()),
+  });
 }
 
 /**

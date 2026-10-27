@@ -146,7 +146,7 @@ impl TunnelManager {
         candidate.is_some_and(|candidate| constant_time_eq(expected, candidate))
     }
 
-    pub async fn site_preview_token(&self, workspace_id: &str) -> String {
+    pub async fn site_preview_token(&self, scope_key: &str) -> String {
         let inner = self.inner.lock().await;
         derive_site_preview_token(
             inner
@@ -154,16 +154,12 @@ impl TunnelManager {
                 .token
                 .as_deref()
                 .unwrap_or(&inner.site_preview_secret),
-            workspace_id,
+            scope_key,
         )
     }
 
-    pub async fn authorize_site_preview_request(
-        &self,
-        workspace_id: &str,
-        candidate: &str,
-    ) -> bool {
-        let expected = self.site_preview_token(workspace_id).await;
+    pub async fn authorize_site_preview_request(&self, scope_key: &str, candidate: &str) -> bool {
+        let expected = self.site_preview_token(scope_key).await;
         constant_time_eq(&expected, candidate)
     }
 
@@ -581,12 +577,12 @@ fn generate_token() -> Result<String, getrandom::Error> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn derive_site_preview_token(secret: &str, workspace_id: &str) -> String {
+fn derive_site_preview_token(secret: &str, scope_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"magi-site-preview:v1\0");
     hasher.update(secret.as_bytes());
     hasher.update(b"\0");
-    hasher.update(workspace_id.as_bytes());
+    hasher.update(scope_key.as_bytes());
     magi_core::hex_lower(hasher.finalize())
 }
 

@@ -410,7 +410,7 @@
       case 'unavailable':
         return i18n.t('settings.tools.dependency.status.unavailable');
       default:
-        return i18n.t('settings.tools.dependency.status.checking');
+        return i18n.t('settings.status.checking');
     }
   }
 
@@ -874,7 +874,7 @@
           <div class="tools-fixed-panel tools-fixed-panel--mcp">
             {#if mcpServersLoading && !mcpServersHydrated}
               <div class="settings-empty">
-                <Icon name="loader" size={16} />
+                <Icon name="loader" size={16} class="spinning" />
                 <div><div class="settings-empty-title">{i18n.t('settings.tools.loading')}</div>{i18n.t('settings.tools.mcpLoadingHint')}</div>
               </div>
             {:else if mcpServers.length === 0}

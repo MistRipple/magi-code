@@ -288,6 +288,8 @@ pub struct LlmMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmMessageParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_capability: Option<crate::reasoning::ReasoningCapability>,
     pub messages: Vec<LlmMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,

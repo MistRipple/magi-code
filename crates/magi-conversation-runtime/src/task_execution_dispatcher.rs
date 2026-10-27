@@ -121,7 +121,7 @@ pub(crate) fn tool_requires_execution_resources(
     tool_requires_workspace_execution_preparation(name, arguments)
         || (is_sidechain
             && BuiltinToolName::from_name(name)
-                .is_some_and(|tool| tool.requires_workspace_context()))
+                .is_some_and(|tool| tool.requires_execution_directory()))
 }
 
 /// 模型请求在目录分配前生成，绝对路径不能静默继续指向旧工作区。
@@ -674,7 +674,7 @@ fn build_client_from_section(
     section: &str,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     let config = settings_store.get_section(section);
-    let normalized = NormalizedModelConfig::from_settings_value(&config)
+    let normalized = NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
         .map_err(|error| format!("{section} 模型配置无效：{error}"))?;
     Ok(normalized
         .to_http_model_client()
@@ -798,7 +798,16 @@ impl LlmTaskDispatcher {
         {
             return Ok(());
         }
-        let root = self.resolve_workspace_root_path(session_id, workspace_id);
+        let root = self
+            .execution_registry
+            .get(task_id)
+            .and_then(|plan| match plan {
+                crate::task_execution_registry::TaskExecutionPlan::Dispatch {
+                    execution_root,
+                    ..
+                } => execution_root,
+            })
+            .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id));
         self.prepare_task_workspace_execution(
             &task,
             &lease.lease_id,
@@ -1915,6 +1924,10 @@ impl LlmTaskDispatcher {
         if !is_sidechain {
             return Ok(main_root);
         }
+        // 个人会话没有项目 Git 注册表；子代理和显式转交沿原执行计划继承目录。
+        if workspace_id.is_none() && main_root.is_some() {
+            return Ok(main_root);
+        }
         let context = self
             .session_code_contexts
             .as_ref()
@@ -2797,6 +2810,17 @@ impl LlmTaskDispatcher {
         execution_role_id: Option<&str>,
         session_id: Option<&SessionId>,
     ) -> Result<Arc<dyn ModelBridgeClient>, String> {
+        if let Some(selection) = task
+            .and_then(|task| task.executor_binding.as_ref())
+            .and_then(|binding| binding.model_selection.as_ref())
+        {
+            let store = settings_store.ok_or_else(|| "恢复子代理缺少模型连接配置".to_string())?;
+            let config = crate::model_config::frozen_agent_model_config(store, selection)?;
+            return config
+                .to_http_model_client()
+                .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+                .ok_or_else(|| "子代理原模型连接不可用".to_string());
+        }
         let role_id = execution_role_id
             .map(str::trim)
             .filter(|role| !role.is_empty())
@@ -3408,7 +3432,11 @@ impl LlmTaskDispatcher {
                         worker,
                         is_primary,
                         self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
-                    ),
+                    )
+                    .with_task_model(
+                        task,
+                        self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
+                    )?,
                     is_sidechain: !is_primary,
                     worker_id,
                     worker_role: worker.role.clone(),
@@ -6263,7 +6291,44 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_surface_hides_workspace_tools_without_workspace() {
+    fn personal_transferred_agent_keeps_execution_root_without_git_context_registry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("retained.txt"), "original output").unwrap();
+        let session = SessionId::new("personal-agent-root");
+        let mut task = task_with_role("executor", TaskTier::ExecutionChain);
+        task.executor_binding.as_mut().unwrap().agent_run_transfer =
+            Some(magi_core::AgentRunTransfer {
+                operation_id: "personal-transfer".into(),
+                session_id: session.clone(),
+                source_turn_id: "original-turn".into(),
+                transferred_by: task.root_task_id.clone(),
+                activation_generation: 1,
+                owner: magi_core::AgentRunOwner::Session,
+                transferred_at: UtcMillis::now(),
+            });
+        let mut dispatcher = dispatcher_with_default_tool_surface();
+        dispatcher.session_code_contexts = None;
+        let inherited = dispatcher
+            .resolve_task_execution_root(
+                &task,
+                &LeaseId::new("personal-resumed-lease"),
+                &session,
+                &None,
+                Some(&root.path().to_path_buf()),
+                true,
+                Some(&WorkerId::new("personal-worker")),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited, root.path());
+        assert_eq!(
+            std::fs::read_to_string(inherited.join("retained.txt")).unwrap(),
+            "original output"
+        );
+    }
+
+    #[test]
+    fn task_tool_surface_separates_project_tools_from_personal_execution() {
         let dispatcher = dispatcher_with_ready_browser_tool_surface();
         let task = task_with_role("executor", TaskTier::ExecutionChain);
         let names = dispatcher
@@ -6272,7 +6337,12 @@ mod tests {
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
 
-        for hidden in ["file_read", "shell_exec", "git_status", "search_text"] {
+        for hidden in [
+            "memory_write",
+            "knowledge_query",
+            "search_semantic",
+            "code_symbols",
+        ] {
             assert!(
                 !names.iter().any(|name| name == hidden),
                 "无 workspace 的任务工具目录不能暴露 {hidden}: {names:?}"
@@ -6282,6 +6352,74 @@ mod tests {
             names.iter().any(|name| name == "browser_navigate"),
             "无 workspace 的任务工具目录必须保留浏览器工具: {names:?}"
         );
+        for local in [
+            "file_read",
+            "file_write",
+            "shell_exec",
+            "search_text",
+            "view_image",
+        ] {
+            assert!(
+                names.iter().any(|name| name == local),
+                "个人会话需要通用工具 {local}"
+            );
+        }
+    }
+
+    #[test]
+    fn personal_session_catalog_checks_every_builtin_for_mainline_and_worker() {
+        let dispatcher = dispatcher_with_ready_browser_tool_surface();
+        let root = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let mut worker = root.clone();
+        worker.parent_task_id = Some(root.task_id.clone());
+        worker.task_id = TaskId::new("personal-catalog-worker");
+        for (task, is_worker) in [(&root, false), (&worker, true)] {
+            let names = dispatcher
+                .build_tool_definitions(task, None, AccessProfile::FullAccess, None)
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<std::collections::HashSet<_>>();
+            for tool in BuiltinToolName::ALL {
+                let expected = match tool.as_str() {
+                    "search_semantic"
+                    | "knowledge_query"
+                    | "knowledge_graph_query"
+                    | "code_symbols"
+                    | "memory_write"
+                    | "agent_apply"
+                    | "process_launch"
+                    | "process_read"
+                    | "process_write"
+                    | "process_kill"
+                    | "process_list" => false,
+                    "context_search" | "context_read" | "context_request" => is_worker,
+                    "agent_spawn"
+                    | "agent_send"
+                    | "agent_cancel"
+                    | "agent_wait"
+                    | "get_goal"
+                    | "create_goal"
+                    | "update_goal"
+                    | "update_plan"
+                    | "git_branch_create"
+                    | "git_branch_switch"
+                    | "git_pull"
+                    | "git_push"
+                    | "git_merge_preview"
+                    | "git_merge"
+                    | "git_branch_delete"
+                    | "git_worktree_create"
+                    | "git_worktree_remove" => !is_worker,
+                    _ => true,
+                };
+                assert_eq!(
+                    names.contains(tool.as_str()),
+                    expected,
+                    "personal worker={is_worker}: {}",
+                    tool.as_str()
+                );
+            }
+        }
     }
 
     #[test]
@@ -7118,8 +7256,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_orchestrator_session_override_null_effort_restores_medium_default() {
-        // reasoningEffort 显式为 null 时恢复产品默认值，运行期不允许出现空强度。
+    fn merge_orchestrator_session_override_null_effort_restores_provider_default() {
+        // null 保留服务商默认语义，与显式 none 档位不同。
         let mut base = serde_json::json!({
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-orch",
@@ -7133,13 +7271,13 @@ mod tests {
         assert_eq!(
             base.get("reasoningEffort")
                 .and_then(serde_json::Value::as_str),
-            Some("medium"),
-            "null 覆盖必须恢复中等 reasoningEffort"
+            None,
+            "null 覆盖保留模型默认值"
         );
     }
 
     #[test]
-    fn resolve_orchestrator_model_config_defaults_reasoning_effort_to_medium() {
+    fn unknown_model_does_not_claim_a_default_reasoning_effort() {
         use magi_settings_store::SettingsStore;
 
         let store = SettingsStore::new();
@@ -7168,7 +7306,7 @@ mod tests {
             config
                 .to_usage_llm_config()
                 .and_then(|config| config.reasoning_effort),
-            Some(magi_usage_authority::ReasoningEffort::Medium),
+            None,
         );
     }
 
@@ -7209,7 +7347,7 @@ mod tests {
             config
                 .to_usage_llm_config()
                 .and_then(|config| config.reasoning_effort),
-            Some(magi_usage_authority::ReasoningEffort::High),
+            None,
         );
     }
 
@@ -7370,6 +7508,168 @@ mod tests {
         assert!(
             !prompt.contains("如果命中以下危险模式，必须先向用户确认"),
             "提示不能再把所有 SafetyGate 动作统一描述为审批"
+        );
+    }
+
+    #[test]
+    fn agent_model_selection_freezes_binding_capability_and_usage_without_credentials() {
+        use crate::model_config::{agent_target_model_config, frozen_agent_model_config};
+        use magi_core::ReasoningEffort::{High, Low, Max, Ultra};
+        let store = Arc::new(SettingsStore::new());
+        let session = SessionId::new("reasoning-selection");
+        let connection = serde_json::json!({"baseUrl":"https://example.test/v1", "apiKey":"private-key", "apiProtocol":"openai_chat"});
+        store
+            .set_section("orchestrator", connection.clone())
+            .unwrap();
+        store
+            .set_session_section(
+                &session,
+                "orchestrator",
+                serde_json::json!({"model":"gpt-5.6-sol", "reasoningEffort":"high"}),
+            )
+            .unwrap();
+        let parent = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let (inherited, engine, revision) =
+            agent_target_model_config(&store, &parent, "executor", &session).unwrap();
+        let inherited_selection = inherited
+            .freeze_agent_selection(engine, revision, Some(Low))
+            .unwrap();
+        assert_eq!(inherited_selection.effective_effort, Some(Low));
+        assert_eq!(
+            inherited
+                .freeze_agent_selection(None, 0, None)
+                .unwrap()
+                .effective_effort,
+            Some(High)
+        );
+        assert!(
+            inherited
+                .freeze_agent_selection(None, 0, Some(Ultra))
+                .is_err()
+        );
+        let mut bound = connection.clone();
+        bound["model"] = serde_json::json!("o3-mini");
+        bound["reasoningEffort"] = serde_json::json!("low");
+        store
+            .set_section("engines", serde_json::json!([{"id":"bound", "llm":bound}]))
+            .unwrap();
+        store.set_section("agents", serde_json::json!([{"templateId":"executor", "engineId":"bound", "bindingRevision":7}])).unwrap();
+        let (config, engine, revision) =
+            agent_target_model_config(&store, &parent, "executor", &session).unwrap();
+        assert!(
+            config
+                .freeze_agent_selection(engine.clone(), revision, Some(Max))
+                .is_err()
+        );
+        let selection = config
+            .freeze_agent_selection(engine, revision, Some(High))
+            .unwrap();
+        assert_eq!(selection.binding_revision, 7);
+        assert_eq!(selection.effective_effort, Some(High));
+        let encoded = serde_json::to_string(&selection).unwrap();
+        assert!(!encoded.contains("private-key"));
+        let mut child = task_with_role("executor", TaskTier::ExecutionChain);
+        child.executor_binding.as_mut().unwrap().model_selection =
+            Some(serde_json::from_str(&encoded).unwrap());
+        let child: Task = serde_json::from_str(&serde_json::to_string(&child).unwrap()).unwrap();
+        // 模拟排队期间修改角色绑定、引擎模型与强度；原任务恢复仍使用原模型与能力。
+        store.set_section("agents", serde_json::json!([])).unwrap();
+        let mut edited = bound.clone();
+        edited["model"] = serde_json::json!("unknown-alias");
+        edited["reasoningEffort"] = serde_json::Value::Null;
+        store
+            .set_section("engines", serde_json::json!([{"id":"bound", "llm":edited}]))
+            .unwrap();
+        let restored = frozen_agent_model_config(&store, &selection).unwrap();
+        assert_eq!(restored.require_model().unwrap(), "o3-mini");
+        assert_eq!(restored.reasoning_effort_label(), Some("high"));
+        assert_eq!(
+            restored.reasoning_capability("o3-mini"),
+            selection.capability
+        );
+        assert!(
+            dispatcher_with_default_tool_surface()
+                .resolve_model_client_for_task(
+                    Some(&store),
+                    Some(&child),
+                    Some("executor"),
+                    Some(&session)
+                )
+                .is_ok()
+        );
+        let usage = crate::usage_recording::session_turn_model_usage_binding(true)
+            .with_task_model(&child, Some(&store))
+            .unwrap();
+        let event_bus = InMemoryEventBus::new(8);
+        let sessions = SessionStore::new();
+        crate::usage_recording::publish_model_usage_record(
+            &event_bus,
+            &sessions,
+            Some(&store),
+            crate::usage_recording::ModelUsageRecordInput {
+                session_id: &session,
+                workspace_id: &None,
+                binding: &usage,
+                call_id: "selection-usage".into(),
+                usage: Some(&serde_json::json!({"prompt_tokens":3,"completion_tokens":7})),
+                context_breakdown: None,
+                status: magi_usage_authority::UsageCallStatus::Success,
+                assignment_id: Some(child.task_id.to_string()),
+                error_code: None,
+            },
+        );
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .unwrap();
+        assert_eq!(event.payload["modelConfig"]["model"], "o3-mini");
+        assert_eq!(event.payload["modelConfig"]["reasoningEffort"], "high");
+        assert_eq!(event.payload["executionBinding"]["bindingRevision"], 7);
+        let (nested, _, _) =
+            agent_target_model_config(&store, &child, "reviewer", &session).unwrap();
+        assert_eq!(nested.require_model().unwrap(), "o3-mini");
+        assert_eq!(
+            nested
+                .freeze_agent_selection(selection.engine_id.clone(), 7, Some(Low))
+                .unwrap()
+                .effective_effort,
+            Some(Low)
+        );
+        let mut replaced = bound;
+        replaced["apiKey"] = serde_json::json!("different-account");
+        store
+            .set_section(
+                "engines",
+                serde_json::json!([{"id":"bound", "llm":replaced}]),
+            )
+            .unwrap();
+        assert!(frozen_agent_model_config(&store, &selection).is_err());
+        store.set_section("engines", serde_json::json!([])).unwrap();
+        assert!(frozen_agent_model_config(&store, &selection).is_err());
+    }
+
+    #[test]
+    fn agent_model_unknown_capability_does_not_accept_explicit_effort() {
+        use magi_core::ReasoningEffort::High;
+        let config = NormalizedModelConfig::from_settings_value(&serde_json::json!({"baseUrl":"https://example.test", "apiProtocol":"openai_chat", "model":"opaque-alias", "reasoningEffort":"high"})).unwrap();
+        assert!(config.freeze_agent_selection(None, 0, Some(High)).is_err());
+        assert_eq!(
+            config
+                .freeze_agent_selection(None, 0, None)
+                .unwrap()
+                .effective_effort,
+            None
+        );
+        let config = config.with_model("gpt-4o");
+        assert!(config.freeze_agent_selection(None, 0, Some(High)).is_err());
+        assert_eq!(
+            config
+                .freeze_agent_selection(None, 0, None)
+                .unwrap()
+                .effective_effort,
+            None
         );
     }
 

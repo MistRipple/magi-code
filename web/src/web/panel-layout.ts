@@ -67,13 +67,14 @@ export function resolvePanelLayout(input: PanelLayoutInput): PanelLayoutResoluti
     + PANEL_LAYOUT.minContentWidth
     + PANEL_LAYOUT.previewHandleWidth
     + previewPanelWidth;
-  // Desktop 的右栏不能在中栏不足时切成 overlay。三栏无法同时容纳时，
+  // Desktop 的右栏不能在中栏不足时切成 overlay。当前可见轨道无法同时容纳时，
   // 只将左栏收为可重新打开的抽屉，让中栏和右栏继续留在同一个父级
   // Grid 中；右栏始终是内容轨道，不会覆盖对话区。
   const sidebarDrawer = input.desktopSurface
-    ? rightPaneOpen
-      && sidebarPreferredVisible
-      && viewportWidth < desktopThreePaneWidth
+    ? sidebarPreferredVisible
+      && viewportWidth < (rightPaneOpen
+        ? desktopThreePaneWidth
+        : sidebarWidth + shellGap + PANEL_LAYOUT.minContentWidth)
     : viewportWidth <= PANEL_LAYOUT.mobileBreakpoint;
   const contentFrameWidth = Math.max(
     0,

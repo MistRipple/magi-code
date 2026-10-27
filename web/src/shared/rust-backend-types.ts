@@ -1161,7 +1161,17 @@ export interface PickerWebEngineDto {
   probedAt?: number;
 }
 
+export interface ModelReasoningCapability {
+  supportedEfforts: import('./orchestrator-session-config').OrchestratorReasoningEffort[];
+  defaultEffort: import('./orchestrator-session-config').OrchestratorReasoningEffort | null;
+  transport: 'openai' | 'anthropic_effort' | 'anthropic_budget';
+  source: 'provider' | 'builtin' | 'unknown';
+}
+
 export interface FetchModelsResponseDto {
+  /** 服务商提供的展示名；保存和执行始终使用 models 中的原始请求 id。 */
+  modelDisplayNames?: Record<string, string>;
+  modelCapabilities?: Record<string, ModelReasoningCapability>;
   success: boolean;
   target: string;
   models: string[];
@@ -1213,7 +1223,7 @@ export interface ExecutionStatsModelDto {
   declaredModelSpec: string;
   resolvedModel: string;
   baseUrlFingerprint: string;
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
+  reasoningEffort?: import('./orchestrator-session-config').OrchestratorReasoningEffort | null;
   totals: ExecutionStatsTotalsDto;
 }
 
@@ -1418,8 +1428,8 @@ export interface FileContentResponseDto {
   content: string;
   filePath?: string | null;
   sessionId?: string | null;
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
   executionGroupId?: string | null;
 }
 
@@ -1513,7 +1523,19 @@ export type TaskStatus =
   | 'failed'
   | 'killed';
 
+export interface AgentModelSelectionDto {
+  engine_id: string | null;
+  binding_revision: number;
+  connection_key: string;
+  model: string;
+  context_window_tokens: number | null;
+  capability: ModelReasoningCapability;
+  requested_effort: ModelReasoningCapability['defaultEffort'];
+  effective_effort: ModelReasoningCapability['defaultEffort'];
+}
+
 export interface ExecutorBindingDto {
+  model_selection?: AgentModelSelectionDto | null;
   target_role: string;
   active_skill_id?: string | null;
   capability_requirements: string[];

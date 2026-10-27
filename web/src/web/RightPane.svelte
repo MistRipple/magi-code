@@ -61,7 +61,7 @@
   import { loadBrowserAuthoritySession } from './browser-authority-coordinator';
   import {
     openUrlInRightPaneBrowser,
-    openWorkspaceHtmlInRightPaneBrowser,
+    openHtmlFileInRightPaneBrowser,
   } from './right-pane-browser';
   import { WEB_MODEL_HOME_TAB_ID, WEB_MODEL_PLUGIN_ID, WEB_MODEL_SURFACE_ID, isWebModelBrowserSession } from '../shared/web-model';
   import { markWebModelStoppedByUser, webModelActiveTurnCount } from '../stores/web-model-runtime.svelte';
@@ -396,9 +396,6 @@
         requestWebModelSettings({ focus: 'status' });
         return;
       }
-      case 'switchModel':
-        window.dispatchEvent(new CustomEvent('magi:webModelOpenModelPicker'));
-        return;
       case 'retry':
         // 发送失败后，InputArea 会按既有 submission-settled 事实恢复草稿；这里
         // 只把焦点交回 composer，不自动重放副作用或创建第二条提交路径。
@@ -1006,11 +1003,11 @@
     if (!isHtmlFile(filePath) || openingHtmlInBrowser) return;
     openingHtmlInBrowser = true;
     try {
-      await openWorkspaceHtmlInRightPaneBrowser({
+      await openHtmlFileInRightPaneBrowser({
         filepath: filePath,
-        workspaceId: activeCodePayload?.workspaceId?.trim() || rightPaneState.activeWorkspaceId.trim(),
-        workspacePath: activeCodePayload?.workspacePath?.trim() || workspaceRoot.trim(),
-        sessionId: activeCodePayload?.sessionId?.trim() || rightPaneState.activeSessionId.trim(),
+        workspaceId: activeCodePayload?.workspaceId?.trim() ?? '',
+        workspacePath: activeCodePayload?.workspacePath?.trim() ?? '',
+        sessionId: activeCodePayload?.sessionId?.trim() ?? '',
       });
     } finally {
       openingHtmlInBrowser = false;
@@ -1100,7 +1097,7 @@
     }
     if (tab.kind === 'terminal') {
       const payload = tab.payload as TerminalTabPayload;
-      return payload.workspacePath || payload.workspaceId || (i18n.locale.startsWith('zh') ? 'Magi 空间' : 'Magi Space');
+      return payload.workspacePath || payload.workspaceId || i18n.t('input.workspace.unbound');
     }
     return tabLabel(tab);
   }
@@ -1363,6 +1360,10 @@
   {#if activeTab && activeTab.kind === 'code'}
     <div class="right-pane-subbar">
       <div class="right-pane-path" title={activeDisplayFilePath}><FileName name={displayPath} /></div>
+      {#if activeFilePreviewQuery && !activeCodePayload?.imageDataUrl}
+        <a class="right-pane-document-icon-action" href={agentUrl('/api/files/download', activeFilePreviewQuery)}
+          download title={i18n.t('web.fileDownload')} aria-label={i18n.t('web.fileDownload')}>{i18n.t('web.fileDownload')}</a>
+      {/if}
       {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
         <div class="right-pane-document-actions">
           {#if markdownFile}
@@ -1591,7 +1592,7 @@
             baseFilePath={activeFilePath}
             filePreviewScope={{
               workspaceId: activeCodePayload?.workspaceId,
-              workspacePath: activeCodePayload?.workspacePath || workspaceRoot,
+              workspacePath: activeCodePayload?.workspacePath,
               sessionId: activeCodePayload?.sessionId,
             }}
           />

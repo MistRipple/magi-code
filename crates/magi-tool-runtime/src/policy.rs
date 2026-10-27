@@ -733,6 +733,42 @@ pub fn tool_path_access_requests(
     let arguments_value = serde_json::from_str::<Value>(arguments).ok();
     let object = arguments_value.as_ref().and_then(Value::as_object);
 
+    if tool.requires_repository() {
+        let kind = if tool.is_write_operation() {
+            write
+        } else {
+            read
+        };
+        let path = object
+            .and_then(|obj| obj.get("repositoryPath"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty());
+        let root = resolve_tool_path(path.unwrap_or("."), workspace_root_path);
+        // linked worktree / submodule 的 Git 元数据可能在工作树之外，也必须进入授权范围。
+        let dot_git = root.join(".git");
+        let git_dir = std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|text| {
+                text.trim()
+                    .strip_prefix("gitdir:")
+                    .map(|path| root.join(path.trim()))
+            })
+            .unwrap_or(dot_git);
+        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .ok()
+            .map(|text| git_dir.join(text.trim()));
+        paths.push(ToolPathAccessRequest {
+            absolute_path: root,
+            kind,
+        });
+        for metadata in std::iter::once(git_dir).chain(common_dir) {
+            paths.push(ToolPathAccessRequest {
+                absolute_path: canonicalize_tool_permission_path(&metadata),
+                kind,
+            });
+        }
+    }
+
     match tool {
         crate::BuiltinToolName::FileRead | crate::BuiltinToolName::ViewImage => {
             push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);

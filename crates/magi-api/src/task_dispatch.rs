@@ -1773,7 +1773,7 @@ mod tests {
                 .expect("new session should inherit the persisted default"),
             Some(serde_json::json!({
                 "model": "model-last-used",
-                "reasoningEffort": "medium"
+                "reasoningEffort": null
             })),
         );
     }

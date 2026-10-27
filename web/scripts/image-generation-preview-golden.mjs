@@ -81,7 +81,7 @@ assert.match(
 );
 assert.match(generatedImageSource, /<ToolCardMeta \{status\}/, '图片生成使用统一状态圆点与右侧列');
 assert.match(generatedImageSource, /@keyframes generated-image-pulse/, '生成占位保留轻量动态反馈');
-assert.match(generatedImageSource, /prefers-reduced-motion:reduce[\s\S]*?animation:none/, '减少动态效果时停止占位动画');
+assert.doesNotMatch(generatedImageSource, /prefers-reduced-motion:reduce[\s\S]*?animation:none/, '图片生成等待反馈不能被局部规则冻结，统一使用共享低动态效果');
 assert.doesNotMatch(generatedImageSource, /linear-gradient|backdrop-filter|generated-image-progress-dots/, '生成状态不再堆叠渐变、玻璃胶囊和多组状态点');
 
 const toolCallRendererSource = await readFile(

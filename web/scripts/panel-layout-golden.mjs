@@ -794,6 +794,32 @@ await withGoldenViteServer(async (server) => {
   assert.deepEqual(
     panelLayout.resolvePanelLayout({
       viewportWidth: 390,
+      sidebarWidth: 240,
+      previewPanelWidth: 480,
+      sidebarVisible: true,
+      rightPaneOpen: false,
+      desktopSurface: true,
+    }),
+    { sidebarDrawer: true, previewOverlay: false, panelsCanCoexist: false },
+    'closing the desktop right pane must not squeeze the conversation behind a fixed sidebar',
+  );
+
+  assert.equal(
+    panelLayout.resolvePanelLayout({
+      viewportWidth: 720,
+      sidebarWidth: 240,
+      previewPanelWidth: 480,
+      sidebarVisible: true,
+      rightPaneOpen: false,
+      desktopSurface: true,
+    }).sidebarDrawer,
+    false,
+    'a closed right pane should restore the preferred sidebar when the conversation still fits',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePanelLayout({
+      viewportWidth: 390,
       sidebarWidth: 320,
       previewPanelWidth: 320,
     }),

@@ -209,7 +209,7 @@
     <Disclosure expanded={!collapsed}>
       <div class="code-content" id={contentId}>
         {#if showLineNumbers}
-          <div class="line-numbers">
+          <div class="line-numbers" aria-hidden="true">
             {#each lines as _, i}
               <span class="line-num">{i + 1}</span>
             {/each}
@@ -239,12 +239,23 @@
 
     margin: var(--spacing-sm) 0;
     overflow: hidden;
+    box-shadow: none;
+  }
+
+  /* Draw the contour above the contents so the code surface cannot erase its sides. */
+  .code-block::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
+    pointer-events: none;
   }
 
   .code-header {
     justify-content: space-between;
     background: transparent;
-    border-bottom: var(--magi-hairline) solid var(--code-border);
+    box-shadow: inset 0 calc(-1 * var(--magi-hairline)) var(--tool-card-outline);
     user-select: none;
   }
 
@@ -253,7 +264,7 @@
     align-items: center;
     gap: var(--space-3);
     flex: 1;
-    height: 100%;
+    align-self: stretch;
     background: transparent;
     border: none;
     padding: 0;
@@ -344,34 +355,30 @@
       magi-feedback-fade 160ms 2340ms ease-out forwards;
   }
 
-  /* 
-   * 🔧 核心修复：内容区域布局
-   * 1. 在父容器统一字号、行高、字体。
-   * 2. 子元素 (行号、代码) 全部 inherit，确保严格对齐。
-   */
+  /* Line numbers and code inherit one typography and the same vertical padding. */
   .code-content {
+    min-width: 0;
     display: flex;
     flex-direction: row;
-    align-items: flex-start;
-    background: var(--code-bg);
+    align-items: stretch;
+    background: transparent;
     position: relative;
     
     /* 统一定义排版属性 */
     font-family: var(--font-mono);
-    font-size: var(--font-size-sm, 12px); /* 使用明确的小字号 */
-    line-height: 1.5;
+    font-size: var(--code-panel-font-size);
+    line-height: var(--code-panel-line-height);
+    tab-size: 2;
   }
 
   .line-numbers {
     display: flex;
     flex-direction: column;
-    padding: var(--spacing-sm) 0;
-    width: 40px;
-    min-width: 40px;
-    border-right: var(--magi-hairline) solid var(--border);
+    padding: var(--code-panel-padding-block) 0 var(--code-panel-padding-block) var(--tool-card-padding);
+    min-width: calc(2ch + var(--tool-card-padding));
     text-align: right;
     user-select: none;
-    background: var(--code-line-number-bg);
+    background: transparent;
     flex-shrink: 0;
     
     /* 强制继承父级排版 */
@@ -382,36 +389,35 @@
 
   .line-num {
     display: block;
-    padding-right: 8px;
     color: var(--foreground-muted);
-    opacity: 0.5;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
 
   .code-pre {
     flex: 1;
-    margin: 0 !important;
-    padding: var(--spacing-sm) var(--spacing-md) !important;
+    margin: 0;
+    padding: var(--code-panel-padding-block) var(--tool-card-padding);
     overflow-x: auto;
-    background: transparent !important;
+    background: transparent;
     min-width: 0;
-    border: none !important;
+    border: none;
+    border-radius: 0;
   }
 
   .code-text {
     display: block;
-    margin: 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
+    margin: 0;
+    padding: 0;
+    background: transparent;
     white-space: pre;
     color: var(--code-fg, inherit);
-    border: none !important;
+    border: none;
     
-    /* 🔧 关键：强制继承，覆盖全局 code { font-size: 0.9em } */
-    font-family: inherit !important;
-    font-size: inherit !important;
-    line-height: inherit !important;
+    /* Semantic code panels own their typography; inline Markdown code stays separate. */
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
   }
 
   @keyframes pulse {

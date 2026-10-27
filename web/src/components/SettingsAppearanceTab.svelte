@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { themeDisplayName, themeDisplayDescription } from '../appearance/labels';
   import SelectField from './SelectField.svelte';
   import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
   import Modal from './Modal.svelte';
@@ -411,7 +412,8 @@
           class="theme-preview"
           type="button"
           style:background={colors.background}
-          aria-label={i18n.t('appearance.applyTheme', { name: record.pack.name })}
+          aria-label={i18n.t('appearance.applyTheme', { name: themeDisplayName(record.pack) })}
+          title={themeDisplayDescription(record.pack)}
           onclick={() => void applyTheme(record.pack.id)}
           disabled={Boolean(busyAction)}
         >
@@ -435,7 +437,7 @@
         </button>
         <div class="theme-card-body">
           <div class="theme-meta">
-            <strong title={record.pack.name}>{record.pack.name}</strong>
+            <strong title={themeDisplayName(record.pack)}>{themeDisplayName(record.pack)}</strong>
             <span class="ui-meta"><span>{sourceLabel(record)}</span><span>{materialLabel(record.pack.material)}</span></span>
           </div>
           <div class="theme-actions">
@@ -556,7 +558,7 @@
   {#if pendingDelete}
     <Modal title={i18n.t('appearance.deleteTitle')} size="sm" closeOnEscape={!busyAction} onClose={() => { if (!busyAction) { pendingDelete = null; errorMessage = ''; } }}>
       <div class="confirm-dialog" data-magi-surface="critical">
-        <p>{i18n.t('appearance.deleteConfirm', { name: pendingDelete.pack.name })}</p>
+        <p>{i18n.t('appearance.deleteConfirm', { name: themeDisplayName(pendingDelete.pack) })}</p>
         {#if errorMessage}<div class="inline-alert inline-alert--error" role="alert">{errorMessage}</div>{/if}
       </div>
       {#snippet footer()}

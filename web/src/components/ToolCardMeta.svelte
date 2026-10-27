@@ -17,7 +17,7 @@
 </script>
 
 {#if children || elapsed || status || expanded !== undefined}
-<span class="tool-card-meta">
+<span class="tool-card-meta" class:status-without-chevron={!!status && expanded === undefined}>
   {@render children?.()}
   {#if elapsed}<span class="tool-card-duration" title={`${i18n.t('toolCall.duration')} ${elapsed}`}>{elapsed}</span>{/if}
   {#if status}
@@ -31,6 +31,8 @@
 
 <style>
   .tool-card-meta { display:inline-flex; align-items:center; justify-content:flex-end; gap:8px; flex:0 0 auto; margin-left:auto; color:var(--foreground-muted); font-size:var(--text-xs); font-weight:var(--font-normal); line-height:1; font-variant-numeric:tabular-nums; }
+  /* Keep status centers on one vertical axis; only the outer action gutter stays empty. */
+  .status-without-chevron { padding-inline-end:22px; }
   .tool-card-status-slot,.tool-card-chevron-slot { display:inline-flex; align-items:center; justify-content:center; width:14px; height:18px; flex:0 0 14px; }
   .tool-status { display:inline-flex; align-items:center; justify-content:center; width:14px; height:18px; }
   .status-dot { display:block; flex:none; width:7px; height:7px; border-radius:50%; background:currentColor; }
@@ -46,5 +48,5 @@
   @keyframes tool-card-pulse { 50% { opacity:.35; } }
   @container(max-width:360px) { .tool-card-duration { display:none; } }
   @media(max-width:480px) { .tool-card-duration { display:none; } }
-  @media(prefers-reduced-motion:reduce) { .pulsing { animation:none; } .tool-card-chevron { transition:none; } }
+  @media(prefers-reduced-motion:reduce) { .tool-card-chevron { transition:none; } }
 </style>

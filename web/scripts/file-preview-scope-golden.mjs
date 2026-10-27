@@ -19,6 +19,14 @@ await withGoldenViteServer(async (server) => {
   };
   const pathForId = (workspaceId) => workspaceId ? `/tmp/${workspaceId}` : '';
 
+  for (const currentBinding of [personalBinding, workspaceBinding]) {
+    assert.deepEqual(resolveFilePreviewScope({
+      metadataSessionId: 'personal-owner', metadataWorkspaceId: '', metadataWorkspacePath: '',
+      currentBinding, selectedWorkspaceId: 'stale-project', selectedWorkspacePath: '/tmp/stale',
+      workspacePathForId: pathForId,
+    }), { workspaceId: '', workspacePath: '', sessionId: 'personal-owner', imageDataUrl: '' });
+  }
+
   assert.deepEqual(
     resolveFilePreviewScope({
       imageDataUrl: 'data:image/png;base64,inline',

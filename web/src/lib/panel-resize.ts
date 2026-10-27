@@ -22,10 +22,6 @@ export function beginPanelResize(event: PointerEvent, callbacks: {
   let moved = false;
   try { handle?.setPointerCapture(pointerId); } catch { /* Window listeners also cover capture-less hosts. */ }
 
-  const swallowClick = (next: MouseEvent) => {
-    next.preventDefault();
-    next.stopImmediatePropagation();
-  };
   const finish = (cancelled: boolean) => {
     if (stopped) return;
     stopped = true;
@@ -42,22 +38,34 @@ export function beginPanelResize(event: PointerEvent, callbacks: {
       if (handle?.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
     } catch { /* Capture may already be released. */ }
     if (moved) {
+      let swallowNextClick = true;
+      const swallowClick = (next: MouseEvent) => {
+        if (!swallowNextClick) return;
+        swallowNextClick = false;
+        next.preventDefault();
+        next.stopImmediatePropagation();
+        window.removeEventListener('click', swallowClick, true);
+      };
       window.addEventListener('click', swallowClick, true);
-      setTimeout(() => window.removeEventListener('click', swallowClick, true), 0);
+      setTimeout(() => {
+        swallowNextClick = false;
+        window.removeEventListener('click', swallowClick, true);
+      }, 0);
     }
     callbacks.finish(cancelled);
   };
   const move = (next: PointerEvent) => {
+    if (stopped) return;
     if (next.pointerId !== pointerId) return;
     if (Math.hypot(next.clientX - event.clientX, next.clientY - event.clientY) <= 3 && !moved) return;
     moved = true;
     callbacks.move(next);
   };
-  const up = (next: PointerEvent) => { if (next.pointerId === pointerId) finish(false); };
-  const cancel = (next: PointerEvent) => { if (next.pointerId === pointerId) finish(true); };
+  const up = (next: PointerEvent) => { if (!stopped && next.pointerId === pointerId) finish(false); };
+  const cancel = (next: PointerEvent) => { if (!stopped && next.pointerId === pointerId) finish(true); };
   const blur = () => finish(true);
   const key = (next: KeyboardEvent) => {
-    if (next.key !== 'Escape') return;
+    if (stopped || next.key !== 'Escape') return;
     next.preventDefault();
     next.stopImmediatePropagation();
     finish(true);

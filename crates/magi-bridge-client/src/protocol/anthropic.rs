@@ -24,10 +24,13 @@ const MIN_MAX_TOKENS_WITH_THINKING: u32 = 8192;
 /// Opus 4.7+ 的 Adaptive Thinking 走 `thinking.effort` 字符串路径，不经过该函数。
 fn reasoning_effort_budget_tokens(effort: ReasoningEffort) -> u32 {
     match effort {
+        ReasoningEffort::None => 0,
+        ReasoningEffort::Minimal => 1024,
         ReasoningEffort::Low => 1024,
         ReasoningEffort::Medium => 4096,
         ReasoningEffort::High => 16384,
         ReasoningEffort::Xhigh => 32768,
+        ReasoningEffort::Max | ReasoningEffort::Ultra => 65536,
     }
 }
 
@@ -75,7 +78,23 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         // 不再保留"配置覆盖能力"的 OR 语义——未知 / 不支持 thinking 的模型
         // 即便调用方传了 reasoning_effort 也绝不写入 thinking 字段，
         // 避免向后端注入会触发 400 的可选字段。
-        let capability = resolve_capability_profile(model);
+        let mut capability = *resolve_capability_profile(model);
+        if let Some(cap) = &params.reasoning_capability {
+            capability.thinking_kind = if cap.supported_efforts.is_empty()
+                || params.reasoning_effort == Some(ReasoningEffort::None)
+                || params.reasoning_effort.is_none()
+            {
+                ThinkingKind::None
+            } else {
+                match cap.transport {
+                    crate::reasoning::ReasoningTransport::AnthropicBudget => {
+                        ThinkingKind::BudgetTokens
+                    }
+                    crate::reasoning::ReasoningTransport::AnthropicEffort => ThinkingKind::Effort,
+                    _ => ThinkingKind::None,
+                }
+            };
+        }
         let configured_effort = params.reasoning_effort;
         let thinking_value = build_thinking_value(
             capability.thinking_kind,
@@ -373,6 +392,7 @@ mod tests {
 
     fn base_params(messages: Vec<LlmMessage>) -> LlmMessageParams {
         LlmMessageParams {
+            reasoning_capability: None,
             messages,
             max_tokens: None,
             temperature: None,

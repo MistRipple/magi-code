@@ -57,12 +57,6 @@ impl AttributionResolver for SlotAttribution {
                     || AttributionRefusal("当前没有可归属的进行中的 GPT Web 对话".to_string());
                 let slots = (self.slots)().ok_or_else(refusal)?;
                 let (owner, turn) = active_turn(&slots).ok_or_else(refusal)?;
-                if owner.project_id.trim().is_empty() {
-                    return Err(AttributionRefusal(
-                        "当前 GPT Web 会话未绑定工作区，请切换到工作区会话后再使用 Magi 内置工具"
-                            .to_string(),
-                    ));
-                }
                 // 身份里的工作区必须就是槽位拥有者会话的项目，防止拿它去操作别的项目。
                 if owner.project_id != principal.workspace_id {
                     return Err(refusal());
@@ -223,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn personal_web_session_gets_a_clear_workspace_requirement() {
+    fn personal_web_session_is_attributed_without_project_identity() {
         let table = Arc::new(WebSlotTable::new());
         let owner = WebSlotOwner::new("session-personal", "");
         table
@@ -231,10 +225,12 @@ mod tests {
             .unwrap();
         let _lease = table.begin_turn(&owner).unwrap();
 
-        let refusal = resolver(&table).resolve(&principal("")).unwrap_err();
-        assert_eq!(
-            refusal.0,
-            "当前 GPT Web 会话未绑定工作区，请切换到工作区会话后再使用 Magi 内置工具"
+        assert!(matches!(resolver(&table).resolve(&principal("")).unwrap(),
+            AttributionTarget::WebSlotTurn { session_id, .. } if session_id == "session-personal"));
+        assert!(
+            resolver(&table)
+                .resolve(&principal("project-other"))
+                .is_err()
         );
     }
 
@@ -279,6 +275,11 @@ mod tests {
 
     #[cfg(unix)]
     async fn fixture() -> Fixture {
+        fixture_for_scope(false).await
+    }
+
+    #[cfg(unix)]
+    async fn fixture_for_scope(personal: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
@@ -291,7 +292,12 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             governance,
         )
-        .with_tool_registry(registry);
+        .with_tool_registry(registry)
+        .with_runtime_persistence(Arc::new(crate::state::RuntimeStatePersistence::new(
+            dir.path().join("state"),
+            dir.path().join("workspaces.json"),
+            dir.path().join("knowledge.json"),
+        )));
         state.mcp_service = Arc::new(McpServiceRuntime::load(dir.path().join("mcp-server.json")));
         let root = dir.path().join("project").canonicalize_or_create();
         state
@@ -304,8 +310,39 @@ mod tests {
         let session_id = SessionId::new("session-owner");
         state
             .session_store
-            .create_session_for_workspace(session_id.clone(), "owner", Some("ws-slot".to_string()))
+            .create_session_for_workspace(
+                session_id.clone(),
+                "owner",
+                (!personal).then(|| "ws-slot".to_string()),
+            )
             .unwrap();
+        let root = if personal {
+            state.personal_session_execution_root(&session_id).unwrap()
+        } else {
+            root
+        };
+        let registry = state
+            .tool_registry()
+            .unwrap()
+            .clone()
+            .with_git_tool_executor(crate::git_tool_runtime::build_git_tool_executor(
+                crate::git_tool_runtime::GitToolRuntimeDependencies {
+                    task_store: None,
+                    git_service: state.git_service.clone(),
+                    session_code_contexts: state.session_code_contexts.clone(),
+                    workspace_git_coordinator: state.workspace_git_coordinator.clone(),
+                    event_bus: state.event_bus.clone(),
+                    knowledge_store: state.knowledge_store.clone(),
+                    snapshot_manager: state.snapshot_manager.clone(),
+                    runtime_persistence: Arc::new(crate::state::RuntimeStatePersistence::new(
+                        dir.path().join("state"),
+                        dir.path().join("workspaces.json"),
+                        dir.path().join("knowledge.json"),
+                    )),
+                    managed_worktree_root: dir.path().join("state/worktrees"),
+                },
+            ));
+        state = state.with_tool_registry(registry);
         let table = Arc::new(WebSlotTable::new());
         state.web_model.set_bindings(table.clone());
         state.install_web_slot_hooks();
@@ -342,7 +379,7 @@ mod tests {
             state,
             table,
             session_id,
-            owner: WebSlotOwner::new("session-owner", "ws-slot"),
+            owner: WebSlotOwner::new("session-owner", if personal { "" } else { "ws-slot" }),
             root,
             endpoint,
             _dir: dir,
@@ -422,6 +459,125 @@ mod tests {
     #[cfg(unix)]
     fn read_call() -> serde_json::Value {
         serde_json::json!({"name": "magi.fs.read", "arguments": {"path": "a.txt"}})
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_slot_uses_session_directory_and_keeps_permissions_attribution_and_revocation()
+    {
+        let f = fixture_for_scope(true).await;
+        let lease = f.begin_web_turn();
+        std::fs::write(f.root.join("a.txt"), "personal data").unwrap();
+        let listed = slot_call(&f.endpoint, "tools/list", serde_json::json!({})).await;
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        for available in ["magi.fs.read", "magi.fs.write", "magi.git.status"] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == available),
+                "{listed}"
+            );
+        }
+        for unavailable in [
+            "magi.shell.exec",
+            "magi.search.semantic",
+            "magi.changes.list",
+            "magi.changes.revert",
+        ] {
+            assert!(
+                !tools.iter().any(|tool| tool["name"] == unavailable),
+                "{listed}"
+            );
+        }
+        let read = slot_call(&f.endpoint, "tools/call", read_call()).await;
+        assert!(!is_error(&read), "{read}");
+        assert!(read.to_string().contains("personal data"));
+        let escaped = slot_call(
+            &f.endpoint,
+            "tools/call",
+            serde_json::json!({"name":"magi.fs.read", "arguments":{"path":"../other.txt"}}),
+        )
+        .await;
+        assert!(is_error(&escaped));
+        let approver = {
+            let state = f.state.clone();
+            let id = f.session_id.clone();
+            std::thread::spawn(move || {
+                let approvals = state.conversation_registry.tool_approvals();
+                for _ in 0..300 {
+                    if let Some(pending) = approvals.pending_for_session(&id).first() {
+                        approvals
+                            .resolve(&id, &pending.approval_id, ToolApprovalDecision::AllowOnce)
+                            .unwrap();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!("个人会话写入必须在原会话审批");
+            })
+        };
+        let written = slot_call(&f.endpoint, "tools/call", serde_json::json!({"name":"magi.fs.write", "arguments":{"path":"result.txt","content":"from personal web"}})).await;
+        approver.join().unwrap();
+        assert!(!is_error(&written), "{written}");
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("result.txt")).unwrap(),
+            "from personal web"
+        );
+        assert!(
+            f.state.snapshot_session(&f.session_id, &f.root).is_none(),
+            "个人文件不能创建项目账本"
+        );
+        assert_eq!(
+            f.state
+                .session_store
+                .session(&f.session_id)
+                .unwrap()
+                .workspace_id,
+            None
+        );
+        let turns = f
+            .state
+            .session_store
+            .canonical_turns_for_session(&f.session_id);
+        assert!(
+            turns
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .any(|item| item.kind == magi_session_store::CanonicalTurnItemKind::ToolCall)
+        );
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.name", "Fixture"],
+            &["config", "user.email", "fixture@example.test"],
+            &["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            assert!(
+                magi_process::std_command("git")
+                    .arg("-C")
+                    .arg(&f.root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let git = slot_call(
+            &f.endpoint,
+            "tools/call",
+            serde_json::json!({"name":"magi.git.status","arguments":{}}),
+        )
+        .await;
+        assert!(!is_error(&git), "个人 GPT Web Git 状态：{git}");
+        f.state
+            .web_model
+            .update_policy(Some("read_only".into()), None);
+        let denied = slot_call(&f.endpoint, "tools/call", serde_json::json!({"name":"magi.fs.write","arguments":{"path":"denied.txt","content":"blocked"}})).await;
+        assert!(is_error(&denied));
+        assert!(!f.root.join("denied.txt").exists());
+        drop(lease);
+        assert!(is_error(
+            &slot_call(&f.endpoint, "tools/call", read_call()).await
+        ));
+        f.state.mcp_service.stop_slot_gateway().await;
     }
 
     #[cfg(unix)]

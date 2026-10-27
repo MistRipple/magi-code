@@ -73,11 +73,6 @@
     }
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .conversation-process-row.streaming .process-marker::before {
-      animation: none;
-    }
-  }
 
   @media (max-width: 560px) {
     .conversation-process-row {

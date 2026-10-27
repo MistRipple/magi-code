@@ -74,12 +74,18 @@ pub(crate) fn api_key_path(state_root: &std::path::Path) -> PathBuf {
     state_root.join("web-model").join("tunnel-api-key")
 }
 
-/// 写入密钥文件（用户私有权限、原子写）。密钥原文不进日志、settings 或任何返回值。
-fn write_api_key(state_root: &std::path::Path, api_key: &str) -> Result<(), String> {
+pub(crate) fn validate_api_key(api_key: &str) -> Result<(), String> {
     let key = api_key.trim();
     if key.is_empty() || key.len() > 512 || key.chars().any(char::is_whitespace) {
         return Err("API 密钥格式不正确".to_string());
     }
+    Ok(())
+}
+
+/// 写入密钥文件（用户私有权限、原子写）。密钥原文不进日志、settings 或任何返回值。
+fn write_api_key(state_root: &std::path::Path, api_key: &str) -> Result<(), String> {
+    validate_api_key(api_key)?;
+    let key = api_key.trim();
     let path = api_key_path(state_root);
     let parent = path.parent().ok_or("密钥路径无效")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("无法创建密钥目录：{error}"))?;
@@ -366,6 +372,9 @@ impl WebModelChannelRuntime {
         config: Option<WebModelTunnelConfig>,
         api_key: Option<String>,
     ) -> Result<WebModelTunnelStatus, String> {
+        if let Some(key) = api_key.as_deref().filter(|key| !key.trim().is_empty()) {
+            validate_api_key(key)?;
+        }
         let state_root = state
             .runtime_persistence()
             .and_then(|persistence| persistence.state_root().map(std::path::Path::to_path_buf))
@@ -429,11 +438,14 @@ impl WebModelChannelRuntime {
         if self.launch_generation.load(Ordering::SeqCst) != generation {
             return;
         }
-        self.lock().phase = None;
+        // connect 尚在执行时必须保留“正在连接”：此时 TunnelManager 的初始 Stopped
+        // 不代表启动失败，否则配置助手会在保存密钥后停止并重新启动同一个运行时。
+        self.set_phase(Some(("runtime_not_ready", "正在连接 OpenAI Tunnel".into())));
         let Some(config) = self
             .configured()
             .filter(WebModelTunnelConfig::is_configured)
         else {
+            self.lock().phase = None;
             self.refresh_channel_status();
             return;
         };
@@ -461,6 +473,7 @@ impl WebModelChannelRuntime {
         }));
         self.lock().tunnel = Some(Arc::clone(&tunnel));
         if tunnel.preflight_status().is_some() {
+            self.lock().phase = None;
             self.refresh_channel_status();
             return;
         }
@@ -475,6 +488,7 @@ impl WebModelChannelRuntime {
             }
         }
         let status = tunnel.start().await;
+        self.lock().phase = None;
         if matches!(
             status,
             TunnelClientStatus::Running { .. } | TunnelClientStatus::NotReady { .. }

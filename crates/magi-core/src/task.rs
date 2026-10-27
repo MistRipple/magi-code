@@ -804,6 +804,8 @@ pub struct TaskRecoveryCheckpoint {
 #[serde(deny_unknown_fields)]
 pub struct TaskExecutorBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<crate::AgentModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_activation: Option<crate::AgentActivation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_transfer: Option<crate::AgentRunTransfer>,

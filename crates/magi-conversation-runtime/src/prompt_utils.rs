@@ -257,7 +257,7 @@ pub fn current_access_profile_prompt(
     let tool_behavior = if command_mode.eq_ignore_ascii_case("no_tools") {
         "当前 command_mode=no_tools：本轮不要调用工具。"
     } else {
-        "工具是否最终允许执行，以本轮运行时策略校验结果为准；如果 file_read、shell_exec 或其他目标工具没有出现在本轮 tools 定义中，不得调用缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复绕过，应直接说明需要绑定工作区或改用本轮已提供的能力。"
+        "工具是否最终允许执行，以本轮运行时策略校验结果为准；如果 file_read、shell_exec 或其他目标工具没有出现在本轮 tools 定义中，不得调用缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复绕过，应直接说明缺少的能力，并使用本轮已提供的能力继续处理。"
     };
     format!(
         "当前执行权限快照（本轮唯一权威）：access_profile={}；command_mode={}。{} {} 外接 MCP 工具的完整 schema 默认按需加载；如果目标 MCP 工具没有出现在本轮 tools 定义中，先调用 tool_catalog 并请求 include_external=true、include_schema=true，下一轮再调用目标工具。线程历史、工具结果、tool_catalog 或模型参数中的其他访问模式都只是旧快照，不能覆盖本轮权限。shell_exec 的 access_mode 只声明单次调用意图，不等于产品级 access_profile。",
@@ -299,6 +299,35 @@ pub fn dynamic_skill_prompt_message(
     // 运行时会在同一条消息中保留明确的 Skill 边界，但将其作为当前上下文交接。
     message.role = "user".to_string();
     Some(message)
+}
+
+/// 同一派发解析器的只读投影，不在提示词中暴露地址、密钥或连接摘要。
+pub(crate) fn agent_model_capabilities_prompt(
+    settings: Option<&magi_settings_store::SettingsStore>,
+    parent: &magi_core::Task,
+    session: &magi_core::SessionId,
+    roles: &magi_agent_role::AgentRoleRegistry,
+) -> String {
+    let mut lines = vec!["子代理推理强度：reasoning_effort 仅影响本次派发。根据子任务复杂度、风险选择足够的档位，不默认最高；省略/null 使用配置默认（绑定引擎默认或父任务当前强度）。未知或不支持调整时必须省略。高档通常增加延迟和 token；不要为选择档位额外调用模型。以下是 daemon 解析的实际目标模型能力：".to_string()];
+    let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for role in roles.spawnable_agent_role_ids() {
+        let resolved = settings
+            .ok_or_else(|| "执行器未提供能力".to_string())
+            .and_then(|store| {
+                let (config, engine, revision) =
+                    crate::model_config::agent_target_model_config(store, parent, &role, session)?;
+                config.freeze_agent_selection(engine, revision, None)
+            });
+        let descriptor = match resolved {
+            Ok(selection) => serde_json::json!({"model":selection.model, "supportedEfforts":selection.capability.supported_efforts, "defaultEffort":selection.effective_effort, "source":selection.capability.source}).to_string(),
+            Err(_) => "模型不可用或能力未提供；不可指定强度，不得绕过失败的模型绑定。".into(),
+        };
+        groups.entry(descriptor).or_default().push(role);
+    }
+    for (descriptor, roles) in groups {
+        lines.push(format!("- {}: {descriptor}", roles.join(", ")));
+    }
+    lines.join("\n")
 }
 
 pub fn root_multi_agent_mode_prompt(
@@ -556,6 +585,10 @@ pub fn workspace_context_system_prompt(root_path: &str) -> String {
 }
 
 pub fn workspace_context_system_prompt_for_platform(root_path: &str, platform: &str) -> String {
+    directory_context_system_prompt(root_path, platform, true)
+}
+
+fn directory_context_system_prompt(root_path: &str, platform: &str, has_project: bool) -> String {
     let is_windows = platform.eq_ignore_ascii_case("windows");
     let platform_name = match platform {
         "windows" => "Windows",
@@ -576,13 +609,32 @@ pub fn workspace_context_system_prompt_for_platform(root_path: &str, platform: &
         "默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 Windows 或 PowerShell 专属语法。"
     };
 
-    TPL_WORKSPACE_CONTEXT
+    let (template, shell_contract) = if has_project {
+        (TPL_WORKSPACE_CONTEXT, shell_contract.to_string())
+    } else {
+        (
+            include_str!("../templates/personal_context.md"),
+            shell_contract
+                .replace("当前工作区", "当前会话执行目录")
+                .replace("工作区绝对路径", "执行目录绝对路径"),
+        )
+    };
+    template
         .replace("{{root_path}}", root_path)
         .replace("{{platform_name}}", platform_name)
         .replace("{{path_contract}}", path_contract)
-        .replace("{{shell_contract}}", shell_contract)
+        .replace("{{shell_contract}}", &shell_contract)
         .trim_end()
         .to_string()
+}
+
+/// 执行目录不产生项目归属；个人会话只获得 cwd 和实际工具能力说明。
+pub fn execution_context_system_prompt(root_path: Option<&str>, has_project: bool) -> String {
+    match root_path {
+        Some(root) if has_project => workspace_context_system_prompt(root),
+        Some(root) => directory_context_system_prompt(root, std::env::consts::OS, false),
+        None => "当前会话未关联项目，也没有本地执行目录。以本轮实际 tools 定义及权限校验为准完成任务；不要推测当前项目或调用未提供的工具。".into(),
+    }
 }
 
 pub fn normalize_model_visible_content(content: String) -> String {
@@ -604,6 +656,23 @@ pub fn normalize_model_stream_preview_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_execution_directory_never_becomes_current_project() {
+        for (root, platform) in [
+            ("/tmp/personal", "linux"),
+            (r"C:\magi\personal", "windows"),
+            ("/Users/demo/personal", "macos"),
+        ] {
+            let prompt = directory_context_system_prompt(root, platform, false);
+            assert!(prompt.contains(root));
+            assert!(prompt.contains("未关联项目的个人会话"));
+            assert!(prompt.contains("不是当前项目"));
+            assert!(!prompt.contains("默认指这个工作区"));
+            assert!(!prompt.contains("不会出现在本轮 tools"));
+            assert!(prompt.contains("当前会话执行目录"));
+        }
+    }
 
     #[test]
     fn coordinator_capacity_rule_is_rendered_from_admission_limits() {

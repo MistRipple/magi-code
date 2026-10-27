@@ -8,7 +8,7 @@ import type { WebModelActionKind } from './web-model-actions';
  * 不自造可用性。`blocksSend` 表示发送必然被 daemon 拒绝，界面先行禁用并说明原因。
  */
 export interface WebSessionBanner {
-  id: 'lost' | 'conflict' | 'unavailable' | 'busy' | 'unsynced' | 'noTools' | 'workspaceRequired';
+  id: 'lost' | 'conflict' | 'unavailable' | 'busy' | 'unsynced' | 'noTools';
   tone: 'warning' | 'info';
   textKey: string;
   params?: Record<string, string>;
@@ -32,7 +32,6 @@ export interface WebSessionBannerInput {
   toolsAvailable: boolean | null;
   toolsDetail?: string;
   /** GPT Web 的项目工具必须绑定到明确的工作区会话。 */
-  workspaceRequired?: boolean;
 }
 
 export function resolveWebSessionBanner(input: WebSessionBannerInput): WebSessionBanner | null {
@@ -102,14 +101,6 @@ export function resolveWebSessionBanner(input: WebSessionBannerInput): WebSessio
       textKey: 'webModel.banner.noTools',
       params: { detail: input.toolsDetail ?? '' },
       action: { kind: 'openTunnelSettings', labelKey: 'webModel.action.configureTunnel' },
-      blocksSend: false,
-    };
-  }
-  if (input.workspaceRequired) {
-    return {
-      id: 'workspaceRequired',
-      tone: 'info',
-      textKey: 'webModel.banner.workspaceRequired',
       blocksSend: false,
     };
   }

@@ -3426,7 +3426,7 @@ impl ApiState {
 
     /// 未绑定项目的个人会话使用 Magi 管理的私有执行目录。
     ///
-    /// 这是工具 cwd/权限根目录，不属于项目注册表，因而不会出现在文件树、Git、变更或项目知识中。
+    /// 这是工具 cwd/权限根目录，不属于项目注册表；文件入口按会话访问它，不继承 Git、变更或项目知识。
     pub(crate) fn personal_session_execution_root_path(&self, session_id: &SessionId) -> PathBuf {
         let state_root = self
             .runtime_persistence()
@@ -4511,10 +4511,78 @@ impl ApiState {
 
     /// 删除 session 时只回收干净的 agent worktree；任何未提交改动都保留目录与 context，
     /// 禁止用 `--force` 静默丢失代理产物。
-    async fn cleanup_session_git_resources(&self, session_id: &SessionId) {
+    async fn cleanup_session_git_resources(&self, session_id: &SessionId) -> bool {
         self.release_session_git_execution_lease(session_id);
+        let personal = self
+            .session_code_contexts
+            .all()
+            .into_iter()
+            .filter(|context| {
+                context.session_id == session_id.as_str() && context.workspace_id.is_empty()
+            })
+            .collect::<Vec<_>>();
+        if !personal.is_empty() {
+            let Some(state_root) = self
+                .runtime_persistence()
+                .and_then(RuntimeStatePersistence::state_root)
+            else {
+                return false;
+            };
+            let managed_root = state_root
+                .join("worktrees/personal")
+                .join(session_id.as_str());
+            let managed_root = managed_root.canonicalize().unwrap_or(managed_root);
+            for context in personal {
+                let Ok(_lease) = self
+                    .workspace_git_coordinator
+                    .begin_mutation(&context.git.git_common_dir)
+                else {
+                    tracing::warn!(%session_id, "个人会话仓库正在使用，保留 Git 资源与执行目录");
+                    return false;
+                };
+                let worktrees = match self
+                    .git_service
+                    .worktree_list(&context.execution_root)
+                    .await
+                {
+                    Ok(worktrees) => worktrees,
+                    Err(error) => {
+                        tracing::warn!(%session_id, %error, "无法核对个人会话 Git worktree，保留目录");
+                        return false;
+                    }
+                };
+                for worktree in worktrees
+                    .into_iter()
+                    .filter(|tree| tree.path.starts_with(&managed_root))
+                {
+                    if let Err(error) = self
+                        .git_service
+                        .worktree_remove(
+                            &context.execution_root,
+                            magi_git::WorktreeRemoveOptions {
+                                path: worktree.path,
+                                force: false,
+                                confirm_force: false,
+                                precondition: magi_git::GitPrecondition::default(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(%session_id, %error, "个人会话删除时保留无法安全回收的 worktree 与仓库目录");
+                        return false;
+                    }
+                }
+            }
+            self.session_code_contexts.remove(session_id.as_str());
+            if let Err(error) = self.persist_session_git_contexts() {
+                tracing::warn!(%session_id, ?error, "持久化个人 Git 资源清理失败");
+            }
+            return true;
+        }
         let Some(context) = self.session_code_contexts.get(session_id.as_str()) else {
-            return;
+            self.session_code_contexts.remove(session_id.as_str());
+            let _ = self.persist_session_git_contexts();
+            return true;
         };
         let mut cleanup_failed = false;
         for agent in &context.agent_worktrees {
@@ -4550,6 +4618,7 @@ impl ApiState {
         if let Err(error) = self.persist_session_git_contexts() {
             tracing::warn!(session_id = %session_id, ?error, "持久化 session Git 资源清理失败");
         }
+        !cleanup_failed
     }
 
     pub fn persist_session_projection(&self) -> Result<(), ApiError> {
@@ -5262,6 +5331,11 @@ impl ApiState {
         session_id: &SessionId,
         replacement_session_id: Option<SessionId>,
     ) -> Result<(), ApiError> {
+        let mut personal_root = self
+            .session_store
+            .session(session_id)
+            .filter(|session| self.session_workspace_id(session).is_none())
+            .map(|_| self.personal_session_execution_root_path(session_id));
         let job_outputs = self
             .session_store
             .background_jobs_for_session(session_id)
@@ -5282,7 +5356,9 @@ impl ApiState {
         self.terminal_sessions
             .close_for_session(session_id.as_str());
         self.cleanup_session_isolation(session_id).await;
-        self.cleanup_session_git_resources(session_id).await;
+        if personal_root.is_none() {
+            self.cleanup_session_git_resources(session_id).await;
+        }
         self.settings_store
             .remove_session(session_id)
             .map_err(crate::errors::settings_persistence_error)?;
@@ -5374,6 +5450,18 @@ impl ApiState {
                 {
                     tracing::warn!(%session_id, job_id = %job.job_id, %error, "删除会话 Job 输出失败");
                 }
+            }
+        }
+        // 只在会话删除已持久提交后回收自有执行目录。失败不能先删除用户成果。
+        if personal_root.is_some() && !self.cleanup_session_git_resources(session_id).await {
+            personal_root = None;
+        }
+        if let Some(root) = personal_root {
+            let result = tokio::task::spawn_blocking(move || fs::remove_dir_all(root)).await;
+            if let Ok(Err(error)) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%session_id, %error, "删除个人会话文件失败");
             }
         }
         self.session_turn_locks
@@ -6597,6 +6685,113 @@ mod tests {
             .get(session_id.as_str())
             .expect("dirty worktree context must remain recoverable");
         assert!(!retained.agent_worktrees[0].active);
+    }
+
+    #[tokio::test]
+    async fn personal_session_delete_reclaims_only_safe_owned_git_worktrees() {
+        for mode in ["clean", "dirty", "busy"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let state_root = fixture.path().join("state");
+            let state = ApiState::new(
+                "personal-git-cleanup",
+                Arc::new(InMemoryEventBus::new(32)),
+                Arc::new(SessionStore::new()),
+                Arc::new(WorkspaceStore::default()),
+                Arc::new(GovernanceService::default()),
+            )
+            .with_runtime_persistence(browser_persistence_for_test(&state_root));
+            let session = SessionId::new("personal-cleanup");
+            state
+                .session_store
+                .create_session(session.clone(), "cleanup")
+                .unwrap();
+            let personal_root = state.personal_session_execution_root(&session).unwrap();
+            std::fs::write(
+                personal_root.join("result.txt"),
+                "keep if cleanup is unsafe",
+            )
+            .unwrap();
+            let repository = fixture.path().join("external-repository");
+            std::fs::create_dir_all(&repository).unwrap();
+            git_fixture(&repository, &["init", "-b", "main"]);
+            git_fixture(&repository, &["config", "user.name", "Magi Test"]);
+            git_fixture(&repository, &["config", "user.email", "magi@example.test"]);
+            git_fixture(&repository, &["commit", "--allow-empty", "-m", "base"]);
+            let observation = state.git_service.observe(&repository).await.unwrap();
+            state
+                .session_code_contexts
+                .accept(session.as_str(), "", vec![], &observation);
+            state.persist_session_git_contexts().unwrap();
+            let owned = state_root
+                .join("worktrees/personal")
+                .join(session.as_str())
+                .join("owned");
+            let other = state_root.join("worktrees/personal/other-session/retained");
+            let unmanaged = fixture.path().join("user-worktree");
+            for path in [&owned, &other, &unmanaged] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                state
+                    .git_service
+                    .worktree_create(
+                        &repository,
+                        magi_git::WorktreeCreateOptions {
+                            path: path.clone(),
+                            base: observation.head.clone().unwrap(),
+                            branch: None,
+                            create_branch: false,
+                            detached: true,
+                            precondition: magi_git::GitPrecondition::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            if mode == "dirty" {
+                std::fs::write(owned.join("uncommitted.txt"), "preserve me").unwrap();
+            }
+            if mode == "busy" {
+                state
+                    .workspace_git_coordinator
+                    .begin_execution("other-session", &observation.git_common_dir)
+                    .unwrap();
+            }
+
+            state.delete_session_and_resources(&session).await.unwrap();
+
+            assert!(state.session_store.session(&session).is_none());
+            assert!(
+                repository.join(".git").is_dir(),
+                "external repository: {mode}"
+            );
+            assert!(other.join(".git").is_file(), "other session: {mode}");
+            assert!(unmanaged.join(".git").is_file(), "user worktree: {mode}");
+            let retained = mode != "clean";
+            assert_eq!(owned.exists(), retained, "owned worktree: {mode}");
+            assert_eq!(
+                personal_root.join("result.txt").exists(),
+                retained,
+                "personal files: {mode}"
+            );
+            assert_eq!(
+                state
+                    .session_code_contexts
+                    .get_repository(session.as_str(), &repository)
+                    .is_some(),
+                retained
+            );
+            let persisted: Vec<magi_git::SessionCodeContext> = serde_json::from_slice(
+                &std::fs::read(state_root.join("session-git-contexts.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted.len(),
+                usize::from(retained),
+                "recoverable baseline: {mode}"
+            );
+            state
+                .workspace_git_coordinator
+                .end_execution("other-session");
+        }
     }
 
     #[cfg(unix)]

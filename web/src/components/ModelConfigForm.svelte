@@ -1,5 +1,7 @@
 <script lang="ts">
   import SelectField from './SelectField.svelte';
+  import { resolveAgentModelReasoning } from '../web/agent-api';
+  import type { ModelReasoningCapability } from '../shared/rust-backend-types';
   import { i18n } from '../stores/i18n.svelte';
   import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import Icon from './Icon.svelte';
@@ -15,9 +17,6 @@
     showModelField = true,
     showAdvancedOptions = true,
     description = null,
-    title = '',
-    statusClass = '',
-    statusLabel = '',
     visionBuiltinTextModelRules = [],
     saveStatus,
     testStatus,
@@ -25,6 +24,7 @@
     modelListOpen,
     modelListPosition,
     modelLists,
+    modelDisplayNames,
     getBaseUrlPlaceholder,
     openModelList,
     closeModelList,
@@ -41,10 +41,6 @@
     showModelField?: boolean;
     showAdvancedOptions?: boolean;
     description?: string | null;
-    /** 表单标题与当前连接状态（状态点颜色类名与文字）。 */
-    title?: string;
-    statusClass?: string;
-    statusLabel?: string;
     visionBuiltinTextModelRules?: VisionBuiltinTextModelRule[];
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
@@ -52,6 +48,7 @@
     modelListOpen: Record<string, boolean>;
     modelListPosition: any;
     modelLists: Record<string, string[]>;
+    modelDisplayNames: Record<string, Record<string, string>>;
     getBaseUrlPlaceholder: () => string;
     openModelList: (type: string, target: HTMLElement) => void;
     closeModelList: (key: string) => void;
@@ -61,6 +58,32 @@
     testModelConnection: (type: FormType, statusKey: string) => void;
   } = $props();
 
+  let reasoningCapability = $state<ModelReasoningCapability | null>(null);
+  let reasoningStatus = $state<'loading' | 'ready' | 'failed'>('loading');
+  let reasoningRetry = $state(0);
+  let reasoningAdjusted = $state(false);
+  $effect(() => {
+    void modelLists[statusKey];
+    void reasoningRetry;
+    reasoningCapability = null;
+    reasoningStatus = 'loading';
+    reasoningAdjusted = false;
+    if (fetchingModels[statusKey]) return;
+    const raw = { baseUrl: config?.baseUrl, apiKey: config?.apiKey, apiProtocol: config?.apiProtocol };
+    const model = String(config?.model ?? '');
+    let cancelled = false;
+    if (formType !== 'image' && model) void resolveAgentModelReasoning(raw, model).then(value => {
+      if (!cancelled) {
+        reasoningCapability = value;
+        reasoningStatus = 'ready';
+        if (value.source !== 'unknown' && config.reasoningEffort != null && !value.supportedEfforts.includes(config.reasoningEffort)) {
+          config.reasoningEffort = null;
+          reasoningAdjusted = true;
+        }
+      }
+    }).catch(() => { if (!cancelled) reasoningStatus = 'failed'; });
+    return () => { cancelled = true; };
+  });
   const keyVisibleKey = $derived(formType);
   // 同一时刻只渲染一个表单，但 statusKey 仍按引擎区分，避免切换引擎时 label 指向旧控件。
   const fieldId = (name: string) => `model-config-${statusKey}-${name}`;
@@ -74,7 +97,7 @@
       apiKey: String(value?.apiKey ?? ''),
       ...(showModelField ? { model: String(value?.model ?? '') } : {}),
       ...(showAdvancedOptions
-        ? { reasoningEffort: String(value?.reasoningEffort ?? 'medium') }
+        ? { reasoningEffort: value?.reasoningEffort ?? null }
         : {}),
       ...(formType === 'vision'
         ? {
@@ -224,7 +247,7 @@
   let modelListEl: HTMLDivElement | undefined = $state();
   let modelQuery = $state('');
   const filteredModels = $derived((modelLists[statusKey] ?? []).filter(model =>
-    model.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase())));
+    `${modelDisplayNames[statusKey]?.[model] ?? ''} ${model}`.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase())));
   $effect(() => { if (!modelListOpen[statusKey] || (modelLists[statusKey]?.length ?? 0) <= 10) modelQuery = ''; });
 
   function portalToBody(node: HTMLElement) {
@@ -301,12 +324,6 @@
     return protocolEndpointPath(config.apiProtocol);
   }
 
-  function protocolBehaviorKey(protocol: string): string {
-    if (protocol === 'openai_responses') return 'settings.model.protocol.openaiResponsesBehavior';
-    if (protocol === 'anthropic_messages') return 'settings.model.protocol.anthropicMessagesBehavior';
-    return 'settings.model.protocol.openaiChatBehavior';
-  }
-
   function visionContextWindowInK(): number {
     const tokens = Number(config?.contextWindowTokens);
     return Number.isFinite(tokens) && tokens > 0 ? tokens / 1000 : 128;
@@ -347,205 +364,216 @@
 </script>
 
 <div class="llm-config-form">
-  {#if title || description}
-    <header class="cfg-header">
-      {#if title}
-        <div class="cfg-title-row">
-          <h3 class="cfg-title">{title}</h3>
-          {#if statusLabel}
-            <span class="cfg-status cfg-status--{statusClass}">
-              <span class="cfg-status-dot" aria-hidden="true"></span>{statusLabel}
-            </span>
-          {/if}
-        </div>
-      {/if}
-      {#if description}
-        <p class="llm-config-lead">{description}</p>
-      {/if}
-    </header>
+  {#if description}
+    <p class="llm-config-lead">{description}</p>
   {/if}
 
-  <section class="cfg-card" aria-label={i18n.t('settings.model.card.connection')}>
-  <h4 class="cfg-card-title">{i18n.t('settings.model.card.connection')}</h4>
-  <div class="llm-config-field">
-    <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
-    <input
-      id={fieldId('base-url')}
-      type="text"
-      class="form-input"
-      bind:value={config.baseUrl}
-      placeholder={getBaseUrlPlaceholder()}
-    />
-  </div>
-
-  {#if showProtocolField}
-    <div class="llm-config-field protocol-field">
-      <label class="form-label" for={fieldId('protocol')}>{i18n.t('settings.model.field.apiProtocol')}</label>
-      <div class="protocol-control-row">
-        <SelectField id={fieldId('protocol')} bind:value={config.apiProtocol}
-          label={i18n.t('settings.model.field.apiProtocol')}
-          options={[{ value: 'openai_responses', label: i18n.t('settings.model.protocol.openaiResponses') }, { value: 'openai_chat', label: i18n.t('settings.model.protocol.openaiChat') }, { value: 'anthropic_messages', label: i18n.t('settings.model.protocol.anthropicMessages') }]} />
-        <div
-          class="protocol-endpoint"
-          aria-live="polite"
-          title={`POST ${protocolEndpointLabel()}`}
-        >
-          <span class="protocol-endpoint__label">{i18n.t('settings.model.protocol.endpoint')}</span>
-          <code>POST {protocolEndpointLabel()}</code>
-        </div>
-      </div>
-      <div class="protocol-behavior" role="note">
-        {i18n.t(protocolBehaviorKey(config.apiProtocol))}
-      </div>
+  <section class="settings-card" aria-label={i18n.t('settings.model.card.connection')}>
+    <div class="settings-card-head">
+      <h4 class="settings-section-title">{i18n.t('settings.model.card.connection')}</h4>
     </div>
-  {/if}
-
-  <div class="llm-config-field">
-      <label class="form-label" for={fieldId('api-key')}>{i18n.t('settings.model.field.apiKey')}</label>
-      <div class="api-key-wrapper">
+    <div class="settings-card-body model-config-grid">
+      <div class="llm-config-field connection-address">
+        <label class="form-label" for={fieldId('base-url')}>{i18n.t('settings.model.field.baseUrl')}</label>
         <input
-          id={fieldId('api-key')}
-          type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
-          class="form-input api-key-input"
-          bind:value={config.apiKey}
-          placeholder={config.apiProtocol === 'anthropic_messages' ? 'sk-ant-...' : 'sk-...'}
-          autocomplete="off"
+          id={fieldId('base-url')}
+          type="text"
+          class="form-input"
+          bind:value={config.baseUrl}
+          placeholder={getBaseUrlPlaceholder()}
         />
-        <button
-          type="button"
-          class="api-key-toggle"
-          onclick={() => (keyVisible[keyVisibleKey] = !keyVisible[keyVisibleKey])}
-          title={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
-        >
-          <Icon name={keyVisible[keyVisibleKey] ? 'eye-slash' : 'eye'} size={14} />
-        </button>
+      </div>
+
+      {#if showProtocolField}
+        <div class="llm-config-field">
+          <label class="form-label" for={fieldId('protocol')}>{i18n.t('settings.model.field.apiProtocol')}</label>
+          <SelectField id={fieldId('protocol')} bind:value={config.apiProtocol}
+            label={i18n.t('settings.model.field.apiProtocol')}
+            options={[{ value: 'openai_responses', label: i18n.t('settings.model.protocol.openaiResponses') }, { value: 'openai_chat', label: i18n.t('settings.model.protocol.openaiChat') }, { value: 'anthropic_messages', label: i18n.t('settings.model.protocol.anthropicMessages') }]} />
+          <div class="protocol-endpoint" aria-live="polite">
+            <span>{i18n.t('settings.model.protocol.endpoint')}</span>
+            <code>POST {protocolEndpointLabel()}</code>
+          </div>
+        </div>
+      {/if}
+
+      <div class="llm-config-field">
+        <label class="form-label" for={fieldId('api-key')}>{i18n.t('settings.model.field.apiKey')}</label>
+        <div class="api-key-wrapper">
+          <input
+            id={fieldId('api-key')}
+            type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
+            class="form-input"
+            bind:value={config.apiKey}
+            placeholder={config.apiProtocol === 'anthropic_messages' ? 'sk-ant-...' : 'sk-...'}
+            autocomplete="off"
+          />
+          <button
+            type="button"
+            class="api-key-toggle"
+            onclick={() => (keyVisible[keyVisibleKey] = !keyVisible[keyVisibleKey])}
+            aria-label={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
+            title={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
+          >
+            <Icon name={keyVisible[keyVisibleKey] ? 'eye-slash' : 'eye'} size={14} />
+          </button>
+        </div>
       </div>
     </div>
   </section>
 
   {#if showModelField || showAdvancedOptions || formType === 'vision'}
-  <section class="cfg-card" aria-label={i18n.t('settings.model.card.model')}>
-  <h4 class="cfg-card-title">{i18n.t('settings.model.card.model')}</h4>
-  <div
-    class="llm-config-field-row model-row"
-    class:has-level={showAdvancedOptions}
-    class:has-context-window={formType === 'vision'}
-  >
-    {#if showModelField}
-      <div class="llm-config-field">
-        <label class="form-label" for={fieldId('model')}>{i18n.t('settings.model.field.model')}</label>
-        <div class="model-combobox" bind:this={comboboxEl}>
-          <input
-            id={fieldId('model')}
-            type="text"
-            class="form-input"
-            bind:value={config.model}
-            onfocus={(e) => {
-              if ((modelLists[statusKey]?.length ?? 0) > 0) openModelList(statusKey, e.currentTarget);
-            }}
-          />
-          <button
-            class="model-fetch-btn"
-            type="button"
-            onclick={handleModelListAction}
-            disabled={fetchingModels[statusKey]}
-            aria-label={modelListActionTitle()}
-            title={modelListActionTitle()}
-          >
-            {#if fetchingModels[statusKey]}
-              <Icon name="refresh" size={12} />
-            {:else if (modelLists[statusKey]?.length ?? 0) > 0}
-              <Icon name="chevron-down" size={12} />
-            {:else}
-              <Icon name="download" size={12} />
-            {/if}
-          </button>
-          {#if modelListOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
-            <div
-              bind:this={modelListEl}
-              use:portalToBody
-              class="model-select-list"
-              data-magi-surface="popover"
-              style="top: {modelListPosition.top}px; left: {modelListPosition.left}px; width: {modelListPosition.width}px;"
-            >
-              {#if modelLists[statusKey].length > 10}
-                <input class="form-input model-select-search" type="search" bind:value={modelQuery}
-                  aria-label={i18n.t('selection.searchFor', { label: i18n.t('settings.model.field.model') })}
-                  placeholder={i18n.t('selection.search')} />
-              {/if}
-              <div role="listbox" aria-label={i18n.t('settings.model.field.model')}>
-              {#each filteredModels as m}
-                <button
-                  type="button"
-                  class="model-select-option"
-                  role="option"
-                  aria-selected={config.model === m}
-                  class:selected={config.model === m}
-                  onclick={() => { selectModel(statusKey, m); }}
+    <section class="settings-card" aria-label={i18n.t('settings.model.card.model')}>
+      <div class="settings-card-head">
+        <h4 class="settings-section-title">{i18n.t('settings.model.card.model')}</h4>
+      </div>
+      <div class="settings-card-body model-config-grid model-row">
+        {#if showModelField}
+          <div class="llm-config-field">
+            <label class="form-label" for={fieldId('model')}>{i18n.t('settings.model.field.model')}</label>
+            <div class="model-combobox" bind:this={comboboxEl}>
+              <input
+                id={fieldId('model')}
+                type="text"
+                class="form-input"
+                bind:value={config.model}
+                onfocus={(e) => {
+                  if ((modelLists[statusKey]?.length ?? 0) > 0) openModelList(statusKey, e.currentTarget);
+                }}
+              />
+              <button
+                class="btn btn--sm btn--secondary model-fetch-btn"
+                type="button"
+                onclick={handleModelListAction}
+                disabled={fetchingModels[statusKey]}
+                aria-label={modelListActionTitle()}
+                title={modelListActionTitle()}
+              >
+                {#if fetchingModels[statusKey]}
+                  <Icon name="refresh" size={14} class="spinning" />
+                {:else if (modelLists[statusKey]?.length ?? 0) > 0}
+                  <Icon name="chevron-down" size={14} />
+                {:else}
+                  <Icon name="download" size={14} />
+                {/if}
+                {modelListActionTitle()}
+              </button>
+              {#if modelListOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
+                <div
+                  bind:this={modelListEl}
+                  use:portalToBody
+                  class="model-select-list"
+                  data-magi-surface="popover"
+                  style="top: {modelListPosition.top}px; left: {modelListPosition.left}px; width: {modelListPosition.width}px;"
                 >
-                  {m}
-                </button>
-              {:else}
-                <p class="select-empty" role="status">{i18n.t('selection.empty')}</p>
-              {/each}
-              </div>
+                  {#if modelLists[statusKey].length > 10}
+                    <input class="form-input model-select-search" type="search" bind:value={modelQuery}
+                      aria-label={i18n.t('selection.searchFor', { label: i18n.t('settings.model.field.model') })}
+                      placeholder={i18n.t('selection.search')} />
+                  {/if}
+                  <div role="listbox" aria-label={i18n.t('settings.model.field.model')}>
+                    {#each filteredModels as m}
+                      <button
+                        type="button"
+                        class="model-select-option"
+                        role="option"
+                        aria-selected={config.model === m}
+                        class:selected={config.model === m}
+                        title={m}
+                        data-model-id={m}
+                        onclick={() => { selectModel(statusKey, m); }}
+                      >
+                        {modelDisplayNames[statusKey]?.[m] || m}
+                      </button>
+                    {:else}
+                      <p class="select-empty" role="status">{i18n.t('selection.empty')}</p>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
             </div>
-          {/if}
-        </div>
-      </div>
-    {/if}
+          </div>
+        {/if}
 
-    {#if formType === 'vision'}
-      <div class="llm-config-field vision-context-window-field">
-        <label class="form-label vision-context-window-label" for="vision-context-window">
-          {i18n.t('settings.model.field.contextWindow')}
-          <span
-            class="vision-context-window-help"
-            title={i18n.t('settings.model.visionContextWindowHint')}
-            aria-label={i18n.t('settings.model.visionContextWindowHint')}
-          >
-            <Icon name="info" size={12} />
-          </span>
-        </label>
-        <div class="vision-context-window-input">
-          <input
-            id="vision-context-window"
-            type="number"
-            class="form-input"
-            min="16"
-            max="10000"
-            step="1"
-            value={visionContextWindowInK()}
-            oninput={handleVisionContextWindowInput}
-          />
-          <span aria-hidden="true">K</span>
-        </div>
-      </div>
-    {/if}
+        {#if showAdvancedOptions && config?.model}
+          <div class="llm-config-field">
+            <span class="form-label" id={fieldId('level-label')}>{i18n.t(formType === 'worker' ? 'settings.model.reasoning.workerDefault' : 'settings.model.field.level')}</span>
+            <div class="reasoning-control" role="group" aria-labelledby={fieldId('level-label')}>
+              {#if reasoningStatus === 'loading'}
+                <div class="reasoning-status" role="status"><Icon name="loader" size={14} class="spinning" />{i18n.t('settings.model.reasoning.loading')}</div>
+              {:else if reasoningStatus === 'failed'}
+                <div class="reasoning-status reasoning-status--error">
+                  <span role="alert">{i18n.t('settings.model.reasoning.failed')}</span>
+                  <button type="button" class="btn btn--sm btn--secondary" onclick={() => reasoningRetry++}>{i18n.t('input.mainModelPicker.retry')}</button>
+                </div>
+                <p class="settings-hint">{i18n.t('settings.model.reasoning.preserved', {
+                  effort: i18n.t(config.reasoningEffort == null ? 'input.mainModelPicker.reasoning.providerDefault' : `input.mainModelPicker.reasoning.${config.reasoningEffort}`),
+                })}</p>
+              {:else if reasoningCapability?.supportedEfforts.length}
+                <SelectField id={fieldId('level')} value={config.reasoningEffort == null ? '' : reasoningCapability.supportedEfforts.includes(config.reasoningEffort) ? config.reasoningEffort : reasoningCapability.defaultEffort ?? ''}
+                  onchange={(value) => { config.reasoningEffort = value || null; reasoningAdjusted = false; }}
+                  label={i18n.t(formType === 'worker' ? 'settings.model.reasoning.workerDefault' : 'settings.model.field.level')}
+                  options={[{value:'',label:i18n.t('input.mainModelPicker.reasoning.providerDefault')}, ...reasoningCapability.supportedEfforts.map(value => ({value,label:i18n.t(`input.mainModelPicker.reasoning.${value}`)}))]} />
+              {:else}
+                <div class="reasoning-status">{i18n.t(reasoningCapability?.source === 'unknown' ? 'input.mainModelPicker.reasoning.unknown' : 'input.mainModelPicker.reasoning.unsupported')}</div>
+              {/if}
+            </div>
+          </div>
+        {/if}
+        {#if formType === 'vision'}
+          <div class="llm-config-field vision-context-window-field">
+            <label class="form-label vision-context-window-label" for="vision-context-window">
+              {i18n.t('settings.model.field.contextWindow')}
+              <span
+                class="vision-context-window-help"
+                title={i18n.t('settings.model.visionContextWindowHint')}
+                aria-label={i18n.t('settings.model.visionContextWindowHint')}
+              >
+                <Icon name="info" size={12} />
+              </span>
+            </label>
+            <div class="vision-context-window-input">
+              <input
+                id="vision-context-window"
+                type="number"
+                class="form-input"
+                min="16"
+                max="10000"
+                step="1"
+                value={visionContextWindowInK()}
+                oninput={handleVisionContextWindowInput}
+              />
+              <span aria-hidden="true">K</span>
+            </div>
+          </div>
+        {/if}
 
-    {#if showAdvancedOptions}
-      <div class="llm-config-field">
-        <label class="form-label" for={fieldId('level')}>{i18n.t('settings.model.field.level')}</label>
-        <SelectField id={fieldId('level')} bind:value={config.reasoningEffort}
-          label={i18n.t('settings.model.field.level')}
-          options={[{ value: 'low', label: i18n.t('settings.model.reasoning.low') }, { value: 'medium', label: i18n.t('settings.model.reasoning.medium') }, { value: 'high', label: i18n.t('settings.model.reasoning.high') }, { value: 'xhigh', label: i18n.t('settings.model.reasoning.xhigh') }]} />
+        {#if showAdvancedOptions && config?.model}
+          <div class="model-reasoning-notes">
+            {#if reasoningAdjusted}
+              <p class="settings-notice" role="status">{i18n.t('settings.model.reasoning.adjusted')}</p>
+            {/if}
+            {#if reasoningCapability?.supportedEfforts.length}
+              <p class="settings-hint">{i18n.t('settings.model.reasoning.cost')} {#if config.reasoningEffort == null}{i18n.t('settings.model.reasoning.defaultHint')}{/if}</p>
+            {/if}
+            <p class="settings-hint">{i18n.t(formType === 'worker' ? 'settings.model.reasoning.workerScope' : 'settings.model.reasoning.savedScope')}</p>
+          </div>
+        {/if}
       </div>
-    {/if}
-  </div>
-  </section>
+    </section>
   {/if}
 
   {#if formType === 'vision'}
-    <section class="cfg-card vision-routing-settings" aria-labelledby="vision-routing-title">
-        <div class="vision-routing-heading">
-          <div>
-            <div class="form-label" id="vision-routing-title">
-              {i18n.t('settings.model.visionRoutingRules')}
-            </div>
-            <div class="llm-config-hint">{i18n.t('settings.model.visionRoutingRulesHint')}</div>
-          </div>
+    <section class="settings-card" aria-labelledby="vision-routing-title">
+      <div class="settings-card-head">
+        <div class="settings-card-title">
+          <h4 class="settings-section-title" id="vision-routing-title">
+            {i18n.t('settings.model.visionRoutingRules')}
+          </h4>
+          <div class="settings-section-desc">{i18n.t('settings.model.visionRoutingRulesHint')}</div>
         </div>
-
+      </div>
+      <div class="settings-card-body">
         <details class="vision-builtin-rules">
           <summary>
             <span class="vision-rules-summary__title">
@@ -613,21 +641,18 @@
             </div>
           {/if}
         </div>
-
+      </div>
     </section>
   {/if}
 
-  <div
-    class="apple-dashboard-bar model-form-actions"
-    class:model-form-actions--buttons-only={!isDirty}
-  >
-    {#if isDirty}
-      <span class="model-form-action-desc">
-        <span class="model-form-dirty-tag" title={i18n.t('settings.model.unsavedChanges')}>
-          {i18n.t('settings.model.unsaved')}
-        </span>
-      </span>
-    {/if}
+  <div class="apple-dashboard-bar model-form-actions">
+    <span class="model-form-action-desc" role="status">
+      {#if isDirty}
+        {i18n.t('settings.model.unsavedChanges')}
+      {:else if showSavedLabel}
+        {i18n.t('settings.model.saved')}
+      {/if}
+    </span>
     <div class="settings-section-actions">
       <button
         class="btn btn--secondary btn--sm"
@@ -673,6 +698,7 @@
 
 <style>
   .llm-config-form {
+    container: model-config / inline-size;
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
@@ -684,56 +710,33 @@
     gap: var(--space-2);
   }
 
-  .llm-config-field-row {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: var(--space-3);
-  }
-  .llm-config-field-row.model-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .llm-config-field-row.model-row.has-level {
-    grid-template-columns: minmax(0, 1fr) 140px;
-  }
-  .llm-config-field-row.model-row.has-context-window {
-    grid-template-columns: minmax(0, 1fr) minmax(118px, 0.42fr);
+  .model-config-grid {
+    align-items: start;
   }
 
-  .cfg-header { display: flex; flex-direction: column; gap: var(--space-1); }
-  .cfg-title-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
-  .cfg-title { margin: 0; font-size: var(--text-lg); font-weight: var(--font-semibold); color: var(--foreground); }
-  .cfg-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 1px 9px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
+  .connection-address,
+  .model-reasoning-notes {
+    grid-column: 1 / -1;
   }
-  .cfg-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--foreground-muted); }
-  .cfg-status--success .cfg-status-dot { background: var(--success, #16a34a); }
-  .cfg-status--success { color: var(--foreground); }
-  .cfg-status--warning .cfg-status-dot, .cfg-status--checking .cfg-status-dot { background: var(--warning, #d97706); }
-  .cfg-status--error .cfg-status-dot { background: var(--error, #dc2626); }
-  .cfg-status--error { color: var(--error, #dc2626); border-color: color-mix(in srgb, var(--error, #dc2626) 40%, var(--border)); }
 
-  /* 分组卡片：连接 / 模型 / 路由规则各自成块，字段不再平铺成一长条。 */
-  .cfg-card {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    padding: var(--space-4);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-lg);
+  .model-reasoning-notes :global(.settings-hint:first-child) {
+    margin-top: 0;
   }
-  .cfg-card-title {
+
+  @container model-config (min-width: 640px) {
+    .model-config-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--space-4);
+    }
+  }
+
+  .llm-config-form,
+  .llm-config-field {
+    min-width: 0;
+  }
+
+  .llm-config-form :global(.settings-section-title) {
     margin: 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    letter-spacing: 0.04em;
   }
 
   .llm-config-lead {
@@ -750,20 +753,23 @@
     color: var(--foreground-muted);
   }
 
-  .protocol-field {
-    gap: var(--space-2);
+  .reasoning-control {
+    min-width: 0;
   }
 
-  .protocol-control-row {
+  .reasoning-status {
     display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-3);
     align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    min-height: var(--btn-height-lg);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
   }
 
-  .protocol-control-row > :global(.select-field) {
-    flex: 0 1 300px;
-    max-width: 100%;
+  .reasoning-status--error > span {
+    color: var(--error);
   }
 
   .vision-context-window-field {
@@ -804,20 +810,6 @@
     font-weight: var(--font-medium);
     transform: translateY(-50%);
     pointer-events: none;
-  }
-
-  .vision-routing-settings {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-
-  .vision-routing-heading {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
   }
 
   .vision-builtin-rules {
@@ -954,34 +946,20 @@
   }
 
   .protocol-endpoint {
-    display: flex;
-    align-items: center;
+    display: inline-flex;
+    align-items: baseline;
+    flex-wrap: wrap;
     gap: var(--space-2);
     min-width: 0;
-    min-height: var(--btn-height-md);
-    padding: 0;
-  }
-
-  .protocol-endpoint__label {
-    flex: 0 0 auto;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
   }
 
   .protocol-endpoint code {
-    min-width: 0;
-    overflow: hidden;
     color: var(--foreground);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .protocol-behavior {
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.45;
+    overflow-wrap: anywhere;
   }
 
   .api-key-wrapper {
@@ -1016,36 +994,20 @@
   }
 
   .model-combobox {
-    position: relative;
-  }
-  .model-combobox .form-input {
-    padding-right: 32px;
-  }
-  .model-fetch-btn {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
     display: flex;
     align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
+    gap: var(--space-2);
+    min-width: 0;
   }
-  .model-fetch-btn:hover {
-    background: var(--secondary);
-    color: var(--foreground);
+
+  .model-combobox .form-input {
+    flex: 1;
+    min-width: 0;
   }
-  .model-fetch-btn:disabled {
-    cursor: wait;
-    opacity: 0.6;
+
+  .model-fetch-btn {
+    flex: 0 0 auto;
+    max-width: 100%;
   }
 
   .model-select-list {
@@ -1083,101 +1045,41 @@
     background: var(--primary-muted, rgba(var(--primary-rgb, 100, 149, 237), 0.1));
   }
 
-  /* 操作栏吸底：长表单（识图规则）滚动时「测试 / 保存」始终可达。 */
   .model-form-actions {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: var(--space-3);
-    margin-top: var(--space-2);
     padding: var(--space-3) 0;
-  }
-
-  .model-form-actions--buttons-only {
-    justify-content: flex-end;
-  }
-
-  .model-form-actions :global(.settings-section-actions) {
-    flex: 0 0 auto;
+    border-top: var(--magi-hairline) solid var(--border-subtle);
   }
 
   .model-form-action-desc {
     min-width: 0;
-    font-size: 12px;
-    line-height: 1.5;
+    flex: 1;
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
+    overflow-wrap: anywhere;
+  }
+
+  .vision-custom-rules__header,
+  .vision-builtin-rules summary {
     flex-wrap: wrap;
   }
 
-  .model-form-dirty-tag {
-    display: inline-flex;
-    align-items: center;
-    padding: 1px 8px;
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    line-height: 1.5;
-    color: var(--warning, #d97706);
-    background: var(--warning-bg, rgba(217, 119, 6, 0.12));
-    border: var(--magi-hairline) solid var(--warning-border, rgba(217, 119, 6, 0.3));
-    border-radius: var(--radius-full);
-  }
-
-  @container settings-model (max-width: 640px) {
+  @container settings-model (max-width: 480px) {
     .model-form-actions {
-      flex-direction: column;
       align-items: stretch;
-      gap: var(--space-3);
-      margin-top: var(--space-4);
+      flex-direction: column;
     }
     .model-form-actions :global(.settings-section-actions) {
-      width: 100%;
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: var(--space-2);
+      width: 100%;
     }
     .model-form-actions :global(.btn) {
       width: 100%;
       justify-content: center;
-    }
-    .model-form-actions--buttons-only {
-      align-items: stretch;
-    }
-    .llm-config-field-row,
-    .llm-config-field-row.model-row,
-    .llm-config-field-row.model-row.has-level,
-    .llm-config-field-row.model-row.has-context-window {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  @media (max-width: 768px) {
-    .model-form-actions {
-      flex-direction: column;
-      align-items: stretch;
-      gap: var(--space-3);
-      margin-top: var(--space-4);
-    }
-    .model-form-actions :global(.settings-section-actions) {
-      width: 100%;
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: var(--space-2);
-    }
-    .model-form-actions :global(.btn) {
-      width: 100%;
-      justify-content: center;
-    }
-    .model-form-actions--buttons-only {
-      align-items: stretch;
-    }
-    .llm-config-field-row,
-    .llm-config-field-row.model-row,
-    .llm-config-field-row.model-row.has-level,
-    .llm-config-field-row.model-row.has-context-window {
-      grid-template-columns: 1fr;
     }
   }
 </style>

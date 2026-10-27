@@ -422,7 +422,7 @@
         onclick={() => { menuOpen = !menuOpen; }}
       >
         <span class="turn-navigation-capsule-count">{activeItem?.index || 0}/{items.length}</span>
-        <span class="turn-navigation-status-dot" class:complete={activeItem?.status === 'completed'}></span>
+        <span class="turn-navigation-status-dot" class:running={activeItem?.status === 'running' || activeItem?.status === 'pending'} class:complete={activeItem?.status === 'completed'}></span>
       </button>
     </div>
   </div>
@@ -625,6 +625,9 @@
     height: 6px;
     border-radius: 50%;
     background: var(--primary);
+  }
+
+  .turn-navigation-status-dot.running {
     animation: turnNavigationPulse 1.5s ease-in-out infinite;
   }
 
@@ -732,9 +735,5 @@
       transition: none;
     }
 
-    .turn-navigation-marker.running::before,
-    .turn-navigation-status-dot {
-      animation: none;
-    }
   }
 </style>

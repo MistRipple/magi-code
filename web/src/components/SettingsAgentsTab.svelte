@@ -638,6 +638,8 @@
                       <div class="binding-hint err">{i18n.t('settings.agents.engineDisabledHint')}</div>
                     {:else if selected.status === 'inherit'}
                       <div class="binding-hint">{i18n.t('settings.agents.inheritOrchestratorHint')}</div>
+                    {:else}
+                      <div class="binding-hint">{i18n.t('settings.agents.boundReasoningHint')}</div>
                     {/if}
                   </section>
                 </div>

@@ -63,10 +63,14 @@ pub fn build_model_resolution_identity(
         .clone()
         .or_else(|| fingerprint_secret(model_config.api_key.as_deref()));
     let reasoning_effort_str = match model_config.reasoning_effort {
+        Some(ReasoningEffort::None) => "none",
+        Some(ReasoningEffort::Minimal) => "minimal",
         Some(ReasoningEffort::Low) => "low",
         Some(ReasoningEffort::Medium) => "medium",
         Some(ReasoningEffort::High) => "high",
         Some(ReasoningEffort::Xhigh) => "xhigh",
+        Some(ReasoningEffort::Max) => "max",
+        Some(ReasoningEffort::Ultra) => "ultra",
         None => "default",
     };
     let identity_parts = [

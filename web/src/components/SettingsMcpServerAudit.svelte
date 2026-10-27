@@ -107,7 +107,7 @@
   }
 
   function formatTime(ms: number): string {
-    return new Date(ms).toLocaleString();
+    return new Date(ms).toLocaleString(i18n.locale);
   }
 
   // 审批处理等外部变化通知刷新。
@@ -179,9 +179,17 @@
 </div>
 
 <style>
+  .mcp-card {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: var(--space-3);
+    padding: var(--space-4);
+  }
 
   .audit-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
     gap: 8px;
@@ -201,6 +209,7 @@
   }
 
   .audit-filter {
+    flex: 1 1 180px;
     min-width: min(180px, 100%);
     max-width: 100%;
   }
@@ -209,29 +218,22 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
     font-size: var(--text-xs);
-  }
-
-  .field :global(.select-field select) {
-    padding: 4px 8px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 6px;
-    font-size: 12px;
-    background: transparent;
-    color: inherit;
   }
 
   .meta {
     margin: 0;
     font-size: var(--text-xs);
-    opacity: 0.66;
+    color: var(--foreground-muted);
+    line-height: 1.5;
     overflow-wrap: anywhere;
   }
 
   .rows {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 0;
     margin: 4px 0 0;
     padding: 0;
     list-style: none;
@@ -243,17 +245,17 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+    min-width: 0;
+    padding: var(--space-3) 0;
   }
 
-
-
-
+  .rows li + li { border-top: var(--magi-hairline) solid var(--border-subtle); }
+  .rows .settings-row-copy { overflow-wrap: anywhere; }
+  .badge--off { color: var(--foreground-muted); }
 
   .pager {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: center;
     gap: 12px;
@@ -264,6 +266,10 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+  }
+
+  @container mcp-server (max-width: 420px) {
+    .mcp-card { padding: var(--space-3); }
   }
 
 </style>

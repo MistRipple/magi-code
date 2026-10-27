@@ -45,7 +45,7 @@ app.whenReady().then(async () => {
         const result = await surfaces.sendCdp(message.binding, message.method, message.params, message.session_id);
         receive({ data: { ...reply, result } });
       } catch (cause) {
-        receive({ data: { ...reply, error: { code: 'browser_cdp_error', message: String(cause), recoverable: false, side_effect_started: false } } });
+        receive({ data: { ...reply, error: { code: 'browser_cdp_error', message: String(cause), recoverable: false, side_effect_started: false, diagnostic: null } } });
       }
     },
   }));
@@ -72,76 +72,88 @@ app.whenReady().then(async () => {
   const target = (name: string) => ({ element_ref: snap.root.children.find((node: any) => node.name === name)?.element_ref });
   const click = (name: string) => run('click', { target: target(name) });
   const type = (name: string, text: string, replace = true) => run('type', { target: target(name), text, replace, submit_key: null });
-  assert.equal(JSON.stringify(snap).includes('SECRET_'), false);
-  assert.equal(snap.root.children.filter((node: any) => node.sensitive_input_kind).length, 3);
-  await guest.executeJavaScript('for(const e of document.querySelectorAll("#secrets input,#secrets textarea,#secrets select")) Object.defineProperty(e,"value",{get(){throw new Error("sensitive value read")}});undefined');
-  const read = await run('devtools', { operation: 'read', arguments: {} });
-  success(read);
-  assert.equal(JSON.stringify(read).includes('SECRET_'), false);
-  await snapshot();
-  const tiny = await snapshot({ max_nodes: 96, max_text_bytes: 12 });
-  assert.ok(tiny.root.children.length > 0);
-  assert.ok(tiny.truncated && tiny.text_bytes <= 12);
-  const scoped = await snapshot(undefined, '#scope');
-  assert.ok(scoped.root.children.some((node: any) => node.name === 'Scoped'));
-  assert.ok(!scoped.root.children.some((node: any) => node.name === 'Click'));
-  await guest.executeJavaScript('document.body.insertAdjacentHTML("beforeend", "<div id=large>"+"<input aria-label=大量输入><a href=#>链接</a>".repeat(150)+"<section id=late><button>Late target</button></section></div>")');
-  const bounded = await snapshot();
-  assert.equal(bounded.returned_nodes, 96);
-  assert.equal(bounded.root.children.length, 96);
-  assert.equal(bounded.truncated, true);
-  assert.ok(bounded.root.children.some((node: any) => node.name === 'late'));
-  const bytes = (bounded.root.name ? Buffer.byteLength(bounded.root.name) : 0) + bounded.root.children.reduce((sum: number, node: any) => sum + ['role','name','value','description'].reduce((size, key) => size + (node[key] ? Buffer.byteLength(node[key]) : 0), 0), 0);
-  assert.equal(bounded.text_bytes, bytes);
-  const late = await snapshot(undefined, '#late');
-  assert.ok(late.root.children.some((node: any) => node.name === 'Late target'));
-  await guest.executeJavaScript('document.getElementById("large").remove()');
-  console.log('PASS sensitive values, UTF-8 budget, retained nodes and scoped snapshot');
-  snap = await snapshot();
-  for (const mode of ['hidden', 'host-focused', 'offscreen']) {
-    if (mode === 'host-focused') { win.show(); win.webContents.focus(); await win.webContents.executeJavaScript('host.focus()'); }
-    if (mode === 'offscreen') { await win.webContents.executeJavaScript('document.querySelector("webview").style.cssText="position:fixed;left:-12000px;width:1000px;height:700px"'); win.hide(); }
-    success(await click('Click'));
-    for (const [name, id, text] of [['Text', 'text', 'new'], ['Email', 'email', 'new@example.com'], ['Number', 'number', '34'], ['Textarea', 'textarea', '一行'], ['Editor', 'editor', 'hello']]) {
-      success(await type(name, text));
-      success(await type(name, name === 'Email' ? '.cn' : name === 'Number' ? '5' : '追加', false));
-      assert.equal(await guest.executeJavaScript('document.getElementById(' + JSON.stringify(id) + ').' + (id === 'editor' ? 'innerText' : 'value')), text + (name === 'Email' ? '.cn' : name === 'Number' ? '5' : '追加'));
-      success(await type(name, ''));
+  if (process.env.MAGI_ACTIONS_TEST_GROUP !== 'pointer') {
+    assert.equal(JSON.stringify(snap).includes('SECRET_'), false);
+    assert.equal(snap.root.children.filter((node: any) => node.sensitive_input_kind).length, 3);
+    await guest.executeJavaScript('for(const e of document.querySelectorAll("#secrets input,#secrets textarea,#secrets select")) Object.defineProperty(e,"value",{get(){throw new Error("sensitive value read")}});undefined');
+    const read = await run('devtools', { operation: 'read', arguments: {} });
+    success(read);
+    assert.equal(JSON.stringify(read).includes('SECRET_'), false);
+    await snapshot();
+    const tiny = await snapshot({ max_nodes: 96, max_text_bytes: 12 });
+    assert.ok(tiny.root.children.length > 0);
+    assert.ok(tiny.truncated && tiny.text_bytes <= 12);
+    const scoped = await snapshot(undefined, '#scope');
+    assert.ok(scoped.root.children.some((node: any) => node.name === 'Scoped'));
+    assert.ok(!scoped.root.children.some((node: any) => node.name === 'Click'));
+    await guest.executeJavaScript('document.body.insertAdjacentHTML("beforeend", "<div id=large>"+"<input aria-label=大量输入><a href=#>链接</a>".repeat(150)+"<section id=late><button>Late target</button></section></div>")');
+    const bounded = await snapshot();
+    assert.equal(bounded.returned_nodes, 96);
+    assert.equal(bounded.root.children.length, 96);
+    assert.equal(bounded.truncated, true);
+    assert.ok(bounded.root.children.some((node: any) => node.name === 'late'));
+    const bytes = (bounded.root.name ? Buffer.byteLength(bounded.root.name) : 0) + bounded.root.children.reduce((sum: number, node: any) => sum + ['role','name','value','description'].reduce((size, key) => size + (node[key] ? Buffer.byteLength(node[key]) : 0), 0), 0);
+    assert.equal(bounded.text_bytes, bytes);
+    const late = await snapshot(undefined, '#late');
+    assert.ok(late.root.children.some((node: any) => node.name === 'Late target'));
+    await guest.executeJavaScript('document.getElementById("large").remove()');
+    console.log('PASS sensitive values, UTF-8 budget, retained nodes and scoped snapshot');
+    snap = await snapshot();
+    for (const mode of ['hidden', 'host-focused', 'offscreen']) {
+      if (mode === 'host-focused') { win.show(); win.webContents.focus(); await win.webContents.executeJavaScript('host.focus()'); }
+      if (mode === 'offscreen') { await win.webContents.executeJavaScript('document.querySelector("webview").style.cssText="position:fixed;left:-12000px;width:1000px;height:700px"'); win.hide(); }
+      success(await click('Click'));
+      for (const [name, id, text] of [['Text', 'text', 'new'], ['Email', 'email', 'new@example.com'], ['Number', 'number', '34'], ['Textarea', 'textarea', '一行'], ['Editor', 'editor', 'hello']]) {
+        success(await type(name, text));
+        success(await type(name, name === 'Email' ? '.cn' : name === 'Number' ? '5' : '追加', false));
+        assert.equal(await guest.executeJavaScript('document.getElementById(' + JSON.stringify(id) + ').' + (id === 'editor' ? 'innerText' : 'value')), text + (name === 'Email' ? '.cn' : name === 'Number' ? '5' : '追加'));
+        success(await type(name, ''));
+      }
+    }
+    assert.equal(await guest.executeJavaScript('window.clicks'), 3);
+    assert.equal(await win.webContents.executeJavaScript('host.value'), '');
+    console.log('PASS native click exactly once; replace/append/clear in hidden, host-focused and offscreen guests');
+    await guest.executeJavaScript(`document.body.insertAdjacentHTML('beforeend', '<div role="option" tabindex="0" id="pointerOption">Pointer option</div><button id="downOnly">Down only</button>');window.optionSelections=0;pointerOption.onpointerup=()=>{window.optionSelections++;pointerOption.remove()};downOnly.onpointerdown=()=>downOnly.remove();undefined`);
+    snap = await snapshot();
+    success(await click('Pointer option'));
+    assert.equal(await guest.executeJavaScript('window.optionSelections'), 1);
+    assert.equal((await click('Down only')).status, 'indeterminate');
+    console.log('PASS option removed on trusted pointerup is confirmed; pointerdown-only button remains unconfirmed');
+    snap = await snapshot();
+    await guest.executeJavaScript('window.selectionKeyups=0;text.onkeyup=()=>{window.selectionKeyups++;history.replaceState(null,"","?selection-keyup")};undefined');
+    success(await type('Text', 'native editing command'));
+    assert.equal(await guest.executeJavaScript('text.value'), 'native editing command');
+    assert.equal(await guest.executeJavaScript('window.selectionKeyups'), 0);
+    await guest.executeJavaScript('text.onkeyup=null;undefined');
+    console.log('PASS text selection uses native editing commands without unrelated keyup navigation');
+    for (const name of ['Disabled', 'Blocked']) assert.equal((await click(name)).status, 'failed');
+    assert.equal((await type('Readonly', 'x')).status, 'failed');
+    assert.equal((await type('Limited', 'too long')).status, 'indeterminate');
+    success(await click('Shadow'));
+    success(await click('Frame'));
+    assert.deepEqual(await guest.executeJavaScript('[window.shadowClicks,window.frameClicks]'), [1, 1]);
+    await guest.executeJavaScript('frame.style.transform="scale(0.65)";frame.style.transformOrigin="top left"');
+    success(await click('Frame'));
+    assert.equal(await guest.executeJavaScript('window.frameClicks'), 2);
+    const multiline = 'first' + String.fromCharCode(10) + 'second';
+    success(await type('Editor', multiline));
+    success(await type('Editor', ' tail', false));
+    success(await type('Editor', ''));
+    await guest.executeJavaScript('editor.dir="rtl"');
+    success(await type('Editor', 'שלום'));
+    success(await type('Editor', ' עולם', false));
+    success(await type('Editor', ''));
+    await guest.executeJavaScript('document.body.insertAdjacentHTML("beforeend", "<select id=select aria-label=Select><option value=one>One</option><option value=two>Two</option></select>")');
+    snap = await snapshot();
+    success(await run('devtools', { operation: 'fill_form', arguments: { fields: [{ ...target('Select'), value: 'two' }] } }));
+    assert.equal(await guest.executeJavaScript('document.getElementById("select").value'), 'two');
+    success(await run('devtools', { operation: 'fill_form', arguments: { fields: [{ ...target('Check'), value: true }] } }));
+    assert.equal(await guest.executeJavaScript('check.checked'), true);
+    console.log('PASS disabled/obscured/readonly rejection, input mismatch, shadow DOM, scaled iframe, multiline editor and checkbox');
+    if (process.env.MAGI_ACTIONS_TEST_GROUP === 'input') {
+      win.destroy(); server.close(); app.exit(0); return;
     }
   }
-  assert.equal(await guest.executeJavaScript('window.clicks'), 3);
-  assert.equal(await win.webContents.executeJavaScript('host.value'), '');
-  console.log('PASS native click exactly once; replace/append/clear in hidden, host-focused and offscreen guests');
-  await guest.executeJavaScript('window.selectionKeyups=0;text.onkeyup=()=>{window.selectionKeyups++;history.replaceState(null,"","?selection-keyup")};undefined');
-  success(await type('Text', 'native editing command'));
-  assert.equal(await guest.executeJavaScript('text.value'), 'native editing command');
-  assert.equal(await guest.executeJavaScript('window.selectionKeyups'), 0);
-  await guest.executeJavaScript('text.onkeyup=null;undefined');
-  console.log('PASS text selection uses native editing commands without unrelated keyup navigation');
-  for (const name of ['Disabled', 'Blocked']) assert.equal((await click(name)).status, 'failed');
-  assert.equal((await type('Readonly', 'x')).status, 'failed');
-  assert.equal((await type('Limited', 'too long')).status, 'indeterminate');
-  success(await click('Shadow'));
-  success(await click('Frame'));
-  assert.deepEqual(await guest.executeJavaScript('[window.shadowClicks,window.frameClicks]'), [1, 1]);
-  await guest.executeJavaScript('frame.style.transform="scale(0.65)";frame.style.transformOrigin="top left"');
-  success(await click('Frame'));
-  assert.equal(await guest.executeJavaScript('window.frameClicks'), 2);
-  const multiline = 'first' + String.fromCharCode(10) + 'second';
-  success(await type('Editor', multiline));
-  success(await type('Editor', ' tail', false));
-  success(await type('Editor', ''));
-  await guest.executeJavaScript('editor.dir="rtl"');
-  success(await type('Editor', 'שלום'));
-  success(await type('Editor', ' עולם', false));
-  success(await type('Editor', ''));
-  await guest.executeJavaScript('document.body.insertAdjacentHTML("beforeend", "<select id=select aria-label=Select><option value=one>One</option><option value=two>Two</option></select>")');
-  snap = await snapshot();
-  success(await run('devtools', { operation: 'fill_form', arguments: { fields: [{ ...target('Select'), value: 'two' }] } }));
-  assert.equal(await guest.executeJavaScript('document.getElementById("select").value'), 'two');
-  success(await run('devtools', { operation: 'fill_form', arguments: { fields: [{ ...target('Check'), value: true }] } }));
-  assert.equal(await guest.executeJavaScript('check.checked'), true);
-  console.log('PASS disabled/obscured/readonly rejection, input mismatch, shadow DOM, scaled iframe, multiline editor and checkbox');
   // 同一真实 guest 验证坐标点击、悬停、下拉禁用与原生拖拽，复用现有验收入口。
   await guest.executeJavaScript(`document.body.innerHTML = '<button id="point">Point</button><button id="nav" onclick="location.href=&quot;/next&quot;">Navigate</button><select id="choices" aria-label="Choices" multiple><option value="one" selected>One</option><option value="two">Two</option><option value="disabled" disabled>Disabled</option><optgroup disabled><option value="group">Group</option></optgroup></select><div id="dragSource" draggable="true" style="width:100px;height:80px;background:red">Source</div><div id="dragTarget" style="width:100px;height:80px;background:blue;margin-left:200px">Target</div><button id="far" style="margin-top:2400px">Far</button>';undefined`);
   await guest.executeJavaScript(`window.clicks=0;window.doubles=0;window.hovers=0;window.changes=0;window.drops=0;window.trusted=[];window.cancelDrag=false;window.acceptDrop=true;
@@ -159,6 +171,34 @@ app.whenReady().then(async () => {
   success(await run('devtools',{operation:'hover',arguments:target('Far')}));
   assert.equal(await guest.executeJavaScript('window.hovers'), 1);
   assert.ok(await guest.executeJavaScript('scrollY > 0'));
+  assert.equal(await guest.executeJavaScript('far.matches(":hover")'), true);
+  const hoverScroll = await guest.executeJavaScript('scrollY');
+  success(await run('devtools',{operation:'hover',arguments:target('Far')}));
+  assert.equal(await guest.executeJavaScript('scrollY'), hoverScroll);
+  assert.equal(await guest.executeJavaScript('window.hovers'), 1);
+  assert.equal(await guest.executeJavaScript('window.clicks'), 2);
+  // 收到 mousemove 不等于最终仍悬停：hover 处理器可能立即把目标移走。
+  await guest.executeJavaScript(`document.body.insertAdjacentHTML('beforeend', '<button id="hoverMoving" style="position:fixed;left:80px;top:80px;cursor:pointer">Hover moving</button>');hoverMoving.onpointermove=()=>{hoverMoving.style.left='300px';hoverMoving.onpointermove=null};undefined`);
+  snap = await snapshot();
+  const movedHover = await run('devtools',{operation:'hover',arguments:target('Hover moving')});
+  assert.equal(movedHover.status, 'indeterminate');
+  assert.equal((movedHover as any).payload.code, 'browser_target_obscured');
+  await guest.executeJavaScript('hoverMoving.remove();undefined');
+  console.log('PASS hover confirms current hit, repeated hover preserves scroll, and never clicks');
+  // 原生光标移动与按下之间页面可能重排；只允许在尚未按下时重新定位同一节点。
+  await guest.executeJavaScript(`document.body.insertAdjacentHTML('beforeend', '<button id="moving" style="position:fixed;left:80px;top:80px">Moving</button>');window.movingClicks=0;moving.onpointermove=()=>{moving.style.left='300px';moving.onpointermove=null};moving.onclick=()=>window.movingClicks++;undefined`);
+  snap = await snapshot();
+  success(await click('Moving'));
+  assert.equal(await guest.executeJavaScript('window.movingClicks'), 1);
+  await guest.executeJavaScript('moving.remove();undefined');
+  await guest.executeJavaScript(`document.body.insertAdjacentHTML('beforeend', '<button id="coveredAfterMove" style="position:fixed;left:80px;top:80px">Covered after move</button>');window.coveredClicks=0;coveredAfterMove.onclick=()=>window.coveredClicks++;coveredAfterMove.onpointermove=()=>{const e=document.createElement('div');e.id='lateCover';e.style='position:fixed;left:80px;top:80px;width:200px;height:100px;z-index:999';document.body.append(e)};undefined`);
+  snap = await snapshot();
+  const obscured = await click('Covered after move');
+  assert.equal(obscured.status, 'indeterminate');
+  assert.equal((obscured as any).payload.code, 'browser_target_obscured');
+  assert.equal(await guest.executeJavaScript('window.coveredClicks'), 0);
+  await guest.executeJavaScript('coveredAfterMove.remove();lateCover.remove();undefined');
+  console.log('PASS target reflow before mouse press relocates the same node and clicks once');
   await guest.executeJavaScript('(()=>{const r=far.getBoundingClientRect();const cover=document.createElement("div");cover.id="hoverCover";Object.assign(cover.style,{position:"fixed",left:r.x+"px",top:r.y+"px",width:r.width+"px",height:r.height+"px",zIndex:99});document.body.append(cover)})()');
   assert.equal((await run('devtools',{operation:'hover',arguments:target('Far')})).status, 'failed');
   await guest.executeJavaScript('document.getElementById("hoverCover").remove()');

@@ -1090,16 +1090,8 @@
   .agent-status--running { color: color-mix(in srgb, var(--success) 78%, var(--foreground)); }
   .agent-status--pending { color: color-mix(in srgb, var(--warning) 78%, var(--foreground)); }
 
-  :global(.spinning) {
-    animation: agent-center-spin 0.9s linear infinite;
-  }
-
   .mobile-backdrop {
     display: none;
-  }
-
-  @keyframes agent-center-spin {
-    to { transform: rotate(360deg); }
   }
 
   @media (max-width: 768px) {

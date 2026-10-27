@@ -1525,33 +1525,9 @@ impl MagiTurnHarness {
                 .with_shared_runner_manager(Arc::new(runner_manager));
             let completion_state = state.clone();
             notifier.set_observer(move |notification| {
-                let Some(session_id) = notification.session_id.as_ref() else {
-                    return;
-                };
-                if matches!(
-                    notification.status,
-                    magi_core::TaskStatus::Completed
-                        | magi_core::TaskStatus::Failed
-                        | magi_core::TaskStatus::Killed
-                ) {
-                    completion_state
-                        .release_finished_task_resources(session_id, &notification.task_id);
-                }
-                let Some(turn_id) = notification.turn_id.as_deref() else {
-                    return;
-                };
-                let runner_status = match notification.status {
-                    magi_core::TaskStatus::Completed => "completed",
-                    magi_core::TaskStatus::Failed => "failed",
-                    magi_core::TaskStatus::Killed => "killed",
-                    _ => return,
-                };
-                crate::task_turn_finalize::schedule_background_session_task_turn_finalize(
-                    completion_state.clone(),
-                    session_id.clone(),
-                    notification.root_task_id,
-                    runner_status,
-                    turn_id.to_string(),
+                crate::task_turn_finalize::handle_task_completion_notification(
+                    &completion_state,
+                    notification,
                 );
             });
         }
@@ -11309,6 +11285,101 @@ done
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn personal_agent_cancel_preserves_the_parent_turn_and_delivers_settled_receipt() {
+        let harness = MagiTurnHarness::new_task("个人主线收到取消回执后继续完成");
+        harness
+            .provider
+            .set_agent_spawn_then_wait("个人主线收到取消回执后继续完成");
+        {
+            let mut provider = harness.provider.state.lock().unwrap();
+            if let Some(ProviderBehavior::AgentSpawnThenWait { child_steps, .. }) =
+                &mut provider.behavior
+            {
+                *child_steps = vec![(
+                    "shell_exec".into(),
+                    serde_json::json!({"command":"sleep 30","access_mode":"read_only"}).to_string(),
+                )];
+            }
+        }
+        let state_for_cancel = harness.state.clone();
+        let sessions = harness.state.session_store.clone();
+        let tools = harness.state.tool_registry().unwrap().clone();
+        harness.provider.state.lock().unwrap().agent_cancel_ready = Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if sessions.sessions().iter().any(|session| {
+                    tools.has_active_executions(&magi_tool_runtime::ToolExecutionContextQuery {
+                        session_id: Some(session.session_id.clone()),
+                        ..Default::default()
+                    })
+                }) {
+                    // 与 daemon 一样，终态回调可能携带普通子代理的原 Session/Turn。
+                    let session = sessions.sessions().into_iter().next().unwrap();
+                    let turn = sessions
+                        .runtime_sidecar(&session.session_id)
+                        .unwrap()
+                        .current_turn
+                        .unwrap();
+                    for child in state_for_cancel
+                        .task_store()
+                        .unwrap()
+                        .all_tasks()
+                        .into_iter()
+                        .filter(|task| task.parent_task_id.is_some())
+                    {
+                        state_for_cancel
+                            .task_completion_notifier()
+                            .unwrap()
+                            .bind_task_context(
+                                &child.task_id,
+                                Some(session.session_id.clone()),
+                                Some(turn.turn_id.clone()),
+                            );
+                    }
+                    break;
+                }
+                assert!(Instant::now() < deadline, "子代理应先执行真实 Shell");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let accepted = harness
+            .submit_task(
+                "请派发代理并取消，主线读取回执后继续",
+                "personal-agent-cancel",
+                "personal-agent-cancel-user",
+            )
+            .await
+            .unwrap();
+        let session = SessionId::new(accepted.session_id);
+        let turn = harness
+            .wait_for_terminal(&session, accepted.turn_id.as_deref().unwrap())
+            .await;
+        assert_eq!(turn.status, CanonicalTurnStatus::Completed, "{turn:?}");
+        assert!(
+            harness
+                .state
+                .session_store
+                .session(&session)
+                .unwrap()
+                .workspace_id
+                .is_none()
+        );
+        let result = turn
+            .items
+            .iter()
+            .filter_map(|item| item.tool.as_ref())
+            .find(|tool| tool.name == "agent_cancel")
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(result["status"], "cancelled");
+        assert_eq!(result["resources_settled"], true);
+        assert_eq!(result["results"][0]["child_status"], "killed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn agent_cancel_receipt_waits_for_child_process_and_worktree_exit() {
         let harness = MagiTurnHarness::new_task("主线已核对取消结果");
         let (workspace, root) = register_git_workspace(&harness);
@@ -16665,7 +16736,7 @@ done
             .lock()
             .unwrap()
             .clone()
-            .expect("必须到达真实 Task 发布写盘边界");
+            .unwrap_or_else(|| panic!("必须到达真实 Task 发布写盘边界: {turn:#?}"));
         assert!(
             harness
                 .state

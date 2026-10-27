@@ -310,9 +310,22 @@ fn agent_projection_from_task(
         .or_else(|| task.executor_binding_target_role())
         .unwrap_or("agent")
         .to_string();
-    let model_binding = model_bindings
-        .get(&role)
-        .cloned()
+    let frozen_binding = task
+        .executor_binding
+        .as_ref()
+        .and_then(|binding| binding.model_selection.as_ref())
+        .map(|selection| AgentModelBinding {
+            engine_id: selection.engine_id.clone(),
+            model: Some(selection.model.clone()),
+            model_source: if selection.engine_id.is_some() {
+                "role_engine"
+            } else {
+                "inherited_orchestrator"
+            }
+            .into(),
+        });
+    let model_binding = frozen_binding
+        .or_else(|| model_bindings.get(&role).cloned())
         .unwrap_or_else(|| AgentModelBinding {
             model_source: "unconfigured".to_string(),
             ..AgentModelBinding::default()
@@ -1180,6 +1193,31 @@ mod tests {
         assert_eq!(agent.engine_id.as_deref(), Some("engine-reviewer"));
         assert_eq!(agent.model.as_deref(), Some("gpt-reviewer"));
         assert_eq!(agent.model_source, "role_engine");
+        let mut frozen_task = projection
+            .tasks
+            .iter()
+            .find(|task| task.task_id == child_id)
+            .unwrap()
+            .clone();
+        let frozen = magi_conversation_runtime::model_config::NormalizedModelConfig::from_settings_value(&serde_json::json!({
+            "baseUrl":"https://example.test", "apiProtocol":"openai_chat", "model":"o3-mini",
+        })).unwrap().freeze_agent_selection(Some("original-engine".into()), 3, Some(magi_core::ReasoningEffort::High)).unwrap();
+        frozen_task
+            .executor_binding
+            .as_mut()
+            .unwrap()
+            .model_selection = Some(frozen);
+        let frozen_agent = agent_projection_from_task(
+            &frozen_task,
+            None,
+            None,
+            None,
+            &model_bindings,
+            &HashMap::new(),
+        );
+        assert_eq!(frozen_agent.model.as_deref(), Some("o3-mini"));
+        assert_eq!(frozen_agent.engine_id.as_deref(), Some("original-engine"));
+
         assert_eq!(agent.lifecycle, "completed");
         assert_eq!(agent.started_at, UtcMillis(10));
         assert_eq!(agent.completed_at, Some(UtcMillis(20)));

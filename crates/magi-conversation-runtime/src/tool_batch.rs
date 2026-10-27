@@ -810,6 +810,11 @@ fn execute_agent_spawn(
     child
         .executor_binding
         .as_mut()
+        .expect("spawn binding")
+        .model_selection = preflight.model_selection.clone();
+    child
+        .executor_binding
+        .as_mut()
         .expect("spawn role binding")
         .agent_activation = Some(activation.clone());
     child
@@ -978,6 +983,7 @@ fn execute_agent_spawn(
             "thread_id": registered_execution.thread_id.to_string(),
             "execution_chain_ref": registered_execution.execution_chain_ref,
             "model_source": preflight.model_source,
+            "model_selection": preflight.model_selection,
             "queue_reason": registered_execution.queue_reason,
         }),
     );
@@ -1020,6 +1026,7 @@ fn execute_agent_spawn(
             "worker_id": registered_execution.worker_id.to_string(),
             "thread_id": registered_execution.thread_id.to_string(),
             "execution_chain_ref": registered_execution.execution_chain_ref,
+            "model_selection": preflight.model_selection,
             "model_source": preflight.model_source.unwrap_or_else(|| "unconfigured".to_string()),
             "queue_reason": queue_reason,
             "instruction": instruction,
@@ -1134,69 +1141,109 @@ fn execute_agent_send(
         estimated_tokens,
         occurred_at: now,
     };
+    deliver_agent_send(
+        task_store,
+        conversation_registry,
+        parent_task,
+        session_id,
+        tool,
+        &target_task_id,
+        target_task.status,
+        supplement,
+        access,
+        estimated_tokens,
+        publish_event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_agent_send(
+    task_store: &TaskStore,
+    conversation_registry: &ConversationRegistry,
+    parent_task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    target_task_id: &TaskId,
+    observed_status: TaskStatus,
+    supplement: AgentContextSupplement,
+    access: AgentContextAccessRecord,
+    estimated_tokens: usize,
+    publish_event: &impl Fn(&str, serde_json::Value),
+) -> (String, ExecutionResultStatus) {
+    let now = supplement.created_at;
     // 排队中的代理尚未开始：补充写入其上下文包即可，启动时随上下文包一起渲染进提示词，
     // 不依赖只在运行期存在的信号通道。
-    if target_task.status == TaskStatus::Pending {
+    if observed_status == TaskStatus::Pending {
         let committed = task_store.deliver_agent_context_supplement(
-            &target_task_id,
+            target_task_id,
             TaskStatus::Pending,
             supplement.clone(),
             access.clone(),
         );
         let package = match committed {
-            Ok(package) => package,
+            Ok(package) => Some(package),
+            // 启动事务可能已在读取状态后提交。原 Pending 写入未发生，沿运行中
+            // FIFO 入口提交同一个 supplement；不能把正常启动竞态报成写盘失败。
+            Err(magi_core::DomainError::InvalidState { .. })
+                if task_store
+                    .get_task(target_task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Running) =>
+            {
+                None
+            }
             Err(error) => {
                 return context_tool_failure(tool, "context_persist_failed", error.to_string());
             }
         };
-        task_store.notify_runtime_change();
-        publish_event(
-            "task.coordinator.agent_send",
-            serde_json::json!({
-                "parent_task_id": parent_task.task_id,
-                "child_task_id": target_task_id,
-                "package_id": package.package_id,
-                "revision": package.revision,
-                "estimated_tokens": estimated_tokens,
-            }),
-        );
-        return (
-            serde_json::json!({
-                "tool": tool.as_str(),
-                "status": "sent",
-                "task_id": target_task_id.to_string(),
-                "package_id": package.package_id,
-                "revision": package.revision,
-                "estimated_tokens": estimated_tokens,
-                "delivery": "on_start",
-                "instruction": "代理尚在排队，补充上下文会在它开始执行时一并提供。",
-            })
-            .to_string(),
-            ExecutionResultStatus::Succeeded,
-        );
-    }
-    let commit =
-        conversation_registry.enqueue_task_signal_with(session_id, &target_task_id, || {
-            let package = task_store.deliver_agent_context_supplement(
-                &target_task_id,
-                TaskStatus::Running,
-                supplement.clone(),
-                access.clone(),
-            )?;
-            let signal = RuntimeSignal {
-                author: MailboxAuthor::Parent(parent_task.task_id.to_string()),
-                kind: MailboxKind::Message,
-                trigger_turn: true,
-                payload: serde_json::json!({
-                    "type": "agent_context_supplement",
+        if let Some(package) = package {
+            task_store.notify_runtime_change();
+            publish_event(
+                "task.coordinator.agent_send",
+                serde_json::json!({
+                    "parent_task_id": parent_task.task_id,
+                    "child_task_id": target_task_id,
                     "package_id": package.package_id,
                     "revision": package.revision,
-                    "supplement": supplement,
+                    "estimated_tokens": estimated_tokens,
                 }),
-                enqueued_at: now,
-            };
-            Ok::<_, magi_core::DomainError>((package, signal))
-        });
+            );
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "sent",
+                    "task_id": target_task_id.to_string(),
+                    "package_id": package.package_id,
+                    "revision": package.revision,
+                    "estimated_tokens": estimated_tokens,
+                    "delivery": "on_start",
+                    "instruction": "代理尚在排队，补充上下文会在它开始执行时一并提供。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            );
+        }
+    }
+    let commit = conversation_registry.enqueue_task_signal_with(session_id, target_task_id, || {
+        let package = task_store.deliver_agent_context_supplement(
+            target_task_id,
+            TaskStatus::Running,
+            supplement.clone(),
+            access.clone(),
+        )?;
+        let signal = RuntimeSignal {
+            author: MailboxAuthor::Parent(parent_task.task_id.to_string()),
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({
+                "type": "agent_context_supplement",
+                "package_id": package.package_id,
+                "revision": package.revision,
+                "supplement": supplement,
+            }),
+            enqueued_at: now,
+        };
+        Ok::<_, magi_core::DomainError>((package, signal))
+    });
     let package = match commit {
         Ok(package) => package,
         Err(crate::TaskSignalCommitError::ChannelClosed) => {
@@ -4564,7 +4611,7 @@ mod tests {
             ("/model", serde_json::json!("caller-selected-model")),
             ("/engineId", serde_json::json!("caller-selected-engine")),
             ("/provider", serde_json::json!("caller-selected-provider")),
-            ("/reasoning_effort", serde_json::json!("high")),
+            ("/reasoning_effort", serde_json::json!("future")),
             ("/model_source", serde_json::json!("role_engine")),
         ] {
             let mut arguments = valid.clone();
@@ -10017,15 +10064,21 @@ mod tests {
 
     #[test]
     fn agent_send_updates_package_revision_and_reaches_running_child() {
-        run_agent_send_to_running_child(false);
+        run_agent_send_to_running_child(false, false);
     }
 
     #[test]
     fn agent_send_checkpoint_failure_leaves_no_partial_supplement_or_wakeup() {
-        run_agent_send_to_running_child(true);
+        run_agent_send_to_running_child(true, false);
     }
 
-    fn run_agent_send_to_running_child(reject_checkpoint: bool) {
+    #[test]
+    fn agent_send_pending_to_running_race_delivers_once_via_the_live_channel() {
+        run_agent_send_to_running_child(false, true);
+        run_agent_send_to_running_child(true, true);
+    }
+
+    fn run_agent_send_to_running_child(reject_checkpoint: bool, stale_pending: bool) {
         let task_store = TaskStore::new();
         let registry = ConversationRegistry::new();
         let session_id = SessionId::new("session-agent-send");
@@ -10074,18 +10127,50 @@ mod tests {
         }));
 
         let observed_version = task_store.status_change_version();
-        let (payload, status) = execute_agent_send(
-            &task_store,
-            &registry,
-            &parent,
-            &session_id,
-            BuiltinToolName::AgentSend,
-            &serde_json::json!({
-                "task_id": child.task_id,
-                "message": "补充：只检查当前分支"
-            }),
-            &|_, _| {},
-        );
+        let (payload, status) = if stale_pending {
+            // 调用方看到 Pending 后，启动事务已经把真实子代理推进至 Running。
+            assert_eq!(child.status, TaskStatus::Running);
+            deliver_agent_send(
+                &task_store,
+                &registry,
+                &parent,
+                &session_id,
+                BuiltinToolName::AgentSend,
+                &child.task_id,
+                TaskStatus::Pending,
+                AgentContextSupplement {
+                    supplement_id: "raced-supplement".into(),
+                    author_task_id: parent.task_id.clone(),
+                    message: "补充：只检查当前分支".into(),
+                    references: vec![],
+                    estimated_tokens: 10,
+                    created_at: UtcMillis::now(),
+                },
+                AgentContextAccessRecord {
+                    record_id: "raced-access".into(),
+                    operation: AgentContextAccessOperation::Send,
+                    query: Some("补充：只检查当前分支".into()),
+                    reference_ids: vec![],
+                    estimated_tokens: 10,
+                    occurred_at: UtcMillis::now(),
+                },
+                10,
+                &|_, _| {},
+            )
+        } else {
+            execute_agent_send(
+                &task_store,
+                &registry,
+                &parent,
+                &session_id,
+                BuiltinToolName::AgentSend,
+                &serde_json::json!({
+                    "task_id": child.task_id,
+                    "message": "补充：只检查当前分支"
+                }),
+                &|_, _| {},
+            )
+        };
         assert_eq!(
             checkpoint_count.load(Ordering::SeqCst),
             1,

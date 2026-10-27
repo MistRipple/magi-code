@@ -44,7 +44,10 @@
     "test:electron-browser-viewport": "node scripts/verify-electron-browser-viewport.mjs",
     "test:electron-right-pane-links": "node scripts/verify-electron-right-pane-links.mjs",
     "test:daemon-controls": "node scripts/verify-daemon-controls.mjs",
+    "test:personal-session-live": "npm --prefix web run build && node scripts/verify-personal-session.mjs",
+    "test:personal-tools-live": "npm --prefix web run build && node scripts/verify-personal-session.mjs --tools",
     "test:prompt-enhance-live": "npm --prefix web run build && node scripts/verify-prompt-enhance.mjs",
+    "test:model-reasoning-live": "npm --prefix web run build && node scripts/verify-model-reasoning.mjs",
     "prune:target": "./scripts/prune-target.sh",
     "posttest": "./scripts/prune-target.sh"
   },

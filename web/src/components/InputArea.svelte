@@ -1,7 +1,7 @@
 <script lang="ts">
   import FileName from './FileName.svelte';
   import FileTypeIcon from './FileTypeIcon.svelte';
-  import { onMount, type Component } from 'svelte';
+  import { onMount, tick, type Component } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { turnStoreState } from '../stores/turn-store.svelte';
   import { isLocalOptimisticTurn } from '../stores/turn-reducer';
@@ -24,6 +24,7 @@
     isReferenceableBrowserAnnotation,
     saveAgentModelContextWindow,
     saveAgentOrchestratorSessionConfig,
+    resolveAgentModelReasoning,
     resolveAgentPath,
     updateBrowserAnnotationComment,
     type BrowserAnnotationSnapshot,
@@ -69,10 +70,11 @@
   import WebModelModeChooser from './WebModelModeChooser.svelte';
   import WebModelSessionBanner from './WebModelSessionBanner.svelte';
   import type { WebSessionBanner } from '../web/web-model-session-banner';
+  import { WEB_MODEL_ACTION_EVENT, type WebModelActionDetail } from '../web/web-model-actions';
   import { dispatchWebModelAction } from '../web/web-model-actions';
   import WebModelSetupPanel from './WebModelSetupPanel.svelte';
   import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
-  import { WEB_MODEL_SETUP_COMMAND, WEB_MODEL_SETUP_REQUEST, setupIsActive, type SetupAction } from '../web/web-model-setup';
+  import { WEB_MODEL_SETUP_COMMAND, WEB_MODEL_SETUP_REQUEST, setupIsActive, webModelSetupAvailable, isWebModelSetupRequest, type SetupAction } from '../web/web-model-setup';
   import { loadedPluginProjection } from '../stores/plugin-registry.svelte';
   import { openSettings, closeSettings } from '../stores/shell-ui.svelte';
   import { createAppBrowserSession } from '../web/agent-api';
@@ -175,6 +177,7 @@
   type SkillOption = ComposerSkillOption;
 
   type ReasoningEffort = OrchestratorReasoningEffort;
+  type ModelReasoningCapability = import('../shared/rust-backend-types').ModelReasoningCapability;
 
   // 当前会话最早一个待回答的选择题；回答后下一个自然顶上来。
   const pendingUserQuestion = $derived(
@@ -187,16 +190,6 @@
       ? userQuestionState.pending.length
       : 0,
   );
-  const reasoningOptions: Array<{
-    value: ReasoningEffort;
-    labelKey: string;
-  }> = [
-    { value: 'low', labelKey: 'input.mainModelPicker.reasoning.low' },
-    { value: 'medium', labelKey: 'input.mainModelPicker.reasoning.medium' },
-    { value: 'high', labelKey: 'input.mainModelPicker.reasoning.high' },
-    { value: 'xhigh', labelKey: 'input.mainModelPicker.reasoning.xhigh' },
-  ];
-
   const accessProfileOptions: Array<{
     value: AccessProfile;
     labelKey: string;
@@ -228,27 +221,29 @@
   let setupStatus = $state<WebModelSetupStatus | null>(null);
   let setupSubmitting = $state(false);
   let setupRequestId = $state<string | null>(null);
+  const setupAvailable = $derived(webModelSetupAvailable(pluginProjection(APPLICATION_PLUGIN_SCOPE)));
+  const setupActive = $derived(setupAvailable && setupIsActive(setupStatus));
+  const setupInputRequest = $derived(isWebModelSetupRequest(inputValue, setupAvailable));
 
-  async function submitWebSetup(action: SetupAction): Promise<void> {
-    if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return;
+  async function submitWebSetup(action: SetupAction): Promise<boolean> {
+    if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return false;
     const origin = `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`;
     setupSubmitting = true;
     try {
-      if (!isDesktopRuntime()) { addToast('warning', i18n.t('settings.browser.webModel.needDesktop')); return; }
+      if (!isDesktopRuntime()) { addToast('warning', i18n.t('settings.browser.webModel.needDesktop')); return false; }
       const projection = await loadedPluginProjection(APPLICATION_PLUGIN_SCOPE);
-      if (!projection.manifests.some(manifest => manifest.id === 'openai.chatgpt-web')
-        || !projection.commands.some(command => command.id === WEB_MODEL_SETUP_COMMAND)) {
+      if (!webModelSetupAvailable(projection)) {
         addToast('warning', i18n.t('webModel.setup.pluginRequired'));
         openSettings('plugins');
-        return;
+        return false;
       }
-      if (origin !== `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`) return;
+      if (origin !== `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`) return false;
       const target = resolveSubmissionWorkspace();
       const sessionId = await materializeDraftSession();
       closeSettings();
       await createAppBrowserSession();
       await projectWebModelAppSession();
-      if (currentSessionId?.trim() !== sessionId) return;
+      if (currentSessionId?.trim() !== sessionId) return false;
       setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
       activateWebModelTab();
       setupRequestId = generateId();
@@ -256,13 +251,15 @@
         sessionId, workspaceId: target?.workspaceId || '', workspacePath: target ? workspaceNavigationPath(target) : '',
         pluginCommandId: WEB_MODEL_SETUP_COMMAND, accessProfile: selectedAccessProfile,
       });
+      return true;
     } catch (error) {
       setupRequestId = null;
       addToast('error', error instanceof Error ? error.message : i18n.t('webModel.setup.failed'));
+      return false;
     } finally { setupSubmitting = false; }
   }
   onMount(() => {
-    const start = () => { void submitWebSetup('start'); };
+    const start = () => { if (setupAvailable) void submitWebSetup('start'); };
     window.addEventListener(WEB_MODEL_SETUP_REQUEST, start);
     return () => window.removeEventListener(WEB_MODEL_SETUP_REQUEST, start);
   });
@@ -344,13 +341,22 @@
   // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
   // 选中后只写当前会话 orchestrator 覆盖段；全局配置仍是新会话默认值和连接凭据来源。
   let pickerOpen = $state(false);
+  let pickerView = $state<'effort' | 'models'>('effort');
+  let pickerCapabilities = $state<Record<string, ModelReasoningCapability>>({});
+  let sliderDraft = $state<number | null>(null);
+  let reasoningAdjusted = $state(false);
+  let fallbackReasoningCapability = $state<ModelReasoningCapability | null>(null);
+  let reasoningReadStatus = $state<'loading' | 'ready' | 'failed'>('loading');
+  let reasoningRetry = $state(0);
   let pickerLoading = $state(false);
   let pickerSavingModel = $state<string | null>(null);
-  let pickerSavingReasoning = $state<ReasoningEffort | null>(null);
+  let pickerSavingReasoning = $state<ReasoningEffort | 'default' | null>(null);
   let pickerModels = $state<string[]>([]);
+  let pickerModelDisplayNames = $state<Record<string, string>>({});
   let modelSearch = $state('');
   let workspaceSearch = $state('');
-  const filteredPickerModels = $derived(pickerModels.filter(model => model.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
+  const filteredPickerModels = $derived(pickerModels.filter(model =>
+    `${pickerModelDisplayNames[model] ?? ''} ${model}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
   /**
    * 从 Web 加载的引擎（`apiProtocol = chatgpt_web`，A22）。
    *
@@ -386,9 +392,42 @@
   const currentPickerLabel = $derived.by(() => (
     currentPickerWebEngine?.displayName?.trim()
     // GPT Web 的“模型名”只是占位（default），界面上始终显示固定入口名。
-    || (currentSessionUsesWebEngine ? i18n.t('webModel.entryName') : currentPickerModel)
+    || (currentSessionUsesWebEngine ? i18n.t('webModel.entryName') : pickerModelDisplayNames[currentPickerModel] || currentPickerModel)
   ));
-  const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
+  const projectedReasoningCapability = $derived(
+    pickerCapabilities[currentPickerModel]
+      ?? (getEffectiveOrchestratorConfigSnapshot()?.model === currentPickerModel ? messagesState.settingsBootstrapSnapshot?.orchestratorReasoningCapability : null)
+      ?? null,
+  );
+  const currentReasoningCapability = $derived(fallbackReasoningCapability ?? projectedReasoningCapability);
+  $effect(() => {
+    const projected = projectedReasoningCapability;
+    const model = currentPickerModel;
+    const config = getOrchestratorConfigSnapshot();
+    const web = currentSessionUsesWebEngine;
+    void reasoningRetry;
+    fallbackReasoningCapability = null;
+    reasoningReadStatus = projected ? 'ready' : 'loading';
+    if ((projected && projected.source !== 'unknown') || web || !model || !config) return;
+    let cancelled = false;
+    void resolveAgentModelReasoning(config, model).then(value => {
+      if (!cancelled) { fallbackReasoningCapability = value; reasoningReadStatus = 'ready'; }
+    }).catch(() => { if (!cancelled) reasoningReadStatus = 'failed'; });
+    return () => { cancelled = true; };
+  });
+  const reasoningOptions = $derived(currentReasoningCapability?.supportedEfforts ?? []);
+  const currentPickerReasoningEffort = $derived(
+    reasoningOptions.includes(readOrchestratorReasoningEffort()!) ? readOrchestratorReasoningEffort() : null,
+  );
+  const reasoningIndex = $derived(Math.max(0, sliderDraft ?? reasoningOptions.indexOf(currentPickerReasoningEffort!)));
+  const displayedReasoning = $derived(sliderDraft === null ? currentPickerReasoningEffort : reasoningOptions[reasoningIndex] ?? null);
+  $effect(() => { void currentSessionId; reasoningAdjusted = false; });
+  $effect(() => {
+    void currentPickerModel;
+    void currentSessionId;
+    void pickerOpen;
+    sliderDraft = null;
+  });
   const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
   // 上下文用量圆环数据：直接取 orchestrator runtime 快照里的 budgetState。
   // 无活动会话或快照缺失时为 null，圆环组件会渲染占位态。
@@ -458,7 +497,7 @@
   const composerWorkspace = $derived.by(() => (
     isPersonalSession
       ? null
-      : resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
+      : resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath)
   ));
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
   const filteredPickerWebEngines = $derived(pickerWebEngines.filter(engine => `${engine.displayName} ${engine.id}`.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase())));
@@ -594,7 +633,7 @@
     if (isSending) {
       return i18n.t('input.followUp.queueTitle');
     }
-    if (!mainModelReady) {
+    if (!mainModelReady && !setupInputRequest && !setupActive && !(setupAvailable && selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND)) {
       return i18n.t('input.mainModelRequired');
     }
     return i18n.t('input.send');
@@ -604,8 +643,8 @@
   let webInfoStatus = $state<WebSessionBanner | null>(null);
   // 首条消息确认 sessionId 前不能追加提交，否则会被识别成另一条新会话请求。
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady && selectedPluginCommand?.pluginCommandId !== WEB_MODEL_SETUP_COMMAND && !setupIsActive(setupStatus))
-    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked && !setupIsActive(setupStatus))
+    sessionInputLocked || (!editingQueuedMessage && isInteractionBlocking) || sendPreparing || Boolean(setupRequestId) || pendingImageReadCount > 0 || (!editingQueuedMessage && !mainModelReady && !(setupAvailable && selectedPluginCommand?.pluginCommandId === WEB_MODEL_SETUP_COMMAND) && !setupActive && !setupInputRequest)
+    || (isDraftSession && isSending) || (!editingQueuedMessage && webSendBlocked && !setupActive && !setupInputRequest)
   ));
 
   // 按钮双态状态 - 使用 $derived 计算
@@ -1726,12 +1765,12 @@
   }
 
   function composerWorkspaceLabel(workspace: ComposerWorkspaceOption | null): string {
-    if (!workspace) return i18n.locale.startsWith('zh') ? 'Magi 空间' : 'Magi Space';
+    if (!workspace) return i18n.t('input.workspace.unbound');
     return workspace.name || workspace.rootPath;
   }
 
   function composerWorkspaceTitle(workspace: ComposerWorkspaceOption | null): string {
-    if (!workspace) return i18n.locale.startsWith('zh') ? 'Magi 内置空间' : 'Built-in Magi Space';
+    if (!workspace) return i18n.t('input.workspace.personalHint');
     return `${i18n.t('input.workspace.title')}: ${workspace.rootPath}`;
   }
 
@@ -1750,6 +1789,11 @@
 
   function selectWorkspace(workspaceId: string) {
     if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
+    if (!workspaceId) {
+      workspacePickerOpen = false;
+      navigateSession({ kind: 'draft', scope: 'personal' });
+      return;
+    }
     const workspace = composerWorkspaceState.workspaces.find((candidate) => candidate.workspaceId === workspaceId) ?? null;
     if (!workspace) return;
     workspacePickerOpen = false;
@@ -1771,7 +1815,7 @@
     if (!currentWorkspaceId?.trim() && !currentWorkspacePath?.trim()) {
       return null;
     }
-    return resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession);
+    return resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath);
   }
 
   onMount(() => {
@@ -1899,9 +1943,13 @@
       if (detail.status !== 'failed' || !draft || !composerIsPristineForSubmissionRecovery()) return;
       restoreComposerSubmissionDraft(draft);
     }
-    function handleOpenWebModelPicker(): void {
+    function handleComposerWebModelAction(event: Event): void {
+      const detail = (event as CustomEvent<WebModelActionDetail>).detail;
+      if (detail?.kind !== 'switchModel') return;
+      if (detail.sessionId && detail.sessionId !== currentSessionId) return;
       if (sessionInputLocked || isInteractionBlocking) return;
       pickerOpen = true;
+      pickerView = 'models';
       if (!pickerLoadedOnce && !pickerLoading) {
         void loadPickerModels();
       }
@@ -1952,7 +2000,7 @@
     window.addEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
     window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
-    window.addEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
+    window.addEventListener(WEB_MODEL_ACTION_EVENT, handleComposerWebModelAction);
     window.addEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
@@ -1969,7 +2017,7 @@
       window.removeEventListener('magi:pluginSelectionInvalidated', handlePluginSelectionInvalidated as EventListener);
       window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener('magi:sessionTurnSubmissionSettled', handleSessionTurnSubmissionSettled as EventListener);
-      window.removeEventListener('magi:webModelOpenModelPicker', handleOpenWebModelPicker);
+      window.removeEventListener(WEB_MODEL_ACTION_EVENT, handleComposerWebModelAction);
       window.removeEventListener('magi:webModelFocusComposer', handleFocusWebModelComposer);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
@@ -1982,6 +2030,8 @@
     const configKey = orchestratorModelListConfigKey(orchestratorConfig);
     if (!configKey) {
       pickerModels = [];
+      pickerModelDisplayNames = {};
+      pickerCapabilities = {};
       pickerModelsConfigKey = '';
       pickerLoadedOnce = false;
       pickerError = null;
@@ -1989,6 +2039,8 @@
     }
     if (pickerModelsConfigKey && pickerModelsConfigKey !== configKey) {
       pickerModels = [];
+      pickerModelDisplayNames = {};
+      pickerCapabilities = {};
       pickerModelsConfigKey = '';
       pickerLoadedOnce = false;
       pickerError = null;
@@ -2044,15 +2096,20 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
+      if (!editingTurn && !selectedSessionCommand && !selectedWorkflow && !selectedSkill && !selectedPluginCommand && !selectedGoalMode && isWebModelSetupRequest(normalizedContent, setupAvailable)) {
+        if (attachmentTotal > 0) { addToast('warning', i18n.t('webModel.setup.noAttachments')); return; }
+        if (await submitWebSetup('start')) inputValue = '';
+        return;
+      }
       // 配置正在等待用户时，短回复作为明确的配置控制输入；不交给 GPT Web 回发。
-      if (setupIsActive(setupStatus)) {
+      if (setupActive) {
         if (/\bsk[-_][A-Za-z0-9_-]{8,}/u.test(normalizedContent)) {
           addToast('warning', i18n.t('webModel.setup.secretHint'));
           return;
         }
         const action: SetupAction | null = /^(?:继续|好了|已完成|完成了|continue|done)$/iu.test(normalizedContent)
           ? 'continue' : /^(?:取消配置|结束配置|cancel)$/iu.test(normalizedContent) ? 'cancel' : null;
-        if (action && attachmentTotal === 0) { await submitWebSetup(action); inputValue = ''; return; }
+        if (action && attachmentTotal === 0) { if (await submitWebSetup(action)) inputValue = ''; return; }
         if (!mainModelReady) {
           addToast('info', i18n.t('webModel.setup.commandHint'));
           return;
@@ -2064,10 +2121,11 @@
         if (normalizedContent && !/^(?:开始|start|继续|continue|取消配置|cancel)$/iu.test(normalizedContent)) {
           addToast('warning', i18n.t('webModel.setup.commandHint')); return;
         }
-        selectedPluginCommand = null;
-        await submitWebSetup(/^(?:取消配置|cancel)$/iu.test(normalizedContent) ? 'cancel'
-          : /^(?:继续|continue)$/iu.test(normalizedContent) ? 'continue' : 'start');
-        inputValue = '';
+        if (await submitWebSetup(/^(?:取消配置|cancel)$/iu.test(normalizedContent) ? 'cancel'
+          : /^(?:继续|continue)$/iu.test(normalizedContent) ? 'continue' : 'start')) {
+          selectedPluginCommand = null;
+          inputValue = '';
+        }
         return;
       }
 
@@ -2501,6 +2559,7 @@
     const model = readOrchestratorModel();
     if (!model) {
       pickerOpen = true;
+      pickerView = 'models';
       if (!pickerLoadedOnce && !pickerLoading) {
         void loadPickerModels();
       }
@@ -2531,22 +2590,17 @@
     return typeof value === 'string' ? value.trim() : '';
   }
 
-  function readOrchestratorReasoningEffort(): ReasoningEffort {
+  function readOrchestratorReasoningEffort(): ReasoningEffort | null {
     return resolveOrchestratorReasoningEffort(
       getCurrentOrchestratorSessionConfigSnapshot(),
       getEffectiveOrchestratorConfigSnapshot(),
     );
   }
 
-  function reasoningEffortLabel(value: ReasoningEffort): string {
-    const match = reasoningOptions.find((option) => option.value === value);
-    return match ? i18n.t(match.labelKey) : '';
+  function reasoningEffortLabel(value: ReasoningEffort | null): string {
+    return value ? i18n.t(`input.mainModelPicker.reasoning.${value}`) : '';
   }
 
-  /**
-   * Web 引擎的强度档位按引擎取值域渲染，其余置灰。
-   * 非 Web 引擎（provider 模型）保持既有四档行为不变。
-   */
   /** 只有 daemon 判为可用的 GPT Web 入口可选；未登录时入口根本不会出现。 */
   function pickerWebEngineUsable(engine: PickerWebEngineDto): boolean {
     return (engine.status ?? 'available').trim() === 'available';
@@ -2555,9 +2609,6 @@
   function pickerWebEngineStatusText(engine: PickerWebEngineDto): string {
     if (!canSelectPickerWebEngine) {
       return i18n.t('input.mainModelPicker.webLocalSessionBlocked');
-    }
-    if (isPersonalSession) {
-      return i18n.t('webModel.tools.workspaceRequired');
     }
     if (engine.tools && !engine.tools.available) {
       return i18n.t('webModel.tools.unavailable');
@@ -2619,11 +2670,14 @@
   function applyLocalOrchestratorSessionConfig(
     sessionConfig: Record<string, unknown>,
     effectiveConfig: Record<string, unknown>,
+    sessionId: string,
+    capability: ModelReasoningCapability | null,
   ) {
     const snapshot = messagesState.settingsBootstrapSnapshot;
-    if (!snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return;
+    if (currentSessionId?.trim() !== sessionId || !snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return;
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
+      orchestratorReasoningCapability: capability,
       orchestratorSessionDefaults: { ...sessionConfig },
       orchestratorSessionConfig: { ...sessionConfig },
       effectiveOrchestratorConfig: { ...effectiveConfig },
@@ -2653,7 +2707,7 @@
       } as AgentSettingsBootstrapSnapshot;
     }
     if (isDraftSession) {
-      messagesState.draftOrchestratorSessionConfig = { ...defaults };
+      messagesState.draftOrchestratorSessionConfig = { ...defaults, ...messagesState.draftOrchestratorSessionConfig };
     }
   }
 
@@ -2673,27 +2727,15 @@
       return;
     }
     pickerOpen = true;
+    pickerView = currentPickerModel ? 'effort' : 'models';
     if (!pickerLoadedOnce && !pickerLoading) {
       await loadPickerModels();
     } else {
-      // provider 模型列表按配置缓存，但 GPT Web 入口是 daemon 的实时投影（登录 / 探测结论会变）：
-      // 每次打开都重新读，否则探测完成前打开过一次，入口就一直缺失。
-      await refreshPickerWebEngines();
+      // HTTP 模型目录与 GPT Web 可用性都可能变化，每次打开同步整份目录。
+      await refreshPickerModels();
     }
   }
 
-  async function refreshPickerWebEngines() {
-    try {
-      const payload = await fetchAgentModelList(
-        (getOrchestratorConfigSnapshot() ?? {}) as Record<string, unknown>,
-        'orch',
-        currentWorkspaceId,
-      );
-      pickerWebEngines = Array.isArray(payload.webEngines) ? payload.webEngines : [];
-    } catch (error) {
-      console.warn('[InputArea] 刷新 GPT Web 入口失败:', error);
-    }
-  }
   async function loadPickerModels() {
     if (pickerLoadPromise) {
       await pickerLoadPromise;
@@ -2716,7 +2758,10 @@
           'orch',
           currentWorkspaceId,
         );
+        if (orchestratorModelListConfigKey(getOrchestratorConfigSnapshot()) !== configKey) return;
         pickerModels = Array.isArray(payload.models) ? payload.models : [];
+        pickerModelDisplayNames = payload.modelDisplayNames ?? {};
+        pickerCapabilities = payload.modelCapabilities ?? {};
         // Web 引擎只来自 daemon 的可用性投影：未登录、未确认说明或
         // 引擎不在本次探测候选里时这里就是空数组，前端不保留上一次的旧列表。
         pickerWebEngines = Array.isArray(payload.webEngines) ? payload.webEngines : [];
@@ -2726,6 +2771,7 @@
         pickerModelsConfigKey = configKey;
         pickerLoadedOnce = true;
       } catch (error) {
+        if (orchestratorModelListConfigKey(getOrchestratorConfigSnapshot()) !== configKey) return;
         pickerModelsConfigKey = configKey;
         pickerLoadedOnce = true;
         console.warn('[InputArea] 拉取主线模型列表失败:', error);
@@ -2749,12 +2795,13 @@
     await loadPickerModels();
   }
   async function selectPickerModel(model: string) {
+    if (pickerSavingModel || pickerSavingReasoning) return;
     const normalizedModel = model.trim();
     if (!normalizedModel) return;
     // Web 引擎的 `model` 是其族名，可能与 provider 列表中的模型同名；
     // 只要仍有 Web `engineId`，点击 provider 条目就必须继续执行单向 Web → 本地。
     if (normalizedModel === currentPickerModel && !currentPickerEngineId) {
-      pickerOpen = false;
+      pickerView = 'effort';
       return;
     }
     const sessionId = currentSessionId?.trim() || '';
@@ -2763,7 +2810,11 @@
     const binding: AgentBindingOverride = workspaceId || workspacePath
       ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
       : { scope: 'personal', sessionId };
-    const reasoningEffort = readOrchestratorReasoningEffort();
+    const targetCapability = pickerCapabilities[normalizedModel];
+    const oldEffort = readOrchestratorReasoningEffort();
+    const reasoningEffort = targetCapability?.supportedEfforts.includes(oldEffort!)
+      ? oldEffort : null;
+    const adjusted = oldEffort !== null && reasoningEffort === null;
     if (!sessionId) {
       messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
         messagesState.draftOrchestratorSessionConfig,
@@ -2772,7 +2823,8 @@
         { model: normalizedModel, engineId: '', webMode: undefined },
       );
       pickerError = null;
-      pickerOpen = false;
+      pickerView = 'effort';
+      reasoningAdjusted = adjusted;
       return;
     }
     pickerSavingModel = normalizedModel;
@@ -2788,6 +2840,8 @@
       applyLocalOrchestratorSessionConfig(
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
+        sessionId,
+        (saved.orchestratorReasoningCapability ?? null) as ModelReasoningCapability | null,
       );
       try {
         await refreshPickerSettingsSnapshot();
@@ -2795,7 +2849,8 @@
         console.warn('[InputArea] 切换主线模型后刷新设置快照失败:', error);
         addToast('warning', i18n.t('input.modelSavedSyncPending'));
       }
-      pickerOpen = false;
+      pickerView = 'effort';
+      reasoningAdjusted = adjusted;
     } catch (error) {
       console.warn('[InputArea] 保存主线模型失败:', error);
       pickerError = i18n.t('input.modelSaveFailed');
@@ -2811,7 +2866,7 @@
    * 与选择 provider 模型的区别只有两点：
    * - 写入会话级 `engineId` 绑定；`model` 写引擎自身的族名（与 daemon 从
    *   `plugin/openai.chatgpt-web/<family>` 推导的值一致），避免会话里残留 provider 模型名；
-   * - 强度收敛到该引擎 `efforts` 的取值域，不支持时落到引擎的第一个可用档位。
+   * - Web 的推理强度由网页管理，本地不生成档位。
    */
   /**
    * GPT Web 对话方式（临时 / 已保存）。方式只在首条消息前可以设置，daemon 把它落到会话级
@@ -2946,6 +3001,8 @@
       applyLocalOrchestratorSessionConfig(
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
+        sessionId,
+        (saved.orchestratorReasoningCapability ?? null) as ModelReasoningCapability | null,
       );
       try {
         await refreshPickerSettingsSnapshot();
@@ -2963,7 +3020,11 @@
     }
   }
 
-  async function selectPickerReasoningEffort(value: ReasoningEffort) {
+  async function selectPickerReasoningEffort(value: ReasoningEffort | null) {
+    if (pickerSavingReasoning || pickerSavingModel || (value !== null && !reasoningOptions.includes(value))) return;
+    reasoningAdjusted = false;
+    const focusedSlider = document.activeElement instanceof HTMLInputElement
+      && document.activeElement.matches('.ia-reasoning-slider input') ? document.activeElement : null;
     const sessionId = currentSessionId?.trim() || '';
     const workspaceId = currentWorkspaceId?.trim() || '';
     const workspacePath = currentWorkspacePath?.trim() || '';
@@ -2972,13 +3033,15 @@
       : { scope: 'personal', sessionId };
     if (!sessionId) {
       applyDraftOrchestratorSessionPatch({ reasoningEffort: value });
+      sliderDraft = null;
       pickerError = null;
       return;
     }
     if (value === currentPickerReasoningEffort) {
+      sliderDraft = null;
       return;
     }
-    pickerSavingReasoning = value;
+    pickerSavingReasoning = value ?? 'default';
     pickerError = null;
     const nextSessionConfig = {
       ...getOrchestratorSessionConfigSnapshot(),
@@ -2989,6 +3052,8 @@
       applyLocalOrchestratorSessionConfig(
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
+        sessionId,
+        (saved.orchestratorReasoningCapability ?? null) as ModelReasoningCapability | null,
       );
     } catch (error) {
       console.warn('[InputArea] 保存主线思考强度失败:', error);
@@ -2996,7 +3061,18 @@
       addToast('error', pickerError);
     } finally {
       pickerSavingReasoning = null;
+      sliderDraft = null;
+      if (focusedSlider) void tick().then(() => {
+        if (focusedSlider.isConnected && document.activeElement === document.body) focusedSlider.focus({ preventScroll: true });
+      });
     }
+  }
+
+  function commitUnselectedReasoningSlider(event: Event) {
+    if (currentPickerReasoningEffort !== null) return;
+    if (event instanceof KeyboardEvent && !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
+    const value = reasoningOptions[Number((event.currentTarget as HTMLInputElement).value)];
+    if (value) void selectPickerReasoningEffort(value);
   }
 
   async function saveCurrentModelContextWindow(contextWindowTokens: number): Promise<void> {
@@ -3160,7 +3236,18 @@
     </div>
   {/if}
   <GoalRunDrawers bind:count={drawersCount} />
-  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={isSending || setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={submitWebSetup} />
+  <WebModelSetupPanel sessionId={currentSessionId?.trim() || ''} busy={isSending || setupSubmitting || Boolean(setupRequestId)} bind:status={setupStatus} onaction={async action => { await submitWebSetup(action); }} />
+  <WebModelSessionBanner
+    usesWeb={currentSessionUsesWebEngine}
+    sessionId={currentSessionId?.trim() || ''}
+    projection={messagesState.settingsBootstrapSnapshot?.webConversation}
+    turnActive={messagesState.isProcessing}
+    toolsAvailable={currentPickerWebEngine?.tools ? currentPickerWebEngine.tools.available : null}
+    toolsDetail={currentPickerWebEngine?.tools?.detail}
+    bind:blocksSend={webSendBlocked}
+    bind:infoStatus={webInfoStatus}
+    onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
+  />
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="ia-wrapper"
@@ -3346,18 +3433,6 @@
       </div>
     {/if}
 
-    <WebModelSessionBanner
-      usesWeb={currentSessionUsesWebEngine}
-      sessionId={currentSessionId?.trim() || ''}
-      projection={messagesState.settingsBootstrapSnapshot?.webConversation}
-      turnActive={messagesState.isProcessing}
-      toolsAvailable={currentPickerWebEngine?.tools ? currentPickerWebEngine.tools.available : null}
-      toolsDetail={currentPickerWebEngine?.tools?.detail}
-      workspaceRequired={isPersonalSession}
-      bind:blocksSend={webSendBlocked}
-      bind:infoStatus={webInfoStatus}
-      onOwnershipLost={() => void refreshPickerSettingsSnapshot()}
-    />
 
     {#if selectedImages.length > 0 || pendingImageReadCount > 0}
       <ImageAttachmentTray
@@ -3551,6 +3626,11 @@
             <div class="ia-popover-backdrop" onclick={() => (workspacePickerOpen = false)}></div>
             <div class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.workspace.title')}>
               <div class="ia-picker-header">{i18n.t('input.workspace.title')}</div>
+              <button type="button" class="ia-picker-item" class:selected={isPersonalSession}
+                onclick={() => selectWorkspace('')}>
+                <span class="ia-picker-item-label">{i18n.t('input.workspace.unbound')}</span>
+                <span class="ia-picker-item-desc">{i18n.t('input.workspace.personalHint')}</span>
+              </button>
               {#if workspaceOptions.length > 10}<input type="search" class="form-input" bind:value={workspaceSearch} placeholder={i18n.t('selection.search')} aria-label={i18n.t('selection.searchFor', { label: i18n.t('input.workspace.title') })} />{/if}
               {#if workspaceOptions.length === 0}
                 <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
@@ -3700,29 +3780,38 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
             <div class="ia-session-model-popover" data-magi-surface="popover" role="group" aria-label={i18n.t('input.mainModelPicker.header')}>
-              {#if !currentSessionUsesWebEngine}
-              <div class="ia-effort-section">
-                <div class="ia-picker-header">{i18n.t('input.mainModelPicker.reasoning.header')}</div>
-                <div class="ia-effort-strip" role="group" aria-label={i18n.t('input.mainModelPicker.reasoning.header')}>
-                  {#each reasoningOptions as option (option.labelKey)}
-                    <button
-                      type="button"
-                      class="ia-effort-option"
-                      class:selected={currentPickerReasoningEffort === option.value}
-                      aria-pressed={currentPickerReasoningEffort === option.value}
-                      onclick={() => void selectPickerReasoningEffort(option.value)}
-                      disabled={pickerSavingReasoning !== null || pickerSavingModel !== null}
-                    >
-                      <span>{i18n.t(option.labelKey)}</span>
-                      {#if pickerSavingReasoning === option.value}
-                        <Icon name="loader" size={12} class="spinning" />
-                      {/if}
-                    </button>
-                  {/each}
+              {#if pickerView === 'effort'}
+                <div class="ia-model-summary">
+                  <div class="ia-effort-summary-header">
+                    <span class="ia-effort-current" aria-live="polite">{#key displayedReasoning}<span class="ia-effort-value">{currentSessionUsesWebEngine ? i18n.t('input.mainModelPicker.reasoning.webManaged') : reasoningEffortLabel(displayedReasoning) || i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>{/key}</span>
+                  </div>
+                  <button type="button" class="ia-summary-model" aria-label={i18n.t('input.mainModelPicker.chooseModel')} onclick={() => { pickerView = 'models'; modelSearch = ''; }}>
+                    <span>{currentPickerLabel || i18n.t('input.mainModelPicker.buttonEmpty')}</span><Icon name="chevron-right" size={13} />
+                  </button>
+                  {#if !currentSessionUsesWebEngine && reasoningOptions.length > 1}
+                    <div class="ia-reasoning-slider" style:--effort-progress={`${reasoningIndex / (reasoningOptions.length - 1) * 100}%`}>
+                      <div class="ia-reasoning-control">
+                      <div class="ia-reasoning-track" aria-hidden="true"><span class="ia-reasoning-fill"></span><span class="ia-reasoning-thumb"></span></div>
+                      <input type="range" class="control-range" min="0" max={reasoningOptions.length - 1} step="1" value={reasoningIndex} aria-label={i18n.t('input.mainModelPicker.reasoning.header')} aria-valuetext={reasoningEffortLabel(displayedReasoning)} disabled={pickerSavingReasoning !== null || pickerSavingModel !== null} oninput={(event) => { sliderDraft = Number(event.currentTarget.value); }} onchange={(event) => void selectPickerReasoningEffort(reasoningOptions[Number(event.currentTarget.value)])} onpointerup={commitUnselectedReasoningSlider} onkeyup={commitUnselectedReasoningSlider} />
+                      </div>
+                      <div class="ia-reasoning-ticks" aria-hidden="true">{#each reasoningOptions as effort}<span class:active={effort === displayedReasoning}></span>{/each}</div>
+                    </div>
+                  {/if}
+                  {#if !currentSessionUsesWebEngine}
+                    {#if reasoningOptions.length === 1}
+                      <div class="ia-reasoning-actions">
+                        <button type="button" class="btn btn--sm btn--secondary" aria-pressed={currentPickerReasoningEffort === reasoningOptions[0]} disabled={pickerSavingReasoning !== null || pickerSavingModel !== null} onclick={() => void selectPickerReasoningEffort(reasoningOptions[0])}>{reasoningEffortLabel(reasoningOptions[0])}</button>
+                      </div>
+                    {/if}
+                    {#if !currentReasoningCapability && reasoningReadStatus === 'loading'}<p class="ia-reasoning-hint" role="status">{i18n.t('settings.model.reasoning.loading')}</p>
+                    {:else if !currentReasoningCapability && reasoningReadStatus === 'failed'}<p class="ia-reasoning-hint" role="alert">{i18n.t('settings.model.reasoning.failed')}</p><button type="button" class="btn btn--sm btn--secondary" onclick={() => reasoningRetry++}>{i18n.t('input.mainModelPicker.retry')}</button>
+                    {:else if !reasoningOptions.length}<p class="ia-reasoning-hint">{i18n.t(currentReasoningCapability?.source === 'unknown' ? 'input.mainModelPicker.reasoning.unknown' : 'input.mainModelPicker.reasoning.unsupported')}</p>
+                    {/if}
+                    {#if reasoningAdjusted}<p class="ia-reasoning-hint" role="status">{i18n.t('settings.model.reasoning.adjusted')}</p>{/if}
+                  {/if}
+                  {#if pickerError}<p class="ia-picker-status-error" role="alert">{pickerError}</p>{/if}
                 </div>
-              </div>
-              <div class="ia-picker-divider"></div>
-              {/if}
+              {:else}
               <div class="ia-model-list-section">
                 <div class="ia-section-header-row">
                   <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
@@ -3764,10 +3853,12 @@
                         class="ia-picker-item ia-picker-row"
                         class:selected={!currentPickerEngineId && currentPickerModel === model}
                         role="option" aria-selected={!currentPickerEngineId && currentPickerModel === model}
+                        title={model}
+                        data-model-id={model}
                         onclick={() => void selectPickerModel(model)}
                         disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
                       >
-                        <span class="ia-picker-item-label">{model}</span>
+                        <span class="ia-picker-item-label">{pickerModelDisplayNames[model] || model}</span>
                         {#if pickerSavingModel === model}
                           <Icon name="loader" size={12} class="spinning" />
                         {:else if !currentPickerEngineId && currentPickerModel === model}
@@ -3825,6 +3916,7 @@
                   </p>
                 {/if}
               </div>
+              {/if}
             </div>
           {/if}
           </div>
@@ -4283,7 +4375,6 @@
   .ia-send.ready:hover { background: var(--primary-hover); transform: scale(1.08); }
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
-  .ia-container :global(.spinning) { animation: ia-spin 0.8s linear infinite; }
   @keyframes ia-spin { to { transform: rotate(360deg); } }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
 
@@ -4639,7 +4730,7 @@
     z-index: 31;
     display: flex;
     flex-direction: column;
-    width: min(280px, calc(100vw - 24px));
+    width: min(260px, calc(100vw - 24px));
     max-height: 264px;
     padding: 8px;
     background: color-mix(in srgb, var(--background) 100%, white 8%);
@@ -4649,47 +4740,32 @@
     border-radius: var(--radius-md);
     box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.22);
   }
-  .ia-effort-section {
-    flex: 0 0 auto;
+  .ia-model-summary { padding: 2px 6px 4px; }
+  .ia-reasoning-actions { display: flex; justify-content: center; gap: 8px; margin-top: 8px; }
+  .ia-effort-summary-header { display: flex; justify-content: center; align-items: center; min-height: 24px; }
+  .ia-effort-current { text-align: center; color: var(--primary); font-size: var(--text-base); font-weight: var(--font-medium); }
+  .ia-summary-model { display: flex; align-items: center; justify-content: center; gap: 5px; width: 100%; padding: 2px 8px 6px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); font: inherit; cursor: pointer; }
+  .ia-summary-model span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ia-summary-model:hover { color: var(--foreground); background: var(--surface-hover); }
+  .ia-reasoning-slider { padding: 4px 6px; }
+  .ia-reasoning-control { position: relative; height: 26px; }
+  .ia-reasoning-slider input { position: relative; z-index: 1; width: 100%; height: 26px; margin: 0; opacity: 0; cursor: pointer; }
+  .ia-reasoning-slider input:disabled { cursor: wait; }
+  .ia-reasoning-track { position: absolute; inset: 10px 7px; border-radius: var(--radius-full); background: var(--surface-3); box-shadow: inset 0 0 0 var(--magi-hairline) var(--border); pointer-events: none; }
+  .ia-reasoning-fill { position: absolute; inset: 0 auto 0 0; width: var(--effort-progress); border-radius: inherit; background: var(--primary); transition: width 180ms cubic-bezier(.2,.8,.2,1); }
+  .ia-reasoning-thumb { position: absolute; top: 50%; left: var(--effort-progress); width: 14px; height: 14px; border-radius: var(--radius-full); background: var(--primary); transform: translate(-50%, -50%); transition: left 180ms cubic-bezier(.2,.8,.2,1), transform 160ms ease, box-shadow 160ms ease; }
+  .ia-reasoning-control:focus-within .ia-reasoning-thumb { box-shadow: 0 0 0 3px var(--background), 0 0 0 5px var(--primary-muted); }
+  .ia-reasoning-control:has(input:active:not(:disabled)) .ia-reasoning-thumb { transform: translate(-50%, -50%) scale(1.15); }
+  .ia-reasoning-ticks { display: flex; justify-content: space-between; padding: 0 7px; pointer-events: none; }
+  .ia-reasoning-ticks span { width: 4px; height: 4px; border-radius: var(--radius-full); background: var(--foreground-muted); opacity: 0.4; transition: transform 180ms ease, opacity 180ms ease, background 180ms ease; }
+  .ia-reasoning-ticks span.active { background: var(--primary); opacity: 1; transform: scale(1.4); }
+  @media (prefers-reduced-motion: no-preference) {
+    .ia-effort-value { display: inline-block; animation: ia-effort-change 160ms ease-out; }
+    .ia-reasoning-ticks span.active { animation: ia-effort-tick-pop 240ms var(--magi-spring-bouncy, cubic-bezier(.2,.8,.2,1)); }
   }
-  .ia-effort-strip {
-    display: flex;
-    gap: 4px;
-    padding: 2px 0 0;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .ia-effort-strip::-webkit-scrollbar {
-    display: none;
-  }
-  .ia-effort-option {
-    flex: 1 0 auto;
-    min-width: 42px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0 6px;
-    background: transparent;
-    border: var(--magi-hairline) solid transparent;
-    border-radius: var(--radius-sm, 6px);
-    color: var(--foreground);
-    font-size: 12px;
-    cursor: pointer;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-  .ia-effort-option:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-  }
-  .ia-effort-option.selected {
-    background: color-mix(in srgb, var(--primary) 16%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 34%, transparent);
-    color: var(--primary);
-  }
-  .ia-effort-option:disabled {
-    cursor: wait;
-    opacity: 0.72;
-  }
+  @keyframes ia-effort-change { from { opacity: .5; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes ia-effort-tick-pop { 0% { transform: scale(.7); opacity: .5; } 60% { transform: scale(1.7); opacity: 1; } 100% { transform: scale(1.4); opacity: 1; } }
+  .ia-reasoning-hint { margin: 4px 0; font-size: var(--text-xs); color: var(--foreground-muted); line-height: 1.5; }
   .ia-model-list-section {
     min-height: 0;
     overflow-y: auto;
@@ -5310,7 +5386,7 @@
       right: 10px;
       bottom: calc(44px + env(safe-area-inset-bottom));
       left: auto;
-      width: min(280px, calc(100vw - 20px));
+      width: min(260px, calc(100vw - 20px));
     }
 
   }

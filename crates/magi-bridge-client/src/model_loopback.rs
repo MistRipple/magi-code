@@ -645,6 +645,7 @@ impl OpenAiCompatibleProviderRuntime {
         let adapted = OpenAiChatCompletionsAdapter
             .build_request(
                 &LlmMessageParams {
+                    reasoning_capability: None,
                     messages: vec![LlmMessage {
                         role: "user".to_string(),
                         content: LlmMessageContent::Text(prompt.to_string()),

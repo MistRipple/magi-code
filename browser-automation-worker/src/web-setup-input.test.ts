@@ -10,6 +10,7 @@ const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 test("配置写命令必须携带 Agent lease，缺失控制或用户控制均被协议拒绝", () => {
   for (const command of [
     { type: "web_platform_setup", payload: { tab_id: "home", action: "create_tunnel" } },
+    { type: "web_platform_setup", payload: { tab_id: "home", action: "prepare_runtime_key" } },
     { type: "web_configure_connector", payload: { tab_id: "home", name: "Magi", tunnel_id: "tunnel_1" } },
   ]) {
     const envelope = { request_id: "setup", protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION, command };

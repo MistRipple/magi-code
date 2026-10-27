@@ -373,7 +373,7 @@
     border: 0;
     box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
     border-radius: var(--tool-card-radius);
-    background: var(--surface-1);
+    background: var(--tool-card-background);
     color: var(--foreground);
     overflow: hidden;
   }
@@ -391,11 +391,11 @@
     min-width: 0;
     max-height: min(60vh, 640px);
     overflow: auto;
-    background: var(--code-bg);
+    background: transparent;
     color: inherit;
     font-family: var(--font-mono);
-    font-size: var(--text-xs, 11px);
-    line-height: 1.55;
+    font-size: var(--code-panel-font-size);
+    line-height: var(--code-panel-line-height);
     tab-size: 2;
   }
 
@@ -448,7 +448,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border-right: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     color: var(--info);
     user-select: none;
   }
@@ -463,7 +462,7 @@
     grid-template-columns: 42px 18px minmax(max-content, 1fr);
     width: 100%;
     min-width: max-content;
-    min-height: 1.55em;
+    min-height: 1lh;
   }
 
   .diff-line--addition {
@@ -485,7 +484,6 @@
   .diff-line-number {
     display: block;
     padding: 0 10px 0 6px;
-    border-right: var(--magi-hairline) solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     color: color-mix(in srgb, var(--foreground-muted) 72%, transparent);
     text-align: right;
     font-variant-numeric: tabular-nums;

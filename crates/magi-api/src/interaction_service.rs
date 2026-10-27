@@ -90,6 +90,7 @@ pub(crate) fn resolve_approval(
                 "tool_name": pending.tool_name,
                 "approval_id": pending.approval_id,
                 "decision": decision,
+                "external": pending.task_id.as_str().starts_with("external:"),
             }),
         )
         .with_context(EventContext {

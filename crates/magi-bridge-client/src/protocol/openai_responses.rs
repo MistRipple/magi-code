@@ -70,8 +70,13 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         }
 
         let capability = resolve_capability_profile(model);
-        if capability.supports_openai_reasoning_effort
-            && let Some(effort) = params.reasoning_effort
+        if params.reasoning_capability.as_ref().map_or(
+            capability.supports_openai_reasoning_effort,
+            |cap| {
+                cap.transport == crate::reasoning::ReasoningTransport::Openai
+                    && !cap.supported_efforts.is_empty()
+            },
+        ) && let Some(effort) = params.reasoning_effort
         {
             body["reasoning"] = json!({"effort": reasoning_effort_label(effort)});
         }
@@ -524,6 +529,7 @@ mod tests {
 
     fn params(messages: Vec<LlmMessage>) -> LlmMessageParams {
         LlmMessageParams {
+            reasoning_capability: None,
             messages,
             max_tokens: Some(512),
             temperature: None,

@@ -796,6 +796,18 @@ export class DesktopControlServer {
       await operation.catch(() => undefined);
       return;
     }
+    const outcome = result.response.envelope.outcome;
+    if (outcome.status === "failed" || outcome.status === "indeterminate") {
+      // Worker 的失败是正常协议结果，不会进入 runCommand 的 catch。
+      // 只记录固定代码和副作用边界，避免把页面文本、凭据或整个结果写入日志。
+      console.warn("[DesktopControlServer] Browser command outcome unconfirmed", {
+        requestId: request.request_id,
+        command: request.command.type,
+        status: outcome.status,
+        code: outcome.payload.code,
+        sideEffectStarted: outcome.payload.side_effect_started,
+      });
+    }
     this.sendEnvelope(connection, result.response.envelope);
     if (result.response.binary)
       this.sendBinary(connection, result.response.binary);

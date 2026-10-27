@@ -86,7 +86,16 @@ pub fn tool_failure(text: impl Into<String>) -> Value {
 }
 
 pub fn tool_success(text: impl Into<String>) -> Value {
-    json!({ "content": [{ "type": "text", "text": text.into() }], "isError": false })
+    let text = text.into();
+    let structured = serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object);
+    let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+    // ChatGPT 插件使用结构化结果继续推理；直接复用执行结果，文本供其他 MCP 客户端读取。
+    if let Some(structured) = structured {
+        result["structuredContent"] = structured;
+    }
+    result
 }
 
 /// `initialize` 的返回：声明协议版本、`tools` 能力与服务信息。
@@ -109,4 +118,25 @@ pub fn initialize_result(
 
 pub fn ping_result() -> Value {
     json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_json_preserves_the_same_content_for_structured_and_text_clients() {
+        let payload = json!({"status":"succeeded", "content":"probe line\n", "truncated":false});
+        let text = payload.to_string();
+        let result = tool_success(&text);
+        assert_eq!(result["structuredContent"], payload);
+        assert_eq!(result["content"][0]["text"], text);
+        assert_eq!(result["isError"], false);
+        for text in ["plain text", "{truncated", "[1,2]", "null"] {
+            let result = tool_success(text);
+            assert!(result.get("structuredContent").is_none());
+            assert_eq!(result["content"][0]["text"], text);
+        }
+        assert_eq!(tool_failure("failed")["isError"], true);
+    }
 }

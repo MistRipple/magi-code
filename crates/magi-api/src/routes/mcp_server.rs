@@ -899,18 +899,17 @@ async fn resolve_approval(
         })
         .map(|owner| owner.session_id)
         .ok_or_else(|| ApiError::not_found("授权请求不存在或已处理", &request.approval_id))?;
-    state
-        .conversation_registry
-        .tool_approvals()
-        .resolve(
-            &owner,
-            &request.approval_id,
-            match request.decision {
-                ExternalApprovalDecision::AllowOnce => ToolApprovalDecision::AllowOnce,
-                ExternalApprovalDecision::Deny => ToolApprovalDecision::Deny,
-            },
-        )
-        .map_err(ApiError::Conflict)?;
+    // 托盘与会话卡片必须沿同一结算入口发布 resolved 事件；否则槽位工具已继续，
+    // 会话中的待审批投影仍会锁住输入框。
+    crate::interaction_service::resolve_approval(
+        &state,
+        &owner,
+        &request.approval_id,
+        match request.decision {
+            ExternalApprovalDecision::AllowOnce => ToolApprovalDecision::AllowOnce,
+            ExternalApprovalDecision::Deny => ToolApprovalDecision::Deny,
+        },
+    )?;
     Ok(Json(ApprovalsResponse {
         approvals: pending_external_approvals(&state),
     }))
@@ -1976,6 +1975,24 @@ mod tests {
             waiter.decision_rx.recv().unwrap(),
             magi_conversation_runtime::ToolApprovalDecision::AllowOnce
         );
+        assert!(
+            crate::interaction_service::pending_approvals(&state, &session_id)
+                .unwrap()
+                .is_empty()
+        );
+        let events = state.event_bus.snapshot();
+        let resolved = events
+            .recent_events
+            .iter()
+            .find(|event| {
+                event.event_type == "tool.approval.resolved"
+                    && event.payload["approval_id"] == "approval-1"
+            })
+            .expect("托盘批准必须通知会话审批投影刷新");
+        assert_eq!(resolved.payload["session_id"], session_id.as_str());
+        assert_eq!(resolved.payload["decision"], "allow_once");
+        assert_eq!(resolved.payload["external"], true);
+        assert_eq!(resolved.payload["task_id"], format!("external:{token_id}"));
 
         let (status, _) = call(
             &state,

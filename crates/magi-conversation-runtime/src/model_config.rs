@@ -8,6 +8,7 @@
 //! provider 标签只用于统计/展示，由 `apiProtocol` 派生。模型配置写入入口只接受
 //! [`MODEL_CONFIG_FIELDS`] 中的字段，未知字段一律拒绝。
 
+use magi_bridge_client::reasoning::{ReasoningCapability, builtin_capability};
 use magi_bridge_client::{
     HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
 };
@@ -16,9 +17,10 @@ use magi_usage_authority::{LlmConfig, ReasoningEffort};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-pub const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: &str = "medium";
 pub const VISION_MODEL_SECTION: &str = "vision";
 pub const DEFAULT_VISION_CONTEXT_WINDOW: u64 = 128_000;
 
@@ -165,53 +167,15 @@ impl ModelApiProtocol {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModelReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-}
-
-impl ModelReasoningEffort {
-    fn from_label(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "xhigh" => Some(Self::Xhigh),
-            _ => None,
-        }
-    }
-
-    /// 归一化标签，与 settings 中 `reasoningEffort` 的取值一致。
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-        }
-    }
-
-    fn to_usage_reasoning_effort(self) -> ReasoningEffort {
-        match self {
-            Self::Low => ReasoningEffort::Low,
-            Self::Medium => ReasoningEffort::Medium,
-            Self::High => ReasoningEffort::High,
-            Self::Xhigh => ReasoningEffort::Xhigh,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedModelConfig {
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
     api_protocol: ModelApiProtocol,
-    reasoning_effort: Option<ModelReasoningEffort>,
+    reasoning_effort: Option<ReasoningEffort>,
     context_window_tokens: Option<u64>,
+    reasoning_capabilities: BTreeMap<String, ReasoningCapability>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +207,7 @@ impl NormalizedModelConfig {
             None => ModelApiProtocol::OpenAiResponses,
         };
         Ok(Self {
+            reasoning_capabilities: BTreeMap::new(),
             base_url: string_field(value, "baseUrl"),
             api_key: string_field(value, "apiKey"),
             model: string_field(value, "model"),
@@ -250,8 +215,61 @@ impl NormalizedModelConfig {
             reasoning_effort: value
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
-                .and_then(ModelReasoningEffort::from_label),
+                .and_then(|value| {
+                    serde_json::from_value::<ReasoningEffort>(serde_json::json!(value)).ok()
+                }),
             context_window_tokens: value.get("contextWindowTokens").and_then(Value::as_u64),
+        })
+    }
+
+    pub fn from_settings_with_catalog(
+        store: &magi_settings_store::SettingsStore,
+        value: &Value,
+    ) -> Result<Self, String> {
+        let mut config = Self::from_settings_value(value)?;
+        let cached = store.get_section("modelReasoningCatalog");
+        let mut capabilities: BTreeMap<String, ReasoningCapability> = cached
+            .get(config.reasoning_catalog_key())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        capabilities.retain(|_, cap| {
+            cap.validate().is_ok()
+                && (config.api_protocol == ModelApiProtocol::AnthropicMessages)
+                    != (cap.transport == magi_bridge_client::reasoning::ReasoningTransport::Openai)
+        });
+        config.reasoning_capabilities = capabilities;
+        Ok(config)
+    }
+
+    pub fn reasoning_catalog_key(&self) -> String {
+        let input = serde_json::json!([
+            self.base_url.as_deref().unwrap_or("").trim_end_matches('/'),
+            self.provider(),
+            format!("{:?}", self.api_protocol),
+            self.api_key
+        ]);
+        Sha256::digest(input.to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn reasoning_capability(&self, model: &str) -> ReasoningCapability {
+        self.reasoning_capabilities
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| {
+                builtin_capability(
+                    model,
+                    self.api_protocol == ModelApiProtocol::AnthropicMessages,
+                )
+            })
+    }
+
+    pub fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.model.as_deref().and_then(|model| {
+            self.reasoning_capability(model)
+                .reconcile(self.reasoning_effort)
         })
     }
 
@@ -308,7 +326,61 @@ impl NormalizedModelConfig {
 
     /// 归一化后的思考强度标签；未配置时为 `None`。
     pub fn reasoning_effort_label(&self) -> Option<&'static str> {
-        self.reasoning_effort.map(ModelReasoningEffort::label)
+        self.effective_reasoning_effort()
+            .map(magi_bridge_client::reasoning::effort_label)
+    }
+
+    pub fn freeze_agent_selection(
+        &self,
+        engine_id: Option<String>,
+        binding_revision: u32,
+        requested_effort: Option<ReasoningEffort>,
+    ) -> Result<magi_core::AgentModelSelection, String> {
+        let model = self.require_model()?.to_string();
+        if self.api_protocol().is_none() {
+            return Err("此引擎不支持子代理推理强度调度".into());
+        }
+        let capability = self.reasoning_capability(&model);
+        if requested_effort.is_some_and(|effort| !capability.supported_efforts.contains(&effort)) {
+            return Err(format!(
+                "模型 {model} 不支持所选推理强度；可用档位：{:?}。省略 reasoning_effort 使用配置默认值。",
+                capability.supported_efforts
+            ));
+        }
+        Ok(magi_core::AgentModelSelection {
+            engine_id,
+            binding_revision,
+            connection_key: self.reasoning_catalog_key(),
+            model,
+            context_window_tokens: self.context_window_tokens,
+            effective_effort: capability.reconcile(requested_effort.or(self.reasoning_effort)),
+            requested_effort,
+            capability,
+        })
+    }
+
+    fn apply_agent_selection(
+        mut self,
+        selection: &magi_core::AgentModelSelection,
+    ) -> Result<Self, String> {
+        if self.reasoning_catalog_key() != selection.connection_key {
+            return Err("子代理原模型连接或账号已变化，无法恢复原执行配置".into());
+        }
+        let mut capability = selection.capability.clone();
+        capability.validate()?;
+        if capability != selection.capability
+            || selection
+                .effective_effort
+                .is_some_and(|effort| !capability.supported_efforts.contains(&effort))
+        {
+            return Err("子代理模型选择快照无效".into());
+        }
+        self.context_window_tokens = selection.context_window_tokens;
+        self.model = Some(selection.model.clone());
+        self.reasoning_effort = selection.effective_effort;
+        self.reasoning_capabilities
+            .insert(selection.model.clone(), capability);
+        Ok(self)
     }
 
     pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
@@ -320,14 +392,16 @@ impl NormalizedModelConfig {
         if model.is_empty() {
             return None;
         }
-        Some(HttpModelBridgeClient::new_with_protocol(
-            base_url,
-            self.api_key.clone(),
-            model.to_string(),
-            protocol,
-            self.reasoning_effort
-                .map(ModelReasoningEffort::to_usage_reasoning_effort),
-        ))
+        Some(
+            HttpModelBridgeClient::new_with_protocol(
+                base_url,
+                self.api_key.clone(),
+                model.to_string(),
+                protocol,
+                self.effective_reasoning_effort(),
+            )
+            .with_reasoning_capability(self.reasoning_capability(model)),
+        )
     }
 
     pub fn to_http_image_generation_client(&self) -> Result<HttpImageGenerationClient, String> {
@@ -352,9 +426,7 @@ impl NormalizedModelConfig {
             base_url: self.base_url.clone()?,
             api_key: self.api_key.clone(),
             account_fingerprint: None,
-            reasoning_effort: self
-                .reasoning_effort
-                .map(ModelReasoningEffort::to_usage_reasoning_effort),
+            reasoning_effort: self.effective_reasoning_effort(),
         })
     }
 
@@ -512,7 +584,7 @@ pub fn resolve_vision_execution_config(
     validate_vision_model_settings(&raw).map_err(|error| {
         format!("模型 {selected_model} 只能处理文本，识图模型配置不可用：{error}")
     })?;
-    NormalizedModelConfig::from_settings_value(&raw).map(Some)
+    NormalizedModelConfig::from_settings_with_catalog(store, &raw).map(Some)
 }
 
 /// 模型配置对象的当前 schema 字段。
@@ -526,13 +598,14 @@ pub const MODEL_CONFIG_FIELDS: &[&str] = &[
     "textModelRules",
 ];
 
-/// 启动时移除已删除的完整路径字段，避免旧设置被投影回请求。
+/// 启动时清理废弃模型字段，避免旧设置被投影回请求。
 pub fn canonicalize_model_settings(
     store: &magi_settings_store::SettingsStore,
 ) -> Result<(), std::io::Error> {
-    fn remove_legacy_path_field(config: &mut Value) {
+    fn remove_obsolete_fields(config: &mut Value) {
         if let Some(fields) = config.as_object_mut() {
             fields.remove("urlMode");
+            fields.remove("modelReasoningOverrides");
         }
     }
 
@@ -541,12 +614,12 @@ pub fn canonicalize_model_settings(
         let mut config = original.clone();
         match section.as_str() {
             "orchestrator" | "auxiliary" | "vision" | "imageGeneration" => {
-                remove_legacy_path_field(&mut config);
+                remove_obsolete_fields(&mut config);
             }
             "workers" => {
                 if let Some(workers) = config.as_object_mut() {
                     for worker in workers.values_mut() {
-                        remove_legacy_path_field(worker);
+                        remove_obsolete_fields(worker);
                     }
                 }
             }
@@ -554,7 +627,7 @@ pub fn canonicalize_model_settings(
                 if let Some(engines) = config.as_array_mut() {
                     for engine in engines {
                         if let Some(llm) = engine.get_mut("llm") {
-                            remove_legacy_path_field(llm);
+                            remove_obsolete_fields(llm);
                         }
                     }
                 }
@@ -609,7 +682,7 @@ pub fn configured_role_engine_model_config(
             binding.engine_id
         )
     })?;
-    let config = NormalizedModelConfig::from_settings_value(&engine_llm)?;
+    let config = NormalizedModelConfig::from_settings_with_catalog(settings_store, &engine_llm)?;
     config.require_base_url().map_err(|error| {
         format!(
             "角色 {role_id} 的模型引擎 {} 配置无效：{error}",
@@ -628,6 +701,47 @@ pub fn configured_role_engine_model_config(
         binding_revision: binding.binding_revision,
         config,
     }))
+}
+
+/// 从持久化选择重建请求；只从当前凭据库取原连接的密钥，不重新选择模型或能力。
+pub(crate) fn frozen_agent_model_config(
+    store: &magi_settings_store::SettingsStore,
+    selection: &magi_core::AgentModelSelection,
+) -> Result<NormalizedModelConfig, String> {
+    let raw = match selection.engine_id.as_deref() {
+        Some(id) => {
+            engine_llm_config(store, id).ok_or_else(|| "子代理原模型引擎已移除".to_string())?
+        }
+        None => store.get_section("orchestrator"),
+    };
+    NormalizedModelConfig::from_settings_value(&raw)?.apply_agent_selection(selection)
+}
+
+pub(crate) fn agent_target_model_config(
+    store: &magi_settings_store::SettingsStore,
+    parent: &magi_core::Task,
+    role: &str,
+    session: &SessionId,
+) -> Result<(NormalizedModelConfig, Option<String>, u32), String> {
+    if let Some(bound) = configured_role_engine_model_config(store, role)? {
+        return Ok((bound.config, Some(bound.engine_id), bound.binding_revision));
+    }
+    if let Some(selection) = parent
+        .executor_binding
+        .as_ref()
+        .and_then(|binding| binding.model_selection.as_ref())
+    {
+        return Ok((
+            frozen_agent_model_config(store, selection)?,
+            selection.engine_id.clone(),
+            selection.binding_revision,
+        ));
+    }
+    Ok((
+        resolve_orchestrator_model_config(store, Some(session))?,
+        None,
+        0,
+    ))
 }
 
 pub fn resolve_orchestrator_model_config(
@@ -663,14 +777,14 @@ pub fn resolve_orchestrator_model_config(
         merge_orchestrator_session_override(&mut config, &defaults);
         merge_orchestrator_session_override(&mut config, &session_override);
         ensure_orchestrator_reasoning_effort(&mut config);
-        return NormalizedModelConfig::from_settings_value(&config)
+        return NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
             .map_err(|error| format!("引擎 {engine_id} 的模型配置无效：{error}"));
     }
     let mut config = settings_store.get_section("orchestrator");
     merge_orchestrator_session_override(&mut config, &defaults);
     merge_orchestrator_session_override(&mut config, &session_override);
     ensure_orchestrator_reasoning_effort(&mut config);
-    NormalizedModelConfig::from_settings_value(&config)
+    NormalizedModelConfig::from_settings_with_catalog(settings_store, &config)
         .map_err(|error| format!("orchestrator 模型配置无效：{error}"))
 }
 
@@ -752,23 +866,26 @@ pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
     let serde_json::Value::Object(config) = config else {
         return;
     };
-    let is_valid = config
-        .get("reasoningEffort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
+    let is_valid = config.get("reasoningEffort") == Some(&Value::Null)
+        || config
+            .get("reasoningEffort")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value.trim(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                )
+            });
     if !is_valid {
-        config.insert(
-            "reasoningEffort".to_string(),
-            serde_json::Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-        );
+        config.insert("reasoningEffort".to_string(), serde_json::Value::Null);
     }
 }
 
 /// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
 ///
 /// 设计约束：会话覆盖**只能**改主模型与思考强度，绝不携带 baseUrl / apiKey，
-/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时恢复为
-/// 产品默认的中等推理强度，运行期不允许出现空强度。
+/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时使用
+/// 当前模型默认行为，不能混同字符串 `none`（明确关闭推理）。
 pub fn merge_orchestrator_session_override(
     base: &mut serde_json::Value,
     override_section: &serde_json::Value,
@@ -819,10 +936,7 @@ pub fn merge_orchestrator_session_override(
                 );
             }
             Some(serde_json::Value::Null) => {
-                base_map.insert(
-                    "reasoningEffort".to_string(),
-                    serde_json::Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-                );
+                base_map.insert("reasoningEffort".to_string(), serde_json::Value::Null);
             }
             _ => {}
         }
@@ -1070,6 +1184,7 @@ mod tests {
             "model": "test-model",
             "apiProtocol": "openai_chat",
             "urlMode": "full",
+            "modelReasoningOverrides": {"test-model":{"supportedEfforts":["high"],"defaultEffort":"high","transport":"openai"}},
             "unrelatedModelOption": "keep"
         });
         let store = magi_settings_store::SettingsStore::with_persistence_path(path.clone());
@@ -1093,6 +1208,10 @@ mod tests {
         canonicalize_model_settings(&store).unwrap();
         let mut expected = connection;
         expected.as_object_mut().unwrap().remove("urlMode");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("modelReasoningOverrides");
         let reloaded = magi_settings_store::SettingsStore::with_persistence_path(path);
         reloaded.load_from_disk().unwrap();
         for section in ["orchestrator", "auxiliary", "vision", "imageGeneration"] {

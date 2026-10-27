@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import type { ToolCallStatus } from '../types/message';
   import Icon from './Icon.svelte';
   import ToolCardMeta from './ToolCardMeta.svelte';
@@ -20,9 +21,10 @@
   interface Props {
     toolCall?: ToolCall;
     status?: ToolCallStatus;
+    outputFooter?: Snippet;
   }
 
-  let { toolCall, status = 'running' }: Props = $props();
+  let { toolCall, status = 'running', outputFooter }: Props = $props();
   // Shell 与其他工具使用同一折叠契约，运行状态变化不干预用户手动选择。
   let collapsed = $state(true);
 
@@ -321,7 +323,8 @@
     return [summary, failure].filter(Boolean).join(', ');
   });
   const isExpandable = $derived(Boolean(
-    displayCommand
+    outputFooter
+    || displayCommand
     || displayCwd
     || showOutput
     || startupMessage
@@ -451,6 +454,7 @@
         {:else}
           <pre class="terminal-output terminal-empty">{i18n.t('terminalSession.noOutput')}</pre>
         {/if}
+        {#if outputFooter}{@render outputFooter()}{/if}
 
         {#if startupMessage}
           <div class="terminal-hint">{i18n.t('terminalSession.startup')}: {startupMessage}</div>
@@ -533,7 +537,6 @@
   .tool-summary {
     font-size: var(--text-xs);
     color: var(--foreground-muted);
-    opacity: 0.8;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

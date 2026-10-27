@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
  */
 
 /** 站点适配层结构版本。selector 集变化即推进，用于诊断与漂移判定。 */
-export const WEB_MODEL_SITE_REVISION = "chatgpt-web-9";
+export const WEB_MODEL_SITE_REVISION = "chatgpt-web-17";
 
 /** ChatGPT 页面的 DOM 事实（selector、命名）。集中在这里，不得散落。 */
 export const WEB_MODEL_SELECTORS = {
@@ -72,7 +72,7 @@ export const WEB_MODEL_SELECTORS = {
   attachmentUploading: ["[data-composer-attachments] [role='progressbar']"],
   /** 文件选择输入：附加图片通过它进入，不模拟粘贴。 */
   fileInput: ["input[type='file']"],
-  /** 提交按钮。找不到时退回 composer 上的 Enter 键（ChatGPT 的默认提交手势）。 */
+  /** 提交按钮。找不到时明确失败，不猜测其他提交手势。 */
   submitButton: [
     "button[data-testid='send-button']",
     "button[data-testid='composer-submit-button']",
@@ -678,8 +678,9 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     const unavailable = () => button.disabled || button.getAttribute('aria-disabled') === 'true';
     for (let waited = 0; unavailable() && waited < 1500; waited += 100) await sleep(100);
     if (unavailable()) throw new Error('web_submit_unavailable:submit button is disabled');
-    // 与站点菜单共用完整指针序列；后台离屏 guest 不依赖 Chromium compositor 接收鼠标。
-    press(button);
+    // GPT Web 推理页可以离屏保活；站点提交使用按钮的标准激活语义，
+    // 不依赖 compositor 对离屏 guest 的原生鼠标命中。是否接纳仍由消息事实确认。
+    button.click();
     await sleep(80);
     const after = firstComposer();
     if (attachmentState().count === 0) ownedAttachmentNames.clear();
@@ -696,19 +697,18 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   // 只接受精确的 Continue/继续语义，不能按按钮位置或“临时聊天”标题猜测，
   // 避免误点“关闭临时聊天”。
   const confirmTemporaryChat = async () => {
-    const candidates = allMatches(SELECTORS.temporaryChatConfirmButton).filter(visible);
-    const button = candidates.find((element) => {
-      const label = [
+    const find = () => allMatches(SELECTORS.temporaryChatConfirmButton).filter(visible).find((element) => [
         element.getAttribute('aria-label'),
         element.getAttribute('data-testid'),
         textOf(element),
-      ].filter(Boolean).join(' ').trim();
-      return /^(?:continue|继续)$/iu.test(label)
-        || /(?:^|[^a-z])continue(?:$|[^a-z])/iu.test(label);
-    });
+      ].some(label => /^(?:continue|继续)$/iu.test((label || '').trim())));
+    // 首次进入时确认层可能晚于 composer 挂载，且 aria-label 与正文可能重复。
+    const button = find() || (location.search.includes('temporary-chat=true')
+      && !allMatches(SELECTORS.userMessage).length ? await waitFor(find, 2000) : null);
     if (!button) return false;
+    // 首次确认与发送共用离屏推理页的标准按钮激活语义。
     button.click();
-    await sleep(120);
+    if (!await waitFor(() => !visible(button), 3000)) throw new Error('web_temporary_chat_unconfirmed');
     return true;
   };
 
@@ -1148,14 +1148,13 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
         && (!selection.text || (item.textInput?.value === selection.text && (!item.customNode || questionOptionChecked(item.customNode))));
     });
   };
-  const activateQuestionAction = (id, action) => {
+  const activateQuestionAction = async (id, action) => {
     const card = requireQuestionCard(id);
     const node = action.kind === 'submit' ? card.submit : action.kind === 'skip' ? card.skip
       : action.kind === 'text' ? card.items[action.item]?.textInput : action.kind === 'custom' ? card.items[action.item]?.customNode : card.items[action.item]?.nodes[action.index];
     if (!node || node.disabled || node.getAttribute('aria-disabled') === 'true') throw new Error('web_question_target_unavailable:页面控件不可用');
     if (!exposed(node)) throw new Error('web_question_target_unavailable:页面控件已隐藏');
-    if (action.kind === 'text') setFieldValue(node, action.text);
-    else press(node);
+    await globalThis.__magiSetupInput.perform(action.kind === 'text' ? 'type' : 'click', node, action.text);
     return true;
   };
 
@@ -1305,16 +1304,19 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
   };
   const buttonWithText = (root, pattern) => allMatches(['button', '[role="button"]', 'a'], root)
     .filter(visible)
-    .find((candidate) => pattern.test(textOf(candidate)));
+    .find((candidate) => !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true' && pattern.test(textOf(candidate)));
   // 已安装列表的行没有稳定的角色或 test id：先找文本恰好等于应用名的叶子节点（标题），
   // 再取它所在的行（带副标题 / 开关的外层容器）。名称必须完全相等，不做包含匹配。
-  const connectorEntry = (root, name) => {
+  const connectorEntries = (root, name) => {
     const wanted = name.trim().toLowerCase();
-    const title = allMatches(['*'], root)
+    return [...new Set(allMatches(['*'], root)
       .filter((element) => element.childElementCount === 0 && visible(element))
-      .find((element) => textOf(element).toLowerCase() === wanted);
-    if (!title) return null;
-    return title.closest('[role="listitem"], li, a, button') || title.parentElement?.parentElement || title;
+      .filter((element) => textOf(element).toLowerCase() === wanted)
+      .map(title => title.closest('[role="listitem"], li, a, button') || title.parentElement?.parentElement || title))];
+  };
+  const connectorEntry = (root, name) => {
+    const entries = connectorEntries(root, name);
+    return entries.length === 1 ? entries[0] : null;
   };
   const connectorUnsupported = (reason) => ({
     supported: false, exists: false, enabled: false, tool_count: null, reason,
@@ -1322,21 +1324,33 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
 
   // 已安装的插件 / MCP 应用列表：当前页必须是设置里的「插件」页。
   const connectorStatus = async ({ name }) => {
-    if (!location.pathname.startsWith('/settings/')) return connectorUnsupported('connector_page_not_open');
-    const entry = await waitFor(() => connectorEntry(document.body, name), 5000);
+    if (!/^\/settings\/plugins-settings\/?$/u.test(location.pathname)) return connectorUnsupported('connector_page_not_open');
+    if (firstVisible(['input[type="password"]', 'input[autocomplete="one-time-code"]'])
+      || buttonWithText(document, /^(?:log in|sign in|登录)$/iu)
+      || firstVisible(['[aria-busy="true"]', '[role="progressbar"]'])) return connectorUnsupported('connector_page_not_open');
+    const entries = await waitFor(() => {
+      const found = connectorEntries(document.body, name);
+      return found.length ? found : null;
+    }, 5000);
+    if (entries?.length > 1) return connectorUnsupported('connector_ambiguous');
+    const entry = entries?.[0];
     if (!entry) {
       // 列表还没渲染完时没有任何可见内容：此时不下“不存在”的结论。
-      const rendered = (document.body.innerText || '').trim().length > 0 && document.querySelector('main, [role="main"]');
-      return rendered
+      const empty = allMatches(['p', 'span', 'div'], document.body).filter(visible).some(element =>
+        /^(?:你尚未安装任何插件|尚未安装任何插件|你尚未连接任何应用|No (?:apps|plugins|connectors) (?:connected|installed)(?: yet)?|You (?:haven't|haven’t|have not) (?:installed|connected) any (?:apps|plugins|connectors)(?: yet)?)[.!。]?$/iu.test(textOf(element)));
+      return empty && !firstVisible(['[aria-busy="true"]', '[role="progressbar"]', '[role="dialog"]', 'dialog'])
         ? { supported: true, exists: false, enabled: false, tool_count: null, reason: null }
         : connectorUnsupported('connector_page_not_open');
     }
     const toggle = entry.querySelector('[role="switch"], input[type="checkbox"]');
+    const entryText = textOf(entry);
+    const countMatch = /(\d+)\s*(?:tools?|个?工具)/iu.exec(entryText);
+    // 权限摘要只说明调用策略，不证明当前工具可用。新版列表缺少工具数量时，
+    // 保留未确认状态，配置路径会进入详情刷新并以本次刷新结果确认。
     const enabled = toggle
       ? toggle.getAttribute('aria-checked') === 'true' || toggle.checked === true
-      // 已安装列表里的应用默认就是启用的；行里没有开关时，只有明确写了停用才算未启用。
-      : !/(?:disabled|paused|已停用|已禁用|未启用|已暂停)/iu.test(textOf(entry));
-    const countMatch = /(\\d+)\\s*(?:tools?|个?工具)/iu.exec(textOf(entry));
+      : Boolean(countMatch && Number(countMatch[1]) > 0)
+        && !/(?:disabled|paused|已停用|已禁用|未启用|已暂停)/iu.test(entryText);
     return {
       supported: true,
       exists: true,
@@ -1354,25 +1368,62 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     const press = element => input.perform('click', element);
     const setFieldValue = (element, value) => input.perform(element.tagName === 'SELECT' ? 'select' : 'type', element, value);
     const fail = (reason) => ({ configured: false, confirmed_enabled: false, reason });
+    const confirmConnection = async () => {
+      const connectLabel = value => value === '连接 ' + name || value === 'Connect ' + name;
+      // 创建后的服务端检查可能超过十秒；只延长等待，不重新提交创建或补点连接。
+      const next = await waitFor(() => {
+        const dialog = firstVisible(SELECTORS.dialog);
+        if (!dialog) return null;
+        const headings = allMatches(['h1', 'h2', '[role="heading"]'], dialog).filter(visible);
+        const connect = allMatches(['button'], dialog).filter(visible).find(button =>
+          connectLabel(textOf(button)) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+        return headings.some(heading => connectLabel(textOf(heading))) && connect ? connect : null;
+      }, 30000);
+      if (!next) return false;
+      await press(next);
+      return Boolean(await waitFor(() => !firstVisible(SELECTORS.dialog), 10000));
+    };
     // 已安装的连接器：ChatGPT 会缓存创建 / 上次刷新时的 MCP 工具列表，Magi 的目录变化后不会自动
     // 同步。此时（页面在设置里的「插件」页）进入该连接器的详情页，点「Refresh tools」重新拉取。
-    if (location.pathname.startsWith('/settings/')) {
+    if (/^\/settings\/plugins-settings(?:\/|$)/u.test(location.pathname)) {
       // 点进详情页会换路由，命令结果因此被判为过期（daemon 把它当页面交接重试）；重试时页面已经
       // 在详情页，直接找按钮，不再找列表行。
       if (!/^\/settings\/plugins-settings\/[^/]+/u.test(location.pathname)) {
         const entry = await waitFor(() => connectorEntry(document.body, name), 8000);
         if (!entry) return fail('connector_not_listed');
         await press(entry);
+        // 本命令只负责打开详情。即使 SPA 在输入结算后才更新路由，也不会顺带提交刷新；
+        // daemon 对齐新的导航代次后再发下一条命令。
+        return fail('connector_detail_opening');
       }
-      const refresh = await waitFor(() => buttonWithText(document, /^(?:refresh tools|刷新工具)$/iu), 8000);
-      if (!refresh) return fail('connector_refresh_button_missing');
+      // 详情路由和标题都必须就绪；旧列表上恰好同名的文字不够，其他应用不能刷新。
+      const detailReady = () => /^\/settings\/plugins-settings\/[^/]+/u.test(location.pathname)
+        && allMatches(['h1', '[role="heading"]']).filter(visible).some(heading => textOf(heading) === name);
+      // 详情页会在应用权限与工具列表完成回读后才启用按钮；只等待就绪，绝不重复点击。
+      const action = await waitFor(() => detailReady()
+        && buttonWithText(document, /^(?:refresh tools|刷新工具|关联|connect|link)$/iu), 30000);
+      if (!action) return fail(detailReady() ? 'connector_refresh_button_missing' : 'connector_detail_unconfirmed');
+      // 详情展示了 Tunnel id 时必须匹配本次配置，不能刷新另一个同名连接器后报告成功。
+      const tunnelIds = (document.body.innerText || '').match(/\btunnel_[a-f0-9]{32}\b/gu) || [];
+      if (tunnelIds.length && !tunnelIds.includes(tunnelId)) return fail('connector_tunnel_mismatch');
+      if (/^(?:关联|connect|link)$/iu.test(textOf(action))) {
+        // 同名列表仅用于定位，详情标题必须再次精确核对，不能关联另一个应用。
+        const headings = allMatches(['h1', '[role="heading"]']).filter(visible);
+        if (!headings.some(heading => textOf(heading) === name)) return fail('connector_not_listed');
+        await press(action);
+        if (!await confirmConnection()) return fail('connector_create_rejected');
+        return { configured: true, confirmed_enabled: true, reason: 'connection_confirmed' };
+      }
+      const refresh = action;
       await press(refresh);
       // 刷新是站点向 Magi 的 MCP 端点重新发 tools/list；按钮在请求期间会置为不可用。
       await sleep(400);
-      await waitFor(() => {
+      const refreshed = await waitFor(() => {
         const button = buttonWithText(document, /^(?:refresh tools|刷新工具)$/iu);
         return button && !button.disabled && button.getAttribute('aria-busy') !== 'true';
-      }, 15000);
+      }, 30000);
+      if (!refreshed) return fail('connector_refresh_unconfirmed');
+      if (firstVisible(['[role="alert"]'])) return fail('connector_refresh_rejected');
       return { configured: true, confirmed_enabled: true, reason: 'tools_refreshed' };
     }
     if (!location.pathname.startsWith('/plugins')) return fail('connector_page_not_open');
@@ -1380,7 +1431,8 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     if (!add) return fail('connector_create_entry_missing');
     await press(add);
     const create = await waitFor(() => allMatches(['[role="menuitem"]']).filter(visible).find((item) => (
-      /(?:创建|Create).*MCP/iu.test(textOf(item))
+      !item.disabled && item.getAttribute('aria-disabled') !== 'true'
+      && /^(?:添加自定义 MCP 服务器|Add custom MCP server|创建 MCP 应用|Create MCP app)$/iu.test(textOf(item))
     )), 3000);
     if (!create) return fail('connector_create_entry_missing');
     await press(create);
@@ -1402,20 +1454,24 @@ export const INSTALL_WEB_MODEL_ADAPTER = String.raw`
     const none = auth && [...auth.options].find((option) => /(?:无需身份验证|no authentication|none)/iu.test(option.text));
     if (!none) return fail('connector_auth_option_missing');
     await setFieldValue(auth, none.value);
-    const acknowledge = allMatches(['input[type="checkbox"]'], form).filter(visible)[0];
+    const acknowledge = firstVisible(['input[type="checkbox"]', '[role="checkbox"]'], form);
     if (!acknowledge) return fail('connector_form_fields_missing');
-    if (!acknowledge.checked) await press(acknowledge);
-    const save = allMatches(['button[type="submit"]', 'button'], form).filter(visible).find((button) => (
-      /^(?:create|创建)$/iu.test(textOf(button))
-    ));
-    if (!save || save.disabled) return fail('connector_save_button_missing');
+    if (!acknowledge.checked && acknowledge.getAttribute('aria-checked') !== 'true') await press(acknowledge);
+    const save = await waitFor(() => allMatches(['button[type="submit"]', 'button'], form).filter(visible).find((button) => (
+      /^(?:create(?: as plugin)?|创建(?:为插件)?)$/iu.test(textOf(button)) && !button.disabled && button.getAttribute('aria-disabled') !== 'true'
+    )), 8000);
+    if (!save) return fail('connector_save_button_missing');
     await press(save);
-    const closed = await waitFor(() => (firstVisible(SELECTORS.dialog) ? null : true), 10000);
+    // 新版创建后用第二个对话框确认连接；只接受当前应用的精确标题和按钮，
+    // 不把创建表单消失或出现其他授权对话框当成已连接。
+    const closed = await confirmConnection();
     if (!closed) {
-      const message = textOf(firstVisible(SELECTORS.dialog)).match(/无法[^。]*。|Unable[^.]*\\./u)?.[0];
-      return fail(message ? 'connector_create_rejected:' + message.slice(0, 80) : 'connector_create_rejected');
+      if (/(?:MCP 服务器拒绝了访问|MCP server (?:denied|rejected) access|workspace access permissions|工作空间访问权限)/iu.test(textOf(form))) {
+        return fail('connector_access_denied');
+      }
+      return fail('connector_create_rejected');
     }
-    return { configured: true, confirmed_enabled: false, reason: null };
+    return { configured: true, confirmed_enabled: true, reason: 'connection_confirmed' };
   };
 
   const writeTextWithTemporaryChat = async (input) => {

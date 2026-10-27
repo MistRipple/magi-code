@@ -485,6 +485,7 @@ impl HostWebModelPageDriver {
             },
             BrowserHostCommandOutcome::Failed(error)
             | BrowserHostCommandOutcome::Indeterminate(error) => {
+                tracing::warn!(code = %error.code, "GPT Web 页面命令未确认");
                 Err(WebModelError::new(failure_code, error.message))
             }
             BrowserHostCommandOutcome::Cancelled => Err(WebModelError::cancelled()),
@@ -495,10 +496,34 @@ impl HostWebModelPageDriver {
     /// 每个窄命令结算后释放控制，等待登录、密钥或确认时不会残留 Agent 光标。
     async fn native_setup_command(
         &self,
-        build: impl FnOnce(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
+        build: impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
     ) -> Result<serde_json::Value, WebModelError> {
+        let mut last = unavailable("browser_surface_stale");
+        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
+            }
+            let (result, retry_safe) = self.native_setup_attempt(&build).await?;
+            if !retry_safe {
+                return result;
+            }
+            last = result.expect_err("retryable setup attempt failed before input");
+        }
+        Err(last)
+    }
+
+    async fn native_setup_attempt(
+        &self,
+        build: &impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
+    ) -> Result<(Result<serde_json::Value, WebModelError>, bool), WebModelError> {
         let tab_id = self.home_tab()?;
-        let binding = self.refresh_primary_binding(&tab_id).await?;
+        // 取得控制权之前的 Surface 交接没有任何输入副作用，也必须进入有界重试。
+        // 原先这里的 ? 直接退出，导致刚导航到插件列表时偶发要求用户手动重试。
+        let binding = match self.refresh_primary_binding(&tab_id).await {
+            Ok(binding) => binding,
+            Err(error) if is_surface_handoff(&error.message) => return Ok((Err(error), true)),
+            Err(error) => return Err(error),
+        };
         let client = self.client()?;
         let now = UtcMillis::now();
         let lease = {
@@ -546,19 +571,57 @@ impl HostWebModelPageDriver {
                 reply.response.outcome,
                 BrowserHostCommandOutcome::Succeeded(_)
             ) {
-                return Err(unavailable("配置页面控制权未取得"));
+                if let BrowserHostCommandOutcome::Failed(error)
+                | BrowserHostCommandOutcome::Indeterminate(error) = &reply.response.outcome
+                {
+                    tracing::warn!(code = %error.code, "GPT Web 配置控制权未取得");
+                }
+                let retry_safe = can_retry_setup_before_input(&reply.response.outcome);
+                return Ok((Err(unavailable("配置页面控制权未取得")), retry_safe));
             }
-            self.json_command(
-                build(
+            let reply = client
+                .request(build(
                     tab_id.clone(),
                     BrowserHostControl::Agent {
                         lease_id: lease.lease_id.clone(),
                         fence: lease.fence,
                     },
+                ))
+                .await
+                .map_err(host_error)?;
+            let retry_safe = can_retry_setup_before_input(&reply.response.outcome);
+            Ok(match reply.response.outcome {
+                BrowserHostCommandOutcome::Succeeded(result) => (
+                    match *result {
+                        BrowserHostCommandResult::Json { value } => Ok(value),
+                        _ => Err(invalid("宿主命令结果不是 JSON")),
+                    },
+                    false,
                 ),
-                WebModelErrorCode::WebTunnelUnavailable,
-            )
-            .await
+                BrowserHostCommandOutcome::Failed(error)
+                | BrowserHostCommandOutcome::Indeterminate(error) => {
+                    // 只有宿主明确证明尚未开始输入时，才重取租约；未知结果绝不重放。
+                    // 进入详情页的导航交接是预期路由变化，后续回读会继续确认，
+                    // 不应在诊断中伪装成要求用户点击“重试”的失败。
+                    if error.code == "browser_navigation_superseded" {
+                        tracing::info!(
+                            code = %error.code,
+                            retry_safe,
+                            "GPT Web 配置页面导航交接，等待新页面回读",
+                        );
+                    } else {
+                        tracing::warn!(code = %error.code, retry_safe, "GPT Web 配置页面交接");
+                    }
+                    (
+                        Err(WebModelError::new(
+                            WebModelErrorCode::WebTunnelUnavailable,
+                            error.message,
+                        )),
+                        retry_safe,
+                    )
+                }
+                BrowserHostCommandOutcome::Cancelled => (Err(WebModelError::cancelled()), false),
+            })
         }
         .await;
         let release = {
@@ -731,7 +794,46 @@ impl WebModelPageDriver for HostWebModelPageDriver {
     }
 
     fn open_page<'a>(&'a self, _page_id: &'a str, url: &'a str) -> DriverFuture<'a, ()> {
-        Box::pin(async move { self.restore(url.to_string()).await.map(|_| ()) })
+        Box::pin(async move {
+            // 配置页交接后保留用户选择和已准备的表单，不因同地址继续而重载。
+            if url == magi_web_model::openai_platform_tunnels_url()
+                || url == magi_web_model::openai_platform_api_keys_url()
+            {
+                let tab = self.restore_page(url.to_string()).await?;
+                if self.page_state(&tab)?.2 != url {
+                    self.navigate_to(&tab, url).await?;
+                }
+                return Ok(());
+            }
+            self.restore(url.to_string()).await.map(|_| ())
+        })
+    }
+
+    fn probe_page<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, magi_web_model::PageProbe> {
+        Box::pin(async move {
+            let value = self
+                .json_read_command(
+                    BrowserHostCommand::WebModelProbe {
+                        tab_id: self.home_tab()?,
+                    },
+                    WebModelErrorCode::WebSendRejected,
+                )
+                .await?;
+            let login_state = match value.get("login_state").and_then(serde_json::Value::as_str) {
+                Some("signed_in") => LoginState::SignedIn,
+                Some("signed_out") => LoginState::SignedOut,
+                Some("blocked") => LoginState::Blocked,
+                _ => return Err(invalid("页面登录探测结果无效")),
+            };
+            let composer_available = value
+                .get("composer_available")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| invalid("页面输入框探测结果无效"))?;
+            Ok(magi_web_model::PageProbe {
+                login_state,
+                composer_available,
+            })
+        })
     }
 
     fn open_saved_chat<'a>(
@@ -1143,7 +1245,12 @@ impl WebModelPageDriver for HostWebModelPageDriver {
     ) -> DriverFuture<'a, ConnectorStatus> {
         Box::pin(async move {
             let status = self.read_connector_list(name).await;
-            self.leave_connector_pages().await;
+            if status
+                .as_ref()
+                .is_ok_and(|value| value.supported && value.exists && value.enabled)
+            {
+                self.leave_connector_pages().await;
+            }
             status
         })
     }
@@ -1156,7 +1263,10 @@ impl WebModelPageDriver for HostWebModelPageDriver {
     ) -> DriverFuture<'a, ConnectorConfigOutcome> {
         Box::pin(async move {
             let outcome = self.create_connector(name, tunnel_id).await;
-            if outcome.is_ok() {
+            if outcome
+                .as_ref()
+                .is_ok_and(|value| value.configured && value.confirmed_enabled)
+            {
                 self.leave_connector_pages().await;
             }
             outcome
@@ -1189,6 +1299,15 @@ impl HostWebModelPageDriver {
                 Err(error) if is_surface_handoff(&error.message) => continue,
                 Err(error) => return Err(error),
             };
+            tracing::info!(
+                attempt,
+                supported = status.supported,
+                exists = status.exists,
+                enabled = status.enabled,
+                reason = crate::web_model_setup::connector_failure_reason(status.reason.as_deref())
+                    .unwrap_or("none"),
+                "GPT Web 连接器列表回读"
+            );
             if status.reason.as_deref() == Some("connector_page_not_open") {
                 parsed = Some(status);
                 continue;
@@ -1219,20 +1338,15 @@ impl HostWebModelPageDriver {
             });
         }
         if before.exists {
-            if !before.enabled {
-                return Ok(ConnectorConfigOutcome {
-                    configured: true,
-                    confirmed_enabled: false,
-                    reason: Some("connector_not_enabled".to_string()),
-                });
-            }
             // 连接器已经存在：不重复创建，而是让 ChatGPT 重新拉取 Magi 当前的工具列表
             //（ChatGPT 缓存创建 / 上次刷新时的列表，Magi 目录变化后不会自动同步）。
-            // 页面此时就在设置里的「插件」页（上面的回读刚把它带到这里）。
+            // 上面的回读已进入列表页；打开详情与刷新工具分成两个命令，
+            // 导航交接不会重放刷新副作用。
             return self.refresh_connector_tools(name, tunnel_id).await;
         }
         self.restore(connector_directory_url()).await?;
         let mut created_reason = None;
+        let mut connection_confirmed = false;
         for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
@@ -1253,6 +1367,11 @@ impl HostWebModelPageDriver {
                         .get("reason")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string);
+                    connection_confirmed = value
+                        .get("confirmed_enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && reason.as_deref() == Some("connection_confirmed");
                     // 页面还没落在目录页：脚本什么都没做，可以安全重试。
                     if reason.as_deref() == Some("connector_page_not_open") {
                         created_reason = reason;
@@ -1267,14 +1386,25 @@ impl HostWebModelPageDriver {
                 Err(error) => return Err(error),
             }
         }
+        // 明确的页面阻断保持在原表单，供用户接手；不能导航抹掉现场。
+        if let Some(reason) = created_reason.filter(|reason| {
+            reason != "connector_page_not_open" && reason != "connection_confirmed"
+        }) {
+            return Ok(ConnectorConfigOutcome {
+                configured: false,
+                confirmed_enabled: false,
+                reason: Some(reason),
+            });
+        }
         let after = self.read_connector_list(name).await?;
         Ok(ConnectorConfigOutcome {
             configured: after.exists,
-            confirmed_enabled: after.exists && after.enabled,
+            confirmed_enabled: after.exists && (after.enabled || connection_confirmed),
             reason: if after.exists {
-                (!after.enabled).then(|| "connector_not_enabled_after_create".to_string())
+                (!after.enabled && !connection_confirmed)
+                    .then(|| "connector_not_enabled_after_create".to_string())
             } else {
-                created_reason.or_else(|| Some("connector_not_listed_after_create".to_string()))
+                Some("connector_not_listed_after_create".to_string())
             },
         })
     }
@@ -1290,6 +1420,10 @@ impl HostWebModelPageDriver {
             if attempt > 0 {
                 tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
             }
+            // 列表上的脚本仅打开详情，不能执行刷新。只有这段导航可以安全自动接续；
+            // 已在详情里开始刷新/关联后的不确定结果不能重放。
+            let opening_detail = self.page_state(&self.home_tab()?)?.2.trim_end_matches('/')
+                == connector_settings_url();
             let value = self
                 .native_setup_command(
                     |tab_id, control| BrowserHostCommand::WebConfigureConnector {
@@ -1303,7 +1437,7 @@ impl HostWebModelPageDriver {
             let value = match value {
                 Ok(value) => value,
                 // 点进连接器详情页会换路由，命令结果因此过期；页面已在详情页，重试即可。
-                Err(error) if is_surface_handoff(&error.message) => {
+                Err(error) if opening_detail && is_surface_handoff(&error.message) => {
                     last_reason = Some("connector_detail_opening".to_string());
                     continue;
                 }
@@ -1313,15 +1447,30 @@ impl HostWebModelPageDriver {
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
+            tracing::info!(
+                attempt,
+                reason = crate::web_model_setup::connector_failure_reason(reason.as_deref())
+                    .unwrap_or("none"),
+                confirmed = matches!(
+                    reason.as_deref(),
+                    Some("tools_refreshed" | "connection_confirmed")
+                ),
+                "GPT Web 连接器刷新回读"
+            );
             // 页面还没落在设置页，或列表还没渲染：脚本什么都没做，可以安全重试。
             if matches!(
                 reason.as_deref(),
-                Some("connector_page_not_open") | Some("connector_not_listed")
+                Some("connector_page_not_open")
+                    | Some("connector_not_listed")
+                    | Some("connector_detail_opening")
             ) {
                 last_reason = reason;
                 continue;
             }
-            let refreshed = reason.as_deref() == Some("tools_refreshed");
+            let refreshed = matches!(
+                reason.as_deref(),
+                Some("tools_refreshed" | "connection_confirmed")
+            );
             return Ok(ConnectorConfigOutcome {
                 configured: true,
                 confirmed_enabled: refreshed,
@@ -1620,6 +1769,11 @@ fn invalid(message: &str) -> WebModelError {
     WebModelError::new(WebModelErrorCode::WebWriteNotConfirmed, message)
 }
 /// Surface 交接类错误：页面导航 / 调试会话换代，命令可能已经在页面里生效。
+fn can_retry_setup_before_input(outcome: &BrowserHostCommandOutcome) -> bool {
+    matches!(outcome, BrowserHostCommandOutcome::Failed(error)
+        if !error.side_effect_started && is_surface_handoff(&error.code))
+}
+
 fn is_surface_handoff(message: &str) -> bool {
     [
         "browser_surface_stale",
@@ -1699,9 +1853,44 @@ fn state_from_json(value: &serde_json::Value) -> Result<TurnState, WebModelError
 
 #[cfg(test)]
 mod tests {
-    use super::{StagedUploads, is_surface_handoff, sweep_upload_dir};
+    use super::{
+        StagedUploads, can_retry_setup_before_input, is_surface_handoff, sweep_upload_dir,
+    };
     use magi_bridge_client::llm_types::ImageSource;
     use magi_web_model::WebModelErrorCode;
+
+    #[test]
+    fn setup_retries_only_explicit_pre_input_surface_failures() {
+        use magi_browser_authority::{BrowserHostCommandError, BrowserHostCommandOutcome};
+        let error = BrowserHostCommandError {
+            code: "browser_surface_stale".into(),
+            message: "stale".into(),
+            recoverable: true,
+            side_effect_started: false,
+            diagnostic: None,
+        };
+        assert!(can_retry_setup_before_input(
+            &BrowserHostCommandOutcome::Failed(error.clone())
+        ));
+        assert!(!can_retry_setup_before_input(
+            &BrowserHostCommandOutcome::Indeterminate(error.clone())
+        ));
+        assert!(!can_retry_setup_before_input(
+            &BrowserHostCommandOutcome::Failed(BrowserHostCommandError {
+                side_effect_started: true,
+                ..error.clone()
+            })
+        ));
+        assert!(!can_retry_setup_before_input(
+            &BrowserHostCommandOutcome::Failed(BrowserHostCommandError {
+                code: "browser_user_control_held".into(),
+                ..error
+            })
+        ));
+        assert!(!can_retry_setup_before_input(
+            &BrowserHostCommandOutcome::Cancelled
+        ));
+    }
 
     fn png(data: &str) -> ImageSource {
         ImageSource {

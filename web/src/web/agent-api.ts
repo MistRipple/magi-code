@@ -433,7 +433,7 @@ export interface AgentExecutionModelStatsItem {
   declaredModelSpec: string;
   resolvedModel: string;
   baseUrlFingerprint: string;
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
+  reasoningEffort?: import('../shared/orchestrator-session-config').OrchestratorReasoningEffort | null;
   totals: AgentExecutionStatsPayload['totals'];
 }
 
@@ -1804,7 +1804,9 @@ export function buildFilePreviewQuery(
   const workspacePath = options.workspacePath?.trim() || '';
   const bindingOverride: AgentBindingOverride = workspaceId || workspacePath
     ? { scope: 'workspace', workspaceId, workspacePath, sessionId: options.sessionId }
-    : { sessionId: options.sessionId };
+    : options.workspaceId === ''
+      ? { scope: 'personal', sessionId: options.sessionId }
+      : { sessionId: options.sessionId };
   return buildBoundQueryWithOverride(
     { filePath },
     bindingOverride,
@@ -2055,8 +2057,9 @@ export interface DirectoryListResult {
 }
 
 export interface WorkspaceDirectoryListResult {
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
+  sessionId?: string | null;
   path: string;
   pathRef: string;
   parent: string;
@@ -2098,13 +2101,15 @@ export async function listAgentDirectory(
   dirPath: string,
   showHidden: boolean,
   workspaceId: string,
+  sessionId?: string,
 ): Promise<WorkspaceDirectoryListResult> {
   try {
     const query = new URLSearchParams();
     if (dirPath) {
       query.set('path', dirPath);
     }
-    query.set('workspaceId', workspaceId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
+    if (sessionId) query.set('sessionId', sessionId);
     if (showHidden) {
       query.set('showHidden', '1');
     }
@@ -2165,7 +2170,7 @@ export async function resolveAgentPath(
 
 export async function resolveAgentFileRevealTarget(
   filePath: string,
-  scope: WorkspaceAgentBindingOverride,
+  scope: AgentBindingOverride,
   signal?: AbortSignal,
 ): Promise<AgentFileRevealTarget> {
   return await postJsonWithBinding<AgentFileRevealTarget>(
@@ -3537,6 +3542,10 @@ export async function upsertAgentRegistryBinding(agent: AgentBinding): Promise<A
 export async function removeAgentRegistryBinding(templateId: string): Promise<AgentBinding[]> {
   const payload = await postGlobalJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
   return Array.isArray(payload.agents) ? payload.agents : [];
+}
+
+export async function resolveAgentModelReasoning(config: Record<string, unknown>, model: string): Promise<import('../shared/rust-backend-types').ModelReasoningCapability> {
+  return await postGlobalJson('/api/settings/models/reasoning', { config, model }, 'resolve model reasoning');
 }
 
 export async function fetchAgentModelList(

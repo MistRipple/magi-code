@@ -422,8 +422,7 @@
     .agent-cursor-tag { transition: none; }
     .agent-cursor.entering,
     .agent-cursor.idle .agent-cursor-halo,
-    .agent-cursor-action,
-    .agent-cursor-dots span { animation: none; }
+    .agent-cursor-action { animation: none; }
     .agent-cursor.pressing .agent-cursor-arrow { transform: none; }
     .agent-cursor-ripple { animation: agent-cursor-fade 400ms linear forwards; transform: none; }
     @keyframes agent-cursor-fade {

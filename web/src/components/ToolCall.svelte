@@ -54,7 +54,7 @@
     sanitizeToolDisplayPayload,
   } from '../lib/tool-call-display';
   import type { ConversationPresentationRole } from '../lib/conversation-presentation';
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, untrack, type Snippet } from 'svelte';
   import Disclosure from './Disclosure.svelte';
 
   interface ErrorDiagnosis {
@@ -82,6 +82,7 @@
     compactAgent?: boolean;
     agentChildStatus?: unknown;
     agentChildStatusUpdatedAt?: unknown;
+    outputFooter?: Snippet;
   }
 
   let {
@@ -100,6 +101,7 @@
     compactAgent = false,
     agentChildStatus,
     agentChildStatusUpdatedAt,
+    outputFooter,
   }: Props = $props();
 
   // 过程工具默认折叠；摘要投影提升出的用户产物和待处理事项默认直接可见。
@@ -225,6 +227,7 @@
   const isAgentSpawn = $derived(name === 'agent_spawn');
 
   interface AgentSpawnDisplay {
+    modelLabel: string;
     /** 代理展示名（首选 output.title，回退到 input.display_name） */
     title: string;
     /** 代理角色（如 executor / explorer / tester），用于角标与色 token */
@@ -274,7 +277,14 @@
         ? outputStatus
         : undefined;
 
+    const selection = parseToolPayloadRecord(parsedOutput?.model_selection);
+    const model = typeof selection?.model === 'string' ? selection.model : '';
+    const effort = selection?.effective_effort;
+    const effortLabel = typeof effort === 'string' && ['none','minimal','low','medium','high','xhigh','max','ultra'].includes(effort)
+      ? i18n.t(`input.mainModelPicker.reasoning.${effort}`)
+      : i18n.t('input.mainModelPicker.reasoning.providerDefault');
     return {
+      modelLabel: model ? `${model} · ${effortLabel}` : '',
       title: outputTitle || inputTitle || i18n.t('toolCall.agentSpawn.defaultTitle'),
       role: outputRole || inputRole || '',
       childTaskId: outputChildId || undefined,
@@ -406,7 +416,7 @@
   const visualStatus = $derived<VisualToolStatus>(status);
 
   const hasContent = $derived(
-    hasInput || hasOutput || hasError || Boolean(toolApproval) || Boolean(userQuestionSummary),
+    hasInput || hasOutput || hasError || Boolean(toolApproval) || Boolean(userQuestionSummary) || Boolean(outputFooter),
   );
   // 待授权是用户必须处理的交互，即使它来自文件变更这类紧凑工具，也不能
   // 被紧凑卡片规则吞掉；授权状态会自动展开到卡片内容区。
@@ -437,7 +447,7 @@
         src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
           workspaceId: filePreviewScope?.workspaceId,
           workspacePath: filePreviewScope?.workspacePath,
-          sessionId: '',
+          sessionId: filePreviewScope?.sessionId,
         })),
         open: handleOpenFile,
       };
@@ -933,6 +943,7 @@
           </span>
         {/if}
       </span>
+      {#if display.modelLabel}<span class="agent-spawn-model ui-meta" title={display.modelLabel}>{display.modelLabel}</span>{/if}
       {#if agentSpawnFailed || agentSpawnDegraded}
         <span class="agent-spawn-error">
           {agentSpawnDegraded
@@ -1084,7 +1095,7 @@
                       {/if}
                       <span>{imagePreview.mime}</span>
                       {#if typeof imagePreview.bytes === 'number'}
-                        <span>{imagePreview.bytes.toLocaleString()} bytes</span>
+                        <span>{imagePreview.bytes.toLocaleString(i18n.locale)} bytes</span>
                       {/if}
                       {#if imagePreview.revisedPrompt}
                         <span title={imagePreview.revisedPrompt}>{imagePreview.revisedPrompt}</span>
@@ -1161,6 +1172,7 @@
             </div>
           {/if}
 
+          {#if outputFooter}{@render outputFooter()}{/if}
         </div>
       </Disclosure>
     </div>
@@ -1206,7 +1218,6 @@
   .tool-summary {
     font-size: var(--text-xs);
     color: var(--foreground-muted);
-    opacity: 0.8;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1472,6 +1483,8 @@
     flex: 1;
     min-width: 0;
   }
+
+  .agent-spawn-model { color: var(--foreground-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .agent-spawn-title-line {
     display: flex;

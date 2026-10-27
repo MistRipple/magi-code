@@ -48,13 +48,12 @@ pub(crate) fn build_tool_catalog_value(
     let runtime_health = RuntimeHealth::from_resources(resources, &agent_roles);
     let mut runtime_warning_count = 0usize;
     let access_profile = context.access_profile;
-    // The settings/API catalog is also used as a model self-inspection tool. A
-    // task without a workspace must not report filesystem/process tools as ready:
-    // those tools are intentionally filtered from the actual model tool surface.
-    // Keep the product-wide catalog unchanged for non-task diagnostics, while
-    // making the model-facing snapshot reflect the current execution scope.
+    // 产品目录保持全局；模型自检按项目身份与实际执行目录分别裁剪。
     let model_execution_without_workspace =
         context.task_id.is_some() && context.workspace_id.is_none();
+    let model_execution_without_directory = context.task_id.is_some()
+        && context.workspace_id.is_none()
+        && context.working_directory.is_none();
 
     for tool in BuiltinToolName::ALL {
         let is_public = tool.is_public_tool_surface();
@@ -76,6 +75,11 @@ pub(crate) fn build_tool_catalog_value(
                 RuntimeToolStatus {
                     status: "unavailable",
                     warnings: vec!["当前任务未绑定工作区".to_string()],
+                }
+            } else if model_execution_without_directory && tool.requires_execution_directory() {
+                RuntimeToolStatus {
+                    status: "unavailable",
+                    warnings: vec!["当前任务没有执行目录".into()],
                 }
             } else {
                 runtime_health.tool_status(tool)
@@ -112,6 +116,8 @@ pub(crate) fn build_tool_catalog_value(
             Some("read_only_access_profile")
         } else if model_execution_without_workspace && tool.requires_workspace_context() {
             Some("workspace_required")
+        } else if model_execution_without_directory && tool.requires_execution_directory() {
+            Some("execution_directory_required")
         } else if runtime_status.status != "ready" {
             Some("runtime_unavailable")
         } else {
@@ -138,6 +144,8 @@ pub(crate) fn build_tool_catalog_value(
             // BuiltinTool::execute。把可调用范围单独输出，避免模型把两者混为一谈。
             "model_call_scope": model_call_scope,
             "workspace_required": tool.requires_workspace_context(),
+            "execution_directory_required": tool.requires_execution_directory(),
+            "repository_required": tool.requires_repository(),
             "model_available": reason.is_none(),
             "availability": availability,
             "reason_code": reason,
@@ -1315,6 +1323,30 @@ mod tests {
     }
 
     #[test]
+    fn personal_model_catalog_has_local_tools_without_project_identity() {
+        let context = ToolExecutionContext {
+            task_id: Some(magi_core::TaskId::new("personal-task")),
+            working_directory: Some(std::env::temp_dir()),
+            ..ToolExecutionContext::default()
+        };
+        let payload = build_tool_catalog_value(
+            r#"{"include_external":false}"#,
+            &context,
+            &ToolRuntimeResources::default(),
+        );
+        for name in ["file_read", "file_write", "shell_exec", "search_text"] {
+            let tool = payload["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["workspace_required"], false, "{name}");
+            assert_eq!(tool["model_available"], true, "{name}");
+        }
+    }
+
+    #[test]
     fn model_catalog_marks_workspace_tools_unavailable_without_workspace_scope() {
         let context = ToolExecutionContext {
             task_id: Some(magi_core::TaskId::new("task-no-workspace")),
@@ -1328,7 +1360,12 @@ mod tests {
         .expect("catalog output should be json");
 
         assert_eq!(payload["workspace_bound"], false);
-        for name in ["file_read", "shell_exec", "search_text", "git_status"] {
+        for name in [
+            "memory_write",
+            "knowledge_query",
+            "search_semantic",
+            "code_symbols",
+        ] {
             let tool = payload["tools"]
                 .as_array()
                 .expect("tools")

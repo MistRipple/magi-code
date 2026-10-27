@@ -2174,7 +2174,7 @@
       {/if}
     {:else}
       {#if loading}
-        <div class="browser-placeholder">{i18n.t('browser.status.loading')}</div>
+        <div class="browser-placeholder">{i18n.t('common.loading')}</div>
       {:else if sessionError}
         <div class="browser-placeholder error">{sessionError}</div>
       {:else if activeTab}

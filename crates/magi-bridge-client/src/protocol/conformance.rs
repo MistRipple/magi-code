@@ -96,6 +96,7 @@ mod tests {
 
     fn params(messages: Vec<LlmMessage>) -> LlmMessageParams {
         LlmMessageParams {
+            reasoning_capability: None,
             messages,
             max_tokens: None,
             temperature: None,

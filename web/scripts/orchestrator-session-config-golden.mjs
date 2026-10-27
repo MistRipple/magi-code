@@ -5,10 +5,18 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 await withGoldenViteServer(async (server) => {
   const sessionConfig = await server.ssrLoadModule('/src/shared/orchestrator-session-config.ts');
 
+  for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+    assert.equal(sessionConfig.normalizeOrchestratorReasoningEffort(effort), effort);
+    assert.equal(sessionConfig.resolveOrchestratorReasoningEffort({ reasoningEffort: effort }, { reasoningEffort: 'high' }), effort);
+  }
+  assert.equal(sessionConfig.resolveOrchestratorReasoningEffort({ reasoningEffort: null }, { reasoningEffort: 'high' }), null);
+  assert.deepEqual(sessionConfig.copyOrchestratorSessionConfig({ model: 'alias', reasoningEffort: null }, { reasoningEffort: 'high' }), { model: 'alias', reasoningEffort: null });
+  assert.equal(sessionConfig.normalizeOrchestratorReasoningEffort('future-value'), null);
+
   assert.equal(
     sessionConfig.resolveOrchestratorReasoningEffort({}, {}),
-    'medium',
-    '新会话必须具有明确的中等推理强度默认值',
+    null,
+    '新会话默认使用模型默认设置，不能伪造中等强度',
   );
 
   assert.equal(

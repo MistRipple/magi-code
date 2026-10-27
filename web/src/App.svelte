@@ -328,7 +328,7 @@
         console.warn('[App] 刷新变更列表失败:', error);
         if (!errorReported) {
           errorReported = true;
-          addToast('error', '变更列表刷新失败，请稍后重试');
+          addToast('error', i18n.t('edits.refreshFailed'));
         }
       } finally {
         inFlight = false;

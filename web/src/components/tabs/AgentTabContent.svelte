@@ -143,18 +143,20 @@
     return projection.agents.find((agent) => agent.agentRunId === agentRunId) ?? null;
   });
 
+  const modelSelection = $derived(projectionTask?.executor_binding?.model_selection);
+
   const assignment = $derived.by<AgentAssignmentSummary | null>(() => {
     const agent = agentProjection;
     if (agent) {
       return {
-        title: getTaskDisplayText(agent.displayName) || '代理任务',
+        title: getTaskDisplayText(agent.displayName) || i18n.t('taskLabels.kind.local_agent'),
         goal: getTaskDisplayText(agent.goal),
       };
     }
     const task = projectionTask;
     if (task) {
       return {
-        title: getTaskDisplayTitle(task) || '代理任务',
+        title: getTaskDisplayTitle(task) || i18n.t('taskLabels.kind.local_agent'),
         goal: getTaskDisplayGoal(task) || '',
       };
     }
@@ -222,18 +224,18 @@
 
   function contextKindLabel(kind: AgentContextReferenceKind): string {
     const labels: Record<AgentContextReferenceKind, string> = {
-      conversation_turn: i18n.locale === 'zh-CN' ? '对话' : 'Turn',
-      task_output: i18n.locale === 'zh-CN' ? '任务输出' : 'Task output',
-      task_evidence: i18n.locale === 'zh-CN' ? '任务证据' : 'Task evidence',
-      file: i18n.locale === 'zh-CN' ? '文件' : 'File',
-      knowledge: i18n.locale === 'zh-CN' ? '知识' : 'Knowledge',
-      other: i18n.locale === 'zh-CN' ? '其他' : 'Other',
+      conversation_turn: i18n.t('agentTab.context.kind.conversation_turn'),
+      task_output: i18n.t('agentTab.context.kind.task_output'),
+      task_evidence: i18n.t('agentTab.context.kind.task_evidence'),
+      file: i18n.t('agentTab.context.kind.file'),
+      knowledge: i18n.t('agentTab.context.kind.knowledge'),
+      other: i18n.t('agentTab.context.kind.other'),
     };
     return labels[kind];
   }
 
   function formatTokens(tokens: number): string {
-    return Number.isFinite(tokens) ? Math.max(0, Math.round(tokens)).toLocaleString() : '0';
+    return Number.isFinite(tokens) ? Math.max(0, Math.round(tokens)).toLocaleString(i18n.locale) : '0';
   }
 
   function assignmentMessageContent(summary: AgentAssignmentSummary): string {
@@ -460,6 +462,12 @@
         </button>
       {/if}
     </section>
+  {/if}
+  {#if modelSelection}
+    <div class="agent-capabilities" data-testid="agent-model-selection">
+      <strong>{i18n.t('settings.model.field.model')}</strong><span>{modelSelection.model}</span>
+      <strong>{i18n.t('settings.model.field.level')}</strong><span>{modelSelection.effective_effort ? i18n.t(`input.mainModelPicker.reasoning.${modelSelection.effective_effort}`) : i18n.t('input.mainModelPicker.reasoning.providerDefault')}</span>
+    </div>
   {/if}
   {#if activeCapabilityIds.length > 0}
     <div class="agent-capabilities" aria-label={i18n.t('settings.agents.sectionCapabilities')}>

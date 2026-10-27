@@ -303,7 +303,7 @@
   .settings-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--foreground-muted); opacity: 0.5; }
   .settings-dot--ok { background: var(--success); opacity: 1; }
   .settings-dot--warn { background: var(--warning); opacity: 1; }
-  .settings-dot--busy { background: var(--primary); opacity: 1; }
+  .settings-dot--busy { background: var(--primary); opacity: 1; animation: magi-status-pulse 1.8s ease-in-out infinite; }
 
   .settings-notice { display: flex; align-items: flex-start; gap: var(--space-2); font-size: var(--text-xs); line-height: 1.5; color: var(--foreground-muted); }
   .settings-notice--warn { color: var(--warning); }

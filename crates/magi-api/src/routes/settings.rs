@@ -180,47 +180,120 @@ fn parse_fetch_models_config(
     Ok((config, request.target))
 }
 
-fn parse_model_ids(payload: &Value) -> Vec<String> {
-    fn extract_name(entry: &Value) -> Option<String> {
-        entry
-            .get("id")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("name").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-    }
+fn model_entry_id(entry: &Value) -> Option<&str> {
+    entry
+        .as_str()
+        .or_else(|| entry.get("id").and_then(Value::as_str))
+        .or_else(|| entry.get("name").and_then(Value::as_str))
+        .or_else(|| entry.get("slug").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
 
-    let mut models = Vec::new();
-    if let Some(data) = payload.get("data").and_then(Value::as_array) {
-        for entry in data {
-            if let Some(name) = extract_name(entry) {
-                models.push(name);
-            }
-        }
-    }
-    if models.is_empty()
-        && let Some(entries) = payload.get("models").and_then(Value::as_array)
-    {
-        for entry in entries {
-            match entry {
-                Value::String(value) => {
-                    let trimmed = value.trim();
-                    if !trimmed.is_empty() {
-                        models.push(trimmed.to_string());
-                    }
-                }
-                _ => {
-                    if let Some(name) = extract_name(entry) {
-                        models.push(name);
-                    }
-                }
-            }
-        }
-    }
+fn model_catalog_entries(payload: &Value) -> &[Value] {
+    payload
+        .get("data")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .or_else(|| payload.get("models").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn parse_model_ids(payload: &Value) -> Vec<String> {
+    let mut models = model_catalog_entries(payload)
+        .iter()
+        .filter_map(model_entry_id)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     models.sort();
     models.dedup();
     models
+}
+
+struct ModelCatalog {
+    models: Vec<String>,
+    capabilities: Map<String, Value>,
+    /// 服务商给请求 id 提供的可读展示名。请求仍必须使用 `models` 中的原始 id，
+    /// 展示层不能把别名反向写回执行配置。
+    display_names: HashMap<String, String>,
+}
+
+impl ModelCatalog {
+    fn from_payload(payload: &Value, anthropic: bool) -> Self {
+        let capabilities = model_catalog_entries(payload)
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    model_entry_id(entry)?.to_string(),
+                    json!(magi_bridge_client::reasoning::provider_capability(
+                        entry, anthropic
+                    )?),
+                ))
+            })
+            .collect();
+        let display_names = model_catalog_entries(payload)
+            .iter()
+            .filter_map(|entry| {
+                let id = model_entry_id(entry)?.to_string();
+                let display_name = entry
+                    .get("display_name")
+                    .or_else(|| entry.get("displayName"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)?;
+                Some((id, display_name))
+            })
+            .collect();
+        Self {
+            models: parse_model_ids(payload),
+            capabilities,
+            display_names,
+        }
+    }
+
+    /// 同一连接的版本化目录。先按精确 id，再按服务商声明的相同展示名关联别名；
+    /// 展示名有冲突且能力不同则不关联，不解码别名、不更换实际请求的 model id。
+    fn supplement(&mut self, primary: &Value, metadata: &Value, anthropic: bool) {
+        let supplement = Self::from_payload(metadata, anthropic);
+        for entry in model_catalog_entries(primary) {
+            let Some(id) = model_entry_id(entry) else {
+                continue;
+            };
+            if self.capabilities.contains_key(id) {
+                continue;
+            }
+            let explicit = supplement.capabilities.get(id).cloned().or_else(|| {
+                let name = entry.get("display_name").and_then(Value::as_str)?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let mut matches = model_catalog_entries(metadata)
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .get("display_name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value.trim() == name)
+                    })
+                    .filter_map(|candidate| {
+                        supplement.capabilities.get(model_entry_id(candidate)?)
+                    });
+                let first = matches.next()?.clone();
+                matches.all(|value| value == &first).then_some(first)
+            });
+            if let Some(capability) = explicit {
+                self.capabilities.insert(id.to_string(), capability);
+            }
+        }
+        for (id, capability) in supplement.capabilities {
+            self.capabilities.entry(id).or_insert(capability);
+        }
+        for (id, display_name) in supplement.display_names {
+            self.display_names.entry(id).or_insert(display_name);
+        }
+    }
 }
 
 fn parse_connection_probe_config(config: Value) -> Result<NormalizedModelConfig, ApiError> {
@@ -258,9 +331,9 @@ async fn execute_connection_probe(config: &NormalizedModelConfig) -> Result<(), 
         .map_err(model_bridge_probe_error)
 }
 
-async fn fetch_model_ids_for_config(
+async fn fetch_model_catalog_for_config(
     config: &NormalizedModelConfig,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<ModelCatalog, ApiError> {
     let url = config.models_list_url().map_err(ApiError::InvalidInput)?;
     let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
     let mut headers = HeaderMap::new();
@@ -289,9 +362,10 @@ async fn fetch_model_ids_for_config(
         }
     }
 
-    let response = reqwest::Client::new()
-        .get(url)
-        .headers(headers)
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .headers(headers.clone())
         .send()
         .await
         .map_err(|error| {
@@ -308,7 +382,68 @@ async fn fetch_model_ids_for_config(
         tracing::warn!(error = %error, "model list response parse failed");
         ApiError::InvalidInput("模型列表响应格式异常".to_string())
     })?;
-    Ok(parse_model_ids(&payload))
+    let anthropic = protocol == HttpModelBridgeProtocol::AnthropicMessages;
+    let mut catalog = ModelCatalog::from_payload(&payload, anthropic);
+    if catalog
+        .models
+        .iter()
+        .any(|model| !catalog.capabilities.contains_key(model))
+    {
+        // Codex-compatible gateways publish richer /models metadata when client_version is
+        // supplied. Identify our actual version; do not impersonate Codex or call inference.
+        let mut versioned_url = reqwest::Url::parse(&url)
+            .map_err(|_| ApiError::InvalidInput("模型列表地址无效".into()))?;
+        versioned_url
+            .query_pairs_mut()
+            .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+        let metadata = client
+            .get(versioned_url)
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        if let Ok(response) = metadata
+            && response.status().is_success()
+            && let Ok(metadata) = response.json::<Value>().await
+        {
+            catalog.supplement(&payload, &metadata, anthropic);
+        }
+    }
+    Ok(catalog)
+}
+
+fn persist_model_reasoning_catalog(
+    state: &ApiState,
+    config: &NormalizedModelConfig,
+    catalog: &ModelCatalog,
+) -> Result<(), ApiError> {
+    let anthropic = config.api_protocol() == Some(HttpModelBridgeProtocol::AnthropicMessages);
+    let mut capabilities = catalog.capabilities.clone();
+    for model in &catalog.models {
+        capabilities.entry(model.clone()).or_insert_with(|| {
+            json!(magi_bridge_client::reasoning::builtin_capability(
+                model, anthropic
+            ))
+        });
+    }
+    state
+        .settings_store
+        .update_section("modelReasoningCatalog", |cache| {
+            if !cache.is_object() {
+                *cache = json!({});
+            }
+            cache
+                .as_object_mut()
+                .unwrap()
+                .insert(config.reasoning_catalog_key(), Value::Object(capabilities));
+        })
+        .map_err(settings_persistence_error)
+}
+
+async fn fetch_model_ids_for_config(
+    config: &NormalizedModelConfig,
+) -> Result<Vec<String>, ApiError> {
+    Ok(fetch_model_catalog_for_config(config).await?.models)
 }
 
 async fn execute_model_catalog_probe(config: &NormalizedModelConfig) -> Result<(), ApiError> {
@@ -357,8 +492,13 @@ fn model_bridge_probe_error(error: BridgeClientError) -> ApiError {
     }
 }
 
-async fn probe_connection_response(request: Value) -> Result<Json<Value>, ApiError> {
-    let config = parse_connection_probe_config(request)?;
+async fn probe_connection_response(
+    state: &ApiState,
+    request: Value,
+) -> Result<Json<Value>, ApiError> {
+    parse_connection_probe_config(request.clone())?;
+    let config = NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &request)
+        .map_err(ApiError::InvalidInput)?;
     execute_connection_probe(&config).await?;
 
     Ok(Json(json!({
@@ -425,6 +565,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/registry/agents/upsert", post(upsert_agent))
         .route("/settings/registry/agents/remove", post(remove_agent))
         .route("/settings/models/fetch", post(fetch_models))
+        .route(
+            "/settings/models/reasoning",
+            post(model_reasoning_capability),
+        )
         .route("/settings/stats", get(execution_stats))
         .route("/settings/stats/reset", post(reset_stats))
 }
@@ -507,6 +651,14 @@ async fn settings_bootstrap(
                 "effectiveOrchestratorConfig".to_string(),
                 effective_orchestrator_config,
             );
+        }
+        if let Some(effective) = object.get("effectiveOrchestratorConfig")
+            && let Ok(config) =
+                NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, effective)
+            && let Ok(model) = config.require_model()
+        {
+            let capability = json!(config.reasoning_capability(model));
+            object.insert("orchestratorReasoningCapability".into(), capability);
         }
         object.insert(
             "orchestratorSessionDefaults".to_string(),
@@ -654,14 +806,14 @@ async fn remove_worker_config(
 }
 
 async fn test_worker_connection(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = request
         .get("config")
         .cloned()
         .ok_or_else(|| ApiError::InvalidInput("worker 连接测试缺少 config".to_string()))?;
-    probe_connection_response(config).await
+    probe_connection_response(&state, config).await
 }
 
 async fn save_orchestrator_config(
@@ -699,7 +851,17 @@ async fn save_orchestrator_session_config(
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
     merge_orchestrator_session_override(&mut effective_config, &override_config);
+    let capability =
+        NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &effective_config)
+            .ok()
+            .and_then(|config| {
+                config
+                    .require_model()
+                    .ok()
+                    .map(|model| config.reasoning_capability(model))
+            });
     Ok(Json(serde_json::json!({
+        "orchestratorReasoningCapability": capability,
         "saved": true,
         "sessionId": scope.session_id.to_string(),
         "workspaceId": scope.workspace_id().map(|id| id.to_string()),
@@ -745,11 +907,12 @@ async fn save_model_context_window(
 }
 
 async fn test_orchestrator_connection(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(config): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let normalized =
-        NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
+        NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &config)
+            .map_err(ApiError::InvalidInput)?;
     normalized
         .require_base_url()
         .map_err(ApiError::InvalidInput)?;
@@ -780,10 +943,10 @@ async fn save_auxiliary_config(
 }
 
 async fn test_auxiliary_connection(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    probe_connection_response(request).await
+    probe_connection_response(&state, request).await
 }
 
 async fn save_vision_config(
@@ -830,10 +993,10 @@ async fn save_vision_config(
 }
 
 async fn test_vision_connection(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    probe_connection_response(request).await
+    probe_connection_response(&state, request).await
 }
 
 fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> {
@@ -1678,14 +1841,34 @@ async fn fetch_models(
         .then(|| state.web_model_picker_engines())
         .unwrap_or_default();
 
+    let request_config = config.clone();
     let provider_result = parse_fetch_models_config(FetchModelsRequest {
-        config,
+        config: config.clone(),
         target: target.clone(),
         workspace_id: workspace_id.clone(),
     });
+    let mut model_capabilities = serde_json::Map::new();
+    let mut catalog_display_names = serde_json::Map::new();
     let (models, session_defaults) = match provider_result {
-        Ok((config, _)) => match fetch_model_ids_for_config(&config).await {
-            Ok(models) if !models.is_empty() => {
+        Ok((config, _)) => match fetch_model_catalog_for_config(&config).await {
+            Ok(catalog) if !catalog.models.is_empty() => {
+                persist_model_reasoning_catalog(&state, &config, &catalog)?;
+                let models = catalog.models;
+                // Re-read the persisted catalog through the same resolver used for execution.
+                let projection_config = request_config;
+                let resolved = NormalizedModelConfig::from_settings_with_catalog(
+                    &state.settings_store,
+                    &projection_config,
+                )
+                .map_err(ApiError::InvalidInput)?;
+                for model in &models {
+                    if let Some(name) = catalog.display_names.get(model) {
+                        catalog_display_names.insert(model.clone(), json!(name));
+                    }
+                    model_capabilities
+                        .insert(model.clone(), json!(resolved.reasoning_capability(model)));
+                }
+
                 let defaults = matches!(target.as_str(), "orch" | "orchestrator")
                     .then(|| ensure_orchestrator_session_defaults_from_models(&state, &models))
                     .transpose()?;
@@ -1726,10 +1909,44 @@ async fn fetch_models(
         "success": true,
         "target": target,
         "models": models,
+        "modelDisplayNames": catalog_display_names,
         "webEngines": web_engines,
+        "modelCapabilities": model_capabilities,
         "orchestratorSessionDefaults": session_defaults,
         "requestedAt": now.0,
     })))
+}
+
+async fn model_reasoning_capability(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let raw = request
+        .get("config")
+        .ok_or_else(|| ApiError::InvalidInput("缺少模型配置".into()))?;
+    reject_unknown_model_config_fields(raw).map_err(ApiError::InvalidInput)?;
+    let config = NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, raw)
+        .map_err(ApiError::InvalidInput)?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let known_in_catalog = state
+        .settings_store
+        .get_section("modelReasoningCatalog")
+        .get(config.reasoning_catalog_key())
+        .and_then(|entries| entries.get(model))
+        .is_some();
+    if !model.is_empty() && !known_in_catalog {
+        let catalog = fetch_model_catalog_for_config(&config).await?;
+        persist_model_reasoning_catalog(&state, &config, &catalog)?;
+        let refreshed =
+            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, raw)
+                .map_err(ApiError::InvalidInput)?;
+        return Ok(Json(json!(refreshed.reasoning_capability(model))));
+    }
+    Ok(Json(json!(config.reasoning_capability(model))))
 }
 
 async fn execution_stats(
@@ -1873,6 +2090,252 @@ mod tests {
 
     fn test_state() -> ApiState {
         test_state_with_external_catalog_snapshot(None)
+    }
+
+    #[tokio::test]
+    async fn reasoning_metadata_is_connection_scoped_and_ignores_obsolete_overrides() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(|| async {
+                Json(json!({"data":[
+                    {"id":"glm-alias","supportedReasoningEfforts":["low","high","max"],"defaultReasoningEffort":"high"},
+                    {"id":"gpt-alias","supportedReasoningEfforts":["none","low","medium","high","xhigh","max"],"defaultReasoningEffort":"medium"},
+                    {"id":"unknown-alias"}
+                ]}))
+            }))).await.unwrap();
+        });
+        let state = test_state();
+        let config = json!({"baseUrl":address,"apiKey":"test-key","apiProtocol":"openai_chat"});
+        let response = fetch_models(
+            State(state.clone()),
+            Json(FetchModelsRequest {
+                config: config.clone(),
+                target: "orch".into(),
+                workspace_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            response["modelCapabilities"]["glm-alias"]["supportedEfforts"],
+            json!(["low", "high", "max"])
+        );
+        assert_eq!(
+            response["modelCapabilities"]["gpt-alias"]["supportedEfforts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(
+            response["modelCapabilities"]["unknown-alias"]["source"],
+            "unknown"
+        );
+        let mut execution = config.clone();
+        execution["model"] = json!("glm-alias");
+        execution["reasoningEffort"] = json!("xhigh");
+        let resolved =
+            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &execution)
+                .unwrap();
+        assert_eq!(resolved.reasoning_effort_label(), Some("high"));
+        execution["apiKey"] = json!("another-account");
+        assert_eq!(
+            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &execution)
+                .unwrap()
+                .reasoning_effort_label(),
+            None
+        );
+        execution["apiKey"] = json!("test-key");
+        // 能力仅来自服务商目录和受维护的内置目录，旧手工规则不再参与解析。
+        execution["modelReasoningOverrides"] = json!({"glm-alias":{"supportedEfforts":["ultra"],"defaultEffort":"ultra","transport":"openai","source":"override"}});
+        assert_eq!(
+            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &execution)
+                .unwrap()
+                .reasoning_effort_label(),
+            Some("high")
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn model_catalog_maps_explicit_provider_display_names_without_decoding_aliases() {
+        let standard = json!({"data":[{"id":"opaque-gpt","display_name":"GPT Sol"},{"id":"opaque-ambiguous","display_name":"Duplicate"},{"id":"glm-5.3"}]});
+        let metadata = json!({"models":[
+            {"slug":"gpt-sol","display_name":"GPT Sol","supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],"default_reasoning_level":"low"},
+            {"slug":"one","display_name":"Duplicate","supported_reasoning_levels":[{"effort":"low"}]},
+            {"slug":"two","display_name":"Duplicate","supported_reasoning_levels":[{"effort":"high"}]},
+            {"slug":"glm-5.3","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"}],"default_reasoning_level":"max"}
+        ]});
+        let mut catalog = ModelCatalog::from_payload(&standard, true);
+        catalog.supplement(&standard, &metadata, true);
+        assert_eq!(
+            catalog.models,
+            vec!["glm-5.3", "opaque-ambiguous", "opaque-gpt"]
+        );
+        assert_eq!(
+            catalog.capabilities["opaque-gpt"]["supportedEfforts"],
+            json!(["low", "ultra"])
+        );
+        assert_eq!(catalog.capabilities["glm-5.3"]["defaultEffort"], "max");
+        assert!(!catalog.capabilities.contains_key("opaque-ambiguous"));
+        assert_eq!(catalog.display_names["opaque-gpt"], "GPT Sol");
+        assert_eq!(catalog.display_names["gpt-sol"], "GPT Sol");
+        assert_eq!(
+            parse_model_ids(&metadata),
+            vec!["glm-5.3", "gpt-sol", "one", "two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_preserves_ids_and_refreshes_provider_display_names() {
+        let payload = std::sync::Arc::new(std::sync::RwLock::new(json!({"data":[
+            {"id":"opaque-id","display_name":" GPT Sol ","supportedEfforts":[]},
+            {"id":"camel-id","displayName":"Gemini Flash","supportedEfforts":[]},
+            {"id":"plain-id","display_name":"  ","supportedEfforts":[]}
+        ]})));
+        let served = payload.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(move || {
+                        let snapshot = served.read().unwrap().clone();
+                        async move { Json(snapshot) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let state = test_state();
+        let config =
+            json!({"baseUrl":address,"apiKey":"test-key","apiProtocol":"anthropic_messages"});
+        let fetch = || {
+            fetch_models(
+                State(state.clone()),
+                Json(FetchModelsRequest {
+                    config: config.clone(),
+                    target: "orch".into(),
+                    workspace_id: None,
+                }),
+            )
+        };
+        let first = fetch().await.unwrap().0;
+        assert_eq!(
+            first["models"],
+            json!(["camel-id", "opaque-id", "plain-id"])
+        );
+        assert_eq!(
+            first["modelDisplayNames"],
+            json!({"opaque-id":"GPT Sol","camel-id":"Gemini Flash"})
+        );
+        assert_eq!(first["orchestratorSessionDefaults"]["model"], "camel-id");
+        // A refresh replaces the whole projection, including renamed/removed display names.
+        *payload.write().unwrap() = json!({"data":[
+            {"id":"opaque-id","display_name":"GPT Sol Updated","supportedEfforts":[]},
+            {"id":"camel-id","supportedEfforts":[]},
+            {"id":"new-id","display_name":"New Model","supportedEfforts":[]}
+        ]});
+        let refreshed = fetch().await.unwrap().0;
+        assert_eq!(
+            refreshed["models"],
+            json!(["camel-id", "new-id", "opaque-id"])
+        );
+        assert_eq!(
+            refreshed["modelDisplayNames"],
+            json!({"opaque-id":"GPT Sol Updated","new-id":"New Model"})
+        );
+        assert_eq!(
+            state
+                .settings_store
+                .get_section("orchestratorSessionDefaults")["model"],
+            "camel-id"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reasoning_catalog_negotiates_codex_metadata_for_both_http_protocols() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(|Query(query): Query<HashMap<String,String>>| async move {
+                if query.contains_key("client_version") {
+                    Json(json!({"models":[{"slug":"glm-5.3","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"}],"default_reasoning_level":"max"}]}))
+                } else { Json(json!({"data":[{"id":"glm-5.3"}]})) }
+            }))).await.unwrap();
+        });
+        for protocol in ["openai_responses", "anthropic_messages"] {
+            let state = test_state();
+            let config = json!({"baseUrl":address,"apiKey":"test-key","apiProtocol":protocol});
+            let response = model_reasoning_capability(
+                State(state.clone()),
+                Json(json!({"config":config,"model":"glm-5.3"})),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(response["supportedEfforts"], json!(["low", "high", "max"]));
+            assert_eq!(response["defaultEffort"], "max");
+            assert_eq!(response["source"], "provider");
+            assert_eq!(
+                response["transport"],
+                if protocol == "anthropic_messages" {
+                    "anthropic_effort"
+                } else {
+                    "openai"
+                }
+            );
+            let mut execution = config.clone();
+            execution["model"] = json!("glm-5.3");
+            execution["reasoningEffort"] = json!("high");
+            let runtime = NormalizedModelConfig::from_settings_with_catalog(
+                &state.settings_store,
+                &execution,
+            )
+            .unwrap();
+            assert_eq!(runtime.reasoning_effort_label(), Some("high"));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn optional_model_metadata_failure_keeps_standard_catalog_usable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(|Query(query): Query<HashMap<String, String>>| async move {
+                        if query.contains_key("client_version") {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({"error":"unsupported parameter"})),
+                            )
+                        } else {
+                            (StatusCode::OK, Json(json!({"data":[{"id":"plain-model"}]})))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({"baseUrl":address,"apiKey":"test-key","apiProtocol":"openai_chat"}),
+        )
+        .unwrap();
+        let catalog = fetch_model_catalog_for_config(&config).await.unwrap();
+        assert_eq!(catalog.models, vec!["plain-model"]);
+        assert!(catalog.capabilities.is_empty());
+        server.abort();
     }
 
     fn install_active_gpt_web_plugin(state: &ApiState) {
@@ -2317,12 +2780,15 @@ mod tests {
                 .expect("stub server should run");
         });
 
-        let result = probe_connection_response(json!({
-            "baseUrl": base_url,
-            "apiKey": "test-key",
-            "model": "gpt-test",
-            "apiProtocol": "openai_chat"
-        }))
+        let result = probe_connection_response(
+            &test_state(),
+            json!({
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "model": "gpt-test",
+                "apiProtocol": "openai_chat"
+            }),
+        )
         .await;
 
         match result {
@@ -2401,7 +2867,7 @@ mod tests {
         .0;
         assert_eq!(
             first["orchestratorSessionDefaults"],
-            json!({ "model": "gpt-test", "reasoningEffort": "medium" })
+            json!({ "model": "gpt-test", "reasoningEffort": null })
         );
 
         state
@@ -4831,7 +5297,7 @@ mod tests {
     }
 
     #[test]
-    fn first_session_model_defaults_reasoning_effort_to_medium() {
+    fn first_session_model_uses_model_default_reasoning() {
         let state = test_state();
         let session_id = SessionId::new("session-model-default-effort");
         state
@@ -4855,9 +5321,53 @@ mod tests {
         .expect("首次模型选择应生成会话覆盖");
 
         assert_eq!(saved["model"], json!("first-model"));
-        assert_eq!(saved["reasoningEffort"], json!("medium"));
+        assert_eq!(saved["reasoningEffort"], Value::Null);
         require_orchestrator_session_model(&state, &session_id)
-            .expect("默认模型和中等推理强度应形成可执行配置");
+            .expect("模型和默认推理行为应形成可执行配置");
+    }
+
+    #[test]
+    fn reasoning_defaults_and_model_switches_follow_the_target_capability() {
+        let state = test_state();
+        state.settings_store.set_section("orchestrator", json!({
+            "baseUrl":"https://fixture.invalid/v1", "apiKey":"fixture", "apiProtocol":"openai_chat"
+        })).unwrap();
+        let defaults =
+            ensure_orchestrator_session_defaults_from_models(&state, &["gpt-5.1".into()]).unwrap();
+        assert_eq!(defaults["reasoningEffort"], Value::Null);
+        let session = SessionId::new("reasoning-switch");
+        let first = save_orchestrator_session_override_for_session(
+            &state,
+            &session,
+            &json!({"model":"gpt-5.1"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first["reasoningEffort"], Value::Null);
+        let switched = save_orchestrator_session_override_for_session(
+            &state,
+            &session,
+            &json!({"model":"gpt-6.1-sol"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(switched["reasoningEffort"], Value::Null);
+        let reset = save_orchestrator_session_override_for_session(
+            &state,
+            &session,
+            &json!({"reasoningEffort":null}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reset["reasoningEffort"], Value::Null);
+        let unsupported = save_orchestrator_session_override_for_session(
+            &state,
+            &session,
+            &json!({"model":"gpt-4o","reasoningEffort":"ultra"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unsupported["reasoningEffort"], Value::Null);
     }
 
     #[test]

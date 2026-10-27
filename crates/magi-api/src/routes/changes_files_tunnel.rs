@@ -23,8 +23,8 @@ use magi_snapshot::SnapshotSession;
 use magi_snapshot::{ToolHook, ToolHookCtx};
 
 use crate::scope_binding::{
-    parse_session_id, require_registered_workspace_binding,
-    resolve_optional_session_workspace_scope,
+    SessionScope, parse_session_id, require_registered_workspace_binding,
+    resolve_existing_session_scope, resolve_optional_session_workspace_scope,
 };
 use crate::{
     change_projection::{
@@ -55,6 +55,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/files/content", get(get_file_content))
         .route("/files/raw", get(get_file_raw))
+        .route("/files/download", get(download_file))
         .route("/files/reveal-target", post(resolve_file_reveal_target))
         .route("/filesystem/list", get(list_filesystem))
         .route("/filesystem/browse", get(browse_filesystem))
@@ -641,6 +642,53 @@ struct FileRevealTargetRequest {
     workspace_path: Option<String>,
 }
 
+/// 文件读取按会话归属解析；项目变更账本不拥有个人会话的文件。
+pub(super) struct FileAccessScope {
+    pub(super) root: PathBuf,
+    pub(super) binding: serde_json::Value,
+}
+
+pub(super) fn resolve_file_access_scope(
+    state: &ApiState,
+    session_id: Option<&str>,
+    workspace_id: Option<&str>,
+    workspace_path: Option<&str>,
+    execution_group_id: Option<&str>,
+) -> Result<FileAccessScope, ApiError> {
+    if let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        let session_id = parse_session_id(Some(session_id))?;
+        match resolve_existing_session_scope(state, &session_id, workspace_id, workspace_path)? {
+            SessionScope::Personal => Ok(FileAccessScope {
+                root: state.personal_session_execution_root_path(&session_id),
+                binding: serde_json::json!({
+                    "sessionId": session_id, "workspaceId": null,
+                    "workspacePath": null, "executionGroupId": null,
+                }),
+            }),
+            SessionScope::Workspace(_) => {
+                let scope = resolve_session_change_scope_from_request(
+                    state,
+                    &session_id,
+                    workspace_id,
+                    workspace_path,
+                    execution_group_id,
+                )?;
+                Ok(FileAccessScope {
+                    root: state.snapshot_root_for_session(&session_id, &scope.workspace_root),
+                    binding: session_scope_binding(&scope),
+                })
+            }
+        }
+    } else {
+        let scope =
+            resolve_workspace_change_scope_from_request(state, workspace_id, workspace_path)?;
+        Ok(FileAccessScope {
+            root: scope.workspace_root.clone(),
+            binding: workspace_scope_binding(&scope),
+        })
+    }
+}
+
 async fn resolve_file_reveal_target(
     State(state): State<ApiState>,
     Json(request): Json<FileRevealTargetRequest>,
@@ -651,30 +699,14 @@ async fn resolve_file_reveal_target(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
-    let workspace_root = if request
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        let session_id = parse_session_id(request.session_id.as_deref())?;
-        let scope = resolve_session_change_scope_from_request(
-            &state,
-            &session_id,
-            request.workspace_id.as_deref(),
-            request.workspace_path.as_deref(),
-            None,
-        )?;
-        // 隔离会话的文件在它自己的副本里，不是主工作区。
-        state.snapshot_root_for_session(&session_id, &scope.workspace_root)
-    } else {
-        resolve_workspace_change_scope_from_request(
-            &state,
-            request.workspace_id.as_deref(),
-            request.workspace_path.as_deref(),
-        )?
-        .workspace_root
-    };
+    let scope = resolve_file_access_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        None,
+    )?;
+    let workspace_root = scope.root;
     let (target_path, _) = safe_workspace_path(&workspace_root, file_path)?;
     if !target_path.is_file() {
         return Err(ApiError::InvalidInput("路径不是可定位的文件".to_string()));
@@ -716,33 +748,15 @@ async fn get_file_content(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
-    let (absolute_path, binding) = if query
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        let session_id = parse_session_id(query.session_id.as_deref())?;
-        let scope = resolve_session_change_scope_from_request(
-            &state,
-            &session_id,
-            query.workspace_id.as_deref(),
-            query.workspace_path.as_deref(),
-            query.execution_group_id.as_deref(),
-        )?;
-        let root = state.snapshot_root_for_session(&session_id, &scope.workspace_root);
-        let absolute = safe_file_preview_path(&state, &root, path)?;
-        (absolute, session_scope_binding(&scope))
-    } else {
-        let scope = resolve_workspace_change_scope_from_request(
-            &state,
-            query.workspace_id.as_deref(),
-            query.workspace_path.as_deref(),
-        )?;
-        let absolute = safe_file_preview_path(&state, &scope.workspace_root, path)?;
-        (absolute, workspace_scope_binding(&scope))
-    };
+    let scope = resolve_file_access_scope(
+        &state,
+        query.session_id.as_deref(),
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+        query.execution_group_id.as_deref(),
+    )?;
+    let absolute_path = safe_file_preview_path(&state, &scope.root, path)?;
+    let binding = scope.binding;
     let content = std::fs::read_to_string(&absolute_path)
         .map_err(|e| file_access_error("读取文件内容失败", &absolute_path, e))?;
     let mut payload = serde_json::json!({
@@ -792,31 +806,14 @@ async fn get_file_raw(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
 
-    let absolute_path = if query
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        let session_id = parse_session_id(query.session_id.as_deref())?;
-        let scope = resolve_session_change_scope_from_request(
-            &state,
-            &session_id,
-            query.workspace_id.as_deref(),
-            query.workspace_path.as_deref(),
-            query.execution_group_id.as_deref(),
-        )?;
-        let root = state.snapshot_root_for_session(&session_id, &scope.workspace_root);
-        safe_file_preview_path(&state, &root, path)?
-    } else {
-        let scope = resolve_workspace_change_scope_from_request(
-            &state,
-            query.workspace_id.as_deref(),
-            query.workspace_path.as_deref(),
-        )?;
-        safe_file_preview_path(&state, &scope.workspace_root, path)?
-    };
+    let scope = resolve_file_access_scope(
+        &state,
+        query.session_id.as_deref(),
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+        query.execution_group_id.as_deref(),
+    )?;
+    let absolute_path = safe_file_preview_path(&state, &scope.root, path)?;
 
     let mime = image_mime_for_path(&absolute_path)
         .ok_or_else(|| ApiError::InvalidInput("仅支持图片文件预览".to_string()))?;
@@ -827,9 +824,49 @@ async fn get_file_raw(
     Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
 }
 
+/// 下载与文本/图片预览复用同一所有权及 canonical 路径边界。
+async fn download_file(
+    State(state): State<ApiState>,
+    Query(query): Query<FileContentQuery>,
+) -> Result<Response, ApiError> {
+    let path = query
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".into()))?;
+    let scope = resolve_file_access_scope(
+        &state,
+        query.session_id.as_deref(),
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+        query.execution_group_id.as_deref(),
+    )?;
+    let file = safe_file_preview_path(&state, &scope.root, path)?;
+    let bytes =
+        std::fs::read(&file).map_err(|error| file_access_error("下载文件失败", &file, error))?;
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    let encoded = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect::<String>();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename*=UTF-8''{encoded}"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FilesystemListQuery {
+    session_id: Option<String>,
     path: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
@@ -900,19 +937,28 @@ async fn list_filesystem(
     State(state): State<ApiState>,
     Query(query): Query<FilesystemListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = resolve_workspace_change_scope_from_request(
+    let scope = resolve_file_access_scope(
         &state,
+        query.session_id.as_deref(),
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
+        None,
     )?;
+    if scope.binding["workspaceId"].is_null() && !scope.root.exists() && query.path.is_none() {
+        return Ok(Json(serde_json::json!({
+            "sessionId": scope.binding["sessionId"], "workspaceId": null, "workspacePath": null,
+            "path": display_path(&scope.root), "pathRef": path_ref(&scope.root),
+            "parent": display_path(&scope.root), "parentPathRef": path_ref(&scope.root), "entries": [],
+        })));
+    }
     let canonical_workspace_root =
-        canonical_directory_path(scope.workspace_root.clone(), "规范化工作区根目录失败")?;
+        canonical_directory_path(scope.root.clone(), "规范化工作区根目录失败")?;
     let path = match query
         .path
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        Some(p) => safe_workspace_path(&scope.workspace_root, p)?.0,
+        Some(p) => safe_workspace_path(&scope.root, p)?.0,
         None => canonical_workspace_root.clone(),
     };
     let path = canonical_directory_path(path, "规范化目录失败")?;
@@ -920,8 +966,9 @@ async fn list_filesystem(
     let entries = read_directory_entries(&path, show_hidden)?;
     let parent = directory_parent(&path, Some(&canonical_workspace_root));
     Ok(Json(serde_json::json!({
-        "workspaceId": scope.workspace_id.as_str(),
-        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "sessionId": scope.binding["sessionId"],
+        "workspaceId": scope.binding["workspaceId"],
+        "workspacePath": scope.binding["workspacePath"],
         "path": display_path(&path),
         "pathRef": path_ref(&path),
         "parent": display_path(&parent),
@@ -2149,6 +2196,145 @@ mod tests {
         assert!(
             matches!(error, ApiError::InvalidInput(message) if message.contains("辅助模型未配置"))
         );
+    }
+
+    #[tokio::test]
+    async fn personal_delete_keeps_files_when_session_commit_fails() {
+        let root = unique_temp_dir("magi-personal-delete-rollback");
+        let state = build_state()
+            .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+                root.clone(),
+                root.join("workspaces.json"),
+                root.join("knowledge.json"),
+            )))
+            .with_session_projection_persist(Arc::new(|_, _, _| {
+                Err(ApiError::internal_assembly(
+                    "测试删除持久化失败",
+                    "injected failure",
+                ))
+            }));
+        let id = SessionId::new("personal-delete-rollback");
+        state
+            .session_store
+            .create_session(id.clone(), "保留成果")
+            .unwrap();
+        let directory = state.personal_session_execution_root(&id).unwrap();
+        fs::write(directory.join("report.md"), "keep").unwrap();
+        assert!(state.delete_session_and_resources(&id).await.is_err());
+        assert!(state.session_store.session(&id).is_some());
+        assert_eq!(
+            fs::read_to_string(directory.join("report.md")).unwrap(),
+            "keep"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn personal_files_keep_session_boundary_and_do_not_require_project_snapshot() {
+        let state_root = unique_temp_dir("magi-personal-files");
+        let project_root = unique_temp_dir("magi-personal-files-project");
+        let state = build_state_with_workspace_root(&project_root, "file-project")
+            .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+                state_root.clone(),
+                state_root.join("workspaces.json"),
+                state_root.join("knowledge.json"),
+            )));
+        for id in ["file-personal-a", "file-personal-b", "file-personal-empty"] {
+            state
+                .session_store
+                .create_session(SessionId::new(id), id)
+                .unwrap();
+        }
+        let a = state
+            .personal_session_execution_root(&SessionId::new("file-personal-a"))
+            .unwrap();
+        let b = state
+            .personal_session_execution_root(&SessionId::new("file-personal-b"))
+            .unwrap();
+        fs::write(a.join("report.md"), "A report").unwrap();
+        fs::write(b.join("report.md"), "B report").unwrap();
+        fs::write(a.join("image.png"), b"fixture-image").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(b.join("report.md"), a.join("escape.md")).unwrap();
+        for (path, expected) in [
+            (
+                "/files/content?sessionId=file-personal-a&filePath=report.md",
+                StatusCode::OK,
+            ),
+            (
+                "/files/raw?sessionId=file-personal-a&filePath=image.png",
+                StatusCode::OK,
+            ),
+            (
+                "/files/download?sessionId=file-personal-a&filePath=report.md",
+                StatusCode::OK,
+            ),
+            ("/filesystem/list?sessionId=file-personal-a", StatusCode::OK),
+            (
+                "/filesystem/list?sessionId=file-personal-empty",
+                StatusCode::OK,
+            ),
+            (
+                "/files/content?sessionId=file-personal-a&workspaceId=file-project&filePath=report.md",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/files/content?sessionId=file-personal-a&workspaceId=unknown&filePath=report.md",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/files/content?sessionId=file-personal-a&filePath=../file-personal-b/report.md",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/files/content?sessionId=file-personal-b&filePath=report.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["content"], "B report");
+        assert!(payload["workspaceId"].is_null());
+        assert!(
+            state
+                .snapshot_manager
+                .get_session("file-personal-b")
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/files/content?sessionId=file-personal-a&filePath=escape.md")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        state
+            .delete_session_and_resources(&SessionId::new("file-personal-a"))
+            .await
+            .unwrap();
+        assert!(!a.exists(), "删除提交后回收自有文件");
+        assert!(b.join("report.md").exists(), "不得清理兄弟会话");
+        fs::remove_dir_all(state_root).unwrap();
+        fs::remove_dir_all(project_root).unwrap();
     }
 
     fn build_state() -> ApiState {

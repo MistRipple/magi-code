@@ -160,4 +160,43 @@ check('menu navigation wraps without sending', () => {
   assert.deepEqual(h.snapshot().calls, []);
 });
 
+// 模型切换由 composer 直接消费，不要求懒加载的 RightPane 存在。
+let modelActionHandler;
+function findModelActionHandler(node) {
+  if (ts.isFunctionDeclaration(node) && node.name?.text === 'handleComposerWebModelAction') {
+    modelActionHandler = node.getText(ast);
+  }
+  ts.forEachChild(node, findModelActionHandler);
+}
+findModelActionHandler(ast);
+assert.ok(modelActionHandler);
+const makeModelActionHarness = new Function('options', ts.transpileModule(`
+  const currentSessionId = 'current';
+  const sessionInputLocked = options.locked ?? false;
+  const isInteractionBlocking = options.blocking ?? false;
+  const pickerLoadedOnce = options.loaded ?? false;
+  const pickerLoading = options.loading ?? false;
+  let pickerOpen = false;
+  let pickerView = 'effort';
+  let loads = 0;
+  function loadPickerModels() { loads += 1; }
+  ${modelActionHandler}
+  return (detail) => {
+    handleComposerWebModelAction({ detail } as CustomEvent);
+    return { open: pickerOpen, loads };
+  };
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText);
+check('switch model works with no right pane', () => {
+  assert.deepEqual(makeModelActionHarness({})({ kind: 'switchModel', sessionId: 'current' }), { open: true, loads: 1 });
+  assert.deepEqual(makeModelActionHarness({ loaded: true })({ kind: 'switchModel' }), { open: true, loads: 0 });
+  assert.deepEqual(makeModelActionHarness({ loading: true })({ kind: 'switchModel' }), { open: true, loads: 0 });
+});
+check('switch model respects session and input locks', () => {
+  for (const options of [{ locked: true }, { blocking: true }]) {
+    assert.deepEqual(makeModelActionHarness(options)({ kind: 'switchModel', sessionId: 'current' }), { open: false, loads: 0 });
+  }
+  assert.deepEqual(makeModelActionHarness({})({ kind: 'switchModel', sessionId: 'other' }), { open: false, loads: 0 });
+  assert.deepEqual(makeModelActionHarness({})({ kind: 'openView' }), { open: false, loads: 0 });
+});
+
 console.log(`composer input golden checks passed (${scenarios} scenarios)`);

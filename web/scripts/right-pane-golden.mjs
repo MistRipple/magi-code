@@ -142,7 +142,7 @@ await withGoldenViteServer(async (server) => {
   assert.match(terminalSource, /class="terminal-pane"/u);
   assert.match(
     shellSource,
-    /if \(desktopAppSurface && isHtmlFile\([\s\S]*?openWorkspaceHtmlInRightPaneBrowser\(\{[\s\S]*?\} else \{[\s\S]*?openCodeTab\(/u,
+    /if \(desktopAppSurface && isHtmlFile\([\s\S]*?openHtmlFileInRightPaneBrowser\(\{[\s\S]*?\} else \{[\s\S]*?openCodeTab\(/u,
     '文件树的 Desktop HTML 与文件视图必须互斥路由',
   );
   assert.match(
@@ -151,7 +151,7 @@ await withGoldenViteServer(async (server) => {
     '链接点击的消费者必须在始终挂载的 Shell 上（右栏是懒加载 + 条件挂载）',
   );
   assert.match(shellSource, /openUrlInRightPaneBrowser\(externalUrl, \{[\s\S]*?workspacePath: binding\.workspacePath/u, 'Shell 必须以权威绑定（含 workspacePath）调用');
-  assert.match(rightPaneSource, /openWorkspaceHtmlInRightPaneBrowser\(\{/u);
+  assert.match(rightPaneSource, /openHtmlFileInRightPaneBrowser\(\{/u);
   assert.doesNotMatch(rightPaneSource, /OPEN_URL_IN_BROWSER_EVENT/u);
   assert.doesNotMatch(rightPaneSource, /currentFilePath !== request\.filepath|\|\| !htmlFile/u);
   for (const [name, source] of Object.entries({ editsSource, fileChangeSource, knowledgeSource })) {

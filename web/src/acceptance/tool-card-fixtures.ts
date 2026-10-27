@@ -5,6 +5,13 @@ const message = (id: string, type: Message['type'], content: string, blocks: Con
 export const call = (id: string,name: string,status: ToolCallStatus,args: Record<string,unknown>,result?: unknown): ContentBlock => ({
   id, type:'tool_call',content:'',toolCall:{id,name,status,arguments:args,result:typeof result === 'string' ? result : result === undefined ? undefined : JSON.stringify(result),durationMs:1234},
 });
+const spacingUser = message('spacing-user', 'user_input', '允许 Magi 配置连接器');
+spacingUser.message.role = 'user';
+spacingUser.message.source = 'user';
+export const messageSpacingItems: TimelineRenderItem[] = [
+  spacingUser,
+  message('spacing-answer', 'text', '连接器配置结果尚未确认。请在右侧完成后继续，或点击「检查并重试连接器」重新授权。Magi 会先检查，缺少时创建，已有连接器需要刷新时重试刷新。', [], {assistantOutputKind:'final',conversationPresentationRole:'final'}),
+];
 export const acceptanceItems: TimelineRenderItem[] = [
   message('thinking','thinking','',[{id:'thinking-block',type:'thinking',content:'',thinking:{groupId:'thinking-group',status:'completed',isStreaming:false,segments:[{segmentId:'segment',messageId:'thinking',status:'completed',content:'先沿现有协议读取事实，再修改展示层。保留审批、产物与用户手动展开状态。'}]}}]),
   message('progress','text','我会检查工具调用与终端输出，再核对文件变更和不同状态。'),
@@ -29,5 +36,5 @@ export const acceptanceItems: TimelineRenderItem[] = [
   message('image-pending','tool_call','',[call('image-call','image_generate','running',{prompt:'产品卡片示意图',size:'1536x1024'})],{conversationPresentationRole:'artifact'}),
   message('image-ready','tool_call','',[call('image-ready-call','image_generate','success',{prompt:'低对比卡片规范'},{status:'succeeded',path:'card-preview.svg',media_type:'image/svg+xml',bytes:600,revised_prompt:'卡片结构示意，背景与前景由当前皮肤控制。'})],{conversationPresentationRole:'artifact'}),
   message('model-failure','error','',[],{assistantOutputKind:'error',modelFailure:{schemaVersion:'model-failure.v1',code:'response_stream_interrupted',summary:'响应流中断，请检查连接后继续。',detail:'连接在最后一段输出前关闭；已收到的内容仍然保留。',stage:'response_stream',retryable:true,retryAttempts:1}}),
-  message('answer','text','已统一工具卡片：箭头最右、状态圆点次之，耗时和其他信息依次向左。\n\n```typescript\nconst columns = [metadata, status, disclosure];\n```\n\n```json\n{ \"layout\": \"trailing\" }\n```\n\n```text\n轻量文本输出，不再堆叠完整工具标题栏。\n```\n\n```mermaid\nflowchart LR\n  Input --> Tool --> Result\n```',[],{assistantOutputKind:'final',conversationPresentationRole:'final',responseDurationMs:306000}),
+  message('answer','text','正文、工具卡片和底部耗时共用左侧基准。\n\n158. 先核对消息正文的边界。\n159. 保留列表自然缩进，编号不能越过内容边界。\n160. 最后检查代码、工具和耗时。\n\n已统一工具卡片：箭头最右、状态圆点次之，耗时和其他信息依次向左。\n\n```javascript\nconst greeting = "你好";\nconsole.log(greeting);\n// 祝你每天都有好心情\n```\n\n```typescript\nconst columns = [metadata, status, disclosure];\n```\n\n```json\n{ \"layout\": \"trailing\", \"endpoint\": \"https://api.example.com/v1/teams/design/message-card-previews\" }\n```\n\n```text\n轻量文本输出，不再堆叠完整工具标题栏。\n```\n\n```mermaid\nflowchart LR\n  Input --> Tool --> Result\n```',[],{assistantOutputKind:'final',conversationPresentationRole:'final',responseDurationMs:306000}),
 ];

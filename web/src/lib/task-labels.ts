@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 import type { TaskDto, TaskKind, TaskStatus } from '../shared/rust-backend-types';
 
 type TaskDisplayInput = Pick<TaskDto, 'kind' | 'title' | 'goal' | 'task_id'>;
@@ -9,7 +10,7 @@ function compactChineseSpacing(text: string): string {
 function stripInternalTaskIds(text: string): string {
   return text.replace(
     /\b(?:task|mission|worker|agent)-[a-z0-9]+(?:-[a-z0-9]+)*\b/gi,
-    '相关任务',
+    i18n.t('taskLabels.related'),
   );
 }
 
@@ -18,7 +19,7 @@ function normalizeTaskText(text: string | null | undefined): string {
 }
 
 export function getTaskDisplayTitle(task: TaskDisplayInput): string {
-  return normalizeTaskText(task.title) || '未命名任务';
+  return normalizeTaskText(task.title) || i18n.t('taskLabels.unnamed');
 }
 
 export function getTaskDisplayGoal(task: TaskDisplayInput): string {
@@ -26,7 +27,7 @@ export function getTaskDisplayGoal(task: TaskDisplayInput): string {
 }
 
 export function getDecisionDisplayReason(reason: string | null | undefined): string {
-  return normalizeTaskText(reason) || '任务执行失败。';
+  return normalizeTaskText(reason) || i18n.t('taskLabels.failure');
 }
 
 export function getTaskDisplayText(text: string | null | undefined): string {
@@ -35,13 +36,13 @@ export function getTaskDisplayText(text: string | null | undefined): string {
 
 export function getTaskKindLabel(kind: TaskKind): string {
   switch (kind) {
-    case 'local_agent': return '代理任务';
-    case 'local_workflow': return '本地流程';
-    case 'remote_agent': return '远程代理';
-    case 'monitor_mcp': return 'MCP 监控';
-    case 'in_process_teammate': return '进程内队友';
-    case 'dream': return '后台整理';
-    default: return '任务';
+    case 'local_agent': return i18n.t('taskLabels.kind.local_agent');
+    case 'local_workflow': return i18n.t('taskLabels.kind.local_workflow');
+    case 'remote_agent': return i18n.t('taskLabels.kind.remote_agent');
+    case 'monitor_mcp': return i18n.t('taskLabels.kind.monitor_mcp');
+    case 'in_process_teammate': return i18n.t('taskLabels.kind.in_process_teammate');
+    case 'dream': return i18n.t('taskLabels.kind.dream');
+    default: return i18n.t('taskLabels.kind.default');
   }
 }
 
@@ -60,33 +61,33 @@ export function isUserVisibleTaskKind(kind: TaskKind): boolean {
 
 export function getTaskStatusLabel(status: TaskStatus): string {
   switch (status) {
-    case 'pending': return '待执行';
-    case 'running': return '执行中';
-    case 'completed': return '已完成';
-    case 'failed': return '失败';
-    case 'killed': return '已终止';
-    default: return '未知';
+    case 'pending': return i18n.t('taskLabels.status.pending');
+    case 'running': return i18n.t('taskLabels.status.running');
+    case 'completed': return i18n.t('taskLabels.status.completed');
+    case 'failed': return i18n.t('taskLabels.status.failed');
+    case 'killed': return i18n.t('taskLabels.status.killed');
+    default: return i18n.t('taskLabels.status.unknown');
   }
 }
 
 export function getTaskStatusTone(status: TaskStatus): string {
   switch (status) {
-    case 'running': return '正在推进';
-    case 'completed': return '已收束';
-    case 'failed': return '执行失败';
-    case 'killed': return '已终止';
-    default: return '等待执行';
+    case 'running': return i18n.t('taskLabels.tone.running');
+    case 'completed': return i18n.t('taskLabels.tone.completed');
+    case 'failed': return i18n.t('taskLabels.tone.failed');
+    case 'killed': return i18n.t('taskLabels.status.killed');
+    default: return i18n.t('taskLabels.tone.pending');
   }
 }
 
 export function getRunnerStatusLabel(status: string): string {
   switch (status) {
-    case 'running': return '运行中';
-    case 'pending': return '待执行';
-    case 'completed': return '已完成';
-    case 'error': return '异常';
-    case 'killed': return '已终止';
-    default: return '空闲';
+    case 'running': return i18n.t('taskLabels.runner.running');
+    case 'pending': return i18n.t('taskLabels.status.pending');
+    case 'completed': return i18n.t('taskLabels.status.completed');
+    case 'error': return i18n.t('taskLabels.runner.error');
+    case 'killed': return i18n.t('taskLabels.status.killed');
+    default: return i18n.t('taskLabels.runner.idle');
   }
 }
 
@@ -108,9 +109,9 @@ export function getRunnerUserState(status: string): RunnerUserState {
 
 export function getRunnerUserStateLabel(status: string): string {
   switch (getRunnerUserState(status)) {
-    case 'in-progress': return '执行中';
-    case 'finished': return '已完成';
-    default: return '已停止';
+    case 'in-progress': return i18n.t('taskLabels.status.running');
+    case 'finished': return i18n.t('taskLabels.status.completed');
+    default: return i18n.t('taskLabels.runner.stopped');
   }
 }
 
@@ -127,10 +128,10 @@ export function getRunnerUserStateTone(status: string): 'running' | 'failed' | '
 export function getRunnerUserStateTooltip(status: string, failedReason?: string | null): string | null {
   if (status === 'error') {
     const reason = (failedReason ?? '').trim();
-    return reason ? `执行异常：${reason}` : '执行过程中出现异常';
+    return reason ? i18n.t('taskLabels.runner.failureReason', { reason }) : i18n.t('taskLabels.runner.failed');
   }
   if (status === 'killed') {
-    return '任务已终止';
+    return i18n.t('taskLabels.runner.killed');
   }
   return null;
 }

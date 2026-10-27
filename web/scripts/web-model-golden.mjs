@@ -7,14 +7,98 @@ globalThis.$derived = (value) => value;
 await withGoldenViteServer(async (server) => {
   const actions = await server.ssrLoadModule('/src/web/web-model-actions.ts');
   const setup = await server.ssrLoadModule('/src/web/web-model-setup.ts');
+  for (const [label, projection, available] of [
+    ['未安装或未激活', { manifests: [], commands: [] }, false],
+    ['旧版未贡献配置命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [] }, false],
+    ['残留命令无激活清单', { manifests: [], commands: [{ id: setup.WEB_MODEL_SETUP_COMMAND }] }, false],
+    ['其他插件的同名命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [{ id: 'plugin/other/setup' }] }, false],
+    ['激活且贡献配置命令', { manifests: [{ id: 'openai.chatgpt-web' }], commands: [{ id: setup.WEB_MODEL_SETUP_COMMAND }] }, true],
+  ]) {
+    assert.equal(setup.webModelSetupAvailable(projection), available, label);
+    assert.equal(setup.isWebModelSetupRequest('帮我配置 GPT Web', setup.webModelSetupAvailable(projection)), available, label);
+  }
+  for (const text of ['帮我配置 GPT Web', '请帮我配置一下gpt web插件', '配置 GPT Web', 'Please help me configure GPT Web']) {
+    assert.equal(setup.isWebModelSetupRequest(text, true), true, text);
+    assert.equal(setup.isWebModelSetupRequest(text, false), false, '未激活插件不拦截普通消息：' + text);
+  }
+  for (const text of ['不要配置 GPT Web', 'GPT Web 怎么配置？', '解释配置 GPT Web 的代码', 'configure GPT Web and delete files', 'sk-private-configure-gpt-web']) {
+    assert.equal(setup.isWebModelSetupRequest(text, true), false, text);
+  }
+  for (const stage of ['tunnel', 'credentials', 'connecting']) assert.equal(setup.setupCanEditCredentials({ stage }), true);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'connector_access_denied' }), true);
+  for (const stage of ['login', 'complete', 'cancelled', 'busy', 'failed']) assert.equal(setup.setupCanEditCredentials({ stage }), false);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'connector_unconfirmed' }), false);
+  const { buildStoreItems, storeGroup } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
+  const oldPlugin = { manifest: { id: 'openai.chatgpt-web', name: 'GPT Web', version: '1.1.0' }, activeScopes: ['application'], draining: [] };
+  const bundled = { ...oldPlugin.manifest, version: '1.2.0' };
+  const [upgrade] = buildStoreItems([oldPlugin], [bundled], [], (manifest, field) => manifest[field] || '');
+  assert.equal(upgrade.updatable, true, '内置新版必须向旧版用户提供升级入口');
+  assert.equal(storeGroup(upgrade), 'updatable');
+  const [same] = buildStoreItems([oldPlugin], [oldPlugin.manifest], [], (manifest, field) => manifest[field] || '');
+  assert.equal(same.updatable, false);
   for (const stage of ['complete', 'cancelled', 'busy']) assert.equal(setup.setupIsActive({ stage }), false);
   for (const stage of ['login', 'tunnel', 'credentials', 'connecting', 'connector', 'failed']) assert.equal(setup.setupIsActive({ stage }), true);
   assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason: 'confirmation_required' }), true);
-  for (const reason of ['connector_write_started', 'connector_unconfirmed']) {
-    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), false, '未确认的写入只能回读');
+  for (const reason of ['connector_write_started', 'connector_unconfirmed', 'connector_refresh_unconfirmed']) {
+    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), true, '重试必须通过卡片显式再次授权');
     assert.equal(setup.setupReasonKey(reason), 'webModel.setup.reason.connectorUnconfirmed');
   }
   assert.equal(setup.setupReasonKey('untrusted page text'), null);
+  assert.equal(setup.setupReasonKey('key_generation_required'), 'webModel.setup.reason.keyReady');
+  assert.equal(setup.setupReasonKey('project_required'), 'webModel.setup.reason.project');
+  assert.equal(setup.setupReasonKey('key_permissions_required'), 'webModel.setup.reason.keyPermissions');
+  assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason: 'connector_access_denied' }), true);
+  assert.equal(setup.setupReasonKey('connector_access_denied'), 'webModel.setup.reason.connectorAccessDenied');
+  for (const [reason, hint] of [
+    ['connector_ambiguous', 'connectorAmbiguous'], ['connector_tunnel_mismatch', 'connectorTunnelMismatch'],
+    ['connector_refresh_rejected', 'connectorRefreshRejected'], ['connector_page_not_open', 'connectorPageNotReady'],
+    ['connector_detail_unconfirmed', 'connectorPageNotReady'], ['connector_refresh_button_missing', 'connectorPageNotReady'],
+    ['connector_form_fields_missing', 'connectorFormChanged'],
+  ]) {
+    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), true);
+    assert.equal(setup.setupHintKey({ stage: 'connector', reason }, false), `webModel.setup.reason.${hint}`);
+  }
+  for (const [stage, reason, expected] of [
+    ['credentials', 'project_required', 'reason.project'],
+    ['credentials', 'key_permissions_required', 'reason.keyPermissions'],
+    ['credentials', 'key_generation_required', 'reason.keyReady'],
+    ['credentials', 'login_required', 'reason.keyLogin'],
+    ['credentials', 'runtime_key_required', 'reason.keyPreparation'],
+    ['tunnel', 'workspace_required', 'reason.workspace'],
+    ['connector', 'connector_access_denied', 'reason.connectorAccessDenied'],
+    ['connector', 'connector_unconfirmed', 'reason.connectorUnconfirmed'],
+    ['connector', 'confirmation_required', 'hint.confirmConnector'],
+    ['tunnel', 'ambiguous_tunnel', 'reason.ambiguousTunnel'],
+    ['tunnel', 'tunnel_id_required', 'reason.tunnelId'],
+    ['tunnel', 'manual_required', 'reason.manual'],
+    ['login', 'chatgpt_login_required', 'hint.login'],
+    ['complete', '', 'hint.complete'],
+    ['cancelled', '', 'hint.cancelled'],
+    ['busy', 'web_session_busy', 'hint.busy'],
+    ['failed', 'step_unconfirmed', 'hint.failed'],
+  ]) {
+    assert.equal(setup.setupHintKey({ stage, reason }, false), `webModel.setup.${expected}`);
+    assert.equal(setup.setupHintKey({ stage, reason }, true), 'webModel.setup.workingHint');
+  }
+  assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'runtime_not_ready' }, false), 'webModel.setup.hint.connecting');
+  assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'stop_failed' }, false, true), 'webModel.setup.reason.connectionFailed');
+  for (const reason of ['creation_started', 'creation_unconfirmed']) {
+    assert.equal(setup.setupCanRetryTunnel({ stage: 'tunnel', reason }), true);
+    assert.equal(setup.setupCanRetryTunnel({ stage: 'cancelled', reason }), false);
+  }
+  assert.equal(setup.setupCanRetryTunnel(null), false);
+  assert.equal(setup.setupCanRetryTunnel({ stage: 'tunnel', reason: 'login_required' }), false);
+  for (const stage of ['tunnel', 'credentials', 'connecting', 'connector']) {
+    const fresh = setup.setupCredentialInput(stage, 'tunnel_new', '', false);
+    assert.equal(fresh.required, stage !== 'tunnel');
+    assert.equal(fresh.placeholderKey, stage === 'tunnel' ? 'webModel.setup.optionalKeyPlaceholder' : 'webModel.setup.keyPlaceholder');
+    assert.deepEqual(setup.setupCredentialInput(stage, 'tunnel_saved', 'tunnel_saved', true), {
+      required: false, placeholderKey: 'webModel.setup.savedKeyPlaceholder',
+    });
+    assert.deepEqual(setup.setupCredentialInput(stage, 'tunnel_new', 'tunnel_saved', true), {
+      required: true, placeholderKey: 'webModel.setup.keyPlaceholder',
+    }, '更换 Tunnel 时不能提示沿用旧密钥');
+  }
   const commands = await server.ssrLoadModule('/src/lib/user-message-command.ts');
   assert.equal(commands.isWebModelSetupCommand({ pluginCommandId: setup.WEB_MODEL_SETUP_COMMAND }), true);
   assert.equal(commands.isWebModelSetupCommand({ 'magi.pluginCommandId': setup.WEB_MODEL_SETUP_COMMAND }), true);
@@ -53,7 +137,7 @@ await withGoldenViteServer(async (server) => {
   const base = {
     usesWeb: true, projection: { mode: 'temporary', syncState: 'active', hasRemoteConversation: false },
     slotOwnerSessionId: null, sessionId: 's1', turnActive: false, runtimeFresh: true,
-    toolsAvailable: true, workspaceRequired: false,
+    toolsAvailable: true,
   };
   const pick = (patch) => banner.resolveWebSessionBanner({ ...base, ...patch });
   assert.equal(pick({ usesWeb: false }), null);
@@ -82,14 +166,8 @@ await withGoldenViteServer(async (server) => {
   const noTools = pick({ slotOwnerSessionId: 's1', toolsAvailable: false, toolsDetail: '缺凭据' });
   assert.equal(noTools.id, 'noTools');
   assert.equal(noTools.blocksSend, false, '没有项目工具不阻止纯对话');
-  const personalWorkspaceRequired = pick({ slotOwnerSessionId: 's1', workspaceRequired: true });
-  assert.equal(personalWorkspaceRequired.id, 'workspaceRequired');
-  assert.equal(personalWorkspaceRequired.blocksSend, false, '个人 GPT Web 会话仍可纯对话');
-  assert.equal(
-    pick({ slotOwnerSessionId: 's1', workspaceRequired: true, toolsAvailable: false }).id,
-    'noTools',
-    '通道未就绪时优先说明具体通道问题',
-  );
+  assert.equal(pick({ slotOwnerSessionId: 's1', toolsAvailable: true }), null,
+    '个人 GPT Web 会话不因无项目而显示工具不可用');
 });
 
 console.log('web model golden replay passed');

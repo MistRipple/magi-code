@@ -87,6 +87,7 @@ pub struct HttpModelBridgeClient {
     /// 推理强度配置：构造期注入；调用时透传到协议层 request body。
     /// `None` 表示未配置（保留协议默认行为）。
     reasoning_effort: Option<ReasoningEffort>,
+    reasoning_capability: Option<crate::reasoning::ReasoningCapability>,
 }
 
 #[derive(Clone)]
@@ -141,7 +142,17 @@ impl HttpModelBridgeClient {
             model,
             protocol,
             reasoning_effort,
+            reasoning_capability: None,
         }
+    }
+
+    pub fn with_reasoning_capability(
+        mut self,
+        capability: crate::reasoning::ReasoningCapability,
+    ) -> Self {
+        self.reasoning_effort = capability.reconcile(self.reasoning_effort);
+        self.reasoning_capability = Some(capability);
+        self
     }
 
     #[cfg(test)]
@@ -199,6 +210,7 @@ impl HttpModelBridgeClient {
             self.reasoning_effort,
             max_output_tokens,
         );
+        params.reasoning_capability = self.reasoning_capability.clone();
         if matches!(params.tool_choice, Some(ToolChoice::Typed { .. })) {
             match self.forced_tool_choice_capability() {
                 ForcedToolChoiceCapability::Required => {
@@ -1925,6 +1937,7 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
     let request = AnthropicMessagesAdapter
         .build_request(
             &LlmMessageParams {
+                reasoning_capability: None,
                 messages: vec![LlmMessage {
                     role: "user".to_string(),
                     content: LlmMessageContent::Text("ping".to_string()),
@@ -1994,6 +2007,7 @@ fn llm_message_params_from_invocation(
             }]
         });
     LlmMessageParams {
+        reasoning_capability: None,
         messages,
         max_tokens: max_output_tokens,
         temperature: None,
@@ -3285,6 +3299,111 @@ mod tests {
                 "effort {:?} should serialize to `{}`",
                 effort, expected
             );
+        }
+    }
+
+    #[test]
+    fn declared_alias_capabilities_drive_each_wire_protocol() {
+        use crate::reasoning::{ReasoningCapability, ReasoningTransport};
+        for protocol in [
+            HttpModelBridgeProtocol::ChatCompletions,
+            HttpModelBridgeProtocol::Responses,
+            HttpModelBridgeProtocol::AnthropicMessages,
+        ] {
+            for effort in crate::reasoning::EFFORTS {
+                let capability = ReasoningCapability {
+                    supported_efforts: crate::reasoning::EFFORTS.to_vec(),
+                    default_effort: Some(ReasoningEffort::High),
+                    transport: if protocol == HttpModelBridgeProtocol::AnthropicMessages {
+                        ReasoningTransport::AnthropicEffort
+                    } else {
+                        ReasoningTransport::Openai
+                    },
+                    source: "provider".into(),
+                };
+                let client = HttpModelBridgeClient::new_with_protocol(
+                    "https://fixture.invalid/v1".into(),
+                    None,
+                    "opaque-alias".into(),
+                    protocol,
+                    Some(*effort),
+                )
+                .with_reasoning_capability(capability);
+                let request = ModelInvocationRequest {
+                    provider: "fixture".into(),
+                    prompt: "test".into(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                };
+                let body = client.build_http_request(&request, false).unwrap().body;
+                assert_eq!(body["model"], "opaque-alias");
+                let expected = crate::reasoning::effort_label(*effort);
+                match protocol {
+                    HttpModelBridgeProtocol::ChatCompletions => {
+                        assert_eq!(body["reasoning_effort"], expected)
+                    }
+                    HttpModelBridgeProtocol::Responses => {
+                        assert_eq!(body["reasoning"]["effort"], expected)
+                    }
+                    HttpModelBridgeProtocol::AnthropicMessages
+                        if *effort == ReasoningEffort::None =>
+                    {
+                        assert!(body.get("thinking").is_none())
+                    }
+                    HttpModelBridgeProtocol::AnthropicMessages => {
+                        assert_eq!(body["output_config"]["effort"], expected)
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn undeclared_aliases_and_unspecified_defaults_omit_optional_reasoning_fields() {
+        for protocol in [
+            HttpModelBridgeProtocol::ChatCompletions,
+            HttpModelBridgeProtocol::Responses,
+            HttpModelBridgeProtocol::AnthropicMessages,
+        ] {
+            for (efforts, requested) in [
+                (vec![], Some(ReasoningEffort::High)),
+                (vec![ReasoningEffort::High], None),
+            ] {
+                let client = HttpModelBridgeClient::new_with_protocol(
+                    "https://fixture.invalid/v1".into(),
+                    None,
+                    "opaque-alias".into(),
+                    protocol,
+                    requested,
+                )
+                .with_reasoning_capability(crate::reasoning::ReasoningCapability {
+                    supported_efforts: efforts,
+                    default_effort: None,
+                    transport: if protocol == HttpModelBridgeProtocol::AnthropicMessages {
+                        crate::reasoning::ReasoningTransport::AnthropicEffort
+                    } else {
+                        crate::reasoning::ReasoningTransport::Openai
+                    },
+                    source: "provider".into(),
+                });
+                let body = client
+                    .build_http_request(
+                        &ModelInvocationRequest {
+                            provider: "fixture".into(),
+                            prompt: "ping".into(),
+                            messages: None,
+                            tools: None,
+                            tool_choice: None,
+                        },
+                        false,
+                    )
+                    .unwrap()
+                    .body;
+                for key in ["reasoning", "reasoning_effort", "thinking", "output_config"] {
+                    assert!(body.get(key).is_none(), "{protocol:?}: {key}");
+                }
+            }
         }
     }
 

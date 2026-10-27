@@ -106,6 +106,15 @@ impl AttributionResolver for ExternalOnlyAttribution {
 pub trait WorkspaceResolver: Send + Sync {
     fn root_of(&self, workspace_id: &str) -> Option<PathBuf>;
 
+    /// 会话调用的目录由宿主按归属事实解析；外部令牌继续使用其注册项目。
+    fn root_for(
+        &self,
+        principal: &ClientPrincipal,
+        _target: &AttributionTarget,
+    ) -> Option<PathBuf> {
+        self.root_of(&principal.workspace_id)
+    }
+
     fn name_of(&self, _workspace_id: &str) -> Option<String> {
         None
     }
@@ -143,6 +152,10 @@ pub trait ToolBackend: Send + Sync {
     /// 每次 `tools/list` 与 `tools/call` 都会重新取，使宿主侧的启停、连接状态立即体现。
     fn dynamic_tools(&self) -> Vec<DynamicTool> {
         Vec::new()
+    }
+
+    fn tool_available(&self, _principal: &ClientPrincipal, _internal_name: &str) -> bool {
+        true
     }
 
     fn path_requests(
@@ -344,13 +357,29 @@ impl McpServer {
         self
     }
 
-    /// 当前令牌可见的工具目录。
+    /// 连接器配置指纹只跟随工具定义与权限档，不随活动会话切换变化。
+    pub fn catalog_definition_for(&self, principal: &ClientPrincipal) -> Vec<ToolDescriptor> {
+        let dynamic = self.backend.dynamic_tools();
+        build_catalog(principal.profile, self.backend.schemas(), &dynamic)
+    }
+
+    /// 当前调用方可见的工具目录；调用准入重复验证相同能力边界。
     pub fn catalog_for(&self, principal: &ClientPrincipal) -> Vec<ToolDescriptor> {
-        build_catalog(
-            principal.profile,
-            self.backend.schemas(),
-            &self.backend.dynamic_tools(),
-        )
+        let dynamic = self.backend.dynamic_tools();
+        build_catalog(principal.profile, self.backend.schemas(), &dynamic)
+            .into_iter()
+            .filter(|tool| {
+                let internal = mapping_for_public_name(&tool.name)
+                    .map(|mapping| mapping.internal_name)
+                    .or_else(|| {
+                        dynamic
+                            .iter()
+                            .find(|item| item.public_name == tool.name)
+                            .map(|item| item.internal_name.as_str())
+                    });
+                internal.is_some_and(|name| self.backend.tool_available(principal, name))
+            })
+            .collect()
     }
 
     /// 处理一条已通过认证的 JSON-RPC 请求。通知返回 `None`。
@@ -495,7 +524,10 @@ impl McpServer {
                     .find(|tool| tool.public_name == name)
                     .map(ResolvedTool::from)
             })
-            .filter(|tool| principal.profile.allows(tool.class));
+            .filter(|tool| {
+                principal.profile.allows(tool.class)
+                    && self.backend.tool_available(principal, &tool.internal_name)
+            });
         let Some(mapping) = resolved else {
             return Ok(tool_failure(format!("未知工具: {name}")));
         };
@@ -543,7 +575,7 @@ impl McpServer {
             Err(AttributionRefusal(reason)) => return Ok(deny(reason, Vec::new(), false)),
         };
 
-        let Some(root) = self.workspaces.root_of(&principal.workspace_id) else {
+        let Some(root) = self.workspaces.root_for(principal, &attribution) else {
             return Ok(deny(
                 "令牌绑定的工作区不可用".to_string(),
                 Vec::new(),

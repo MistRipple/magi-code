@@ -8,8 +8,6 @@ export interface ComposerWorkspaceOption {
 
 export const composerWorkspaceState = $state({
   workspaces: [] as ComposerWorkspaceOption[],
-  recentWorkspaceId: '',
-  draftWorkspaceId: '',
   hasUnsavedInput: false,
 });
 
@@ -88,57 +86,17 @@ function currentBindingWorkspace(
   };
 }
 
-function defaultWorkspace(): ComposerWorkspaceOption | null {
-  return findWorkspaceById(composerWorkspaceState.recentWorkspaceId)
-    ?? composerWorkspaceState.workspaces.find((workspace) => workspace.isActive)
-    ?? composerWorkspaceState.workspaces[0]
-    ?? null;
-}
-
-export function syncComposerWorkspaces(
-  workspaces: ComposerWorkspaceOption[],
-  recentWorkspaceId: string | null | undefined,
-): void {
-  const normalized = workspaces
+/** 项目列表只提供选择项；会话归属完全由 daemon 导航绑定决定。 */
+export function syncComposerWorkspaces(workspaces: ComposerWorkspaceOption[]): void {
+  composerWorkspaceState.workspaces = workspaces
     .map(normalizeWorkspaceOption)
     .filter((workspace): workspace is ComposerWorkspaceOption => workspace !== null);
-  composerWorkspaceState.workspaces = normalized;
-
-  const normalizedRecentId = normalizeWorkspaceId(recentWorkspaceId);
-  if (normalizedRecentId && normalized.some((workspace) => workspace.workspaceId === normalizedRecentId)) {
-    composerWorkspaceState.recentWorkspaceId = normalizedRecentId;
-  } else if (!findWorkspaceById(composerWorkspaceState.recentWorkspaceId)) {
-    composerWorkspaceState.recentWorkspaceId = defaultWorkspace()?.workspaceId ?? '';
-  }
-
-  if (composerWorkspaceState.draftWorkspaceId && !findWorkspaceById(composerWorkspaceState.draftWorkspaceId)) {
-    composerWorkspaceState.draftWorkspaceId = '';
-  }
-}
-
-export function selectComposerDraftWorkspace(workspaceId: string): ComposerWorkspaceOption | null {
-  if (!normalizeWorkspaceId(workspaceId)) {
-    composerWorkspaceState.draftWorkspaceId = '';
-    return null;
-  }
-  const workspace = findWorkspaceById(workspaceId);
-  if (!workspace) return null;
-  composerWorkspaceState.draftWorkspaceId = workspace.workspaceId;
-  composerWorkspaceState.recentWorkspaceId = workspace.workspaceId;
-  return workspace;
 }
 
 export function resolveComposerWorkspace(
   currentWorkspaceId: string | null | undefined,
   currentWorkspacePath: string | null | undefined,
-  preferDraftWorkspace: boolean,
 ): ComposerWorkspaceOption | null {
-  if (preferDraftWorkspace) {
-    return findWorkspaceById(composerWorkspaceState.draftWorkspaceId)
-      ?? findWorkspaceByBinding(currentWorkspaceId, currentWorkspacePath)
-      ?? currentBindingWorkspace(currentWorkspaceId, currentWorkspacePath)
-      ?? defaultWorkspace();
-  }
   return findWorkspaceByBinding(currentWorkspaceId, currentWorkspacePath)
     ?? currentBindingWorkspace(currentWorkspaceId, currentWorkspacePath);
 }

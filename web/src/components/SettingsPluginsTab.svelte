@@ -234,6 +234,10 @@
   }
 
   async function updateFromCenter(item: StoreItem): Promise<void> {
+    if (item.bundled) {
+      await run(() => installBundledPlugin(item.id));
+      return;
+    }
     if (!item.catalog) return;
     await run(() => installFromPluginCenter(item.id, item.catalog!.version));
   }

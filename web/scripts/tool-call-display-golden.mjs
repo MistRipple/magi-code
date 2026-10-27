@@ -255,9 +255,40 @@ await withGoldenViteServer(async (server) => {
   );
 
   const { render } = await server.ssrLoadModule('svelte/server');
+  const { default: ToolCardMeta } = await server.ssrLoadModule('/src/components/ToolCardMeta.svelte');
+  const fileStatus = render(ToolCardMeta, { props: { status: 'success', duration: 1234 } }).body;
+  assert.match(fileStatus, /status-without-chevron/, '无折叠箭头的状态保留外侧操作间距，与相邻工具圆点对齐');
+  assert.doesNotMatch(fileStatus, /class="tool-card-chevron-slot/, '不可折叠工具不生成空箭头节点');
+  const expandableStatus = render(ToolCardMeta, { props: { status: 'running', expanded: false } }).body;
+  assert.doesNotMatch(expandableStatus, /class="[^"]*status-without-chevron/, '可折叠工具不重复增加右侧间距');
+  const codeMeta = render(ToolCardMeta, { props: { expanded: false } }).body;
+  assert.doesNotMatch(codeMeta, /class="[^"]*status-without-chevron|class="tool-card-status-slot/, '无状态的代码栏不保留中间空位');
+
   const failureCard = await server.ssrLoadModule('/src/components/ModelFailureCard.svelte');
   const toolCall = await server.ssrLoadModule('/src/components/ToolCall.svelte');
   const messageItem = await server.ssrLoadModule('/src/components/MessageItem.svelte');
+  const { default: ToolCallRenderer } = await server.ssrLoadModule('/src/components/ToolCallRenderer.svelte');
+  const truncatedBlock = (name) => ({
+    id: `truncated-${name}`, type: 'tool_call', content: '',
+    toolCall: {
+      id: `truncated-${name}`, name, status: 'success', arguments: { path: 'README.md', command: 'cat README.md' },
+      result: '历史输出预览',
+      truncatedResult: { sessionId: 's', turnId: 't', itemId: 'i', omittedChars: 9235 },
+    },
+  });
+  for (const name of ['file_read', 'shell_exec', 'web_fetch']) {
+    const markup = render(ToolCallRenderer, { props: { block: truncatedBlock(name) } }).body;
+    assert.doesNotMatch(markup, /data-testid="tool-output-truncated"/, `${name} 收起时不得在卡片外暴露历史输出提示`);
+    if (name === 'file_read') {
+      assert.doesNotMatch(markup, /aria-expanded=/, '成功文件读取保持原有直接打开文件入口');
+    }
+  }
+  const expandedHistory = render(ToolCallRenderer, { props: {
+    block: truncatedBlock('web_fetch'), presentationRole: 'artifact',
+  } }).body;
+  assert.match(expandedHistory, /aria-expanded="true"/, '产物工具默认展开');
+  assert.match(expandedHistory, /class="tool-content[\s\S]*data-testid="tool-output-truncated"/, '历史输出加载入口必须位于已展开的详情内部');
+  assert.match(expandedHistory, /9235/, '仍保留服务端报告的省略数量');
   const { resolveAgentChildStatus } = await server.ssrLoadModule('/src/lib/agent-child-status.ts');
   const staleProjection = { root_task: { task_id: 'root' }, agents: [], tasks: [{ task_id: 'child', status: 'failed', updated_at: 100 }] };
   assert.equal(resolveAgentChildStatus(staleProjection, 'child', 'completed', 200), 'completed', '旧失败快照不能覆盖独立继续后的完成状态');
@@ -283,6 +314,9 @@ await withGoldenViteServer(async (server) => {
     assert.ok(markup.includes(`agent-spawn-card status-${visualStatus}`), `${childStatus} 必须渲染真实子任务状态`);
     if (!['running', 'queued'].includes(childStatus)) assert.doesNotMatch(markup, /status-dot pulsing/);
   }
+  const selectedAgent = render(toolCall.default, {props:{name:'agent_spawn',status:'success',output:{status:'started',child_task_id:'selected-child',model_selection:{model:'glm-fixture',effective_effort:'max'}}}}).body;
+  assert.match(selectedAgent, /glm-fixture/, '派发卡片展示服务端固定模型');
+  assert.match(selectedAgent, /最高|Max/, '派发卡片展示服务端实际强度');
   const compactReadFailure = render(toolCall.default, { props: {
     name:'file_read', id:'compact-read-failure', status:'error',
     input:{path:'missing.ts'}, error:'读取路径失败：路径不存在',

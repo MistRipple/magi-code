@@ -270,10 +270,18 @@ pub(crate) fn resolve_optional_session_workspace_scope(
     requested_workspace_path_value: Option<&str>,
 ) -> Result<OptionalSessionWorkspaceScope, ApiError> {
     let requested_workspace_path = trimmed_non_empty(requested_workspace_path_value);
-    let requested_workspace_id = state.resolve_workspace_id_from_request(
-        trimmed_non_empty(requested_workspace_id_value).map(WorkspaceId::new),
-        requested_workspace_path,
-    );
+    let requested_workspace_id = trimmed_non_empty(requested_workspace_id_value);
+    let has_binding = requested_workspace_id.is_some() || requested_workspace_path.is_some();
+    let requested_scope = has_binding
+        .then(|| {
+            require_registered_workspace_binding(
+                state,
+                requested_workspace_id,
+                requested_workspace_path,
+            )
+            .map(SessionScope::Workspace)
+        })
+        .transpose()?;
     let session_id = trimmed_non_empty(session_id_value).map(SessionId::new);
     let workspace_id = match session_id.as_ref() {
         Some(session_id) => {
@@ -281,9 +289,12 @@ pub(crate) fn resolve_optional_session_workspace_scope(
                 .session_store
                 .session(session_id)
                 .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-            resolve_session_workspace_binding(state, &session, requested_workspace_id.as_ref())?
+            if let Some(scope) = requested_scope.as_ref() {
+                require_session_record_in_scope(state, session_id, scope)?;
+            }
+            state.session_workspace_id(&session)
         }
-        None => requested_workspace_id,
+        None => requested_scope.and_then(|scope| scope.workspace_id()),
     };
     let workspace_path = workspace_id
         .as_ref()
@@ -334,17 +345,15 @@ pub(crate) fn resolve_session_workspace_binding(
 ) -> Result<Option<WorkspaceId>, ApiError> {
     let bound_workspace_id = state.session_workspace_id(session);
 
-    if let (Some(requested_workspace_id), Some(bound_workspace_id)) =
-        (requested_workspace_id, bound_workspace_id.as_ref())
-        && requested_workspace_id != bound_workspace_id
+    if let Some(requested) = requested_workspace_id
+        && bound_workspace_id.as_ref() != Some(requested)
     {
         return Err(session_workspace_mismatch(
             &session.session_id,
-            requested_workspace_id.as_str(),
+            requested.as_str(),
         ));
     }
-
-    Ok(requested_workspace_id.cloned().or(bound_workspace_id))
+    Ok(bound_workspace_id)
 }
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {

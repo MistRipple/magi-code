@@ -612,7 +612,7 @@
       "properties": {
         "tab_id": { "$ref": "#/$defs/id" },
         "control": { "$ref": "#/$defs/agentControl" },
-        "action": { "enum": ["inspect_tunnel", "create_tunnel"] }
+        "action": { "enum": ["inspect_tunnel", "create_tunnel", "prepare_runtime_key"] }
       }
     },
     "updateControlPayload": {

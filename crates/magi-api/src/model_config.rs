@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) use magi_conversation_runtime::model_config::{
-    DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW, NormalizedModelConfig,
-    VISION_MODEL_SECTION, builtin_text_model_rule_catalog, merge_orchestrator_session_override,
+    DEFAULT_VISION_CONTEXT_WINDOW, NormalizedModelConfig, VISION_MODEL_SECTION,
+    builtin_text_model_rule_catalog, merge_orchestrator_session_override,
     reject_unknown_model_config_fields, resolve_orchestrator_model_config,
     validate_vision_model_settings,
 };
@@ -64,14 +64,14 @@ fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiErr
     if config.contains_key("reasoningEffort") {
         match config.get("reasoningEffort") {
             Some(Value::Null) => {
-                override_config.insert(
-                    "reasoningEffort".to_string(),
-                    Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-                );
+                override_config.insert("reasoningEffort".to_string(), Value::Null);
             }
             Some(Value::String(value)) => {
                 let value = value.trim();
-                if !matches!(value, "low" | "medium" | "high" | "xhigh") {
+                if !matches!(
+                    value,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                ) {
                     return Err(ApiError::InvalidInput("reasoningEffort 无效".to_string()));
                 }
                 override_config.insert(
@@ -97,15 +97,18 @@ fn ensure_session_reasoning_effort(config: &mut Value) {
     let fields = config
         .as_object_mut()
         .expect("orchestrator session config should be object");
-    let reasoning_effort_is_valid = fields
-        .get("reasoningEffort")
-        .and_then(Value::as_str)
-        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
+    let reasoning_effort_is_valid = fields.get("reasoningEffort") == Some(&Value::Null)
+        || fields
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value.trim(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                )
+            });
     if !reasoning_effort_is_valid {
-        fields.insert(
-            "reasoningEffort".to_string(),
-            Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-        );
+        fields.insert("reasoningEffort".to_string(), Value::Null);
     }
 }
 
@@ -150,6 +153,7 @@ pub(crate) fn ensure_orchestrator_session_defaults_from_models(
                 .is_some_and(|value| !value.trim().is_empty());
             if !has_model && let Some(model) = first_model.as_ref() {
                 fields.insert("model".to_string(), Value::String(model.clone()));
+                fields.insert("reasoningEffort".into(), Value::Null);
             }
             *stored = defaults;
         })
@@ -232,7 +236,28 @@ fn save_orchestrator_session_override_for_session_with_policy(
     for (key, value) in override_fields {
         next_fields.insert(key.clone(), value.clone());
     }
+    let requested = next_config
+        .get("reasoningEffort")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
     ensure_session_reasoning_effort(&mut next_config);
+    let mut effective = state.settings_store.get_section("orchestrator");
+    merge_orchestrator_session_override(&mut effective, &next_config);
+    if !next_config
+        .get("engineId")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        && let Ok(resolved) =
+            NormalizedModelConfig::from_settings_with_catalog(&state.settings_store, &effective)
+        && let Ok(model) = resolved.require_model()
+    {
+        let capability = resolved.reasoning_capability(model);
+        if capability.source != "unknown" {
+            // null is the user's choice to follow the model default, not a concrete effort.
+            next_config["reasoningEffort"] =
+                json!(requested.filter(|value| capability.supported_efforts.contains(value)));
+        }
+    }
     let mut next_defaults = orchestrator_session_defaults(state);
     merge_orchestrator_session_override(&mut next_defaults, &next_config);
     state

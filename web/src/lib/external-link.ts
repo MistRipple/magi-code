@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 const EXTERNAL_WEB_PROTOCOLS = new Set(['http:', 'https:']);
 /**
  * 能交给操作系统默认处理器的协议。
@@ -39,7 +40,7 @@ export function normalizeExternalHandlerUrl(rawUrl: string): string | null {
 export async function openExternalUrl(rawUrl: string): Promise<void> {
   const url = normalizeExternalHandlerUrl(rawUrl);
   if (!url) {
-    throw new Error('仅支持打开网页或邮件地址');
+    throw new Error(i18n.t('externalLink.unsupported'));
   }
 
   if (window.magiDesktop) {

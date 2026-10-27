@@ -327,12 +327,12 @@
 
   function formatTimestamp(timestamp: number): string {
     if (!Number.isFinite(timestamp)) return '--';
-    return new Date(timestamp).toLocaleTimeString();
+    return new Date(timestamp).toLocaleTimeString(i18n.locale, { hour12: false });
   }
 
   function formatDateTime(timestamp: number): string {
     if (!Number.isFinite(timestamp)) return '--';
-    return new Date(timestamp).toLocaleString();
+    return new Date(timestamp).toLocaleString(i18n.locale);
   }
 
   function formatRuntimePhase(phase: string | undefined): string {
@@ -564,54 +564,54 @@
     if (!normalized) return '--';
     switch (normalized) {
       case 'task.dispatched':
-        return '任务已派发';
+        return i18n.t('runtimeDiagnostics.event.taskDispatched');
       case 'task.running':
-        return '任务执行中';
+        return i18n.t('runtimeDiagnostics.event.taskRunning');
       case 'task.completed':
-        return '任务已完成';
+        return i18n.t('runtimeDiagnostics.event.taskCompleted');
       case 'task.failed':
-        return '任务失败';
+        return i18n.t('runtimeDiagnostics.event.taskFailed');
       case 'task.status.changed':
-        return '任务状态更新';
+        return i18n.t('runtimeDiagnostics.event.taskChanged');
       case 'mission.execution.overview':
-        return '执行概览';
+        return i18n.t('runtimeDiagnostics.event.overview');
       case 'knowledge.context.selected':
-        return '知识按需决策';
+        return i18n.t('runtimeDiagnostics.event.context');
       case 'knowledge.learning.extraction':
-        return '自动经验抽取';
+        return i18n.t('runtimeDiagnostics.event.learning');
       case 'mission.resume.dispatch.created':
-        return '恢复调度已创建';
+        return i18n.t('runtimeDiagnostics.event.resume');
       case 'worker.reported':
-        return '执行者上报';
+        return i18n.t('runtimeDiagnostics.event.worker');
       case 'worker.tool.observed':
       case 'task.tool.invoked':
       case 'session.turn.tool.invoked':
       case 'tool.call.finished':
       case 'tool.invoked':
-        return '工具调用';
+        return i18n.t('runtimeDiagnostics.event.tool');
       case 'session.turn.failed':
-        return '本轮执行失败';
+        return i18n.t('runtimeDiagnostics.event.turnFailed');
       case 'session.turn.interrupted':
-        return '本轮执行中断';
+        return i18n.t('runtimeDiagnostics.event.interrupted');
       case 'session.turn.queue_failed':
-        return '任务排队失败';
+        return i18n.t('runtimeDiagnostics.event.queueFailed');
       case 'model.retry.runtime':
-        return '模型重试';
+        return i18n.t('runtimeDiagnostics.event.retry');
       case 'worker.skill_dispatch.observed':
       case 'worker.skill_dispatch.applied':
-        return '技能调度';
+        return i18n.t('runtimeDiagnostics.event.skill');
       case 'worker.executor.observed':
-        return '执行器状态';
+        return i18n.t('runtimeDiagnostics.event.executor');
       case 'governance.decision.applied':
-        return '决策已应用';
+        return i18n.t('runtimeDiagnostics.event.decision');
       case 'system.runtime.maintenance.status':
-        return '运行态维护';
+        return i18n.t('runtimeDiagnostics.event.maintenance');
       default:
         return normalized
           .split('.')
           .map((part) => formatRuntimeTokenLabel(part))
           .filter(Boolean)
-          .join(', ') || '运行事件';
+          .join(', ') || i18n.t('runtimeDiagnostics.event.default');
     }
   }
 
@@ -701,34 +701,34 @@
     item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'kind'>,
   ): string {
     switch (resolveRuntimeRecordKind(item)) {
-      case 'success': return '已完成';
-      case 'warning': return '需处理';
-      case 'error': return '错误';
-      default: return '进行中';
+      case 'success': return i18n.t('runtimeDiagnostics.recordKind.success');
+      case 'warning': return i18n.t('runtimeDiagnostics.recordKind.warning');
+      case 'error': return i18n.t('runtimeDiagnostics.recordKind.error');
+      default: return i18n.t('runtimeDiagnostics.recordKind.progress');
     }
   }
 
   function formatRuntimeTokenLabel(token: string): string {
     switch (token) {
-      case 'task': return '任务';
-      case 'mission': return '执行组';
-      case 'worker': return '执行者';
-      case 'tool': return '工具';
-      case 'governance': return '决策';
-      case 'decision': return '决策';
-      case 'system': return '系统';
-      case 'runtime': return '运行态';
-      case 'execution': return '执行';
-      case 'overview': return '概览';
-      case 'status': return '状态';
-      case 'changed': return '更新';
-      case 'dispatched': return '已派发';
-      case 'reported': return '上报';
-      case 'observed': return '已观测';
-      case 'applied': return '已应用';
-      case 'resume': return '恢复';
-      case 'dispatch': return '调度';
-      case 'created': return '已创建';
+      case 'task': return i18n.t('runtimeDiagnostics.token.task');
+      case 'mission': return i18n.t('runtimeDiagnostics.token.mission');
+      case 'worker': return i18n.t('runtimeDiagnostics.token.worker');
+      case 'tool': return i18n.t('runtimeDiagnostics.token.tool');
+      case 'governance': return i18n.t('runtimeDiagnostics.token.decision');
+      case 'decision': return i18n.t('runtimeDiagnostics.token.decision');
+      case 'system': return i18n.t('runtimeDiagnostics.token.system');
+      case 'runtime': return i18n.t('runtimeDiagnostics.token.runtime');
+      case 'execution': return i18n.t('runtimeDiagnostics.token.execution');
+      case 'overview': return i18n.t('runtimeDiagnostics.token.overview');
+      case 'status': return i18n.t('runtimeDiagnostics.token.status');
+      case 'changed': return i18n.t('runtimeDiagnostics.token.changed');
+      case 'dispatched': return i18n.t('runtimeDiagnostics.token.dispatched');
+      case 'reported': return i18n.t('runtimeDiagnostics.token.reported');
+      case 'observed': return i18n.t('runtimeDiagnostics.token.observed');
+      case 'applied': return i18n.t('runtimeDiagnostics.token.applied');
+      case 'resume': return i18n.t('runtimeDiagnostics.token.resume');
+      case 'dispatch': return i18n.t('runtimeDiagnostics.token.dispatch');
+      case 'created': return i18n.t('runtimeDiagnostics.token.created');
       default:
         return token
           .replace(/[_-]/g, ' ')

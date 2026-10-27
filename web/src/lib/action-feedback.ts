@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 import {
   directIncidentError,
   incidentErrorDiagnostics,
@@ -24,12 +25,12 @@ function resolveSuccessMessage<T>(
   options: ActionFeedbackOptions<T>,
 ): string {
   if (typeof options.successMessage === 'function') {
-    return options.successMessage(result)?.trim() || `${options.actionLabel}成功`;
+    return options.successMessage(result)?.trim() || i18n.t('common.actionSucceeded', { action: options.actionLabel });
   }
   if (typeof options.successMessage === 'string' && options.successMessage.trim()) {
     return options.successMessage.trim();
   }
-  return `${options.actionLabel}成功`;
+  return i18n.t('common.actionSucceeded', { action: options.actionLabel });
 }
 
 export async function runActionWithFeedback<T>(
@@ -50,7 +51,7 @@ export async function runActionWithFeedback<T>(
     });
     return result;
   } catch (error) {
-    const errorMessage = `${options.actionLabel}失败`;
+    const errorMessage = i18n.t('common.actionFailed', { action: options.actionLabel });
     await options.onError?.(errorMessage, error);
     const directError = directIncidentError(error, errorMessage);
     reportIncident(directError, {

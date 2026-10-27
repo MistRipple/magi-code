@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 export type DesktopUpdateProgress = {
   downloadedBytes: number;
   contentLength?: number;
@@ -78,9 +79,9 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
       lastError = error;
     }
   }
-  if (!snapshot) throw lastError ?? new Error('桌面端更新检查失败');
+  if (!snapshot) throw lastError ?? new Error(i18n.t('desktopUpdate.checkFailed'));
   if (snapshot.status === 'failed' || snapshot.status === 'unsupported') {
-    throw new Error(snapshot.error || '当前构建不支持在线更新');
+    throw new Error(snapshot.error || i18n.t('desktopUpdate.unsupported'));
   }
   if (!snapshot.availableVersion) return null;
 
@@ -100,7 +101,7 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
       try {
         const downloaded = await desktop.downloadUpdate();
         if (downloaded.status !== 'downloaded') {
-          throw new Error(downloaded.error || '桌面更新尚未准备完成，请重试');
+          throw new Error(downloaded.error || i18n.t('desktopUpdate.notReady'));
         }
         onProgress?.(formatUpdateProgress(
           downloaded.downloadedBytes,

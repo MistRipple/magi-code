@@ -555,39 +555,23 @@ impl BuiltinToolName {
         magi_browser_authority::BrowserToolKind::from_name(self.as_str())
     }
 
-    /// 该工具是否要求会话绑定工作区。
-    ///
-    /// 工作区是本地文件、进程、搜索、Git、项目知识和图片产物的唯一执行根。
-    /// 没有工作区时，这些工具不能仅靠执行阶段再返回错误，必须从模型工具目录中
-    /// 完全隐藏；浏览器、网络和会话内部工具不依赖工作区。
+    /// 项目身份、索引或 Git 合同是这些能力的必要条件，执行 cwd 不能替代。
     pub fn requires_workspace_context(&self) -> bool {
         matches!(
             self,
-            Self::FileRead
-                | Self::ViewImage
-                | Self::FileWrite
-                | Self::FilePatch
-                | Self::ApplyPatch
-                | Self::AgentApply
-                | Self::FileRemove
-                | Self::FileMkdir
-                | Self::FileCopy
-                | Self::FileMove
-                | Self::SearchText
+            Self::AgentApply
                 | Self::SearchSemantic
-                | Self::ShellExec
-                | Self::ProcessLaunch
-                | Self::ProcessRead
-                | Self::ProcessWrite
-                | Self::ProcessKill
-                | Self::ProcessList
-                | Self::ProcessInspect
-                | Self::DiffPreview
-                | Self::ImageGenerate
                 | Self::KnowledgeQuery
                 | Self::KnowledgeGraphQuery
                 | Self::CodeSymbols
-                | Self::GitStatus
+                | Self::MemoryWrite
+        )
+    }
+
+    pub fn requires_repository(&self) -> bool {
+        matches!(
+            self,
+            Self::GitStatus
                 | Self::GitBranchList
                 | Self::GitBranchCreate
                 | Self::GitBranchSwitch
@@ -600,6 +584,34 @@ impl BuiltinToolName {
                 | Self::GitWorktreeCreate
                 | Self::GitWorktreeRemove
         )
+    }
+
+    /// 通用本地能力只要求实际 cwd；个人会话由 daemon 提供独立目录。
+    pub fn requires_execution_directory(&self) -> bool {
+        self.requires_workspace_context()
+            || self.requires_repository()
+            || matches!(
+                self,
+                Self::FileRead
+                    | Self::ViewImage
+                    | Self::FileWrite
+                    | Self::FilePatch
+                    | Self::ApplyPatch
+                    | Self::FileRemove
+                    | Self::FileMkdir
+                    | Self::FileCopy
+                    | Self::FileMove
+                    | Self::SearchText
+                    | Self::ShellExec
+                    | Self::ProcessLaunch
+                    | Self::ProcessRead
+                    | Self::ProcessWrite
+                    | Self::ProcessKill
+                    | Self::ProcessList
+                    | Self::ProcessInspect
+                    | Self::DiffPreview
+                    | Self::ImageGenerate
+            )
     }
 
     /// 首次会话工作区执行需要建立变更账本、校验 Git 基线并取得执行租约。
@@ -1280,7 +1292,7 @@ impl BuiltinToolName {
         if let Some(tool) = self.browser_tool_kind() {
             return tool.input_schema();
         }
-        match self {
+        let mut schema = match self {
             Self::FileRead => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1894,6 +1906,7 @@ impl BuiltinToolName {
                     "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
                     "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
                     "role": { "type": "string", "description": "可派发角色 id，以系统提示中的“可派发角色”清单为准（含用户自定义角色）。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
+                    "reasoning_effort": { "type": ["string", "null"], "enum": [null, "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"], "description": "可选。本次子任务推理强度，必须属于运行时展示的目标角色模型档位。省略或 null 使用配置默认强度；none 是明确关闭。仅按任务复杂度和风险选够用的档位，高档通常更慢且消耗更多 token。不能覆盖模型、引擎或权限。" },
                     "capabilities": {
                         "type": "array",
                         "minItems": 1,
@@ -2150,7 +2163,14 @@ impl BuiltinToolName {
                 "required": ["questions"]
             }),
             _ => unreachable!("浏览器工具参数已由 browser-tool.schema.json 的唯一目录提供"),
+        };
+        if self.requires_repository() {
+            schema["properties"]["repositoryPath"] = serde_json::json!({
+                "type": "string", "minLength": 1,
+                "description": "明确的 Git 仓库目录（相对会话执行目录或原生绝对路径）；省略时使用当前执行目录。不注册项目，不继承项目记忆。"
+            });
         }
+        schema
     }
 }
 

@@ -405,10 +405,24 @@ impl ToolRegistry {
                 return output;
             }
             if canonical_name.requires_workspace_context() && context.workspace_id.is_none() {
-                let output = self.build_workspace_required_rejection(&input, canonical_name);
+                let output = self.build_context_required_rejection(&input, canonical_name, true);
                 self.record_invocation(&input, &context, &output);
                 return output;
             }
+        }
+        if input.tool_kind == ToolKind::Builtin
+            && BuiltinToolName::from_name(input.tool_name.trim())
+                .is_some_and(|tool| tool.requires_execution_directory())
+            && context.workspace_id.is_none()
+            && context.working_directory.is_none()
+        {
+            let output = self.build_context_required_rejection(
+                &input,
+                BuiltinToolName::from_name(input.tool_name.trim()).expect("builtin checked"),
+                false,
+            );
+            self.record_invocation(&input, &context, &output);
+            return output;
         }
         if let Some(output) = self.enforce_execution_policy(&input, policy) {
             self.record_invocation(&input, &context, &output);
@@ -552,22 +566,25 @@ impl ToolRegistry {
         }
     }
 
-    fn build_workspace_required_rejection(
+    fn build_context_required_rejection(
         &self,
         input: &ToolExecutionInput,
         tool_name: BuiltinToolName,
+        project: bool,
     ) -> ToolExecutionOutput {
-        let reason = format!(
-            "{} 需要当前会话绑定工作区；请先选择工作区后再执行该工具",
-            tool_name.as_str()
-        );
+        let (code, requirement) = if project {
+            ("workspace_required", "当前会话关联项目")
+        } else {
+            ("execution_directory_required", "daemon 提供会话执行目录")
+        };
+        let reason = format!("{} 需要{}；调用尚未执行", tool_name.as_str(), requirement);
         ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
             status: ExecutionResultStatus::Rejected,
             payload: serde_json::json!({
                 "tool": tool_name.as_str(),
                 "status": "rejected",
-                "error_code": "workspace_required",
+                "error_code": code,
                 "error": reason.clone(),
             })
             .to_string(),

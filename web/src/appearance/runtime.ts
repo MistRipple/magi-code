@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 import {
   activateAppearanceTheme,
   fetchAppearanceAsset,
@@ -49,7 +50,7 @@ export async function refreshAppearanceRuntime(): Promise<void> {
 
 export async function applyAppearanceSnapshot(snapshot: AppearanceSnapshot): Promise<void> {
   const record = snapshot.themes.find((candidate) => candidate.pack.id === snapshot.activeThemeId);
-  if (!record) throw new Error('当前外观主题不存在');
+  if (!record) throw new Error(i18n.t('appearance.error.missing'));
   library = snapshot;
   previewing = false;
   await applyTheme(record.pack);
@@ -129,7 +130,7 @@ function resolveMode(pack: ThemePack): EffectiveAppearanceMode {
 
 function resolveScheme(pack: ThemePack, targetMode: EffectiveAppearanceMode): ThemeScheme {
   const scheme = pack.schemes[targetMode];
-  if (!scheme) throw new Error(`主题缺少${targetMode === 'light' ? '浅色' : '深色'}方案`);
+  if (!scheme) throw new Error(i18n.t('appearance.error.missingScheme', { mode: i18n.t(`appearance.mode.${targetMode}`) }));
   return scheme;
 }
 
@@ -226,7 +227,6 @@ function applyRootTheme(
     '--dropdown-bg': elevated,
     '--glass-bg': elevated,
     '--code-bg': critical,
-    '--code-border': rgba(foreground, 0.055 + contrastFactor * 0.055),
     '--user-message-bg': rgba(foreground, mode === 'dark' ? 0.09 : 0.065),
     '--assistant-message-bg': mainPanel,
     '--overlay': mode === 'dark' ? 'rgba(0, 0, 0, 0.58)' : 'rgba(15, 23, 42, 0.34)',

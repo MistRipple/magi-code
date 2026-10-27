@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 import { getTransport } from '../shared/transport';
 import { agentUrl } from '../web/agent-api';
 import {
@@ -10,7 +11,7 @@ import {
 
 async function parseJson<T>(response: Response, action: string): Promise<T> {
   if (!response.ok) {
-    let message = `${action}失败（HTTP ${response.status}）`;
+    let message = i18n.t('common.actionHttpFailed', { action, status: response.status });
     try {
       const payload = await response.json() as { message?: unknown; detail?: unknown; error?: unknown };
       const detail = typeof payload.detail === 'string' && payload.detail.trim()
@@ -41,35 +42,35 @@ async function postJson<T>(path: string, body: unknown, action: string): Promise
 }
 
 export async function fetchAppearanceSnapshot(): Promise<AppearanceSnapshot> {
-  return normalizeAppearanceSnapshot(await getJson('/api/appearance/bootstrap', '加载外观'));
+  return normalizeAppearanceSnapshot(await getJson('/api/appearance/bootstrap', i18n.t('appearance.action.load')));
 }
 
 export async function activateAppearanceTheme(themeId: string, expectedRevision: number): Promise<AppearanceSnapshot> {
-  return normalizeAppearanceSnapshot(await postJson('/api/appearance/activate', { themeId, expectedRevision }, '应用主题'));
+  return normalizeAppearanceSnapshot(await postJson('/api/appearance/activate', { themeId, expectedRevision }, i18n.t('appearance.action.activate')));
 }
 
 export async function createAppearanceTheme(pack: ThemePack, expectedRevision: number): Promise<AppearanceSnapshot> {
-  return normalizeAppearanceSnapshot(await postJson('/api/appearance/themes', { pack, expectedRevision }, '创建主题'));
+  return normalizeAppearanceSnapshot(await postJson('/api/appearance/themes', { pack, expectedRevision }, i18n.t('appearance.action.create')));
 }
 
 export async function updateAppearanceTheme(themeId: string, pack: ThemePack, expectedRevision: number): Promise<AppearanceSnapshot> {
-  return normalizeAppearanceSnapshot(await postJson('/api/appearance/themes/update', { themeId, pack, expectedRevision }, '保存主题'));
+  return normalizeAppearanceSnapshot(await postJson('/api/appearance/themes/update', { themeId, pack, expectedRevision }, i18n.t('appearance.action.save')));
 }
 
 export async function deleteAppearanceTheme(themeId: string, expectedRevision: number): Promise<AppearanceSnapshot> {
   return normalizeAppearanceSnapshot(await postJson(
     `/api/appearance/themes/${encodeURIComponent(themeId)}/delete`,
     { expectedRevision },
-    '删除主题',
+    i18n.t('appearance.action.delete'),
   ));
 }
 
 export async function uploadAppearanceAsset(file: File): Promise<AppearanceAssetUploadResult> {
-  return await postJson('/api/appearance/assets', { dataBase64: await fileToBase64(file) }, '上传背景图');
+  return await postJson('/api/appearance/assets', { dataBase64: await fileToBase64(file) }, i18n.t('appearance.action.upload'));
 }
 
 export async function fetchAppearanceAsset(assetId: string): Promise<AppearanceAssetPayload> {
-  return await getJson(`/api/appearance/assets/${encodeURIComponent(assetId)}`, '加载背景图');
+  return await getJson(`/api/appearance/assets/${encodeURIComponent(assetId)}`, i18n.t('appearance.action.asset'));
 }
 
 export async function importAppearanceTheme(
@@ -81,11 +82,11 @@ export async function importAppearanceTheme(
     expectedRevision,
     packageBase64: await fileToBase64(file),
     conflictStrategy,
-  }, '导入主题'));
+  }, i18n.t('appearance.action.import')));
 }
 
 export async function exportAppearanceTheme(themeId: string): Promise<{ fileName: string; packageBase64: string }> {
-  return await getJson(`/api/appearance/themes/${encodeURIComponent(themeId)}/export`, '导出主题');
+  return await getJson(`/api/appearance/themes/${encodeURIComponent(themeId)}/export`, i18n.t('appearance.action.export'));
 }
 
 export function downloadThemePackage(payload: { fileName: string; packageBase64: string }): void {

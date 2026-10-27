@@ -1,6 +1,10 @@
 <script lang="ts">
+  import { themeDisplayName } from '../appearance/labels';
+
+  $effect(() => { document.documentElement.lang = i18n.locale; });
   import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
+  import { recentSessionList } from '../lib/recent-sessions';
   import { beginPanelResize } from '../lib/panel-resize';
   import { imeEnterGuard } from '../lib/ime-enter-guard';
   import ToastContainer from '../components/ToastContainer.svelte';
@@ -88,7 +92,7 @@
   import { normalizeExternalWebUrl, openExternalUrl } from '../lib/external-link';
   import {
     openUrlInRightPaneBrowser,
-    openWorkspaceHtmlInRightPaneBrowser,
+    openHtmlFileInRightPaneBrowser,
   } from './right-pane-browser';
   import {
     RUNTIME_CONNECTION_EVENT,
@@ -182,7 +186,7 @@ import {
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
-  let recentSessions = $state<Session[]>([]);
+  let personalSessions = $state<Session[]>([]);
   // 启动时无法加载的会话由 daemon 报告，只读展示，不参与会话导航。
   let unavailableSessionsByWorkspace = $state<Record<string, AgentUnavailableSession[]>>({});
   let unavailablePersonalSessions = $state<AgentUnavailableSession[]>([]);
@@ -290,6 +294,7 @@ import {
 
   type WorkspaceFileSelection = { pathRef: string; displayPath: string; name: string };
   type ProjectFileTreeProps = {
+    sessionId?: string;
     rootPath: string;
     workspaceId: string;
     showHidden?: boolean;
@@ -402,9 +407,8 @@ import {
 
   $effect(() => {
     const nextWorkspaces = workspaces;
-    const nextSelectedWorkspaceId = selectedWorkspaceId;
     untrack(() => {
-      syncComposerWorkspaces(nextWorkspaces, nextSelectedWorkspaceId);
+      syncComposerWorkspaces(nextWorkspaces);
     });
   });
 
@@ -438,7 +442,7 @@ import {
   }
 
   $effect(() => {
-    recentSessions = messagesState.personalSessionProjection.sessions;
+    personalSessions = messagesState.personalSessionProjection.sessions;
     personalSessionsError = '';
   });
 
@@ -956,9 +960,7 @@ import {
     if (requestedWorkspace) {
       return requestedWorkspace.workspaceId;
     }
-    return nextWorkspaces.find((workspace) => workspace.isActive)?.workspaceId
-      || nextWorkspaces[0]?.workspaceId
-      || '';
+    return '';
   }
 
   // 列表同步 effect：按 workspaceId 分片接收目录投影，不能用当前草稿工作区
@@ -1008,7 +1010,7 @@ import {
     }
     const session = workspaceId
       ? (sessionsByWorkspace[workspaceId] ?? []).find((candidate) => candidate.id === sessionId)
-      : recentSessions.find((candidate) => candidate.id === sessionId);
+      : personalSessions.find((candidate) => candidate.id === sessionId);
     if (!session) {
       return;
     }
@@ -1041,7 +1043,7 @@ import {
         ? messagesState.workspaceSessionProjections[workspaceId]?.runtimeEpoch
         : messagesState.personalSessionProjection.runtimeEpoch;
       if (expectedEpoch && cursor.runtimeEpoch !== expectedEpoch) return;
-      const currentSessions = workspaceId ? (sessionsByWorkspace[workspaceId] ?? []) : recentSessions;
+      const currentSessions = workspaceId ? (sessionsByWorkspace[workspaceId] ?? []) : personalSessions;
       const nextSessions = currentSessions.map((candidate) => (
         candidate.id === sessionId
           ? { ...candidate, hasUnreadCompletion: false }
@@ -1057,7 +1059,7 @@ import {
         };
       } else {
         if (!replacePersonalSessionProjection(nextSessions, cursor)) return;
-        recentSessions = nextSessions;
+        personalSessions = nextSessions;
       }
     }).catch((error) => {
       console.warn('[WebWorkbenchShell] 标记会话已查看失败:', error);
@@ -1197,8 +1199,43 @@ import {
     return externalApprovals.approvals.filter((approval) => approval.tokenId === session.tokenId).length;
   }
 
-  function getPersonalSessionList(): Session[] {
-    return recentSessions.filter((session) => !isInternalSession(session));
+  // 最近是同一目录事实的排序视图，不持有另一份会话或项目归属。
+  function getRecentSessionList(): Session[] {
+    return recentSessionList(personalSessions, sessionsByWorkspace)
+      .filter((session) => !isInternalSession(session));
+  }
+
+  function recentSessionWorkspace(session: Session): AgentWorkspaceSummary | undefined {
+    return workspaces.find((workspace) => workspace.workspaceId === session.workspaceId);
+  }
+
+  function switchRecentSession(session: Session): void {
+    const workspace = recentSessionWorkspace(session);
+    if (workspace) switchSession(workspace, session.id);
+    else if (!session.workspaceId) switchPersonalSession(session.id);
+  }
+
+  function isEditingRecentSession(session: Session): boolean {
+    return editingSession?.sessionId === session.id
+      && (editingSession.workspaceId || '') === (session.workspaceId || '');
+  }
+
+  function beginRecentSessionRename(session: Session): Promise<void> {
+    const workspace = recentSessionWorkspace(session);
+    if (workspace) return beginSessionRename(workspace, session);
+    return session.workspaceId ? Promise.resolve() : beginPersonalSessionRename(session);
+  }
+
+  function saveRecentSessionRename(session: Session): Promise<void> {
+    const workspace = recentSessionWorkspace(session);
+    if (workspace) return saveSessionRename(workspace, session);
+    return session.workspaceId ? Promise.resolve() : savePersonalSessionRename(session);
+  }
+
+  function openRecentDeleteSessionDialog(session: Session): void {
+    const workspace = recentSessionWorkspace(session);
+    if (workspace) openDeleteSessionDialog(workspace, session);
+    else if (!session.workspaceId) openPersonalDeleteSessionDialog(session);
   }
 
   function currentSessionDirectoryEpoch(): string | null {
@@ -1223,7 +1260,7 @@ import {
         eventStreamNextSequence: snapshot.eventStreamNextSequence,
       }, { allowRuntimeEpochChange: snapshot.runtimeEpoch === epoch });
       if (applied) {
-        recentSessions = snapshot.sessions;
+        personalSessions = snapshot.sessions;
         unavailablePersonalSessions = snapshot.unavailableSessions;
       }
     } catch (error) {
@@ -1278,7 +1315,7 @@ import {
     return appearanceRuntime.mode === 'light' ? 'sun' : 'moon';
   });
   const themeToggleTitle = $derived.by(() => {
-    return appearanceRuntime.activeTheme?.name || i18n.t('web.themeSystem');
+    return appearanceRuntime.activeTheme ? themeDisplayName(appearanceRuntime.activeTheme) : i18n.t('web.themeSystem');
   });
 
   function toggleWebTheme(): void {
@@ -1742,7 +1779,7 @@ import {
     // 浏览器 view_image 的结果已经携带内存中的 PNG，不属于工作区文件。
     // 个人会话也必须能在右栏直接打开它，不能继续落到 bridge 的文件预览
     // 请求，否则后端会把绝对 artifact 路径误送进 workspace 变更投影。
-    if ((!workspaceId || !workspacePath) && !imageDataUrl) {
+    if (!workspaceId && !sessionId && !imageDataUrl) {
       return false;
     }
     const normalizedFilePath = filePath.trim();
@@ -1753,7 +1790,7 @@ import {
       // HTML 文件在桌面端代表可运行的网页入口。创建动作直接由 Shell 发起，
       // 不经过「请求对象 → 等右栏消费」，右栏懒加载或未挂载时也不会丢事件。
       requestRightPaneVisibility(true);
-      void openWorkspaceHtmlInRightPaneBrowser({
+      void openHtmlFileInRightPaneBrowser({
         filepath: normalizedFilePath,
         workspaceId,
         workspacePath,
@@ -1952,7 +1989,7 @@ import {
   const hasCurrentSession = $derived(Boolean(messagesState.currentSessionId?.trim()));
   const unreadNotificationCount = $derived.by(() => getUnreadNotificationCount());
   const currentSessionIsEmpty = $derived(
-    hasCurrentSession && (appState.threadMessages?.length ?? 0) === 0,
+    hasCurrentSession && !currentBootstrapWorkspaceId() && (appState.threadMessages?.length ?? 0) === 0,
   );
   const newSessionDisabled = $derived(
     workspaceActionPending || messagesState.sessionHydrating || currentSessionIsEmpty,
@@ -1961,16 +1998,10 @@ import {
     currentSessionIsEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'),
   );
 
-  // 有当前工作区就在其中新建草稿，否则新建个人会话；已在空会话上时不重复新建。
+  // 全局新建始终不关联项目；项目分组的 + 使用自己的显式项目入口。
   function openNewSession(): void {
     if (newSessionDisabled) return;
-    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
-    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
-    if (workspaceId && workspacePath) {
-      navigateSession({ kind: 'draft', scope: 'workspace', workspaceId, workspacePath });
-    } else {
-      navigateSession({ kind: 'draft', scope: 'personal' });
-    }
+    navigateSession({ kind: 'draft', scope: 'personal' });
     if (sidebarIsDrawer) sidebarOpen = false;
   }
 
@@ -2933,7 +2964,7 @@ import {
       const binding = currentWorkspaceBinding();
       if (binding.scope !== 'workspace' || !binding.workspaceId || !binding.workspacePath || !binding.sessionId) return;
       requestRightPaneVisibility(true);
-      void openWorkspaceHtmlInRightPaneBrowser({
+      void openHtmlFileInRightPaneBrowser({
         filepath,
         workspaceId: binding.workspaceId,
         workspacePath: binding.workspacePath,
@@ -3510,7 +3541,7 @@ import {
               <Icon name="chevronDown" size={11} />
             </span>
             <span class="section-title" title={selectedWorkspace?.rootPath || ''}>
-              {selectedWorkspace?.name || i18n.t('web.projectFiles')}
+              {selectedWorkspace?.name || i18n.t('web.sessionFiles')}
             </span>
           </button>
           <div class="section-title-tools">
@@ -3521,7 +3552,7 @@ import {
               data-testid="sidebar-refresh"
               data-tooltip={i18n.t('common.refresh')}
               aria-label={i18n.t('common.refresh')}
-              disabled={sidebarRefreshing || !selectedWorkspace?.rootPath}
+              disabled={sidebarRefreshing || (!selectedWorkspace?.rootPath && !currentSessionId)}
               onclick={() => void refreshSidebar()}
             >
               <Icon name="refresh" size={13} />
@@ -3533,7 +3564,7 @@ import {
               data-tooltip={i18n.t('web.projectFilesShowHidden')}
               aria-label={i18n.t('web.projectFilesShowHidden')}
               aria-pressed={fileTreeShowHidden}
-              disabled={!selectedWorkspace?.rootPath}
+              disabled={!selectedWorkspace?.rootPath && !currentSessionId}
               onclick={() => { fileTreeShowHidden = !fileTreeShowHidden; }}
             >
               <Icon name={fileTreeShowHidden ? 'eye' : 'eye-slash'} size={13} />
@@ -3545,6 +3576,7 @@ import {
             bind:this={projectFileTreeHandle}
             rootPath={selectedWorkspace?.rootPath || ''}
             workspaceId={selectedWorkspaceId}
+            sessionId={!selectedWorkspaceId ? currentSessionId || '' : ''}
             showHidden={fileTreeShowHidden}
             selectedFilePath={activeCodeTabFilePath}
             onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
@@ -3590,36 +3622,41 @@ import {
         </div>
         {#if !recentSessionsCollapsed}
           <div id="recent-session-content">
-            {#if personalSessionsLoading && getPersonalSessionList().length === 0}
+            {#if personalSessionsLoading && getRecentSessionList().length === 0}
               <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
-            {:else if personalSessionsError && getPersonalSessionList().length === 0}
+            {:else if personalSessionsError && getRecentSessionList().length === 0}
               <div class="sidebar-error">{personalSessionsError}</div>
-            {:else if getPersonalSessionList().length === 0}
+            {:else if getRecentSessionList().length === 0}
               <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noRecentSessions')}</div>
             {:else}
               <div class="session-list session-list--nested">
-                {#each getPersonalSessionList() as session (session.id)}
-                {@const sessionRunning = isSessionRunning('', session)}
+                {#each getRecentSessionList() as session (session.id)}
+                {@const sessionRunning = isSessionRunning(session.workspaceId || '', session)}
                 {@const sessionIndicator = resolveSessionActivityIndicator({ isRunning: sessionRunning, hasUnreadCompletion: session.hasUnreadCompletion === true })}
-                <div class="session-row" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:editing={isEditingPersonalSession(session.id)}>
-                  {#if isEditingPersonalSession(session.id)}
+                {@const sessionLabel = session.name?.trim() || i18n.t('header.unnamedSession')}
+                {@const sessionActivityLabel = sessionIndicator === 'running' ? i18n.t('web.sessionRunning') : sessionIndicator === 'unread' ? i18n.t('web.sessionUnreadCompletion') : ''}
+                {@const sessionSelected = session.id === currentSessionId && (session.workspaceId || '') === currentBootstrapWorkspaceId()}
+                <div class="session-row recent-session-row" class:active={sessionSelected} class:editing={isEditingRecentSession(session)}>
+                  {#if isEditingRecentSession(session)}
                     <div class="session-rename-editor">
                       <div class="session-rename-controls">
-                        <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void savePersonalSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
-                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.saveSessionName')} onclick={() => void savePersonalSessionRename(session)}><Icon name="check" size={12} /></button>
+                        <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void saveRecentSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
+                        <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.saveSessionName')} onclick={() => void saveRecentSessionRename(session)}><Icon name="check" size={12} /></button>
                         <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.cancelSessionRename')} onclick={cancelSessionRename}><Icon name="x" size={12} /></button>
                       </div>
                       {#if sessionRenameError}<span class="session-rename-error">{sessionRenameError}</span>{/if}
                     </div>
                   {:else}
-                    <button type="button" class="session-item" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:pending={session.id === pendingSessionSwitchId && pendingSessionSwitchWorkspaceId === null} data-session-id={session.id} title={session.name || i18n.t('header.unnamedSession')} onclick={() => switchPersonalSession(session.id)}>
-                      <span class="session-running-dot" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} aria-hidden="true"></span>
-                      <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
-                      <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
+                    <button type="button" class="session-item recent-session-item" class:active={sessionSelected} class:pending={session.id === pendingSessionSwitchId && (pendingSessionSwitchWorkspaceId || '') === (session.workspaceId || '')} data-session-id={session.id} aria-current={sessionSelected ? 'page' : undefined} aria-label={sessionActivityLabel ? `${sessionLabel}, ${sessionActivityLabel}` : sessionLabel} title={sessionLabel} onclick={() => switchRecentSession(session)}>
+                      <span class="recent-session-indicator" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} title={sessionActivityLabel || undefined} aria-hidden="true">
+                        {#if sessionIndicator === 'running'}<Icon name="loader" size={12} />{/if}
+                      </span>
+                      <span class="session-name recent-session-name">{sessionLabel}</span>
+                      <span class="session-meta recent-session-meta"><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt, relativeTimeNow, i18n.locale)}</span></span>
                     </button>
                     <div class="session-actions">
-                      <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
-                      <button type="button" class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('header.deleteSession')} onclick={() => openPersonalDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm" title={i18n.t('header.renameSession')} aria-label={i18n.t('header.renameSession')} onclick={() => void beginRecentSessionRename(session)}><Icon name="pencil" size={12} /></button>
+                      <button type="button" class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('header.deleteSession')} aria-label={i18n.t('header.deleteSession')} onclick={() => openRecentDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
                     </div>
                   {/if}
                 </div>
@@ -4519,6 +4556,76 @@ import {
     gap: 1px;
   }
 
+  .session-item.recent-session-item {
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    min-height: 28px;
+  }
+
+  .recent-session-name {
+    line-height: 20px;
+  }
+
+  .recent-session-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 12px;
+    width: 12px;
+    height: 20px;
+    color: var(--info);
+  }
+
+  .recent-session-indicator.running :global(svg) {
+    animation: recent-session-spin 1.2s linear infinite;
+  }
+
+  .recent-session-indicator.unread::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    border-radius: var(--radius-full);
+    background: var(--foreground-muted);
+  }
+
+  .recent-session-row .recent-session-meta {
+    min-width: 54px;
+    line-height: 20px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .recent-session-row .session-actions {
+    background: transparent;
+  }
+
+  .recent-session-item:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: -2px;
+  }
+
+  @media (hover: none) {
+    .session-item.recent-session-item {
+      padding-block: 8px;
+      min-height: 36px;
+    }
+
+    .recent-session-row .session-actions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .recent-session-row .recent-session-meta {
+      opacity: 0;
+      pointer-events: none;
+    }
+  }
+
+  @keyframes recent-session-spin {
+    to { transform: rotate(360deg); }
+  }
+
+
   .session-row {
     position: relative;
     display: flex;
@@ -4695,10 +4802,6 @@ import {
     }
   }
 
-  /* 外部会话指示点的动效偏好；放在运行指示灯规则之后，运行指示灯不受系统动画偏好影响。 */
-  @media (prefers-reduced-motion: reduce) {
-    .external-dot.running { animation: none; }
-  }
 
   .session-name {
     flex: 1;

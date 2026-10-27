@@ -129,6 +129,40 @@ impl WorkspaceResolver for RegistryWorkspaces {
             .workspace_root_path(&Some(WorkspaceId::new(workspace_id)))
     }
 
+    fn root_for(
+        &self,
+        principal: &magi_mcp_server::ClientPrincipal,
+        target: &AttributionTarget,
+    ) -> Option<PathBuf> {
+        match target {
+            AttributionTarget::ExternalSession { .. } => self.root_of(&principal.workspace_id),
+            AttributionTarget::WebSlotTurn {
+                session_id,
+                turn_id,
+            } => {
+                let (owner, active) = self.state.web_model.bindings()?.active_context()?;
+                if owner.session_id != *session_id
+                    || active.to_string() != *turn_id
+                    || owner.project_id != principal.workspace_id
+                {
+                    return None;
+                }
+                let id = SessionId::new(session_id);
+                let session = self.state.session_store.session(&id)?;
+                if session.workspace_id.as_deref().unwrap_or("") != principal.workspace_id {
+                    return None;
+                }
+                match self.state.session_workspace_id(&session) {
+                    Some(workspace) => self
+                        .state
+                        .workspace_root_path(&Some(workspace))
+                        .map(|root| self.state.snapshot_root_for_session(&id, &root)),
+                    None => self.state.personal_session_execution_root(&id).ok(),
+                }
+            }
+        }
+    }
+
     fn name_of(&self, workspace_id: &str) -> Option<String> {
         workspace_name(&self.state, workspace_id)
     }
@@ -167,7 +201,8 @@ impl AuditSink for EventBusAudit {
         {
             record_denied_external_call(&self.state, &event, reason);
         }
-        let workspace_id = WorkspaceId::new(event.workspace_id.clone());
+        let workspace_id =
+            (!event.workspace_id.is_empty()).then(|| WorkspaceId::new(event.workspace_id.clone()));
         let _ = self.state.event_bus.publish(
             EventEnvelope::domain(
                 EventId::new(format!(
@@ -188,7 +223,7 @@ impl AuditSink for EventBusAudit {
                 }),
             )
             .with_context(EventContext {
-                workspace_id: Some(workspace_id),
+                workspace_id,
                 ..EventContext::default()
             }),
         );
@@ -428,11 +463,13 @@ impl ApiToolBackend {
                 &invocation.principal.client_name,
                 &invocation.principal.workspace_id,
             ),
-            AttributionTarget::WebSlotTurn {
-                session_id,
-                turn_id,
-            } => {
-                if !slot_turn_is_active(&self.state, turn_id) {
+            AttributionTarget::WebSlotTurn { session_id, .. } => {
+                if !(RegistryWorkspaces {
+                    state: self.state.clone(),
+                })
+                .root_for(&invocation.principal, &invocation.attribution)
+                .is_some()
+                {
                     return Err("当前没有可归属的进行中的 GPT Web 对话".to_string());
                 }
                 let session_id = SessionId::new(session_id.clone());
@@ -468,7 +505,7 @@ impl ApiToolBackend {
                 &invocation,
                 &call_id,
                 &session_id,
-                &workspace_id,
+                Some(&workspace_id),
                 &root,
             )
         })
@@ -560,15 +597,6 @@ fn record_denied_external_call(state: &ApiState, event: &AuditEvent, reason: &st
     turns.end_call(state, &session_id);
 }
 
-/// 槽位表里当前进行中的 Web turn 是否就是这一个。槽位表是唯一事实源。
-fn slot_turn_is_active(state: &ApiState, turn_id: &str) -> bool {
-    state
-        .web_model
-        .bindings()
-        .and_then(|slots| slots.active_context())
-        .is_some_and(|(_, active)| active.to_string() == turn_id)
-}
-
 /// 一个“可能产生外部待审批”的调用方：令牌，或 GPT Web 槽位端点。
 pub(crate) struct ApprovalOwner {
     pub token_id: String,
@@ -655,9 +683,16 @@ fn liveness(
     move || {
         !cancellation.is_cancelled()
             && match &attribution {
-                AttributionTarget::WebSlotTurn { turn_id, .. } => {
-                    slot_turn_is_active(&state, turn_id)
-                }
+                AttributionTarget::WebSlotTurn {
+                    session_id,
+                    turn_id,
+                } => state
+                    .web_model
+                    .bindings()
+                    .and_then(|slots| slots.active_context())
+                    .is_some_and(|(owner, active)| {
+                        owner.session_id == *session_id && active.to_string() == *turn_id
+                    }),
                 AttributionTarget::ExternalSession { .. } => {
                     tokens.records().iter().any(|record| {
                         record.token_id == token_id
@@ -744,6 +779,26 @@ impl ToolBackend for ApiToolBackend {
             .unwrap_or_default()
     }
 
+    fn tool_available(&self, principal: &magi_mcp_server::ClientPrincipal, name: &str) -> bool {
+        if principal.attribution != magi_mcp_server::AttributionMode::FollowWebSlot {
+            return true;
+        }
+        let Some(snapshot) = self
+            .state
+            .web_model
+            .bindings()
+            .and_then(|slots| slots.snapshot())
+        else {
+            return true;
+        };
+        if snapshot.owner_project_id.is_empty() {
+            return !name.starts_with("changes_")
+                && !BuiltinToolName::from_name(name)
+                    .is_some_and(|tool| tool.requires_workspace_context());
+        }
+        true
+    }
+
     fn path_requests(
         &self,
         internal_name: &str,
@@ -779,7 +834,12 @@ impl ToolBackend for ApiToolBackend {
     fn invoke<'a>(&'a self, invocation: ToolInvocation) -> BoxFuture<'a, InvocationOutcome> {
         Box::pin(async move {
             let call_id = next_call_id(&invocation.principal.token_id);
-            let workspace_id = Some(WorkspaceId::new(invocation.principal.workspace_id.clone()));
+            // 记录开始项前也检查真实会话与槽位代际，不能先向旧归属写入。
+            if let Err(error) = self.resolve_session(&invocation) {
+                return error_outcome(error);
+            }
+            let workspace_id = (!invocation.principal.workspace_id.is_empty())
+                .then(|| WorkspaceId::new(invocation.principal.workspace_id.clone()));
             let turns = &self.state.mcp_service.external_turns;
             // 调用都作为普通工具项写进 canonical（§8.4）：GPT Web 槽位写进拥有者会话当前的 Turn，
             // 外部令牌写进它自己外部会话的活动段 Turn。
@@ -936,27 +996,35 @@ impl ApiToolBackend {
                 Ok(id) => id,
                 Err(error) => return error_outcome(error),
             };
-            let workspace_id = WorkspaceId::new(invocation.principal.workspace_id.clone());
-            let Some(root) = self.state.workspace_root_path(&Some(workspace_id.clone())) else {
+            let workspace_id = (!invocation.principal.workspace_id.is_empty())
+                .then(|| WorkspaceId::new(invocation.principal.workspace_id.clone()));
+            let Some(root) = (RegistryWorkspaces {
+                state: self.state.clone(),
+            })
+            .root_for(&invocation.principal, &invocation.attribution) else {
                 return error_outcome("令牌绑定的工作区不可用");
             };
             let class = Some(invocation.class);
             if invocation.internal_name.starts_with("changes_") {
+                let Some(workspace_id) = workspace_id.as_ref() else {
+                    return error_outcome("个人会话没有项目变更账本");
+                };
                 return self
-                    .run_changes_tool(&invocation, call_id, &session_id, &workspace_id, &root)
+                    .run_changes_tool(&invocation, call_id, &session_id, workspace_id, &root)
                     .await;
             }
             // git 工具需要会话的 Git context；由变更面板同一入口建立（幂等）。
             if invocation.internal_name.starts_with("git_")
+                && let Some(workspace_id) = workspace_id.as_ref()
                 && let Err(error) = self
                     .state
-                    .synchronize_session_changes(&session_id, &workspace_id, &root, false)
+                    .synchronize_session_changes(&session_id, workspace_id, &root, false)
                     .await
             {
                 return error_outcome(format!("无法建立 Git 上下文: {}", error.message()));
             }
             // 写入类调用才需要会话账本；只读调用不触发整树快照的懒启动。
-            let snapshot = if matches!(class, Some(ToolClass::Read)) {
+            let snapshot = if workspace_id.is_none() || matches!(class, Some(ToolClass::Read)) {
                 None
             } else {
                 match self.state.ensure_snapshot_session(&session_id, &root).await {
@@ -978,7 +1046,7 @@ impl ApiToolBackend {
                     &invocation,
                     &call_id,
                     &session_id,
-                    &workspace_id,
+                    workspace_id.as_ref(),
                     &root,
                     snapshot
                         .as_deref()
@@ -1039,7 +1107,7 @@ fn approve_blocking(
     invocation: &ToolInvocation,
     call_id: &str,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: Option<&WorkspaceId>,
     root: &Path,
 ) -> Result<(), String> {
     match slot_approval_mode(state, invocation) {
@@ -1055,7 +1123,7 @@ fn approve_blocking(
         state.conversation_registry.tool_approvals(),
         &ExternalApprovalRequest {
             session_id,
-            workspace_id: Some(workspace_id),
+            workspace_id,
             token_id: &invocation.principal.token_id,
             client_name: &invocation.principal.client_name,
             token_prefix: &invocation.principal.token_prefix,
@@ -1079,7 +1147,7 @@ fn run_blocking(
     invocation: &ToolInvocation,
     call_id: &str,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: Option<&WorkspaceId>,
     root: &Path,
     snapshot: Option<&dyn magi_snapshot::ToolHook>,
 ) -> InvocationOutcome {
@@ -1094,7 +1162,7 @@ fn run_blocking(
             state.conversation_registry.tool_approvals(),
             &ExternalApprovalRequest {
                 session_id,
-                workspace_id: Some(workspace_id),
+                workspace_id,
                 token_id: &invocation.principal.token_id,
                 client_name: &invocation.principal.client_name,
                 token_prefix: &invocation.principal.token_prefix,
@@ -1136,7 +1204,7 @@ fn run_blocking(
         tool_name: &invocation.internal_name,
         arguments_json: &arguments_json,
         session_id,
-        workspace_id: Some(workspace_id),
+        workspace_id,
         workspace_root: root,
         access_profile,
         snapshot,
@@ -1244,7 +1312,7 @@ fn web_slot_catalog(state: &ApiState) -> Option<Vec<magi_mcp_server::ToolDescrip
     };
     let principal = provider()?;
     let server = build_slot_mcp_server(state.clone());
-    Some(server.catalog_for(&principal))
+    Some(server.catalog_definition_for(&principal))
 }
 
 fn assemble_server(

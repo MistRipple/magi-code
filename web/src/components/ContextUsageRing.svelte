@@ -380,12 +380,6 @@
     50% { opacity: 1; }
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .ia-context-ring.estimating .ring-fill {
-      animation: none;
-    }
-  }
-
   .ia-context-popover {
     position: absolute;
     right: 0;
@@ -595,7 +589,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-
   .context-window-icon-button {
     width: 22px;
     height: 24px;
@@ -616,14 +609,6 @@
     display: block;
     margin-top: 5px;
     color: var(--error);
-  }
-
-  :global(.spinning) {
-    animation: context-window-spin 0.9s linear infinite;
-  }
-
-  @keyframes context-window-spin {
-    to { transform: rotate(360deg); }
   }
 
   .tone-notice .ring-fill { stroke: var(--warning, #d6a700); }

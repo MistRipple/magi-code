@@ -2562,7 +2562,7 @@ fn process_write_failure_uses_public_error_message() {
 }
 
 #[test]
-fn process_tools_reject_missing_workspace_context_before_execution() {
+fn process_tools_reject_missing_execution_directory_before_execution() {
     let root = unique_temp_dir("magi-tool-process-context");
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -2587,7 +2587,7 @@ fn process_tools_reject_missing_workspace_context_before_execution() {
     );
     assert_eq!(output.status, ExecutionResultStatus::Rejected);
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-    assert_eq!(payload["error_code"], "workspace_required");
+    assert_eq!(payload["error_code"], "execution_directory_required");
 
     let context = ToolExecutionContext {
         caller_scope: crate::ToolCallerScope::SessionMainline,
@@ -2635,7 +2635,7 @@ fn process_tools_reject_missing_workspace_context_before_execution() {
     assert_eq!(read_without_context.status, ExecutionResultStatus::Rejected);
     let read_payload: Value =
         serde_json::from_str(&read_without_context.payload).expect("read payload json");
-    assert_eq!(read_payload["error_code"], "workspace_required");
+    assert_eq!(read_payload["error_code"], "execution_directory_required");
 
     let kill = tool_registry.execute_internal_builtin_with_policy(
         ToolExecutionInput {
@@ -3999,7 +3999,15 @@ fn registry_enforces_workspace_boundary_and_keeps_browser_available_without_work
 
         assert_eq!(output.status, ExecutionResultStatus::Rejected, "{tool:?}");
         let payload: Value = serde_json::from_str(&output.payload).expect("rejection payload");
-        assert_eq!(payload["error_code"], "workspace_required", "{tool:?}");
+        assert_eq!(
+            payload["error_code"],
+            if tool.requires_workspace_context() {
+                "workspace_required"
+            } else {
+                "execution_directory_required"
+            },
+            "{tool:?}"
+        );
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -4038,6 +4046,192 @@ fn registry_enforces_workspace_boundary_and_keeps_browser_available_without_work
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let payload: Value = serde_json::from_str(&browser_output.payload).expect("browser payload");
     assert_eq!(payload["tool"], BuiltinToolName::BrowserTabs.as_str());
+}
+
+#[test]
+fn personal_session_routes_every_browser_tool_without_project_or_local_directory() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let registry = make_registry().with_browser_automation(
+        Arc::new(move |_, tool, _, context| {
+            assert!(context.workspace_id.is_none());
+            assert!(context.working_directory.is_none());
+            observed.lock().unwrap().push(tool.to_string());
+            (
+                serde_json::json!({"tool":tool,"status":"succeeded"}).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }),
+        Arc::new(|| magi_browser_authority::BrowserCapabilitySnapshot {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            devtools_enabled: true,
+            lan_access_enabled: false,
+            host_status: magi_browser_authority::BrowserHostStatus::Ready,
+            host_protocol_compatible: true,
+        }),
+    );
+    for kind in magi_browser_authority::BrowserToolKind::ALL {
+        let result = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(kind.name()),
+                kind.name(),
+                "{}",
+            ),
+            ToolExecutionContext {
+                session_id: Some(SessionId::new("personal-browser")),
+                ..Default::default()
+            },
+            &full_access_policy(),
+        );
+        assert_eq!(
+            result.status,
+            ExecutionResultStatus::Succeeded,
+            "{}: {}",
+            kind.name(),
+            result.payload
+        );
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        magi_browser_authority::BrowserToolKind::ALL.len()
+    );
+}
+
+#[test]
+fn personal_session_project_tools_reject_before_executors_or_persistence() {
+    let root = unique_temp_dir("personal-project-tool-boundary");
+    let registry = make_registry();
+    for tool in [
+        BuiltinToolName::SearchSemantic,
+        BuiltinToolName::KnowledgeQuery,
+        BuiltinToolName::KnowledgeGraphQuery,
+        BuiltinToolName::CodeSymbols,
+        BuiltinToolName::MemoryWrite,
+        BuiltinToolName::AgentApply,
+    ] {
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new(tool.as_str()),
+                tool.as_str(),
+                "{}",
+            ),
+            ToolExecutionContext {
+                session_id: Some(SessionId::new("personal")),
+                working_directory: Some(root.clone()),
+                ..Default::default()
+            },
+            &full_access_policy(),
+        );
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Rejected,
+            "{}: {}",
+            tool.as_str(),
+            output.payload
+        );
+        assert_eq!(
+            payload_of(&output)["error_code"],
+            "workspace_required",
+            "{}",
+            tool.as_str()
+        );
+    }
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn personal_git_permissions_cover_external_repository_and_linked_metadata_before_execution() {
+    let root = unique_temp_dir("personal-git-permissions");
+    let cwd = root.join("personal");
+    let worktree = root.join("linked-worktree");
+    let common = root.join("repository.git");
+    let metadata = common.join("worktrees/linked");
+    for path in [&cwd, &worktree, &metadata] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", metadata.display()),
+    )
+    .unwrap();
+    fs::write(metadata.join("commondir"), "../..\n").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executed = calls.clone();
+    let registry = make_registry().with_git_tool_executor(Arc::new(move |_, _, context| {
+        assert!(context.workspace_id.is_none());
+        executed.fetch_add(1, Ordering::SeqCst);
+        (
+            r#"{"status":"succeeded"}"#.into(),
+            ExecutionResultStatus::Succeeded,
+        )
+    }));
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("personal-git")),
+        working_directory: Some(cwd),
+        ..Default::default()
+    };
+    let run = |tool: BuiltinToolName, policy: ToolExecutionPolicy| {
+        registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("personal-git-permission"),
+                tool.as_str(),
+                serde_json::json!({"repositoryPath": worktree, "branch": "feature"}).to_string(),
+            ),
+            context.clone(),
+            &policy,
+        )
+    };
+    let allowed = run(BuiltinToolName::GitStatus, full_access_policy());
+    assert_eq!(
+        allowed.status,
+        ExecutionResultStatus::Succeeded,
+        "{}",
+        allowed.payload
+    );
+    for denied in [&worktree, &metadata, &common] {
+        let result = run(
+            BuiltinToolName::GitStatus,
+            ToolExecutionPolicy {
+                denied_paths: vec![denied.to_string_lossy().to_string()],
+                ..full_access_policy()
+            },
+        );
+        assert_eq!(
+            result.status,
+            ExecutionResultStatus::Rejected,
+            "{}: {}",
+            denied.display(),
+            result.payload
+        );
+    }
+    assert_eq!(
+        run(
+            BuiltinToolName::GitBranchCreate,
+            ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::ReadOnly,
+                ..Default::default()
+            }
+        )
+        .status,
+        ExecutionResultStatus::Rejected
+    );
+    assert_eq!(
+        run(
+            BuiltinToolName::GitBranchCreate,
+            ToolExecutionPolicy::default()
+        )
+        .status,
+        ExecutionResultStatus::NeedsApproval
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "拒绝和审批必须先于 Git executor"
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn full_access_policy() -> ToolExecutionPolicy {
@@ -7134,10 +7328,15 @@ fn web_fetch_rejects_non_http_urls_without_sending_a_request() {
 #[ignore = "live network smoke for manually verifying web_search against the real search sources"]
 fn web_search_live_smoke_returns_json_payload() {
     let registry = make_registry();
-    let output = exec_tool(
+    let output = exec_tool_with_context_and_policy(
         &registry,
         BuiltinToolName::WebSearch,
         &serde_json::json!({ "query": "OpenAI" }).to_string(),
+        ToolExecutionContext {
+            session_id: Some(SessionId::new("personal-live-search")),
+            ..Default::default()
+        },
+        ToolExecutionPolicy::default(),
     );
 
     assert_eq!(output.status, ExecutionResultStatus::Succeeded);

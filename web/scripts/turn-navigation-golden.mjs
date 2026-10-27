@@ -171,8 +171,8 @@ assert.match(
 );
 assert.match(
   messageListSource,
-  /@container message-list \(min-width:\s*640px\)[\s\S]*?padding-left:\s*calc\(var\(--space-4\)\s*\+\s*8px\)/,
-  '宽屏轨道右侧安全区必须再收窄 10px，让消息内容更靠左',
+  /@container message-list \(min-width:\s*640px\)[\s\S]*?padding-left:\s*calc\(var\(--message-column-gutter\)\s*\+\s*8px\)/,
+  '轮次轨道在居中阅读列之外保留 8px 安全区，窄栏与宽栏复用同一边界',
 );
 assert.match(
   messageListSource,

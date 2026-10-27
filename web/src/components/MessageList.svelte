@@ -1838,7 +1838,7 @@
             onclick={() => requestOlderHistoryLoad()}
             disabled={!canLoadOlderHistory}
           >
-            <Icon name={sessionHistory.historyLoadStatus === 'loading' ? 'loader' : 'chevron-up'} size={14} />
+            <Icon name={sessionHistory.historyLoadStatus === 'loading' ? 'loader' : 'chevron-up'} size={14} class={sessionHistory.historyLoadStatus === 'loading' ? 'spinning' : ''} />
             <span>{sessionHistory.historyLoadStatus === 'loading' ? i18n.t('messageList.loadingOlder') : i18n.t('messageList.loadOlder')}</span>
           </button>
         {/if}
@@ -1913,9 +1913,10 @@
     overflow-y: auto;
     overflow-x: hidden;
     scrollbar-gutter: stable;
-    /* 消息列随中间面板自适应铺满，仅保留基础安全留白。 */
+    /* 滚动区保持全宽，正文与工具共用居中阅读列；窄分屏只留安全边距。 */
+    --message-column-gutter: max(var(--space-4), calc((100cqw - 1040px) / 2));
     padding-block: var(--space-4);
-    padding-inline: var(--space-4);
+    padding-inline: var(--message-column-gutter);
     /* 阅读位置由应用消息锚点统一维护，避免浏览器锚点与应用恢复竞争。 */
     overflow-anchor: none;
   }
@@ -1924,10 +1925,10 @@
     flex: 0 0 auto;
   }
 
-  /* 轮次导航轨道只占用左侧窄条，不限制消息列的横向自适应宽度。 */
+  /* 轮次导航轨道额外保留 8px，仍由同一阅读列管理消息边界。 */
   @container message-list (min-width: 640px) {
     .message-list-wrapper.has-turn-navigation .message-list {
-      padding-left: calc(var(--space-4) + 8px);
+      padding-left: calc(var(--message-column-gutter) + 8px);
     }
   }
 
@@ -2064,7 +2065,7 @@
     flex-direction: column;
     gap: var(--space-2);
     align-items: stretch;
-    /* 建议卡片保持原来的内容列宽；消息记录本身仍由 message-list 全宽自适应。 */
+    /* 建议卡片保留自身较窄的内容宽度；消息沿共享阅读列对齐。 */
     width: min(100%, 768px);
     margin-top: var(--space-6);
     text-align: left;

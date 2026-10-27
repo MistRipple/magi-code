@@ -22,7 +22,7 @@ export interface StoreItem {
   bundled: PluginManifest | null;
   catalog: PluginCenterEntry | null;
   status: StoreStatus;
-  /** 插件中心有比已安装版本更新的版本。 */
+  /** 内置包或插件中心有比已安装版本更新的版本。 */
   updatable: boolean;
 }
 
@@ -61,7 +61,8 @@ export function buildStoreItems(
       bundled: bundled.find((manifest) => manifest.id === installed.manifest.id) ?? null,
       catalog: null,
       status: statusOf(installed),
-      updatable: false,
+      updatable: bundled.some((manifest) => manifest.id === installed.manifest.id
+        && newerBundledVersion(manifest.version, installed.manifest.version)),
     });
   }
   for (const manifest of bundled) {
@@ -82,7 +83,7 @@ export function buildStoreItems(
     const existing = items.get(entry.id);
     if (existing) {
       existing.catalog = entry;
-      existing.updatable = entry.state === 'updatable';
+      if (!existing.bundled) existing.updatable = entry.state === 'updatable';
       continue;
     }
     items.set(entry.id, {
@@ -102,6 +103,17 @@ export function buildStoreItems(
       || STATUS_ORDER[left.status] - STATUS_ORDER[right.status]
       || left.name.localeCompare(right.name),
   );
+}
+
+/** 内置清单使用稳定的 x.y.z 版本；未知格式不推断更新。 */
+function newerBundledVersion(candidate: string, installed: string): boolean {
+  if (!/^\d+\.\d+\.\d+$/u.test(candidate) || !/^\d+\.\d+\.\d+$/u.test(installed)) return false;
+  const left = candidate.split('.').map(Number);
+  const right = installed.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (left[i] !== right[i]) return left[i]! > right[i]!;
+  }
+  return false;
 }
 
 export function filterStoreItems(items: StoreItem[], filter: StoreFilter, query: string): StoreItem[] {

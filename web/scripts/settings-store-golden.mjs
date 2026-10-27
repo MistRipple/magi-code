@@ -23,6 +23,7 @@ const modelConfigFormSource = await readFile(
   new URL('../src/components/ModelConfigForm.svelte', import.meta.url),
   'utf8',
 );
+assert.doesNotMatch(modelConfigFormSource, /ModelReasoningOverrides|compatibilityError/, '模型配置不再要求用户维护能力规则');
 const usageAggregationSource = await readFile(
   new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
@@ -36,6 +37,7 @@ const configHelpers = [
   'normalizeModelApiProtocol', 'normalizeOrchestratorFormConfig', 'normalizeAuxiliaryFormConfig',
   'normalizeVisionFormConfig', 'normalizeWorkerFormConfig', 'buildBaseModelConfigPayload',
   'buildOrchestratorConnectionConfigPayload', 'buildInteractiveModelConfigPayload', 'buildWorkerModelConfigPayload',
+  'buildVisionModelConfigPayload',
 ];
 const helperSource = configHelpers.map(name => {
   const node = storeFactory.body.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
@@ -63,6 +65,16 @@ assert.deepEqual(payload, {
 assert.deepEqual(helpers.buildOrchestratorConnectionConfigPayload(payload), {
   baseUrl: payload.baseUrl, apiKey: payload.apiKey, apiProtocol: payload.apiProtocol,
 }, 'main model connection payload contains only connection fields');
+
+for (const hydrate of ['normalizeAuxiliaryFormConfig', 'normalizeVisionFormConfig']) {
+  for (const effort of [null, 'none', 'minimal', 'high', 'max', 'ultra']) {
+    const form = helpers[hydrate]({ ...payload, reasoningEffort: effort });
+    assert.equal(form.reasoningEffort, effort, `${hydrate} preserves reasoning`);
+    const saved = hydrate === 'normalizeVisionFormConfig' ? helpers.buildVisionModelConfigPayload(form) : helpers.buildInteractiveModelConfigPayload(form);
+    assert.equal(saved.reasoningEffort, effort, `${hydrate} saves reasoning`);
+  }
+  assert.equal(helpers[hydrate](payload).reasoningEffort, null, '历史辅助/识图配置继承模型默认');
+}
 
 assert.match(
   settingsStoreSource,

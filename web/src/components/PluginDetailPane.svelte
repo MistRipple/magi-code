@@ -86,7 +86,7 @@
 
   <div class="pane-actions">
     {#if plugin}
-      {#if item.updatable && item.catalog}
+      {#if item.updatable && (item.bundled || item.catalog)}
         <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
           <Icon name="download" size={13} />
           <span>{i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
@@ -116,9 +116,13 @@
     {/if}
   </div>
 
+  {#if busy}
+    <div class="settings-hint" role="status"><Icon name="loader" size={13} class="spinning" /> {i18n.t('common.loading')}</div>
+  {/if}
+
   <dl class="pane-facts">
     <div><dt>{i18n.t('settings.plugins.detail.type')}</dt><dd>{item.bundled ? i18n.t('settings.plugins.detail.kindBuiltin') : i18n.t('settings.plugins.detail.kindExtension')}</dd></div>
-    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable && item.catalog} → v{item.catalog.version}{/if}</dd></div>
+    <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if item.updatable} → v{item.bundled?.version ?? item.catalog?.version}{/if}</dd></div>
     {#if plugin}
       <div data-testid="plugin-source" class:pane-warn={plugin.source.kind === 'address' || plugin.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>

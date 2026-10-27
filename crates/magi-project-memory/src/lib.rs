@@ -540,7 +540,7 @@ pub fn execute_memory_write_tool(
 ) -> (String, magi_core::ExecutionResultStatus) {
     use magi_core::{EventId, ExecutionResultStatus};
     use magi_event_bus::{EventContext, EventEnvelope};
-    let Some(store) = store else {
+    let Some(store) = store.filter(|_| workspace_id.is_some()) else {
         return (
             serde_json::json!({
                 "tool": "memory_write",
@@ -827,6 +827,27 @@ mod tests {
             store.save_entry(&bad),
             Err(ProjectMemoryError::InvalidFileStem(_))
         ));
+    }
+
+    #[test]
+    fn personal_memory_write_rejects_an_injected_project_store() {
+        let home = TempDir::new().unwrap();
+        let store = store(&home, "/Users/x/proj");
+        let (payload, status) = execute_memory_write_tool(
+            &magi_event_bus::InMemoryEventBus::new(16),
+            Some(&store),
+            &magi_core::SessionId::new("personal"),
+            None,
+            &magi_core::TaskId::new("personal-task"),
+            &magi_core::MissionId::new("personal-mission"),
+            r#"{"action":"save","file_stem":"leaked","name":"test","description":"test","kind":"project","body":"must not persist"}"#,
+        );
+        assert_eq!(
+            status,
+            magi_core::ExecutionResultStatus::Failed,
+            "{payload}"
+        );
+        assert!(!store.root().exists(), "个人会话不能写入误注入的项目记忆");
     }
 
     #[test]

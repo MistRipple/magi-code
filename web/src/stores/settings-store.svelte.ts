@@ -103,7 +103,7 @@ import {
   type NormalizedMcpServerDraft,
 } from "../shared/mcp-config";
 
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = import('../shared/orchestrator-session-config').OrchestratorReasoningEffort;
 
 export interface TextModelRule {
   matchMode: "exact" | "regex";
@@ -120,7 +120,7 @@ export interface BaseModelFormConfig {
 }
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
-  reasoningEffort: ReasoningEffort;
+  reasoningEffort: ReasoningEffort | null;
 }
 
 export interface WorkerModelFormConfig extends InteractiveModelFormConfig {}
@@ -135,7 +135,7 @@ type BaseModelConfigPayload = Record<string, unknown> & {
 };
 
 type InteractiveModelConfigPayload = BaseModelConfigPayload & {
-  reasoningEffort: ReasoningEffort;
+  reasoningEffort: ReasoningEffort | null;
 };
 
 type WorkerModelConfigPayload = InteractiveModelConfigPayload & LLMConfig;
@@ -400,15 +400,16 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       apiProtocol: "openai_responses",
       apiKey: "",
       model: "",
-      reasoningEffort: "medium",
+      reasoningEffort: null,
       ...overrides,
     };
   }
 
   function createAuxiliaryConfig(
-    overrides: Partial<BaseModelFormConfig> = {},
-  ): BaseModelFormConfig {
+    overrides: Partial<InteractiveModelFormConfig> = {},
+  ): InteractiveModelFormConfig {
     return {
+      reasoningEffort: null,
       baseUrl: "",
       apiProtocol: "openai_responses",
       apiKey: "",
@@ -418,8 +419,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   function createVisionConfig(
-    overrides: Partial<BaseModelFormConfig> = {},
-  ): BaseModelFormConfig {
+    overrides: Partial<InteractiveModelFormConfig> = {},
+  ): InteractiveModelFormConfig {
     return {
       ...createAuxiliaryConfig(),
       contextWindowTokens: 128000,
@@ -457,10 +458,10 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   }
 
   function buildVisionModelConfigPayload(
-    config: BaseModelFormConfig,
-  ): BaseModelConfigPayload {
+    config: InteractiveModelFormConfig,
+  ): InteractiveModelConfigPayload {
     return {
-      ...buildBaseModelConfigPayload(config),
+      ...buildInteractiveModelConfigPayload(config),
       contextWindowTokens: Math.floor(Number(config.contextWindowTokens) || 128000),
       textModelRules: (config.textModelRules || []).map((rule) => ({
         matchMode: rule.matchMode === "regex" ? "regex" : "exact",
@@ -530,7 +531,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       : target === "worker"
         ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
         : target === "vision"
-          ? buildVisionModelConfigPayload(config as BaseModelFormConfig)
+          ? buildVisionModelConfigPayload(config as InteractiveModelFormConfig)
+          : target === "comp"
+            ? buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig)
         : buildBaseModelConfigPayload(config as BaseModelFormConfig);
     return JSON.stringify(payload);
   }
@@ -568,8 +571,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     });
   }
 
-  function normalizeAuxiliaryFormConfig(config: any): BaseModelFormConfig {
+  function normalizeAuxiliaryFormConfig(config: any): InteractiveModelFormConfig {
     return createAuxiliaryConfig({
+      reasoningEffort: config?.reasoningEffort ?? null,
       baseUrl: config?.baseUrl || "",
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
@@ -577,7 +581,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     });
   }
 
-  function normalizeVisionFormConfig(config: any): BaseModelFormConfig {
+  function normalizeVisionFormConfig(config: any): InteractiveModelFormConfig {
     const rules = Array.isArray(config?.textModelRules)
       ? config.textModelRules
           .map((rule: any) => ({
@@ -588,6 +592,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       : [];
     const contextWindowTokens = Number(config?.contextWindowTokens);
     return createVisionConfig({
+      reasoningEffort: config?.reasoningEffort ?? null,
       baseUrl: config?.baseUrl || "",
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
@@ -605,7 +610,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
       apiKey: config?.apiKey || "",
       model: config?.model || "",
-      reasoningEffort: config?.reasoningEffort || "medium",
+      reasoningEffort: config?.reasoningEffort ?? null,
     });
   }
 
@@ -638,6 +643,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     comp: [],
     image: [],
   });
+  let modelDisplayNames = $state<Record<string, Record<string, string>>>({});
   let modelListSignatures = $state<Record<string, string>>({
     orch: "",
     comp: "",
@@ -705,6 +711,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     }
     modelLists[key] = [];
     modelLists = { ...modelLists };
+    modelDisplayNames[key] = {};
+    modelDisplayNames = { ...modelDisplayNames };
     modelListOpen[key] = false;
     modelListOpen = { ...modelListOpen };
   }
@@ -745,6 +753,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         if (liveWorkerKeys.has(key)) continue;
         delete modelListSignatures[key];
         delete modelLists[key];
+        delete modelDisplayNames[key];
         delete modelListOpen[key];
         delete fetchingModels[key];
         changed = true;
@@ -752,6 +761,7 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       if (changed) {
         modelListSignatures = { ...modelListSignatures };
         modelLists = { ...modelLists };
+        modelDisplayNames = { ...modelDisplayNames };
         modelListOpen = { ...modelListOpen };
         fetchingModels = { ...fetchingModels };
       }
@@ -800,8 +810,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
   let orchConfig = $state<InteractiveModelFormConfig>(
     createInteractiveConfig(),
   );
-  let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
-  let visionConfig = $state<BaseModelFormConfig>(createVisionConfig());
+  let compConfig = $state<InteractiveModelFormConfig>(createAuxiliaryConfig());
+  let visionConfig = $state<InteractiveModelFormConfig>(createVisionConfig());
   let visionBuiltinTextModelRules = $state<VisionBuiltinTextModelRule[]>([]);
   let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
@@ -1256,13 +1266,13 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     }
     if (target === "comp") {
       await testAgentAuxiliaryConnection(
-        buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig),
       );
       return;
     }
     if (target === "vision") {
       await testAgentVisionConnection(
-        buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        buildVisionModelConfigPayload(config as InteractiveModelFormConfig),
       );
       return;
     }
@@ -1870,9 +1880,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     } else if (target === "orch") {
       orchConfig = restored as InteractiveModelFormConfig;
     } else if (target === "comp") {
-      compConfig = restored;
+      compConfig = restored as InteractiveModelFormConfig;
     } else if (target === "vision") {
-      visionConfig = restored;
+      visionConfig = restored as InteractiveModelFormConfig;
     } else {
       imageConfig = restored;
     }
@@ -2160,6 +2170,8 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
       }
       modelLists[key] = result.models;
       modelLists = { ...modelLists };
+      modelDisplayNames[key] = result.modelDisplayNames ?? {};
+      modelDisplayNames = { ...modelDisplayNames };
       if (result.models.length > 0 && modelConfigTab === key) {
         modelListOpen[key] = true;
         modelListOpen = { ...modelListOpen };
@@ -2248,9 +2260,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     } else if (target === "orch") {
       orchConfig = cloneModelFormConfig(config as InteractiveModelFormConfig);
     } else if (target === "comp") {
-      compConfig = cloneModelFormConfig(config as BaseModelFormConfig);
+      compConfig = cloneModelFormConfig(config as InteractiveModelFormConfig);
     } else if (target === "vision") {
-      visionConfig = cloneModelFormConfig(config as BaseModelFormConfig);
+      visionConfig = cloneModelFormConfig(config as InteractiveModelFormConfig);
     } else {
       imageConfig = cloneModelFormConfig(config as BaseModelFormConfig);
     }
@@ -2346,11 +2358,11 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
         );
       } else if (target === "comp") {
         response = await saveAgentAuxiliaryConfig(
-          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+          buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig),
         );
       } else if (target === "vision") {
         response = await saveAgentVisionConfig(
-          buildVisionModelConfigPayload(config as BaseModelFormConfig),
+          buildVisionModelConfigPayload(config as InteractiveModelFormConfig),
         );
       } else if (target === "image") {
         response = await saveAgentImageGenerationConfig(
@@ -4095,6 +4107,9 @@ function createSettingsStore(props: { onClose?: () => void; isActive?: () => boo
     },
     get modelLists() {
       return modelLists;
+    },
+    get modelDisplayNames() {
+      return modelDisplayNames;
     },
     get fetchingModels() {
       return fetchingModels;

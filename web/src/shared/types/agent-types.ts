@@ -65,7 +65,7 @@ export interface LLMConfig {
   apiProtocol: HttpModelApiProtocol;
   apiKey: string;
   model: string;
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoningEffort?: import('../orchestrator-session-config').OrchestratorReasoningEffort | null;
   autonomyCapability?: ModelAutonomyCapability;
   [key: string]: unknown;
 }

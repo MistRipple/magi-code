@@ -1135,11 +1135,11 @@
         <!-- 紧凑统计条 -->
         <div class="kp-stats-row">
           <div class="kp-stat">
-            <span class="kp-stat-value">{fileCount.toLocaleString()}</span>
+            <span class="kp-stat-value">{fileCount.toLocaleString(i18n.locale)}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.files')}</span>
           </div>
           <div class="kp-stat">
-            <span class="kp-stat-value">{totalLines.toLocaleString()}</span>
+            <span class="kp-stat-value">{totalLines.toLocaleString(i18n.locale)}</span>
             <span class="kp-stat-label">{i18n.t('knowledge.overview.lines')}</span>
           </div>
           <div class="kp-stat">
@@ -1650,7 +1650,6 @@
     height: 20px;
     animation: kp-spin 1s linear infinite;
   }
-  :global(.kp-icon-btn .spinning) { animation: kp-spin 1s linear infinite; }
   @keyframes kp-spin { to { transform: rotate(360deg); } }
   .kp-overview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: var(--space-6); }
   .kp-stats-row {

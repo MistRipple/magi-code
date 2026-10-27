@@ -4,6 +4,11 @@
   --tool-card-padding: 13px;
   --tool-card-outline: color-mix(in srgb, var(--foreground) 9%, transparent);
   --tool-card-background: var(--surface-1);
+  --tool-row-background: color-mix(in srgb, var(--foreground) 1.8%, transparent);
+  --code-panel-font-size: var(--text-xs);
+  --code-panel-line-height: 1.65;
+  --code-panel-padding-block: 10px;
+  --tool-row-outline: color-mix(in srgb, var(--foreground) 4%, transparent);
 }
 :root.theme-light {
   --tool-card-background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
@@ -42,7 +47,13 @@
   border-radius: var(--tool-card-radius);
 }
 .file-mutation-header, .plan-header { cursor: default; }
-.code-header { min-height: 36px; padding: 6px var(--tool-card-padding); }
+.tool-header { min-height:36px; padding-block:6px; line-height:20px; }
+/* Finished/collapsed tools read as quiet execution rows; open results retain their card surface. */
+.message-card.tool-call:where(:not(.has-error):not(.has-warning):has(> .tool-header:not([aria-expanded="true"]))) {
+  background:var(--tool-row-background);
+  box-shadow:inset 0 0 0 var(--magi-hairline) var(--tool-row-outline);
+}
+.code-header { min-height: 36px; padding: 5px var(--tool-card-padding); line-height:20px; }
 .tool-name, .lang-name, .thinking-title, .plan-title {
   font-weight: var(--font-medium);
   font-size: var(--text-sm);
@@ -81,3 +92,8 @@
 .message-card .tool-title .filespan { min-width:0; background:transparent; padding:0; }
 .message-card .tool-title .filespan:hover { background:var(--surface-hover); }
 .message-card .tool-title .filespan-name { color:var(--foreground-muted); }
+
+/* Preserve the filename suffix before spending narrow header space on its directory. */
+@container (max-width:360px) {
+  .tool-title .filespan-dir { display:none; }
+}

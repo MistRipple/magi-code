@@ -1,5 +1,6 @@
 /** Protect every text-entry shortcut, including rename, settings and browser URL fields. */
 export function imeEnterGuard(node: HTMLElement) {
+  let disposed = false;
   const composing = new WeakSet<EventTarget>();
   const endedAt = new WeakMap<EventTarget, number>();
   const fieldFor = (target: EventTarget | null): HTMLElement | null => {
@@ -8,16 +9,19 @@ export function imeEnterGuard(node: HTMLElement) {
     return field instanceof HTMLElement ? field : null;
   };
   const start = (event: CompositionEvent) => {
+    if (disposed) return;
     const field = fieldFor(event.target);
     if (field) composing.add(field);
   };
   const end = (event: CompositionEvent) => {
+    if (disposed) return;
     const field = fieldFor(event.target);
     if (!field) return;
     composing.delete(field);
     endedAt.set(field, performance.now());
   };
   const keydown = (event: KeyboardEvent) => {
+    if (disposed) return;
     const field = fieldFor(event.target);
     if (!field) return;
     if (event.isComposing || event.keyCode === 229 || composing.has(field)) {
@@ -36,6 +40,8 @@ export function imeEnterGuard(node: HTMLElement) {
   node.addEventListener('compositionend', end, true);
   node.addEventListener('keydown', keydown, true);
   return { destroy() {
+    if (disposed) return;
+    disposed = true;
     node.removeEventListener('compositionstart', start, true);
     node.removeEventListener('compositionend', end, true);
     node.removeEventListener('keydown', keydown, true);

@@ -176,7 +176,7 @@ await withGoldenViteServer(async (server) => {
     'Web / 手机端必须退回外部浏览器',
   );
   assert.equal(
-    await browser.openWorkspaceHtmlInRightPaneBrowser({
+    await browser.openHtmlFileInRightPaneBrowser({
       filepath: '/tmp/index.html',
       workspaceId: 'workspace-golden',
       workspacePath: '/tmp',
@@ -442,6 +442,19 @@ await withGoldenViteServer(async (server) => {
     1,
     '离开应用级视图不销毁它：GPT Web 宿主仍挂载，后台推理不中断',
   );
+
+  for (const binding of [
+    { workspaceId: '', workspacePath: '', sessionId: 'personal-html' },
+    { workspaceId: 'workspace-golden', workspacePath: '/tmp', sessionId: 'project-html' },
+  ]) {
+    calls = installDaemonStub();
+    assert.equal(await browser.openHtmlFileInRightPaneBrowser({ filepath: 'index.html', ...binding }), 'opened');
+    const created = calls.find(call => call.path.endsWith('/tabs'));
+    const previewUrl = new URL(created.body.initialUrl);
+    assert.equal(previewUrl.pathname, '/api/files/site-open');
+    assert.equal(previewUrl.searchParams.get('sessionId'), binding.sessionId, 'HTML 必须携带来源会话，隔离副本和个人目录均按会话解析');
+    assert.equal(previewUrl.searchParams.get('workspaceId') || '', binding.workspaceId);
+  }
 
   globalThis.fetch = originalFetch;
   globalThis.window = originalWindow;

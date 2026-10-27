@@ -15,13 +15,14 @@
   interface Props {
     rootPath: string;
     workspaceId: string;
+    sessionId?: string;
     /** 是否显示隐藏文件；由侧栏标题行的开关持有，树只负责按它加载。 */
     showHidden?: boolean;
     selectedFilePath?: string | null;
     onFileSelect?: (selection: { pathRef: string; displayPath: string; name: string }) => void;
   }
 
-  let { rootPath, workspaceId, showHidden = false, selectedFilePath = null, onFileSelect }: Props = $props();
+  let { rootPath, workspaceId, sessionId = '', showHidden = false, selectedFilePath = null, onFileSelect }: Props = $props();
 
   let expandedDirPaths = $state<Set<string>>(new Set());
   let dirCache = $state<Map<string, DirectoryEntry[]>>(new Map());
@@ -42,18 +43,18 @@
   $effect(() => {
     const nextRoot = rootPath?.trim() || '';
     const nextWorkspaceId = workspaceId?.trim() || '';
-    const nextTreeKey = `${nextWorkspaceId}\u0000${nextRoot}`;
+    const nextTreeKey = `${nextWorkspaceId}\u0000${sessionId}\u0000${nextRoot}`;
     if (nextTreeKey === loadedTreeKey) {
       return;
     }
     resetTree(nextTreeKey);
-    if (nextRoot) {
+    if (nextRoot || sessionId) {
       void loadDirectory(undefined, { force: true });
     }
   });
 
   function currentTreeKey(): string {
-    return `${workspaceId?.trim() || ''}\u0000${rootPath?.trim() || ''}`;
+    return `${workspaceId?.trim() || ''}\u0000${sessionId}\u0000${rootPath?.trim() || ''}`;
   }
 
   function resetTree(nextTreeKey = currentTreeKey()): void {
@@ -74,7 +75,7 @@
     const nextRootPath = rootPath?.trim() || '';
     const currentSelectionGeneration = ++selectionGeneration;
     selectedPathRef = '';
-    if (!filePath || !nextWorkspaceId || !nextRootPath) {
+    if (!filePath || (!sessionId && (!nextWorkspaceId || !nextRootPath))) {
       return;
     }
     void revealActiveFile(filePath, currentSelectionGeneration, nextWorkspaceId, nextRootPath);
@@ -87,11 +88,10 @@
     nextRootPath: string,
   ): Promise<void> {
     try {
-      const response = await resolveAgentFileRevealTarget(filePath, {
-        scope: 'workspace',
-        workspaceId: nextWorkspaceId,
-        workspacePath: nextRootPath,
-      });
+      const response = await resolveAgentFileRevealTarget(filePath, nextWorkspaceId ? {
+        scope: 'workspace', workspaceId: nextWorkspaceId, workspacePath: nextRootPath,
+        ...(sessionId ? { sessionId } : {}),
+      } : { scope: 'personal', sessionId });
       if (currentSelectionGeneration !== selectionGeneration || currentTreeKey() !== loadedTreeKey) {
         return;
       }
@@ -137,6 +137,7 @@
     const requestGeneration = treeGeneration;
     const requestTreeKey = loadedTreeKey;
     const requestWorkspaceId = workspaceId;
+    const requestSessionId = sessionId;
     const isCurrent = () => requestGeneration === treeGeneration && requestTreeKey === loadedTreeKey;
     const entry = { promise: Promise.resolve(), refreshQueued: false };
     loadingDirPaths = new Set(loadingDirPaths).add(cacheKey);
@@ -147,7 +148,7 @@
         nextErrors.delete(cacheKey);
         dirErrors = nextErrors;
         try {
-          const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId);
+          const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId, requestSessionId);
           if (!isCurrent()) return;
           // 读取期间发生刷新或切换隐藏文件条件时，先补读，不能提交已过期的结果。
           if (entry.refreshQueued) continue;
@@ -194,7 +195,7 @@
    * 目录已不存在（如切分支后）的展开项在重读失败后被收起。
    */
   export async function refresh(): Promise<void> {
-    if (!rootPath?.trim()) return;
+    if (!rootPath?.trim() && !sessionId) return;
     const treeKey = loadedTreeKey;
     const directories = [undefined, ...expandedDirPaths];
     await Promise.all(directories.map((pathRef) => loadDirectory(pathRef, { force: true })));
@@ -245,7 +246,7 @@
 </script>
 
 <div class="project-file-tree" data-workspace-id={workspaceId} bind:this={treeElement}>
-  {#if !rootPath}
+  {#if !rootPath && !sessionId}
     <div class="file-tree-empty">{i18n.t('web.projectFilesNoWorkspace')}</div>
   {:else if rootLoading && rootEntries.length === 0}
     <div class="file-tree-empty">{i18n.t('common.loading')}</div>

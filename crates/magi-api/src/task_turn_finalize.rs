@@ -257,6 +257,54 @@ pub fn finalize_background_session_task_turn_if_root_completed_for_turn(
 ///
 /// 收口与提交新消息、中断共用同一把 session Turn 锁：否则在 canonical Turn 已进入
 /// 终态、Coordinator 尚未释放占位的窗口里提交的新消息会被 409 拒绝而丢失。
+pub fn handle_task_completion_notification(
+    state: &ApiState,
+    notification: magi_conversation_runtime::task_completion_notifier::TaskCompletionNotification,
+) {
+    if !matches!(
+        notification.status,
+        magi_core::TaskStatus::Completed
+            | magi_core::TaskStatus::Failed
+            | magi_core::TaskStatus::Killed
+    ) {
+        return;
+    }
+    let Some(session_id) = notification.session_id.as_ref() else {
+        return;
+    };
+    state.release_finished_task_resources(session_id, &notification.task_id);
+    let Some(turn_id) = notification.turn_id.as_deref() else {
+        return;
+    };
+    if notification.task_id != notification.root_task_id {
+        // 普通子代理只结算自己的资源。只有绑定独立 Turn 的 Agent 才拥有 Turn 终态。
+        match state
+            .session_store
+            .agent_turn_for_task(session_id, &notification.task_id)
+        {
+            Ok(Some(turn)) if turn.turn_id == turn_id => {}
+            Ok(_) => return,
+            Err(error) => {
+                tracing::error!(task_id = %notification.task_id, %error, "核对代理终态拥有方失败");
+                return;
+            }
+        }
+    }
+    let runner_status = match notification.status {
+        magi_core::TaskStatus::Completed => "completed",
+        magi_core::TaskStatus::Failed => "failed",
+        magi_core::TaskStatus::Killed => "killed",
+        _ => return,
+    };
+    schedule_background_session_task_turn_finalize(
+        state.clone(),
+        session_id.clone(),
+        notification.root_task_id,
+        runner_status,
+        turn_id.to_string(),
+    );
+}
+
 pub fn schedule_background_session_task_turn_finalize(
     state: ApiState,
     session_id: SessionId,

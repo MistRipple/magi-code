@@ -96,7 +96,7 @@
   .filespan {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1);
+    gap: 8px;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--foreground);
@@ -134,8 +134,10 @@
   }
 
   .filespan-dir {
+    min-width: 0;
+    flex: 0 1 auto;
     color: var(--foreground-muted);
-    font-size: max(var(--text-xs), 0.85em);
+    font-size: var(--text-xs);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

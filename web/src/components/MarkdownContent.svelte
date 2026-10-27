@@ -122,7 +122,16 @@
   .markdown-content :global(ul),
   .markdown-content :global(ol) {
     margin: var(--spacing-sm) 0;
-    padding-left: var(--spacing-lg);
+    padding-inline-start: var(--spacing-lg);
+  }
+
+  /* Three-digit ordered markers must stay inside the same column as cards and prose. */
+  .markdown-content :global(ol) {
+    padding-inline-start: max(var(--spacing-lg), 4.5ch);
+  }
+
+  .markdown-content :global(li::marker) {
+    font-variant-numeric: tabular-nums;
   }
 
   .markdown-content :global(li) {
@@ -137,7 +146,7 @@
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   }
 
-  .markdown-content :global(pre) {
+  .markdown-content :global(pre:not(.code-pre):not(.plain-text-block)) {
     margin: var(--spacing-sm) 0;
     padding: var(--spacing-md);
     box-sizing: border-box;
@@ -146,7 +155,7 @@
     overflow-x: auto;
   }
 
-  .markdown-content :global(code) {
+  .markdown-content :global(code:not(.code-text):not(.plain-text-code):not(.diff-line-code)) {
     font-family: var(--font-mono);
     font-size: max(var(--text-xs), 0.9em);
   }

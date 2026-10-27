@@ -9,7 +9,8 @@
    */
   import { onMount, tick } from 'svelte';
   import Icon from './Icon.svelte';
-  import { WEB_MODEL_SETUP_REQUEST } from '../web/web-model-setup';
+  import { WEB_MODEL_SETUP_REQUEST, webModelSetupAvailable } from '../web/web-model-setup';
+  import { APPLICATION_PLUGIN_SCOPE, pluginProjection } from '../stores/plugin-registry.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
@@ -54,6 +55,7 @@
   }
 
   let { isDesktop }: Props = $props();
+  const setupAvailable = $derived(webModelSetupAvailable(pluginProjection(APPLICATION_PLUGIN_SCOPE)));
 
   let probe = $state<WebModelProbeResponse | null>(null);
   let probing = $state(false);
@@ -146,14 +148,6 @@
     }
   }
 
-  // 通道组件在后台下载 / 启动：状态还在「准备中」时轮询，完成后自动停下。
-  const PREPARING_CODES = new Set(['client_installing', 'runtime_not_ready']);
-  $effect(() => {
-    if (!isDesktop || !tunnel || !PREPARING_CODES.has(tunnel.code)) return;
-    const timer = setInterval(() => void loadTunnel(false), 1500);
-    return () => clearInterval(timer);
-  });
-
   onMount(() => {
     const handleSettingsReady = (event: Event) => {
       const request = (event as CustomEvent<WebModelSettingsRequest>).detail;
@@ -170,7 +164,11 @@
     const pending = consumeWebModelSettingsRequest();
     if (pending) window.dispatchEvent(new CustomEvent(WEB_MODEL_SETTINGS_READY_EVENT, { detail: pending }));
     const runtimeTimer = window.setInterval(() => {
-      if (isDesktop) void refreshWebModelRuntime();
+      if (isDesktop) {
+        void refreshWebModelRuntime();
+        // 保存会先停止旧通道再后台连接；持续回读，不能停在中途的「未启动」。
+        if (!tunnelBusy) void loadTunnel(false);
+      }
     }, 2000);
     return () => {
       window.clearInterval(runtimeTimer);
@@ -213,13 +211,14 @@
   const TUNNEL_CODES = new Set([
     'running', 'stopped', 'client_installing', 'client_install_failed', 'tunnel_not_configured',
     'tunnel_id_invalid', 'credential_missing', 'client_missing', 'client_checksum_mismatch',
-    'client_checksum_missing', 'process_exited', 'runtime_not_ready', 'start_failed', 'mcp_unavailable',
+    'client_checksum_missing', 'process_exited', 'runtime_not_ready', 'start_failed', 'stop_failed', 'mcp_unavailable',
   ]);
   /** 通道状态用人话显示；已知状态码给本地化名称，未知的原样带上服务端说明。 */
   function tunnelStatusText(status: WebModelTunnelStatus): string {
     if (TUNNEL_CODES.has(status.code)) {
       const label = i18n.t(`webModel.tunnel.code.${status.code}`);
-      return status.ready || !status.detail ? label : `${label}: ${status.detail}`;
+      // 空配置已有本地化名称，操作指引由本节表单提供，避免重复拼接 daemon 的空状态说明。
+      return status.ready || status.code === 'tunnel_not_configured' || !status.detail ? label : `${label}: ${status.detail}`;
     }
     return status.detail ? `${status.code}: ${status.detail}` : status.code;
   }
@@ -456,6 +455,7 @@
       <div class="settings-notice settings-notice--warn">{i18n.t('settings.browser.webModel.needDesktop')}</div>
     </div>
   {/if}
+  {#if setupAvailable}
   <section class="settings-section" aria-labelledby="web-model-setup-title" data-web-model-setup-entry>
     <div class="settings-card">
       <div class="settings-card-head wm-setup-head">
@@ -472,6 +472,7 @@
       </div>
     </div>
   </section>
+  {/if}
 
 <section class="settings-section" aria-labelledby="web-model-title">
   <div class="settings-section-header">

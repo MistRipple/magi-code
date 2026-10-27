@@ -43,7 +43,7 @@ export interface BrowserOpenBinding {
   sessionId?: string;
 }
 
-export interface WorkspaceHtmlBrowserTarget extends BrowserOpenBinding {
+export interface HtmlFileBrowserTarget extends BrowserOpenBinding {
   filepath: string;
 }
 
@@ -267,14 +267,14 @@ export function openUrlInRightPaneBrowser(
 }
 
 /**
- * 在右栏把工作区 HTML 文件作为可运行网页打开。
+ * 在右栏把会话或项目 HTML 文件作为可运行网页打开。
  *
- * 工作区 / 会话由调用方给出（文件树与变更卡片知道自己属于哪个会话），
+ * 项目 / 会话由调用方给出（文件树与变更卡片知道自己属于哪个会话），
  * 缺失时按 URL 链接同样的规则物化会话，保证预览页始终挂在一个真实 Magi
  * 会话上；没有内置浏览器时不做系统浏览器兜底（HTML 文件不是网址）。
  */
-export function openWorkspaceHtmlInRightPaneBrowser(
-  input: WorkspaceHtmlBrowserTarget,
+export function openHtmlFileInRightPaneBrowser(
+  input: HtmlFileBrowserTarget,
 ): Promise<RightPaneBrowserOpenOutcome> {
   const filepath = input.filepath.trim();
   const workspaceId = trim(input.workspaceId);
@@ -292,7 +292,7 @@ export function openWorkspaceHtmlInRightPaneBrowser(
     try {
       const target = await resolveBrowserTarget({ workspaceId, workspacePath, sessionId });
       const url = agentUrl('/api/files/site-open', buildFilePreviewQuery(filepath, {
-        includeSession: false,
+        sessionId: target.sessionId,
         workspaceId: target.workspaceId,
         workspacePath: target.workspacePath,
       }));

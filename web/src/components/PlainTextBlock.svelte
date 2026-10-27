@@ -20,7 +20,7 @@
   const segments = $derived(splitPlainTextFileReferenceText(content || ''));
 </script>
 
-<pre class="plain-text-block"><code>{#each segments as segment}{#if segment.kind === 'file'}<FileReferenceInline
+<pre class="plain-text-block"><code class="plain-text-code">{#each segments as segment}{#if segment.kind === 'file'}<FileReferenceInline
         label={segment.text}
         target={segment.target}
       />{:else}{segment.text}{/if}{/each}</code></pre>
@@ -28,20 +28,22 @@
 <style>
   .plain-text-block {
     margin: var(--spacing-sm) 0;
-    padding: var(--space-3);
+    padding: var(--code-panel-padding-block) var(--tool-card-padding);
     border-radius: var(--tool-card-radius);
-    background: var(--code-bg);
+    background: var(--tool-card-background);
     border: 0;
     box-shadow: inset 0 0 0 var(--magi-hairline) var(--tool-card-outline);
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: var(--font-family-mono, 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace);
-    font-size: var(--text-sm);
-    line-height: 1.6;
+    font-family: var(--font-mono);
+    font-size: var(--code-panel-font-size);
+    line-height: var(--code-panel-line-height);
   }
 
   .plain-text-block code {
     font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
   }
 </style>

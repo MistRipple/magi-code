@@ -792,7 +792,7 @@
           <div class="goal-metrics">
             <span class="goal-metric">
               <span class="goal-detail-label">{i18n.t('goalPanel.goal.attemptsUsed')}</span>
-              <strong>{(currentGoal.modelAttemptsUsed ?? 0).toLocaleString()}</strong>
+              <strong>{(currentGoal.modelAttemptsUsed ?? 0).toLocaleString(i18n.locale)}</strong>
             </span>
             <span class="goal-metric">
               <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
@@ -804,7 +804,7 @@
             </span>
             <span class="goal-metric">
               <span class="goal-detail-label">{i18n.t('goalPanel.goal.tokensUsed')}</span>
-              <strong>{currentGoal.tokensUsed.toLocaleString()}</strong>
+              <strong>{currentGoal.tokensUsed.toLocaleString(i18n.locale)}</strong>
             </span>
           </div>
         </div>
@@ -1297,15 +1297,6 @@
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: var(--leading-tight);
-  }
-
-  :global(.spinning) {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
   }
 
   @media (max-width: 640px) {

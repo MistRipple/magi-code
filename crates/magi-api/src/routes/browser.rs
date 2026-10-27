@@ -1270,7 +1270,8 @@ async fn get_web_model_tunnel(
     Ok(Json(state.web_model.status()))
 }
 
-#[derive(Debug, Default, Deserialize)]
+// 不派生 Debug：该请求包含原始密钥。
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConfigureWebModelTunnelRequest {
     /// 显式清除配置（连同已保存的 API 密钥）。
@@ -1330,6 +1331,18 @@ async fn configure_web_model_tunnel(
             .map_err(|error| ApiError::internal_assembly("序列化 T3 通道配置失败", error))?,
         None => Value::Null,
     };
+    if let Some(config) = config.as_ref() {
+        if !magi_web_model::tunnel::valid_tunnel_id(&config.tunnel_id) {
+            return Err(ApiError::InvalidInput("Tunnel id 格式不正确".into()));
+        }
+        if let Some(key) = request
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            crate::web_model_channel::validate_api_key(key).map_err(ApiError::InvalidInput)?;
+        }
+    }
     state
         .settings_store
         .set_section(crate::web_model_channel::WEB_MODEL_TUNNEL_SECTION, stored)
@@ -3846,6 +3859,52 @@ mod tests {
         assert!(matches!(error, ApiError::Forbidden(message) if message.contains("GPT Web 插件")));
     }
 
+    #[tokio::test]
+    async fn setup_status_is_only_readable_while_gpt_web_plugin_is_active() {
+        let state = capability_test_state("browser-setup-plugin-gate-test");
+        let headers = desktop_request_headers(&state);
+        let session_id = SessionId::new("setup-plugin-gate");
+        state
+            .session_store
+            .create_session_for_workspace(session_id.clone(), "Setup", None)
+            .unwrap();
+        state.settings_store.set_section("webModelSetup", serde_json::json!({
+            "sessionId": session_id.as_str(), "stage": "credentials", "reason": "key_generation_required", "updatedAt": 1
+        })).unwrap();
+        let read = || {
+            super::get_web_model_setup(
+                State(state.clone()),
+                headers.clone(),
+                Query(super::WebModelSetupQuery {
+                    session_id: session_id.to_string(),
+                }),
+            )
+        };
+        assert!(matches!(read().await, Err(ApiError::Forbidden(_))));
+        activate_gpt_web_plugin(&state);
+        assert_eq!(read().await.unwrap().0.unwrap().stage, "credentials");
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .deactivate(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+        }
+        assert!(
+            matches!(read().await, Err(ApiError::Forbidden(_))),
+            "停用后不能读取残留配置卡片"
+        );
+        {
+            let mut manager = state.plugin_manager.lock().unwrap();
+            manager
+                .disable(magi_web_model::WEB_MODEL_PLUGIN_ID, "application")
+                .unwrap();
+            manager
+                .uninstall(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .unwrap();
+        }
+        assert!(matches!(read().await, Err(ApiError::Forbidden(_))));
+    }
+
     fn annotation_fixture() -> (ApiState, SessionId, SessionId, BrowserAnnotationId) {
         let state = ApiState::new(
             "browser-annotation-context-test",
@@ -5197,6 +5256,7 @@ async fn get_web_model_setup(
     headers: HeaderMap,
     Query(query): Query<WebModelSetupQuery>,
 ) -> Result<Json<Option<magi_app_server_protocol::generated::WebModelSetupStatus>>, ApiError> {
+    require_web_model_plugin(&state)?;
     require_desktop_browser_capability(&state, &headers, None)?;
     let session = SessionId::new(query.session_id);
     if state.session_store.session(&session).is_none() {

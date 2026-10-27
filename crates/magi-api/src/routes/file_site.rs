@@ -8,10 +8,11 @@ use axum::{
 };
 use magi_browser_authority::{PREVIEW_OPEN_PATH, PREVIEW_PATH_PREFIX};
 use serde::Deserialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
-use crate::scope_binding::require_registered_workspace_binding;
+use super::changes_files_tunnel::resolve_file_access_scope;
 use crate::{change_projection::safe_workspace_path, errors::ApiError, state::ApiState};
+use magi_core::SessionId;
 
 const SITE_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'";
 
@@ -21,7 +22,7 @@ pub fn routes() -> Router<ApiState> {
         .strip_prefix("/api")
         .expect("preview open path must live under /api");
     let asset_route = format!(
-        "{}{{preview_token}}/{{workspace_id}}/{{*file_path}}",
+        "{}{{preview_token}}/{{scope_key}}/{{*file_path}}",
         PREVIEW_PATH_PREFIX
             .strip_prefix("/api")
             .expect("preview path prefix must live under /api"),
@@ -34,6 +35,7 @@ pub fn routes() -> Router<ApiState> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SiteOpenQuery {
+    session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     file_path: Option<String>,
@@ -42,7 +44,7 @@ struct SiteOpenQuery {
 #[derive(Debug, Deserialize)]
 struct SiteAssetPath {
     preview_token: String,
-    workspace_id: String,
+    scope_key: String,
     file_path: String,
 }
 
@@ -57,13 +59,14 @@ async fn open_site_preview(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
-    let binding = require_registered_workspace_binding(
+    let scope = resolve_file_access_scope(
         &state,
+        query.session_id.as_deref(),
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
+        None,
     )?;
-    let workspace_root = PathBuf::from(&binding.workspace_path);
-    let (absolute_path, relative_path) = safe_workspace_path(&workspace_root, requested_path)?;
+    let (absolute_path, relative_path) = safe_workspace_path(&scope.root, requested_path)?;
     if !absolute_path.is_file()
         || site_mime_for_path(&absolute_path) != Some("text/html; charset=utf-8")
     {
@@ -73,12 +76,21 @@ async fn open_site_preview(
     }
     ensure_public_site_asset(&relative_path, &absolute_path)?;
 
-    let workspace_id = binding.workspace_id.as_str();
-    let preview_token = state.tunnel_manager.site_preview_token(workspace_id).await;
+    // token 绑定来源会话或显式项目，资源请求重新解析 daemon 事实；不保存第二份目录映射。
+    let scope_key = match scope.binding["sessionId"].as_str() {
+        Some(id) => format!("session:{id}"),
+        None => format!(
+            "workspace:{}",
+            scope.binding["workspaceId"]
+                .as_str()
+                .expect("workspace scope")
+        ),
+    };
+    let preview_token = state.tunnel_manager.site_preview_token(&scope_key).await;
     let path = format!(
         "/api/files/site/{}/{}/{}",
         encode_path_segment(&preview_token),
-        encode_path_segment(workspace_id),
+        encode_path_segment(&scope_key),
         encode_relative_path(&relative_path),
     );
     // 本机预览放到独立来源上：预览里的脚本不能与 API 同源。
@@ -102,13 +114,13 @@ async fn serve_site_asset(
 ) -> Response {
     if !state
         .tunnel_manager
-        .authorize_site_preview_request(&path.workspace_id, &path.preview_token)
+        .authorize_site_preview_request(&path.scope_key, &path.preview_token)
         .await
     {
         return (StatusCode::UNAUTHORIZED, "网页预览凭据无效").into_response();
     }
 
-    match load_site_asset(&state, &path.workspace_id, &path.file_path) {
+    match load_site_asset(&state, &path.scope_key, &path.file_path) {
         Ok((mime, bytes)) => {
             let mut response = Response::new(Body::from(bytes));
             *response.status_mut() = StatusCode::OK;
@@ -131,11 +143,21 @@ async fn serve_site_asset(
 
 fn load_site_asset(
     state: &ApiState,
-    workspace_id: &str,
+    scope_key: &str,
     requested_path: &str,
 ) -> Result<(&'static str, Vec<u8>), ApiError> {
-    let binding = require_registered_workspace_binding(state, Some(workspace_id), None)?;
-    let workspace_root = PathBuf::from(binding.workspace_path);
+    let scope = if let Some(id) = scope_key.strip_prefix("session:") {
+        let session = state
+            .session_store
+            .session(&SessionId::new(id))
+            .ok_or_else(|| ApiError::session_not_found(id))?;
+        resolve_file_access_scope(state, Some(id), session.workspace_id.as_deref(), None, None)?
+    } else if let Some(id) = scope_key.strip_prefix("workspace:") {
+        resolve_file_access_scope(state, None, Some(id), None, None)?
+    } else {
+        return Err(ApiError::InvalidInput("网页预览作用域无效".into()));
+    };
+    let workspace_root = scope.root;
     let (mut absolute_path, mut relative_path) =
         safe_workspace_path(&workspace_root, requested_path)?;
     if absolute_path.is_dir() {
@@ -283,7 +305,7 @@ mod tests {
         let state = test_state(root.path(), "workspace-site");
         let token = state
             .tunnel_manager
-            .site_preview_token("workspace-site")
+            .site_preview_token("workspace:workspace-site")
             .await;
         let app = routes().with_state(state);
 
@@ -296,7 +318,9 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/files/site/{token}/workspace-site/{path}"))
+                        .uri(format!(
+                            "/files/site/{token}/workspace%3Aworkspace-site/{path}"
+                        ))
                         .body(Body::empty())
                         .expect("request should build"),
                 )
@@ -328,11 +352,11 @@ mod tests {
         let state = test_state(root.path(), "workspace-site");
         let wrong_token = state
             .tunnel_manager
-            .site_preview_token("workspace-other")
+            .site_preview_token("workspace:workspace-other")
             .await;
         let valid_token = state
             .tunnel_manager
-            .site_preview_token("workspace-site")
+            .site_preview_token("workspace:workspace-site")
             .await;
         let app = routes().with_state(state);
 
@@ -341,7 +365,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/files/site/{wrong_token}/workspace-site/index.html"
+                        "/files/site/{wrong_token}/workspace%3Aworkspace-site/index.html"
                     ))
                     .body(Body::empty())
                     .expect("request should build"),
@@ -354,7 +378,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/files/site/{valid_token}/workspace-site/secret.rs"
+                        "/files/site/{valid_token}/workspace%3Aworkspace-site/secret.rs"
                     ))
                     .body(Body::empty())
                     .expect("request should build"),
@@ -391,8 +415,110 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("redirect should include location");
         assert!(location.starts_with("/api/files/site/"));
-        assert!(location.ends_with("/workspace-site/index.html"));
+        assert!(location.ends_with("/workspace%3Aworkspace-site/index.html"));
         assert!(!location.contains("transport-secret"));
+    }
+
+    #[tokio::test]
+    async fn personal_site_preview_keeps_assets_in_the_owning_session_and_expires_on_delete() {
+        let root = tempdir().unwrap();
+        let state = test_state(root.path(), "workspace-site").with_runtime_persistence(Arc::new(
+            crate::state::RuntimeStatePersistence::new(
+                root.path().join("state"),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ),
+        ));
+        for id in ["site-a", "site-b"] {
+            state
+                .session_store
+                .create_session(SessionId::new(id), id)
+                .unwrap();
+            let directory = state
+                .personal_session_execution_root(&SessionId::new(id))
+                .unwrap();
+            fs::write(
+                directory.join("index.html"),
+                format!("<script src='app.js'></script>{id}"),
+            )
+            .unwrap();
+            fs::write(directory.join("app.js"), id).unwrap();
+        }
+        let app = routes().with_state(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/files/site-open?sessionId=site-a&filePath=index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .trim_start_matches("/api")
+            .to_string();
+        assert!(location.contains("session%3Asite-a"));
+        for (uri, expected) in [
+            (location.clone(), StatusCode::OK),
+            (location.replace("index.html", "app.js"), StatusCode::OK),
+            (
+                location.replace("site-a", "site-b"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/files/site-open?sessionId=site-a&workspaceId=workspace-site&filePath=index.html"
+                    .into(),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+        }
+        #[cfg(unix)]
+        {
+            let a = state.personal_session_execution_root_path(&SessionId::new("site-a"));
+            let b = state.personal_session_execution_root_path(&SessionId::new("site-b"));
+            std::os::unix::fs::symlink(b.join("app.js"), a.join("escape.js")).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(location.replace("index.html", "escape.js"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        state
+            .delete_session_and_resources(&SessionId::new("site-a"))
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(location)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            state
+                .personal_session_execution_root_path(&SessionId::new("site-b"))
+                .join("app.js")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -418,6 +544,6 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("redirect should include location");
         assert!(location.starts_with("http://site.localhost:38123/api/files/site/"));
-        assert!(location.ends_with("/workspace-site/index.html"));
+        assert!(location.ends_with("/workspace%3Aworkspace-site/index.html"));
     }
 }

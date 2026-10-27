@@ -59,9 +59,9 @@ use crate::{
     prompt_utils::{
         PromptFragmentKind, current_access_profile_prompt, current_agent_mode_prompt,
         current_turn_context_priority_prompt, dynamic_skill_prompt_message,
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        runtime_context_message, skill_prompt_message, system_prompt_fragment_message,
-        workspace_context_system_prompt,
+        execution_context_system_prompt, normalize_model_stream_preview_content,
+        normalize_model_visible_content, runtime_context_message, skill_prompt_message,
+        system_prompt_fragment_message,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
@@ -662,6 +662,7 @@ fn refresh_current_agent_mode(
     roles: &magi_agent_role::AgentRoleRegistry,
     limits: &crate::execution_admission::ExecutionAdmissionLimits,
     tools: &[ChatToolDefinition],
+    model_capabilities: Option<&str>,
 ) {
     let kind = PromptFragmentKind::CurrentAgentMode;
     let prefix = format!("<magi-developer-fragment id=\"{}\"", kind.as_str());
@@ -674,6 +675,12 @@ fn refresh_current_agent_mode(
                 .is_some_and(|text| text.starts_with(&prefix)))
     });
     if let Some(mut prompt) = current_agent_mode_prompt(task, limits, roles, tools) {
+        if tools.iter().any(|tool| tool.function.name == "agent_spawn")
+            && let Some(capabilities) = model_capabilities
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(capabilities);
+        }
         if tools
             .iter()
             .any(|tool| tool.function.name == "update_execution_steps")
@@ -829,20 +836,14 @@ fn run_conversation_loop_inner(
     }) {
         static_context_messages.push(skill_message);
     }
-    // [CACHE: STATIC] S8b · Workspace 根目录上下文。
-    // 引导模型把"当前项目 / current repo"等措辞默认对齐到该 workspace；
-    // 并强制 Git 状态命令前必须先做 NOT_GIT_WORKTREE 探测。
-    if let Some(root_path) = workspace_root_path.as_ref() {
-        static_context_messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::WorkspaceContext,
-            workspace_context_system_prompt(&root_path.display().to_string()),
-        ));
-    } else {
-        static_context_messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::WorkspaceContext,
-            "当前会话未绑定工作区。file_read、view_image、search_text、search_semantic、code_symbols、shell_exec、Git、进程和其他本地文件/进程工具不会出现在本轮 tools 定义中；不要调用这些缺失工具，也不要通过 tool_catalog 或 agent_spawn 反复尝试。需要本地项目事实时，请先让用户切换到绑定工作区的会话，或基于本轮实际提供的工具完成任务。",
-        ));
-    }
+    // 执行 cwd 与项目归属分别由 daemon 提供，个人目录不能被描述成项目。
+    static_context_messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::WorkspaceContext,
+        execution_context_system_prompt(
+            workspace_root_path.as_ref().and_then(|root| root.to_str()),
+            workspace_id.is_some(),
+        ),
+    ));
     // ---- Cache breakpoint · STATIC → NON-STATIC ----
     // 上面 Tier A 三段同一角色 / workspace / mission 多轮不变，是 prompt
     // 缓存命中的真正受益面。这里插入一条 boundary 标记消息，下游
@@ -921,12 +922,19 @@ fn run_conversation_loop_inner(
         PromptFragmentKind::CurrentTurnPriority,
         current_turn_context_priority_prompt(),
     ));
+    let agent_model_capabilities = crate::prompt_utils::agent_model_capabilities_prompt(
+        settings_store.map(AsRef::as_ref),
+        task,
+        session_id,
+        agent_role_registry,
+    );
     refresh_current_agent_mode(
         &mut messages,
         task,
         agent_role_registry,
         execution_registry.execution_admission().limits(),
         tools.as_deref().unwrap_or_default(),
+        Some(&agent_model_capabilities),
     );
     messages.extend(build_task_context_base_messages(
         &task_context_messages,
@@ -1020,7 +1028,13 @@ fn run_conversation_loop_inner(
         &resolved_context_model,
         vision_execution_config
             .as_ref()
-            .and_then(|config| config.context_window_tokens()),
+            .and_then(|config| config.context_window_tokens())
+            .or_else(|| {
+                task.executor_binding
+                    .as_ref()
+                    .and_then(|binding| binding.model_selection.as_ref())
+                    .and_then(|selection| selection.context_window_tokens)
+            }),
     );
     let initial_skill_name = skill_name.clone();
     let turn_visibility = task_turn_visibility(
@@ -1344,6 +1358,7 @@ fn run_conversation_loop_inner(
             agent_role_registry,
             execution_registry.execution_admission().limits(),
             round_tools.unwrap_or_default(),
+            Some(&agent_model_capabilities),
         );
         if let Some(skill_message) = dynamic_skill_prompt_message(
             skill_runtime,
@@ -1573,6 +1588,7 @@ fn run_conversation_loop_inner(
             agent_role_registry,
             execution_registry.execution_admission().limits(),
             round_tools.as_deref().unwrap_or_default(),
+            Some(&agent_model_capabilities),
         );
         if let Some(turn_id) = expected_turn_id.as_deref() {
             match session_store.execution_steps_for_task(session_id, turn_id, task_id) {
@@ -2925,11 +2941,9 @@ fn run_conversation_loop_inner(
                                 .rebind_workspace_root(workspace_root_path.as_deref());
                             let updated = system_prompt_fragment_message(
                                 PromptFragmentKind::WorkspaceContext,
-                                workspace_context_system_prompt(
-                                    &workspace_root_path
-                                        .as_ref()
-                                        .map(|root| root.display().to_string())
-                                        .unwrap_or_default(),
+                                execution_context_system_prompt(
+                                    workspace_root_path.as_ref().and_then(|root| root.to_str()),
+                                    workspace_id.is_some(),
                                 ),
                             );
                             for history in [&mut static_context_messages, &mut messages] {
@@ -4781,7 +4795,7 @@ mod tests {
                 "多代理协作（root coordinator 必须遵守）",
             ),
         ] {
-            refresh_current_agent_mode(&mut messages, &task, &roles, &limits, &tools);
+            refresh_current_agent_mode(&mut messages, &task, &roles, &limits, &tools, None);
             let fragments = messages
                 .iter()
                 .filter(|message| {
@@ -4824,6 +4838,7 @@ mod tests {
             &roles,
             &limits,
             &[exposed_test_tool("agent_spawn")],
+            None,
         );
         assert!(
             rebuilt[0]
@@ -4839,6 +4854,7 @@ mod tests {
             &roles,
             &limits,
             &[exposed_test_tool("agent_spawn")],
+            None,
         );
         assert_eq!(rebuilt.len(), 1);
         assert!(
@@ -4848,7 +4864,7 @@ mod tests {
                 .unwrap()
                 .contains("受委派代理模式")
         );
-        refresh_current_agent_mode(&mut rebuilt, &task, &roles, &limits, &[]);
+        refresh_current_agent_mode(&mut rebuilt, &task, &roles, &limits, &[], None);
         assert!(
             rebuilt[0]
                 .content

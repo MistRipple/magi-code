@@ -19,9 +19,9 @@ restart_fixed_port() {
   fi
 
   is_magi_process() {
-    local pid="$1"
+    local candidate_pid="$1"
     local command_line
-    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    command_line="$(ps -p "$candidate_pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
       *magi-daemon-app*|*"cargo run -p magi-daemon-app"*) return 0 ;;
       *) return 1 ;;
@@ -30,7 +30,7 @@ restart_fixed_port() {
 
   for pid in $pids; do
     if ! is_magi_process "$pid"; then
-      echo "端口 $PORT 已被非 Magi 进程占用（PID $pid），拒绝终止该进程。" >&2
+      echo "端口 $PORT 已被非 Magi 进程占用（PID ${pid}），拒绝终止该进程。" >&2
       return 1
     fi
   done
@@ -49,7 +49,7 @@ restart_fixed_port() {
   if [ -n "$pids" ]; then
     for pid in $pids; do
       if ! is_magi_process "$pid"; then
-        echo "端口 $PORT 的监听进程已变化且不是 Magi，拒绝强制终止（PID $pid）。" >&2
+        echo "端口 $PORT 的监听进程已变化且不是 Magi，拒绝强制终止（PID ${pid}）。" >&2
         return 1
       fi
     done

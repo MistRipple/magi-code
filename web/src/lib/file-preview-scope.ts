@@ -37,18 +37,18 @@ export function resolveFilePreviewScope(input: FilePreviewScopeInput): FilePrevi
   const imageDataUrl = trim(input.imageDataUrl);
   const currentBinding = input.currentBinding;
   const explicitWorkspaceId = trim(input.metadataWorkspaceId);
-  const workspaceId = explicitWorkspaceId || (
-    imageDataUrl
-      ? (currentBinding.scope === 'workspace' ? trim(currentBinding.workspaceId) : '')
-      : trim(input.selectedWorkspaceId)
+  // 消息携带 sessionId 且显式空项目时属于个人会话，不能借用侧栏项目。
+  const explicitPersonal = Boolean(trim(input.metadataSessionId))
+    && input.metadataWorkspaceId === '' && !trim(input.metadataWorkspacePath);
+  const useCurrent = imageDataUrl || explicitPersonal || currentBinding.scope === 'personal';
+  const workspaceId = explicitPersonal ? '' : explicitWorkspaceId || (
+    useCurrent ? trim(currentBinding.workspaceId) : trim(input.selectedWorkspaceId)
   );
   const sessionId = trim(input.metadataSessionId)
     || (workspaceId === trim(currentBinding.workspaceId) ? trim(currentBinding.sessionId) : '')
-    || (workspaceId === trim(input.activeWorkspaceId) ? trim(input.activeSessionId) : '');
-  const workspacePath = trim(input.metadataWorkspacePath)
-    || (imageDataUrl
-      ? (currentBinding.scope === 'workspace' ? trim(currentBinding.workspacePath) : '')
-      : trim(input.selectedWorkspacePath))
+    || (workspaceId && workspaceId === trim(input.activeWorkspaceId) ? trim(input.activeSessionId) : '');
+  const workspacePath = explicitPersonal ? '' : trim(input.metadataWorkspacePath)
+    || (useCurrent ? trim(currentBinding.workspacePath) : trim(input.selectedWorkspacePath))
     || trim(input.workspacePathForId(workspaceId))
     || (workspaceId === trim(currentBinding.workspaceId) ? trim(currentBinding.workspacePath) : '');
   return { workspaceId, workspacePath, sessionId, imageDataUrl };

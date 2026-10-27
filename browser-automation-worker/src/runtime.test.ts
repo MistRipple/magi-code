@@ -97,7 +97,9 @@ class ScriptedPort implements ParentPort {
       ...(message.session_id ? { sessionId: message.session_id } : {}),
     });
     queueMicrotask(() => {
-      const result = message.method === "Runtime.evaluate"
+      const result = message.method === "Runtime.evaluate" && String(message.params?.expression ?? "").startsWith("globalThis.__magiBrowserAutomation.relocatePointer(")
+        ? { result: { value: null } } // 这些协议夹具中的节点不重排；真实重排由 Electron 回归覆盖。
+        : message.method === "Runtime.evaluate"
         && String(message.params?.expression ?? "").includes("typeof globalThis.__magiBrowserAutomation.setAnnotations")
         ? { result: { value: this.runtimeProbe?.() ?? true } }
         : this.respond(message.method, message.params ?? {});
@@ -185,6 +187,7 @@ interface WebScriptResponses {
 
 function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
   let adapterInstalled = false;
+  let setupValue: unknown = null;
   let observeCalls = 0;
   let attachmentReads = 0;
   return new ScriptedPort((method, params) => {
@@ -211,6 +214,7 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
       return { result: { value: responses.probe ?? null } };
     }
     if (expression.includes("globalThis.__magiWebModel.writeText(")) {
+      setupValue = responses.write ?? null;
       return { result: { value: responses.write ?? null } };
     }
     if (expression.includes("globalThis.__magiWebModel.observe(")) {
@@ -226,6 +230,7 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
       };
     }
     if (expression.includes("globalThis.__magiWebModel.submit()")) {
+      setupValue = responses.submit ?? null;
       return { result: { value: responses.submit ?? null } };
     }
     if (expression.includes("globalThis.__magiWebModel.turnState()")) {
@@ -244,16 +249,20 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
       return { result: { value: responses.connectorStatus ?? null } };
     }
     if (expression.includes("globalThis.__magiSetupInput") && expression.includes(".snapshot()")) {
-      return { result: { value: { done: true, failed: false, value: responses.configureConnector ?? null, request: null } } };
+      return { result: { value: { done: true, failed: false, value: setupValue, request: null } } };
     }
     if (expression.includes("globalThis.__magiWebModel.configureConnector(")) {
+      setupValue = responses.configureConnector ?? null;
       return { result: { value: responses.configureConnector ?? null } };
     }
     if (expression.includes("globalThis.__magiWebModel.questionActions(")) {
       if (responses.questionStale) return { exceptionDetails: { text: "web_question_stale:changed" } };
       return { result: { value: [{ kind: "option", item: 0, index: 0 }, { kind: "submit" }] } };
     }
-    if (expression.includes("globalThis.__magiWebModel.activateQuestionAction(")) return { result: { value: true } };
+    if (expression.includes("globalThis.__magiWebModel.activateQuestionAction(")) {
+      setupValue = true;
+      return { result: { value: true } };
+    }
     if (expression.includes("globalThis.__magiWebModel.verifyQuestionAnswer(")) return { result: { value: responses.questionConfirmed !== false } };
     if (expression.includes("globalThis.__magiBrowserAutomation.preparePointer(")) return { result: { value: { x: 50, y: 50, bounds: { x: 40, y: 40, width: 20, height: 20 }, name: "option", role: "radio" } } };
     if (expression.includes("globalThis.__magiBrowserAutomation.verifyPointer(")) return { result: { value: true } };
@@ -1131,6 +1140,10 @@ test("悬停和坐标点击没有收到目标事件时返回未确认；双击�
     tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30, double_click: true },
   } });
   assert.equal(result.outcome.status, "indeterminate");
+  if (result.outcome.status === "indeterminate") {
+    assert.equal(result.outcome.payload.code, "browser_navigation_superseded");
+    assert.equal(result.outcome.payload.side_effect_started, true);
+  }
   assert.equal(port.requests.filter(request => request.method === "Input.dispatchMouseEvent" && request.params.type === "mousePressed").length, 1);
 });
 
@@ -2376,6 +2389,87 @@ test("页面适配器返回畸形的已保存对话 / 连接器结果时命令�
     assert.equal(result.outcome.status, "failed", type);
     if (result.outcome.status === "failed") assert.equal(result.outcome.payload.code, code);
   }
+});
+
+test("配置已点击后轮询失效仍标记结果不确定，不能作为无副作用错误重试", async () => {
+  let polls = 0;
+  const port = new ScriptedPort((method, params) => {
+    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
+    if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+    if (method !== 'Runtime.evaluate') return {};
+    const expression = String(params.expression);
+    if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
+    if (expression.includes('.snapshot()')) {
+      if (polls++ > 0) return { exceptionDetails: { text: 'browser_surface_stale' } };
+      return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'save', value: null } } } };
+    }
+    if (expression.includes('.preparePointer(')) return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 30, height: 30 } } } };
+    if (expression.includes('.finishPointer(')) return { result: { value: { observed: true } } };
+    return { result: { value: true } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
+  const result = await runtime.execute('setup-navigation-after-click', binding, webCommand('web_configure_connector', {
+    tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
+  }));
+  assert.equal(result.outcome.status, 'indeterminate');
+  if (result.outcome.status === 'indeterminate') assert.equal(result.outcome.payload.side_effect_started, true);
+  assert.equal(port.requests.filter(request => request.method === 'Input.dispatchMouseEvent' && request.params.type === 'mousePressed').length, 1);
+});
+
+test("配置命中失败保留固定原因及不确定边界，不重放输入且固定原因不夹带异常正文", async () => {
+  for (const [description, code] of [
+    ['Error: browser_target_obscured\n    at actionPoint', 'browser_target_obscured'],
+    ['Error: browser_element_ref_stale\n    at resolve', 'browser_element_ref_stale'],
+    ['Error: vendor-private-diagnostic', 'browser_page_script_failed'],
+  ]) {
+    const port = new ScriptedPort((method, params) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+      if (method !== 'Runtime.evaluate') return {};
+      const expression = String(params.expression);
+      if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
+      if (expression.includes('.snapshot()')) return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'acknowledge', value: null } } } };
+      if (expression.includes('.preparePointer(')) return { exceptionDetails: { exception: { description } } };
+      return { result: { value: true } };
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
+    const result = await runtime.execute(`setup-hit-${code}`, binding, webCommand('web_configure_connector', {
+      tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
+    }));
+    assert.equal(result.outcome.status, 'indeterminate');
+    if (result.outcome.status === 'indeterminate') {
+      assert.equal(result.outcome.payload.code, code);
+      assert.equal(result.outcome.payload.side_effect_started, true);
+      if (code !== 'browser_page_script_failed') assert.equal(result.outcome.payload.message, code);
+    }
+    assert.equal(port.requests.some(request => request.method.startsWith('Input.')), false);
+  }
+});
+
+test("连接器详情导航保留已输入事实并报告页面交接，不重放旧页点击", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
+    if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+    if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased') {
+      port.emit('Page.frameStartedLoading', {}, { ...binding, navigation_revision: binding.navigation_revision + 1 });
+    }
+    if (method !== 'Runtime.evaluate') return {};
+    const expression = String(params.expression);
+    if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
+    if (expression.includes('.snapshot()')) return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'magi-detail', value: null } } } };
+    if (expression.includes('.preparePointer(')) return { result: { value: { x: 10, y: 20 } } };
+    return { result: { value: true } };
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
+  const result = await runtime.execute('connector-detail-navigation', binding, webCommand('web_configure_connector', {
+    tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
+  }));
+  assert.equal(result.outcome.status, 'indeterminate');
+  if (result.outcome.status === 'indeterminate') {
+    assert.equal(result.outcome.payload.code, 'browser_navigation_superseded');
+    assert.equal(result.outcome.payload.side_effect_started, true);
+  }
+  assert.equal(port.requests.filter(request => request.method === 'Input.dispatchMouseEvent' && request.params.type === 'mousePressed').length, 1);
 });
 
 test("连接器状态与配置命令把页面适配器的回读结果原样返回", async () => {

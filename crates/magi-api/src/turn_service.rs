@@ -1097,10 +1097,10 @@ pub(crate) fn validate_plugin_command_selection(
         }
         if !matches!(
             request.trimmed_text().as_deref().unwrap_or(""),
-            "" | "start" | "continue" | "confirm_connector" | "cancel"
+            "" | "start" | "continue" | "retry_tunnel" | "confirm_connector" | "cancel"
         ) {
             return Err(ApiError::InvalidInput(
-                "配置命令只接受开始、继续或取消；密钥请使用配置卡片的安全输入框".into(),
+                "配置命令只接受开始、继续、重试创建、连接器确认或取消；密钥请使用配置卡片的安全输入框".into(),
             ));
         }
     }

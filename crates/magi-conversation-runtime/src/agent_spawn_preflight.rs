@@ -98,6 +98,7 @@ pub(crate) struct AgentSpawnPreflight {
     pub(crate) child_dependency_ids: Vec<TaskId>,
     pub(crate) child_input_refs: Vec<String>,
     pub(crate) model_source: Option<String>,
+    pub(crate) model_selection: Option<magi_core::AgentModelSelection>,
 }
 
 pub(crate) struct AgentSpawnPreflightInput<'a> {
@@ -387,13 +388,17 @@ pub(crate) fn preflight_agent_spawn(
         })?;
     // role 已在上方完成身份与能力校验；这里只解析该角色的模型绑定，
     // 不参与“是否派发”或“选哪个角色”的决策。
-    let model_source = preflight_agent_model(
+    let (model_source, model_selection) = preflight_agent_model(
         execution_registry,
         parent_task,
         &runtime.settings_store,
         runtime.default_model_client.clone(),
         &role,
         session_id,
+        object
+            .get("reasoning_effort")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()).expect("schema-validated effort")),
     )?;
     let workspace_root = preflight_workspace_and_git(
         execution_registry,
@@ -513,6 +518,7 @@ pub(crate) fn preflight_agent_spawn(
         child_dependency_ids,
         child_input_refs,
         model_source,
+        model_selection,
     })
 }
 
@@ -774,7 +780,8 @@ fn preflight_agent_model(
     default_model_client: Option<Arc<dyn ModelBridgeClient>>,
     role: &str,
     session_id: &magi_core::SessionId,
-) -> Result<Option<String>, AgentSpawnPreflightError> {
+    effort: Option<magi_core::ReasoningEffort>,
+) -> Result<(Option<String>, Option<magi_core::AgentModelSelection>), AgentSpawnPreflightError> {
     let parent_settings = execution_registry
         .get(&parent_task.task_id)
         .and_then(|plan| plan.execution_settings_snapshot());
@@ -782,46 +789,100 @@ fn preflight_agent_model(
     if settings.is_none() && default_model_client.is_none() {
         // 轻量单测和仅验证任务拓扑的运行时没有模型配置注入，保留其原有能力；daemon
         // 生产路径会注入 settings 或默认模型客户端，从而启用完整模型预检。
-        return Ok(None);
+        if effort.is_some() {
+            return Err(AgentSpawnPreflightError::input(
+                "reasoning_capability_unavailable",
+                "当前执行器未提供模型能力",
+                "省略 reasoning_effort 使用执行器默认值。",
+            ));
+        }
+        return Ok((None, None));
     }
-    let role_bound = settings
-        .map(|store| configured_role_engine_model_config(store, role))
-        .transpose()
-        .map_err(|error| {
-            tracing::warn!(role, %error, "agent_spawn role model preflight failed");
-            AgentSpawnPreflightError::runtime(
-                "model_preflight_failed",
-                "model",
-                "角色模型配置不可用",
-                "请检查角色模型引擎绑定和编排模型配置后重试。",
-            )
-        })?
-        .flatten();
-    if role_bound.is_some() {
-        let resolved = resolve_target_for_role(
-            settings,
-            default_model_client,
-            RoleTarget::Agent { role_id: role },
-            Some(session_id),
-        )
-        .map_err(|error| {
-            tracing::warn!(role, %error, "agent_spawn bound role model preflight failed");
-            AgentSpawnPreflightError::runtime(
-                "model_preflight_failed",
-                "model",
-                "角色模型配置不可用",
-                "请检查角色模型引擎绑定后重试。",
-            )
-        })?;
-        if resolved.is_none() {
+    if let Some(store) = settings {
+        let explicitly_bound = parent_task
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.model_selection.as_ref())
+            .is_some()
+            || crate::model_config::configured_role_engine_model_config(store, role)
+                .map_err(|_| {
+                    AgentSpawnPreflightError::runtime(
+                        "model_preflight_failed",
+                        "model",
+                        "角色模型配置不可用",
+                        "请检查角色模型引擎绑定后重试。",
+                    )
+                })?
+                .is_some();
+        let fallback_available =
+            default_model_client.is_some() && effort.is_none() && !explicitly_bound;
+        let (config, engine, revision) = match crate::model_config::agent_target_model_config(
+            store,
+            parent_task,
+            role,
+            session_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) if fallback_available => {
+                // Harnesses and lightweight embedders may provide an already-built client
+                // without a persisted settings section. Preserve the historical fallback;
+                // production with a reasoning override still requires a real catalog.
+                tracing::debug!(role, %error, "falling back to injected agent model client");
+                return Ok((Some("inherited_orchestrator".into()), None));
+            }
+            Err(error) => {
+                tracing::warn!(role, %error, "agent model resolution failed");
+                return Err(AgentSpawnPreflightError::runtime(
+                    "model_preflight_failed",
+                    "model",
+                    "角色或继承模型配置不可用",
+                    "检查原角色模型引擎与主对话配置后重试。",
+                ));
+            }
+        };
+        if config.to_http_model_client().is_none() {
+            if fallback_available {
+                return Ok((Some("inherited_orchestrator".into()), None));
+            }
             return Err(AgentSpawnPreflightError::runtime(
                 "model_preflight_failed",
                 "model",
-                "角色模型配置不可用",
-                "请检查角色模型引擎绑定后重试。",
+                "子代理模型连接不可用",
+                "检查原模型连接配置后重试。",
             ));
         }
-        return Ok(Some("role_engine".to_string()));
+        let mut selection = config.freeze_agent_selection(engine, revision, effort).map_err(|message| AgentSpawnPreflightError::runtime(
+            "invalid_reasoning_effort", "model", message, "按当前角色模型的可用档位重新选择，或省略 reasoning_effort；不得更换模型绕过配置。"
+        ))?;
+        selection.context_window_tokens = Some(
+            crate::model_context_window::resolve_model_context_window_with_override(
+                Some(store),
+                &selection.model,
+                selection.context_window_tokens,
+            ),
+        );
+        let bound = configured_role_engine_model_config(store, role)
+            .ok()
+            .flatten()
+            .is_some();
+        return Ok((
+            Some(
+                if bound {
+                    "role_engine"
+                } else {
+                    "inherited_orchestrator"
+                }
+                .into(),
+            ),
+            Some(selection),
+        ));
+    }
+    if effort.is_some() {
+        return Err(AgentSpawnPreflightError::input(
+            "reasoning_capability_unavailable",
+            "执行器未提供可调模型能力",
+            "省略 reasoning_effort 使用执行器默认值。",
+        ));
     }
     let resolved = resolve_target_for_role(
         settings,
@@ -846,7 +907,7 @@ fn preflight_agent_model(
             "请检查主对话编排模型配置后重试。",
         ));
     }
-    Ok(Some("inherited_orchestrator".to_string()))
+    Ok((Some("inherited_orchestrator".to_string()), None))
 }
 
 fn preflight_workspace_and_git(

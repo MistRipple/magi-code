@@ -2,6 +2,8 @@
 
 脚本的执行入口以各 workspace 的 package.json、Cargo target 和 .github/workflows 为准。本文区分离线检查、真实集成验收与发布，不把源码断言当作真实 Chromium 或 Provider 验收。
 
+模型档位与切换：`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地 Provider，覆盖三/六档、强度实际参数、切模校正、无默认档位重置、设置页覆盖保存、草稿刷新与重启恢复。数据归属和离线回归见[模型推理能力与选择交互](model-reasoning-capabilities.md)；不调用 GPT Web 或用户的外部模型服务。
+
 ## 日常开发与构建
 
 | 任务 | 入口 | 条件 |
@@ -15,6 +17,24 @@
 | crate 架构图 | `npm run docs:architecture` / `npm run docs:architecture:check` | Cargo metadata 生成 docs/architecture.html；crate 注释和业务流程必须引用实际 workspace 成员；CI 发布预检执行一致性检查 |
 
 ## 本地定向回归
+
+无项目会话收口：`npm --prefix web run test:personal-session`，真实 daemon + Chromium 验收用 `npm run test:personal-session-live`。覆盖文件/Shell/执行步骤、项目规则隔离、最近目录、文件预览下载、重启不重放和会话删除回收；只使用独立状态根与本地 Provider。
+
+无项目工具完整矩阵：`npm run test:personal-tools-live` 在同一隔离 daemon/Chromium/App Server 中增加 41 种工具的实际调用与 Provider 回灌，涵盖完整文件操作、图片生成/查看、提问答复、后台进程读写/等待/停止、12 个 Git 工具（remote 为本地 bare 仓库）、Goal/Plan 与代理发送/上下文检索/答复/取消；基础场景另执行 `update_execution_steps`。确认子代理取消已结算且主线继续完成，重启不重放副作用。模型和图片 Provider 均为本地替身，不调用 GPT Web 或用户模型配置。
+
+83 个内置工具按以下口径全量核对，不能把目录检查或模拟宿主当作真实页面验收：
+
+| 工具范围 | 数量 | 验证入口和边界 |
+| --- | --- | --- |
+| 个人通用、Git、目标/计划、代理和提问 | 42 | `test:personal-tools-live` 的真实 Turn/执行器/本地持久副作用，包含原基础执行步骤场景 |
+| `web_search` | 1 | `cargo test -p magi-tool-runtime --lib web_search_live_smoke_returns_json_payload -- --ignored`，真实网络搜索；外网可用性单独报告 |
+| `browser_*` | 29 | `personal_session_routes_every_browser_tool` 全量验证无项目/无 cwd 的宿主路由；Worker `src/runtime.test.ts` 验证动作和诊断语义；`test:electron-browser-actions` 使用真实 Chromium 核对点击、输入、悬停、表单、拖拽、frame 和导航失效，其他诊断动作不宣称逐项真实网站验收 |
+| 项目专用工具 | 6 | `search_semantic`、`knowledge_query`、`knowledge_graph_query`、`code_symbols`、`memory_write`、`agent_apply` 在个人模型目录隐藏，`personal_session_project_tools` 核对调用拒绝且无持久副作用 |
+| 内部进程工具 | 5 | `process_launch/read/write/kill/list` 由工具库进程回归验证，不作为模型工具暴露；个人会话通过公开 `shell_exec` 的后台动作闭环验证 |
+
+`cargo test -p magi-conversation-runtime --lib personal_session_catalog` 逐项核对全部 83 个工具在个人主线和普通子代理中的目录范围。代理补充回归 `agent_send_pending_to_running_race` 验证 Pending → Running 竞态只提交一次、持久失败无半写和无唤醒；API `personal_agent_cancel_preserves` 复用 daemon 的终态通知入口，验证普通子代理的 Killed 只释放子资源，不收口父 Turn。独立 Agent Turn 的既有终态仍由原绑定拥有。
+
+无项目 Git 与工具边界：`cargo test -p magi-api --lib personal_` 覆盖多仓库基线、持久恢复、外部漂移 CAS，以及删除时仅回收干净自有 worktree、保留 dirty/占用资源和外部仓库；`cargo test -p magi-api --lib web_slot_mcp::tests` 经真实 MCP socket 验证个人 GPT Web 的读写、原会话审批与工具记录、Git 查询、权限限制及槽位撤销。`cargo test -p magi-tool-runtime --lib personal_git_permissions` 验证外部仓库及 linked worktree 元数据均在执行前授权；`cargo test -p magi-project-memory --lib personal_memory_write` 验证误注入项目存储时也不能写入项目记忆。上述 live 脚本另经真实 Turn 链路执行 Shell 建仓、Git 查询/切分支和双仓库隔离；Provider 为本地替身，不代表外部模型或已登录 GPT 网站验收。
 
 - Web：`npm --prefix web run check` 和 web/package.json 中对应的 `test:*`。`test:transport` 包括实时传输、App Server 客户端、滚动协调和数据加载恢复回归；`test:data-loading` 单独验证临时失败、旧请求、插件修订失效和交互作用域切换。`test:notification-runtime` 覆盖后台目录、全局错误与切换会话后的异步错误归属。
 - Desktop：`npm run check --workspace @magi/desktop`、`npm run test --workspace @magi/desktop`。

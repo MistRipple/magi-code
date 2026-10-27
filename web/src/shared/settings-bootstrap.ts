@@ -69,6 +69,7 @@ export interface WebConversationProjection {
 }
 
 export interface SettingsBootstrapPayload {
+  orchestratorReasoningCapability?: import('./rust-backend-types').ModelReasoningCapability | null;
   scope: 'personal' | 'workspace';
   workspaceId?: string | null;
   workspacePath?: string | null;

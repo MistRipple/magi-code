@@ -152,7 +152,7 @@
   const durationLabel = $derived.by(() => {
     if (isLive) return formatElapsed(Math.max(0, elapsedSeconds));
     if (durationMs === null) return '';
-    return durationMs > 0 && durationMs < 1000 ? '<1s' : formatDuration(durationMs);
+    return formatDuration(durationMs, (key, vars) => i18n.t(key, vars));
   });
   const disclosureLabel = $derived.by(() => {
     const prefix = isLive
@@ -326,7 +326,7 @@
     max-width: 100%;
     min-height: 38px;
     gap: 8px;
-    padding: 0 var(--tool-card-padding);
+    padding: 0;
     border: 0;
     border-bottom: var(--magi-hairline) solid var(--border);
     border-radius: 0;
@@ -409,15 +409,9 @@
     margin-left: 0;
   }
 
-  .conversation-turn > :global(.message-item.assistant) { padding-inline:0; }
-
   .turn-promoted {
     min-width: 0;
     padding: 2px 0;
-  }
-
-  .turn-promoted :global(.message-item.assistant) {
-    padding-inline: 0;
   }
 
   @media (max-width: 560px) {

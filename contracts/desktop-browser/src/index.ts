@@ -424,7 +424,7 @@ export type BrowserHostCommand =
       payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; name: string; tunnel_id: string };
     }
   /** 创建 / 回读平台 Tunnel；禁止返回页面正文或密钥。 */
-  | { type: "web_platform_setup"; payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; action: "inspect_tunnel" | "create_tunnel" } }
+  | { type: "web_platform_setup"; payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; action: "inspect_tunnel" | "create_tunnel" | "prepare_runtime_key" } }
   | { type: "shutdown" };
 
 export interface BrowserHostRequestEnvelope {

@@ -48,7 +48,29 @@ fn execute_git_tool(
         Ok(arguments) => arguments,
         Err(message) => return rejected(tool, "git_invalid_input", message),
     };
-    if execution_context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline {
+    // 个人会话的仓库绑定来自明确目录，不借用 workspace 或主会话 Git context。
+    let personal = execution_context.workspace_id.is_none();
+    let (personal_binding, _personal_lease) = if personal {
+        match resolve_personal_binding(deps, execution_context, &arguments) {
+            Ok((binding, lease)) => (Some(binding), Some(lease)),
+            Err(result) => return result,
+        }
+    } else {
+        (None, None)
+    };
+    if personal
+        && execution_context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline
+        && !matches!(tool, "git_status" | "git_branch_list" | "git_worktree_list")
+    {
+        return rejected(
+            tool,
+            "agent_git_mutation_forbidden",
+            "子代理只能查询获授目录的 Git 资源",
+        );
+    }
+    if !personal
+        && execution_context.caller_scope != magi_tool_runtime::ToolCallerScope::SessionMainline
+    {
         if tool == "agent_apply"
             && execution_context.caller_scope == magi_tool_runtime::ToolCallerScope::DelegatingTask
         {
@@ -60,7 +82,10 @@ fn execute_git_tool(
         }
         return execute_delegated_git_query(deps, tool, &arguments, execution_context);
     }
-    let binding = match resolve_binding(deps, execution_context, &arguments) {
+    let binding = match personal_binding
+        .map(Ok)
+        .unwrap_or_else(|| resolve_binding(deps, execution_context, &arguments))
+    {
         Ok(binding) => binding,
         Err(result) => return result,
     };
@@ -71,7 +96,7 @@ fn execute_git_tool(
             json!({
                 "observation": binding.observation,
                 "sessionContext": binding.context,
-                "contextDrift": false,
+                "contextDrift": binding.context.has_external_drift(),
             }),
         ),
         "git_branch_list" => {
@@ -425,6 +450,81 @@ struct GitToolBinding {
     precondition: GitPrecondition,
 }
 
+fn resolve_personal_binding(
+    deps: &GitToolRuntimeDependencies,
+    execution: &ToolExecutionContext,
+    arguments: &Map<String, Value>,
+) -> Result<(GitToolBinding, magi_git::GitMutationLease), (String, ExecutionResultStatus)> {
+    let session = execution
+        .session_id
+        .as_ref()
+        .ok_or_else(|| rejected("git", "git_missing_session", "缺少会话身份"))?;
+    let cwd = execution
+        .working_directory
+        .as_deref()
+        .ok_or_else(|| rejected("git", "git_missing_working_directory", "缺少会话执行目录"))?;
+    let path = magi_core::HostPath::resolve_native_input(
+        optional_string(arguments, "repositoryPath")
+            .as_deref()
+            .unwrap_or("."),
+        Some(cwd),
+        None,
+    )
+    .map_err(|error| rejected("git", "git_invalid_repository_path", error.to_string()))?
+    .into_path_buf();
+    let observation =
+        block_on(deps.git_service.observe(&path)).map_err(|error| git_error("git", error))?;
+    if !same_path(&path, &observation.worktree_path) {
+        return Err(rejected(
+            "git",
+            "git_repository_root_required",
+            "repositoryPath 必须明确指向仓库工作树根目录",
+        ));
+    }
+    let lease = deps
+        .workspace_git_coordinator
+        .begin_mutation(&observation.git_common_dir)
+        .map_err(|error| rejected("git", "git_repository_busy", error.to_string()))?;
+    let current =
+        block_on(deps.git_service.observe(&path)).map_err(|error| git_error("git", error))?;
+    if !same_path(&current.git_common_dir, &observation.git_common_dir) {
+        return Err(rejected(
+            "git",
+            "git_repository_changed",
+            "取得仓库租约前 repository 已变化",
+        ));
+    }
+    let observation = current;
+    let context = deps
+        .session_code_contexts
+        .observe(session.as_str(), "", vec![], &observation);
+    if arguments
+        .get("expectedContextRevision")
+        .and_then(Value::as_u64)
+        .is_some_and(|revision| revision != context.context_revision)
+    {
+        return Err(rejected(
+            "git",
+            "git_stale_context_revision",
+            "仓库上下文 revision 已变化，请重新读取状态",
+        ));
+    }
+    // 只读状态可以展示漂移。修改必须按调用方刚确认的 branch/HEAD/path 或原基线比较。
+    let precondition = explicit_precondition(arguments).unwrap_or_else(|| context.precondition());
+    persist_contexts(deps).map_err(|error| failed("git", "git_context_persist_failed", error))?;
+    Ok((
+        GitToolBinding {
+            session_id: session.to_string(),
+            workspace_id: String::new(),
+            path: observation.worktree_path.clone(),
+            context,
+            observation,
+            precondition,
+        },
+        lease,
+    ))
+}
+
 fn resolve_binding(
     deps: &GitToolRuntimeDependencies,
     execution_context: &ToolExecutionContext,
@@ -465,6 +565,22 @@ fn resolve_binding(
             "git_workspace_mismatch",
             "工具上下文与 session Git context 不属于同一 workspace",
         ));
+    }
+    if let Some(path) = optional_string(arguments, "repositoryPath") {
+        let target = magi_core::HostPath::resolve_native_input(
+            &path,
+            execution_context.working_directory.as_deref(),
+            None,
+        )
+        .map_err(|error| rejected("git", "git_invalid_repository_path", error.to_string()))?
+        .into_path_buf();
+        if !same_path(&target, &existing.execution_root) {
+            return Err(rejected(
+                "git",
+                "git_repository_mismatch",
+                "项目会话的 Git 操作必须使用当前获授工作树",
+            ));
+        }
     }
     let working_directory = execution_context
         .working_directory
@@ -586,9 +702,10 @@ fn execute_mutation(
             "子代理不能改变主对话的 branch、HEAD 或 worktree",
         );
     }
-    if !deps
-        .workspace_git_coordinator
-        .session_holds_execution(&binding.session_id, &binding.context.git.git_common_dir)
+    if !binding.workspace_id.is_empty()
+        && !deps
+            .workspace_git_coordinator
+            .session_holds_execution(&binding.session_id, &binding.context.git.git_common_dir)
     {
         return rejected(
             tool,
@@ -609,6 +726,41 @@ fn execute_mutation(
         );
     }
 
+    if binding.workspace_id.is_empty()
+        && deps
+            .task_store
+            .as_ref()
+            .zip(execution_context.task_id.as_ref())
+            .is_some_and(|(store, caller)| {
+                store.get_children(caller).iter().any(|child| {
+                    !matches!(
+                        child.status,
+                        magi_core::TaskStatus::Completed
+                            | magi_core::TaskStatus::Failed
+                            | magi_core::TaskStatus::Killed
+                    )
+                })
+            })
+    {
+        return rejected(
+            tool,
+            "agent_execution_active",
+            "个人会话仍有子代理运行；改变 Git branch/HEAD 前必须等待它们完成",
+        );
+    }
+    if binding.workspace_id.is_empty()
+        && binding.context.has_external_drift()
+        && !(arguments.get("expectedBranch") == Some(&json!(binding.observation.branch))
+            && arguments.get("expectedHead") == Some(&json!(binding.observation.head))
+            && optional_string(arguments, "expectedWorktreePath")
+                .is_some_and(|path| same_path(Path::new(&path), &binding.path)))
+    {
+        return rejected(
+            tool,
+            "git_stale_context",
+            "仓库 branch/HEAD 已变化；先读取 git_status，再明确传 expectedBranch、expectedHead、expectedWorktreePath 确认本次操作基线",
+        );
+    }
     let operation = match tool {
         "git_branch_create" => {
             let branch = match required_string(arguments, "branch") {
@@ -715,7 +867,16 @@ fn execute_mutation(
             );
             let path = deps
                 .managed_worktree_root
-                .join(&binding.workspace_id)
+                .join(if binding.workspace_id.is_empty() {
+                    "personal"
+                } else {
+                    &binding.workspace_id
+                })
+                .join(if binding.workspace_id.is_empty() {
+                    binding.session_id.as_str()
+                } else {
+                    ""
+                })
                 .join(format!("{}-{}", allocation_key, UtcMillis::now().0));
             if let Some(parent) = path.parent()
                 && let Err(error) = std::fs::create_dir_all(parent)
@@ -754,7 +915,18 @@ fn execute_mutation(
                 Ok(value) => PathBuf::from(value),
                 Err(message) => return rejected(tool, "git_invalid_input", message),
             };
-            let managed_root = deps.managed_worktree_root.join(&binding.workspace_id);
+            let managed_root = deps
+                .managed_worktree_root
+                .join(if binding.workspace_id.is_empty() {
+                    "personal"
+                } else {
+                    &binding.workspace_id
+                })
+                .join(if binding.workspace_id.is_empty() {
+                    binding.session_id.as_str()
+                } else {
+                    ""
+                });
             if !path_is_within(&path, &managed_root) {
                 return rejected(
                     tool,
@@ -832,7 +1004,7 @@ fn finish_mutation(
     if let Err(message) = persist_contexts(deps) {
         return failed(tool, "git_context_persist_failed", message);
     }
-    let snapshot_baseline_status = if git_tree_changed {
+    let snapshot_baseline_status = if git_tree_changed && !binding.workspace_id.is_empty() {
         match block_on(
             deps.snapshot_manager
                 .rebase_session(binding.session_id.clone(), binding.path.clone()),
@@ -885,6 +1057,9 @@ fn schedule_code_index_refresh(
     workspace_id: &str,
     workspace_root: &Path,
 ) {
+    if workspace_id.is_empty() {
+        return;
+    }
     let workspace_id = WorkspaceId::new(workspace_id.to_string());
     if !deps
         .knowledge_store
@@ -907,6 +1082,9 @@ fn publish_context_changed(
     context: &SessionCodeContext,
     observation: &GitObservation,
 ) {
+    if workspace_id.is_empty() {
+        return;
+    }
     deps.event_bus.publish(
         EventEnvelope::domain(
             EventId::unique(format!("workspace-git-context-changed-{workspace_id}")),
@@ -1190,6 +1368,109 @@ mod tests {
         fs::write(root.join("README.md"), "base\n").expect("seed file");
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-m", "base"]);
+    }
+
+    #[test]
+    fn personal_git_uses_explicit_repositories_and_preserves_baselines_across_restore() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("personal");
+        fs::create_dir_all(&cwd).unwrap();
+        let a = cwd.join("repo-a");
+        let b = fixture.path().join("repo-b");
+        init_repository(&a);
+        init_repository(&b);
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        let coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
+        let service = Arc::new(magi_git::GitService::new());
+        let executor = build_git_tool_executor(GitToolRuntimeDependencies {
+            task_store: None,
+            git_service: service.clone(),
+            session_code_contexts: contexts.clone(),
+            workspace_git_coordinator: coordinator.clone(),
+            event_bus: Arc::new(InMemoryEventBus::new(32)),
+            knowledge_store: Arc::new(magi_knowledge_store::KnowledgeStore::new()),
+            snapshot_manager: Arc::new(magi_snapshot::SnapshotManager::new()),
+            runtime_persistence: Arc::new(RuntimeStatePersistence::new(
+                fixture.path().join("state"),
+                fixture.path().join("workspaces.json"),
+                fixture.path().join("knowledge.json"),
+            )),
+            managed_worktree_root: fixture.path().join("worktrees"),
+        });
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("personal-git")),
+            working_directory: Some(cwd.clone()),
+            access_profile: AccessProfile::FullAccess,
+            ..Default::default()
+        };
+        let call = |tool: &str, args: Value| {
+            let (payload, status) = executor(tool, &args.to_string(), &context);
+            (serde_json::from_str::<Value>(&payload).unwrap(), status)
+        };
+        let (result, status) = call("git_status", json!({}));
+        assert_ne!(status, ExecutionResultStatus::Succeeded, "{result}");
+        assert!(!cwd.join(".git").exists());
+        for path in [&a, &b] {
+            let (result, status) = call("git_status", json!({"repositoryPath": path}));
+            assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        }
+        let (result, status) = call(
+            "git_branch_create",
+            json!({"repositoryPath":"repo-a", "branch":"feature"}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        assert_eq!(git(&a, &["branch", "--show-current"]), "feature");
+        assert_eq!(git(&b, &["branch", "--show-current"]), "main");
+        let (result, status) = call(
+            "git_worktree_create",
+            json!({"repositoryPath": a, "mode":"read_only"}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        let managed = result["result"]["data"]["worktree"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(path_is_within(
+            Path::new(managed),
+            &fixture.path().join("worktrees/personal/personal-git")
+        ));
+        let (result, status) = call(
+            "git_worktree_remove",
+            json!({"repositoryPath":a,"path":managed}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        assert!(
+            contexts.get("personal-git").is_none(),
+            "个人 Git 不得改变会话默认 cwd 或生成项目 context"
+        );
+        assert_eq!(contexts.all().len(), 2);
+        let persisted = fs::read(fixture.path().join("state/session-git-contexts.json")).unwrap();
+        contexts.restore_after_restart(serde_json::from_slice(&persisted).unwrap());
+        git(&a, &["switch", "main"]);
+        let (result, status) = call("git_status", json!({"repositoryPath": a}));
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        assert_eq!(result["result"]["contextDrift"], true);
+        let (result, status) = call(
+            "git_branch_create",
+            json!({"repositoryPath": a, "branch":"blocked"}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Rejected, "{result}");
+        assert_eq!(result["error_code"], "git_stale_context");
+        let observation = block_on(service.observe(&a)).unwrap();
+        let (result, status) = call(
+            "git_branch_create",
+            json!({"repositoryPath":a,"branch":"accepted",
+            "expectedBranch":observation.branch, "expectedHead":observation.head,"expectedWorktreePath":observation.worktree_path}),
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{result}");
+        coordinator
+            .begin_execution("other-project-session", &observation.git_common_dir)
+            .unwrap();
+        let (result, status) = call("git_status", json!({"repositoryPath":a}));
+        assert_eq!(status, ExecutionResultStatus::Rejected, "{result}");
+        assert_eq!(result["error_code"], "git_repository_busy");
+        coordinator.end_execution("other-project-session");
+        contexts.remove("personal-git");
+        assert!(contexts.all().is_empty());
     }
 
     fn apply_task(

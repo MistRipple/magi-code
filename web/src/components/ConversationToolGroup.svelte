@@ -113,7 +113,6 @@
    */
   :global(.conversation-turn .summary-tool-flow .message-item.assistant) {
     margin-top: 0;
-    padding-inline: 0;
   }
 
   :global(.conversation-turn .summary-tool-flow .tool-call) {

@@ -12,6 +12,7 @@ mod mcp_client;
 mod mcp_loopback;
 mod model_loopback;
 pub mod protocol;
+pub mod reasoning;
 pub mod structured_dispatch;
 pub mod tool_concurrency;
 mod transport;

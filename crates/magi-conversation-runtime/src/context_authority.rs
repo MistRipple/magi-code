@@ -1030,8 +1030,12 @@ impl<'a> ContextAuthority<'a> {
     ) -> Result<CompactionModel<'a>, String> {
         let auxiliary = self
             .settings_store
-            .map(|store| store.get_section("auxiliary"))
-            .map(|config| NormalizedModelConfig::from_settings_value(&config))
+            .map(|store| {
+                NormalizedModelConfig::from_settings_with_catalog(
+                    store,
+                    &store.get_section("auxiliary"),
+                )
+            })
             .transpose()?
             .and_then(|config| {
                 let client = config.to_http_model_client()?;

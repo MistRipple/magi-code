@@ -533,7 +533,7 @@
           </div>
 
           {#if resourceLoading && !browserResources}
-            <div class="resource-empty" role="status"><Icon name="loader" size={14} />{i18n.t('settings.browser.resourcesReading')}</div>
+            <div class="resource-empty" role="status"><Icon name="loader" size={14} class="spinning" />{i18n.t('settings.browser.resourcesReading')}</div>
           {:else if browserResources?.tabs.length === 0}
             <div class="resource-empty">{i18n.t('settings.browser.resourcesEmpty')}</div>
           {:else if browserResources}

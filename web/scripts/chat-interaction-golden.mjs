@@ -201,6 +201,7 @@ await withGoldenViteServer(async server => {
     assert.equal(dispatch('keydown', { key: 'Enter' }, input).defaultPrevented, true,
       'descendant composition end uses the same editor grace period');
     assert.equal(submissions, 2);
+    await new Promise(resolve => setTimeout(resolve, 510));
     cleanup.destroy();
     dispatch('compositionstart', {}, input);
     dispatch('keydown', { key: 'Enter' }, input);
@@ -224,7 +225,7 @@ await withGoldenViteServer(async server => {
       else if (ending === 'dispose') stop();
       else if (ending === 'lostcapture') dispatch('lostpointercapture', {}, handle);
       else dispatch(ending, { pointerId: 7 });
-      assert.deepEqual(results, [ending !== 'pointerup']);
+      assert.deepEqual(results, [ending !== 'pointerup'], `${ending} settles the resize transaction`);
       assert.equal(shields.at(-1).removed, true, `${ending} removes the shield`);
       assert.equal(handle.captured, null);
       assert.deepEqual(body.style, { cursor: 'default', userSelect: 'text' });
@@ -233,8 +234,8 @@ await withGoldenViteServer(async server => {
       assert.equal(moves, 1, 'listeners stop after transaction cleanup');
       assert.equal(results.length, 1, 'cleanup is idempotent');
       assert.equal(dispatch('click').defaultPrevented, true, 'drag-ending click cannot activate underlying content');
-      await new Promise(resolve => setTimeout(resolve, 0));
-      assert.equal(dispatch('click').defaultPrevented, false, 'the next deliberate click remains available');
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(dispatch('click').defaultPrevented, false, `${ending}: the next deliberate click remains available`);
     }
   } finally {
     for (const [name, value] of Object.entries(globals)) {

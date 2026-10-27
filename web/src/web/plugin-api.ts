@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 import { getTransport } from '../shared/transport';
 import { agentUrl } from './agent-api';
 import type {
@@ -41,18 +42,18 @@ async function pluginFailure(action: string, response: Response): Promise<Error>
   } catch {
     // 响应体不是 JSON 时只报告状态码。
   }
-  return new Error(detail ? `${action}：${detail}` : `${action}（HTTP ${response.status}）`);
+  return new Error(detail ? i18n.t('common.actionFailureDetail', { action, detail }) : `${action} (HTTP ${response.status})`);
 }
 
 export async function listInstalledPlugins(): Promise<PluginList> {
   const response = await pluginRequest('/api/plugins');
-  if (!response.ok) throw await pluginFailure('读取插件列表失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.load'), response);
   return await response.json() as PluginList;
 }
 
 export async function listBundledPlugins(): Promise<PluginManifest[]> {
   const response = await pluginRequest('/api/plugins/bundled');
-  if (!response.ok) throw await pluginFailure('内置插件列表请求失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.bundled'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifest[] : [];
 }
@@ -61,7 +62,7 @@ export async function installBundledPlugin(pluginId: string): Promise<void> {
   const response = await pluginRequest(`/api/plugins/bundled/${encodeURIComponent(pluginId)}/install`, {
     method: 'POST',
   });
-  if (!response.ok) throw await pluginFailure('安装内置插件失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installBundled'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -95,7 +96,7 @@ export async function previewPluginCandidate(candidate: PluginCandidate): Promis
     headers: { 'content-type': 'application/json' },
     body: candidateBody(candidate),
   });
-  if (!response.ok) throw await pluginFailure('读取候选插件失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.preview'), response);
   return await response.json() as PluginCandidatePreview;
 }
 
@@ -107,20 +108,20 @@ export async function applyPluginCandidate(candidate: PluginCandidate, preview: 
     headers: { 'content-type': 'application/json' },
     body: candidateBody(candidate, preview.digest),
   });
-  if (!response.ok) throw await pluginFailure(upgrade ? '升级插件失败' : '安装插件失败', response);
+  if (!response.ok) throw await pluginFailure(upgrade ? i18n.t('plugins.error.upgrade') : i18n.t('plugins.error.install'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
 /** 插件作者指南（Markdown）：随 daemon 发布，与仓库文档同源。 */
 export async function fetchPluginGuide(): Promise<string> {
   const response = await pluginRequest('/api/plugins/guide');
-  if (!response.ok) throw await pluginFailure('读取插件开发规范失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.guide'), response);
   return await response.text();
 }
 
 export async function fetchPluginCenter(): Promise<PluginCenterProjection> {
   const response = await pluginRequest('/api/plugins/center');
-  if (!response.ok) throw await pluginFailure('读取插件中心失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.center'), response);
   return await response.json() as PluginCenterProjection;
 }
 
@@ -130,7 +131,7 @@ export async function savePluginCenterConfig(config: PluginCenterConfig): Promis
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(config),
   });
-  if (!response.ok) throw await pluginFailure('保存插件中心配置失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.saveCenter'), response);
   return await response.json() as PluginCenterConfig;
 }
 
@@ -141,7 +142,7 @@ export async function installFromPluginCenter(id: string, version?: string): Pro
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id, version: version ?? null }),
   });
-  if (!response.ok) throw await pluginFailure('从插件中心安装失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installCenter'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -155,9 +156,9 @@ export async function authorizeAndActivatePlugin(pluginId: string, manifest: Plu
     });
     if (!response.ok) throw await pluginFailure(failure, response);
   };
-  await post('authorize', { grants: manifest.permissions }, '插件授权失败');
-  await post('enable', {}, '插件激活失败');
-  await post('activate', {}, '插件激活失败');
+  await post('authorize', { grants: manifest.permissions }, i18n.t('plugins.error.authorize'));
+  await post('enable', {}, i18n.t('plugins.error.activate'));
+  await post('activate', {}, i18n.t('plugins.error.activate'));
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -167,7 +168,7 @@ async function changePluginActivation(pluginId: string, action: 'deactivate' | '
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ scope: APPLICATION_PLUGIN_SCOPE }),
   });
-  if (!response.ok) throw await pluginFailure(action === 'deactivate' ? '停用插件失败' : '禁用插件失败', response);
+  if (!response.ok) throw await pluginFailure(action === 'deactivate' ? i18n.t('plugins.error.deactivate') : i18n.t('plugins.error.disable'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -181,7 +182,7 @@ export function disablePlugin(pluginId: string): Promise<void> {
 
 export async function uninstallPlugin(pluginId: string): Promise<void> {
   const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/uninstall`, { method: 'POST' });
-  if (!response.ok) throw await pluginFailure('卸载插件失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.uninstall'), response);
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }
 
@@ -189,21 +190,21 @@ export async function loadActivePluginManifests(scope = APPLICATION_PLUGIN_SCOPE
   const response = await getTransport().request(
     agentUrl(`/api/plugins/manifests?scope=${encodeURIComponent(scope)}`),
   );
-  if (!response.ok) throw await pluginFailure('插件清单请求失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.manifest'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginManifestProjection[] : [];
 }
 
 export async function loadActivePluginCommands(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginContributionProjection[]> {
   const response = await pluginRequest(`/api/plugins/commands?scope=${encodeURIComponent(scope)}`);
-  if (!response.ok) throw await pluginFailure('插件命令请求失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.commands'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
 
 export async function loadActivePluginWorkflows(scope = APPLICATION_PLUGIN_SCOPE): Promise<PluginContributionProjection[]> {
   const response = await pluginRequest(`/api/plugins/workflows?scope=${encodeURIComponent(scope)}`);
-  if (!response.ok) throw await pluginFailure('插件工作流请求失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.workflows'), response);
   const payload = await response.json() as unknown;
   return Array.isArray(payload) ? payload as PluginContributionProjection[] : [];
 }
@@ -228,7 +229,7 @@ export function subscribePluginResource(
           const event = JSON.parse(data) as { reset?: unknown; closed?: unknown; version?: unknown; value?: unknown };
           if (event.closed === true) {
             // 插件被停用、撤权或升级：订阅已由 daemon 结束，不会再有变更。
-            onError?.(new Error('插件资源订阅已关闭'));
+            onError?.(new Error(i18n.t('plugins.error.subscriptionClosed')));
             return;
           }
           if (event.reset === true) {
@@ -251,7 +252,7 @@ export function subscribePluginResource(
         }
       },
       onError() {
-        if (!closed) onError?.(new Error('插件资源订阅失败'));
+        if (!closed) onError?.(new Error(i18n.t('plugins.error.subscriptionFailed')));
       },
     },
   );
@@ -269,7 +270,7 @@ export async function readPluginResource(
   const response = await pluginRequest(
     `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}?scope=${encodeURIComponent(scope)}`,
   );
-  if (!response.ok) throw await pluginFailure('读取插件资源失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readResource'), response);
   return await response.json();
 }
 
@@ -288,7 +289,7 @@ export async function writePluginResource(
       body: JSON.stringify({ expectedVersion, value }),
     },
   );
-  if (!response.ok) throw await pluginFailure('写入插件资源失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.writeResource'), response);
   return await response.json();
 }
 
@@ -296,7 +297,7 @@ export async function readPluginSettings(pluginId: string, scope: string): Promi
   const response = await pluginRequest(
     `/api/plugins/${encodeURIComponent(pluginId)}/settings?scope=${encodeURIComponent(scope)}`,
   );
-  if (!response.ok) throw await pluginFailure('读取插件设置失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readSettings'), response);
   return await response.json();
 }
 
@@ -314,6 +315,6 @@ export async function writePluginSettings(
       body: JSON.stringify({ expectedVersion, value }),
     },
   );
-  if (!response.ok) throw await pluginFailure('写入插件设置失败', response);
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.writeSettings'), response);
   return await response.json();
 }

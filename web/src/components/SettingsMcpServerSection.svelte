@@ -447,7 +447,7 @@
   }
 
   function formatTime(ms: number): string {
-    return new Date(ms).toLocaleString();
+    return new Date(ms).toLocaleString(i18n.locale);
   }
 
   function tokenStateLabel(token: McpServerToken): string {
@@ -533,8 +533,8 @@
 <section class="mcp-server-section" data-mcp-server="1">
   <div class="settings-section-header">
     <div>
-    <div class="settings-section-title">{i18n.t('mcpServer.title')}</div>
-    <div class="settings-section-desc">{i18n.t('mcpServer.desc')}</div>
+      <div class="settings-section-title">{i18n.t('mcpServer.title')}</div>
+      <div class="settings-section-desc">{i18n.t('mcpServer.desc')}</div>
     </div>
   </div>
 
@@ -554,7 +554,7 @@
         onclick={() => { tab = id; }}
       >
         {i18n.t(`mcpServer.tab.${id}`)}
-        {#if tabBadge(id)}<span class="tab-badge" class:tab-badge--alert={id === 'activity'}>{tabBadge(id)}</span>{/if}
+        {#if tabBadge(id)}<span class="tab-badge">{tabBadge(id)}</span>{/if}
       </button>
     {/each}
   </div>
@@ -1071,6 +1071,9 @@
 
 <style>
   .mcp-server-section {
+    container-type: inline-size;
+    container-name: mcp-server;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -1088,71 +1091,102 @@
     color: var(--accent-strong, #3b6fd4);
   }
 
-  .tab-badge--alert {
-    background: var(--danger, #c53f4f);
-    color: #fff;
+  .mcp-card {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: var(--space-3);
+    padding: var(--space-4);
   }
 
-
-  .card h4 {
+  .mcp-card h4 {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--text-sm);
+  }
+
+  .clients-header, .clients-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+
+  .clients-footer {
+    padding-top: var(--space-3);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+  }
+
+  .clients-footer > .action-row:last-child {
+    margin-left: auto;
   }
 
   .meta {
     margin: 0;
     font-size: var(--text-xs);
-    opacity: 0.66;
+    color: var(--foreground-muted);
+    line-height: 1.5;
     overflow-wrap: anywhere;
   }
 
   .switch-line {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     font-size: 12px;
     cursor: pointer;
     min-height: 24px;
   }
 
-
-
   .rows {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 0;
     margin: 4px 0 0;
     padding: 0;
     list-style: none;
   }
 
-  .rows li {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+  .rows > li {
+    min-width: 0;
+    padding: var(--space-4) 0;
+  }
+
+  .rows > li + .token-row {
+    border-top: var(--magi-hairline) solid var(--border-subtle);
+  }
+
+  .token-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    align-items: start;
+    gap: var(--space-3);
+  }
+
+  .token-row .settings-row-copy {
+    gap: var(--space-2);
+    overflow-wrap: anywhere;
+  }
+
+  .token-actions {
+    justify-content: flex-end;
+  }
+
+  .badge--off {
+    color: var(--foreground-muted);
   }
 
   .rows li.detail {
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: flex-start;
-    margin-left: 12px;
-  }
-
-  .edit-form {
-    padding-top: 0;
-    border-top: none;
+    display: grid;
+    gap: var(--space-3);
+    border-top: var(--magi-hairline) solid var(--border-subtle);
   }
 
   .rows li.inactive {
     opacity: 0.55;
   }
-
-
 
   .quick-add {
     display: flex;
@@ -1164,7 +1198,7 @@
 
   .form-field-row {
     display: grid;
-    grid-template-columns: 96px minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
     align-items: center;
     gap: 8px;
   }
@@ -1175,13 +1209,9 @@
   }
 
   .field textarea {
-    padding: 4px 8px;
-    border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.24));
-    border-radius: 6px;
-    font-size: 12px;
-    font-family: inherit;
-    background: transparent;
-    color: inherit;
+    height: auto;
+    min-height: 64px;
+    padding-block: var(--space-2);
     resize: vertical;
   }
 
@@ -1223,33 +1253,29 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
     font-size: var(--text-xs);
   }
 
-  .field input,
-  .field :global(.select-field select) {
-    min-height: 28px;
-    padding: 0 var(--space-3);
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-sm);
-    font-size: var(--text-sm);
-    background: var(--vscode-input-background);
-    color: var(--foreground);
+  .create-form.edit-form {
+    padding-top: 0;
+    border-top: 0;
   }
-  .field input:focus,
-  .field :global(.select-field select):focus { outline: none; border-color: var(--primary); }
 
   .snippet {
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
   }
 
   .snippet-head {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     justify-content: space-between;
     gap: 8px;
+    min-width: 0;
   }
 
   .snippet pre {
@@ -1258,6 +1284,8 @@
     border-radius: 8px;
     font-size: var(--text-xs);
     overflow-x: auto;
+    min-width: 0;
+    max-width: 100%;
     background: var(--surface-muted, rgba(127, 127, 127, 0.1));
   }
 
@@ -1265,6 +1293,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+    min-width: 0;
   }
 
   .status-message {
@@ -1274,5 +1303,17 @@
 
   .status-message.error {
     color: var(--danger, #c53f4f);
+  }
+
+  @container mcp-server (max-width: 720px) {
+    .token-row { grid-template-columns: minmax(0, 1fr); }
+    .token-actions { justify-self: end; }
+  }
+
+  @container mcp-server (max-width: 420px) {
+    .mcp-card { padding: var(--space-3); }
+    .token-actions { justify-self: start; justify-content: flex-start; }
+    .form-field-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .form-field-row > .meta { grid-column: 1 / -1; }
   }
 </style>

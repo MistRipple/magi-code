@@ -357,6 +357,11 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     throw new Error('browser_target_obscured');
   };
   const scrollTo = (element) => {
+    // 已有可命中的页面位置时保留滚动位置，避免每次点击/输入都把表单滚到中间。
+    try { actionPoint(element); return; }
+    catch (error) {
+      if (!['browser_target_outside_viewport', 'browser_target_obscured'].includes(error.message)) throw error;
+    }
     element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     let view = element.ownerDocument.defaultView;
     while (view?.frameElement) {
@@ -677,13 +682,22 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       if (!point) scrollTo(element);
       const position = point || actionPoint(element);
       verifyPoint(element, position.x, position.y);
-      const guard = { element, eventType, observed: false, listeners: [] };
+      const guard = { element, eventType, position, bounds: rectFor(element), observed: false, listeners: [] };
       const listener = event => {
         if (isFrameElement(element) && !frameDocument(element)) return;
-        if (event.isTrusted && event.composedPath().includes(element)) guard.observed = true;
+        if (event.isTrusted && event.composedPath().includes(element)) {
+          guard.observed = true;
+          guard.complete?.();
+        }
       };
-      element.ownerDocument.addEventListener(eventType, listener, true);
-      guard.listeners.push([element.ownerDocument, eventType, listener]);
+      // 自定义 listbox 选项常在 pointerup 完成选择并卸载节点，此后不会再有 click。
+      // 仅对 option 接受命中该节点的可信 pointerup；普通按钮仍须确认 click。
+      const observedEvents = eventType === 'click' && roleFor(element) === 'option'
+        ? ['click', 'pointerup'] : [eventType];
+      for (const type of observedEvents) {
+        element.ownerDocument.addEventListener(type, listener, true);
+        guard.listeners.push([element.ownerDocument, type, listener]);
+      }
       state.pointerGuards.set(String(token), guard);
       const rect = rectFor(element);
       return { x: position.x, y: position.y, bounds: rect, role: roleFor(element), name: nameFor(element) };
@@ -694,11 +708,37 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       verifyPoint(guard.element, x, y);
       return true;
     },
-    finishPointer(token) {
+    relocatePointer(token, x, y) {
+      const guard = state.pointerGuards.get(String(token));
+      if (!guard) throw new Error('browser_pointer_observation_missing');
+      try { verifyPoint(guard.element, x, y); return null; }
+      catch (error) {
+        if (error.message !== 'browser_target_obscured') throw error;
+        const bounds = rectFor(guard.element);
+        // 真正的遮挡仍然拒绝；只在同一节点确实重排且尚未按下时重取命中点。
+        if (['x', 'y', 'width', 'height'].every(key => Math.abs(bounds[key] - guard.bounds[key]) < .5)) throw error;
+        const position = actionPoint(guard.element);
+        guard.bounds = bounds;
+        return { ...position, bounds, role: roleFor(guard.element), name: nameFor(guard.element) };
+      }
+    },
+    async finishPointer(token, waitForEvent = false) {
       const guard = state.pointerGuards.get(String(token));
       if (!guard) return { observed: false };
+      // CDP 的命令回包不是 DOM 事件交付屏障。只在事件尚未到达时等可信事件，
+      // 已确认的动作立即结束；离屏页不依赖会被 Chromium 限流的动画帧。
+      if (waitForEvent && !guard.observed) {
+        await new Promise(resolve => {
+          const timer = setTimeout(() => { guard.complete = null; resolve(); }, 250);
+          guard.complete = () => { clearTimeout(timer); guard.complete = null; resolve(); };
+        });
+      }
       for (const [doc, type, listener] of guard.listeners) doc.removeEventListener(type, listener, true);
       state.pointerGuards.delete(String(token));
+      guard.complete?.();
+      // 经过目标的 mousemove 不代表结束时仍在悬停：页面可在处理器中
+      // 移走或遮住目标。只回读当前命中，不补移、不触发额外点击。
+      if (waitForEvent && guard.eventType === 'mousemove' && guard.observed) verifyPoint(guard.element, guard.position.x, guard.position.y);
       return { observed: guard.observed };
     },
     prepareDrag(sourceRef, targetRef, token) {

@@ -119,6 +119,13 @@ pub struct TurnState {
     pub last_message_text: Option<String>,
 }
 
+/// 登录探测与输入框就绪是独立事实；访客页面也可能有输入框。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageProbe {
+    pub login_state: LoginState,
+    pub composer_available: bool,
+}
+
 /// 唯一的页面驱动入口。实现不得在这些方法外维护第二套 DOM 控制链。
 pub trait WebModelPageDriver: Send + Sync {
     fn open_temporary_chat<'a>(&'a self, page_id: &'a str) -> DriverFuture<'a, ()>;
@@ -182,6 +189,16 @@ pub trait WebModelPageDriver: Send + Sync {
             Err(WebModelError::new(
                 WebModelErrorCode::WebSavedConversationUnavailable,
                 "页面驱动未提供页面导航能力",
+            ))
+        })
+    }
+
+    /// 使用站点会话与账号入口的证据，而非回合状态中的输入框推断登录。
+    fn probe_page<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, PageProbe> {
+        Box::pin(async {
+            Err(WebModelError::new(
+                WebModelErrorCode::WebDesktopUnavailable,
+                "页面驱动未提供登录态探测",
             ))
         })
     }

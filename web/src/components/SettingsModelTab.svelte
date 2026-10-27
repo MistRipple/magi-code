@@ -28,6 +28,7 @@
     modelListOpen,
     modelListPosition,
     modelLists,
+    modelDisplayNames,
     roleTemplates,
     registryAgents,
     getBaseUrlPlaceholder,
@@ -62,6 +63,7 @@
     modelListOpen: Record<string, boolean>;
     modelListPosition: any;
     modelLists: Record<string, string[]>;
+    modelDisplayNames: Record<string, Record<string, string>>;
     roleTemplates: RoleTemplate[];
     registryAgents: AgentBinding[];
     getBaseUrlPlaceholder: () => string;
@@ -262,9 +264,7 @@
     workerModelTabs.map((id: string) => railItem(id, getWorkerDisplayName(id), workerConfigs[id]?.model)),
   );
 
-  function tabTitle(tabId: string): string {
-    return roleRailItems.find((item) => item.id === tabId)?.name ?? getWorkerDisplayName(tabId);
-  }
+
 
   // --- Inline rename 状态机 ---
   let editingTab = $state<string | null>(null);
@@ -426,9 +426,6 @@
           <ModelConfigForm
             formType="orch"
             statusKey="orch"
-            title={tabTitle(modelConfigTab)}
-            statusClass={tabStatus(modelConfigTab).statusClass}
-            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={orchConfig}
             baselineConfig={modelConfigBaselines.orch}
             bind:keyVisible
@@ -441,6 +438,7 @@
             {modelListOpen}
             {modelListPosition}
             {modelLists}
+            {modelDisplayNames}
             {getBaseUrlPlaceholder}
             {openModelList}
             {closeModelList}
@@ -453,13 +451,10 @@
           <ModelConfigForm
             formType="comp"
             statusKey="comp"
-            title={tabTitle(modelConfigTab)}
-            statusClass={tabStatus(modelConfigTab).statusClass}
-            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={compConfig}
             baselineConfig={modelConfigBaselines.comp}
             bind:keyVisible
-            showAdvancedOptions={false}
+            showAdvancedOptions={true}
             description={i18n.t('settings.model.auxiliaryDesc')}
             {saveStatus}
             {testStatus}
@@ -467,6 +462,7 @@
             {modelListOpen}
             {modelListPosition}
             {modelLists}
+            {modelDisplayNames}
             {getBaseUrlPlaceholder}
             {openModelList}
             {closeModelList}
@@ -479,9 +475,6 @@
           <ModelConfigForm
             formType="image"
             statusKey="image"
-            title={tabTitle(modelConfigTab)}
-            statusClass={tabStatus(modelConfigTab).statusClass}
-            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={imageConfig}
             baselineConfig={modelConfigBaselines.image}
             bind:keyVisible
@@ -493,6 +486,7 @@
             {modelListOpen}
             {modelListPosition}
             {modelLists}
+            {modelDisplayNames}
             {getBaseUrlPlaceholder}
             {openModelList}
             {closeModelList}
@@ -505,14 +499,11 @@
           <ModelConfigForm
             formType="vision"
             statusKey="vision"
-            title={tabTitle(modelConfigTab)}
-            statusClass={tabStatus(modelConfigTab).statusClass}
-            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={visionConfig}
             baselineConfig={modelConfigBaselines.vision}
             {visionBuiltinTextModelRules}
             bind:keyVisible
-            showAdvancedOptions={false}
+            showAdvancedOptions={true}
             description={i18n.t('settings.model.visionDesc')}
             {saveStatus}
             {testStatus}
@@ -520,6 +511,7 @@
             {modelListOpen}
             {modelListPosition}
             {modelLists}
+            {modelDisplayNames}
             {getBaseUrlPlaceholder}
             {openModelList}
             {closeModelList}
@@ -532,9 +524,6 @@
           <ModelConfigForm
             formType="worker"
             statusKey={modelConfigTab}
-            title={tabTitle(modelConfigTab)}
-            statusClass={tabStatus(modelConfigTab).statusClass}
-            statusLabel={tabStatus(modelConfigTab).statusText}
             bind:config={workerConfigs[modelConfigTab]}
             baselineConfig={modelConfigBaselines[modelConfigTab]}
             bind:keyVisible
@@ -546,6 +535,7 @@
             {modelListOpen}
             {modelListPosition}
             {modelLists}
+            {modelDisplayNames}
             {getBaseUrlPlaceholder}
             {openModelList}
             {closeModelList}

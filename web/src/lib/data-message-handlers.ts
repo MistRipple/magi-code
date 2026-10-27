@@ -63,7 +63,6 @@ import {
   sessionNavigationState,
   settleSessionNavigation,
 } from '../shared/session-navigation.svelte';
-import { selectComposerDraftWorkspace } from '../stores/composer-workspace.svelte';
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import {
   isCanonicalTerminalStatus,
@@ -1404,7 +1403,6 @@ function applySessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.draftOrchestratorSessionConfig = navigationTarget === 'draft'
         ? { ...navigationDraftConfig }
         : preserveExistingDraftConfig ? { ...messagesState.draftOrchestratorSessionConfig } : {};
-      selectComposerDraftWorkspace(workspaceId);
       clearStaleSettingsBootstrapSnapshot();
       setSessionHistoryState(null, { workspaceId });
       setAppState({

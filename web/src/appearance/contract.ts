@@ -1,3 +1,4 @@
+import { i18n } from '../stores/i18n.svelte';
 export type ThemeSchemePolicy = 'light' | 'dark' | 'adaptive';
 export type ThemeMaterial = 'clear' | 'translucent' | 'immersive';
 export type ThemeSource = 'builtin' | 'created' | 'imported';
@@ -61,29 +62,29 @@ export interface AppearanceAssetUploadResult {
 
 export function normalizeAppearanceSnapshot(value: unknown): AppearanceSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('外观状态格式无效');
+    throw new Error(i18n.t('appearance.error.snapshot'));
   }
   const payload = value as Record<string, unknown>;
   const revision = Number(payload.revision);
   const activeThemeId = typeof payload.activeThemeId === 'string' ? payload.activeThemeId.trim() : '';
   if (!Number.isSafeInteger(revision) || revision < 1 || !activeThemeId || !Array.isArray(payload.themes)) {
-    throw new Error('外观状态缺少必要字段');
+    throw new Error(i18n.t('appearance.error.required'));
   }
   const themes = payload.themes.map(normalizeThemeRecord);
   if (!themes.some((record) => record.pack.id === activeThemeId)) {
-    throw new Error('当前外观主题不存在');
+    throw new Error(i18n.t('appearance.error.missing'));
   }
   return { revision, activeThemeId, themes };
 }
 
 function normalizeThemeRecord(value: unknown): ThemeRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('主题记录格式无效');
+    throw new Error(i18n.t('appearance.error.record'));
   }
   const record = value as Record<string, unknown>;
   const source = record.source;
   if (source !== 'builtin' && source !== 'created' && source !== 'imported') {
-    throw new Error('主题来源无效');
+    throw new Error(i18n.t('appearance.error.source'));
   }
   return {
     pack: normalizeThemePack(record.pack),
@@ -98,7 +99,7 @@ function normalizeThemeRecord(value: unknown): ThemeRecord {
 
 export function normalizeThemePack(value: unknown): ThemePack {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('主题定义格式无效');
+    throw new Error(i18n.t('appearance.error.definition'));
   }
   const pack = value as Record<string, unknown>;
   const schemes = pack.schemes && typeof pack.schemes === 'object' && !Array.isArray(pack.schemes)
@@ -107,10 +108,10 @@ export function normalizeThemePack(value: unknown): ThemePack {
   const policy = pack.schemePolicy;
   const material = pack.material;
   if (pack.schemaVersion !== 1 || (policy !== 'light' && policy !== 'dark' && policy !== 'adaptive')) {
-    throw new Error('主题协议不受支持');
+    throw new Error(i18n.t('appearance.error.protocol'));
   }
   if (material !== 'clear' && material !== 'translucent' && material !== 'immersive') {
-    throw new Error('主题材质无效');
+    throw new Error(i18n.t('appearance.error.material'));
   }
   const result: ThemePack = {
     schemaVersion: 1,
@@ -135,13 +136,13 @@ export function normalizeThemePack(value: unknown): ThemePack {
       blur: Number(wallpaper.blur),
     };
   }
-  if (!result.id || !result.name) throw new Error('主题标识或名称无效');
+  if (!result.id || !result.name) throw new Error(i18n.t('appearance.error.identity'));
   return result;
 }
 
 function normalizeThemeScheme(value: unknown): ThemeScheme {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('主题配色格式无效');
+    throw new Error(i18n.t('appearance.error.colors'));
   }
   const scheme = value as Record<string, unknown>;
   return {

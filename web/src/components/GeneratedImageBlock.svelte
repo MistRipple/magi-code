@@ -35,7 +35,7 @@
     return agentUrl('/api/files/raw', buildFilePreviewQuery(preview.path, {
       workspaceId: filePreviewScope?.workspaceId,
       workspacePath: filePreviewScope?.workspacePath,
-      sessionId: '',
+      sessionId: filePreviewScope?.sessionId,
     }));
   });
 
@@ -98,5 +98,4 @@
   .generated-image-progress { display:flex; align-items:center; justify-content:center; width:100%; min-height:150px; max-height:320px; background:var(--code-bg); color:var(--foreground-muted); font-size:var(--text-sm); }
   .generated-image-progress > span { animation:generated-image-pulse 1.5s ease-in-out infinite; }
   @keyframes generated-image-pulse { 50% { opacity:.4; } }
-  @media(prefers-reduced-motion:reduce) { .generated-image-progress > span { animation:none; } }
 </style>

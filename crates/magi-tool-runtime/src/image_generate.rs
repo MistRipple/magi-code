@@ -15,7 +15,7 @@ use std::{
 const TOOL_NAME: &str = "image_generate";
 const DEFAULT_SIZE: &str = "1024x1024";
 const PUBLIC_PROVIDER_ERROR: &str = "图片生成服务暂不可用，请检查图片模型配置后重试";
-const PUBLIC_WRITE_ERROR: &str = "生成图片暂不可保存，请检查工作区路径或权限";
+const PUBLIC_WRITE_ERROR: &str = "生成图片暂不可保存，请检查执行目录或权限";
 const MAX_OUTPUT_NAME_ATTEMPTS: u32 = 10_000;
 
 pub(crate) fn execute_image_generate(
@@ -38,9 +38,9 @@ pub(crate) fn execute_image_generate(
     let Some(executor) = resources.image_generation_executor.as_ref() else {
         return image_generation_error("not_configured", "图片生成模型尚未配置或未启用");
     };
-    let workspace_root = match canonical_workspace_root(context) {
+    let workspace_root = match canonical_execution_root(context) {
         Ok(root) => root,
-        Err(error) => return image_generation_error("workspace_required", error),
+        Err(error) => return image_generation_error("execution_directory_required", error),
     };
     let requested_output_path =
         match resolve_requested_output_path(&workspace_root, request.output_path.as_deref()) {
@@ -187,13 +187,13 @@ fn validate_size(size: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_workspace_root(context: &ToolExecutionContext) -> Result<PathBuf, String> {
+fn canonical_execution_root(context: &ToolExecutionContext) -> Result<PathBuf, String> {
     let root = context
         .working_directory
         .as_deref()
-        .ok_or_else(|| "缺少当前工作区目录，无法保存生成图片".to_string())?;
+        .ok_or_else(|| "缺少当前会话执行目录，无法保存生成图片".to_string())?;
     root.canonicalize()
-        .map_err(|_| "当前工作区目录不可访问，无法保存生成图片".to_string())
+        .map_err(|_| "当前会话执行目录不可访问，无法保存生成图片".to_string())
 }
 
 fn resolve_output_path(
@@ -329,10 +329,12 @@ fn instruction_for(kind: &str) -> &'static str {
     match kind {
         "invalid_input" | "invalid_output_path" => "按参数要求修正后再调用。",
         "not_configured" => "图片生成模型尚未配置；告知用户到设置里配置图片模型，不要重试。",
-        "workspace_required" => "需要先选择工作区才能保存生成的图片；告知用户。",
+        "execution_directory_required" => "缺少会话执行目录，无法保存图片；告知用户。",
         "provider_failed" => "图片服务暂不可用；不要立刻用相同参数重试，告知用户检查图片模型配置。",
         "invalid_result" => "图片服务返回了无法保存的结果；换一个提示词或告知用户。",
-        "write_failed" => "生成的图片没能保存到工作区；检查 output_path 与目录权限，或换一个位置。",
+        "write_failed" => {
+            "生成的图片没能保存到会话执行目录；检查 output_path 与目录权限，或换一个位置。"
+        }
         _ => "不要用相同参数重复调用。",
     }
 }

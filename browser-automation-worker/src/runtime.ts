@@ -392,11 +392,7 @@ export class BrowserAutomationRuntime {
         const { selector, text, mode, expect_text_digest: expectDigest } = command.payload;
         const timeoutMs = normalizeWebCommandTimeout(command.payload.timeout_ms);
         const expectedText = normalizeComposerText(text);
-        const observed = await this.evaluate<{
-          text: string;
-          charCount: number;
-          becameAttachment: boolean;
-        }>(
+        const observed = await this.runSetupInput(
           binding,
           `globalThis.__magiWebModel.writeText(${JSON.stringify({
             selector,
@@ -404,7 +400,7 @@ export class BrowserAutomationRuntime {
             mode,
             timeout_ms: timeoutMs,
           })})`,
-        );
+        ) as { text: string; charCount: number; becameAttachment: boolean } | null;
         if (
           !observed
           || typeof observed.text !== "string"
@@ -500,11 +496,7 @@ export class BrowserAutomationRuntime {
         await this.ensureWebModelAdapter(binding);
         // 提交只负责「把输入交给站点并观察输入框是否清空」；是否被接受由
         // `web_turn_state` 的消息计数证据判定，不以返回成功为准（§5.6 步骤 4）。
-        const submitted = await this.evaluate<{
-          submitted: boolean;
-          composer_empty: boolean;
-          reason: string | null;
-        }>(binding, "globalThis.__magiWebModel.submit()");
+        const submitted = await this.runSetupInput(binding, "globalThis.__magiWebModel.submit()");
         if (!isWebSubmitResult(submitted)) {
           throw protocolFailure(
             "web_submit_result_invalid",
@@ -827,11 +819,15 @@ export class BrowserAutomationRuntime {
       userGesture: false,
     });
     if (response.exceptionDetails) {
+      const description = response.exceptionDetails.exception?.description
+        || response.exceptionDetails.text || "page script failed";
+      // 页面运行时自己的固定原因可安全保留，避免把命中/失效问题都折叠为脚本错误。
+      // 不记录任意页面异常正文，尤其不能把表单或凭据内容带入诊断。
+      const known = /^(?:Error: )?(browser_(?:element_ref_stale|target_disabled|target_not_visible|target_obscured|target_outside_viewport|pointer_outside_viewport|pointer_observation_missing|sensitive_action_requires_user|target_read_only|target_not_editable))\b/u.exec(description)?.[1];
+      if (known) throw protocolFailure(known, known);
       throw protocolFailure(
         "browser_page_script_failed",
-        response.exceptionDetails.exception?.description
-          || response.exceptionDetails.text
-          || "page script failed",
+        description,
       );
     }
     return response.result.value as T;
@@ -885,6 +881,7 @@ export class BrowserAutomationRuntime {
     const id = randomUUID();
     const state = "globalThis.__magiSetupInput";
     await this.evaluate(binding, `${INSTALL_WEB_SETUP_INPUT}(${JSON.stringify(id)}, ${JSON.stringify(expression)})`);
+    let inputStarted = false;
     try {
       const deadline = Date.now() + 90_000;
       while (Date.now() < deadline) {
@@ -899,6 +896,8 @@ export class BrowserAutomationRuntime {
         }
         const request = next.request;
         if (request) {
+          // 后续轮询遇到导航也不能抹掉先前输入可能已生效的事实。
+          inputStarted = true;
           const target = { element_ref: request.ref };
           if (request.kind === "click") await this.click(binding, target);
           else if (request.kind === "type" && typeof request.value === "string") {
@@ -913,6 +912,8 @@ export class BrowserAutomationRuntime {
         } else await waitWithSignal(50, this.#cdp.currentSignal());
       }
       throw protocolFailure("browser_setup_input_timeout", "配置操作超时，请检查页面", true);
+    } catch (cause) {
+      throw inputStarted ? sideEffectFailure(cause) : cause;
     } finally {
       if (!this.navigationAdvanced(binding) && !this.#cdp.currentSignal()?.aborted) {
         await this.evaluate(binding, `${state}?.id === ${JSON.stringify(id)} && ${state}.dispose()`).catch(() => undefined);
@@ -938,11 +939,23 @@ export class BrowserAutomationRuntime {
     forText = false,
   ): Promise<BrowserActionTarget> {
     const token = `pointer-${randomUUID()}`;
-    const target = await this.evaluate<PageTarget>(binding,
+    let target = await this.evaluate<PageTarget>(binding,
       `globalThis.__magiBrowserAutomation.preparePointer(${JSON.stringify(ref)}, ${JSON.stringify(token)}, ${JSON.stringify(event)}, ${JSON.stringify(point)}, ${forText})`);
     let finished = false;
     try {
       await this.observedPointer(binding, "mouseMoved", target.x, target.y);
+      if (event === "click" && ref !== null) {
+        // 光标到位前的跨进程等待中，表单可能重排。按下前仅对同一节点重新瞄准；
+        // 不重放按下/释放，不接受坐标点击换目标，也不绕过真实遮挡。
+        for (let relocation = 0; ; relocation++) {
+          const moved = await this.evaluate<PageTarget | null>(binding,
+            `globalThis.__magiBrowserAutomation.relocatePointer(${JSON.stringify(token)}, ${target.x}, ${target.y})`);
+          if (!moved) break;
+          if (relocation >= 3) throw protocolFailure("browser_target_unstable", "browser_target_unstable", true);
+          target = moved;
+          await this.observedPointer(binding, "mouseMoved", target.x, target.y);
+        }
+      }
       if (event !== "mousemove") {
         for (let clickCount = 1; clickCount <= (event === "dblclick" ? 2 : 1); clickCount++) {
           await this.evaluate(binding, `globalThis.__magiBrowserAutomation.verifyPointer(${JSON.stringify(token)}, ${target.x}, ${target.y})`);
@@ -950,7 +963,7 @@ export class BrowserAutomationRuntime {
           await this.observedPointer(binding, "mouseReleased", target.x, target.y, { button: "left", buttons: 0, clickCount });
         }
       }
-      const observed = await this.finishPointer(binding, token);
+      const observed = await this.finishPointer(binding, token, true);
       finished = true;
       if (!observed) throw protocolFailure("browser_pointer_unconfirmed", "没有确认目标收到原生事件；检查页面状态，不要直接重试", true);
       return actionTarget(target);
@@ -962,15 +975,19 @@ export class BrowserAutomationRuntime {
   }
 
   private async observedPointer(binding: BrowserSurfaceBinding, type: string, x: number, y: number, extra: Record<string, unknown> = {}): Promise<void> {
-    if (!await this.pointerOrHandleDialog(binding, type, x, y, extra)
-      || this.navigationAdvanced(binding) || this.currentPage(binding.surface_id)?.dialog) {
+    const dispatched = await this.pointerOrHandleDialog(binding, type, x, y, extra);
+    // 路由交接与未收到点击不同：配置驱动可在新详情页继续检查，不能重放旧页点击。
+    if (this.navigationAdvanced(binding)) {
+      throw protocolFailure("browser_navigation_superseded", "browser_navigation_superseded", true);
+    }
+    if (!dispatched || this.currentPage(binding.surface_id)?.dialog) {
       throw protocolFailure("browser_pointer_unconfirmed", "操作中页面导航或打开对话框，结果未确认", true);
     }
   }
 
-  private async finishPointer(binding: BrowserSurfaceBinding, token: string): Promise<boolean> {
+  private async finishPointer(binding: BrowserSurfaceBinding, token: string, waitForEvent = false): Promise<boolean> {
     const result = await this.evaluate<{ observed: boolean }>(binding,
-      `globalThis.__magiBrowserAutomation.finishPointer(${JSON.stringify(token)})`);
+      `globalThis.__magiBrowserAutomation.finishPointer(${JSON.stringify(token)}, ${waitForEvent})`);
     return result?.observed === true;
   }
 
@@ -1565,7 +1582,7 @@ export class BrowserAutomationRuntime {
         if (!confirmed) throw protocolFailure("web_question_answer_unconfirmed", "页面没有确认选项或输入，未提交", true);
       }
       try {
-        const activated = await this.evaluate<boolean>(binding,
+        const activated = await this.runSetupInput(binding,
           `globalThis.__magiWebModel.activateQuestionAction(${JSON.stringify(questionId)}, ${JSON.stringify(action)})`);
         if (activated !== true) throw protocolFailure("web_question_answer_unconfirmed", "页面操作未确认", true);
       } catch (cause) { throw sideEffectFailure(cause); }

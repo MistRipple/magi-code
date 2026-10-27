@@ -6,6 +6,10 @@ pub mod executor_receipt;
 pub mod fs_atomic;
 pub mod host_path;
 pub mod ids;
+pub mod model_reasoning;
+pub use model_reasoning::{
+    AgentModelSelection, ReasoningCapability, ReasoningEffort, ReasoningTransport,
+};
 pub mod paths;
 pub mod public_text;
 pub mod status;

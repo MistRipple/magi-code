@@ -103,10 +103,7 @@
 
   /* 代码块 */
   --code-bg: var(--vscode-textCodeBlock-background, #111827);
-  --code-border: var(--vscode-panel-border, var(--vscode-widget-border, #273142));
-  --code-header-bg: var(--surface-2);
   --code-copy-hover-bg: var(--surface-hover);
-  --code-line-number-bg: color-mix(in srgb, var(--foreground) 3%, transparent);
   --diagram-connector: #cbd5e1;
   --diagram-node-bg: #f8fafc;
   --diagram-node-text: #111827;
@@ -326,7 +323,6 @@ body.vscode-light,
   --surface-selected: rgba(59, 130, 246, 0.15);
   --scrollbar-thumb: rgba(15, 23, 42, 0.12);
   --scrollbar-thumb-hover: rgba(15, 23, 42, 0.20);
-  --code-line-number-bg: rgba(15, 23, 42, 0.03);
   --diagram-connector: #475569;
   --diagram-node-bg: #ffffff;
   --diagram-node-text: #111827;
@@ -878,8 +874,19 @@ pre code {
   border-color: var(--warning-muted);
   cursor: wait;
 }
-.btn.is-saving svg,
-.btn.is-testing svg { animation: spin 1s linear infinite; }
+.spinning,
+.btn:is(.is-testing, .is-saving) svg {
+  animation: magi-status-spin 1s linear infinite;
+}
+
+@keyframes magi-status-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes magi-status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
 
 .btn.is-saved,
 .btn.is-success {
@@ -1948,4 +1955,32 @@ strong, b { font-weight: var(--font-bold); }
     scroll-behavior: auto !important;
   }
   [data-copy-feedback="true"] svg { animation: none; }
+
+  /* 关键状态反馈保留缓慢明暗循环；替换位移/旋转，不恢复装饰性动效。
+     加载图标沿用 spinning，其余选择器均对应已存在的运行态标记。 */
+  :is(
+    .spinning, .spin, .spinner, .kp-spinner, .mac-spinner,
+    .bootstrap-spinner:not(.static), .lazy-panel-loading svg, .loading-state svg,
+    .sidebar-empty--recovering svg, .settings-loading svg, .sidebar-refreshing svg,
+    .right-pane-add-tab[aria-busy='true'] svg, .git-repository-stats button.loading svg,
+    .refreshing svg, .ghost-action.saving svg, .skill-row-progress,
+    .btn:is(.is-testing, .is-saving) svg, .apple-indicator.checking, .settings-dot--busy,
+    .turn-runtime-dot, .tool-card-meta .status-dot.pulsing, .executor-status .status-dot.running,
+    .generated-image-progress > span, .ia-context-ring.estimating .ring-fill,
+    .notice-icon.compacting, .ia-context-picker-loading svg, .loading-dot,
+    .agent-cursor-dots span, .update-status-action-icon--spinning,
+    .update-status-progress-ring--indeterminate, .recent-session-indicator.running svg,
+    .external-dot.running, .streaming-badge, .image-tray-pending
+  ),
+  .conversation-process-row.streaming .process-marker::before,
+  .turn-navigation-marker.running::before,
+  .turn-navigation-status-dot.running,
+  .session-running-dot.running::before {
+    animation-name: magi-status-pulse !important;
+    animation-duration: 1.8s !important;
+    animation-iteration-count: infinite !important;
+    animation-timing-function: ease-in-out !important;
+  }
+
+  .session-running-dot.running::after { display: none; }
 }

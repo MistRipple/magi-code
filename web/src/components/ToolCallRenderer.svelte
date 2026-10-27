@@ -34,7 +34,9 @@
   const truncatedRef = $derived(fullResult === undefined ? block.toolCall?.truncatedResult : undefined);
   const effectiveToolCall = $derived(
     block.toolCall && fullResult !== undefined
-      ? { ...block.toolCall, result: fullResult }
+      ? { ...block.toolCall, ...(block.toolCall.status === 'error' || block.toolCall.status === 'cancelled'
+        ? { error: fullResult }
+        : { result: fullResult }) }
       : block.toolCall,
   );
 
@@ -47,7 +49,8 @@
     loadFullFailed = false;
     try {
       const item = await getAgentMessageItem(ref);
-      const text = valueToDisplayText(item.tool?.result);
+      const failed = block.toolCall?.status === 'error' || block.toolCall?.status === 'cancelled';
+      const text = valueToDisplayText(failed ? item.tool?.error || item.tool?.result : item.tool?.result);
       if (text === undefined) {
         loadFullFailed = true;
       } else {
@@ -82,6 +85,20 @@
   );
 </script>
 
+{#snippet outputFooter()}
+  {#if truncatedRef}
+    <div class="tool-output-truncated" data-testid="tool-output-truncated" aria-busy={loadingFull}>
+      <span>{i18n.t('toolCall.truncatedOutput', { omitted: truncatedRef.omittedChars })}</span>
+      <button type="button" class="tool-output-load" disabled={loadingFull} onclick={loadFullResult}>
+        {i18n.t(loadingFull ? 'common.loading' : 'toolCall.loadFullOutput')}
+      </button>
+      {#if loadFullFailed}
+        <span class="tool-output-error" role="alert">{i18n.t('toolCall.loadFullOutputFailed')}</span>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
 {#if isGeneratedImageTool && (hasGeneratedImagePreview || toolStatus === 'pending' || toolStatus === 'running')}
   <GeneratedImageBlock
     {block}
@@ -91,6 +108,7 @@
   <TerminalSessionCard
     toolCall={effectiveToolCall}
     status={toolStatus}
+    outputFooter={truncatedRef ? outputFooter : undefined}
   />
 {:else}
   <ToolCall
@@ -100,36 +118,26 @@
     input={block.toolCall?.arguments}
     status={toolStatus}
     output={effectiveToolCall?.result}
-    error={block.toolCall?.error}
+    error={effectiveToolCall?.error}
     standardized={block.toolCall?.standardized}
     {filePreviewScope}
     {presentationRole}
     {agentChildStatus} {agentChildStatusUpdatedAt}
     {compactAgent}
+    outputFooter={truncatedRef ? outputFooter : undefined}
     duration={typeof block.toolCall?.durationMs === 'number'
       ? block.toolCall.durationMs
       : (block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined)}
   />
 {/if}
 
-{#if truncatedRef}
-  <div class="tool-output-truncated" data-testid="tool-output-truncated">
-    <span>{i18n.t('toolCall.truncatedOutput', { omitted: truncatedRef.omittedChars })}</span>
-    <button type="button" class="tool-output-load" disabled={loadingFull} onclick={loadFullResult}>
-      {i18n.t('toolCall.loadFullOutput')}
-    </button>
-    {#if loadFullFailed}
-      <span class="tool-output-error">{i18n.t('toolCall.loadFullOutputFailed')}</span>
-    {/if}
-  </div>
-{/if}
-
 <style>
   .tool-output-truncated {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-1) var(--space-3);
+    padding-block: var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
   }

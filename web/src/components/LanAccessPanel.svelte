@@ -268,7 +268,7 @@
     <div class="panel-body">
       <button class="tunnel-toggle-btn" onclick={toggleTunnel} disabled={tunnelBusy || tunnelStatus === 'starting' || tunnelStatus === 'stopping'}>
         {#if tunnelBusy || tunnelStatus === 'starting' || tunnelStatus === 'stopping'}
-          <Icon name="loader" size={14} />
+          <Icon name="loader" size={14} class="spinning" />
         {:else if tunnelStatus === 'running'}
           {i18n.t('lanAccess.tunnelClose')}
         {:else}

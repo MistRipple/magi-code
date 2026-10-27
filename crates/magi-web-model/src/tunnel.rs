@@ -777,7 +777,7 @@ impl TunnelManager {
         command.args(["runtimes", "stop", &self.config.alias, "--json"]);
         command.stdin(Stdio::null());
         command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
+        command.stderr(Stdio::piped());
         command.kill_on_drop(true);
         for key in [
             "OPENAI_API_KEY",
@@ -791,11 +791,20 @@ impl TunnelManager {
         let command_result = match tokio::time::timeout(TUNNEL_STOP_TIMEOUT, command.output()).await
         {
             Ok(Ok(output)) if output.status.success() => Ok(()),
-            Ok(Ok(output)) => Err(format!("runtimes stop 退出码 {:?}", output.status.code())),
+            Ok(Ok(output)) => {
+                // 只记录固定分类，厂商原始错误可能包含凭据引用，不能直接输出。
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(exit_code = ?output.status.code(),
+                    cli_panic = stderr.contains("panic:") || stderr.contains("fatal error:"),
+                    unknown_flag = stderr.contains("unknown flag"),
+                    "Tunnel 停止命令失败");
+                Err(format!("runtimes stop 退出码 {:?}", output.status.code()))
+            }
             Ok(Err(error)) => Err(format!("无法执行 runtimes stop：{error}")),
             Err(_) => Err("runtimes stop 超时".to_string()),
         };
-        let released = match self.inventory_live().await {
+        let inventory = self.inventory_live().await;
+        let released = match inventory {
             // 清单确认运行时仍在：无论命令返回什么都没有释放。
             Some(true) => false,
             // 清单确认别名已不存在。
@@ -813,6 +822,7 @@ impl TunnelManager {
         let reason = command_result
             .err()
             .unwrap_or_else(|| "清单显示运行时仍在运行".to_string());
+        tracing::warn!(inventory_live = ?inventory, "Tunnel 停止未确认，保留运行时跟踪");
         state.status = TunnelClientStatus::StopFailed {
             reason: reason.clone(),
         };
