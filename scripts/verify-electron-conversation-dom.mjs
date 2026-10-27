@@ -3623,15 +3623,17 @@ try {
   try {
     multiAgentCenter = await waitFor(async () => {
       const state = await rendererState(page);
-      const hasMultiStatusSummary = /1\s*已完成\s*[·.]\s*1\s*失败/iu.test(state.text);
-      const hasSuccess = /成功|完成|completed|success/iu.test(`${state.agentCenter.text} ${state.text}`);
-      const hasFailure = /失败|failed|error/iu.test(`${state.agentCenter.text} ${state.text}`);
-      return hasMultiStatusSummary && hasSuccess && hasFailure ? state : null;
-    }, "子代理多状态卡片", 60_000);
+      const cards = state.agentCenter.agentCards;
+      const hasSuccess = cards.some((card) => card.status.includes('status-success')
+        && /已完成|完成|completed|success/iu.test(card.text));
+      const hasFailure = cards.some((card) => card.status.includes('status-error')
+        && /失败|failed|error/iu.test(card.text));
+      return cards.length === 2 && hasSuccess && hasFailure ? state : null;
+    }, "成功与失败子代理卡片", 60_000);
   } catch (error) {
     throw new Error(`${error.message}；当前多状态 Renderer：${JSON.stringify(await rendererState(page))}；Provider requests=${provider.requests.length}`);
   }
-  check("子代理多状态摘要同时保留成功和失败计数", /1\s*已完成\s*[·.]\s*1\s*失败/iu.test(multiAgentCenter.text));
+  check("同一轮的成功与失败代理卡片同时进入真实界面", multiAgentCenter.agentCenter.agentCards.length === 2);
   await ensureLatestAgentGroupVisible(page);
   const multiCards = await waitFor(async () => {
     const cards = (await rendererState(page)).agentCenter.agentCards;
