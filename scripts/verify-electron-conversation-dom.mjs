@@ -3207,12 +3207,15 @@ try {
       text: bubble.querySelector('.markdown-content')?.innerText || '',
       footerPosition: getComputedStyle(footer).position,
       footerVisibility: getComputedStyle(footer).visibility,
+      footerHeight: footer.getBoundingClientRect().height,
     };
   })()`);
   check("个人 Chat 用户消息内容完整", userMessageLayout?.text.trim() === "请只回复 ELECTRON_DOM_CHAT_OK", JSON.stringify(userMessageLayout));
   check(
-    "个人 Chat 隐藏时间/操作行不占布局",
-    userMessageLayout?.footerPosition === "absolute" && userMessageLayout.footerVisibility === "hidden",
+    "个人 Chat 隐藏时间/操作行保留间距避免重叠",
+    userMessageLayout?.footerPosition === "static"
+      && userMessageLayout.footerVisibility === "hidden"
+      && userMessageLayout.footerHeight >= 22,
     JSON.stringify(userMessageLayout),
   );
   const personalTurnId = assistantTurnId(personal, responseText);
