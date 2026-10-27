@@ -3550,7 +3550,7 @@ try {
       turn.querySelector('.turn-disclosure-header').click();
     }
   })()`);
-  await expandLatestAgentGroup(page);
+  await ensureLatestAgentGroupVisible(page);
   const failedAgent = await waitFor(async () => {
     const state = await rendererState(page);
     const cardText = state.agentCenter.agentCards.at(-1)?.text || "";
@@ -3632,7 +3632,7 @@ try {
     throw new Error(`${error.message}；当前多状态 Renderer：${JSON.stringify(await rendererState(page))}；Provider requests=${provider.requests.length}`);
   }
   check("子代理多状态摘要同时保留成功和失败计数", /1\s*已完成\s*[·.]\s*1\s*失败/iu.test(multiAgentCenter.text));
-  await expandLatestAgentGroup(page);
+  await ensureLatestAgentGroupVisible(page);
   const multiCards = await waitFor(async () => {
     const cards = (await rendererState(page)).agentCenter.agentCards;
     return cards.length === 2 && cards.every(card => card.taskId && !card.disabled)
