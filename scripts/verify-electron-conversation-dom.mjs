@@ -2426,9 +2426,17 @@ async function openSessionDraft(page, { personal = false } = {}) {
     return state.input && state.inputEditable && !state.stop ? state : null;
   }, "上一轮 Turn 收口", 45_000);
   const expectedWorkspaceId = personal ? null : new URL(previous.url).searchParams.get('workspaceId');
-  const selector = personal ? '.recent-sessions-header .btn-icon' : '[data-testid="sidebar-new-session"]';
   await page.evaluate(`(() => {
-    const button = document.querySelector(${JSON.stringify(selector)});
+    const workspaceId = ${JSON.stringify(expectedWorkspaceId)};
+    const personal = ${JSON.stringify(personal)};
+    const workspace = workspaceId
+      ? document.querySelector('[data-workspace-id="' + workspaceId + '"]')
+      : null;
+    const button = workspace && !personal
+      ? workspace.closest('.workspace-row')?.querySelector('button.row-action[aria-label]')
+      : document.querySelector(personal
+        ? '.recent-sessions-header .btn-icon'
+        : '[data-testid="sidebar-new-session"]');
     if (!button || button.disabled) throw new Error('new session button unavailable');
     button.click();
   })()`);
@@ -2606,11 +2614,11 @@ async function chooseAccessProfile(page, profile) {
     if (button.disabled) throw new Error('access profile button disabled');
     button.click();
   })()`);
-  await waitFor(async () => page.evaluate(`document.querySelectorAll('[role="menuitemradio"]').length > 0`), "访问模式选项弹出");
+  await waitFor(async () => page.evaluate(`document.querySelectorAll('[role="listbox"] [role="option"]').length === 3`), "访问模式选项弹出");
   await page.evaluate(`(() => {
     const value = ${JSON.stringify(profile)};
     const label = value === 'read_only' ? '只读' : value === 'full_access' ? '完全访问' : '受限访问';
-    const option = [...document.querySelectorAll('[role="menuitemradio"]')]
+    const option = [...document.querySelectorAll('[role="listbox"] [role="option"]')]
       .find((item) => item.innerText.includes(label));
     if (!option) throw new Error('access profile option missing after open: ' + value);
     option.click();
