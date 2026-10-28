@@ -39,6 +39,22 @@ await withGoldenViteServer(async (server) => {
     '',
     '模型配置不可用时不得伪造模型名称',
   );
+  assert.equal(
+    sessionConfig.resolveOrchestratorModel(
+      { model: 'default' },
+      { model: 'default', apiProtocol: 'openai_responses' },
+    ),
+    '',
+    '本地 provider 不得把 GPT Web 的 default 占位值当成可执行模型',
+  );
+  assert.equal(
+    sessionConfig.resolveOrchestratorModel(
+      { model: 'default', engineId: 'plugin/openai.chatgpt-web/default' },
+      { model: 'default', apiProtocol: 'chatgpt_web' },
+    ),
+    'default',
+    '显式 GPT Web 引擎仍可使用其内部 default 家族名',
+  );
 
   assert.equal(
     sessionConfig.resolveOrchestratorReasoningEffort(
@@ -76,6 +92,14 @@ await withGoldenViteServer(async (server) => {
     ),
     { model: 'session-model', reasoningEffort: 'high' },
     '新会话只能继承来源会话的模型选择和推理强度',
+  );
+  assert.deepEqual(
+    sessionConfig.copyOrchestratorSessionConfig(
+      { model: 'default', engineId: 'plugin/openai.chatgpt-web/default', reasoningEffort: 'xhigh' },
+      { model: 'default', apiProtocol: 'chatgpt_web' },
+    ),
+    { reasoningEffort: null },
+    '新建本地会话不得继承 GPT Web 的占位模型或其推理强度',
   );
 });
 

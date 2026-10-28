@@ -2842,33 +2842,55 @@ mod tests {
             "http://{}",
             listener.local_addr().expect("stub addr should exist")
         );
-        let app = Router::new().route("/v1/models", get(successful_models_stub));
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "z-test"}, {"id": "gpt-test"}]})) }),
+        );
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
                 .expect("stub server should run");
         });
         let state = test_state();
-
-        let first = fetch_models(
-            State(state.clone()),
-            Json(FetchModelsRequest {
-                config: json!({
-                    "baseUrl": base_url,
-                    "apiKey": "test-key",
-                    "apiProtocol": "openai_chat"
+        for previous in [
+            json!({}),
+            json!({ "model": "default", "reasoningEffort": "xhigh" }),
+        ] {
+            state
+                .settings_store
+                .set_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION, previous)
+                .unwrap();
+            let first = fetch_models(
+                State(state.clone()),
+                Json(FetchModelsRequest {
+                    config: json!({
+                        "baseUrl": base_url,
+                        "apiKey": "test-key",
+                        "apiProtocol": "openai_chat"
+                    }),
+                    target: "orch".to_string(),
+                    workspace_id: None,
                 }),
-                target: "orch".to_string(),
-                workspace_id: None,
-            }),
-        )
-        .await
-        .expect("first catalog fetch should initialize the default")
-        .0;
-        assert_eq!(
-            first["orchestratorSessionDefaults"],
-            json!({ "model": "gpt-test", "reasoningEffort": null })
-        );
+            )
+            .await
+            .expect("first catalog fetch should initialize the default")
+            .0;
+            assert_eq!(
+                first["orchestratorSessionDefaults"],
+                json!({ "model": "gpt-test", "reasoningEffort": null })
+            );
+
+            assert_eq!(
+                first["orchestratorSessionDefaults"]["model"],
+                first["models"][0]
+            );
+            assert_eq!(
+                crate::model_config::initial_session_orchestrator_config(&state, true, None)
+                    .unwrap(),
+                Some(first["orchestratorSessionDefaults"].clone()),
+                "首条请求必须继承已持久化的列表第一项"
+            );
+        }
 
         state
             .settings_store
@@ -5169,6 +5191,54 @@ mod tests {
         assert!(
             matches!(&reverse, ApiError::InvalidInput(message) if message.contains("暂不支持转为 GPT Web")),
             "反向转换错误应明确说明方向限制：{reverse:?}"
+        );
+    }
+
+    #[test]
+    fn selecting_web_engine_does_not_replace_provider_default_model() {
+        let state = test_state();
+        install_active_gpt_web_plugin(&state);
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "test-key",
+                    "apiProtocol": "openai_chat"
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({ "model": "gpt-5.6-luna", "reasoningEffort": "high" }),
+            )
+            .unwrap();
+        let session_id = SessionId::new("session-web-keeps-provider-default");
+        state
+            .session_store
+            .create_session(session_id.clone(), "Web 不污染默认模型")
+            .unwrap();
+
+        save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({
+                "engineId": "plugin/openai.chatgpt-web/default",
+                "model": "default"
+            }),
+        )
+        .expect("Web 引擎选择应成功")
+        .expect("Web 会话应保存覆盖");
+
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
+            json!({ "model": "gpt-5.6-luna", "reasoningEffort": "high" }),
+            "Web 的 default 占位名不得成为后续本地会话默认模型"
         );
     }
 

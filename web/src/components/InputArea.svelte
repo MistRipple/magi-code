@@ -2549,9 +2549,7 @@
     return withOrchestratorReasoningEffort(
       config,
       readOrchestratorReasoningEffort(),
-      typeof config.model === 'string' && config.model.trim()
-        ? {}
-        : { model },
+      { model },
     );
   }
 
@@ -2577,6 +2575,7 @@
     return resolveOrchestratorModel(
       getCurrentOrchestratorSessionConfigSnapshot(),
       getEffectiveOrchestratorConfigSnapshot(),
+      pickerModels,
     );
   }
 
@@ -2678,7 +2677,7 @@
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
       orchestratorReasoningCapability: capability,
-      orchestratorSessionDefaults: { ...sessionConfig },
+      ...(!sessionConfig.engineId ? { orchestratorSessionDefaults: { ...sessionConfig } } : {}),
       orchestratorSessionConfig: { ...sessionConfig },
       effectiveOrchestratorConfig: { ...effectiveConfig },
     } as AgentSettingsBootstrapSnapshot;
@@ -2688,16 +2687,13 @@
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
       const currentSessionConfig = objectRecord(snapshot.orchestratorSessionConfig);
-      const currentModel = typeof currentSessionConfig.model === 'string'
-        ? currentSessionConfig.model.trim()
-        : '';
-      const resolvedSessionConfig = currentModel
-        ? currentSessionConfig
-        : { ...defaults, ...currentSessionConfig };
+      const currentModel = resolveOrchestratorModel(currentSessionConfig, undefined, pickerModels);
+      const shouldInitialize = !currentModel && (isDraftSession || !currentSessionConfig.model);
+      const resolvedSessionConfig = { ...currentSessionConfig, ...defaults };
       messagesState.settingsBootstrapSnapshot = {
         ...snapshot,
         orchestratorSessionDefaults: { ...defaults },
-        ...(!currentModel ? {
+        ...(shouldInitialize ? {
           orchestratorSessionConfig: { ...resolvedSessionConfig },
           effectiveOrchestratorConfig: {
             ...snapshot.orchestratorConfig,
@@ -2707,7 +2703,11 @@
       } as AgentSettingsBootstrapSnapshot;
     }
     if (isDraftSession) {
-      messagesState.draftOrchestratorSessionConfig = { ...defaults, ...messagesState.draftOrchestratorSessionConfig };
+      const draftConfig = messagesState.draftOrchestratorSessionConfig;
+      const draftModel = resolveOrchestratorModel(draftConfig, undefined, pickerModels);
+      messagesState.draftOrchestratorSessionConfig = draftModel
+        ? { ...defaults, ...draftConfig }
+        : { ...draftConfig, ...defaults };
     }
   }
 

@@ -17,6 +17,10 @@ pub(crate) use magi_conversation_runtime::model_config::{
     validate_vision_model_settings,
 };
 
+fn is_web_placeholder_model(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("default")
+}
+
 fn orchestrator_session_override_request(config: &Value) -> Result<Value, ApiError> {
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
@@ -150,7 +154,11 @@ pub(crate) fn ensure_orchestrator_session_defaults_from_models(
             let has_model = fields
                 .get("model")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|value| {
+                    !value.trim().is_empty()
+                        && (!is_web_placeholder_model(value)
+                            || models.iter().any(|listed| listed == value))
+                });
             if !has_model && let Some(model) = first_model.as_ref() {
                 fields.insert("model".to_string(), Value::String(model.clone()));
                 fields.insert("reasoningEffort".into(), Value::Null);
@@ -258,8 +266,16 @@ fn save_orchestrator_session_override_for_session_with_policy(
                 json!(requested.filter(|value| capability.supported_efforts.contains(value)));
         }
     }
+    let next_config_is_web = next_config
+        .get("engineId")
+        .and_then(Value::as_str)
+        .is_some_and(magi_web_model::is_chatgpt_web_engine_id);
     let mut next_defaults = orchestrator_session_defaults(state);
-    merge_orchestrator_session_override(&mut next_defaults, &next_config);
+    // Web's `default` family is session-owned. Never promote it to the
+    // provider defaults used by the next local conversation.
+    if !next_config_is_web {
+        merge_orchestrator_session_override(&mut next_defaults, &next_config);
+    }
     state
         .settings_store
         .set_session_and_global_sections(
