@@ -1279,6 +1279,7 @@ fn assemble_server(
         .with_catalog_observer(Arc::new(move |principal| {
             if principal.token_id == crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID {
                 state.web_model.record_slot_catalog_served();
+                tracing::info!("GPT Web 槽位工具目录已被读取（ChatGPT 经 Tunnel 到达本机）");
             }
         })),
     )

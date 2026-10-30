@@ -1040,6 +1040,20 @@
           "additionalProperties": false,
           "required": ["type", "payload"],
           "properties": {
+            "type": { "const": "user_activity" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["binding"],
+              "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" } }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
             "type": { "const": "control_revoked" },
             "payload": {
               "type": "object",

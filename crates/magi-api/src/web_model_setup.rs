@@ -267,7 +267,7 @@ impl ApiState {
             let record = self.save_setup_stage(session, "cancelled", &reason)?;
             slots.release_maintenance(session.as_str());
             if let Some(driver) = self.web_model.driver() {
-                let _ = driver.set_setup_desktop_layout(false).await;
+                let _ = driver.end_setup_control().await;
             }
             return Ok(record);
         }
@@ -374,10 +374,6 @@ impl ApiState {
                 )
                 .await
                 .map_err(crate::web_model_ops::web_model_api_error)?;
-        }
-        // 布局切换只是为了让 Agent 看清页面，失败不阻塞配置。
-        if let Err(error) = driver.set_setup_desktop_layout(true).await {
-            tracing::warn!(reason = %error.message, "配置页面桌面布局未能启用");
         }
         for _ in 0..4 {
             let config = self.web_model.configured().unwrap_or_default();
@@ -491,7 +487,7 @@ impl ApiState {
                         return Err(ApiError::Conflict("通道尚未就绪，不能宣布配置完成".into()));
                     }
                     let record = self.save_setup_detail(session, "complete", "", &result.detail)?;
-                    let _ = driver.set_setup_desktop_layout(false).await;
+                    let _ = driver.end_setup_control().await;
                     self.web_model
                         .bindings()
                         .unwrap()

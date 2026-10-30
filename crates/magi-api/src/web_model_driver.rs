@@ -30,8 +30,6 @@ const READ_STATE_RETRIES: usize = 30;
 /// 配置期间页面的桌面布局尺寸：足以显示组织切换、导航和完整表单。
 /// 所在表单/对话框出现这些词时，配置 Agent 不得点击其提交按钮（密钥只能由用户生成）。
 const SETUP_FORBIDDEN_SUBMIT_CONTEXT: [&str; 4] = ["secret key", "api key", "密钥", "机密密钥"];
-const SETUP_DESKTOP_WIDTH: u32 = 1100;
-const SETUP_DESKTOP_HEIGHT: u32 = 860;
 const READ_STATE_RETRY_DELAY: Duration = Duration::from_millis(300);
 const NAVIGATE_RETRIES: usize = 30;
 const NAVIGATE_RETRY_DELAY: Duration = Duration::from_millis(400);
@@ -43,6 +41,10 @@ const SAVED_LIST_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// 配置运行期间控制租约的有效期；剩余不足 `SETUP_CONTROL_RENEW_MARGIN` 时重新取得。
 const SETUP_CONTROL_TTL_MS: u64 = 300_000;
 const SETUP_CONTROL_RENEW_MARGIN_MS: u64 = 60_000;
+/// 用户停手这么久才算「操作完了」：期间代理不抢控制；等待上限到了才交还用户手动继续。
+const SETUP_USER_IDLE_MS: u64 = 2_500;
+const SETUP_USER_YIELD_MAX: Duration = Duration::from_secs(600);
+const SETUP_USER_YIELD_POLL: Duration = Duration::from_millis(400);
 const SETUP_COMMAND_ATTEMPTS: usize = 24;
 const SETUP_COMMAND_DELAY: Duration = Duration::from_millis(700);
 
@@ -667,16 +669,21 @@ impl HostWebModelPageDriver {
         binding: &magi_browser_authority::BrowserSurfaceBinding,
     ) -> Result<(BrowserLeaseId, u64), (WebModelError, bool)> {
         let now = UtcMillis::now();
+        let user_held = self
+            .authority
+            .lock()
+            .map_err(|_| (unavailable("浏览器权威状态不可用"), false))?
+            .user_control_held(tab_id);
+        if user_held {
+            // 用户在 Agent 持有控制期间动了页面：这条命令是按旧页面规划的，不执行；
+            // 等用户停手、清掉接管、重新取得控制，让 Agent 依据最新快照重新规划。
+            return Err((self.yield_to_user(tab_id).await, false));
+        }
         let stale = {
             let authority = self
                 .authority
                 .lock()
                 .map_err(|_| (unavailable("浏览器权威状态不可用"), false))?;
-            if authority.user_control_held(tab_id) {
-                drop(authority);
-                self.forget_setup_control();
-                return Err((unavailable("browser_user_control_held"), false));
-            }
             let retained = self.setup_control.lock().ok().and_then(|held| held.clone());
             let active = authority
                 .active_lease_for_surface(tab_id, &binding.surface_id)
@@ -688,13 +695,22 @@ impl HostWebModelPageDriver {
             }
             retained
         };
-        if let Some(held) = stale {
+        if stale.is_some() {
             // 过期、换了 Surface 或租约已被撤销：先清掉旧的再取新的。
-            if let Ok(mut authority) = self.authority.lock() {
-                let _ = authority.release_lease(&held.lease_id, now);
-            }
-            self.forget_setup_control();
+            self.drop_setup_control();
         }
+        // 用户正在操作页面时不去抢：等他停手再取得控制。
+        self.wait_for_user_idle(tab_id).await;
+        // 上一次运行（或被打断的运行）遗留的本驱动租约：释放后才能重新取得。
+        if let Ok(mut authority) = self.authority.lock()
+            && let Some(lease) = authority
+                .active_lease_for_surface(tab_id, &binding.surface_id)
+                .cloned()
+            && lease.lease_id.as_str().starts_with("web-setup-")
+        {
+            let _ = authority.release_lease(&lease.lease_id, UtcMillis::now());
+        }
+        let now = UtcMillis::now();
         let lease = {
             let mut authority = self
                 .authority
@@ -766,10 +782,72 @@ impl HostWebModelPageDriver {
         Ok((lease.lease_id, lease.fence))
     }
 
-    fn forget_setup_control(&self) {
-        if let Ok(mut held) = self.setup_control.lock() {
-            *held = None;
+    /// 丢弃保留的控制并释放权威里的那张租约。只忘记不释放会让租约占着 Surface，
+    /// 下一次取得控制就会因 `active lease` 冲突而失败。
+    fn drop_setup_control(&self) {
+        let held = self.setup_control.lock().ok().and_then(|mut held| held.take());
+        if let (Some(held), Ok(mut authority)) = (held, self.authority.lock()) {
+            let _ = authority.release_lease(&held.lease_id, UtcMillis::now());
         }
+    }
+
+    /// 等用户停手（没有输入记录视为已停手），有上限。
+    async fn wait_for_user_idle(&self, tab_id: &BrowserTabId) {
+        let started = tokio::time::Instant::now();
+        loop {
+            let idle = self
+                .authority
+                .lock()
+                .ok()
+                .and_then(|authority| authority.user_idle_ms(tab_id, UtcMillis::now()));
+            if idle.is_none_or(|ms| ms >= SETUP_USER_IDLE_MS)
+                || started.elapsed() >= SETUP_USER_YIELD_MAX
+            {
+                return;
+            }
+            tokio::time::sleep(SETUP_USER_YIELD_POLL).await;
+        }
+    }
+
+    /// 用户接管了页面：等他停手，清掉接管并释放旧租约，返回「被用户打断」让 Agent 重新规划。
+    /// 一直等不到用户停手才返回接管错误，交还用户手动继续。
+    async fn yield_to_user(&self, tab_id: &BrowserTabId) -> WebModelError {
+        self.yield_to_user_within(
+            tab_id,
+            SETUP_USER_IDLE_MS,
+            SETUP_USER_YIELD_MAX,
+            SETUP_USER_YIELD_POLL,
+        )
+        .await
+    }
+
+    async fn yield_to_user_within(
+        &self,
+        tab_id: &BrowserTabId,
+        idle_ms: u64,
+        max_wait: Duration,
+        poll: Duration,
+    ) -> WebModelError {
+        self.drop_setup_control();
+        let started = tokio::time::Instant::now();
+        loop {
+            let idle = self
+                .authority
+                .lock()
+                .ok()
+                .and_then(|authority| authority.user_idle_ms(tab_id, UtcMillis::now()));
+            if idle.is_none_or(|ms| ms >= idle_ms) {
+                break;
+            }
+            if started.elapsed() >= max_wait {
+                return unavailable("browser_user_control_held");
+            }
+            tokio::time::sleep(poll).await;
+        }
+        if let Ok(mut authority) = self.authority.lock() {
+            let _ = authority.release_user_control(tab_id);
+        }
+        unavailable("browser_user_yielded")
     }
 
     /// 配置运行结束：释放保留的控制，页面上不残留 Agent 光标，用户可以自由操作而不被当成接管。
@@ -903,7 +981,9 @@ impl HostWebModelPageDriver {
         if let Ok((Err(error), _)) = &result
             && error.message.contains("browser_user_control_held")
         {
-            self.forget_setup_control();
+            // Main 先于 daemon 的接管记录拒绝了这条命令：同样等用户停手后重新取得控制，不执行旧动作。
+            let yielded = self.yield_to_user(&tab_id).await;
+            return Ok((Err(yielded), false));
         }
         result
     }
@@ -1108,34 +1188,6 @@ impl WebModelPageDriver for HostWebModelPageDriver {
             };
             let tab = self.restore(url).await?;
             self.wait_ready(&tab).await
-        })
-    }
-
-    fn set_setup_desktop_layout<'a>(&'a self, desktop: bool) -> DriverFuture<'a, ()> {
-        Box::pin(async move {
-            let viewport = if desktop {
-                BrowserLogicalViewport::Fixed {
-                    width: SETUP_DESKTOP_WIDTH,
-                    height: SETUP_DESKTOP_HEIGHT,
-                    device_scale_factor_millis: 1000,
-                    device_type: magi_browser_authority::BrowserDeviceType::Desktop,
-                }
-            } else {
-                BrowserLogicalViewport::Auto
-            };
-            // 视口只有在 Agent 持有控制租约时才允许改变，所以沿与配置动作相同的租约通道提交。
-            let result = self
-                .native_setup_command(|tab_id, _control| BrowserHostCommand::SetLogicalViewport {
-                    tab_id,
-                    viewport,
-                })
-                .await
-                .map(|_| ());
-            // 恢复自适应意味着配置结束：不再保留控制。
-            if !desktop {
-                self.release_setup_control().await;
-            }
-            result
         })
     }
 
@@ -1943,6 +1995,149 @@ fn state_from_json(value: &serde_json::Value) -> Result<TurnState, WebModelError
 
 #[cfg(test)]
 mod tests {
+
+    fn driver_with_tab() -> (super::HostWebModelPageDriver, magi_core::BrowserTabId, tempfile::TempDir) {
+        use magi_browser_authority::{
+            BrowserAuthority, BrowserProfile, BrowserProfileKind, BrowserSessionLifecycle,
+            BrowserSessionOwner, BrowserTabLifecycle, CreateBrowserSession, CreateBrowserTab,
+        };
+        use magi_core::{BrowserProfileId, BrowserSessionId};
+        let mut authority = BrowserAuthority::new();
+        authority
+            .register_profile(BrowserProfile {
+                profile_id: BrowserProfileId::new("profile-1"),
+                kind: BrowserProfileKind::ManagedDefault,
+                data_path: std::path::PathBuf::from("/tmp/magi-browser-profile"),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            })
+            .unwrap();
+        let session = BrowserSessionId::new("browser-session-1");
+        authority
+            .create_session(CreateBrowserSession {
+                browser_session_id: session.clone(),
+                owner: BrowserSessionOwner::App,
+                profile_id: BrowserProfileId::new("profile-1"),
+                now: UtcMillis(2),
+            })
+            .unwrap();
+        authority
+            .transition_session(&session, BrowserSessionLifecycle::Ready, UtcMillis(3))
+            .unwrap();
+        let tab = magi_core::BrowserTabId::new("browser-tab-1");
+        authority
+            .create_tab(CreateBrowserTab {
+                tab_id: tab.clone(),
+                browser_session_id: session,
+                url: "about:blank".into(),
+                now: UtcMillis(4),
+            })
+            .unwrap();
+        authority
+            .transition_tab(&tab, BrowserTabLifecycle::Ready, UtcMillis(5))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let driver = super::HostWebModelPageDriver::new(
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(authority)),
+            dir.path().join("uploads"),
+        );
+        (driver, tab, dir)
+    }
+
+    #[tokio::test]
+    async fn user_takeover_yields_after_the_user_goes_idle_and_clears_the_hold() {
+        use std::time::Duration;
+        let (driver, tab, _dir) = driver_with_tab();
+        {
+            let mut authority = driver.authority.lock().unwrap();
+            authority.hold_user_control(&tab).unwrap();
+            authority.record_user_activity(&tab, UtcMillis::now());
+        }
+        let started = std::time::Instant::now();
+        let error = driver
+            .yield_to_user_within(&tab, 150, Duration::from_secs(5), Duration::from_millis(20))
+            .await;
+        // 用户刚操作过：先等他停手（至少约 150ms），之后清掉接管并让 Agent 重新规划，而不是停下等用户点继续。
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(error.message.contains("browser_user_yielded"), "{}", error.message);
+        assert!(!driver.authority.lock().unwrap().user_control_held(&tab));
+    }
+
+    #[tokio::test]
+    async fn a_user_who_never_stops_hands_the_page_back_for_a_manual_continue() {
+        use std::time::Duration;
+        let (driver, tab, _dir) = driver_with_tab();
+        {
+            let mut authority = driver.authority.lock().unwrap();
+            authority.hold_user_control(&tab).unwrap();
+            authority.record_user_activity(&tab, UtcMillis::now());
+        }
+        let keep_active = {
+            let authority = driver.authority.clone();
+            let tab = tab.clone();
+            tokio::spawn(async move {
+                for _ in 0..60 {
+                    authority.lock().unwrap().record_user_activity(&tab, UtcMillis::now());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        let error = driver
+            .yield_to_user_within(&tab, 100, Duration::from_millis(300), Duration::from_millis(20))
+            .await;
+        keep_active.abort();
+        assert!(error.message.contains("browser_user_control_held"), "{}", error.message);
+        assert!(driver.authority.lock().unwrap().user_control_held(&tab), "等不到停手时保持接管");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_retained_control_releases_the_authority_lease() {
+        use magi_browser_authority::AcquireBrowserLease;
+        let (driver, tab, _dir) = driver_with_tab();
+        {
+            let mut authority = driver.authority.lock().unwrap();
+            authority
+                .set_primary_surface(
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop".into(),
+                        window_id: "window-1".into(),
+                        surface_id: "surface-a".into(),
+                        surface_revision: 1,
+                        tab_id: tab.clone(),
+                        web_contents_id: 7,
+                        target_id: "target-1".into(),
+                        browser_context_id: "context-1".into(),
+                        navigation_revision: 0,
+                    },
+                    UtcMillis(6),
+                )
+                .unwrap();
+            let lease = authority
+                .acquire_lease(AcquireBrowserLease {
+                    lease_id: BrowserLeaseId::new("web-setup-1"),
+                    tab_id: tab.clone(),
+                    surface_id: "surface-a".into(),
+                    owner: magi_core::ExecutionOwnership::default(),
+                    turn_id: "turn".into(),
+                    goal_binding: None,
+                    acquired_at: UtcMillis::now(),
+                    expires_at: UtcMillis(UtcMillis::now().0 + 60_000),
+                })
+                .unwrap();
+            *driver.setup_control.lock().unwrap() = Some(RetainedSetupControl {
+                lease_id: lease.lease_id,
+                fence: lease.fence,
+                surface_id: "surface-a".into(),
+                expires_at: lease.expires_at,
+            });
+        }
+        driver.drop_setup_control();
+        // 只忘记不释放会让租约占着 Surface：下一次取得控制报 active lease 冲突。
+        assert!(driver.authority.lock().unwrap().active_lease_for_surface(&tab, "surface-a").is_none());
+        assert!(driver.setup_control.lock().unwrap().is_none());
+    }
+
     use super::{RetainedSetupControl, SETUP_CONTROL_RENEW_MARGIN_MS, setup_control_reusable};
     use magi_core::{BrowserLeaseId, UtcMillis};
 

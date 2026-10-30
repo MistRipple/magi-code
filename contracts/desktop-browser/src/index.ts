@@ -683,6 +683,7 @@ export type BrowserHostEvent =
       payload: { binding: BrowserSurfaceBinding };
     }
   | { type: "user_takeover"; payload: { binding: BrowserSurfaceBinding } }
+  | { type: "user_activity"; payload: { binding: BrowserSurfaceBinding } }
   | {
       type: "control_revoked";
       payload: { binding: BrowserSurfaceBinding; reason: string };

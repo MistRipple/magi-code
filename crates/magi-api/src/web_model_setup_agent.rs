@@ -302,15 +302,23 @@ fn url_path(url: &str) -> String {
 
 /// 由 daemon 已持久化的事实推出当前该完成的阶段。这是步骤依赖，不是页面规则：
 /// 页面上已有的连接器不代表 Tunnel、密钥和通道已就绪。
-fn current_stage_goal(tunnel_saved: bool, has_api_key: bool, channel_ready: bool) -> &'static str {
+fn current_stage_goal(
+    tunnel_saved: bool,
+    has_api_key: bool,
+    channel_ready: bool,
+    catalog_observed: bool,
+) -> String {
     if !tunnel_saved {
-        "Tunnel（daemon 尚未保存 Tunnel ID）：先在 OpenAI 平台查找或创建 Magi Tunnel 并回读完整 ID；不要操作 ChatGPT 连接器"
+        "Tunnel（daemon 尚未保存 Tunnel ID）：先在 OpenAI 平台查找或创建 Magi Tunnel 并回读完整 ID；不要操作 ChatGPT 连接器".into()
     } else if !has_api_key {
-        "运行时密钥（daemon 尚无密钥）：准备密钥表单并交还用户生成；不要操作 ChatGPT 连接器"
+        "运行时密钥（daemon 尚无密钥）：准备密钥表单并交还用户生成；不要操作 ChatGPT 连接器".into()
     } else if !channel_ready {
-        "通道（daemon 通道尚未就绪）：等待 daemon 启动通道，不要操作页面"
+        "通道（daemon 通道尚未就绪）：等待 daemon 启动通道，不要操作页面".into()
+    } else if catalog_observed {
+        // daemon 的事实比页面文案可靠：刷新已经生效，Agent 不必再反复刷新或四处导航去找证据。
+        "连接器（Tunnel、密钥和通道均已就绪）：daemon 已确认 ChatGPT 在本次运行中经 Tunnel 读取了 Magi 工具目录，刷新已生效，这次读取也证明连接器绑定的是当前 Tunnel；只需在页面核实连接器可用，然后提交 connector_ready，不要再反复刷新，也不要为找 Tunnel ID 四处导航".into()
     } else {
-        "连接器（Tunnel、密钥和通道均已就绪）：核对、复用或创建 ChatGPT 的 Magi 连接器，刷新工具并回读"
+        "连接器（Tunnel、密钥和通道均已就绪）：核对、复用或创建 ChatGPT 的 Magi 连接器，在核对过归属的连接器详情页点击“刷新工具”并等待；daemon 尚未观察到 ChatGPT 本次读取 Magi 工具目录".into()
     }
 }
 
@@ -330,18 +338,6 @@ fn snapshot_text(snapshot: &Value) -> String {
         text.push_str(&value.to_string());
     }
     text
-}
-
-fn connector_matches_tunnel(snapshot: &Value, tunnel_id: &str) -> bool {
-    if !magi_web_model::tunnel::valid_tunnel_id(tunnel_id)
-        || !snapshot["url"]
-            .as_str()
-            .is_some_and(|url| url.starts_with(magi_web_model::chatgpt_web_origin()))
-    {
-        return false;
-    }
-    let text = snapshot_text(snapshot);
-    text.contains("Magi") && text.contains(tunnel_id)
 }
 
 pub(crate) fn validate_checkpoint(checkpoint: &Checkpoint, snapshot: &Value) -> Result<(), String> {
@@ -574,7 +570,7 @@ async fn execute_action(
         return Ok(ActionFlow::Takeover(Checkpoint {
             outcome: USER_TAKEOVER.into(),
             tunnel_id: None,
-            detail: "你已接管右侧浏览器，Magi 已停止操作。处理完成后点击「我已完成，继续」，Magi 会先重新读取页面再继续，不会重放之前的操作。".into(),
+            detail: "你一直在操作右侧浏览器，Magi 等待了很久后暂停。处理完成后点击「我已完成，继续」，Magi 会先重新读取页面再继续，不会重放之前的操作。".into(),
             handoff_stage: None,
             organization: None,
             project: None,
@@ -585,11 +581,21 @@ async fn execute_action(
         .as_ref()
         .err()
         .is_some_and(|error| error.message.contains("browser_navigation_superseded"));
+    // 用户在 Agent 思考期间动过页面：driver 已等用户停手并重新取得控制，但这次动作是按旧页面规划的，没有执行。
+    let user_yielded = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.message.contains("browser_user_yielded"));
     let value = match result {
         Ok(value) => redact_value(value),
         Err(error) => {
             if error.message.contains("browser_submit_forbidden") {
                 json!({"status":"refused","instruction":"这是生成密钥的最终提交按钮，只能由用户点击。请确认表单已按要求填好并由页面控件状态证明，然后用 setup_checkpoint 的 key_prepared 交还用户；不要尝试其他方式提交。"})
+            } else if user_yielded {
+                if let Some(count) = write_key.as_ref().and_then(|key| ctx.write_counts.get_mut(key)) {
+                    *count = count.saturating_sub(1);
+                }
+                json!({"status":"not_delivered","instruction":"用户刚才操作过页面，Magi 已等用户停手并重新取得控制；这次动作是按旧页面规划的，没有执行。依据下一次最新快照重新规划，用户改过的内容以快照为准，不要重放旧动作。"})
             } else if navigation_handoff {
                 // 没有送达的动作不算一次写入，不占用重复上限。
                 if let Some(count) = write_key.as_ref().and_then(|key| ctx.write_counts.get_mut(key)) {
@@ -701,7 +707,6 @@ pub(crate) async fn run(
     );
     let mut last_result = json!({"status":"started"});
     let mut pending_response = None;
-    let mut connector_identity_verified = false;
     let mut action_context = ActionContext {
         state,
         session,
@@ -720,16 +725,18 @@ pub(crate) async fn run(
         if started.elapsed() > MAX_ELAPSED {
             break;
         }
-        if connector_matches_tunnel(&snapshot, &config.tunnel_id) {
-            connector_identity_verified = true;
-        }
         if let Some(response) = pending_response.take() {
             remember_response(&mut history, response, &last_result);
         }
         let stage_goal = {
             let saved = state.web_model.configured().unwrap_or_default();
             let status = state.web_model.status();
-            current_stage_goal(!saved.tunnel_id.is_empty(), status.has_api_key, status.ready)
+            current_stage_goal(
+                !saved.tunnel_id.is_empty(),
+                status.has_api_key,
+                status.ready,
+                state.web_model.slot_catalog_served_since(run_started_at),
+            )
         };
         // 诊断：模型看到的快照规模与可交互控件，用于排查“找不到控件”类问题。只含控件角色和名称，不含值和正文。
         tracing::info!(
@@ -861,10 +868,9 @@ pub(crate) async fn run(
                         last_result = json!({"error":"daemon 尚未观察到 ChatGPT 经 Tunnel 读取 Magi 工具目录。请在连接器详情中刷新工具（或完成连接），等待页面显示结果后再核对；不能仅凭页面文案宣布成功"});
                         continue;
                     }
-                    if checkpoint.outcome == "connector_ready" && !connector_identity_verified {
-                        last_result = json!({"error":"尚未在本次实际页面中核对 Magi 与当前 Tunnel 的对应关系，请打开详情核对，不能依靠同名项宣布成功"});
-                        continue;
-                    }
+                    // 归属证明来自 daemon 的观察而不是页面文案：ChatGPT 的连接器详情页并不显示它绑定的 Tunnel，
+                    // 但上面已经要求 daemon 在本次运行内收到了经 Tunnel 到达本机槽位的 tools/list，
+                    // 一个同名但绑定别的 Tunnel 的连接器不可能让本机槽位收到这次读取。
                     checkpoint.detail = redact(&checkpoint.detail).chars().take(1000).collect();
                     return Ok(checkpoint);
                 }
@@ -1030,22 +1036,6 @@ mod tests {
         assert!(validate_checkpoint(&proof, &page).is_err());
     }
     #[test]
-    fn connector_identity_requires_current_tunnel_on_the_connector_site() {
-        let id = "tunnel_0123456789abcdef0123456789abcdef";
-        let mut page = snapshot(&format!("Magi {id}"));
-        assert!(
-            !connector_matches_tunnel(&page, id),
-            "平台资源不证明连接器身份"
-        );
-        page["url"] = json!("https://chatgpt.com/plugins/magi");
-        assert!(connector_matches_tunnel(&page, id));
-        assert!(!connector_matches_tunnel(
-            &page,
-            "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        assert!(!connector_matches_tunnel(&page, ""));
-    }
-    #[test]
     fn credentials_are_redacted_in_text_fields_and_nested_observations() {
         let value = redact_value(
             json!({"elements":[{"name":"key sk-proj-abcdef_1234","value":"sk-test-secret"}],"detail":"请复制 sk-runtime-secret 后继续"}),
@@ -1112,11 +1102,13 @@ mod tests {
     }
     #[test]
     fn stage_goal_follows_the_dependency_order_of_daemon_facts() {
-        assert!(current_stage_goal(false, false, false).starts_with("Tunnel"));
-        assert!(current_stage_goal(false, true, true).starts_with("Tunnel"));
-        assert!(current_stage_goal(true, false, false).starts_with("运行时密钥"));
-        assert!(current_stage_goal(true, true, false).starts_with("通道"));
-        assert!(current_stage_goal(true, true, true).starts_with("连接器"));
+        assert!(current_stage_goal(false, false, false, false).starts_with("Tunnel"));
+        assert!(current_stage_goal(false, true, true, false).starts_with("Tunnel"));
+        assert!(current_stage_goal(true, false, false, false).starts_with("运行时密钥"));
+        assert!(current_stage_goal(true, true, false, false).starts_with("通道"));
+        assert!(current_stage_goal(true, true, true, false).starts_with("连接器"));
+        assert!(current_stage_goal(true, true, true, false).contains("尚未观察到"));
+        assert!(current_stage_goal(true, true, true, true).contains("提交 connector_ready"));
     }
 
     #[test]
@@ -1361,6 +1353,29 @@ mod tests {
         assert_eq!(model.requests.lock().unwrap().len(), 5);
     }
 
+
+    #[tokio::test]
+    async fn a_user_who_touched_the_page_mid_run_interrupts_without_stopping_the_run() {
+        let handoff = tool(
+            "setup_checkpoint",
+            json!({"outcome":"human_required","handoff_stage":"login","detail":"请登录","evidence":["Create"]}),
+        );
+        let (state, session, model, driver) = fixture(
+            vec![tool("browser_click", json!({"element_ref":"e:1:1"})), handoff],
+            vec![snapshot("Create")],
+            true,
+        );
+        *driver.error_message.lock().unwrap() = "browser_user_yielded";
+        let result = run(&state, &session, &driver, None, &RunCancellation::default())
+            .await
+            .unwrap();
+        // 用户停手后 Magi 自己重新接管：这次动作没有执行并告诉 Agent 重新规划，运行继续到下一步，而不是停在接管。
+        assert_ne!(result.outcome, USER_TAKEOVER);
+        let second = format!("{:?}", model.requests.lock().unwrap()[1].messages);
+        assert!(second.contains("not_delivered"));
+        assert!(second.contains("用户刚才操作过页面"));
+        assert_eq!(*driver.actions.lock().unwrap(), ["browser_click"]);
+    }
 
     #[tokio::test]
     async fn an_undelivered_click_after_page_handoff_is_reported_as_not_delivered() {

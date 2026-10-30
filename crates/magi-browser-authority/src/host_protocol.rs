@@ -768,6 +768,11 @@ pub enum BrowserHostEvent {
     UserTakeover {
         binding: BrowserSurfaceBinding,
     },
+    /// 用户在页面上的真实输入（节流）。不夺走控制权，只让 daemon 知道用户此刻是否仍在操作，
+    /// 代理据此判断何时可以安全地重新接管。
+    UserActivity {
+        binding: BrowserSurfaceBinding,
+    },
     ControlRevoked {
         binding: BrowserSurfaceBinding,
         reason: String,
@@ -1453,6 +1458,16 @@ mod tests {
             .expect("serialize user takeover event"),
             serde_json::json!({
                 "type": "user_takeover",
+                "payload": { "binding": binding }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserHostEvent::UserActivity {
+                binding: binding.clone(),
+            })
+            .expect("serialize user activity event"),
+            serde_json::json!({
+                "type": "user_activity",
                 "payload": { "binding": binding }
             })
         );

@@ -201,13 +201,6 @@ pub trait WebModelPageDriver: Send + Sync {
         })
     }
 
-    /// 配置期间让页面按桌面布局渲染。右栏很窄时站点会切到移动布局（隐藏组织切换、导航和侧栏），
-    /// Agent 就看不到完成配置所需的信息；配置结束后恢复自适应。失败不影响配置本身。
-    fn set_setup_desktop_layout<'a>(&'a self, desktop: bool) -> DriverFuture<'a, ()> {
-        let _ = desktop;
-        Box::pin(async { Ok(()) })
-    }
-
     /// 配置 Agent 一次运行结束（交接、完成、取消、失败）时调用：释放运行期间保持的页面控制。
     /// 运行期间控制跨命令保留，用户在两条命令之间操作页面才会被识别为接管；结束后必须释放，
     /// 否则等待用户处理时页面上会残留 Agent 光标，用户的操作也会被误当作接管。

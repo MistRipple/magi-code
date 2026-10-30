@@ -810,6 +810,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 true,
             );
         }
+        BrowserHostEvent::UserActivity { binding } => {
+            if !is_current_primary_binding(state, &binding) {
+                return;
+            }
+            let _ = state.mutate_browser_authority(|authority| {
+                authority.record_user_activity(&binding.tab_id, UtcMillis::now());
+                Ok(())
+            });
+        }
         BrowserHostEvent::ControlRevoked { binding, reason } => {
             let lease_reason = control_revocation_reason(&reason);
             revoke_surface_control(state, &binding, lease_reason, &reason, false);
