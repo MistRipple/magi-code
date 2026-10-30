@@ -141,6 +141,7 @@ export type BrowserSurfaceEvent =
       error?: string;
     }
   | { type: "user_takeover"; binding: BrowserSurfaceBinding }
+  | { type: "user_activity"; binding: BrowserSurfaceBinding }
   | {
       type: "agent_cursor";
       binding: BrowserSurfaceBinding;
@@ -231,6 +232,8 @@ interface BrowserSurfaceRecord {
   closed: boolean;
   automationInputDepth: number;
   agentControlled: boolean;
+  /** 视口是代理取得控制时从自适应「钉」成当前尺寸的；代理释放控制时必须还原为自适应。 */
+  viewportPinnedByAgent: boolean;
   agentControl: Extract<BrowserControl, { mode: "agent" }> | null;
   /** 展示目标可能在取消后尚未到达；相同坐标的新动作仍需确认到位。 */
   cursorPresentationReady: boolean;
@@ -599,6 +602,8 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
 /** 等待视口提交时允许的重新排程次数；超过即判定 Surface 生命周期已过期。 */
 const MAX_VIEWPORT_COMMIT_WAIT_ATTEMPTS = 50;
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
+/** 用户输入通知的最小间隔：足够新鲜地反映「用户是否仍在操作」，又不会随每次按键刷屏。 */
+const USER_ACTIVITY_EMIT_INTERVAL_MS = 700;
 const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
 const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
@@ -717,6 +722,7 @@ export class BrowserSurfaceManager {
   readonly #surfaces = new BrowserSurfaceRegistry<BrowserSurfaceRecord>();
   // 代理需要在后台保持挂载的逻辑 Tab；代理控制释放、用户接管或页面关闭时移除。
   readonly #agentRetainedTabs = new Set<string>();
+  readonly #userActivityEmittedAt = new Map<string, number>();
   readonly #onRuntimeStateChanged: (() => void) | undefined;
   readonly #configuredPartitions = new Set<string>();
   readonly #knownPartitions = new Set<string>();
@@ -882,6 +888,7 @@ export class BrowserSurfaceManager {
       closed: false,
       automationInputDepth: 0,
       agentControlled: false,
+      viewportPinnedByAgent: false,
       agentControl: null,
       cursorPresentationReady: false,
       cursor: { visible: false, x: null, y: null, action: null },
@@ -2221,6 +2228,8 @@ export class BrowserSurfaceManager {
     this.assertRenderableBinding(binding);
     if (!userInitiated && !record.agentControlled) throw new Error("browser_user_control_held");
     record.viewport = viewport;
+    // 用户或代理显式选择的视口是有意的，释放控制时不能被当成「钉住的」自动还原。
+    record.viewportPinnedByAgent = false;
     // 显式提交即使与宿主记录相同，也必须重新写入当前 Chromium session。
     // 这使调用方可以校正外部调试动作造成的实际状态漂移，宿主缓存只用于
     // 合并内部重复生命周期事件，不能替代浏览器事实。
@@ -2247,6 +2256,15 @@ export class BrowserSurfaceManager {
       const state = await this.readViewport(binding);
       if (!record.agentControlled) throw new Error("browser_user_control_held");
       await this.setViewport(binding, { mode: "fixed", ...state.actual_viewport });
+      // 钉住只为让一条命令执行期间布局稳定；它不是用户选的视口，代理释放控制时要还原为自适应。
+      record.viewportPinnedByAgent = true;
+    }
+    if (!record.agentControlled && record.viewportPinnedByAgent) {
+      record.viewportPinnedByAgent = false;
+      if (record.viewport.mode === "fixed") {
+        record.viewport = { mode: "auto" };
+        this.scheduleViewportCommit(record, true);
+      }
     }
     if (!record.agentControlled) this.setAgentRetained(tabId, false);
     this.setAgentCursor(
@@ -5090,6 +5108,7 @@ export class BrowserSurfaceManager {
       )
         return;
       this.promote(record.surfaceId);
+      this.noteUserActivity(record);
       this.releaseAgentControlForUserInput(record);
     });
     webContents.on("before-mouse-event", (event, input) => {
@@ -5167,6 +5186,7 @@ export class BrowserSurfaceManager {
       )
         return;
       this.promote(record.surfaceId);
+      this.noteUserActivity(record);
       this.releaseAgentControlForUserInput(record);
     });
     webContents.on("render-process-gone", (_event, details) => {
@@ -5190,11 +5210,21 @@ export class BrowserSurfaceManager {
     if (record && this.#surfaces.isPrimary(record)) this.releaseAgentControlForUserInput(record);
   }
 
+  // 用户真实输入的节流通知：daemon 据此知道用户是否仍在操作，代理在用户停手后才重新接管。
+  // 不夺走控制权；代理自己的原生输入（automationInputDepth > 0）不会走到这里。
+  private noteUserActivity(record: BrowserSurfaceRecord): void {
+    const now = Date.now();
+    if (now - (this.#userActivityEmittedAt.get(record.surfaceId) ?? 0) < USER_ACTIVITY_EMIT_INTERVAL_MS) return;
+    this.#userActivityEmittedAt.set(record.surfaceId, now);
+    this.#onEvent({ type: "user_activity", binding: this.binding(record) });
+  }
+
   // 接管只在首次介入 AI 控制时发布；后续原生交互不重复撤销租约。
   private releaseAgentControlForUserInput(record: BrowserSurfaceRecord, followPanel = true): void {
     if (record.closed || !record.agentControlled) return;
     record.agentControlled = false;
     record.agentControl = null;
+    record.viewportPinnedByAgent = false;
     this.setAgentCursor(record, false, null, null, null);
     // 只有介入 AI 控制才自动恢复响应式；用户显式选固定设备时保留其选择。
     if (followPanel && record.viewport.mode === "fixed") {

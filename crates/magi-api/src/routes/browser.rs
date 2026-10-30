@@ -115,10 +115,6 @@ pub fn routes() -> Router<ApiState> {
             post(set_web_model_tool_policy),
         )
         .route(
-            "/browser/web-models/connector",
-            get(get_web_connector).post(configure_web_connector),
-        )
-        .route(
             "/browser/web-models/saved",
             get(list_web_saved_conversations),
         )
@@ -1497,86 +1493,6 @@ async fn stop_web_model(
     require_desktop_browser_capability(&state, &headers, request.client_platform)?;
     state.stop_web_model().await;
     Ok(Json(serde_json::json!({ "status": "stopped" })))
-}
-
-fn connector_tools_digest_path(state: &ApiState) -> Option<std::path::PathBuf> {
-    state
-        .runtime_persistence()?
-        .state_root()
-        .map(|root| root.join("web-model").join("connector-tools.digest"))
-}
-
-fn read_connector_tools_digest(state: &ApiState) -> Option<String> {
-    std::fs::read_to_string(connector_tools_digest_path(state)?)
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-fn write_connector_tools_digest(state: &ApiState) {
-    let (Some(path), Some(digest)) = (
-        connector_tools_digest_path(state),
-        crate::mcp_service::web_slot_tool_digest(state),
-    ) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(error) = std::fs::write(&path, digest) {
-        tracing::warn!(%error, "记录 ChatGPT 连接器工具目录指纹失败");
-    }
-}
-
-/// `GET /browser/web-models/connector`：只读检查 ChatGPT 侧 Magi 连接器。
-async fn get_web_connector(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    require_desktop_browser_capability(&state, &headers, None)?;
-    let mut status = state
-        .web_connector_status()
-        .await
-        .map_err(crate::web_model_ops::web_model_api_error)?;
-    // ChatGPT 设置页的已安装连接器行通常不展示工具数；以槽位 MCP 的实际
-    // `tools/list` 目录为准，避免把页面文案缺失误报成 Magi 工具数量不可用。
-    status.tool_count = crate::mcp_service::web_slot_tool_count(&state);
-    // ChatGPT 缓存的是创建 / 上次刷新时的工具列表。Magi 记下当时推给它的目录指纹：
-    // 指纹和现在不同（或从没记录过），就说明 ChatGPT 手里的列表可能已经过期。
-    let tools_stale = status.exists.then(|| {
-        let current = crate::mcp_service::web_slot_tool_digest(&state);
-        current.is_some() && current != read_connector_tools_digest(&state)
-    });
-    Ok(Json(serde_json::json!({
-        "supported": status.supported,
-        "exists": status.exists,
-        "enabled": status.enabled,
-        "toolCount": status.tool_count,
-        "toolsStale": tools_stale,
-        "reason": status.reason,
-    })))
-}
-
-/// `POST /browser/web-models/connector`：在 ChatGPT 中创建 / 启用 Magi 连接器（显式用户动作）。
-async fn configure_web_connector(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<WebModelClientRequest>,
-) -> Result<Json<Value>, ApiError> {
-    require_desktop_browser_capability(&state, &headers, request.client_platform)?;
-    let outcome = state
-        .configure_web_connector()
-        .await
-        .map_err(crate::web_model_ops::web_model_api_error)?;
-    // 创建或刷新成功：ChatGPT 此刻持有的就是 Magi 当前的目录，记下指纹。
-    if outcome.configured && outcome.confirmed_enabled {
-        write_connector_tools_digest(&state);
-    }
-    Ok(Json(serde_json::json!({
-        "configured": outcome.configured,
-        "confirmedEnabled": outcome.confirmed_enabled,
-        "reason": outcome.reason,
-    })))
 }
 
 /// `GET /browser/web-models/saved`：已保存对话列表（只读）。
@@ -5256,7 +5172,11 @@ async fn get_web_model_setup(
     headers: HeaderMap,
     Query(query): Query<WebModelSetupQuery>,
 ) -> Result<Json<Option<magi_app_server_protocol::generated::WebModelSetupStatus>>, ApiError> {
-    require_web_model_plugin(&state)?;
+    if !state.web_model_setup_available() {
+        return Err(ApiError::Forbidden(
+            "GPT Web 配置需要先安装并激活 GPT Web 插件".into(),
+        ));
+    }
     require_desktop_browser_capability(&state, &headers, None)?;
     let session = SessionId::new(query.session_id);
     if state.session_store.session(&session).is_none() {

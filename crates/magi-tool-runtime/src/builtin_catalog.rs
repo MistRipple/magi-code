@@ -2459,7 +2459,15 @@ mod tests {
     fn browser_wait_for_schema_requires_a_real_wait_condition() {
         let schema = BuiltinToolName::BrowserWaitFor.parameters_schema();
 
-        assert_eq!(schema["anyOf"].as_array().map(Vec::len), Some(4));
+        let conditions = schema["anyOf"].as_array().expect("wait conditions");
+        for condition in ["selector", "text", "texts", "url", "stable"] {
+            assert!(
+                conditions
+                    .iter()
+                    .any(|variant| { variant["required"] == serde_json::json!([condition]) })
+            );
+        }
+        assert_eq!(schema["properties"]["stable"]["type"], "boolean");
         assert_eq!(schema["properties"]["selector"]["minLength"], 1);
         assert_eq!(schema["properties"]["texts"]["minItems"], 1);
     }

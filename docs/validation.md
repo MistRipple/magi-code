@@ -1,5 +1,7 @@
 # 脚本与验证入口
 
+界面设计、文案、布局与交互验收同时遵循 [UX/UI 设计与开发规范](ux-ui-guidelines.md)的检查清单，按改动面选择检查及真实运行场景；多语言、触摸与视觉检查的结果不能由静态通过代替。
+
 脚本的执行入口以各 workspace 的 package.json、Cargo target 和 .github/workflows 为准。本文区分离线检查、真实集成验收与发布，不把源码断言当作真实 Chromium 或 Provider 验收。
 
 模型档位与切换：`npm run test:model-reasoning-live` 使用隔离状态、真实 daemon/App Server/Chromium 和本地 Provider，覆盖三/六档、强度实际参数、切模校正、无默认档位重置、设置页覆盖保存、草稿刷新与重启恢复。数据归属和离线回归见[模型推理能力与选择交互](model-reasoning-capabilities.md)；不调用 GPT Web 或用户的外部模型服务。
@@ -55,7 +57,7 @@ Rust 摘要、压缩或语言解析依赖升级时，运行 `cargo test -p magi-
 | --- | --- |
 | `npm run test:data-loading-live` | 构建 Web、独立 daemon 和 Chromium、本地 Provider；验证折叠工作区目录预取、慢目录不阻塞、临时失败重试、后台会话更新、跨客户端工作区变化、daemon 重启恢复、文件树加载途中切换隐藏文件补读、Markdown/公式/代码高亮/Mermaid 实际渲染，以及设置页重新显示/focus 刷新、迟到响应隔离与未保存草稿保留；不接管用户已有进程 |
 | `npm run test:electron-browser-viewport` | 已打包 Electron、独立状态根与本地 Provider；真实 AI 工具验证固定/自适应视口、窄电脑/手机横屏、DPR/触控、缩放点击、光标常驻/导航/折叠恢复、拖动与网页点击接管后自适应、交还、320px 工具栏/菜单边界和后台页面不改布局 |
-| `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算、点击、输入、焦点、遮挡及导航引用失效；需要本机图形环境 |
+| `npm run test:electron-browser-actions` | 从当前源码构建 Worker 与 SurfaceManager，在独立临时状态目录启动真实 Electron webview；验证敏感值、快照预算与视口内优先排序、未返回控件汇总、按 element_ref 缩小范围、点击、输入、焦点、遮挡、按键与滚动的动作证据、页面稳定等待及导航引用失效；需要本机图形环境。input 组在宿主窗口隐藏后有既有的时间预算（离屏 guest 长时间运行后调试器以 target closed 断开，HEAD 代码同样如此），新增检查放在 pointer 组 |
 | `npm run test:electron-cursor-presentation` | 从当前 Main、Worker 和 Svelte 光标源码启动真实 Electron guest；验证移动完成确认先于原生点击和输入框焦点、原地点击、隐藏/减少动态效果，以及移动途中用户接管、取消、导航和迟到确认；使用本地测试页与独立临时状态目录，需要本机图形环境 |
 | `npm run test:electron-cursor-desktop-live` | 当前源码的完整开发 Desktop + daemon + 原生 Worker，访问真实 Example/IANA、Wikipedia 和 Rust Book，验证对话触发工具、光标滑行先于原生点击、输入/替换/搜索、右栏折叠恢复、移动中接管和交还；使用独立状态目录和本地模型调度，依赖公网和本机图形环境。先构建 Web 与 Desktop JavaScript，脚本通过 `scripts/dev-daemon.sh` 启动当前 daemon；截图与日志默认保留在临时目录，可用 `MAGI_CURSOR_LIVE_ARTIFACTS` 指定输出目录 |
 | `npm run test:electron-browser-network-policy` | 开发依赖 Electron 的网络边界验收；验证 iframe、fetch、重定向和 localhost 预览来源 |

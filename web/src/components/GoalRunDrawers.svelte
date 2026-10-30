@@ -1107,7 +1107,6 @@
     font: inherit;
     font-size: var(--text-sm);
     line-height: 1.5;
-    resize: none;
     overflow-y: auto;
   }
 

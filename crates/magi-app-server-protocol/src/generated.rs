@@ -424,6 +424,9 @@ pub struct WebModelSetupStatus {
     pub session_id: String,
     pub stage: String,
     pub reason: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
 }

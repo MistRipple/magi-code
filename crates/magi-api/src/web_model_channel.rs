@@ -161,6 +161,11 @@ pub struct WebModelChannelRuntime {
     driver: Mutex<Option<Arc<dyn magi_web_model::WebModelPageDriver>>>,
     /// 最近一次配置时的 state root（读取密钥是否存在用）。
     state_root: Mutex<Option<PathBuf>>,
+    /// 槽位端点最近一次响应 `tools/list` 的时间（毫秒，0 表示从未）。
+    /// 这是 ChatGPT 经 Tunnel 实际读取过 Magi 工具目录的 daemon 侧事实。
+    slot_catalog_served_at: AtomicU64,
+    /// 正在运行的配置 Agent 的取消句柄。结束配置必须能打断正在持锁的运行，而不是排队等它跑完。
+    setup_run: Mutex<Option<magi_plugin_system::RunCancellation>>,
 }
 
 impl WebModelChannelRuntime {
@@ -183,6 +188,8 @@ impl WebModelChannelRuntime {
             runtime: Mutex::new(None),
             driver: Mutex::new(None),
             state_root: Mutex::new(None),
+            slot_catalog_served_at: AtomicU64::new(0),
+            setup_run: Mutex::new(None),
         }
     }
 
@@ -649,6 +656,39 @@ pub async fn restore_configured_channel(state: &ApiState) -> Option<WebModelTunn
             tracing::warn!(%error, "恢复 GPT Web 工具通道失败，该 Web 会话没有项目工具");
             None
         }
+    }
+}
+
+impl WebModelChannelRuntime {
+    pub(crate) fn begin_setup_run(&self, cancellation: magi_plugin_system::RunCancellation) {
+        *self.setup_run.lock().expect("setup run lock poisoned") = Some(cancellation);
+    }
+
+    pub(crate) fn finish_setup_run(&self) {
+        *self.setup_run.lock().expect("setup run lock poisoned") = None;
+    }
+
+    /// 通知正在运行的配置在下一个阶段边界停止；没有运行时是空操作。
+    pub(crate) fn cancel_running_setup(&self) {
+        if let Some(cancellation) = self
+            .setup_run
+            .lock()
+            .expect("setup run lock poisoned")
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
+    }
+
+    pub(crate) fn record_slot_catalog_served(&self) {
+        self.slot_catalog_served_at
+            .store(magi_core::UtcMillis::now().0, Ordering::SeqCst);
+    }
+
+    /// `since` 之后是否有远端客户端经槽位端点读取过工具目录。
+    pub(crate) fn slot_catalog_served_since(&self, since: u64) -> bool {
+        let served = self.slot_catalog_served_at.load(Ordering::SeqCst);
+        served != 0 && served >= since
     }
 }
 

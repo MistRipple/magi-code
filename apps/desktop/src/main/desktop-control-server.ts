@@ -302,6 +302,12 @@ export class DesktopControlServer {
           payload: { binding: event.binding },
         });
         break;
+      case "user_activity":
+        this.emit({
+          type: "user_activity",
+          payload: { binding: event.binding },
+        });
+        break;
       case "agent_cursor":
         this.emit({
           type: "agent_cursor",

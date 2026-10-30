@@ -2115,6 +2115,27 @@ impl ApiState {
         self.plugin_active(magi_web_model::WEB_MODEL_PLUGIN_ID)
     }
 
+    /// GPT Web 配置能力：插件已安装、启用、授权并激活，且清单贡献了 `setup` 命令。
+    /// 设置入口、配置 API 和配置 Agent 都以这一个事实为准。
+    pub(crate) fn web_model_setup_available(&self) -> bool {
+        if !self.web_model_plugin_active() {
+            return false;
+        }
+        self.plugin_manager.lock().ok().is_some_and(|manager| {
+            manager
+                .package(magi_web_model::WEB_MODEL_PLUGIN_ID)
+                .map(|package| {
+                    package
+                        .manifest()
+                        .contributions
+                        .commands
+                        .iter()
+                        .any(|command| command.id == "setup")
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Magi MCP 服务（对外开放工具）只能在第一方插件的应用实例激活后使用。
     pub(crate) fn mcp_server_plugin_active(&self) -> bool {
         self.plugin_active(crate::bundled_plugins::MCP_SERVER_PLUGIN_ID)

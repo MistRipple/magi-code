@@ -35,8 +35,6 @@ use crate::state::ApiState;
 /// 按需创建，不在这里创建。
 pub const WEB_MODEL_HOME_TAB_ID: &str = "browser-tab-web-model-home";
 
-/// ChatGPT 侧连接器的显示名。
-const WEB_CONNECTOR_NAME: &str = "Magi";
 const HOME_RECOVERY_ATTEMPTS: usize = 4;
 const HOME_RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
@@ -562,8 +560,8 @@ impl ApiState {
         Err(last.expect("at least one attempt ran"))
     }
 
-    /// 会导航唯一 WebView 的操作（连接器、读取历史列表）：槽位被会话占用时拒绝，不接管、不打断。
-    fn require_free_slot_for_connector(&self) -> Result<(), WebModelError> {
+    /// 会导航唯一 WebView 的操作（读取历史列表）：槽位被会话占用时拒绝，不接管、不打断。
+    fn require_free_slot_for_page_read(&self) -> Result<(), WebModelError> {
         if let Some(owner) = self.web_model.bindings().and_then(|slots| slots.owner()) {
             return Err(WebModelError::new(
                 WebModelErrorCode::WebSessionBusy,
@@ -597,7 +595,7 @@ impl ApiState {
         target: WebModelPageTarget,
     ) -> Result<(), WebModelError> {
         self.require_web_model_plugin()?;
-        self.require_free_slot_for_connector()?;
+        self.require_free_slot_for_page_read()?;
         let driver = self.web_driver()?;
         match target {
             WebModelPageTarget::Chat => self.open_home_with_recovery(&driver).await,
@@ -642,52 +640,13 @@ impl ApiState {
         Err(last.expect("at least one attempt ran"))
     }
 
-    /// 只读检查 ChatGPT 侧的 Magi 连接器。
-    pub async fn web_connector_status(
-        &self,
-    ) -> Result<magi_web_model::ConnectorStatus, WebModelError> {
-        let _serial = self.web_model.setup_lock.lock().await;
-        self.require_web_model_plugin()?;
-        self.require_free_slot_for_connector()?;
-        self.require_no_setup_reservation()?;
-        // 页面可能停在 OpenAI 平台页或设置页：连接器检查从 ChatGPT 主页开始。
-        let driver = self.web_driver()?;
-        self.open_home_with_recovery(&driver).await?;
-        driver
-            .connector_status(WEB_MODEL_HOME_TAB_ID, WEB_CONNECTOR_NAME)
-            .await
-    }
-
-    /// 在 ChatGPT 里创建 / 启用 Magi 连接器并回读确认。这是**显式用户动作**（会修改用户的
-    /// ChatGPT 连接器设置，只写连接器设置）；需要工具通道已配置 Tunnel id。
-    pub async fn configure_web_connector(
-        &self,
-    ) -> Result<magi_web_model::ConnectorConfigOutcome, WebModelError> {
-        let _serial = self.web_model.setup_lock.lock().await;
-        self.require_web_model_plugin()?;
-        self.require_free_slot_for_connector()?;
-        self.require_no_setup_reservation()?;
-        let status = self.web_model.status();
-        if status.tunnel_id.trim().is_empty() {
-            return Err(WebModelError::new(
-                WebModelErrorCode::WebTunnelUnavailable,
-                "请先在设置里配置 OpenAI Tunnel id",
-            ));
-        }
-        let driver = self.web_driver()?;
-        self.open_home_with_recovery(&driver).await?;
-        driver
-            .configure_connector(WEB_MODEL_HOME_TAB_ID, WEB_CONNECTOR_NAME, &status.tunnel_id)
-            .await
-    }
-
     /// 已保存对话列表（侧栏历史）。只读，不导航、不改变槽位。
     pub async fn list_web_saved_conversations(
         &self,
     ) -> Result<Vec<SavedConversationEntry>, WebModelError> {
         let _serial = self.web_model.setup_lock.lock().await;
         self.require_web_model_plugin()?;
-        self.require_free_slot_for_connector()?;
+        self.require_free_slot_for_page_read()?;
         self.require_no_setup_reservation()?;
         // 侧栏历史只在普通（非临时）主页上可读；槽位空闲时先回到主页再读。
         let driver = self.web_driver()?;

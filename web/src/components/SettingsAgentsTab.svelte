@@ -811,7 +811,7 @@
   .role-editor-header p { margin: 7px 0 0; color: var(--ind-foreground-soft); font-size: 12px; line-height: 1.5; }
   .role-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 20px; align-items: start; }
   .role-editor-grid label, .role-editor-grid legend { color: var(--ind-foreground-secondary); font-size: 12px; font-weight: var(--font-semibold); line-height: 1.35; }
-  .role-editor-grid input:not([type='checkbox']), .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: var(--magi-hairline) solid var(--ind-border-control); border-radius: var(--radius-md); background: var(--ind-bg-control); color: var(--ind-foreground); padding: 9px 10px; font: inherit; font-size: 13px; line-height: 1.45; resize: vertical; }
+  .role-editor-grid input:not([type='checkbox']), .role-editor-grid textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: var(--magi-hairline) solid var(--ind-border-control); border-radius: var(--radius-md); background: var(--ind-bg-control); color: var(--ind-foreground); padding: 9px 10px; font: inherit; font-size: 13px; line-height: 1.45; }
   .role-editor-grid input:not([type='checkbox'])::placeholder, .role-editor-grid textarea::placeholder { color: var(--ind-foreground-soft); opacity: 1; }
   .role-editor-grid input:not([type='checkbox']):disabled { opacity: .65; cursor: not-allowed; }
   .role-editor-grid input:focus, .role-editor-grid textarea:focus { outline: none; box-shadow: var(--magi-focus-shadow); }

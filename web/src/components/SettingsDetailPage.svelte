@@ -58,4 +58,17 @@
   .detail-header h3 { margin: 0; font-size: var(--text-lg); }
   .detail-body { min-width: 0; }
   .detail-footer { flex-shrink: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 20px 0 0; }
+
+  /* 按信息层次入场；仅透明度变化，保留内部 fixed 浮层的定位参照。 */
+  @media (prefers-reduced-motion: no-preference) {
+    .detail-back-row, .detail-header, .detail-body, .detail-footer {
+      animation: detail-reveal 150ms var(--magi-ease-ink) backwards;
+    }
+    .detail-body { animation-delay: 35ms; }
+    .detail-footer { animation-delay: 70ms; }
+  }
+  @keyframes detail-reveal {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
 </style>

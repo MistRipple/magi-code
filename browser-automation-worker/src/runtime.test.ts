@@ -175,8 +175,6 @@ interface WebScriptResponses {
   origin?: string;
   savedConversations?: Record<string, unknown>;
   savedMessages?: Record<string, unknown>;
-  connectorStatus?: Record<string, unknown>;
-  configureConnector?: Record<string, unknown>;
   /** 每次 attachmentState() 依次返回；用完后重复最后一项。 */
   attachmentStates?: Array<{ count: number; uploading: boolean }>;
   fileInputTarget?: string | null;
@@ -245,16 +243,10 @@ function webScriptedPort(responses: WebScriptResponses): ScriptedPort {
     if (expression.includes("globalThis.__magiWebModel.savedMessages()")) {
       return { result: { value: responses.savedMessages ?? null } };
     }
-    if (expression.includes("globalThis.__magiWebModel.connectorStatus(")) {
-      return { result: { value: responses.connectorStatus ?? null } };
-    }
-    if (expression.includes("globalThis.__magiSetupInput") && expression.includes(".snapshot()")) {
+    if (expression.includes("globalThis.__magiNativeInput") && expression.includes(".snapshot()")) {
       return { result: { value: { done: true, failed: false, value: setupValue, request: null } } };
     }
-    if (expression.includes("globalThis.__magiWebModel.configureConnector(")) {
-      setupValue = responses.configureConnector ?? null;
-      return { result: { value: responses.configureConnector ?? null } };
-    }
+
     if (expression.includes("globalThis.__magiWebModel.questionActions(")) {
       if (responses.questionStale) return { exceptionDetails: { text: "web_question_stale:changed" } };
       return { result: { value: [{ kind: "option", item: 0, index: 0 }, { kind: "submit" }] } };
@@ -493,26 +485,42 @@ test("CDP 请求超时会通知 Main 取消底层请求，并保留超时错误�
   );
 });
 
-test("浏览器按键使用 Chromium 原生 key 事件类型和键码", async () => {
-  const port = new FakePort();
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port));
-  const result = await runtime.execute("press-enter", binding, {
-    type: "press",
-    payload: {
-      tab_id: binding.tab_id,
-      control: { mode: "agent", lease_id: "lease-1", fence: 1 },
-      key: "Enter",
-    },
-  });
-  assert.equal(result.outcome.status, "succeeded");
-  const keyEvents = port.methods.filter((method) => method === "Input.dispatchKeyEvent");
-  assert.equal(keyEvents.length, 2);
-  const inputRequests = port.requests.filter((request) => request.method === "Input.dispatchKeyEvent");
-  assert.equal(inputRequests[0]?.params.type, "rawKeyDown");
-  assert.equal(inputRequests[0]?.params.key, "Enter");
-  assert.equal(inputRequests[0]?.params.code, "Enter");
-  assert.equal(inputRequests[0]?.params.windowsVirtualKeyCode, 13);
-  assert.equal(inputRequests[1]?.params.type, "keyUp");
+test("浏览器按键使用 Chromium 原生 key 事件类型和键码，并回报按键后的页面效果", async () => {
+  const run = async (watched: Record<string, unknown>) => {
+    const port = new ScriptedPort((method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") {
+        return { result: { value: String(params.expression).includes("endWatch(") ? watched : null } };
+      }
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute("press-enter", binding, {
+      type: "press",
+      payload: { tab_id: binding.tab_id, control: { mode: "agent", lease_id: "lease-1", fence: 1 }, key: "Enter" },
+    });
+    return { port, result };
+  };
+  const changed = await run({ mutations: 0, stateBefore: "focus=input#q value_len=3", stateAfter: "focus=input#q value_len=0" });
+  assert.equal(changed.result.outcome.status, "succeeded");
+  const keyRequests = changed.port.requests.filter((request) => request.method === "Input.dispatchKeyEvent");
+  assert.equal(keyRequests.length, 2);
+  assert.equal(keyRequests[0]?.params.type, "rawKeyDown");
+  assert.equal(keyRequests[0]?.params.key, "Enter");
+  assert.equal(keyRequests[0]?.params.code, "Enter");
+  assert.equal(keyRequests[0]?.params.windowsVirtualKeyCode, 13);
+  assert.equal(keyRequests[1]?.params.type, "keyUp");
+  const effectOf = (result: Awaited<ReturnType<typeof run>>["result"]) => {
+    if (result.outcome.status !== "succeeded" || result.outcome.payload.type !== "action_target") throw new Error("action target expected");
+    return result.outcome.payload.payload?.effect;
+  };
+  assert.equal(effectOf(changed.result)?.verdict, "changed");
+  assert.deepEqual(effectOf(changed.result)?.target_state, { before: "focus=input#q value_len=3", after: "focus=input#q value_len=0" });
+  const domOnly = await run({ mutations: 4, stateBefore: "focus=none", stateAfter: "focus=none" });
+  assert.equal(effectOf(domOnly.result)?.verdict, "changed");
+  const nothing = await run({ mutations: 0, stateBefore: "focus=none", stateAfter: "focus=none" });
+  assert.equal(effectOf(nothing.result)?.verdict, "no_visible_change");
 });
 
 test("扩展浏览器能力已经进入 Worker 执行链", async () => {
@@ -839,7 +847,7 @@ test("滚动目标元素时直接调用元素 scrollBy，不依赖鼠标坐标",
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
-    if (method === "Runtime.evaluate") return { result: { value: null } };
+    if (method === "Runtime.evaluate") return { result: { value: { before: { x: 0, y: 0 }, after: { x: 0, y: 300 } } } };
     return {};
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -863,6 +871,9 @@ test("滚动目标元素时直接调用元素 scrollBy，不依赖鼠标坐标",
   assert.match(String(scroll.params.expression), /__magiBrowserAutomation\.resolve/);
   assert.match(String(scroll.params.expression), /left: 0/);
   assert.match(String(scroll.params.expression), /top: 300/);
+  if (result.outcome.status !== "succeeded" || result.outcome.payload.type !== "action_target") throw new Error("action target expected");
+  assert.equal(result.outcome.payload.payload?.effect?.verdict, "changed");
+  assert.equal(result.outcome.payload.payload?.effect?.delivered, "confirmed");
 });
 
 test("页面滚动不再经过会超时的 Input.dispatchMouseEvent CDP 通道", async () => {
@@ -872,7 +883,7 @@ test("页面滚动不再经过会超时的 Input.dispatchMouseEvent CDP 通道",
     if (method === "Input.dispatchMouseEvent") {
       return new Error("browser_cdp_timeout:Input.dispatchMouseEvent");
     }
-    return { result: { value: null } };
+    return { result: { value: { before: { x: 0, y: 900 }, after: { x: 0, y: 900 } } } };
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
 
@@ -892,6 +903,10 @@ test("页面滚动不再经过会超时的 Input.dispatchMouseEvent CDP 通道",
     false,
   );
   assert.ok(port.requests.some((request) => request.method === "Runtime.evaluate" && String(request.params.expression).includes("window.scrollBy")));
+  // 位置没变（已在页面底部）：如实告诉 Agent，不要重复同一滚动。
+  if (result.outcome.status !== "succeeded" || result.outcome.payload.type !== "action_target") throw new Error("action target expected");
+  assert.equal(result.outcome.payload.payload?.effect?.verdict, "no_visible_change");
+  assert.match(String(result.outcome.payload.payload?.effect?.target_state?.after), /已到边界/);
 });
 
 test("click_at 的 double_click 产生完整双击序列", async () => {
@@ -931,7 +946,11 @@ test("click_at 按下触发导航后不向新文档发送释放事件", async ()
     payload: { tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 } },
   });
 
-  assert.equal(result.outcome.status, "indeterminate");
+  // 按下本身触发了导航：这是点击的结果，不是失败。旧页面不再回读，也不向新文档补发释放。
+  assert.equal(result.outcome.status, "succeeded");
+  if (result.outcome.status === "succeeded" && result.outcome.payload.type === "json") {
+    assert.equal((result.outcome.payload.payload as { value: { target: { effect: { verdict: string } } } }).value.target.effect.verdict, "navigated");
+  }
   assert.deepEqual(
     port.requests
       .filter((request) => request.method === "Input.dispatchMouseEvent")
@@ -1112,6 +1131,111 @@ test("拖拽只使用原生鼠标序列；未观察到 drop 不报告成功", as
   }
 });
 
+test("点击结果带页面内观察到的效果：有变化、目标被移除、无可见变化三种判定", async () => {
+  const cases = [
+    { name: "状态变化", page: { observed: true, mutations: 0, connected: true, stateBefore: "expanded=false", stateAfter: "expanded=true" }, verdict: "changed" },
+    { name: "DOM 变化", page: { observed: true, mutations: 5, connected: true, stateBefore: "", stateAfter: "" }, verdict: "changed" },
+    { name: "目标被移除", page: { observed: true, mutations: 0, connected: false, stateBefore: "", stateAfter: "" }, verdict: "changed" },
+    { name: "无可见变化", page: { observed: true, mutations: 0, connected: true, stateBefore: "", stateAfter: "" }, verdict: "no_visible_change" },
+  ];
+  for (const item of cases) {
+    const port = new ScriptedPort((method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, role: "button", name: "展开", ...item.page } } };
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    const result = await runtime.execute(item.name, binding, { type: "devtools", payload: {
+      tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 },
+    } });
+    assert.equal(result.outcome.status, "succeeded", item.name);
+    if (result.outcome.status !== "succeeded" || result.outcome.payload.type !== "json") throw new Error(item.name);
+    const effect = (result.outcome.payload.payload as { value: { target: { effect: { verdict: string; delivered: string; navigated: boolean } } } }).value.target.effect;
+    assert.equal(effect.verdict, item.verdict, item.name);
+    assert.equal(effect.delivered, "confirmed");
+    assert.equal(effect.navigated, false);
+  }
+});
+
+test("按下之后读取页面时发现页面内路由换代：报告为已跳转，按下之前的换代仍是未送达的失败", async () => {
+  const run = async (staleAfterPress: boolean) => {
+    let pressed = false;
+    const port = new ScriptedPort((method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") pressed = true;
+      if (method === "Runtime.evaluate") {
+        const expression = String(params.expression);
+        if (staleAfterPress ? pressed && expression.includes("finishPointer(") : expression.includes("verifyPointer(")) {
+          return new Error("browser_surface_stale: binding is older than the current navigation");
+        }
+        return { result: { value: { x: 20, y: 30, role: "button", name: "列出工具", observed: true, mutations: 0, connected: true, stateBefore: "", stateAfter: "" } } };
+      }
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    return runtime.execute("spa-route", binding, { type: "devtools", payload: {
+      tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 },
+    } });
+  };
+  const after = await run(true);
+  assert.equal(after.outcome.status, "succeeded");
+  if (after.outcome.status === "succeeded" && after.outcome.payload.type === "json") {
+    const effect = (after.outcome.payload.payload as { value: { target: { effect: { verdict: string; delivered: string } } } }).value.target.effect;
+    assert.equal(effect.verdict, "navigated");
+    assert.equal(effect.delivered, "inferred");
+  }
+  const before = await run(false);
+  assert.notEqual(before.outcome.status, "succeeded");
+});
+
+test("wait_for stable 只等页面安静：超时返回 stable=false 而不是报错，参数缺失仍被拒绝", async () => {
+  const run = async (args: Record<string, unknown>, settled: Record<string, unknown>) => {
+    const port = new ScriptedPort((method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") return { result: { value: String(params.expression).includes("settle(") ? settled : null } };
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    return runtime.execute("wait-stable", binding, { type: "devtools", payload: { tab_id: binding.tab_id, operation: "wait_for", arguments: args } });
+  };
+  const valueOf = (result: Awaited<ReturnType<typeof run>>) => {
+    if (result.outcome.status !== "succeeded" || result.outcome.payload.type !== "json") throw new Error(JSON.stringify(result.outcome));
+    return (result.outcome.payload.payload as { value: Record<string, unknown> }).value;
+  };
+  assert.equal(valueOf(await run({ stable: true, timeout_ms: 1 }, { stable: true, mutations: 0, waited_ms: 420, ready_state: "complete" })).matched, true);
+  const busy = valueOf(await run({ stable: true, timeout_ms: 1 }, { stable: false, mutations: 90, waited_ms: 1, ready_state: "complete" }));
+  assert.equal(busy.matched, false);
+  assert.equal(busy.stable, false);
+  assert.notEqual((await run({}, {})).outcome.status, "succeeded");
+});
+
+test("事件未回读确认但目标已被移出文档时，如实报告已生效（送达为推断）；其他未确认仍是 indeterminate", async () => {
+  const run = async (page: Record<string, unknown>) => {
+    const port = new ScriptedPort((method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") return { result: { value: { x: 20, y: 30, role: "option", name: "Default project", ...page } } };
+      return {};
+    });
+    const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+    return runtime.execute("option-click", binding, { type: "devtools", payload: {
+      tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30 },
+    } });
+  };
+  const removed = await run({ observed: false, mutations: 4, connected: false, stateBefore: "", stateAfter: "" });
+  assert.equal(removed.outcome.status, "succeeded");
+  if (removed.outcome.status === "succeeded" && removed.outcome.payload.type === "json") {
+    const effect = (removed.outcome.payload.payload as { value: { target: { effect: { verdict: string; delivered: string } } } }).value.target.effect;
+    assert.equal(effect.verdict, "changed");
+    assert.equal(effect.delivered, "inferred");
+  }
+  const stillThere = await run({ observed: false, mutations: 9, connected: true, stateBefore: "", stateAfter: "" });
+  assert.equal(stillThere.outcome.status, "indeterminate", "目标仍在文档中且事件未确认：不能凭其他区域的变化宣称生效");
+});
+
 test("悬停和坐标点击没有收到目标事件时返回未确认；双击中途导航不继续第二次点击", async () => {
   for (const operation of ["hover", "click_at"]) {
     const port = new ScriptedPort((method) => {
@@ -1139,11 +1263,8 @@ test("悬停和坐标点击没有收到目标事件时返回未确认；双击�
   const result = await runtime.execute("double-navigation", binding, { type: "devtools", payload: {
     tab_id: binding.tab_id, operation: "click_at", arguments: { x: 20, y: 30, double_click: true },
   } });
-  assert.equal(result.outcome.status, "indeterminate");
-  if (result.outcome.status === "indeterminate") {
-    assert.equal(result.outcome.payload.code, "browser_navigation_superseded");
-    assert.equal(result.outcome.payload.side_effect_started, true);
-  }
+  // 第一次点击就触发了导航：如实报告“已跳转”，且不向新文档发送第二次点击。
+  assert.equal(result.outcome.status, "succeeded");
   assert.equal(port.requests.filter(request => request.method === "Input.dispatchMouseEvent" && request.params.type === "mousePressed").length, 1);
 });
 
@@ -2371,121 +2492,20 @@ test("已保存对话命令只做校验后的透传：列表、消息、精确�
   assert.equal(messages?.messages?.[1]?.role, "assistant");
 });
 
-test("页面适配器返回畸形的已保存对话 / 连接器结果时命令显式失败，不透传", async () => {
+test("页面适配器返回畸形的已保存对话结果时命令显式失败，不透传", async () => {
   const port = webScriptedPort({
     savedConversations: { conversations: [{ conversation_id: "", title: 1 }] },
     savedMessages: { conversation_id: null, messages: [{ role: "system", text: "x", remote_id: null }] },
-    connectorStatus: { supported: true },
-    configureConnector: { configured: true },
   });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
   for (const [type, payload, code] of [
     ["web_saved_conversations", {}, "web_saved_conversations_result_invalid"],
     ["web_saved_messages", {}, "web_saved_messages_result_invalid"],
-    ["web_connector_status", { name: "Magi" }, "web_connector_status_result_invalid"],
-    ["web_configure_connector", { name: "Magi", tunnel_id: "t" }, "web_configure_connector_result_invalid"],
   ] as const) {
     const result = await runtime.execute(`bad-${type}`, binding, webCommand(type, { tab_id: binding.tab_id, ...payload }));
     assert.equal(result.outcome.status, "failed", type);
     if (result.outcome.status === "failed") assert.equal(result.outcome.payload.code, code);
   }
-});
-
-test("配置已点击后轮询失效仍标记结果不确定，不能作为无副作用错误重试", async () => {
-  let polls = 0;
-  const port = new ScriptedPort((method, params) => {
-    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
-    if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
-    if (method !== 'Runtime.evaluate') return {};
-    const expression = String(params.expression);
-    if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
-    if (expression.includes('.snapshot()')) {
-      if (polls++ > 0) return { exceptionDetails: { text: 'browser_surface_stale' } };
-      return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'save', value: null } } } };
-    }
-    if (expression.includes('.preparePointer(')) return { result: { value: { x: 10, y: 20, bounds: { x: 0, y: 0, width: 30, height: 30 } } } };
-    if (expression.includes('.finishPointer(')) return { result: { value: { observed: true } } };
-    return { result: { value: true } };
-  });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
-  const result = await runtime.execute('setup-navigation-after-click', binding, webCommand('web_configure_connector', {
-    tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
-  }));
-  assert.equal(result.outcome.status, 'indeterminate');
-  if (result.outcome.status === 'indeterminate') assert.equal(result.outcome.payload.side_effect_started, true);
-  assert.equal(port.requests.filter(request => request.method === 'Input.dispatchMouseEvent' && request.params.type === 'mousePressed').length, 1);
-});
-
-test("配置命中失败保留固定原因及不确定边界，不重放输入且固定原因不夹带异常正文", async () => {
-  for (const [description, code] of [
-    ['Error: browser_target_obscured\n    at actionPoint', 'browser_target_obscured'],
-    ['Error: browser_element_ref_stale\n    at resolve', 'browser_element_ref_stale'],
-    ['Error: vendor-private-diagnostic', 'browser_page_script_failed'],
-  ]) {
-    const port = new ScriptedPort((method, params) => {
-      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
-      if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
-      if (method !== 'Runtime.evaluate') return {};
-      const expression = String(params.expression);
-      if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
-      if (expression.includes('.snapshot()')) return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'acknowledge', value: null } } } };
-      if (expression.includes('.preparePointer(')) return { exceptionDetails: { exception: { description } } };
-      return { result: { value: true } };
-    });
-    const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
-    const result = await runtime.execute(`setup-hit-${code}`, binding, webCommand('web_configure_connector', {
-      tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
-    }));
-    assert.equal(result.outcome.status, 'indeterminate');
-    if (result.outcome.status === 'indeterminate') {
-      assert.equal(result.outcome.payload.code, code);
-      assert.equal(result.outcome.payload.side_effect_started, true);
-      if (code !== 'browser_page_script_failed') assert.equal(result.outcome.payload.message, code);
-    }
-    assert.equal(port.requests.some(request => request.method.startsWith('Input.')), false);
-  }
-});
-
-test("连接器详情导航保留已输入事实并报告页面交接，不重放旧页点击", async () => {
-  const port = new ScriptedPort((method, params) => {
-    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-1' } } };
-    if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
-    if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased') {
-      port.emit('Page.frameStartedLoading', {}, { ...binding, navigation_revision: binding.navigation_revision + 1 });
-    }
-    if (method !== 'Runtime.evaluate') return {};
-    const expression = String(params.expression);
-    if (expression === 'location.origin') return { result: { value: 'https://chatgpt.com' } };
-    if (expression.includes('.snapshot()')) return { result: { value: { done: false, failed: false, request: { kind: 'click', ref: 'magi-detail', value: null } } } };
-    if (expression.includes('.preparePointer(')) return { result: { value: { x: 10, y: 20 } } };
-    return { result: { value: true } };
-  });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), 'worker-test');
-  const result = await runtime.execute('connector-detail-navigation', binding, webCommand('web_configure_connector', {
-    tab_id: binding.tab_id, name: 'Magi', tunnel_id: 'tunnel_1',
-  }));
-  assert.equal(result.outcome.status, 'indeterminate');
-  if (result.outcome.status === 'indeterminate') {
-    assert.equal(result.outcome.payload.code, 'browser_navigation_superseded');
-    assert.equal(result.outcome.payload.side_effect_started, true);
-  }
-  assert.equal(port.requests.filter(request => request.method === 'Input.dispatchMouseEvent' && request.params.type === 'mousePressed').length, 1);
-});
-
-test("连接器状态与配置命令把页面适配器的回读结果原样返回", async () => {
-  const port = webScriptedPort({
-    connectorStatus: { supported: true, exists: true, enabled: true, tool_count: 14, reason: null },
-    configureConnector: { configured: true, confirmed_enabled: true, reason: null },
-  });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
-  const status = await runtime.execute("connector-status", binding, webCommand("web_connector_status", {
-    tab_id: binding.tab_id, name: "Magi",
-  }));
-  assert.equal(status.outcome.status, "succeeded");
-  const configured = await runtime.execute("connector-configure", binding, webCommand("web_configure_connector", {
-    tab_id: binding.tab_id, name: "Magi", tunnel_id: "tunnel_1",
-  }));
-  assert.equal(configured.outcome.status, "succeeded");
 });
 
 test("web_write_text 使用 snake_case payload、遵守 timeout_ms，并返回安全回读诊断", async () => {

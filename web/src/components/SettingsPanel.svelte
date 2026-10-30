@@ -1094,7 +1094,6 @@ import {
   .mcp-json-editor { margin-bottom: 0; }
   .mcp-json-editor .form-textarea {
     min-height: 320px;
-    resize: vertical;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     line-height: 1.55;

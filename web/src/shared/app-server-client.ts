@@ -54,6 +54,11 @@ export interface AppServerClientOptions {
   onNotification?: (notification: ServerNotification) => void;
   onEvent?: (event: EventEnvelope) => void;
   onSnapshot?: (snapshot: EventStreamSnapshot) => void;
+  /**
+   * 重连后发现 daemon 运行代际变化（进程重启）时触发。重启时的收敛（孤立回合取消、任务终止、
+   * 通道回收）直接写入权威状态，不会产生事件，事件流本身补不回这些变化；上层必须据此重建权威状态。
+   */
+  onRuntimeEpochChange?: (change: { previous: string; current: string }) => void;
   onServerRequest?: (context: AppServerServerRequestContext) => void | Promise<void>;
 }
 
@@ -445,8 +450,12 @@ export class AppServerClient {
         this.#lastSequence = 0;
         if (this.#subscription) this.#subscription = { ...this.#subscription, afterSequence: 0 };
       }
+      const previousEpoch = this.#lastRuntimeEpoch;
       this.#lastRuntimeEpoch = initialize.runtimeEpoch;
       this.#initializeResult = initialize;
+      if (previousEpoch && previousEpoch !== initialize.runtimeEpoch) {
+        this.#options.onRuntimeEpochChange?.({ previous: previousEpoch, current: initialize.runtimeEpoch });
+      }
       this.sendNotification('initialized', {}, connection);
       if (this.#subscription) {
         const subscription = {

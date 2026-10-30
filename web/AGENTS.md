@@ -2,7 +2,7 @@
 
 本文件补充根目录 [AGENTS.md](../AGENTS.md)。产品与架构事实以 [工程约束和运行入口](../docs/README.md)、[Browser 设计](../docs/browser-runtime-design.md)及源码为准。
 
-UI 设计、交互和验收遵循 [UX/UI 规范](../docs/ux-ui-guidelines.md)。
+所有界面设计、文案、布局与交互工作先读并遵循 [UX/UI 设计与开发规范](../docs/ux-ui-guidelines.md)，包括自适应、多语言、触摸热区、反馈及验收；本文件仅补充 Web 与设置页的专有约定，不另行复制一套通用规范。
 
 ## 运行与验收
 

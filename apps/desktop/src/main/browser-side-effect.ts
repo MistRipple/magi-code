@@ -21,8 +21,6 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "web_clear_attachments":
     case "web_answer_question":
     case "web_cancel_generation":
-    case "web_platform_setup":
-    case "web_configure_connector":
       return true;
     case "ping":
     case "cancel":
@@ -48,7 +46,6 @@ export function isSideEffectingBrowserCommand(command: BrowserHostCommand): bool
     case "web_saved_conversations":
     case "web_saved_messages":
     case "web_read_image":
-    case "web_connector_status":
     case "shutdown":
       return false;
     default: {

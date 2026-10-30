@@ -1234,7 +1234,6 @@
     height: auto;
     min-height: 64px;
     padding-block: var(--space-2);
-    resize: vertical;
   }
 
   .named-tunnel {

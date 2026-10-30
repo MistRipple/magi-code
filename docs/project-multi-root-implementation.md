@@ -361,3 +361,10 @@ P1–P5 的主要源码接线、双 Git + 普通目录真实任务及 macOS 独�
 - 皮肤覆盖内置浅色/深色及带壁纸自定义皮肤的浅色/深色 × clear/translucent/immersive，共 8 组。主按钮文字/背景均不透明，实测最小对比度约 11.49:1；弹窗无横向溢出。已人工查看浅色、沉浸壁纸、390px 弹窗与目录面板截图。390px 验收还确认面板在视口内、Esc 关闭并回焦。该证据仍不是实体触控或软键盘验收。
 - 新增提示修复后 Web 检查为 0 错误/0 警告，right-pane 与 file-preview-scope golden 通过。项目迁移/身份/冲突恢复定向 5 项再次通过，升级前备份与回退操作边界已补入工程 README。打包内的 199 个 Web 静态资源与当前 `web/dist` 一致，内置 daemon 与本轮 release 二进制一致；改动文件清单与 SHA-256 记录已保存，新增源码仍未暂存或提交。
 - 记录位于 `/tmp/magi-final-client-acceptance/result.json`、`source-manifest.json` 和同目录截图；最终执行日志 `/tmp/magi-final-client-acceptance-complete.log`，构建日志 `/tmp/magi-final-client-package-tooltip.log`，迁移日志 `/tmp/magi-final-migration-tests.log`。早期脚本的主题夹具错误、重载/动画同步错误保留原失败记录，最终脚本已等待新文档与动画结束后再验收，不能把早期截图当作最终画面。临时客户端、sidecar 和 Provider 均已停止，测试端口已释放，用户已有客户端与数据未改动。
+
+### 合并 main 前的集成验证（2026-10-30）
+
+- 用户已明确授权提交并推送到 main。功能快照提交为 `2e8b7d78`；随后在 `codex/project-multi-root` 分支合并主线 `4fb8293e`，保留其 9 个新提交，包括 GPT Web 配置 Agent、发送/停止交互、浏览器合同、视觉规范与依赖更新。共享规范合并为一份，未回退主线的新功能或重新引入已删除的配置路径。
+- 逐项解决 UX 规范、Web 指南、知识图谱样式和 GPT Web 验收脚本冲突；主线独有 70 个路径另行核对，除格式化和等价 Clippy 整理外保留原内容。App Server 协议按合并后的 schema 重新生成并检查；架构图因新增 crate 依赖重新生成，官方插件中心检查通过。
+- 集成后通过：Desktop 159 项、Worker 114 项、Web 全量 golden、全部 JS 类型检查（Svelte 0 错误/0 警告）、Browser 核心与发行边界、全目标严格 Clippy、格式与 diff 检查。Rust 库测试通过 API 1036 项/2 忽略、Browser Authority 70 项、conversation-runtime 679 项、daemon 140 项、MCP 66 项、tool-runtime 318 项/1 忽略、web-model 63 项、workspace 34 项。首轮工具目录测试仍固定等待条件数为 4，与主线新增 stable 条件不符；已改为逐项核对五类真实条件并通过完整工具库复验，没有删除测试或忽略失败。
+- 合并后的 macOS 目录包重新构建，并在独立状态根再次通过 41/41 项客户端验收及八组皮肤检查，Renderer 错误为零；日志 `/tmp/magi-merge-client-package.log`、`/tmp/magi-merge-client-acceptance.log`，结果 `/tmp/magi-merge-client-acceptance/result.json`。后端与检查日志为 `/tmp/magi-merge-*.log`。临时客户端已退出，未打 Tag 或发布安装包，Windows/Linux 与真实触控的原边界保持不变。

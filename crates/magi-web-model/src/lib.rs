@@ -25,9 +25,9 @@ pub use client::{
     BrowserWebModelBridgeClient, WebModelClientConfig, WebModelIdentity, normalize_composer_text,
 };
 pub use driver::{
-    ConnectorConfigOutcome, ConnectorStatus, DriverFuture, ImageChunk, LoginState, PageProbe,
-    SavedConversationEntry, SavedConversationSink, SavedConversationSnapshot, SavedProgress,
-    SubmitOutcome, TurnState, WebMessage, WebModelPageDriver, WriteOutcome,
+    DriverFuture, ImageChunk, LoginState, PageProbe, SavedConversationEntry, SavedConversationSink,
+    SavedConversationSnapshot, SavedProgress, SubmitOutcome, TurnState, WebMessage,
+    WebModelPageDriver, WriteOutcome,
 };
 pub use errors::{EngineState, WebModelError, WebModelErrorCode};
 pub use factory::new_web_slot_table;

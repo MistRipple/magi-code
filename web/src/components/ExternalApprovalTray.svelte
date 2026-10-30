@@ -60,7 +60,7 @@
     border: var(--magi-hairline) solid var(--border-subtle, rgba(127, 127, 127, 0.28));
     border-radius: 12px;
     background: var(--surface-elevated, var(--surface, #fff));
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+    box-shadow: var(--shadow-lg);
   }
 
   .tray-title {

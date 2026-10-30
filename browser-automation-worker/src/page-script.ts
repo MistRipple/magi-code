@@ -42,6 +42,7 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     if (tag === 'iframe' || tag === 'frame') return 'iframe';
     if (tag === 'a' && element.hasAttribute('href')) return 'link';
     if (tag === 'button') return 'button';
+    if (tag === 'td' || tag === 'th') return 'cell';
     if (tag === 'textarea') return 'textbox';
     if (tag === 'select') return 'combobox';
     if (tag === 'img') return 'img';
@@ -241,16 +242,47 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       if (role === 'link') return 4;
       return 5;
     };
-    // 按类型预留位置，避免长表单挤掉所有区域和链接。
-    const buckets = Array.from({ length: 6 }, () => []);
-    for (const element of candidates) buckets[priority(element)].push(element);
-    const selected = [], selectedSet = new Set();
-    for (const [rank, limit] of [4, 20, 24, 16, 28, 4].entries()) {
-      for (const element of buckets[rank].slice(0, limit)) {
-        selected.push(element); selectedSet.add(element);
+    // 视口内的控件先于视口外的：用户（和 Agent）此刻能看到、能操作的才是预算的第一用途，
+    // 文档顺序靠前的页眉、侧边栏历史列表不应挤掉当前屏幕上的控件。
+    const onScreen = new Map();
+    const isOnScreen = (element) => {
+      let value = onScreen.get(element);
+      if (value === undefined) {
+        const rect = rectFor(element);
+        value = rect.x < innerWidth && rect.y < innerHeight && rect.x + rect.width > 0 && rect.y + rect.height > 0;
+        onScreen.set(element, value);
       }
+      return value;
+    };
+    const viewportFirst = (list) => {
+      const visibleNow = [], elsewhere = [];
+      for (const element of list) (isOnScreen(element) ? visibleNow : elsewhere).push(element);
+      return visibleNow.concat(elsewhere);
+    };
+    // 按类型预留位置，避免长表单挤掉所有区域和链接。
+    const selectByKind = (list, limits) => {
+      const buckets = Array.from({ length: 6 }, () => []);
+      for (const element of viewportFirst(list)) buckets[priority(element)].push(element);
+      const picked = [];
+      for (const [rank, limit] of limits.entries()) picked.push(...buckets[rank].slice(0, limit));
+      return picked;
+    };
+    const selected = [], selectedSet = new Set();
+    const addAll = (list) => { for (const element of list) if (!selectedSet.has(element)) { selectedSet.add(element); selected.push(element); } };
+    // 模态对话框在最上层：用户（和 Agent）只能操作其中的控件，背景页面是惰性的。
+    // 预算必须先给对话框，否则背景里的长列表（表格行、复选框）会挤掉对话框里的表单控件。
+    const modal = activeModal();
+    if (modal) {
+      const inside = candidates.filter(element => containsComposed(modal, element));
+      const outside = candidates.filter(element => !containsComposed(modal, element));
+      addAll(selectByKind(inside, [8, 40, 60, 40, 40, 20]));
+      addAll(viewportFirst(inside));
+      addAll(selectByKind(outside, [2, 6, 6, 4, 8, 2]));
+      addAll(viewportFirst(outside));
+    } else {
+      addAll(selectByKind(candidates, [4, 20, 24, 16, 28, 4]));
+      addAll(viewportFirst(candidates));
     }
-    for (const element of candidates) if (!selectedSet.has(element)) selected.push(element);
     const encoder = new TextEncoder();
     const encode = (value) => {
       if (!value) return null;
@@ -271,14 +303,38 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       nodes.push({
         element_ref: refFor(element), role: encode(roleFor(element)), name: encode(nameFor(element)),
         value: sensitive ? null : encode(typeof element.value === 'string' ? element.value : null),
-        description: encode(element.getAttribute('aria-description') || (!frameAccessible ? 'iframe 内容不可检查，请用 browser_click_at 按坐标操作' : null)),
+        description: encode(element.getAttribute('aria-description') || (element.tagName.toLowerCase() === 'select' && !sensitive
+          ? 'options: ' + JSON.stringify([...(element.options || [])].slice(0, 20).map(option => ({ label: option.label || option.textContent, value: option.value, disabled: option.disabled })))
+          : element.tagName.toLowerCase() === 'a' && element.href ? 'href: ' + element.href
+          : !frameAccessible ? 'iframe 内容不可检查，请用 browser_click_at 按坐标操作' : null)),
         disabled: disabled(element), focused: (element.getRootNode().activeElement || element.ownerDocument.activeElement) === element,
         editable: Boolean(element.isContentEditable) || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase()),
         sensitive_input_kind: sensitive, states: statesFor(element), visible: true, bounds: rectFor(element), children: [],
       });
     }
     budget.nodes = nodes.length;
+    // 没返回的控件按类型和是否在视口内汇总，让 Agent 知道页面上还有什么、是否值得滚动或缩小范围。
+    const omitted = selected.slice(nodes.length);
+    if (omitted.length) {
+      const counts = new Map();
+      let inView = 0;
+      for (const element of omitted) {
+        const key = roleFor(element) || element.tagName.toLowerCase();
+        counts.set(key, (counts.get(key) || 0) + 1);
+        if (isOnScreen(element)) inView += 1;
+      }
+      const kinds = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([key, count]) => key + ' ' + count).join('、');
+      budget.omitted = '未返回 ' + omitted.length + ' 个控件（视口内 ' + inView + '，视口外 ' + (omitted.length - inView) + '；' + kinds + '）';
+    }
     return { nodes, title: encode(document.title) };
+  };
+  // 当前最上层的模态容器：优先取覆盖视口中心的那个，否则取文档中最后出现的（门户通常追加在 body 末尾）。
+  const activeModal = () => {
+    const found = [...document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')].filter(visible);
+    if (!found.length) return null;
+    const center = document.elementFromPoint?.(Math.floor(innerWidth / 2), Math.floor(innerHeight / 2));
+    const covering = center ? found.filter(element => containsComposed(element, center)) : [];
+    return (covering.length ? covering : found)[(covering.length ? covering : found).length - 1];
   };
   const disabled = (element) => Boolean(element.disabled) || element.matches(':disabled')
     || Boolean(element.closest('[inert], [aria-disabled="true"]'));
@@ -625,8 +681,11 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       if (!Number.isSafeInteger(revision) || revision <= 0) {
         throw new Error('browser_snapshot_revision_invalid');
       }
-      const root = selector ? document.querySelector(selector) : (document.body || document.documentElement);
-      if (!root) throw new Error('browser_snapshot_scope_not_found');
+      // scope 可以是 CSS 选择器，也可以是上一次快照里的 element_ref（缩小到某个弹窗、列表或表单，无需猜选择器）。
+      const root = !selector ? (document.body || document.documentElement)
+        : /^e:\d+:\d+$/.test(selector) ? state.refs.get(selector)
+        : document.querySelector(selector);
+      if (!root || !root.isConnected) throw new Error('browser_snapshot_scope_not_found');
       for (const token of state.pointerGuards.keys()) this.finishPointer(token);
       state.snapshotRevision = revision;
       state.nextRef = 1;
@@ -640,7 +699,10 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
           role: 'document',
           name: title,
           value: null,
-          description: null,
+          description: [
+            '视口 ' + innerWidth + '×' + innerHeight + '，已滚动 ' + Math.round(scrollY) + '/' + Math.max(0, Math.round(document.documentElement.scrollHeight - innerHeight)) + 'px',
+            budget.omitted || null,
+          ].filter(Boolean).join('；'),
           disabled: false,
           focused: false,
           editable: false,
@@ -655,6 +717,65 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         text_bytes: budget.textBytes,
         truncated: budget.truncated,
       };
+    },
+    // 等页面稳定：文档加载完成且连续 quietMs 没有 DOM 变化；超时仍在变化则如实返回 stable=false。
+    // 轮询、动画、实时数据流的页面可能永远不安静，调用方据此直接快照，不应反复等待。
+    settle(quietMs, timeoutMs) {
+      return new Promise(resolve => {
+        const startedAt = Date.now();
+        let mutations = 0, lastChangeAt = startedAt, timer = 0;
+        const observer = typeof MutationObserver === 'function' ? new MutationObserver(records => { mutations += records.length; lastChangeAt = Date.now(); }) : null;
+        observer?.observe(document, { subtree: true, childList: true, attributes: true });
+        const finish = stable => {
+          clearTimeout(timer);
+          observer?.disconnect();
+          resolve({ stable, mutations: observer ? mutations : null, waited_ms: Date.now() - startedAt, ready_state: document.readyState });
+        };
+        const tick = () => {
+          const now = Date.now();
+          if (document.readyState === 'complete' && now - lastChangeAt >= quietMs) return finish(true);
+          if (now - startedAt >= timeoutMs) return finish(false);
+          timer = setTimeout(tick, 50);
+        };
+        tick();
+      });
+    },
+    // 按键没有目标元素，效果证据来自页面：文档变化量，以及焦点元素的状态（焦点、值长度、勾选）。
+    // 不观察 characterData：输入的字符通过焦点元素的值长度体现，避免对整篇文档的文本节点订阅。
+    beginWatch(token) {
+      const describe = () => {
+        const element = document.activeElement;
+        if (!element || element === document.body) return 'focus=none';
+        const parts = ['focus=' + element.tagName.toLowerCase() + (element.id ? '#' + element.id : '')];
+        if (!sensitiveKind(element)) {
+          if (typeof element.value === 'string') parts.push('value_len=' + element.value.length);
+          else if (element.isContentEditable) parts.push('text_len=' + (element.textContent || '').length);
+        }
+        if (typeof element.checked === 'boolean') parts.push('checked=' + element.checked);
+        return parts.join(' ');
+      };
+      const watch = { describe, mutations: 0, lastMutationAt: 0, before: describe(), observer: null };
+      if (typeof MutationObserver === 'function') {
+        watch.observer = new MutationObserver(records => { watch.mutations += records.length; watch.lastMutationAt = Date.now(); });
+        watch.observer.observe(document, { subtree: true, childList: true, attributes: true });
+      }
+      (state.watches ||= new Map()).set(token, watch);
+    },
+    async endWatch(token) {
+      const watch = state.watches?.get(token);
+      if (!watch) return null;
+      const startedAt = Date.now();
+      while (watch.observer && Date.now() - startedAt < 400 && Date.now() - Math.max(watch.lastMutationAt, startedAt) < 100) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      watch.observer?.disconnect();
+      state.watches.delete(token);
+      return { mutations: watch.observer ? watch.mutations : null, stateBefore: watch.before, stateAfter: watch.describe() };
+    },
+    cancelWatch(token) {
+      const watch = state.watches?.get(token);
+      watch?.observer?.disconnect();
+      state.watches?.delete(token);
     },
     // 引用（e:<快照版本>:<序号>）本身标识了所属快照；每次快照都会重建引用表，
     // 所以旧快照、旧文档或 Worker 重启前的引用在这里都查不到，统一视为过期。
@@ -676,13 +797,48 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
         name: nameFor(element),
       };
     },
-    preparePointer(ref, token, eventType, point, forText = false) {
+    preparePointer(ref, token, eventType, point, forText = false, forbidSubmitIn = []) {
+      const stateSummary = element => {
+        const parts = [];
+        for (const name of ['aria-expanded', 'aria-checked', 'aria-pressed', 'aria-selected', 'aria-current', 'aria-disabled', 'aria-busy']) {
+          const value = element.getAttribute?.(name);
+          if (value !== null && value !== undefined) parts.push(name.slice(5) + '=' + value);
+        }
+        if (typeof element.checked === 'boolean') parts.push('checked=' + element.checked);
+        if (element.disabled === true) parts.push('disabled=true');
+        if (element.open === true) parts.push('open=true');
+        return parts.join(' ');
+      };
       const element = ref ? this.resolve(ref) : elementAtPoint(point.x, point.y);
       if (forText) assertTextTarget(element); else assertActionable(element);
+      // 结构性拦截：按钮是表单的提交控件，且所在对话框/表单的文字涉及受保护的资源（如密钥）时拒绝点击。
+      // 判断依据是 DOM 语义（提交按钮 + 所在表单上下文），不依赖按钮自身的文案或语言。
+      if (Array.isArray(forbidSubmitIn) && forbidSubmitIn.length) {
+        const control = element.closest?.('button, input, [role="button"]') || element;
+        const typeAttr = control.getAttribute?.('type');
+        // 现代页面的对话框确认按钮常常不在 <form> 里（点击处理函数提交）：对话框内标着保存/创建/确认的按钮同样算提交。
+        const label = String(control.getAttribute?.('aria-label') || control.textContent || '').trim().toLowerCase();
+        const confirmLike = Boolean(control.closest?.('[role="dialog"], dialog'))
+          && ['save', 'create', 'submit', 'confirm', 'apply', 'delete', 'remove', '保存', '创建', '提交', '确认', '应用', '删除'].some(prefix => label.startsWith(prefix));
+        const submitLike = (control.tagName === 'BUTTON' && control.form && (typeAttr === null || typeAttr === 'submit'))
+          || (control.tagName === 'INPUT' && typeAttr === 'submit') || typeAttr === 'submit' || confirmLike;
+        if (submitLike) {
+          const scope = control.closest?.('[role="dialog"], dialog, form') || control.form;
+          const context = String(scope?.innerText || scope?.textContent || '').toLowerCase();
+          if (forbidSubmitIn.some(word => context.includes(String(word).toLowerCase()))) throw new Error('browser_submit_forbidden');
+        }
+      }
       if (!point) scrollTo(element);
       const position = point || actionPoint(element);
       verifyPoint(element, position.x, position.y);
-      const guard = { element, eventType, position, bounds: rectFor(element), observed: false, listeners: [] };
+      const guard = { element, eventType, position, bounds: rectFor(element), observed: false, listeners: [], stateSummary,
+        stateBefore: stateSummary(element), mutations: 0, lastMutationAt: 0, observer: null };
+      // 动作结果的页面证据：目标自身状态、文档变化量和目标是否仍在文档中。
+      // 为输入框获得焦点的点击不收集页面变化：输入前不能有额外的等待窗口，焦点必须原样交给紧随其后的输入。
+      if (!forText && typeof MutationObserver === 'function') {
+        guard.observer = new MutationObserver(records => { guard.mutations += records.length; guard.lastMutationAt = Date.now(); });
+        guard.observer.observe(element.ownerDocument, { subtree: true, childList: true, attributes: true, characterData: true });
+      }
       const listener = event => {
         if (isFrameElement(element) && !frameDocument(element)) return;
         if (event.isTrusted && event.composedPath().includes(element)) {
@@ -733,13 +889,29 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
           guard.complete = () => { clearTimeout(timer); guard.complete = null; resolve(); };
         });
       }
+      // 事件已送达后等页面“安静”一小段：点击的效果（展开、勾选、弹层、列表刷新）常在事件处理后异步出现。
+      if (guard.observer && guard.observed && guard.eventType !== 'mousemove') {
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < 400 && Date.now() - Math.max(guard.lastMutationAt, startedAt) < 100) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }
+      guard.observer?.disconnect();
       for (const [doc, type, listener] of guard.listeners) doc.removeEventListener(type, listener, true);
       state.pointerGuards.delete(String(token));
       guard.complete?.();
       // 经过目标的 mousemove 不代表结束时仍在悬停：页面可在处理器中
       // 移走或遮住目标。只回读当前命中，不补移、不触发额外点击。
       if (waitForEvent && guard.eventType === 'mousemove' && guard.observed) verifyPoint(guard.element, guard.position.x, guard.position.y);
-      return { observed: guard.observed };
+      if (!guard.element) return { observed: guard.observed };
+      const connected = guard.element.isConnected !== false;
+      return {
+        observed: guard.observed,
+        mutations: Math.min(guard.mutations, 99),
+        connected,
+        stateBefore: guard.stateBefore,
+        stateAfter: connected && guard.stateSummary ? guard.stateSummary(guard.element) : '',
+      };
     },
     prepareDrag(sourceRef, targetRef, token) {
       const source = this.resolve(sourceRef), target = this.resolve(targetRef);

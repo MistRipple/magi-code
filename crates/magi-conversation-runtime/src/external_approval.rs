@@ -5,6 +5,7 @@
 //!
 //! 每次调用使用独立的合成 `turn_id`（`external:<token_id>:<call_id>`），因此每次询问只作用于该调用。
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use magi_core::{ExecutionResultStatus, SessionId, TaskId, UtcMillis, WorkspaceId};
@@ -86,6 +87,7 @@ pub fn await_external_tool_approval(
 ) -> Result<(), (String, ExecutionResultStatus)> {
     let turn_id = external_turn_id(request.token_id, request.tool_call_id);
     let approval_id = format!("tool-approval-{turn_id}");
+    let requested = Cell::new(false);
     let result = run_approval(
         event_bus,
         registry,
@@ -93,9 +95,46 @@ pub fn await_external_tool_approval(
         is_alive,
         &turn_id,
         &approval_id,
+        &requested,
     );
     registry.remove_turn(request.session_id, &turn_id);
+    // 用户的允许/拒绝由提交决定的入口发布 `tool.approval.resolved`；超时、连接失效、令牌撤销则没有人
+    // 提交决定。待授权状态只存在于注册表里，不发布事件客户端就永远不知道它已经消失，
+    // 界面会一直显示一张点了只会报「已过期」的授权卡片。
+    if requested.get() && result.is_err() {
+        publish_resolved_without_decision(event_bus, request, &turn_id, &approval_id);
+    }
     result
+}
+
+fn publish_resolved_without_decision(
+    event_bus: &InMemoryEventBus,
+    request: &ExternalApprovalRequest<'_>,
+    turn_id: &str,
+    approval_id: &str,
+) {
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            magi_core::EventId::unique("event-tool-approval-resolved"),
+            "tool.approval.resolved",
+            serde_json::json!({
+                "session_id": request.session_id,
+                "workspace_id": request.workspace_id,
+                "task_id": external_approval_task_id(request.token_id),
+                "turn_id": turn_id,
+                "tool_call_id": request.tool_call_id,
+                "tool_name": request.tool_name,
+                "approval_id": approval_id,
+                "decision": null,
+                "external": true,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: request.workspace_id.cloned(),
+            session_id: Some(request.session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
 }
 
 fn run_approval(
@@ -105,6 +144,7 @@ fn run_approval(
     is_alive: &dyn Fn() -> bool,
     turn_id: &str,
     approval_id: &str,
+    requested: &Cell<bool>,
 ) -> Result<(), (String, ExecutionResultStatus)> {
     if !is_alive() {
         return Err(failure(
@@ -147,6 +187,7 @@ fn run_approval(
         }
     };
 
+    requested.set(true);
     let _ = event_bus.publish(
         EventEnvelope::domain(
             magi_core::EventId::unique("event-tool-approval-requested"),
@@ -338,6 +379,20 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Rejected);
         assert!(payload.contains("tool_approval_timeout"));
         assert!(registry.pending_for_session(&session).is_empty());
+        // 没有人提交决定：必须发布 resolved，客户端才会撤下授权卡片。
+        let types = event_types(&bus);
+        assert_eq!(
+            types,
+            vec!["tool.approval.requested", "tool.approval.resolved"],
+        );
+    }
+
+    fn event_types(bus: &InMemoryEventBus) -> Vec<String> {
+        bus.snapshot()
+            .recent_events
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect()
     }
 
     #[test]
@@ -362,6 +417,26 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Cancelled);
         assert!(payload.contains("tool_approval_cancelled"));
         assert!(registry.pending_for_session(&session).is_empty());
+        assert_eq!(
+            event_types(&bus),
+            vec!["tool.approval.requested", "tool.approval.resolved"],
+        );
+    }
+
+    #[test]
+    fn approval_that_was_never_requested_publishes_nothing() {
+        let bus = InMemoryEventBus::new(8);
+        let registry = ToolApprovalRegistry::default();
+        let session = SessionId::new("ext-session");
+        let (_, status) = await_external_tool_approval(
+            &bus,
+            &registry,
+            &request(&session, Duration::from_secs(1)),
+            &|| false,
+        )
+        .unwrap_err();
+        assert_eq!(status, ExecutionResultStatus::Cancelled);
+        assert!(event_types(&bus).is_empty());
     }
 
     #[test]

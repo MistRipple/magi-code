@@ -585,36 +585,6 @@
         "length": { "type": "integer", "minimum": 1, "maximum": 786432 }
       }
     },
-    "webConnectorStatusPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["tab_id", "name"],
-      "properties": {
-        "tab_id": { "$ref": "#/$defs/id" },
-        "name": { "type": "string", "minLength": 1 }
-      }
-    },
-    "webConfigureConnectorPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["tab_id", "control", "name", "tunnel_id"],
-      "properties": {
-        "tab_id": { "$ref": "#/$defs/id" },
-        "control": { "$ref": "#/$defs/agentControl" },
-        "name": { "type": "string", "minLength": 1 },
-        "tunnel_id": { "type": "string", "minLength": 1 }
-      }
-    },
-    "webPlatformSetupPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["tab_id", "control", "action"],
-      "properties": {
-        "tab_id": { "$ref": "#/$defs/id" },
-        "control": { "$ref": "#/$defs/agentControl" },
-        "action": { "enum": ["inspect_tunnel", "create_tunnel", "prepare_runtime_key"] }
-      }
-    },
     "updateControlPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -659,7 +629,31 @@
       "required": ["role", "name"],
       "properties": {
         "role": { "type": ["string", "null"] },
-        "name": { "type": ["string", "null"] }
+        "name": { "type": ["string", "null"] },
+        "effect": { "oneOf": [{ "$ref": "#/$defs/actionEffect" }, { "type": "null" }] }
+      }
+    },
+    "actionEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "delivered", "navigated", "dom_mutations", "target_connected", "target_state"],
+      "properties": {
+        "verdict": { "enum": ["navigated", "changed", "no_visible_change"] },
+        "delivered": { "enum": ["confirmed", "inferred"] },
+        "navigated": { "type": "boolean" },
+        "dom_mutations": { "type": ["integer", "null"], "minimum": 0, "maximum": 99 },
+        "target_connected": { "type": ["boolean", "null"] },
+        "target_state": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["before", "after"],
+              "properties": { "before": { "type": "string", "maxLength": 200 }, "after": { "type": "string", "maxLength": 200 } }
+            }
+          ]
+        }
       }
     },
     "interaction": {
@@ -1033,6 +1027,20 @@
           "required": ["type", "payload"],
           "properties": {
             "type": { "const": "user_takeover" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["binding"],
+              "properties": { "binding": { "$ref": "#/$defs/surfaceBinding" } }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "payload"],
+          "properties": {
+            "type": { "const": "user_activity" },
             "payload": {
               "type": "object",
               "additionalProperties": false,
@@ -1601,32 +1609,6 @@
           "properties": {
             "type": { "const": "web_read_image" },
             "payload": { "$ref": "#/$defs/webReadImagePayload" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "payload"],
-          "properties": {
-            "type": { "const": "web_connector_status" },
-            "payload": { "$ref": "#/$defs/webConnectorStatusPayload" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "payload"],
-          "properties": {
-            "type": { "const": "web_configure_connector" },
-            "payload": { "$ref": "#/$defs/webConfigureConnectorPayload" }
-          }
-        },
-        {
-          "type": "object", "additionalProperties": false,
-          "required": ["type", "payload"],
-          "properties": {
-            "type": { "const": "web_platform_setup" },
-            "payload": { "$ref": "#/$defs/webPlatformSetupPayload" }
           }
         },
         {

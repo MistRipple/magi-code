@@ -194,6 +194,7 @@
         "reason": {
           "type": "string"
         },
+        "detail": {"type": "string"},
         "updatedAt": {
           "type": "integer",
           "minimum": 0

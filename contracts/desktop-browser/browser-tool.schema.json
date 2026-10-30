@@ -179,7 +179,7 @@
       "rustVariant": "Snapshot",
       "access": "read",
       "tier": "core",
-      "description": "读取当前页面的可交互元素、区域、标题和状态。敏感输入不返回值。预算在页面采集时统一应用，结果包含 returned_nodes、total_nodes、text_bytes、truncated；truncated=true 时用 selector 缩小范围，total_nodes 是扫描到的元素数。element_ref 仅在本次快照内有效，每次快照使旧引用失效。读取正文用 browser_read。",
+      "description": "读取当前页面的可交互元素、区域、标题和状态。敏感输入不返回值。预算在页面采集时统一应用，控件按「视口内优先」排序，page 字段给出视口大小、滚动位置和未返回控件的汇总（按类型、是否在视口内）；结果包含 returned_nodes、total_nodes、text_bytes、truncated。truncated=true 时先看 page：视口内没有遗漏就不必重复快照，需要更多再把 selector 设为某个弹窗或区域的 element_ref 缩小范围，或滚动后重新快照。page 里的视口很窄（约 900 以下）时，许多站点会折叠成移动布局、隐藏账号入口和侧边栏，找不到控件时先用 browser_viewport 切到桌面视口再快照。total_nodes 是扫描到的元素数。element_ref 仅在本次快照内有效，每次快照使旧引用失效。读取正文用 browser_read。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -189,7 +189,7 @@
           },
           "selector": {
             "type": "string",
-            "description": "可选 CSS 选择器，将快照限定到页面区域；截断时缩小范围，不要反复获取相同全页快照",
+            "description": "可选，将快照限定到页面区域：CSS 选择器，或上一次快照中某个容器（弹窗、列表、表单）的 element_ref；截断时缩小范围，不要反复获取相同全页快照",
             "maxLength": 1000
           }
         },
@@ -201,7 +201,7 @@
       "rustVariant": "Click",
       "access": "write",
       "tier": "core",
-      "description": "点击最近快照中的 element_ref。先检查可见、启用和未被遮挡，再只发送一组原生鼠标事件。返回 target 表示确认收到点击的目标；结果未确认时先检查页面状态，不要直接重试。",
+      "description": "点击最近快照中的 element_ref。先检查可见、启用和未被遮挡，再只发送一组原生鼠标事件。返回 target 表示确认收到点击的目标，outcome 说明动作是否生效：page_navigated（已跳转，旧引用失效，结果已附带新快照）、page_changed（已生效，effect 给出变化）、no_visible_change（事件已送达但页面没有变化，不要重复同一动作，换控件或回读确认）。结果未确认时先检查页面状态，不要直接重试。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -214,7 +214,7 @@
           },
           "include_snapshot": {
             "type": "boolean",
-            "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"
+            "description": "操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"
           }
         },
         "required": [
@@ -251,7 +251,7 @@
           },
           "include_snapshot": {
             "type": "boolean",
-            "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"
+            "description": "操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"
           }
         },
         "required": [
@@ -265,7 +265,7 @@
       "rustVariant": "Press",
       "access": "write",
       "tier": "core",
-      "description": "向当前浏览器页面发送一个按键或组合键。",
+      "description": "向当前浏览器页面发送一个按键或组合键。返回 outcome：页面跳转、文档或焦点元素状态发生变化，或 no_visible_change（按键送达但没有观察到任何变化，不要重复）。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -278,7 +278,7 @@
           },
           "include_snapshot": {
             "type": "boolean",
-            "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"
+            "description": "操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"
           }
         },
         "required": [
@@ -291,7 +291,7 @@
       "rustVariant": "Scroll",
       "access": "write",
       "tier": "core",
-      "description": "滚动当前浏览器页面或快照中的指定元素。",
+      "description": "滚动当前浏览器页面或快照中的指定元素。返回 outcome 与滚动位置前后对比；no_visible_change 表示已到边界或该区域不可滚动，不要重复同一滚动，换用其他可滚动容器或确认目标已在视野内。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -310,7 +310,7 @@
           },
           "include_snapshot": {
             "type": "boolean",
-            "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"
+            "description": "操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"
           }
         },
         "required": [
@@ -539,7 +539,7 @@
       "rustVariant": "WaitFor",
       "access": "read",
       "tier": "core",
-      "description": "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。",
+      "description": "等待当前页面出现指定文本、选择器或 URL，或用 stable=true 等页面停止变化（点击、导航之后内容异步加载时使用，比固定等待可靠）。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -578,6 +578,10 @@
             "type": "string",
             "minLength": 1
           },
+          "stable": {
+            "type": "boolean",
+            "description": "等页面稳定：文档加载完成且连续 400ms 没有 DOM 变化。单独使用时超时不报错，返回 stable=false 表示页面持续变化（轮询、动画、实时数据），此时直接快照，不要重复等待"
+          },
           "timeout_ms": {
             "type": "integer",
             "minimum": 1,
@@ -604,6 +608,11 @@
           {
             "required": [
               "url"
+            ]
+          },
+          {
+            "required": [
+              "stable"
             ]
           }
         ]

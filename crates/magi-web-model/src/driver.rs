@@ -75,24 +75,6 @@ pub struct SavedConversationEntry {
     pub updated_at: Option<String>,
 }
 
-/// ChatGPT 侧 Magi 连接器的只读状态。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectorStatus {
-    pub supported: bool,
-    pub exists: bool,
-    pub enabled: bool,
-    pub tool_count: Option<u64>,
-    pub reason: Option<String>,
-}
-
-/// 创建 / 启用连接器并回读后的结果。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectorConfigOutcome {
-    pub configured: bool,
-    pub confirmed_enabled: bool,
-    pub reason: Option<String>,
-}
-
 /// 页面图片的一块字节（控制通道单条消息有上限，图片按块读取）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageChunk {
@@ -203,15 +185,27 @@ pub trait WebModelPageDriver: Send + Sync {
         })
     }
 
-    /// 平台窄配置命令，不返回正文或凭据。
-    fn platform_setup<'a>(&'a self, action: &'a str) -> DriverFuture<'a, serde_json::Value> {
-        let _ = action;
+    /// 通用页面操作供配置 AI 使用；沿既有 Browser Host 快照、节点引用与原生输入链执行。
+    /// 实现不解释配置步骤，也不接受任意脚本。
+    fn setup_browser<'a>(
+        &'a self,
+        tool: &'a str,
+        arguments: &'a serde_json::Value,
+    ) -> DriverFuture<'a, serde_json::Value> {
+        let _ = (tool, arguments);
         Box::pin(async {
             Err(WebModelError::new(
-                WebModelErrorCode::WebTunnelUnavailable,
-                "平台配置驱动不可用",
+                WebModelErrorCode::WebDesktopUnavailable,
+                "配置浏览器通道不可用",
             ))
         })
+    }
+
+    /// 配置 Agent 一次运行结束（交接、完成、取消、失败）时调用：释放运行期间保持的页面控制。
+    /// 运行期间控制跨命令保留，用户在两条命令之间操作页面才会被识别为接管；结束后必须释放，
+    /// 否则等待用户处理时页面上会残留 Agent 光标，用户的操作也会被误当作接管。
+    fn end_setup_control<'a>(&'a self) -> DriverFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     /// `conversation_id=None` 表示创建新的已保存对话，返回的远端 id 由
@@ -297,35 +291,6 @@ pub trait WebModelPageDriver: Send + Sync {
             Err(WebModelError::new(
                 WebModelErrorCode::WebSavedConversationUnavailable,
                 "页面驱动未提供已保存对话列表能力",
-            ))
-        })
-    }
-
-    /// 只读检查 ChatGPT 侧的 Magi 连接器。
-    fn connector_status<'a>(
-        &'a self,
-        _page_id: &'a str,
-        _name: &'a str,
-    ) -> DriverFuture<'a, ConnectorStatus> {
-        Box::pin(async {
-            Err(WebModelError::new(
-                WebModelErrorCode::WebTunnelUnavailable,
-                "页面驱动未提供连接器检查能力",
-            ))
-        })
-    }
-
-    /// 创建 / 启用 Magi 连接器并回读确认。只写连接器设置。
-    fn configure_connector<'a>(
-        &'a self,
-        _page_id: &'a str,
-        _name: &'a str,
-        _tunnel_id: &'a str,
-    ) -> DriverFuture<'a, ConnectorConfigOutcome> {
-        Box::pin(async {
-            Err(WebModelError::new(
-                WebModelErrorCode::WebTunnelUnavailable,
-                "页面驱动未提供连接器配置能力",
             ))
         })
     }

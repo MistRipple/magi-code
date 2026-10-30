@@ -373,9 +373,9 @@
     container-name: notification-panel;
     max-height: min(560px, calc(100vh - 24px));
     background: var(--dropdown-bg);
-    border: var(--magi-hairline) solid var(--border);
+    border: 0;
     border-radius: var(--radius-md, 6px);
-    box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.3));
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint), var(--shadow-lg);
     z-index: var(--z-popover);
     overflow: hidden;
     display: flex;

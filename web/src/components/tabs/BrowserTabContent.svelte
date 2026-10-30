@@ -2304,7 +2304,7 @@
   .browser-page-error button:hover:not(:disabled) { background: var(--surface-hover); }
   .browser-page-error button:disabled { cursor: default; opacity: .5; }
   .annotation-editor { position: fixed; top: calc(anchor(bottom) - 12px); left: anchor(left); width: min(360px, calc(anchor-size(width) - 24px)); z-index: 4; box-sizing: border-box; padding: 10px; border: var(--magi-hairline) solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); transform: translateY(-100%); }
-  .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
+  .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; padding: 7px; border: var(--magi-hairline) solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
   .browser-placeholder { display: grid; flex: 1; place-items: center; padding: 20px; color: var(--foreground-muted); font-size: var(--text-sm); text-align: center; }
   .browser-placeholder.error { color: var(--error); }

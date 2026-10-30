@@ -233,16 +233,20 @@ impl BrowserToolKind {
                 "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。\n\n# Web 项目验收\n- 先读取项目清单确认启动命令，再用 shell_exec(background=true) 启动开发服务\n- 从服务输出确认实际监听 URL 和端口，不要臆测 localhost 端口\n- 导航后还要继续交互时，在本次调用设置 include_snapshot=true，直接取得最新可交互元素，避免再单独调用 browser_snapshot\n- 使用 browser_click、browser_type、browser_press 和 browser_scroll 完成真实用户路径；搜索或表单提交优先 browser_type(submit_key=Enter)\n- 控件、按钮及其勾选/展开等状态从快照读取；正文、文章、列表和表格内容用 browser_read 读取（可用 query 检索）；只读取 URL 或标题时不要附带快照\n- 仅在页面结构确实变化且当前结果未附带快照时调用 browser_snapshot，不要因为页面内容很多而重复快照\n- browser_screenshot 只用于布局、样式、图像等视觉问题或用户明确要求截图的场景，不能用于读取文本或定位控件\n- 响应式任务使用 browser_viewport 覆盖桌面和手机视口\n- 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
             Self::Snapshot => {
-                "读取当前页面的可交互元素、区域、标题和状态。敏感输入不返回值。预算在页面采集时统一应用，结果包含 returned_nodes、total_nodes、text_bytes、truncated；truncated=true 时用 selector 缩小范围，total_nodes 是扫描到的元素数。element_ref 仅在本次快照内有效，每次快照使旧引用失效。读取正文用 browser_read。"
+                "读取当前页面的可交互元素、区域、标题和状态。敏感输入不返回值。预算在页面采集时统一应用，控件按「视口内优先」排序，page 字段给出视口大小、滚动位置和未返回控件的汇总（按类型、是否在视口内）；结果包含 returned_nodes、total_nodes、text_bytes、truncated。truncated=true 时先看 page：视口内没有遗漏就不必重复快照，需要更多再把 selector 设为某个弹窗或区域的 element_ref 缩小范围，或滚动后重新快照。page 里的视口很窄（约 900 以下）时，许多站点会折叠成移动布局、隐藏账号入口和侧边栏，找不到控件时先用 browser_viewport 切到桌面视口再快照。total_nodes 是扫描到的元素数。element_ref 仅在本次快照内有效，每次快照使旧引用失效。读取正文用 browser_read。"
             }
             Self::Click => {
-                "点击最近快照中的 element_ref。先检查可见、启用和未被遮挡，再只发送一组原生鼠标事件。返回 target 表示确认收到点击的目标；结果未确认时先检查页面状态，不要直接重试。"
+                "点击最近快照中的 element_ref。先检查可见、启用和未被遮挡，再只发送一组原生鼠标事件。返回 target 表示确认收到点击的目标，outcome 说明动作是否生效：page_navigated（已跳转，旧引用失效，结果已附带新快照）、page_changed（已生效，effect 给出变化）、no_visible_change（事件已送达但页面没有变化，不要重复同一动作，换控件或回读确认）。结果未确认时先检查页面状态，不要直接重试。"
             }
             Self::Type => {
                 "向当前浏览器快照中的可编辑元素输入文本。需要提交搜索或表单时同时传 submit_key=Enter，避免再调用 browser_press。不能用于密码、验证码或支付字段。结果中的 target 是实际输入的元素（角色与名称）。"
             }
-            Self::Press => "向当前浏览器页面发送一个按键或组合键。",
-            Self::Scroll => "滚动当前浏览器页面或快照中的指定元素。",
+            Self::Press => {
+                "向当前浏览器页面发送一个按键或组合键。返回 outcome：页面跳转、文档或焦点元素状态发生变化，或 no_visible_change（按键送达但没有观察到任何变化，不要重复）。"
+            }
+            Self::Scroll => {
+                "滚动当前浏览器页面或快照中的指定元素。返回 outcome 与滚动位置前后对比；no_visible_change 表示已到边界或该区域不可滚动，不要重复同一滚动，换用其他可滚动容器或确认目标已在视野内。"
+            }
             Self::Screenshot => {
                 "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取正文内容用 browser_read，读取控件、标题和状态用 browser_snapshot。截图范围三选一：省略 element_ref、clip、full_page 时截取当前视口；指定 clip 时不能同时传 full_page；指定 element_ref 时不能同时传 clip 或 full_page。quality 只对 jpeg/webp 有效，png 不要传 quality。"
             }
@@ -253,7 +257,7 @@ impl BrowserToolKind {
                 "读取或设置当前内置浏览器页面的设备视口。使用 action=set、mode=auto 恢复跟随右侧内容槽的自适应布局；使用 mode=fixed 并传入 width/height 验证电脑/平板宽屏或手机窄屏响应式布局。可选 device_scale_factor_millis 调整设备像素比（500-4000，默认 1000）。尺寸与设备类型独立；省略 device_type 时使用 desktop，验证手机时明确传 mobile。get/set 均返回实际生效的 actual_viewport（CSS 宽高、DPR 与设备类型）及 display_scale（预览比例），viewport 为固定模式配置，自适应时为 null。调整视口后重新获取页面快照，旧坐标不可沿用。该工具只通过 Chromium 原生 device metrics、设备类型和触控语义改变页面 CSS 视口，不修改页面 DOM，也不使用 Magi 外层缩放。"
             }
             Self::WaitFor => {
-                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
+                "等待当前页面出现指定文本、选择器或 URL，或用 stable=true 等页面停止变化（点击、导航之后内容异步加载时使用，比固定等待可靠）。调用前先用 browser_snapshot 读取当前真实页面状态；只等待快照中已出现或根据页面流程确实可能出现的条件，超时后重新快照确认，不要重复提交同一个无法出现的条件。"
             }
             Self::Hover => {
                 "将鼠标悬停到最近快照的元素；先滚入视口并检查实际命中，确认目标收到原生鼠标移动事件后返回。结果未确认时先检查页面状态。"
@@ -311,19 +315,19 @@ impl BrowserToolKind {
                 r#"{"type":"object","properties":{"action":{"type":"string","enum":["url","back","forward","stop","reload"],"description":"可选；提供 url 时默认执行 URL 导航，后退、前进或刷新时再显式填写"},"url":{"type":"string","minLength":1,"description":"要打开的 URL；提供该字段时 action 默认是 url"},"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"ignore_cache":{"type":"boolean","description":"action=reload 时忽略缓存；默认 false"},"handle_before_unload":{"type":"string","enum":["accept","dismiss"],"description":"导航触发 beforeunload 时自动接受或取消"},"init_script":{"type":"string","description":"只对本次 URL 导航生效、在页面脚本前执行的 JavaScript"},"timeout_ms":{"type":"integer","minimum":1,"maximum":60000,"description":"导航超时，默认 15000 毫秒"},"include_snapshot":{"type":"boolean","description":"导航后还要继续交互时设为 true，在同一次工具结果中附带最新可访问性快照；默认 false"}},"required":[],"oneOf":[{"description":"URL 导航；action 可省略或必须为 url","required":["url"],"properties":{"action":{"enum":["url"]}},"not":{"required":["ignore_cache"]}},{"description":"停止当前页面的 Chromium 导航并保留当前已显示页面","required":["action"],"properties":{"action":{"enum":["stop"]}},"not":{"anyOf":[{"required":["url"]},{"required":["ignore_cache"]},{"required":["init_script"]}]}},{"description":"后退或前进","required":["action"],"properties":{"action":{"enum":["back","forward"]}},"not":{"anyOf":[{"required":["url"]},{"required":["ignore_cache"]},{"required":["init_script"]}]}},{"description":"刷新","required":["action"],"properties":{"action":{"enum":["reload"]}},"not":{"anyOf":[{"required":["url"]},{"required":["init_script"]}]}}]}"#
             }
             Self::Snapshot => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"selector":{"type":"string","description":"可选 CSS 选择器，将快照限定到页面区域；截断时缩小范围，不要反复获取相同全页快照","maxLength":1000}},"required":[]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"selector":{"type":"string","description":"可选，将快照限定到页面区域：CSS 选择器，或上一次快照中某个容器（弹窗、列表、表单）的 element_ref；截断时缩小范围，不要反复获取相同全页快照","maxLength":1000}},"required":[]}"#
             }
             Self::Click => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["element_ref"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"}},"required":["element_ref"]}"#
             }
             Self::Type => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"text":{"type":"string"},"replace":{"type":"boolean","description":"true 替换全部内容（默认），false 追加到末尾；text 为空且 replace=true 时清空。原生输入后必须确认实际值与预期一致。"},"submit_key":{"type":"string","description":"可选；输入后立即发送的按键，例如 Enter。搜索或表单提交应与输入合并，避免额外 browser_press 往返"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["element_ref","text"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"text":{"type":"string"},"replace":{"type":"boolean","description":"true 替换全部内容（默认），false 追加到末尾；text 为空且 replace=true 时清空。原生输入后必须确认实际值与预期一致。"},"submit_key":{"type":"string","description":"可选；输入后立即发送的按键，例如 Enter。搜索或表单提交应与输入合并，避免额外 browser_press 往返"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"}},"required":["element_ref","text"]}"#
             }
             Self::Press => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"key":{"type":"string","description":"按键或组合键，例如 Enter、Control+L"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["key"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"key":{"type":"string","description":"按键或组合键，例如 Enter、Control+L"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"}},"required":["key"]}"#
             }
             Self::Scroll => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"可选；省略时滚动页面"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false"}},"required":["delta_y"]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"可选；省略时滚动页面"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"include_snapshot":{"type":"boolean","description":"操作后附带最新可访问性快照。默认：动作导致页面跳转时自动附带（旧引用已失效，必须重新快照），其他情况不附带；附带新快照会使同一份旧快照上的其余 element_ref 失效，所以要连续操作多个控件时保持 false，依据返回的 outcome 判断每步是否生效"}},"required":["delta_y"]}"#
             }
             Self::Screenshot => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"可选；省略时截取页面；与 clip、full_page 互斥"},"clip":{"type":"object","properties":{"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},"width":{"type":"number","exclusiveMinimum":0,"maximum":1},"height":{"type":"number","exclusiveMinimum":0,"maximum":1}},"required":["x","y","width","height"],"description":"按当前视口归一化坐标截取区域；与 element_ref、full_page 互斥，只能三选一"},"format":{"type":"string","enum":["png","jpeg","webp"],"description":"图片格式，默认 png"},"quality":{"type":"integer","minimum":0,"maximum":100,"description":"jpeg/webp 压缩质量；format=png 时不要传此字段"},"full_page":{"type":"boolean","description":"设为 true 截取整页；不能同时传 element_ref 或 clip，默认 false"}},"required":[]}"#
@@ -335,7 +339,7 @@ impl BrowserToolKind {
                 r#"{"type":"object","properties":{"action":{"type":"string","enum":["get","set"]},"mode":{"type":"string","enum":["auto","fixed"],"description":"action=set 时必填；auto 跟随右侧内容槽，fixed 使用 width/height 进行 Chromium 响应式设备仿真。"},"tab_id":{"type":"string","description":"可选；省略时使用活动标签页"},"width":{"type":"integer","minimum":320,"maximum":7680,"description":"action=set、mode=fixed 时必填；CSS 像素"},"height":{"type":"integer","minimum":240,"maximum":4320,"description":"action=set、mode=fixed 时必填；CSS 像素"},"device_scale_factor_millis":{"type":"integer","minimum":500,"maximum":4000,"description":"action=set、mode=fixed 时可选，设备像素比乘以 1000，默认 1000。"},"device_type":{"type":"string","enum":["desktop","mobile"],"description":"action=set 时可选；默认 desktop；与 width 独立。mobile 启用移动端布局和触控仿真（包含横屏），desktop 保持桌面布局和鼠标语义（包含窄窗口）。"}},"required":["action"],"oneOf":[{"description":"读取当前视口","properties":{"action":{"const":"get"}},"not":{"anyOf":[{"required":["mode"]},{"required":["width"]},{"required":["height"]},{"required":["device_scale_factor_millis"]},{"required":["device_type"]}]}},{"description":"恢复跟随右侧内容槽的自适应视口","properties":{"action":{"const":"set"},"mode":{"const":"auto"}},"required":["action","mode"],"not":{"anyOf":[{"required":["width"]},{"required":["height"]},{"required":["device_scale_factor_millis"]},{"required":["device_type"]}]}},{"description":"设置固定的 Chromium 响应式设备视口","properties":{"action":{"const":"set"},"mode":{"const":"fixed"}},"required":["action","mode","width","height"]}]}"#
             }
             Self::WaitFor => {
-                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"text":{"anyOf":[{"type":"string","minLength":1},{"type":"array","items":{"type":"string","minLength":1},"minItems":1}]},"texts":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"selector":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"timeout_ms":{"type":"integer","minimum":1,"maximum":60000}},"required":[],"anyOf":[{"required":["selector"]},{"required":["text"]},{"required":["texts"]},{"required":["url"]}]}"#
+                r#"{"type":"object","properties":{"tab_id":{"type":"string"},"text":{"anyOf":[{"type":"string","minLength":1},{"type":"array","items":{"type":"string","minLength":1},"minItems":1}]},"texts":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"selector":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"stable":{"type":"boolean","description":"等页面稳定：文档加载完成且连续 400ms 没有 DOM 变化。单独使用时超时不报错，返回 stable=false 表示页面持续变化（轮询、动画、实时数据），此时直接快照，不要重复等待"},"timeout_ms":{"type":"integer","minimum":1,"maximum":60000}},"required":[],"anyOf":[{"required":["selector"]},{"required":["text"]},{"required":["texts"]},{"required":["url"]},{"required":["stable"]}]}"#
             }
             Self::Hover => {
                 r#"{"type":"object","properties":{"tab_id":{"type":"string"},"element_ref":{"type":"string","description":"browser_snapshot 返回的元素引用，例如 e:3:12；页面变化后旧引用失效，需要重新快照"},"include_snapshot":{"type":"boolean"}},"required":["element_ref"]}"#

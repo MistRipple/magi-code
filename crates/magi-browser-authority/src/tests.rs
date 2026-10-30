@@ -608,6 +608,27 @@ fn user_takeover_hold_blocks_agent_lease_until_user_hands_back() {
 }
 
 #[test]
+fn user_activity_tracks_idle_time_without_holding_control() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    assert_eq!(
+        authority.user_idle_ms(&tab_id, at(100)),
+        None,
+        "从未操作过没有记录"
+    );
+    authority.record_user_activity(&tab_id, at(100));
+    assert_eq!(authority.user_idle_ms(&tab_id, at(100)), Some(0));
+    assert_eq!(authority.user_idle_ms(&tab_id, at(3_100)), Some(3_000));
+    // 只是活动记录：不接管，也不推进修订号。
+    assert!(!authority.user_control_held(&tab_id));
+    let revision = authority.snapshot().revision;
+    authority.record_user_activity(&tab_id, at(200));
+    assert_eq!(authority.snapshot().revision, revision);
+}
+
+#[test]
 fn browser_lease_rejects_owner_turn_tab_and_surface_drift() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

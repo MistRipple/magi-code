@@ -397,6 +397,10 @@ impl BrowserWebModelBridgeClient {
             &self.page_id,
         );
 
+        // Once the submit control was activated, a failed readback is ambiguous: ChatGPT
+        // may have accepted the message while the page is still updating. Keep the slot
+        // bound until message facts confirm acceptance or the user resolves the state.
+        let mut submission_may_have_been_accepted = false;
         let mut message_accepted = false;
         let result = async {
             let image_sink = self.image_sink.as_ref().map(|sink| {
@@ -481,7 +485,13 @@ impl BrowserWebModelBridgeClient {
                 }
                 if is_cancelled() { return Err(WebModelError::cancelled()); }
                 let submitted = self.driver.submit(&self.page_id).await?;
-                if !submitted.submitted || !submitted.composer_empty {
+                // The submitted flag only means that the page accepted the click. The composer
+                // is controlled by ChatGPT and may clear after the submit command returns
+                // (especially when the page immediately starts a new turn or navigates).
+                // Treating a transient composer-empty=false observation as a rejection can report
+                // an error after the message was already sent. The authoritative acceptance
+                // check below uses the page user-message/generation facts.
+                if !submitted.submitted {
                     return Err(WebModelError::new(
                         WebModelErrorCode::WebSendRejected,
                         submitted
@@ -489,6 +499,7 @@ impl BrowserWebModelBridgeClient {
                             .unwrap_or_else(|| "ChatGPT Web 未接受本次消息".to_string()),
                     ));
                 }
+                submission_may_have_been_accepted = true;
                 Ok(())
             }
             .await;
@@ -498,12 +509,6 @@ impl BrowserWebModelBridgeClient {
                 }
                 return Err(error);
             }
-            message_accepted = true;
-            if let Some(sink) = &self.saved_sink {
-                sink.message_accepted(&self.identity.session_id);
-            }
-            self.runtime.record_web_send(&self.identity.session_id);
-
             let acceptance_deadline = tokio::time::Instant::now() + self.config.acceptance_timeout;
             let mut last_assistant = String::new();
             let mut last_thinking = String::new();
@@ -526,7 +531,19 @@ impl BrowserWebModelBridgeClient {
                     let _ = self.driver.cancel_generation(&self.page_id).await;
                     return Err(WebModelError::cancelled());
                 }
-                let mut state = self.driver.turn_state(&self.page_id).await?;
+                let mut state = match self.driver.turn_state(&self.page_id).await {
+                    Ok(state) => state,
+                    Err(error)
+                        if submission_may_have_been_accepted
+                            && error.code == WebModelErrorCode::WebSendRejected =>
+                    {
+                        return Err(WebModelError::new(
+                            WebModelErrorCode::WebSendUnconfirmed,
+                            "点击已执行，但 GPT Web 页面状态暂时无法回读，请先检查页面后再继续",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
                 // 提交会让 ChatGPT 把页面换成一个新对话（`/` → `/c/<id>`）：新页面的消息计数从头算，
                 // 比提交前的基线还小。此时基线已经不是同一个对话的计数，按 0 重新记。
                 if state.user_message_count < baseline_users
@@ -554,6 +571,20 @@ impl BrowserWebModelBridgeClient {
                         && !(saw_generating && !state.generating)
                         && !baseline.assistant_text.is_empty()
                         && state.assistant_text == baseline.assistant_text);
+                // A new assistant message is itself conclusive evidence that ChatGPT
+                // accepted this turn. This also covers a fast response that is already
+                // complete before the first post-submit poll, when there is no transient
+                // `generating` state left to observe.
+                if reply_started {
+                    accepted = true;
+                }
+                if accepted && !message_accepted {
+                    message_accepted = true;
+                    if let Some(sink) = &self.saved_sink {
+                        sink.message_accepted(&self.identity.session_id);
+                    }
+                    self.runtime.record_web_send(&self.identity.session_id);
+                }
                 if !reply_started {
                     state.assistant_text.clear();
                     // 思考阶段先于助手消息节点出现：消息被接受之后读到的推理就是本轮的（页面只在进行中的
@@ -570,8 +601,8 @@ impl BrowserWebModelBridgeClient {
                 }
                 if !accepted && tokio::time::Instant::now() >= acceptance_deadline {
                     return Err(WebModelError::new(
-                        WebModelErrorCode::WebSendRejected,
-                        "ChatGPT Web 未确认已接受本次消息",
+                        WebModelErrorCode::WebSendUnconfirmed,
+                        "点击已执行，但 ChatGPT Web 尚未返回可确认的消息事实",
                     ));
                 }
                 // 页面图片在 Magi 里还不可用：流式阶段只发文字，图片在收口时随全文一起交付。
@@ -686,7 +717,7 @@ impl BrowserWebModelBridgeClient {
         // 首次 claim 在页面打开、登录或写入阶段失败时不能留下一个没有可用
         // 页面上下文的 owner；存活判定失败也按状态机释放槽位。已被站点接受的
         // turn 保留槽位，允许用户按同一网页上下文重试或切换到本地。
-        if (claim.newly_claimed && !message_accepted)
+        if (claim.newly_claimed && !submission_may_have_been_accepted)
             || result
                 .as_ref()
                 .is_err_and(|error| error.code == WebModelErrorCode::WebContextLost)

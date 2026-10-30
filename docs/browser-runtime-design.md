@@ -189,7 +189,7 @@ Desktop 使用每个 BrowserWindow 独立的 `sessionStorage`，只解决同一�
 
 除以上各条外，本文件关于显示路径、安全边界、popup、视口、焦点、协议与恢复的全部规则对 `webSession` 同样适用。
 
-Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置 Worker 的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；用户接管后拒绝后续输入，配置脚本不允许合成事件或直接改写文本字段绕过控制。每条配置命令结算后释放控制，登录、验证码和密钥输入阶段交由用户处理。
+Desktop Control 3.8 要求 GPT Web 配置写命令携带 Agent lease/fence（旧宿主在版本握手时拒绝）。GPT Web 配置使用同一 Authority lease 与原生输入链，复用 Main `agent_cursor` 与 Renderer Top Layer 覆盖层。配置的每次 CDP 请求绑定本次 lease/fence，Main 在 Surface lane 中检查控制仍有效；页面里不运行配置脚本，也不合成事件或直接改写文本字段绕过控制。配置运行期间 Agent 持有这张租约并跨命令保留（剩余有效期不足时续租），运行结束（交接、完成、取消、失败）一律释放，登录、验证码和密钥输入阶段交由用户处理。用户在 Agent 思考期间动页面时 Main 识别为接管并撤销租约，daemon 等用户停手（无输入 2.5 秒）后清掉接管并重新取得控制，被打断的那一步不执行、由 Agent 依据最新快照重新规划；等不到停手才交还用户手动继续。Agent 取得控制时 Main 会把自适应视口钉成当前尺寸，释放时还原为自适应（用户或工具显式选的固定视口不受影响）。
 
 ### 4.4 自动化不改布局与代理保留页面
 
@@ -244,6 +244,9 @@ Worker 的定位、命中校验和工具参数始终使用页面 CSS 坐标。Ma
 - Main 在当前 Surface lane 投递原生写入前聚焦受控 guest WebContents，确保键盘路由正确；不激活宿主窗口，也不在导航完成时抢焦点。
 - 快照的节点选择、排序和 UTF-8 文本预算只由 Worker 采集端执行，默认 96 个节点、10 KiB 文本。保留已收集节点；敏感输入值在采集源排除，祖先/标签名称也不能重新带入敏感表单文本。daemon 只投影，不进行第二次裁剪。
 - 快照结果暴露 returned_nodes、total_nodes、text_bytes 和 truncated。total_nodes 是扫描到的元素数（扫描上限 20,000），不是完整页面总数；truncated 也包括单字段和扫描限制。模型可用 browser_snapshot 的 selector 缩小页面区域，每次快照仍统一失效旧引用。
+- 快照预算按「视口内优先」分配：同一类控件里，当前屏幕上的先于视口外的，再按弹窗优先和类型配额选择；文档顺序靠前的页眉、侧边栏历史列表不会挤掉屏幕上的控件。根节点 `description` 随结果以 `page` 字段投影：视口尺寸、滚动位置，以及未返回控件按类型和是否在视口内的汇总，Agent 据此判断是否漏看了东西。`selector` 除 CSS 选择器外也接受上一次快照中某个容器的 `element_ref`，无需猜选择器就能缩小到弹窗或列表。视口很窄时站点会折叠成移动布局，工具说明引导 Agent 先用 `browser_viewport` 切到桌面视口。
+- 所有交互动作都带 `outcome`，告诉 Agent 动作是否真的生效：点击/输入来自页面内观察（MutationObserver、目标状态、目标是否仍在文档中），按键来自文档变化和焦点元素状态（值长度、勾选）前后对比，滚动来自滚动位置前后对比；原生事件已送达却没有任何变化时返回 `no_visible_change`，并明确不要重复同一动作。按下之后才发现页面换代（整页跳转或 SPA 路由）是这次动作自身的结果，报告 `navigated`（送达为推断），不再报成「绑定过期」。动作导致页面跳转时，结果默认附带新快照（旧引用已失效，这一步必然发生）；其余情况默认不附带，因为新快照会使同一份旧快照上其余动作的引用失效。为输入框获得焦点的点击不收集变化证据，输入前不能有额外等待窗口。
+- `browser_wait_for` 除文本、选择器、URL 外支持 `stable=true`：文档加载完成且连续 400ms 没有 DOM 变化。单独使用时超时不是错误，返回 `stable=false` 表示页面持续变化（轮询、动画、实时流），Agent 应直接快照而不是重复等待；等待期间页面换代按 `navigated` 报告。
 
 身份与失效边界如下：
 

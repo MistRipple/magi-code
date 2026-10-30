@@ -194,7 +194,7 @@
     border: 0;
     border-radius: calc(var(--radius-sm) + 6px);
     background: var(--dropdown-bg);
-    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 36px rgba(0, 0, 0, 0.32);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), var(--shadow-lg);
   }
 
   .session-isolation-heading {

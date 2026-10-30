@@ -89,6 +89,8 @@ export function webModelFailureAction(code: string): WebModelFailureAction | nul
     case 'web_attach_failed':
     case 'web_turn_timeout':
       return { kind: 'retry', labelKey: 'webModel.action.retry' };
+    case 'web_send_unconfirmed':
+      return { kind: 'openView', labelKey: 'webModel.action.openHome' };
     case 'web_session_busy':
       return { kind: 'releaseSession', labelKey: 'webModel.action.releaseSession' };
     case 'web_context_lost':

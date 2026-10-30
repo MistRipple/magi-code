@@ -16,6 +16,7 @@ pub enum WebModelErrorCode {
     WebPluginInactive,
     WebDesktopUnavailable,
     WebSendRejected,
+    WebSendUnconfirmed,
     WebWriteNotConfirmed,
     WebAttachFailed,
     WebTurnTimeout,
@@ -39,6 +40,7 @@ impl WebModelErrorCode {
             Self::WebPluginInactive => "web_plugin_inactive",
             Self::WebDesktopUnavailable => "web_desktop_unavailable",
             Self::WebSendRejected => "web_send_rejected",
+            Self::WebSendUnconfirmed => "web_send_unconfirmed",
             Self::WebWriteNotConfirmed => "web_write_not_confirmed",
             Self::WebAttachFailed => "web_attach_failed",
             Self::WebTurnTimeout => "web_turn_timeout",
@@ -50,7 +52,7 @@ impl WebModelErrorCode {
         }
     }
 
-    pub const ALL: [WebModelErrorCode; 18] = [
+    pub const ALL: [WebModelErrorCode; 19] = [
         Self::WebSessionBusy,
         Self::WebContextLost,
         Self::WebSavedConversationUnavailable,
@@ -61,6 +63,7 @@ impl WebModelErrorCode {
         Self::WebPluginInactive,
         Self::WebDesktopUnavailable,
         Self::WebSendRejected,
+        Self::WebSendUnconfirmed,
         Self::WebWriteNotConfirmed,
         Self::WebAttachFailed,
         Self::WebTurnTimeout,
@@ -103,6 +106,9 @@ impl WebModelErrorCode {
             Self::WebPluginInactive => "GPT Web 插件尚未安装并激活，请先在设置 → 插件中完成安装。",
             Self::WebDesktopUnavailable => "GPT Web 需要 Magi Desktop。",
             Self::WebSendRejected => "ChatGPT 未接受这条消息，本次没有产生任何副作用，可以重试。",
+            Self::WebSendUnconfirmed => {
+                "消息已点击发送，但 Magi 尚未确认 ChatGPT 是否接收。请先检查 GPT Web 页面，确认后再继续，避免重复发送。"
+            }
             Self::WebWriteNotConfirmed => "网页输入框回读未确认，本次消息未提交，可以重试。",
             Self::WebAttachFailed => "图片没能附加到 ChatGPT 输入框，本次消息未提交，可以重试。",
             Self::WebTurnTimeout => "消息已被 ChatGPT 接受，但回复没有在时限内完成。",

@@ -10,7 +10,7 @@ use magi_session_store::{
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) struct StepModelClient<'a> {
+pub struct StepModelClient<'a> {
     inner: &'a dyn ModelBridgeClient,
     store: &'a SessionStore,
     session_id: &'a SessionId,

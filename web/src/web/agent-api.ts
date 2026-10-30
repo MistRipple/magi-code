@@ -1462,40 +1462,6 @@ export async function stopWebModel(): Promise<{ status: string }> {
   return parseAgentJson<{ status: string }>(response, 'stop web model');
 }
 
-/** ChatGPT 侧 Magi 连接器的状态 / 配置结果。 */
-export interface WebConnectorStatus {
-  supported: boolean;
-  exists: boolean;
-  enabled: boolean;
-  toolCount?: number | null;
-  /** ChatGPT 缓存的是创建 / 上次刷新时的工具列表；Magi 目录之后变过则为 true（需要刷新）。 */
-  toolsStale?: boolean | null;
-  reason?: string | null;
-}
-
-export interface WebConnectorConfigResult {
-  configured: boolean;
-  confirmedEnabled: boolean;
-  reason?: string | null;
-}
-
-export async function getWebConnectorStatus(): Promise<WebConnectorStatus> {
-  const response = await getTransport().request(agentUrl('/api/browser/web-models/connector'), {
-    method: 'GET',
-  });
-  return parseAgentJson<WebConnectorStatus>(response, 'get web connector status');
-}
-
-/** 在 ChatGPT 里创建 / 启用 Magi 连接器。会修改用户的 ChatGPT 连接器设置，调用方必须已确认。 */
-export async function configureWebConnector(): Promise<WebConnectorConfigResult> {
-  const response = await getTransport().request(agentUrl('/api/browser/web-models/connector'), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientPlatform: browserClientPlatform() }),
-  });
-  return parseAgentJson<WebConnectorConfigResult>(response, 'configure web connector');
-}
-
 /** ChatGPT 侧已保存对话列表里的一项。 */
 export interface WebSavedConversation {
   conversationId: string;

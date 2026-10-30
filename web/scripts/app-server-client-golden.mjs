@@ -265,11 +265,13 @@ await withGoldenViteServer(async (server) => {
   {
     // daemon 重启后事件序号重新计数：重连发现 runtimeEpoch 变化时必须丢弃旧游标，
     // 否则带着更大的 afterSequence 订阅会把新代际的事件全部过滤掉。
+    const epochChanges = [];
     const { client, socket: oldSocket } = await connectReady(AppServerClient, {
       reconnect: true,
       reconnectBaseDelayMs: 0,
       reconnectMaxDelayMs: 0,
       subscription: { sessionId: 'session-golden', afterSequence: 0 },
+      onRuntimeEpochChange: (change) => epochChanges.push(change),
     });
     oldSocket.message({
       jsonrpc: '2.0',
@@ -303,6 +305,29 @@ await withGoldenViteServer(async (server) => {
       'daemon 重启后必须从新代际的起点订阅',
     );
     assert.equal(client.lastSequence, 0);
+    // 重启的收敛不产生事件：上层必须被告知代际变化，才能重建权威状态。
+    assert.deepEqual(epochChanges, [{ previous: 'runtime-golden-1', current: 'runtime-golden-restarted' }]);
+    client.close();
+  }
+
+  {
+    // 普通断线重连（代际不变）不触发重建。
+    const epochChanges = [];
+    const { client, socket: oldSocket } = await connectReady(AppServerClient, {
+      reconnect: true,
+      reconnectBaseDelayMs: 0,
+      reconnectMaxDelayMs: 0,
+      onRuntimeEpochChange: (change) => epochChanges.push(change),
+    });
+    oldSocket.close();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const reconnected = FakeWebSocket.instances.at(-1);
+    reconnected.open();
+    await Promise.resolve();
+    reply(reconnected, lastRequest(reconnected, 'initialize'), initializeResult());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(client.state, 'ready');
+    assert.deepEqual(epochChanges, []);
     client.close();
   }
 

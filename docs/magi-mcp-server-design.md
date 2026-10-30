@@ -326,7 +326,7 @@ GPT Web 的项目工具只有一条路：ChatGPT 连接器 → OpenAI Tunnel →
 | 没有进行中的 turn / 槽位已释放 | — | 所有调用一律拒绝；已建立的连接下一条请求即失败 |
 | 工具目录 | 外部 MCP 令牌统一开放完整 MCP 工具目录 | GPT Web 槽位按设置里的工具档过滤，**没有 `exec`** |
 
-**工具列表刷新：** ChatGPT 在创建连接器时缓存工具列表，之后不会自动更新。设置页在 Magi 当前目录摘要与上次同步时的摘要不一致时显示“工具列表已过期”（`GET /api/browser/web-models/connector` 的 `toolsStale`），点“刷新 ChatGPT 工具列表”会复用 `WebConfigureConnector` 在连接器详情页点 Refresh tools，并重新记录摘要。
+**工具列表刷新：** ChatGPT 在创建连接器时缓存工具列表，之后不会自动更新。Magi 不再保存目录摘要，也不显示“已过期”提示；Magi 目录变化后，点设置页“检查并配置 ChatGPT 连接器”会启动 GPT Web 配置 Agent，由模型根据连接器详情页实时快照找到 Refresh tools 并回读结果。
 
 **退出清理：** OpenAI Tunnel 由厂商 CLI 以脱离进程的托管运行时持有，不在 daemon 子进程树内。daemon 在 HTTP 服务停稳后调用 `ApiState::shutdown_external_channels` 显式停止通道；异常退出遗留的运行时在下次启动时由 `reap_leaked_clients` 回收。
 

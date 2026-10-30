@@ -335,6 +335,8 @@ impl InFlightCalls {
     }
 }
 
+type CatalogObserver = Arc<dyn Fn(&ClientPrincipal) + Send + Sync>;
+
 pub struct McpServer {
     name: String,
     version: String,
@@ -342,6 +344,7 @@ pub struct McpServer {
     workspaces: Arc<dyn WorkspaceResolver>,
     attribution: Arc<dyn AttributionResolver>,
     audit: Arc<dyn AuditSink>,
+    catalog_observer: Option<CatalogObserver>,
     in_flight: Arc<InFlightCalls>,
 }
 
@@ -359,6 +362,7 @@ impl McpServer {
             workspaces,
             attribution: Arc::new(ExternalOnlyAttribution),
             audit: Arc::new(NoopAudit),
+            catalog_observer: None,
             in_flight: Arc::new(InFlightCalls::default()),
         }
     }
@@ -370,6 +374,12 @@ impl McpServer {
 
     pub fn with_audit(mut self, audit: Arc<dyn AuditSink>) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// 每次成功响应 `tools/list` 时通知宿主，用于证明远端客户端确实读取过工具目录。
+    pub fn with_catalog_observer(mut self, observer: CatalogObserver) -> Self {
+        self.catalog_observer = Some(observer);
         self
     }
 
@@ -506,7 +516,13 @@ impl McpServer {
                 ))
             }
             "ping" => Some(success(id, ping_result())),
-            "tools/list" => Some(success(id, tools_list_result(&self.catalog_for(principal)))),
+            "tools/list" => {
+                let result = tools_list_result(&self.catalog_for(principal));
+                if let Some(observer) = &self.catalog_observer {
+                    observer(principal);
+                }
+                Some(success(id, result))
+            }
             "tools/call" => {
                 let params = request.params.unwrap_or(Value::Null);
                 match self

@@ -209,6 +209,9 @@ pub struct BrowserAuthority {
     /// 用户在页面上直接操作而接管的 Tab。接管期间代理不能重新获取控制权，
     /// 必须由用户显式交还；运行态事实，不进入 durable state。
     user_control_holds: HashSet<BrowserTabId>,
+    /// 用户最近一次直接操作某个 Tab 页面的时间（真实键盘/鼠标输入，不含代理自己的原生输入）。
+    /// 只用于「用户停手后代理自动重新接管」的判断，不持有控制权；运行态事实，不进入 durable state。
+    user_activity: HashMap<BrowserTabId, UtcMillis>,
     /// 每个执行者（主线或某个子任务）在浏览器会话里自己的当前 Tab；运行态事实。
     /// 执行者之间不共享默认目标，避免子代理与主代理争用同一页面。
     agent_tabs: HashMap<(BrowserSessionId, String), AgentTabTarget>,
@@ -1655,6 +1658,18 @@ impl BrowserAuthority {
             self.bump_revision();
         }
         Ok(released)
+    }
+
+    /// 记录用户刚刚在这个 Tab 的页面上操作过。不改变控制权，也不推进修订号。
+    pub fn record_user_activity(&mut self, tab_id: &BrowserTabId, now: UtcMillis) {
+        self.user_activity.insert(tab_id.clone(), now);
+    }
+
+    /// 用户距离上次操作该 Tab 已停手多久（毫秒）；从未操作过返回 `None`。
+    pub fn user_idle_ms(&self, tab_id: &BrowserTabId, now: UtcMillis) -> Option<u64> {
+        self.user_activity
+            .get(tab_id)
+            .map(|at| now.0.saturating_sub(at.0))
     }
 
     pub fn user_control_held(&self, tab_id: &BrowserTabId) -> bool {
