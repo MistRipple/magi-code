@@ -410,12 +410,12 @@
     box-sizing: border-box;
     max-height: min(70vh, 560px);
     overflow: auto;
-    padding: 12px;
-    border: var(--magi-hairline) solid var(--border);
-    border-radius: var(--radius-md);
+    padding: var(--space-4);
+    border: 0;
+    border-radius: calc(var(--radius-sm) + var(--space-4));
     background: var(--background);
     color: var(--foreground);
-    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint), var(--shadow-lg);
     font-size: 12px;
     line-height: 1.35;
     opacity: 0;

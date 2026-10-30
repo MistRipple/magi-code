@@ -339,7 +339,7 @@
     background: var(--vscode-input-background);
     color: var(--primary);
     font-weight: var(--font-semibold);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-sm);
   }
 
   .uq-step.done:not(.active) {

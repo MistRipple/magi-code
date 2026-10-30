@@ -1560,7 +1560,7 @@
     background: var(--background);
     border: var(--magi-hairline) solid var(--border);
     border-radius: 9px;
-    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2), 0 1px 3px rgba(0, 0, 0, 0.08);
+    box-shadow: var(--shadow-lg);
     z-index: var(--z-popover);
     padding: 0;
     box-sizing: border-box;
@@ -1880,7 +1880,7 @@
     background: var(--background);
     border: var(--magi-hairline) solid var(--border);
     border-radius: 8px;
-    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.08);
+    box-shadow: var(--shadow-lg);
     font-size: var(--text-xs);
     line-height: 1.5;
     color: var(--foreground);
@@ -1984,7 +1984,7 @@
   .skill-detail-size { font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-detail-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: color-mix(in srgb, var(--foreground) 6%, transparent); }
   .skill-detail-tab { padding: 1px 12px; border: 0; border-radius: 999px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: var(--text-xs); cursor: pointer; }
-  .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: var(--font-semibold); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+  .skill-detail-tab.active { background: var(--surface-1); color: var(--primary); font-weight: var(--font-semibold); box-shadow: var(--shadow-sm); }
   .skill-detail-meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; font-size: 12px; }
   .skill-detail-meta dt { color: var(--foreground-muted); }
   .skill-detail-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); }

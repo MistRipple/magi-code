@@ -128,9 +128,9 @@
   .error-popover-btn { width: 24px; height: 24px; }
   .error-more-btn:hover { color: var(--primary-hover); }
   .error-more-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--radius-xs); }
-  .error-popover-btn { border: var(--magi-hairline) solid var(--border); background: var(--surface-2); color: var(--foreground-muted); border-radius: var(--radius-sm); }
+  .error-popover-btn { border: 0; background: transparent; color: var(--foreground-muted); border-radius: var(--radius-sm); }
   .error-popover-btn:hover { background: var(--surface-hover); color: var(--foreground); }
-  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--background); border: var(--magi-hairline) solid var(--border); border-radius: var(--radius-md); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
+  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--background); border: 0; border-radius: calc(var(--radius-sm) + var(--space-3)); box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint), var(--shadow-lg); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
   .error-popover-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .error-popover-title { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
   .error-popover-actions { display: flex; align-items: center; gap: var(--space-2); }

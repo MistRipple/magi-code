@@ -75,7 +75,7 @@
 <style>
   .profile-editor { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-4); }
   .profile-field { display: flex; flex-direction: column; gap: var(--space-2); }
-  .user-rules-textarea { resize: none; min-height: 140px; width: 100%; box-sizing: border-box; }
+  .user-rules-textarea { min-height: 140px; width: 100%; box-sizing: border-box; }
 
   .rules-save-status {
     display: inline-flex;

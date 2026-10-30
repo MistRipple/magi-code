@@ -210,7 +210,7 @@
   .plugin-settings-form { display: grid; gap: 16px; max-width: 720px; }
   .plugin-settings-form .form-field { display: grid; gap: 6px; }
   .plugin-settings-checkbox { display: inline-flex; gap: 8px; align-items: center; color: var(--text-secondary); }
-  .plugin-settings-json { min-height: 120px; resize: vertical; font-family: var(--font-mono, monospace); }
+  .plugin-settings-json { min-height: 120px; font-family: var(--font-mono, monospace); }
   .plugin-settings-actions { display: flex; gap: 10px; align-items: center; }
   .plugin-settings-error { color: var(--text-danger, #d33); }
 </style>

@@ -242,10 +242,10 @@
   /* ==========================================
      6. 阴影系统 (Shadow System)
      ========================================== */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);
-  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.10), 0 2px 6px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.10), 0 6px 16px rgba(0, 0, 0, 0.10);
+  --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.12), 0 12px 32px rgba(0, 0, 0, 0.14);
+  --shadow-xl: 0 3px 8px rgba(0, 0, 0, 0.12), 0 18px 48px rgba(0, 0, 0, 0.16);
 
   /* ==========================================
      7. 动画系统 (Animation)
@@ -624,6 +624,10 @@ textarea {
   box-shadow: inset 0 0 0 var(--magi-hairline) var(--vscode-input-border, var(--border));
   border-radius: var(--radius-sm);
   padding: var(--spacing-sm);
+}
+
+/* 文本域尺寸由布局或内容自适应控制，禁止原生拖动破坏对齐。 */
+textarea {
   resize: none;
 }
 
@@ -631,6 +635,14 @@ input:focus,
 textarea:focus {
   outline: none;
   box-shadow: var(--magi-focus-shadow);
+}
+
+/* 短标题平衡换行；单行省略控件仍由自身的 white-space 规则决定。 */
+:where(h1, h2, h3, h4, h5, h6),
+.modal-title,
+.empty-state__title,
+.settings-section-title {
+  text-wrap: balance;
 }
 
 /* Keep changing counters and timestamps from shifting their neighbours. */
@@ -1251,7 +1263,6 @@ pre code {
   box-shadow: inset 0 0 0 var(--magi-hairline) var(--border);
   border-radius: var(--radius-sm);
   outline: none;
-  resize: vertical;
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 

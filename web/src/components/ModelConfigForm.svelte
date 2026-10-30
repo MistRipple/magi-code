@@ -907,7 +907,6 @@
 
   .vision-rules-input {
     min-height: 76px;
-    resize: vertical;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     line-height: 1.55;
@@ -1018,7 +1017,7 @@
     border: var(--magi-hairline) solid var(--border);
     border-top: none;
     border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--shadow-md);
   }
   .model-select-search { margin: 4px; width: calc(100% - 8px); }
   .select-empty { margin: 8px; color: var(--foreground-muted); font-size: var(--text-xs); }

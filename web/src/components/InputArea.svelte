@@ -328,11 +328,6 @@
     });
   });
 
-  // 拖动调整大小相关
-  let inputHeight = $state(120); // 默认高度增加到 120px
-  const minHeight = 80;
-  const maxHeight = 400;
-
   // 🔧 图片上传相关状态
   let selectedImages = $state<SelectedImage[]>([]);
   let pendingImageReadCount = $state(0);
@@ -2431,26 +2426,6 @@
     }
   }
 
-  // 拖动调整大小
-  function startResize(event: MouseEvent) {
-    const startY = event.clientY;
-    const startHeight = inputHeight;
-
-    function onMouseMove(e: MouseEvent) {
-      const delta = startY - e.clientY;
-      const newHeight = Math.min(maxHeight, Math.max(minHeight, startHeight + delta));
-      inputHeight = newHeight;
-    }
-
-    function onMouseUp() {
-      document.removeEventListener('mousemove', onMouseMove);
-      document.removeEventListener('mouseup', onMouseUp);
-    }
-
-    document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
-  }
-
   // 🔧 处理粘贴事件（支持图片粘贴 + 纯文本插入）
   function handlePaste(event: ClipboardEvent) {
     const imageFiles = collectClipboardImageFiles(event.clipboardData);
@@ -3274,7 +3249,6 @@
   <div
     class="ia-wrapper"
     class:drag-active={imageDragActive}
-    style="min-height: {inputHeight}px"
     ondragover={handleImageDragOver}
     ondragleave={handleImageDragLeave}
     ondrop={handleImageDrop}
@@ -3282,10 +3256,6 @@
     {#if imageDragActive}
       <div class="ia-drop-hint" aria-hidden="true">{i18n.t('input.drop.hint')}</div>
     {/if}
-    <!-- 拖动调整大小 -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="ia-resize" onmousedown={startResize}></div>
-
     {#if editingTurn || editingQueuedMessage}
       <div class="ia-editing-bar" role="status" data-testid="input-editing-bar">
         <span>{i18n.t(editingQueuedMessage ? 'input.queue.editing' : 'input.editingPreviousMessage')}</span>
@@ -4202,6 +4172,7 @@
     flex-direction: column;
     container-name: magi-composer;
     container-type: inline-size;
+    min-height: 120px;
     max-height: 50vh;
     background: var(--magi-surface-composer);
     border: 0;
@@ -4254,32 +4225,6 @@
     color: var(--error);
   }
 
-  /* 拖拽调整：视觉 2px 指示器，交互区域 10px */
-  .ia-resize {
-    height: 10px;
-    flex-shrink: 0;
-    cursor: ns-resize;
-    background: transparent;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background var(--transition-fast);
-    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-  }
-
-  .ia-resize::after {
-    content: '';
-    width: 28px;
-    height: 2px;
-    background: var(--border);
-    border-radius: 1px;
-    opacity: 0;
-    transition: opacity var(--transition-fast);
-  }
-
-  .ia-resize:hover { background: color-mix(in srgb, var(--primary) 8%, transparent); }
-  .ia-resize:hover::after { opacity: 0.8; }
-
   /* 文本框 */
   .ia-textarea {
     flex: 1;
@@ -4288,7 +4233,6 @@
     padding: var(--space-2) var(--space-3);
     font-size: var(--text-sm);
     line-height: var(--leading-relaxed);
-    resize: none;
     border: none;
     background: transparent;
     color: var(--foreground);
@@ -4672,7 +4616,7 @@
     -webkit-backdrop-filter: blur(18px);
     border: 0;
     border-radius: calc(var(--radius-sm) + 8px);
-    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), var(--shadow-lg);
   }
   .ia-add-popover {
     border-radius: calc(var(--radius-sm) + 6px);
@@ -4756,13 +4700,13 @@
     flex-direction: column;
     width: min(260px, calc(100vw - 24px));
     max-height: 264px;
-    padding: 8px;
+    padding: var(--space-3);
     background: color-mix(in srgb, var(--background) 100%, white 8%);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
-    border: var(--magi-hairline) solid color-mix(in srgb, var(--border) 70%, var(--foreground) 30%);
-    border-radius: var(--radius-md);
-    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.22);
+    border: 0;
+    border-radius: calc(var(--radius-sm) + var(--space-3));
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--magi-border-faint), var(--shadow-lg);
   }
   .ia-model-summary { padding: 2px 6px 4px; }
   .ia-reasoning-actions { display: flex; justify-content: center; gap: 8px; margin-top: 8px; }
@@ -5162,7 +5106,6 @@
     box-sizing: border-box;
     width: 100%;
     min-height: 92px;
-    resize: vertical;
     border: var(--magi-hairline) solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--background);
@@ -5209,7 +5152,7 @@
     -webkit-backdrop-filter: blur(18px);
     border: 0;
     border-radius: calc(var(--radius-sm) + 6px);
-    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), 0 14px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.25);
+    box-shadow: inset 0 0 0 var(--magi-hairline) var(--border), var(--shadow-lg);
   }
   .ia-slash-list {
     display: flex;

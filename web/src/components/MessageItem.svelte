@@ -1171,7 +1171,7 @@
 
   .user-image-thumb:hover {
     transform: scale(1.05);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--shadow-md);
   }
 
   .user-image-thumb img {
@@ -1227,7 +1227,7 @@
     max-width: 90vw;
     max-height: 85vh;
     border-radius: 4px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-xl);
     pointer-events: auto;
   }
 

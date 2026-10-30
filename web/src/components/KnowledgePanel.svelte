@@ -1609,7 +1609,7 @@
     color: var(--foreground);
     font-size: var(--text-sm);
   }
-  .kp-editor-textarea { resize: vertical; min-height: 110px; }
+  .kp-editor-textarea { min-height: 110px; }
   .kp-editor-input:focus-visible, .kp-editor-textarea:focus-visible { box-shadow: var(--magi-focus-shadow); }
   .kp-editor-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--space-2); }
   .kp-editor-error { color: var(--error); font-size: var(--text-xs); overflow-wrap: anywhere; }

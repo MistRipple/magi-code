@@ -1177,7 +1177,7 @@
     border: var(--magi-hairline) solid var(--vscode-editorWidget-border, var(--border));
     border-top: 0;
     border-radius: 0 0 8px 8px;
-    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
+    box-shadow: var(--shadow-lg);
     pointer-events: auto;
   }
 
