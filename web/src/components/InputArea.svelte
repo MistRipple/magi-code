@@ -79,7 +79,7 @@
   import { openSettings, closeSettings } from '../stores/shell-ui.svelte';
   import { createAppBrowserSession } from '../web/agent-api';
   import { projectWebModelAppSession } from '../web/web-model-session-projection';
-  import { activateWebModelTab, setRightPaneCollapsed } from '../stores/right-pane.svelte';
+  import { activateWebModelTab, appWebModelTab, setRightPaneCollapsed } from '../stores/right-pane.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
   import { bindWebSavedConversation, materializeSession } from '../web/agent-api';
   import { canFetchModelList } from '../shared/model-governance';
@@ -225,6 +225,22 @@
   const setupActive = $derived(setupAvailable && setupIsActive(setupStatus));
   const setupInputRequest = $derived(isWebModelSetupRequest(inputValue, setupAvailable));
 
+  /**
+   * 配置时右栏必须展开并切到 GPT Web 标签，用户才看得到 Agent 在操作什么。
+   * 应用级主页标签由 daemon 打开页面后才进入投影，所以不能只尝试一次：
+   * 标签出现前 `activateWebModelTab` 是空操作。成功展开一次即停止，之后用户可自行收起。
+   */
+  async function revealSetupWebModelTab(): Promise<void> {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500));
+      if (!appWebModelTab()) await projectWebModelAppSession();
+      if (!appWebModelTab()) continue;
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+      activateWebModelTab();
+      return;
+    }
+  }
+
   async function submitWebSetup(action: SetupAction): Promise<boolean> {
     if (setupSubmitting || setupRequestId || isSending || sessionInputLocked || isInteractionBlocking) return false;
     const origin = `${currentWorkspaceId || ''}|${currentWorkspacePath || ''}|${currentSessionId || ''}`;
@@ -244,9 +260,8 @@
       await createAppBrowserSession();
       await projectWebModelAppSession();
       if (currentSessionId?.trim() !== sessionId) return false;
-      setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
-      activateWebModelTab();
       setupRequestId = generateId();
+      void revealSetupWebModelTab();
       vscode.postMessage({ type: 'executeTask', text: action, requestId: setupRequestId,
         sessionId, workspaceId: target?.workspaceId || '', workspacePath: target ? workspaceNavigationPath(target) : '',
         pluginCommandId: WEB_MODEL_SETUP_COMMAND, accessProfile: selectedAccessProfile,
@@ -2790,7 +2805,14 @@
     }
   }
   async function refreshPickerModels() {
-    if (pickerLoading) return;
+    // A probe can make GPT Web available while the initial provider catalog
+    // request is still in flight. Wait for that request before refreshing, or
+    // the first picker open can keep the pre-probe empty Web list.
+    if (pickerLoading) {
+      const pending = pickerLoadPromise;
+      if (pending) await pending;
+      if (pickerLoading) return;
+    }
     pickerLoadedOnce = false;
     await loadPickerModels();
   }
@@ -4011,8 +4033,7 @@
           >
             <Icon name={resumeSubmitting ? 'loader' : 'play'} size={14} class={resumeSubmitting ? 'spinning' : ''} />
           </button>
-          {:else if isSending}
-          {#if hasContent}
+          {:else if isSending && hasContent}
             <button
               type="button"
               class="ia-queue-action dock-btn"
@@ -4027,10 +4048,11 @@
               onclick={() => sendMessage()}
               disabled={sendDisabled}
               title={sendButtonTitle}
+              aria-label={sendButtonTitle}
             >
               <Icon name={sendPreparing ? 'loader' : 'send'} size={14} class={sendPreparing ? 'spinning' : ''} />
             </button>
-          {/if}
+          {:else if isSending}
           <button
             class="ia-send stop"
             data-testid="input-stop-button"
@@ -4050,6 +4072,7 @@
             onclick={() => sendMessage()}
             disabled={sendDisabled}
             title={sendButtonTitle}
+            aria-label={sendButtonTitle}
           >
             <Icon name={sendPreparing ? 'loader' : 'send'} size={14} class={sendPreparing ? 'spinning' : ''} />
           </button>

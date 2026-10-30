@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import type { WebModelSetupStatus } from '../shared/app-server-protocol.generated';
-  import { getWebModelSetup, saveWebModelSetupCredentials, setupIsActive, setupNeedsConnectorConsent, setupCanRetryTunnel, setupCanEditCredentials, setupHintKey, setupCredentialInput, webModelSetupAvailable, type SetupAction } from '../web/web-model-setup';
+  import { getWebModelSetup, saveWebModelSetupCredentials, setupIsActive, setupCanEditCredentials, setupHintKey, setupCredentialInput, webModelSetupAvailable, type SetupAction } from '../web/web-model-setup';
   import { dispatchWebModelAction } from '../web/web-model-actions';
   import { i18n } from '../stores/i18n.svelte';
   import { getWebModelTunnel } from '../web/agent-api';
@@ -58,7 +58,7 @@
         if (setupIsActive(next) || (next && next.updatedAt !== status?.updatedAt)) dismissed = false;
         status = next;
         if (!setupCanEditCredentials(next)) { apiKey = ''; editingCredentials = false; }
-        if (setupCanEditCredentials(next)) {
+        if (setupIsActive(next)) {
           const tunnel = await getWebModelTunnel();
           if (disposed || epoch !== generation || saving) return;
           // 只回填 ID 与“是否保存密钥”的事实，不读取密钥内容或遮罩预览。
@@ -115,13 +115,26 @@
   }
   const step = $derived(status?.stage || 'login');
   const terminal = $derived(status && !setupIsActive(status) && step !== 'busy');
-  const consent = $derived(setupNeedsConnectorConsent(status));
-  const retryConnector = $derived(consent && status?.reason !== 'confirmation_required');
-  const canRetryTunnel = $derived(setupCanRetryTunnel(status));
   const canRetryChannel = $derived(step === 'connecting' && !channelReady && !['', 'client_installing', 'runtime_not_ready'].includes(channelCode));
-  const showCredentials = $derived(step === 'credentials' || editingCredentials);
-  const showTunnelGuide = $derived(step === 'tunnel' && status?.reason === 'workspace_required');
-  const keyNeedsPreparation = $derived(step === 'credentials' && ['project_required', 'key_permissions_required', 'runtime_key_required', 'login_required'].includes(status?.reason || ''));
+  // 只有密钥表单已准备（或用户明确要手动填写）时才展示安全输入框；
+  // Agent 交还用户处理表单时还没有密钥可粘贴，不能提示“等待安全输入”。
+  const needsHuman = $derived(['agent_handoff', 'user_takeover'].includes(status?.reason || ''));
+  const showCredentials = $derived((step === 'credentials' && ['key_generation_required', 'runtime_key_required'].includes(status?.reason || '')) || editingCredentials);
+  // 进度只来自 daemon 已保存的事实，不来自 Agent 的描述。
+  const steps = $derived.by(() => {
+    const order = ['login', 'tunnel', 'credentials', 'connecting', 'connector'] as const;
+    const done: Record<string, boolean> = {
+      // 已保存 Tunnel 或密钥说明已经越过登录；阶段标签本身只在检查点处才更新。
+      login: (step !== 'login' && step !== 'cancelled') || Boolean(savedTunnelId) || hasSavedKey,
+      tunnel: Boolean(savedTunnelId),
+      credentials: hasSavedKey,
+      connecting: channelReady,
+      connector: step === 'complete',
+    };
+    const current = order.find(name => !done[name]);
+    return order.map(name => ({ name, state: done[name] ? 'done' : name === current ? 'current' : 'pending' }));
+  });
+  const keyNeedsPreparation = $derived(step === 'credentials' && status?.reason === 'runtime_key_required');
   const credentialInput = $derived(setupCredentialInput(step, tunnelId, savedTunnelId, hasSavedKey));
   const keyRequired = $derived(credentialInput.required);
 </script>
@@ -130,16 +143,14 @@
   <section class="setup-panel" aria-label={i18n.t('webModel.setup.title')} data-web-model-setup={step} aria-busy={busy || saving}>
     <div class="setup-heading">
       <strong><Icon name={step === 'complete' ? 'check' : 'globe'} size={14} />{i18n.t('webModel.setup.title')}</strong>
-      <span>{i18n.t(busy ? 'webModel.setup.working' : `webModel.setup.stage.${step}`)}</span>
+      <span>{i18n.t(busy ? 'webModel.setup.working' : ['agent_failed', 'agent_write_pending'].includes(status.reason) ? 'webModel.setup.stage.failed' : needsHuman ? 'webModel.setup.stage.needsYou' : `webModel.setup.stage.${step}`)}</span>
     </div>
-    <p aria-live="polite">{i18n.t(setupHintKey(status, busy, canRetryChannel))}</p>
-    {#if showTunnelGuide}
-      <dl class="tunnel-guide" aria-label={i18n.t('webModel.setup.tunnelGuide.title')}>
-        {#each ['name', 'description', 'organization', 'workspace'] as field}
-          <div><dt>{i18n.t(`webModel.setup.tunnelGuide.${field}`)}</dt><dd>{i18n.t(`webModel.setup.tunnelGuide.${field}Value`)}</dd></div>
-        {/each}
-      </dl>
-    {/if}
+    <ol class="setup-steps" aria-label={i18n.t('webModel.setup.stepsLabel')}>
+      {#each steps as item}
+        <li data-step={item.name} data-state={item.state} aria-current={item.state === 'current' ? 'step' : undefined}>{i18n.t(`webModel.setup.step.${item.name}`)}</li>
+      {/each}
+    </ol>
+    <p aria-live="polite">{!busy && status.detail ? status.detail : i18n.t(setupHintKey(status, busy, canRetryChannel))}</p>
     {#if !busy && canRetryChannel && channelDetail}<p class="reason" role="status">{channelDetail}</p>{/if}
     {#if error && !showCredentials}<p class="credentials-error" role="alert">{error}</p>{/if}
     {#if keyNeedsPreparation}<button class="btn btn--sm btn--secondary" disabled={busy || saving} onclick={() => void onaction('continue')}>{i18n.t('webModel.setup.prepareKey')}</button>{/if}
@@ -152,6 +163,7 @@
         {#if error}<p class="credentials-error" role="alert">{error}</p>{/if}
         <div class="credential-actions">
           <button class="btn btn--sm btn--primary" type="submit" disabled={busy || saving || !tunnelId.trim() || (keyRequired && !apiKey.trim())}>{i18n.t(saving ? 'webModel.setup.saving' : 'webModel.setup.saveContinue')}</button>
+          {#if step === 'credentials' && status?.reason === 'key_generation_required'}<button class="btn btn--sm btn--secondary" type="button" disabled={busy || saving} onclick={() => void onaction('continue')}>{i18n.t('webModel.setup.prepareKey')}</button>{/if}
           {#if step !== 'credentials'}<button class="btn btn--sm btn--secondary" type="button" disabled={saving} onclick={() => { editingCredentials = false; apiKey = ''; error = ''; tunnelId = savedTunnelId; }}>{i18n.t('webModel.setup.cancelEdit')}</button>{/if}
         </div>
       </form>
@@ -163,8 +175,8 @@
           <button class="btn btn--sm btn--secondary" disabled={busy || saving} onclick={() => { editingCredentials = true; error = ''; }}>{i18n.t(step === 'tunnel' ? 'webModel.setup.manualTunnel' : 'webModel.setup.editCredentials')}</button>
         {/if}
         {#if !showCredentials}
-          <button class="btn btn--sm btn--primary" disabled={busy || saving || (step === 'connecting' && !channelReady && !canRetryChannel)} onclick={() => void onaction(consent ? 'confirm_connector' : canRetryTunnel ? 'retry_tunnel' : 'continue')}>
-            {busy ? i18n.t('webModel.setup.working') : i18n.t(retryConnector ? 'webModel.setup.retryConnector' : consent ? 'webModel.setup.allowConnector' : canRetryTunnel ? 'webModel.setup.retryTunnel' : canRetryChannel ? 'webModel.setup.retryConnection' : 'webModel.setup.continue')}
+          <button class="btn btn--sm btn--primary" disabled={busy || saving || (step === 'connecting' && !channelReady && !canRetryChannel)} onclick={() => void onaction('continue')}>
+            {busy ? i18n.t('webModel.setup.working') : i18n.t(canRetryChannel ? 'webModel.setup.retryConnection' : 'webModel.setup.continue')}
           </button>
         {/if}
         <button class="btn btn--sm btn--secondary" disabled={busy || saving} onclick={() => { apiKey = ''; void onaction('cancel'); }}>{i18n.t('webModel.setup.cancel')}</button>
@@ -182,15 +194,14 @@
   .setup-heading > span { color: var(--foreground-muted); }
   p { margin: 8px 0; line-height: 1.6; overflow-wrap: anywhere; }
   .reason, .secure-hint { color: var(--foreground-muted); }
-  .tunnel-guide { margin: 10px 0; display: grid; gap: 8px; }
-  .tunnel-guide > div { display: grid; grid-template-columns: minmax(84px, 1fr) minmax(0, 3fr); gap: 12px; }
-  .tunnel-guide dt { color: var(--foreground-muted); }
-  .tunnel-guide dd { margin: 0; overflow-wrap: anywhere; line-height: 1.5; }
   .credentials-card { display: grid; gap: 12px; border: var(--magi-hairline) solid var(--border); border-radius: 8px; padding: 12px; margin: 12px 0; min-width: 0; }
   label { display: grid; gap: 6px; min-width: 0; }
   input { min-width: 0; width: 100%; box-sizing: border-box; }
   .secure-hint { line-height: 1.5; overflow-wrap: anywhere; }
   .credentials-error { margin: 0; color: var(--error); }
+  .setup-steps { display: flex; flex-wrap: wrap; gap: 6px 10px; list-style: none; margin: 8px 0 0; padding: 0; color: var(--foreground-muted); }
+  .setup-steps li[data-state='done']::before { content: '✓ '; color: var(--success, currentColor); }
+  .setup-steps li[data-state='current'] { color: var(--foreground); font-weight: 600; }
   .setup-actions { margin-top: 12px; }
   .setup-actions .btn, .credential-actions .btn { white-space: normal; }
   @media (max-width: 640px) { .setup-panel { padding: 12px; } }

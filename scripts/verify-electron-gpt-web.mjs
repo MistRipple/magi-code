@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ const repositoryRoot = new URL("..", import.meta.url).pathname.replace(/\/$/u, "
 const appExecutable = process.env.MAGI_GPT_WEB_APP_EXECUTABLE?.trim()
   || join(repositoryRoot, "target/electron-dist/mac-arm64/Magi.app/Contents/MacOS/Magi");
 const sourceUserData = process.env.MAGI_GPT_WEB_SOURCE_USERDATA?.trim() || join(homedir(), ".magi", "desktop");
+const sourceStateRoot = process.env.MAGI_GPT_WEB_SOURCE_STATE_ROOT?.trim() || join(homedir(), ".magi");
 const cdpPort = Number.parseInt(process.env.MAGI_GPT_WEB_CDP_PORT || "9311", 10);
 const daemonPort = Number.parseInt(process.env.MAGI_GPT_WEB_DAEMON_PORT || "38941", 10);
 const screenshotDir = process.env.MAGI_GPT_WEB_SCREENSHOTS?.trim() || "";
@@ -37,6 +38,7 @@ let lastProbe = "";
 
 // MAGI_GPT_WEB_FRESH=1：不复制登录分区，验证全新环境下 surface 能挂载且探测给出“需要登录”。
 const questionFixture = process.env.MAGI_GPT_WEB_QUESTION_FIXTURE === "1";
+const toolRoundTrip = process.env.MAGI_GPT_WEB_TOOL_E2E === "1";
 const fresh = !questionFixture && process.env.MAGI_GPT_WEB_FRESH === "1";
 if (!fresh && !questionFixture && !existsSync(join(sourceUserData, "Partitions", "magi-web-model"))) {
   process.stdout.write("跳过：未找到已登录的 GPT Web 分区\n");
@@ -62,6 +64,21 @@ if (!fresh && !questionFixture) {
   await cp(join(sourceUserData, "Partitions", "magi-web-model"), join(stateRoot, "desktop", "Partitions", "magi-web-model"), { recursive: true });
   await cp(join(sourceUserData, "Local State"), join(stateRoot, "desktop", "Local State")).catch(() => {});
   await cp(join(sourceUserData, "browser-partitions.json"), join(stateRoot, "desktop", "browser-partitions.json")).catch(() => {});
+}
+if (toolRoundTrip) {
+  // 可选真实工具往返：只把已保存的 Tunnel 配置投影到一次性 state root，
+  // 私钥仍以权限 0600 的独立文件存在；不复制其他设置、模型密钥或 MCP token。
+  const savedSettings = JSON.parse(await readFile(join(sourceStateRoot, "settings.json"), "utf8"));
+  const savedTunnel = savedSettings.webModelTunnel;
+  const credentialSource = join(sourceStateRoot, "web-model", "tunnel-api-key");
+  if (!savedTunnel?.tunnelId || !existsSync(credentialSource)) {
+    throw new Error("真实 GPT Web 工具验收需要已有 Tunnel ID 和本地安全密钥文件");
+  }
+  await writeFile(join(stateRoot, "settings.json"), JSON.stringify({ webModelTunnel: savedTunnel }), { mode: 0o600 });
+  await mkdir(join(stateRoot, "web-model"), { recursive: true, mode: 0o700 });
+  const credentialCopy = join(stateRoot, "web-model", "tunnel-api-key");
+  await copyFile(credentialSource, credentialCopy);
+  await chmod(credentialCopy, 0o600);
 }
 
 const app = launchApp({
@@ -138,12 +155,13 @@ try {
   const registered = await tools.post("/api/workspaces/register", { path: workspaceRoot });
   const workspaceId = JSON.parse(registered.body).workspaceId;
   await page.call("Page.reload", { ignoreCache: true });
-  await waitFor(() => tools.exists(`[data-workspace-id="${workspaceId}"]`), "工作区进入侧栏", 30_000);
-  await page.evaluate(`(() => {
+  await waitFor(() => page.evaluate(`(() => {
     const row = document.querySelector('[data-workspace-id="${workspaceId}"]');
+    if (!row || !row.getClientRects().length) return false;
     row.click();
     row.closest('.workspace-row')?.querySelector('button.row-action[aria-label]')?.click();
-  })()`);
+    return true;
+  })()`), "工作区进入侧栏", 30_000, 250);
   await waitFor(() => tools.exists('[data-testid="input-textarea"]'), "工作区会话输入区", 30_000);
 
   // 与用户一致的入口：设置 → GPT Web（独立分类）→“连接/检查可用性”（投影应用级会话、挂载 guest、探测）
@@ -155,6 +173,7 @@ try {
     await sleep(600);
     return page.evaluate(`Boolean(document.getElementById('web-model-title'))`);
   }, "设置页出现独立的 GPT Web 分类", 30_000, 500);
+  await waitFor(() => tools.exists('[data-web-model-connect]'), "GPT Web 设置中的连接按钮挂载", 15_000, 250);
   await page.evaluate(`document.querySelector('[data-web-model-connect]').click()`);
   await waitFor(() => tools.exists("webview"), "GPT Web webview 挂载", 45_000);
   check("连接 GPT Web 后右栏挂载原生 webview", true);
@@ -198,12 +217,20 @@ try {
   // 输入区模型选择器：登录探测通过后应出现固定的 GPT Web 入口
   await tools.click('.ia-model-btn');
   await sleep(800);
+  if (!await page.evaluate(`[...document.querySelectorAll('.ia-model-wrap *')].some((el) => el.children.length === 0 && el.textContent.trim() === 'GPT Web')`)) {
+    await tools.click('.ia-summary-model');
+    await sleep(400);
+  }
   await waitFor(() => page.evaluate(`[...document.querySelectorAll('.ia-model-wrap *')].some((el) => el.children.length === 0 && el.textContent.trim() === 'GPT Web')`), "选择器出现 GPT Web 入口", 15_000);
   check("探测通过后选择器出现固定的 GPT Web 入口", true);
   await page.evaluate(`(() => { const label = [...document.querySelectorAll('.ia-model-wrap *')].find((el) => el.children.length === 0 && el.textContent.trim() === 'GPT Web'); (label.closest('button, [role=option], [role=menuitem], li') || label).click(); })()`);
   await sleep(1200);
   // 对话方式：临时对话（不在 ChatGPT 侧留下历史）
   await tools.click(".ia-model-btn");
+  await sleep(300);
+  if (!await tools.exists(`[data-web-model-mode-option="${conversationMode}"]`)) {
+    await tools.click('.ia-summary-model');
+  }
   await waitFor(() => tools.exists(`[data-web-model-mode-option="${conversationMode}"]`), "对话方式选择出现", 10_000);
   await tools.click(`[data-web-model-mode-option="${conversationMode}"]`);
   await sleep(500);
@@ -211,6 +238,23 @@ try {
   await page.evaluate(`document.querySelector('.ia-reasoning-title, .ia-model-wrap')?.blur?.()`);
   await page.evaluate(`document.querySelector('.ia-popover-backdrop')?.click()`);
   await sleep(400);
+
+  if (toolRoundTrip) {
+    const tunnel = JSON.parse((await tools.api('/api/browser/web-models/tunnel')).body);
+    await waitFor(async () => {
+      const status = JSON.parse((await tools.api('/api/browser/web-models/tunnel')).body);
+      return status.ready ? status : null;
+    }, "隔离客户端复用本机 Tunnel 后工具通道就绪", 150_000, 2_000);
+    check("真实 OpenAI Tunnel 工具通道已就绪", tunnel.ready || JSON.parse((await tools.api('/api/browser/web-models/tunnel')).body).ready, JSON.stringify({ ready: tunnel.ready, code: tunnel.code }));
+    const toolWorkspaceFile = join(workspaceRoot, "magi-live-tool-e2e.txt");
+    const toolToken = `MAGI_REAL_TOOL_E2E_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    await writeFile(toolWorkspaceFile, `${toolToken}\n`);
+    await sendComposerMessage("请使用 Magi 项目工具读取 magi-live-tool-e2e.txt 的第一行，只返回这一行原文。");
+    await waitFor(async () => (await page.evaluate("document.body.innerText")).includes(toolToken), "真实 MCP 工具读取结果回到 Magi 会话", 180_000, 1_000);
+    check("真实 ChatGPT 通过 OpenAI Tunnel 调用 Magi 文件工具并读回唯一测试值", true);
+    await waitFor(async () => !(await tools.exists('[data-testid="input-stop-button"]')), "MCP 工具回合成功结束", 30_000);
+    await snap("tool-roundtrip");
+  }
 
   if (questionFixture) {
   await sendComposerMessage('问我晚上想吃什么，从先选主食，再选吃法');

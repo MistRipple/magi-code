@@ -1090,14 +1090,14 @@ pub(crate) fn validate_plugin_command_selection(
                 "GPT Web 配置只能从本机 Magi Desktop 发起".into(),
             ));
         }
-        if !state.web_model_plugin_active() {
+        if !state.web_model_setup_available() {
             return Err(ApiError::Forbidden(
-                "GPT Web 插件未安装或未激活，请先到设置 → 插件安装并激活".into(),
+                "GPT Web 插件未安装、未激活或不提供配置命令，请先到设置 → 插件安装并激活".into(),
             ));
         }
         if !matches!(
             request.trimmed_text().as_deref().unwrap_or(""),
-            "" | "start" | "continue" | "retry_tunnel" | "confirm_connector" | "cancel"
+            "" | "start" | "continue" | "cancel"
         ) {
             return Err(ApiError::InvalidInput(
                 "配置命令只接受开始、继续、重试创建、连接器确认或取消；密钥请使用配置卡片的安全输入框".into(),

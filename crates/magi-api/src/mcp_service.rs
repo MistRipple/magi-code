@@ -1257,64 +1257,6 @@ fn slots_provider(
     Arc::new(move || harness.bindings())
 }
 
-/// GPT Web 连接器当前从 Magi MCP 目录可见的工具数。
-///
-/// ChatGPT 的已安装连接器行不稳定地展示工具数；此处复用槽位端点的身份和工具目录，
-/// 返回 Magi 实际通过 `tools/list` 暴露的数量。
-pub(crate) fn web_slot_tool_count(state: &ApiState) -> Option<u64> {
-    u64::try_from(web_slot_catalog(state)?.len()).ok()
-}
-
-/// GPT Web 连接器目录的指纹：工具名、描述与输入 schema 的 SHA-256（按名称排序）。
-///
-/// ChatGPT 会缓存创建 / 上次刷新时的工具列表，Magi 目录变化后不会自动同步；
-/// 记下上次推给 ChatGPT 时的指纹，就能知道它手里的列表是不是已经过期。
-pub(crate) fn web_slot_tool_digest(state: &ApiState) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let mut tools = web_slot_catalog(state)?;
-    tools.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut hasher = Sha256::new();
-    for tool in tools {
-        hasher.update(tool.name.as_bytes());
-        hasher.update([0]);
-        hasher.update(tool.description.as_bytes());
-        hasher.update([0]);
-        hasher.update(tool.input_schema.to_string().as_bytes());
-        hasher.update([1]);
-    }
-    Some(
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
-}
-
-fn web_slot_catalog(state: &ApiState) -> Option<Vec<magi_mcp_server::ToolDescriptor>> {
-    if !state.web_model_plugin_active() {
-        return None;
-    }
-    let harness = state.web_model.clone();
-    let auth = crate::web_slot_mcp::slot_principal_provider(
-        slots_provider(state),
-        Arc::new(move || {
-            crate::web_slot_mcp::slot_profile_from_setting(
-                harness
-                    .configured()
-                    .and_then(|config| config.tool_profile)
-                    .as_deref(),
-            )
-        }),
-    );
-    let magi_mcp_server::local_socket::SocketAuth::Principal(provider) = auth else {
-        return None;
-    };
-    let principal = provider()?;
-    let server = build_slot_mcp_server(state.clone());
-    Some(server.catalog_definition_for(&principal))
-}
-
 fn assemble_server(
     state: ApiState,
     backend: Arc<ApiToolBackend>,
@@ -1331,7 +1273,14 @@ fn assemble_server(
         .with_attribution(Arc::new(crate::web_slot_mcp::SlotAttribution {
             slots: slots_provider(&state),
         }))
-        .with_audit(Arc::new(EventBusAudit { state })),
+        .with_audit(Arc::new(EventBusAudit {
+            state: state.clone(),
+        }))
+        .with_catalog_observer(Arc::new(move |principal| {
+            if principal.token_id == crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID {
+                state.web_model.record_slot_catalog_served();
+            }
+        })),
     )
 }
 
@@ -2589,18 +2538,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_tool_digest_is_stable_for_the_same_catalog() {
+    async fn slot_tools_list_is_a_subset_of_the_token_catalog() {
+        // GPT Web 槽位按槽位工具档过滤目录，比令牌的完整目录少。
         let f = fixture(Duration::from_secs(5));
-        let first = web_slot_tool_digest(&f.state).expect("catalog digest");
-        assert_eq!(Some(first.clone()), web_slot_tool_digest(&f.state));
-        assert_eq!(first.len(), 64);
-    }
-
-    #[tokio::test]
-    async fn web_slot_tool_count_matches_the_slots_own_tools_list() {
-        // 连接器状态的工具数来自 GPT Web 槽位自己的目录（按槽位工具档过滤），
-        // 而不是令牌的完整目录；两者都必须与各自真实的 tools/list 一致。
-        let f = fixture(Duration::from_secs(5));
+        assert!(!f.state.web_model.slot_catalog_served_since(1));
         let slot_principal = magi_mcp_server::ClientPrincipal {
             token_id: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
             token_prefix: crate::web_slot_mcp::WEB_SLOT_PRINCIPAL_ID.to_string(),
@@ -2623,12 +2564,11 @@ mod tests {
             )
             .await
             .expect("slot tools/list responds");
-        let slot_count = response["result"]["tools"].as_array().unwrap().len();
-        assert_eq!(
-            web_slot_tool_count(&f.state),
-            u64::try_from(slot_count).ok(),
-            "connector status count must come from the slot's own tools/list catalog"
+        assert!(
+            f.state.web_model.slot_catalog_served_since(1),
+            "槽位读取目录必须留下 daemon 侧事实"
         );
+        let slot_count = response["result"]["tools"].as_array().unwrap().len();
         let token_names = tool_names(&f).await;
         assert!(
             token_names.len() > slot_count,

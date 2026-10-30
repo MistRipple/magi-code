@@ -50,6 +50,7 @@ mod web_model_channel;
 mod web_model_driver;
 pub mod web_model_ops;
 pub mod web_model_setup;
+mod web_model_setup_agent;
 mod web_question;
 pub mod web_slot_mcp;
 

@@ -74,6 +74,8 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 
 ## 架构与维护文档
 
+- [UX/UI 设计与开发规范](ux-ui-guidelines.md)：后续界面工作的统一基线，涵盖自适应布局、控件分工、文案与多语言/RTL、移动触摸、关键动画、代理展示、组件示例及验收清单；规范要求不代表全项目已经完成合规改造。
+
 - [模型推理能力与选择交互](model-reasoning-capabilities.md)：daemon 能力解析、服务商声明、子代理按次强度与恢复快照、实际传输参数和模型选择器验收。
 
 - [无项目会话与最近对话](personal-session-architecture.md)：个人归属、独立执行目录、项目能力边界、文件生命周期和历史兼容。
@@ -86,6 +88,7 @@ Electron 45 桌面宿主要求 macOS 13 及以上；macOS 12 停留在 Electron 
 - [知识图谱设计与维护](./knowledge-graph-design.md)：图谱事实源、候选审阅、检索预算、索引维护与定向验证。
 - [用户自定义子代理角色](./custom-worker-role-design.md)：角色定义、持久化、注册表热更新、导入导出与调度合同。
 - [Magi GPT Web 最终开发文档](./web-model-browser-development.md)：**当前唯一开发基线**；单宿主、单槽位、临时 / 已保存对话、单向 Web → 本地、工具能力通过 Magi MCP 服务接入、状态所有权和验收口径。
+- [GPT Web AI 配置改造目标与验收](./web-model-setup-agent.md)：配置 Agent 的边界、检查点闸门、人工交接与代码地图；验收入口见[GPT Web 配置验收](./gpt-web-setup-validation.md)。
 - [Magi MCP 服务设计](./magi-mcp-server-design.md)：Magi 对外提供的标准 MCP 服务端，任何 MCP 客户端可在已注册工作区使用文件、搜索、只读 git、变更账本等工具；令牌与授权方式、审批、路径限制、审计，本机 stdio / 回环 HTTP 与 Cloudflare Quick Tunnel 网络模式（**均已实现**）；动态网关目录含内置工具、下游 MCP 与 Skill handler；§12 记录 GPT Web 槽位端点的最终接线（无令牌、槽位表派生身份与归属、OpenAI Tunnel 通道、代码地图）。
 
 - [Turn、事件事实与对话执行架构](./conversation-response-core-architecture-redesign.md)：统一接纳、任务调度、终态、恢复和权限边界。

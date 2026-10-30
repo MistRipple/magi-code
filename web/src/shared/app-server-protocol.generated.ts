@@ -221,6 +221,7 @@ export interface WebModelSetupStatus {
   sessionId: string;
   stage: string;
   reason: string;
+  detail?: string;
   updatedAt: number;
 }
 

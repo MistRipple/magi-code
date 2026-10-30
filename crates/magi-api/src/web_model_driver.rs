@@ -16,9 +16,9 @@ use magi_browser_authority::{
 };
 use magi_core::{BrowserLeaseId, BrowserSessionId, BrowserTabId, ExecutionOwnership, UtcMillis};
 use magi_web_model::{
-    BrowserWebModelBridgeClient, ConnectorConfigOutcome, ConnectorStatus, DriverFuture, LoginState,
-    SavedConversationEntry, SavedConversationSnapshot, SubmitOutcome, TurnState, WebMessage,
-    WebModelClientConfig, WebModelError, WebModelErrorCode, WebModelIdentity, WebModelPageDriver,
+    BrowserWebModelBridgeClient, DriverFuture, LoginState, SavedConversationEntry,
+    SavedConversationSnapshot, SubmitOutcome, TurnState, WebMessage, WebModelClientConfig,
+    WebModelError, WebModelErrorCode, WebModelIdentity, WebModelPageDriver,
     WebModelRuntimeRegistry, WebSlotOwner, WebSlotTable, WriteOutcome, new_web_slot_table,
 };
 
@@ -27,6 +27,11 @@ const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 // 「停止并释放」之后页面被销毁，右栏要重新挂载 webview 才能再注册 Surface：这段窗口里的
 // `browser_surface_*` 交接错误是暂时的，要等得够久（约 9–12 秒），不能几秒就当作发送失败。
 const READ_STATE_RETRIES: usize = 30;
+/// 配置期间页面的桌面布局尺寸：足以显示组织切换、导航和完整表单。
+/// 所在表单/对话框出现这些词时，配置 Agent 不得点击其提交按钮（密钥只能由用户生成）。
+const SETUP_FORBIDDEN_SUBMIT_CONTEXT: [&str; 4] = ["secret key", "api key", "密钥", "机密密钥"];
+const SETUP_DESKTOP_WIDTH: u32 = 1100;
+const SETUP_DESKTOP_HEIGHT: u32 = 860;
 const READ_STATE_RETRY_DELAY: Duration = Duration::from_millis(300);
 const NAVIGATE_RETRIES: usize = 30;
 const NAVIGATE_RETRY_DELAY: Duration = Duration::from_millis(400);
@@ -35,8 +40,11 @@ const PAGE_READY_POLL: Duration = Duration::from_millis(250);
 const SAVED_LIST_ATTEMPTS: usize = 8;
 const SAVED_LIST_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// 连接器页面（设置里的「插件」页、`/plugins` 目录页）加载与脚本就绪的等待。
-const CONNECTOR_PAGE_ATTEMPTS: usize = 24;
-const CONNECTOR_PAGE_DELAY: Duration = Duration::from_millis(700);
+/// 配置运行期间控制租约的有效期；剩余不足 `SETUP_CONTROL_RENEW_MARGIN` 时重新取得。
+const SETUP_CONTROL_TTL_MS: u64 = 300_000;
+const SETUP_CONTROL_RENEW_MARGIN_MS: u64 = 60_000;
+const SETUP_COMMAND_ATTEMPTS: usize = 24;
+const SETUP_COMMAND_DELAY: Duration = Duration::from_millis(700);
 
 static WEB_SETUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -56,6 +64,30 @@ pub struct HostWebModelPageDriver {
     authority: Arc<Mutex<BrowserAuthority>>,
     /// 本轮图片落盘的暂存目录：页面文件输入只认磁盘路径，图片在 Magi 里只有 base64。
     upload_dir: PathBuf,
+    /// 配置运行期间保持的 Agent 控制租约；运行结束（交接、完成、取消、失败）时释放。
+    setup_control: Mutex<Option<RetainedSetupControl>>,
+}
+
+/// 保留的控制租约是否可以继续使用：仍是该 Surface 上有效的那一张、没有换 Surface，且离过期还有余量。
+/// 被用户接管撤销（权威里不再有这张租约）、过期或换了 Surface 都必须重新取得。
+fn setup_control_reusable(
+    held: &RetainedSetupControl,
+    active_lease: Option<&BrowserLeaseId>,
+    surface_id: &str,
+    now: UtcMillis,
+) -> bool {
+    held.surface_id == surface_id
+        && held.expires_at.0.saturating_sub(now.0) > SETUP_CONTROL_RENEW_MARGIN_MS
+        && active_lease == Some(&held.lease_id)
+}
+
+/// 配置 Agent 在一次运行内持有的控制：跨命令保留，用户在两条命令之间碰页面才会被 Main 识别为接管。
+#[derive(Clone)]
+struct RetainedSetupControl {
+    lease_id: BrowserLeaseId,
+    fence: u64,
+    surface_id: String,
+    expires_at: UtcMillis,
 }
 
 impl HostWebModelPageDriver {
@@ -70,6 +102,7 @@ impl HostWebModelPageDriver {
             host_client,
             authority,
             upload_dir,
+            setup_control: Mutex::new(None),
         }
     }
 
@@ -250,7 +283,28 @@ impl HostWebModelPageDriver {
         if self.accept_binding(&binding)? {
             return Ok(binding);
         }
-        // Authority 记录的导航代次与 Host 页面不一致（常见于 daemon 重启而 Desktop 页面还活着）：
+        // Authority 记录的导航代次与 Host 页面不一致（常见于 daemon 重启而 Desktop 页面还活着）。
+        // SPA 路由交接期间 Host 可能暂时返回上一代 binding；先短暂等待并重新取事实，
+        // 避免把同一个旧快照交回 AI，导致它重复点击已经失效的节点。
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let refreshed = self
+                .client()?
+                .request(BrowserHostCommand::EnsureSurface {
+                    tab_id: tab_id.clone(),
+                })
+                .await
+                .map_err(host_error)?;
+            if let BrowserHostCommandOutcome::Succeeded(result) = refreshed.response.outcome {
+                if let BrowserHostCommandResult::SurfaceBinding(binding) = *result {
+                    if self.accept_binding(&binding)? {
+                        return Ok(binding);
+                    }
+                }
+            }
+        }
+        // If the page is still on an older epoch, restore it once and take a
+        // final binding. This path is read-only and never replays a write.
         // 用当前代次重新登记一次（RestorePage 对存活页面只重新登记，不导航），再取一次绑定。
         let url = {
             let authority = self
@@ -492,6 +546,98 @@ impl HostWebModelPageDriver {
         }
     }
 
+    /// Navigation replaces the DOM and node map asynchronously. Only observation is retried;
+    /// the AI always receives fresh references and no write is replayed here.
+    async fn setup_snapshot(&self) -> Result<serde_json::Value, WebModelError> {
+        let mut last = unavailable("browser_surface_stale");
+        for attempt in 0..=READ_STATE_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(READ_STATE_RETRY_DELAY).await;
+            }
+            match self.setup_snapshot_once().await {
+                Ok(value) => return Ok(value),
+                Err(error) if setup_observation_is_transient(&error.message) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    }
+
+    async fn setup_snapshot_once(&self) -> Result<serde_json::Value, WebModelError> {
+        let tab_id = self.home_tab()?;
+        self.refresh_primary_binding(&tab_id).await?;
+        let (navigation_revision, snapshot_revision) = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_| unavailable("浏览器权威状态不可用"))?;
+            let (navigation, snapshot) = authority
+                .record_snapshot(&tab_id, UtcMillis::now())
+                .map_err(|error| unavailable(&error.to_string()))?;
+            (navigation, snapshot)
+        };
+        let reply = self
+            .client()?
+            .request(BrowserHostCommand::Snapshot {
+                tab_id: tab_id.clone(),
+                navigation_revision,
+                snapshot_revision,
+                limits: Default::default(),
+                selector: None,
+            })
+            .await
+            .map_err(host_error)?;
+        match reply.response.outcome {
+            BrowserHostCommandOutcome::Succeeded(result) => match *result {
+                BrowserHostCommandResult::Snapshot(snapshot) if snapshot.tab_id == tab_id => {
+                    self.authority
+                        .lock()
+                        .map_err(|_| unavailable("浏览器权威状态不可用"))?
+                        .validate_snapshot_result(
+                            &tab_id,
+                            snapshot.navigation_revision,
+                            snapshot.snapshot_revision,
+                        )
+                        .map_err(|error| unavailable(&error.to_string()))?;
+                    let mut value = crate::browser_tool_runtime::browser_tool_snapshot_value(
+                        &snapshot, &tab_id,
+                    );
+                    let body = self
+                        .json_read_command(
+                            BrowserHostCommand::Devtools {
+                                tab_id: tab_id.clone(),
+                                control: None,
+                                operation: "read".into(),
+                                arguments: serde_json::json!({"max_chars":16000}),
+                            },
+                            WebModelErrorCode::WebDesktopUnavailable,
+                        )
+                        .await?;
+                    self.authority
+                        .lock()
+                        .map_err(|_| unavailable("浏览器权威状态不可用"))?
+                        .validate_snapshot_result(
+                            &tab_id,
+                            snapshot.navigation_revision,
+                            snapshot.snapshot_revision,
+                        )
+                        .map_err(|error| unavailable(&error.to_string()))?;
+                    // The read result carries the actual document URL. Authority
+                    // page_updated can lag behind SPA navigation even after it
+                    // accepts the new binding; never tell the AI it is still on
+                    // the previous page using that cached URL.
+                    value["url"] = body["url"].clone();
+                    value["page_text"] = body;
+                    Ok(value)
+                }
+                _ => Err(invalid("配置页面快照无效")),
+            },
+            BrowserHostCommandOutcome::Failed(error)
+            | BrowserHostCommandOutcome::Indeterminate(error) => Err(unavailable(&error.message)),
+            BrowserHostCommandOutcome::Cancelled => Err(WebModelError::cancelled()),
+        }
+    }
+
     /// 应用级配置也沿 Authority lease → Main 控制投影 → Worker 原生输入链执行。
     /// 每个窄命令结算后释放控制，等待登录、密钥或确认时不会残留 Agent 光标。
     async fn native_setup_command(
@@ -499,9 +645,9 @@ impl HostWebModelPageDriver {
         build: impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
     ) -> Result<serde_json::Value, WebModelError> {
         let mut last = unavailable("browser_surface_stale");
-        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
+        for attempt in 0..SETUP_COMMAND_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
+                tokio::time::sleep(SETUP_COMMAND_DELAY).await;
             }
             let (result, retry_safe) = self.native_setup_attempt(&build).await?;
             if !retry_safe {
@@ -512,25 +658,48 @@ impl HostWebModelPageDriver {
         Err(last)
     }
 
-    async fn native_setup_attempt(
+    /// 取得（或沿用）本次配置运行的控制租约。返回 `Err((错误, 是否可安全重试))`：
+    /// 用户正在控制页面时报 `browser_user_control_held`，不可重试。
+    async fn ensure_setup_control(
         &self,
-        build: &impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
-    ) -> Result<(Result<serde_json::Value, WebModelError>, bool), WebModelError> {
-        let tab_id = self.home_tab()?;
-        // 取得控制权之前的 Surface 交接没有任何输入副作用，也必须进入有界重试。
-        // 原先这里的 ? 直接退出，导致刚导航到插件列表时偶发要求用户手动重试。
-        let binding = match self.refresh_primary_binding(&tab_id).await {
-            Ok(binding) => binding,
-            Err(error) if is_surface_handoff(&error.message) => return Ok((Err(error), true)),
-            Err(error) => return Err(error),
-        };
-        let client = self.client()?;
+        client: &BrowserHostClient,
+        tab_id: &BrowserTabId,
+        binding: &magi_browser_authority::BrowserSurfaceBinding,
+    ) -> Result<(BrowserLeaseId, u64), (WebModelError, bool)> {
         let now = UtcMillis::now();
+        let stale = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_| (unavailable("浏览器权威状态不可用"), false))?;
+            if authority.user_control_held(tab_id) {
+                drop(authority);
+                self.forget_setup_control();
+                return Err((unavailable("browser_user_control_held"), false));
+            }
+            let retained = self.setup_control.lock().ok().and_then(|held| held.clone());
+            let active = authority
+                .active_lease_for_surface(tab_id, &binding.surface_id)
+                .map(|lease| lease.lease_id.clone());
+            if let Some(held) = retained.as_ref()
+                && setup_control_reusable(held, active.as_ref(), &binding.surface_id, now)
+            {
+                return Ok((held.lease_id.clone(), held.fence));
+            }
+            retained
+        };
+        if let Some(held) = stale {
+            // 过期、换了 Surface 或租约已被撤销：先清掉旧的再取新的。
+            if let Ok(mut authority) = self.authority.lock() {
+                let _ = authority.release_lease(&held.lease_id, now);
+            }
+            self.forget_setup_control();
+        }
         let lease = {
             let mut authority = self
                 .authority
                 .lock()
-                .map_err(|_| unavailable("浏览器权威状态不可用"))?;
+                .map_err(|_| (unavailable("浏览器权威状态不可用"), false))?;
             authority
                 .acquire_lease(AcquireBrowserLease {
                     lease_id: BrowserLeaseId::new(format!(
@@ -551,40 +720,115 @@ impl HostWebModelPageDriver {
                     }),
                     goal_binding: None,
                     acquired_at: now,
-                    expires_at: UtcMillis(now.0.saturating_add(120_000)),
+                    expires_at: UtcMillis(now.0.saturating_add(SETUP_CONTROL_TTL_MS)),
                 })
-                .map_err(|error| unavailable(&error.to_string()))?
+                .map_err(|error| match error {
+                    magi_browser_authority::BrowserAuthorityError::UserControlHeld(_) => {
+                        (unavailable("browser_user_control_held"), false)
+                    }
+                    other => (unavailable(&other.to_string()), false),
+                })?
         };
-        let result = async {
-            let reply = client
+        let reply = client
+            .request(BrowserHostCommand::UpdateControl {
+                tab_id: tab_id.clone(),
+                surface_id: binding.surface_id.clone(),
+                control: BrowserHostControlUpdate::Agent {
+                    lease_id: lease.lease_id.clone(),
+                    fence: lease.fence,
+                },
+            })
+            .await
+            .map_err(|error| (host_error(error), false))?;
+        if !matches!(
+            reply.response.outcome,
+            BrowserHostCommandOutcome::Succeeded(_)
+        ) {
+            if let BrowserHostCommandOutcome::Failed(error)
+            | BrowserHostCommandOutcome::Indeterminate(error) = &reply.response.outcome
+            {
+                tracing::warn!(code = %error.code, "GPT Web 配置控制权未取得");
+            }
+            let retry_safe = can_retry_setup_before_input(&reply.response.outcome);
+            if let Ok(mut authority) = self.authority.lock() {
+                let _ = authority.release_lease(&lease.lease_id, UtcMillis::now());
+            }
+            return Err((unavailable("配置页面控制权未取得"), retry_safe));
+        }
+        if let Ok(mut held) = self.setup_control.lock() {
+            *held = Some(RetainedSetupControl {
+                lease_id: lease.lease_id.clone(),
+                fence: lease.fence,
+                surface_id: binding.surface_id.clone(),
+                expires_at: lease.expires_at,
+            });
+        }
+        Ok((lease.lease_id, lease.fence))
+    }
+
+    fn forget_setup_control(&self) {
+        if let Ok(mut held) = self.setup_control.lock() {
+            *held = None;
+        }
+    }
+
+    /// 配置运行结束：释放保留的控制，页面上不残留 Agent 光标，用户可以自由操作而不被当成接管。
+    async fn release_setup_control(&self) {
+        let Some(held) = self.setup_control.lock().ok().and_then(|mut held| held.take()) else {
+            return;
+        };
+        let Ok(tab_id) = self.home_tab() else {
+            return;
+        };
+        let release = {
+            let Ok(mut authority) = self.authority.lock() else {
+                return;
+            };
+            let _ = authority.release_lease(&held.lease_id, UtcMillis::now());
+            // 只清理本次物理 Surface；不能撤销另一控制者或新 Surface 的控制。
+            authority
+                .surface_control_snapshot(&tab_id, &held.surface_id)
+                .ok()
+                .filter(|snapshot| snapshot.lease_id.is_none())
+        };
+        if let (Some(snapshot), Ok(client)) = (release, self.client()) {
+            let _ = client
                 .request(BrowserHostCommand::UpdateControl {
-                    tab_id: tab_id.clone(),
-                    surface_id: binding.surface_id.clone(),
-                    control: BrowserHostControlUpdate::Agent {
-                        lease_id: lease.lease_id.clone(),
-                        fence: lease.fence,
+                    tab_id,
+                    surface_id: held.surface_id,
+                    control: BrowserHostControlUpdate::Released {
+                        fence: snapshot.fence,
                     },
                 })
-                .await
-                .map_err(host_error)?;
-            if !matches!(
-                reply.response.outcome,
-                BrowserHostCommandOutcome::Succeeded(_)
-            ) {
-                if let BrowserHostCommandOutcome::Failed(error)
-                | BrowserHostCommandOutcome::Indeterminate(error) = &reply.response.outcome
-                {
-                    tracing::warn!(code = %error.code, "GPT Web 配置控制权未取得");
-                }
-                let retry_safe = can_retry_setup_before_input(&reply.response.outcome);
-                return Ok((Err(unavailable("配置页面控制权未取得")), retry_safe));
-            }
+                .await;
+        }
+    }
+
+    async fn native_setup_attempt(
+        &self,
+        build: &impl Fn(BrowserTabId, BrowserHostControl) -> BrowserHostCommand,
+    ) -> Result<(Result<serde_json::Value, WebModelError>, bool), WebModelError> {
+        let tab_id = self.home_tab()?;
+        // 取得控制权之前的 Surface 交接没有任何输入副作用，也必须进入有界重试。
+        // 原先这里的 ? 直接退出，导致刚导航到插件列表时偶发要求用户手动重试。
+        let binding = match self.refresh_primary_binding(&tab_id).await {
+            Ok(binding) => binding,
+            Err(error) if is_surface_handoff(&error.message) => return Ok((Err(error), true)),
+            Err(error) => return Err(error),
+        };
+        let client = self.client()?;
+        // 运行期间保持控制：用户在两条命令之间碰页面，Main 才认得出这是对 Agent 的接管。
+        let (lease_id, fence) = match self.ensure_setup_control(&client, &tab_id, &binding).await {
+            Ok(control) => control,
+            Err((error, retry_safe)) => return Ok((Err(error), retry_safe)),
+        };
+        let result = async {
             let reply = client
                 .request(build(
                     tab_id.clone(),
                     BrowserHostControl::Agent {
-                        lease_id: lease.lease_id.clone(),
-                        fence: lease.fence,
+                        lease_id: lease_id.clone(),
+                        fence,
                     },
                 ))
                 .await
@@ -593,7 +837,38 @@ impl HostWebModelPageDriver {
             Ok(match reply.response.outcome {
                 BrowserHostCommandOutcome::Succeeded(result) => (
                     match *result {
-                        BrowserHostCommandResult::Json { value } => Ok(value),
+                        BrowserHostCommandResult::Json { mut value } => {
+                            // devtools 点击的结果带有 target.effect；补上与 Interaction 相同的 outcome 结论。
+                            if let Some(target) = value
+                                .get("target")
+                                .and_then(|target| {
+                                    serde_json::from_value::<magi_browser_authority::BrowserActionTarget>(target.clone()).ok()
+                                })
+                            {
+                                value["outcome"] = crate::browser_tool_runtime::action_outcome(Some(&target));
+                            }
+                            Ok(value)
+                        }
+                        BrowserHostCommandResult::Interaction(interaction) => {
+                            self.authority.lock().map_err(|_| unavailable("浏览器权威状态不可用"))?
+                                .apply_host_page_state(&tab_id, interaction.page_state.navigation_revision,
+                                    interaction.page_state.url.clone(), interaction.page_state.origin.clone(),
+                                    interaction.page_state.title.clone(), UtcMillis::now())
+                                .map_err(|error| unavailable(&error.to_string()))?;
+                            Ok(serde_json::json!({
+                                "status":"succeeded",
+                                "target": interaction.target,
+                                "outcome": crate::browser_tool_runtime::action_outcome(interaction.target.as_ref()),
+                                "page": interaction.page_state,
+                            }))
+                        }
+                        BrowserHostCommandResult::PageState(page) => {
+                            self.authority.lock().map_err(|_| unavailable("浏览器权威状态不可用"))?
+                                .apply_host_page_state(&tab_id, page.navigation_revision,
+                                    page.url.clone(), page.origin.clone(), page.title.clone(), UtcMillis::now())
+                                .map_err(|error| unavailable(&error.to_string()))?;
+                            Ok(serde_json::json!({"status":"succeeded", "page": page}))
+                        }
                         _ => Err(invalid("宿主命令结果不是 JSON")),
                     },
                     false,
@@ -624,28 +899,11 @@ impl HostWebModelPageDriver {
             })
         }
         .await;
-        let release = {
-            let mut authority = self
-                .authority
-                .lock()
-                .map_err(|_| unavailable("浏览器权威状态不可用"))?;
-            let _ = authority.release_lease(&lease.lease_id, UtcMillis::now());
-            // 只清理本次物理 Surface；不能撤销另一控制者或新 Surface 的控制。
-            authority
-                .surface_control_snapshot(&tab_id, &binding.surface_id)
-                .ok()
-                .filter(|snapshot| snapshot.lease_id.is_none())
-        };
-        if let Some(snapshot) = release {
-            let _ = client
-                .request(BrowserHostCommand::UpdateControl {
-                    tab_id,
-                    surface_id: binding.surface_id,
-                    control: BrowserHostControlUpdate::Released {
-                        fence: snapshot.fence,
-                    },
-                })
-                .await;
+        // Main 已因用户接管撤销了控制：保留的租约不再有效，下一条命令必须重新取得（并被用户接管挡住）。
+        if let Ok((Err(error), _)) = &result
+            && error.message.contains("browser_user_control_held")
+        {
+            self.forget_setup_control();
         }
         result
     }
@@ -853,6 +1111,41 @@ impl WebModelPageDriver for HostWebModelPageDriver {
         })
     }
 
+    fn set_setup_desktop_layout<'a>(&'a self, desktop: bool) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            let viewport = if desktop {
+                BrowserLogicalViewport::Fixed {
+                    width: SETUP_DESKTOP_WIDTH,
+                    height: SETUP_DESKTOP_HEIGHT,
+                    device_scale_factor_millis: 1000,
+                    device_type: magi_browser_authority::BrowserDeviceType::Desktop,
+                }
+            } else {
+                BrowserLogicalViewport::Auto
+            };
+            // 视口只有在 Agent 持有控制租约时才允许改变，所以沿与配置动作相同的租约通道提交。
+            let result = self
+                .native_setup_command(|tab_id, _control| BrowserHostCommand::SetLogicalViewport {
+                    tab_id,
+                    viewport,
+                })
+                .await
+                .map(|_| ());
+            // 恢复自适应意味着配置结束：不再保留控制。
+            if !desktop {
+                self.release_setup_control().await;
+            }
+            result
+        })
+    }
+
+    fn end_setup_control<'a>(&'a self) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            self.release_setup_control().await;
+            Ok(())
+        })
+    }
+
     fn refresh_surface<'a>(&'a self, _page_id: &'a str) -> DriverFuture<'a, ()> {
         Box::pin(async move {
             let tab = self.home_tab()?;
@@ -1042,15 +1335,17 @@ impl WebModelPageDriver for HostWebModelPageDriver {
                     _ => return Err(invalid("提交结果无效")),
                 },
                 // 点击提交之后，ChatGPT 会立刻做页面内路由（新对话变成 `/c/<id>`）：导航代次随之推进，
-                // Worker 校验绑定时报 `browser_surface_stale`，但点击已经生效，消息已经发出去了。
-                // 结果不确定（Indeterminate）同理。这两种情况都不能报告「未被接受、可以重试」——
-                // 重新对齐绑定后，是否被接受由 `turn_state` 的消息计数证据判定（接受窗口内始终没有
-                // 新增用户消息才会报 `web_send_rejected`）。
+                // Worker 校验绑定时报 `browser_surface_stale`，但点击可能已经生效。带有副作用标记的失败
+                // 和 Indeterminate 结果同样可能已发送，不能报告「未被接受、可以重试」；重新对齐绑定后，
+                // 是否被接受由 `turn_state` 的消息计数 / 生成事实判定。
                 BrowserHostCommandOutcome::Indeterminate(_) => {
                     return self.submitted_maybe("indeterminate").await;
                 }
                 BrowserHostCommandOutcome::Failed(error) if is_surface_handoff(&error.message) => {
                     return self.submitted_maybe("surface_changed_during_submit").await;
+                }
+                BrowserHostCommandOutcome::Failed(error) if error.side_effect_started => {
+                    return self.submitted_maybe("submit_outcome_unconfirmed").await;
                 }
                 BrowserHostCommandOutcome::Failed(error) => {
                     return Err(WebModelError::new(
@@ -1227,301 +1522,81 @@ impl WebModelPageDriver for HostWebModelPageDriver {
         })
     }
 
-    fn platform_setup<'a>(&'a self, action: &'a str) -> DriverFuture<'a, serde_json::Value> {
+    fn setup_browser<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a serde_json::Value,
+    ) -> DriverFuture<'a, serde_json::Value> {
         Box::pin(async move {
-            self.native_setup_command(|tab_id, control| BrowserHostCommand::WebPlatformSetup {
-                tab_id,
-                control,
-                action: action.to_string(),
+            if tool == "browser_snapshot" {
+                return self.setup_snapshot().await;
+            }
+            if !matches!(
+                tool,
+                "browser_click"
+                    | "browser_type"
+                    | "browser_press"
+                    | "browser_scroll"
+                    | "browser_fill_form"
+                    | "browser_hover"
+                    | "browser_navigate"
+            ) {
+                return Err(invalid("配置浏览器操作不支持"));
+            }
+            let target = magi_browser_authority::BrowserSnapshotTarget {
+                element_ref: args["element_ref"].as_str().unwrap_or_default().to_string(),
+            };
+            self.native_setup_command(|tab_id, control| match tool {
+                // 配置点击走带结构性拦截的 devtools 操作：提交“生成密钥”类表单的按钮会被 Worker 拒绝。
+                "browser_click" => BrowserHostCommand::Devtools {
+                    tab_id,
+                    control: Some(control),
+                    operation: "click_guarded".into(),
+                    arguments: serde_json::json!({
+                        "element_ref": target.element_ref,
+                        "forbid_submit_in": SETUP_FORBIDDEN_SUBMIT_CONTEXT,
+                    }),
+                },
+                "browser_type" => BrowserHostCommand::Type {
+                    tab_id,
+                    control,
+                    target: target.clone(),
+                    text: args["text"].as_str().unwrap_or_default().to_string(),
+                    replace: args["replace"].as_bool().unwrap_or(true),
+                    submit_key: None,
+                },
+                "browser_press" => BrowserHostCommand::Press {
+                    tab_id,
+                    control,
+                    key: args["key"].as_str().unwrap_or("Escape").to_string(),
+                },
+                "browser_scroll" => BrowserHostCommand::Scroll {
+                    tab_id,
+                    control,
+                    target: None,
+                    delta_x: args["delta_x"].as_f64().unwrap_or(0.0),
+                    delta_y: args["delta_y"].as_f64().unwrap_or(0.0),
+                },
+                "browser_fill_form" | "browser_hover" => BrowserHostCommand::Devtools {
+                    tab_id,
+                    control: Some(control),
+                    operation: tool.trim_start_matches("browser_").into(),
+                    arguments: args.clone(),
+                },
+                "browser_navigate" => BrowserHostCommand::Navigate {
+                    tab_id,
+                    control,
+                    navigation: BrowserNavigation::Url {
+                        url: args["url"].as_str().unwrap_or_default().to_string(),
+                        handle_before_unload: None,
+                        init_script: None,
+                        timeout_ms: Some(30_000),
+                    },
+                },
+                _ => unreachable!(),
             })
             .await
         })
-    }
-
-    fn connector_status<'a>(
-        &'a self,
-        _page_id: &'a str,
-        name: &'a str,
-    ) -> DriverFuture<'a, ConnectorStatus> {
-        Box::pin(async move {
-            let status = self.read_connector_list(name).await;
-            if status
-                .as_ref()
-                .is_ok_and(|value| value.supported && value.exists && value.enabled)
-            {
-                self.leave_connector_pages().await;
-            }
-            status
-        })
-    }
-
-    fn configure_connector<'a>(
-        &'a self,
-        _page_id: &'a str,
-        name: &'a str,
-        tunnel_id: &'a str,
-    ) -> DriverFuture<'a, ConnectorConfigOutcome> {
-        Box::pin(async move {
-            let outcome = self.create_connector(name, tunnel_id).await;
-            if outcome
-                .as_ref()
-                .is_ok_and(|value| value.configured && value.confirmed_enabled)
-            {
-                self.leave_connector_pages().await;
-            }
-            outcome
-        })
-    }
-}
-
-impl HostWebModelPageDriver {
-    /// 打开设置里的「插件」页并读取已安装列表。页面脚本不做路由跳转（跳转会让 Desktop 把命令结果
-    /// 判为过期），所以由这里用 Host 的导航命令去到该页面，等脚本报告页面已就绪再读。
-    async fn read_connector_list(&self, name: &str) -> Result<ConnectorStatus, WebModelError> {
-        self.restore(connector_settings_url()).await?;
-        let mut parsed = None;
-        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
-            }
-            let value = self
-                .json_read_command(
-                    BrowserHostCommand::WebConnectorStatus {
-                        tab_id: self.home_tab()?,
-                        name: name.to_string(),
-                    },
-                    WebModelErrorCode::WebTunnelUnavailable,
-                )
-                .await;
-            let status = match value {
-                Ok(value) => connector_status_from_json(&value),
-                // 页面还在加载 / 交接：和「页面未就绪」一样继续等。
-                Err(error) if is_surface_handoff(&error.message) => continue,
-                Err(error) => return Err(error),
-            };
-            tracing::info!(
-                attempt,
-                supported = status.supported,
-                exists = status.exists,
-                enabled = status.enabled,
-                reason = crate::web_model_setup::connector_failure_reason(status.reason.as_deref())
-                    .unwrap_or("none"),
-                "GPT Web 连接器列表回读"
-            );
-            if status.reason.as_deref() == Some("connector_page_not_open") {
-                parsed = Some(status);
-                continue;
-            }
-            return Ok(status);
-        }
-        Ok(parsed.unwrap_or_else(|| ConnectorStatus {
-            supported: false,
-            exists: false,
-            enabled: false,
-            tool_count: None,
-            reason: Some("connector_page_not_open".to_string()),
-        }))
-    }
-
-    /// 创建连接器：先读已安装列表（已存在就不重复创建），再去目录页创建，最后回读列表确认。
-    async fn create_connector(
-        &self,
-        name: &str,
-        tunnel_id: &str,
-    ) -> Result<ConnectorConfigOutcome, WebModelError> {
-        let before = self.read_connector_list(name).await?;
-        if !before.supported {
-            return Ok(ConnectorConfigOutcome {
-                configured: false,
-                confirmed_enabled: false,
-                reason: before.reason,
-            });
-        }
-        if before.exists {
-            // 连接器已经存在：不重复创建，而是让 ChatGPT 重新拉取 Magi 当前的工具列表
-            //（ChatGPT 缓存创建 / 上次刷新时的列表，Magi 目录变化后不会自动同步）。
-            // 上面的回读已进入列表页；打开详情与刷新工具分成两个命令，
-            // 导航交接不会重放刷新副作用。
-            return self.refresh_connector_tools(name, tunnel_id).await;
-        }
-        self.restore(connector_directory_url()).await?;
-        let mut created_reason = None;
-        let mut connection_confirmed = false;
-        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
-            }
-            let value = self
-                .native_setup_command(
-                    |tab_id, control| BrowserHostCommand::WebConfigureConnector {
-                        tab_id,
-                        control,
-                        name: name.to_string(),
-                        tunnel_id: tunnel_id.to_string(),
-                    },
-                )
-                .await;
-            match value {
-                Ok(value) => {
-                    let reason = value
-                        .get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    connection_confirmed = value
-                        .get("confirmed_enabled")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && reason.as_deref() == Some("connection_confirmed");
-                    // 页面还没落在目录页：脚本什么都没做，可以安全重试。
-                    if reason.as_deref() == Some("connector_page_not_open") {
-                        created_reason = reason;
-                        continue;
-                    }
-                    created_reason = reason;
-                    break;
-                }
-                // 点了“创建”之后页面会跳到新应用页：命令结果因导航而过期，但创建可能已经生效，
-                // 是否成功只看下面回读的已安装列表。
-                Err(error) if is_surface_handoff(&error.message) => break,
-                Err(error) => return Err(error),
-            }
-        }
-        // 明确的页面阻断保持在原表单，供用户接手；不能导航抹掉现场。
-        if let Some(reason) = created_reason.filter(|reason| {
-            reason != "connector_page_not_open" && reason != "connection_confirmed"
-        }) {
-            return Ok(ConnectorConfigOutcome {
-                configured: false,
-                confirmed_enabled: false,
-                reason: Some(reason),
-            });
-        }
-        let after = self.read_connector_list(name).await?;
-        Ok(ConnectorConfigOutcome {
-            configured: after.exists,
-            confirmed_enabled: after.exists && (after.enabled || connection_confirmed),
-            reason: if after.exists {
-                (!after.enabled && !connection_confirmed)
-                    .then(|| "connector_not_enabled_after_create".to_string())
-            } else {
-                Some("connector_not_listed_after_create".to_string())
-            },
-        })
-    }
-
-    /// 在已安装连接器的详情页点「Refresh tools」。成功时 `reason` 为 `tools_refreshed`。
-    async fn refresh_connector_tools(
-        &self,
-        name: &str,
-        tunnel_id: &str,
-    ) -> Result<ConnectorConfigOutcome, WebModelError> {
-        let mut last_reason = None;
-        for attempt in 0..CONNECTOR_PAGE_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(CONNECTOR_PAGE_DELAY).await;
-            }
-            // 列表上的脚本仅打开详情，不能执行刷新。只有这段导航可以安全自动接续；
-            // 已在详情里开始刷新/关联后的不确定结果不能重放。
-            let opening_detail = self.page_state(&self.home_tab()?)?.2.trim_end_matches('/')
-                == connector_settings_url();
-            let value = self
-                .native_setup_command(
-                    |tab_id, control| BrowserHostCommand::WebConfigureConnector {
-                        tab_id,
-                        control,
-                        name: name.to_string(),
-                        tunnel_id: tunnel_id.to_string(),
-                    },
-                )
-                .await;
-            let value = match value {
-                Ok(value) => value,
-                // 点进连接器详情页会换路由，命令结果因此过期；页面已在详情页，重试即可。
-                Err(error) if opening_detail && is_surface_handoff(&error.message) => {
-                    last_reason = Some("connector_detail_opening".to_string());
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let reason = value
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            tracing::info!(
-                attempt,
-                reason = crate::web_model_setup::connector_failure_reason(reason.as_deref())
-                    .unwrap_or("none"),
-                confirmed = matches!(
-                    reason.as_deref(),
-                    Some("tools_refreshed" | "connection_confirmed")
-                ),
-                "GPT Web 连接器刷新回读"
-            );
-            // 页面还没落在设置页，或列表还没渲染：脚本什么都没做，可以安全重试。
-            if matches!(
-                reason.as_deref(),
-                Some("connector_page_not_open")
-                    | Some("connector_not_listed")
-                    | Some("connector_detail_opening")
-            ) {
-                last_reason = reason;
-                continue;
-            }
-            let refreshed = matches!(
-                reason.as_deref(),
-                Some("tools_refreshed" | "connection_confirmed")
-            );
-            return Ok(ConnectorConfigOutcome {
-                configured: true,
-                confirmed_enabled: refreshed,
-                reason,
-            });
-        }
-        Ok(ConnectorConfigOutcome {
-            configured: true,
-            confirmed_enabled: false,
-            reason: last_reason.or_else(|| Some("connector_refresh_failed".to_string())),
-        })
-    }
-
-    /// 连接器操作结束后回到 ChatGPT 主页（尽力而为，不等待）。
-    async fn leave_connector_pages(&self) {
-        if let Err(error) = self.restore(magi_web_model::chatgpt_web_home_url()).await {
-            tracing::debug!(error = %error.message, "连接器操作后回到主页未成功");
-        }
-    }
-}
-
-fn connector_settings_url() -> String {
-    format!(
-        "{}/settings/plugins-settings",
-        magi_web_model::chatgpt_web_origin()
-    )
-}
-
-fn connector_directory_url() -> String {
-    format!("{}/plugins", magi_web_model::chatgpt_web_origin())
-}
-
-fn connector_status_from_json(value: &serde_json::Value) -> ConnectorStatus {
-    ConnectorStatus {
-        supported: value
-            .get("supported")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        exists: value
-            .get("exists")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        enabled: value
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        tool_count: value.get("tool_count").and_then(serde_json::Value::as_u64),
-        reason: value
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
     }
 }
 
@@ -1774,6 +1849,21 @@ fn can_retry_setup_before_input(outcome: &BrowserHostCommandOutcome) -> bool {
         if !error.side_effect_started && is_surface_handoff(&error.code))
 }
 
+fn setup_observation_is_transient(message: &str) -> bool {
+    is_surface_handoff(message)
+        || [
+            "browser_snapshot_stale",
+            "browser_snapshot_revision",
+            "browser_navigation_stale",
+            "browser_navigation_revision_mismatch",
+            "browser navigation revision moved backwards",
+            "Execution context was destroyed",
+            "Cannot find context with specified id",
+        ]
+        .iter()
+        .any(|code| message.contains(code))
+}
+
 fn is_surface_handoff(message: &str) -> bool {
     [
         "browser_surface_stale",
@@ -1853,6 +1943,36 @@ fn state_from_json(value: &serde_json::Value) -> Result<TurnState, WebModelError
 
 #[cfg(test)]
 mod tests {
+    use super::{RetainedSetupControl, SETUP_CONTROL_RENEW_MARGIN_MS, setup_control_reusable};
+    use magi_core::{BrowserLeaseId, UtcMillis};
+
+    fn retained(expires_at: u64) -> RetainedSetupControl {
+        RetainedSetupControl {
+            lease_id: BrowserLeaseId::new("web-setup-1"),
+            fence: 7,
+            surface_id: "surface-a".into(),
+            expires_at: UtcMillis(expires_at),
+        }
+    }
+
+    #[test]
+    fn retained_setup_control_is_reused_only_while_it_is_still_the_active_lease() {
+        let now = UtcMillis(1_000_000);
+        let fresh = retained(now.0 + SETUP_CONTROL_RENEW_MARGIN_MS + 1);
+        let id = BrowserLeaseId::new("web-setup-1");
+        assert!(setup_control_reusable(&fresh, Some(&id), "surface-a", now));
+        // 用户接管撤销了租约：权威里没有它，必须重新取得（并被用户控制挡住）。
+        assert!(!setup_control_reusable(&fresh, None, "surface-a", now));
+        // 权威里现在是别的租约。
+        let other = BrowserLeaseId::new("web-setup-2");
+        assert!(!setup_control_reusable(&fresh, Some(&other), "surface-a", now));
+        // Surface 换了。
+        assert!(!setup_control_reusable(&fresh, Some(&id), "surface-b", now));
+        // 剩余有效期不足：续租，避免一条命令执行到一半过期。
+        let expiring = retained(now.0 + SETUP_CONTROL_RENEW_MARGIN_MS);
+        assert!(!setup_control_reusable(&expiring, Some(&id), "surface-a", now));
+    }
+
     use super::{
         StagedUploads, can_retry_setup_before_input, is_surface_handoff, sweep_upload_dir,
     };

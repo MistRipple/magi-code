@@ -26,7 +26,7 @@ mod mailbox;
 pub mod model_config;
 pub mod model_context_window;
 pub mod model_error;
-mod model_step;
+pub mod model_step;
 pub mod prompt_utils;
 mod registry;
 pub mod session_images;

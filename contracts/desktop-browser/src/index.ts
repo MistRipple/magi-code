@@ -413,18 +413,6 @@ export type BrowserHostCommand =
       type: "web_read_image";
       payload: { tab_id: BrowserTabId; source: string; offset: number; length: number };
     }
-  /** 只读检查 ChatGPT 侧的 Magi 连接器是否存在 / 启用。 */
-  | {
-      type: "web_connector_status";
-      payload: { tab_id: BrowserTabId; name: string };
-    }
-  /** 创建 / 启用 Magi 连接器并回读确认；只写连接器设置。 */
-  | {
-      type: "web_configure_connector";
-      payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; name: string; tunnel_id: string };
-    }
-  /** 创建 / 回读平台 Tunnel；禁止返回页面正文或密钥。 */
-  | { type: "web_platform_setup"; payload: { tab_id: BrowserTabId; control: Extract<BrowserControl, { mode: "agent" }>; action: "inspect_tunnel" | "create_tunnel" | "prepare_runtime_key" } }
   | { type: "shutdown" };
 
 export interface BrowserHostRequestEnvelope {
@@ -476,24 +464,6 @@ export interface BrowserWebSavedMessages {
   updated_at: string | null;
 }
 
-/** `web_connector_status` 的结果。 */
-export interface BrowserWebConnectorStatus {
-  /** 站点是否提供自定义连接器入口（套餐 / 开发者模式）。 */
-  supported: boolean;
-  exists: boolean;
-  enabled: boolean;
-  tool_count: number | null;
-  reason: string | null;
-}
-
-/** `web_configure_connector` 的结果。 */
-export interface BrowserWebConfigureConnectorResult {
-  configured: boolean;
-  /** 配置后回读确认已启用。 */
-  confirmed_enabled: boolean;
-  reason: string | null;
-}
-
 /** `web_write_text` 的回读校验结果。 */
 export interface BrowserWebWriteTextResult {
   confirmed: boolean;
@@ -517,7 +487,10 @@ export interface BrowserWebObserveResult {
 /** `web_submit` 的提交结果。 */
 export interface BrowserWebSubmitResult {
   submitted: boolean;
-  /** 提交后输入框是否已清空；未清空说明站点未接受这次提交。 */
+  /**
+   * 提交后输入框是否已清空。它只是页面清理的即时观察值；受控输入框可能延迟清空，
+   * 因此 false 不能单独证明消息未被接受，最终以 web_turn_state 的消息事实为准。
+   */
   composer_empty: boolean;
   reason: "composer_missing" | "composer_empty" | null;
 }
@@ -595,6 +568,27 @@ export interface BrowserHostResponseEnvelope {
 export interface BrowserActionTarget {
   role: string | null;
   name: string | null;
+  /** 动作的可观察结果。没有结果证据的命令（如按键、滚动）省略。 */
+  effect?: BrowserActionEffect | null;
+}
+
+/**
+ * 交互动作实际产生的效果，由 Worker 在页面内观察得出，是 Agent 判断“操作是否生效”的唯一依据。
+ * - `navigated`：动作触发了文档或路由跳转，旧节点引用已失效；
+ * - `changed`：页面或目标自身状态发生了变化（展开、勾选、弹层、内容刷新、目标被移除）；
+ * - `no_visible_change`：原生事件已送达，但没有观察到任何变化，重复同一动作通常没有帮助。
+ */
+export interface BrowserActionEffect {
+  verdict: "navigated" | "changed" | "no_visible_change";
+  /** `confirmed`：页面内确认收到可信事件；`inferred`：页面已跳转，无法回读，按已完成的输入派发推断。 */
+  delivered: "confirmed" | "inferred";
+  navigated: boolean;
+  /** 动作后稳定窗口内的 DOM 变化次数（上限 99）；页面已跳转时为 null。 */
+  dom_mutations: number | null;
+  /** 目标节点动作后是否仍在文档中；被移除常是菜单项、弹层按钮成功的信号。页面已跳转时为 null。 */
+  target_connected: boolean | null;
+  /** 目标自身的无障碍状态摘要（如 `expanded=true`）；没有可读状态时为 null。 */
+  target_state: { before: string; after: string } | null;
 }
 
 export interface BrowserInteraction {

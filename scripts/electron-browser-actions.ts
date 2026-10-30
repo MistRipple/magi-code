@@ -96,8 +96,21 @@ app.whenReady().then(async () => {
     assert.equal(bounded.text_bytes, bytes);
     const late = await snapshot(undefined, '#late');
     assert.ok(late.root.children.some((node: any) => node.name === 'Late target'));
+    // 视口内优先：文档顺序靠前但在屏幕外的 60 个按钮不能挤掉屏幕上的按钮；未返回的控件要有汇总；
+    // 上一次快照里的 element_ref 可以直接作为范围。
+    await guest.executeJavaScript(`document.body.insertAdjacentHTML('afterbegin', '<div id=far style="position:absolute;top:6000px">' + Array.from({length: 60}, (_, i) => '<button>Far ' + i + '</button>').join('') + '</div>');document.body.insertAdjacentHTML('beforeend', '<button id=near style="position:fixed;left:4px;top:4px">Near</button>');undefined`);
+    const ordered = await snapshot();
+    assert.ok(ordered.root.children.some((node: any) => node.name === 'Near'), 'on-screen button must outrank off-screen ones');
+    assert.match(ordered.root.description, /视口 \d+×\d+，已滚动 \d+\/\d+px/);
+    assert.match(ordered.root.description, /未返回 \d+ 个控件（视口内 \d+，视口外 \d+；/);
+    const lateRef = ordered.root.children.find((node: any) => node.name === 'late')?.element_ref;
+    assert.ok(lateRef);
+    const byRef = await snapshot(undefined, lateRef);
+    assert.ok(byRef.root.children.some((node: any) => node.name === 'Late target'));
+    assert.ok(!byRef.root.children.some((node: any) => node.name === 'Near'));
+    await guest.executeJavaScript('document.getElementById("far").remove();document.getElementById("near").remove();undefined');
     await guest.executeJavaScript('document.getElementById("large").remove()');
-    console.log('PASS sensitive values, UTF-8 budget, retained nodes and scoped snapshot');
+    console.log('PASS sensitive values, UTF-8 budget, retained nodes, viewport-first order, omission summary and scoped snapshot');
     snap = await snapshot();
     for (const mode of ['hidden', 'host-focused', 'offscreen']) {
       if (mode === 'host-focused') { win.show(); win.webContents.focus(); await win.webContents.executeJavaScript('host.focus()'); }
@@ -117,8 +130,13 @@ app.whenReady().then(async () => {
     snap = await snapshot();
     success(await click('Pointer option'));
     assert.equal(await guest.executeJavaScript('window.optionSelections'), 1);
-    assert.equal((await click('Down only')).status, 'indeterminate');
-    console.log('PASS option removed on trusted pointerup is confirmed; pointerdown-only button remains unconfirmed');
+    // 按下即移除的按钮收不到 click：事件未确认，但目标已离开文档，如实标为「推断送达」而不是失败或确认。
+    const downOnly: any = await click('Down only');
+    success(downOnly);
+    const downEffect = downOnly.payload.payload.effect;
+    assert.equal(downEffect.delivered, 'inferred');
+    assert.equal(downEffect.target_connected, false);
+    console.log('PASS option removed on trusted pointerup is confirmed; pointerdown-only removal is reported as inferred delivery');
     snap = await snapshot();
     await guest.executeJavaScript('window.selectionKeyups=0;text.onkeyup=()=>{window.selectionKeyups++;history.replaceState(null,"","?selection-keyup")};undefined');
     success(await type('Text', 'native editing command'));
@@ -126,6 +144,7 @@ app.whenReady().then(async () => {
     assert.equal(await guest.executeJavaScript('window.selectionKeyups'), 0);
     await guest.executeJavaScript('text.onkeyup=null;undefined');
     console.log('PASS text selection uses native editing commands without unrelated keyup navigation');
+
     for (const name of ['Disabled', 'Blocked']) assert.equal((await click(name)).status, 'failed');
     assert.equal((await type('Readonly', 'x')).status, 'failed');
     assert.equal((await type('Limited', 'too long')).status, 'indeterminate');
@@ -154,6 +173,44 @@ app.whenReady().then(async () => {
       win.destroy(); server.close(); app.exit(0); return;
     }
   }
+  // 动作证据检查放在 pointer 组（全新 Chromium、窗口不隐藏）：input 组在宿主窗口隐藏后有既有的时间预算，
+  // 离屏 guest 长时间运行后调试器会以 target closed 断开（HEAD 代码同样如此，与动作实现无关）。
+  // 按键和滚动同样要告诉 Agent 是否生效：输入框收到字符、滚动位置前后对比、没有效果时如实说明。
+  const effectOf = (result: any) => { success(result); return result.payload.payload.effect; };
+  snap = await snapshot();
+  success(await click('Text'));
+  await guest.executeJavaScript('text.value="";undefined');
+  const typed = effectOf(await run('press', { key: 'x' }));
+  assert.equal(typed.verdict, 'changed');
+  assert.match(typed.target_state.after, /value_len=1/);
+  assert.equal(await guest.executeJavaScript('text.value'), 'x');
+  const idle = effectOf(await run('press', { key: 'Escape' }));
+  assert.equal(idle.verdict, 'no_visible_change');
+  await guest.executeJavaScript('document.body.insertAdjacentHTML("beforeend", "<div id=tall style=\\"height:3000px\\"></div>");window.scrollTo(0,0);undefined');
+  const down = effectOf(await run('scroll', { target: null, delta_x: 0, delta_y: 300 }));
+  assert.equal(down.verdict, 'changed');
+  assert.equal(down.target_state.after, 'scroll(0,300)');
+  await guest.executeJavaScript('window.scrollTo(0, document.documentElement.scrollHeight);undefined');
+  const edge = effectOf(await run('scroll', { target: null, delta_x: 0, delta_y: 300 }));
+  assert.equal(edge.verdict, 'no_visible_change');
+  await guest.executeJavaScript('document.getElementById("tall").remove();window.scrollTo(0,0);undefined');
+
+  // 页面稳定等待：异步内容加载完才返回；持续变化的页面到时间如实返回 stable=false。
+  const waitStable = async (timeout_ms: number) => {
+    const result: any = await run('devtools', { operation: 'wait_for', arguments: { stable: true, timeout_ms } });
+    success(result);
+    return result.payload.payload.value;
+  };
+  await guest.executeJavaScript('window.lazyTimer=setTimeout(()=>document.body.insertAdjacentHTML("beforeend","<p id=lazy>late</p>"),200);undefined');
+  const quiet = await waitStable(5000);
+  assert.equal(quiet.stable, true);
+  assert.equal(await guest.executeJavaScript('!!document.getElementById("lazy")'), true);
+  await guest.executeJavaScript('document.getElementById("lazy").remove();window.churn=setInterval(()=>document.body.appendChild(document.createElement("i")).remove(),30);undefined');
+  const churn = await waitStable(1500);
+  assert.equal(churn.stable, false);
+  await guest.executeJavaScript('clearInterval(window.churn);undefined');
+  console.log('PASS stable wait returns after async content settles and reports a page that never settles');
+  console.log('PASS key press and scroll report observed effect or lack of one');
   // 同一真实 guest 验证坐标点击、悬停、下拉禁用与原生拖拽，复用现有验收入口。
   await guest.executeJavaScript(`document.body.innerHTML = '<button id="point">Point</button><button id="nav" onclick="location.href=&quot;/next&quot;">Navigate</button><select id="choices" aria-label="Choices" multiple><option value="one" selected>One</option><option value="two">Two</option><option value="disabled" disabled>Disabled</option><optgroup disabled><option value="group">Group</option></optgroup></select><div id="dragSource" draggable="true" style="width:100px;height:80px;background:red">Source</div><div id="dragTarget" style="width:100px;height:80px;background:blue;margin-left:200px">Target</div><button id="far" style="margin-top:2400px">Far</button>';undefined`);
   await guest.executeJavaScript(`window.clicks=0;window.doubles=0;window.hovers=0;window.changes=0;window.drops=0;window.trusted=[];window.cancelDrag=false;window.acceptDrop=true;

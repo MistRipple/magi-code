@@ -11,6 +11,7 @@
 - 外部 DTO、事件、生成协议和宿主命令遵循其 schema 与现有兼容策略。UI 只能消费和展示服务端事实，不能反向发明业务协议或绕开授权入口。
 - 架构文档描述设计和当前约束；方案、计划及进度文档可能描述尚未完成的目标。实施前核对当前源码和真实运行链路，不把计划状态当成已交付事实。
 - 只运行与改动相关的检查和回归；不因全仓指南默认运行完整测试套件。未运行的验证及已有失败要如实说明。
+- 涉及界面设计、文案、布局或交互的新增、优化与修复，必须先读并遵循 [UX/UI 设计与开发规范](docs/ux-ui-guidelines.md)，沿共享组件实施并完成对应验收；不把规范要求当作已经实现的事实。
 - 根指南只放跨目录规则。只有当子目录有稳定、独有且易误改的约定时才增加局部 `AGENTS.md`；局部文件只写差异并链接事实文档。
 
 ## 按改动位置读取规则
@@ -28,6 +29,7 @@
 ## 权威文档入口
 
 - [工程约束、运行入口和整体架构](docs/README.md)
+- [UX/UI 设计与开发规范](docs/ux-ui-guidelines.md)
 - [Browser 显示、状态所有权、安全和恢复设计](docs/browser-runtime-design.md)
 - [Turn、事件事实与对话执行架构](docs/conversation-response-core-architecture-redesign.md)
 - [上下文压力与压缩架构](docs/context-pressure-compaction-architecture.md)

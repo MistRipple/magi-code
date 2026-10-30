@@ -6,6 +6,48 @@ import { parse } from 'svelte/compiler';
 // 执行组件中的真实事件处理函数；只替换发送、换行和菜单提交等副作用。
 // 这验证组合事件合同，不替代操作系统候选窗的真实验收。
 const component = await readFile(new URL('../src/components/InputArea.svelte', import.meta.url), 'utf8');
+// 直接走真实 Svelte 分支树，验证运行中输入/清空时主按钮互斥，而非复制选择规则。
+function findPrimaryAction(node) {
+  if (!node || typeof node !== 'object') return null;
+  if (node.type === 'IfBlock' && node.expression?.name === 'editingQueuedMessage') return node;
+  for (const value of Object.values(node)) {
+    for (const child of Array.isArray(value) ? value : [value]) {
+      const found = findPrimaryAction(child);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+const primaryAction = findPrimaryAction(parse(component).html);
+assert.ok(primaryAction, 'composer main action branch must exist');
+function visibleMainActions(node, state) {
+  if (!node) return [];
+  if (node.type === 'IfBlock') {
+    const condition = component.slice(node.expression.start, node.expression.end);
+    const matched = new Function(...Object.keys(state), `return (${condition});`)(...Object.values(state));
+    return (matched ? node.children : node.else?.children ?? []).flatMap(child => visibleMainActions(child, state));
+  }
+  const attribute = name => node.attributes?.find(item => item.name === name)?.value?.[0]?.data;
+  if (node.name === 'button' && attribute('class')?.split(/\s+/).includes('ia-send')) {
+    return [attribute('data-testid') ?? 'disabled-send'];
+  }
+  return (node.children ?? []).flatMap(child => visibleMainActions(child, state));
+}
+const baseState = { editingQueuedMessage: null, resumeSubmitting: false, isSending: false, hasContent: false, editingTurn: null, canContinueSession: false };
+for (const [state, expected] of [
+  [{ isSending: true }, 'input-stop-button'],
+  [{ isSending: true, hasContent: true }, 'input-followup-send-button'],
+  [{ isSending: true, hasContent: false }, 'input-stop-button'],
+  [{ hasContent: true }, 'input-send-button'],
+  [{}, 'disabled-send'],
+  [{ canContinueSession: true }, 'input-continue-button'],
+  [{ canContinueSession: true, hasContent: true }, 'input-send-button'],
+  [{ isSending: true, hasContent: true, editingQueuedMessage: {} }, 'input-queue-save-button'],
+  [{ isSending: true, resumeSubmitting: true }, 'input-continue-button'],
+]) {
+  assert.deepEqual(visibleMainActions(primaryAction, { ...baseState, ...state }), [expected],
+    `composer must display exactly one main action: ${JSON.stringify(state)}`);
+}
 const instance = parse(component).instance;
 assert.ok(instance, 'InputArea must expose its component script');
 const script = component.slice(instance.content.start, instance.content.end);

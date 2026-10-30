@@ -2,6 +2,8 @@
 
 本文件补充根目录 [AGENTS.md](../AGENTS.md)。产品与架构事实以 [工程约束和运行入口](../docs/README.md)、[Browser 设计](../docs/browser-runtime-design.md)及源码为准。
 
+所有界面设计、文案、布局与交互工作先读并遵循 [UX/UI 设计与开发规范](../docs/ux-ui-guidelines.md)，包括自适应、多语言、触摸热区、反馈及验收；本文件仅补充 Web 与设置页的专有约定，不另行复制一套通用规范。
+
 ## 运行与验收
 
 - Web、Rust daemon 的日常开发和真实浏览器验收都通过 `./scripts/dev-daemon.sh`。主入口是 `http://127.0.0.1:38123/web.html`；API、SSE、会话、任务和设置请求应回到同一个 daemon。

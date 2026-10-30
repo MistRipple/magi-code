@@ -2,27 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { INSTALL_WEB_SETUP_INPUT } from "./web-setup-input.js";
-import { DESKTOP_BROWSER_PROTOCOL_VERSION } from "@magi/desktop-browser-contracts";
-import { parseBrowserHostRequest } from "@magi/desktop-browser-contracts/validation";
-
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
-
-test("配置写命令必须携带 Agent lease，缺失控制或用户控制均被协议拒绝", () => {
-  for (const command of [
-    { type: "web_platform_setup", payload: { tab_id: "home", action: "create_tunnel" } },
-    { type: "web_platform_setup", payload: { tab_id: "home", action: "prepare_runtime_key" } },
-    { type: "web_configure_connector", payload: { tab_id: "home", name: "Magi", tunnel_id: "tunnel_1" } },
-  ]) {
-    const envelope = { request_id: "setup", protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION, command };
-    assert.throws(() => parseBrowserHostRequest(envelope));
-    assert.throws(() => parseBrowserHostRequest({ ...envelope,
-      command: { ...command, payload: { ...command.payload, control: { mode: "user", fence: 1 } } },
-    }));
-    assert.doesNotThrow(() => parseBrowserHostRequest({ ...envelope,
-      command: { ...command, payload: { ...command.payload, control: { mode: "agent", lease_id: "lease", fence: 1 } } },
-    }));
-  }
-});
 
 function fixture() {
   const context = createContext({ __magiBrowserAutomation: { reference: (element: string) => element } });

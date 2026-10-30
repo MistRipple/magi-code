@@ -59,7 +59,6 @@ const WAIT_FOR_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(62);
 // 网页端上传图片实测要十几秒；Worker 自己等待上传最多 60 秒，客户端要比它多留收口余量。
 const WEB_ATTACH_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 // Worker 配置流程最多 90 秒，Desktop 允许 100 秒；Host 还需留出结果及取消结算余量。
-const WEB_SETUP_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(110);
 const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
@@ -374,13 +373,6 @@ fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Durat
     }
     if matches!(command, BrowserHostCommand::WebAttachFiles { .. }) {
         return default.max(WEB_ATTACH_BROWSER_HOST_REQUEST_TIMEOUT);
-    }
-    if matches!(
-        command,
-        BrowserHostCommand::WebConfigureConnector { .. }
-            | BrowserHostCommand::WebPlatformSetup { .. }
-    ) {
-        return default.max(WEB_SETUP_BROWSER_HOST_REQUEST_TIMEOUT);
     }
     if matches!(
         command,
@@ -742,35 +734,6 @@ mod tests {
         assert_eq!(
             request_timeout_for(&attach, Duration::from_secs(30)),
             Duration::from_secs(75)
-        );
-    }
-
-    #[test]
-    fn web_setup_requests_outlast_the_worker_setup_window() {
-        let command = BrowserHostCommand::WebConfigureConnector {
-            tab_id: magi_core::BrowserTabId::new("test-tab"),
-            control: crate::BrowserHostControl::Agent {
-                lease_id: "lease".into(),
-                fence: 1,
-            },
-            name: "Magi".into(),
-            tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
-        };
-        assert_eq!(
-            request_timeout_for(&command, Duration::from_secs(30)),
-            Duration::from_secs(110)
-        );
-        let platform = BrowserHostCommand::WebPlatformSetup {
-            tab_id: magi_core::BrowserTabId::new("test-tab"),
-            control: crate::BrowserHostControl::Agent {
-                lease_id: "lease".into(),
-                fence: 1,
-            },
-            action: "prepare_runtime_key".into(),
-        };
-        assert_eq!(
-            request_timeout_for(&platform, Duration::from_secs(30)),
-            Duration::from_secs(110)
         );
     }
 

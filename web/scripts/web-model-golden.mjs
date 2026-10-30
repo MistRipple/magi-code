@@ -25,9 +25,8 @@ await withGoldenViteServer(async (server) => {
     assert.equal(setup.isWebModelSetupRequest(text, true), false, text);
   }
   for (const stage of ['tunnel', 'credentials', 'connecting']) assert.equal(setup.setupCanEditCredentials({ stage }), true);
-  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'connector_access_denied' }), true);
   for (const stage of ['login', 'complete', 'cancelled', 'busy', 'failed']) assert.equal(setup.setupCanEditCredentials({ stage }), false);
-  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'connector_unconfirmed' }), false);
+  assert.equal(setup.setupCanEditCredentials({ stage: 'connector', reason: 'agent_handoff' }), false);
   const { buildStoreItems, storeGroup } = await server.ssrLoadModule('/src/lib/plugin-store.ts');
   const oldPlugin = { manifest: { id: 'openai.chatgpt-web', name: 'GPT Web', version: '1.1.0' }, activeScopes: ['application'], draining: [] };
   const bundled = { ...oldPlugin.manifest, version: '1.2.0' };
@@ -38,56 +37,27 @@ await withGoldenViteServer(async (server) => {
   assert.equal(same.updatable, false);
   for (const stage of ['complete', 'cancelled', 'busy']) assert.equal(setup.setupIsActive({ stage }), false);
   for (const stage of ['login', 'tunnel', 'credentials', 'connecting', 'connector', 'failed']) assert.equal(setup.setupIsActive({ stage }), true);
-  assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason: 'confirmation_required' }), true);
-  for (const reason of ['connector_write_started', 'connector_unconfirmed', 'connector_refresh_unconfirmed']) {
-    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), true, '重试必须通过卡片显式再次授权');
-    assert.equal(setup.setupReasonKey(reason), 'webModel.setup.reason.connectorUnconfirmed');
-  }
   assert.equal(setup.setupReasonKey('untrusted page text'), null);
   assert.equal(setup.setupReasonKey('key_generation_required'), 'webModel.setup.reason.keyReady');
-  assert.equal(setup.setupReasonKey('project_required'), 'webModel.setup.reason.project');
-  assert.equal(setup.setupReasonKey('key_permissions_required'), 'webModel.setup.reason.keyPermissions');
-  assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason: 'connector_access_denied' }), true);
-  assert.equal(setup.setupReasonKey('connector_access_denied'), 'webModel.setup.reason.connectorAccessDenied');
-  for (const [reason, hint] of [
-    ['connector_ambiguous', 'connectorAmbiguous'], ['connector_tunnel_mismatch', 'connectorTunnelMismatch'],
-    ['connector_refresh_rejected', 'connectorRefreshRejected'], ['connector_page_not_open', 'connectorPageNotReady'],
-    ['connector_detail_unconfirmed', 'connectorPageNotReady'], ['connector_refresh_button_missing', 'connectorPageNotReady'],
-    ['connector_form_fields_missing', 'connectorFormChanged'],
-  ]) {
-    assert.equal(setup.setupNeedsConnectorConsent({ stage: 'connector', reason }), true);
-    assert.equal(setup.setupHintKey({ stage: 'connector', reason }, false), `webModel.setup.reason.${hint}`);
-  }
+  assert.equal(setup.setupReasonKey('user_takeover'), 'webModel.setup.reason.userTakeover');
   for (const [stage, reason, expected] of [
-    ['credentials', 'project_required', 'reason.project'],
-    ['credentials', 'key_permissions_required', 'reason.keyPermissions'],
     ['credentials', 'key_generation_required', 'reason.keyReady'],
-    ['credentials', 'login_required', 'reason.keyLogin'],
     ['credentials', 'runtime_key_required', 'reason.keyPreparation'],
-    ['tunnel', 'workspace_required', 'reason.workspace'],
-    ['connector', 'connector_access_denied', 'reason.connectorAccessDenied'],
-    ['connector', 'connector_unconfirmed', 'reason.connectorUnconfirmed'],
-    ['connector', 'confirmation_required', 'hint.confirmConnector'],
-    ['tunnel', 'ambiguous_tunnel', 'reason.ambiguousTunnel'],
-    ['tunnel', 'tunnel_id_required', 'reason.tunnelId'],
-    ['tunnel', 'manual_required', 'reason.manual'],
+    ['tunnel', 'user_takeover', 'reason.userTakeover'],
+    ['connector', 'user_takeover', 'reason.userTakeover'],
+    ['tunnel', 'agent_handoff', 'hint.tunnel'],
+    ['connector', 'agent_handoff', 'hint.connector'],
     ['login', 'chatgpt_login_required', 'hint.login'],
     ['complete', '', 'hint.complete'],
     ['cancelled', '', 'hint.cancelled'],
     ['busy', 'web_session_busy', 'hint.busy'],
-    ['failed', 'step_unconfirmed', 'hint.failed'],
+    ['failed', 'agent_failed', 'hint.failed'],
   ]) {
     assert.equal(setup.setupHintKey({ stage, reason }, false), `webModel.setup.${expected}`);
     assert.equal(setup.setupHintKey({ stage, reason }, true), 'webModel.setup.workingHint');
   }
   assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'runtime_not_ready' }, false), 'webModel.setup.hint.connecting');
   assert.equal(setup.setupHintKey({ stage: 'connecting', reason: 'stop_failed' }, false, true), 'webModel.setup.reason.connectionFailed');
-  for (const reason of ['creation_started', 'creation_unconfirmed']) {
-    assert.equal(setup.setupCanRetryTunnel({ stage: 'tunnel', reason }), true);
-    assert.equal(setup.setupCanRetryTunnel({ stage: 'cancelled', reason }), false);
-  }
-  assert.equal(setup.setupCanRetryTunnel(null), false);
-  assert.equal(setup.setupCanRetryTunnel({ stage: 'tunnel', reason: 'login_required' }), false);
   for (const stage of ['tunnel', 'credentials', 'connecting', 'connector']) {
     const fresh = setup.setupCredentialInput(stage, 'tunnel_new', '', false);
     assert.equal(fresh.required, stage !== 'tunnel');
@@ -115,6 +85,7 @@ await withGoldenViteServer(async (server) => {
     web_selectors_drift: 'probe',
     web_desktop_unavailable: 'openSettings',
     web_send_rejected: 'retry',
+    web_send_unconfirmed: 'openView',
     web_write_not_confirmed: 'retry',
     web_attach_failed: 'retry',
     web_turn_timeout: 'retry',

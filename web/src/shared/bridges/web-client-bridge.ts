@@ -3227,6 +3227,13 @@ async function ensureEventStream(
         if (streamToken !== activeEventStreamToken) return;
         markEventStreamActive();
       },
+      onRuntimeEpochChange({ previous, current }) {
+        if (streamToken !== activeEventStreamToken) return;
+        // daemon 重启时的收敛（孤立回合取消、任务终止）直接写入权威状态而不产生事件，
+        // 事件流补不回来：界面会一直显示「运行中」和已失效的授权。必须重新读取权威 bootstrap。
+        console.warn('[web-client-bridge] daemon 运行代际变化，重建权威状态', { previous, current });
+        scheduleRecovery('daemon_runtime_epoch_changed', undefined, true);
+      },
       onSnapshot(snapshot) {
         if (streamToken !== activeEventStreamToken) return;
         markEventStreamActive();

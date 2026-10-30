@@ -15,10 +15,8 @@
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import { addToast } from '../stores/messages.svelte';
   import {
-    configureWebConnector,
     configureWebModelTunnel,
     createAppBrowserSession,
-    getWebConnectorStatus,
     getWebModelTunnel,
     navigateWebModelPage,
     revealWebModelTunnelApiKey,
@@ -308,71 +306,10 @@
     }
   }
 
-  let connectorBusy = $state(false);
-  let connectorMessage = $state('');
-
-  function connectorText(status: { supported: boolean; exists: boolean; enabled: boolean; toolCount?: number | null; toolsStale?: boolean | null; reason?: string | null }): string {
-    if (!status.supported) return i18n.t('webModel.connector.unsupported');
-    if (!status.exists) return i18n.t('webModel.connector.missing');
-    if (!status.enabled) return i18n.t('webModel.connector.disabled');
-    // This count comes from Magi's live MCP tools/list catalog, not ChatGPT's
-    // installed-app row, which does not reliably expose the catalog size.
-    const base = status.toolCount == null
-      ? i18n.t('webModel.connector.enabledCountUnavailable')
-      : i18n.t('webModel.connector.enabled', { count: status.toolCount });
-    // ChatGPT 只在创建 / 刷新连接器时读取工具列表，Magi 目录变化后它手里的是旧的。
-    return status.toolsStale ? `${base}；${i18n.t('webModel.connector.stale')}` : base;
-  }
-
-  async function checkConnector(): Promise<void> {
-    if (connectorBusy) return;
-    connectorBusy = true;
-    errorMessage = '';
-    try {
-      await ensureAppSession();
-      connectorMessage = connectorText(await getWebConnectorStatus());
-    } catch (error) {
-      errorMessage = errorText(error);
-    } finally {
-      connectorBusy = false;
-    }
-  }
-
-  /** 让 ChatGPT 重新读取 Magi 当前的工具列表（只刷新缓存，不改连接器的其他设置）。 */
-  async function refreshConnectorTools(): Promise<void> {
-    if (connectorBusy) return;
-    connectorBusy = true;
-    errorMessage = '';
-    try {
-      await ensureAppSession();
-      const result = await configureWebConnector();
-      connectorMessage = result.confirmedEnabled && result.reason === 'tools_refreshed'
-        ? i18n.t('webModel.connector.refreshed')
-        : i18n.t('webModel.connector.refreshFailed', { reason: result.reason || '-' });
-    } catch (error) {
-      errorMessage = errorText(error);
-    } finally {
-      connectorBusy = false;
-    }
-  }
-
-  /** 会改动用户 ChatGPT 账号里的连接器设置：必须经用户确认。 */
-  async function configureConnector(): Promise<void> {
-    if (connectorBusy) return;
-    if (!(await confirmMessage(i18n.t('webModel.connector.confirmBody'), { confirmLabel: i18n.t('webModel.connector.configure') }))) return;
-    connectorBusy = true;
-    errorMessage = '';
-    try {
-      await ensureAppSession();
-      const result = await configureWebConnector();
-      connectorMessage = result.confirmedEnabled
-        ? i18n.t(result.reason === 'tools_refreshed' ? 'webModel.connector.refreshed' : 'webModel.connector.configured')
-        : i18n.t('webModel.connector.configFailed', { reason: result.reason || '-' });
-    } catch (error) {
-      errorMessage = errorText(error);
-    } finally {
-      connectorBusy = false;
-    }
+  /** 检查、配置与刷新连接器都进入同一个 AI 配置命令，页面事实由 Agent 实时读取。 */
+  function requestConnectorSetup(): void {
+    if (!setupAvailable) return;
+    window.dispatchEvent(new CustomEvent(WEB_MODEL_SETUP_REQUEST));
   }
 
   async function clearTunnel(): Promise<void> {
@@ -676,19 +613,11 @@
       <div class="settings-row settings-row--stacked" data-web-model-connector="1">
         <div class="settings-row-copy">
           <span class="settings-row-title">{i18n.t('webModel.connector.title')}</span>
-          {#if connectorMessage}
-            <span class="settings-row-desc">{connectorMessage}</span>
-          {/if}
+          <span class="settings-row-desc">{i18n.t('webModel.connector.setupHint')}</span>
         </div>
         <div class="settings-row-actions">
-          <button type="button" class="btn btn--sm btn--secondary" disabled={!isDesktop || connectorBusy} onclick={() => void checkConnector()}>
-            {i18n.t('webModel.connector.check')}
-          </button>
-          <button type="button" class="btn btn--sm btn--secondary" data-web-model-refresh-tools="1" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void refreshConnectorTools()}>
-            {i18n.t('webModel.connector.refresh')}
-          </button>
-          <button type="button" class="btn btn--sm btn--secondary" disabled={!isDesktop || connectorBusy || !tunnelId.trim()} onclick={() => void configureConnector()}>
-            {i18n.t('webModel.connector.configure')}
+          <button type="button" class="btn btn--sm btn--secondary" data-web-model-connector-action="1" disabled={!isDesktop || !setupAvailable || !tunnelId.trim()} onclick={requestConnectorSetup}>
+            {i18n.t('webModel.connector.setup')}
           </button>
         </div>
       </div>

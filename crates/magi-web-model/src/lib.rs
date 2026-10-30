@@ -25,7 +25,7 @@ pub use client::{
     BrowserWebModelBridgeClient, WebModelClientConfig, WebModelIdentity, normalize_composer_text,
 };
 pub use driver::{
-    ConnectorConfigOutcome, ConnectorStatus, DriverFuture, ImageChunk, LoginState, PageProbe,
+    DriverFuture, ImageChunk, LoginState, PageProbe,
     SavedConversationEntry, SavedConversationSink, SavedConversationSnapshot, SavedProgress,
     SubmitOutcome, TurnState, WebMessage, WebModelPageDriver, WriteOutcome,
 };

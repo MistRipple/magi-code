@@ -183,7 +183,7 @@
 
   const hideUserCommandContent = $derived(isUser && isWebModelSetupCommand(message.metadata));
   const userCommandLabel = $derived(hideUserCommandContent
-    ? i18n.t(`webModel.setup.userAction.${['start', 'continue', 'retry_tunnel', 'confirm_connector', 'cancel'].includes(message.content?.trim()) ? message.content.trim() : 'start'}`)
+    ? i18n.t(`webModel.setup.userAction.${['start', 'continue', 'cancel'].includes(message.content?.trim()) ? message.content.trim() : 'start'}`)
     : resolveUserMessageCommandLabel(message.metadata));
 
   function resolveBlockRenderKey(

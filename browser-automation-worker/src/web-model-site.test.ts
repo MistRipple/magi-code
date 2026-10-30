@@ -125,7 +125,7 @@ test("回合登录态需要 conversation 与可用 composer 两项证据", () =>
 test("页面适配器字符串包含命令所需的原子写入、观察和回合读取接口", () => {
   for (const method of [
     "probe", "writeText", "observe", "submit", "turnState", "cancelGeneration",
-    "savedConversations", "savedMessages", "connectorStatus", "configureConnector",
+    "savedConversations", "savedMessages",
   ]) {
     assert.match(INSTALL_WEB_MODEL_ADAPTER, new RegExp(`\\b${method}\\b`));
   }
@@ -143,7 +143,8 @@ test("页面适配器字符串包含命令所需的原子写入、观察和回�
 
 test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结果", async () => {
   const document = {
-    documentElement: { getAttribute: () => null },
+    // Chromium may report an initial Document before its root element exists.
+    documentElement: null,
     querySelector: () => null,
     querySelectorAll: () => [],
     getElementById: () => null,
@@ -163,18 +164,16 @@ test("适配器在未知 / 空 DOM 上安装后返回明确的未登录探测结
     probe: () => Promise<WebModelRawSnapshot>;
     savedConversations: () => { conversations: unknown[] };
     savedMessages: () => { conversation_id: string | null; messages: unknown[] };
-    connectorStatus: (input: { name: string }) => Promise<{ supported: boolean; reason: string | null }>;
     observe: (input: { selector: string; fields: string[]; attribute: null }) => { revision: number; nodes: Array<Record<string, unknown>> };
   };
   const probe = await adapter.probe();
   assert.equal(probe.composerFound, false);
   assert.equal(probe.conversationFound, false);
-  // 空 DOM：没有历史、不是已保存对话页面、没有连接器入口——都是明确的“没有”，不猜测。
+  // 空 DOM：没有历史、不是已保存对话页面——都是明确的“没有”，不猜测。
   assert.deepEqual(JSON.parse(JSON.stringify(adapter.savedConversations())), { conversations: [] });
   const messages = adapter.savedMessages();
   assert.equal(messages.conversation_id, null);
   assert.deepEqual(JSON.parse(JSON.stringify(messages.messages)), []);
-  assert.equal((await adapter.connectorStatus({ name: "Magi" })).supported, false);
   const observed = adapter.observe({ selector: "@assistantMessage", fields: ["existence"], attribute: null });
   assert.equal(observed.revision, 1);
   assert.equal(observed.nodes.length, 1);
@@ -339,10 +338,9 @@ test("会话接口没拿到答案时回到页面证据，不把“不知道”�
   })).loginState, "signed_out");
 });
 
-test("适配器脚本整体可解析，连接器入口按精确名称查找", () => {
+test("适配器脚本整体可解析", () => {
   // 页面脚本是模板字符串里的一大段代码：重复声明、反引号、转义错误都会让整个适配器装不上。
   assert.doesNotThrow(() => new Function(INSTALL_WEB_MODEL_ADAPTER));
-  assert.match(INSTALL_WEB_MODEL_ADAPTER, /textOf\(element\)\.toLowerCase\(\) === wanted/u);
 });
 
 test("未知账号等级归为 unknown，不猜等级", () => {
@@ -575,191 +573,6 @@ test("生成的图片：画廊里每张图一段，按钮里的图用按钮标�
       "来源[example.com](https://example.com/)",
     ].join("\n\n"),
   );
-});
-
-function connectorFixture(options: { stuck?: boolean; rejected?: boolean; duplicate?: boolean; login?: boolean; wrongTunnel?: boolean; noTools?: boolean; unlinked?: boolean; entryText?: string; detailDelay?: number; refreshDelay?: number; wrongHeading?: boolean; empty?: boolean; loading?: boolean; listDelay?: number } = {}) {
-  let now = 0;
-  let refreshedAt = 0;
-  let refreshClicks = 0;
-  const makeNode = (text: string) => ({
-    innerText: text, textContent: text, childElementCount: 0, disabled: false,
-    getAttribute: (_: string) => null as string | null,
-    getBoundingClientRect: () => ({ width: 100, height: 20 }),
-    querySelector: (_: string) => null,
-    closest: (_: string) => null as unknown,
-  });
-  const entry = makeNode(options.entryText ?? (options.noTools ? 'Magi Magi' : 'Magi 12 tools'));
-  const title = makeNode('Magi');
-  title.closest = () => entry;
-  const duplicate = makeNode('Magi');
-  duplicate.closest = () => makeNode('Magi 9 tools');
-  const refresh = makeNode(options.unlinked ? '关联' : 'Refresh tools');
-  Object.defineProperty(refresh, 'disabled', { get: () => now < (options.detailDelay ?? 0)
-    || (refreshClicks > 0 && (Boolean(options.stuck) || now < refreshedAt)) });
-  const connect = makeNode('连接 Magi');
-  const dialog = { ...makeNode('连接 Magi'), querySelectorAll: (selector: string) =>
-    selector === 'h2' ? [makeNode('连接 Magi')] : selector === 'button' ? [connect] : [] };
-  let connected = false;
-  const alert = makeNode('Private error text');
-  let clicked = false;
-  const body = {
-    innerText: 'Installed apps Magi 12 tools' + (options.wrongTunnel ? ' tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' : ''),
-    querySelectorAll: (selector: string) => selector === '*' && !options.empty && !options.loading && now >= (options.listDelay ?? 0)
-      ? [title, ...(options.duplicate ? [duplicate] : [])]
-      : selector === 'div' && options.empty ? [makeNode('你尚未安装任何插件')] : [],
-  };
-  const document = {
-    body, documentElement: { getAttribute: () => null },
-    querySelector: (selector: string) => options.login && selector === 'input[type="password"]' ? makeNode('')
-      : options.rejected && clicked && selector === '[role="alert"]' ? alert
-      : options.unlinked && clicked && !connected && selector === "[role='dialog']" ? dialog : null,
-    querySelectorAll: (selector: string) => selector === 'button' ? [refresh]
-      : options.unlinked && clicked && !connected && selector === "[role='dialog']" ? [dialog]
-      : selector === 'h1' ? [makeNode(options.wrongHeading ? 'Other app' : 'Magi')]
-      : options.login && selector === 'input[type="password"]' ? [makeNode('')]
-      : options.rejected && clicked && selector === '[role="alert"]' ? [alert] : [],
-  };
-  const context: Record<string, unknown> = {
-    document, location: { origin: 'https://chatgpt.com', pathname: '/settings/plugins-settings/magi', search: '' },
-    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
-    setTimeout: (callback: () => void, ms: number) => { now += ms; callback(); }, clearTimeout,
-    __magiSetupInput: { perform: async (_: string, target: unknown) => {
-      clicked = true;
-      if (target === refresh) { refreshClicks++; refreshedAt = now + (options.refreshDelay ?? 0); }
-      if (target === connect) connected = true;
-    } },
-  };
-  runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
-  const adapter = context.__magiWebModel as {
-    configureConnector: (input: { name: string; tunnel_id: string }) => Promise<{ confirmed_enabled: boolean; reason: string }>;
-    connectorStatus: (input: { name: string }) => Promise<{ supported: boolean; enabled: boolean; tool_count: number | null; reason: string | null }>;
-  };
-  return {
-    ...adapter,
-    get refreshClicks() { return refreshClicks; },
-    connectorStatus: (input: { name: string }) => {
-      (context.location as { pathname: string }).pathname = '/settings/plugins-settings';
-      return adapter.connectorStatus(input);
-    },
-  };
-}
-
-test('创建表单消失后等待超过十秒才出现的精确连接确认层，不能提前结束', async () => {
-  let stage = 'directory';
-  let now = 0;
-  let connectAt = 0;
-  let connects = 0;
-  let connectDelay = 12000;
-  const node = (label: string, attrs: Record<string, string> = {}) => ({
-    innerText: label, textContent: label, disabled: false, checked: false,
-    getAttribute: (key: string) => attrs[key] ?? null,
-    getBoundingClientRect: () => ({ width: 100, height: 20 }),
-    querySelectorAll: (_: string): unknown[] => [],
-  });
-  const add = node('Add'), create = node('Add custom MCP server'), tunnel = node('Tunnel');
-  const name = node('', { type: 'text' }), id = node('', { 'aria-label': 'Tunnel id' });
-  const auth = { ...node(''), options: [{ text: 'No authentication', value: 'none' }] };
-  const ack = { ...node(''), checked: true };
-  const save = node('Create as plugin'), heading = node('Connect Magi'), connect = node('Connect Magi');
-  const form = node('Create app');
-  form.querySelectorAll = selector => ({
-    button: [tunnel, save], input: [name, id], 'input[type="text"]': [name],
-    select: [auth], 'input[type="checkbox"]': [ack], 'button[type="submit"]': [save],
-  })[selector] ?? [];
-  const confirmation = node('Connect Magi');
-  confirmation.querySelectorAll = selector => selector === 'h2' ? [heading] : selector === 'button' ? [connect] : [];
-  const document = {
-    documentElement: { getAttribute: () => null },
-    querySelector(selector: string) { return this.querySelectorAll(selector)[0] ?? null; },
-    querySelectorAll(selector: string): unknown[] {
-      if (selector === '[role=\'dialog\']') return stage === 'form' ? [form]
-        : stage === 'gap' && now >= connectAt ? [confirmation] : [];
-      return selector === 'button' ? [add] : selector === '[role="menuitem"]' ? [create] : [];
-    },
-  };
-  const context = {
-    document, location: { origin: 'https://chatgpt.com', pathname: '/plugins', search: '' },
-    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
-    Date: class extends Date { static override now() { return now; } },
-    setTimeout: (callback: () => void, ms: number) => { now += ms; callback(); }, clearTimeout,
-    __magiSetupInput: { perform: async (_: string, target: unknown) => {
-      if (target === create) stage = 'form';
-      if (target === save) { stage = 'gap'; connectAt = now + connectDelay; }
-      if (target === connect) { connects++; stage = 'closed'; }
-    } },
-  };
-  runInNewContext(INSTALL_WEB_MODEL_ADAPTER, context);
-  const adapter = (context as unknown as { __magiWebModel: {
-    configureConnector: (input: { name: string; tunnel_id: string }) => Promise<{ configured: boolean }>;
-  } }).__magiWebModel;
-  const result = await adapter.configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(result.configured, true);
-  assert.equal(connects, 1, '延迟出现的连接确认必须实际点击一次');
-  stage = 'directory';
-  connects = 0;
-  heading.innerText = heading.textContent = 'Connect Other';
-  const wrongApp = await adapter.configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(wrongApp.configured, false, '其他应用的确认层不能视为成功');
-  assert.equal(connects, 0, '标题不匹配时不点击确认按钮');
-  stage = 'directory';
-  heading.innerText = heading.textContent = 'Connect Magi';
-  connectDelay = 31000;
-  const timeout = await adapter.configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(timeout.configured, false, '等待仍有上限，超时保留未确认结果');
-  assert.equal(connects, 0, '超时不补点连接');
-});
-
-test('连接器刷新等待超时或出现错误不能报告成功', async () => {
-  for (const options of [{ stuck: true }, { rejected: true }]) {
-    const result = await connectorFixture(options).configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-    assert.equal(result.confirmed_enabled, false);
-    assert.equal(result.reason, options.stuck ? 'connector_refresh_unconfirmed' : 'connector_refresh_rejected');
-    assert.ok(!result.reason.includes('Private'));
-  }
-  assert.equal((await connectorFixture().configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' })).confirmed_enabled, true);
-});
-
-test('连接器回读识别工具数量，登录页和同名歧义不能当成配置成功', async () => {
-  const ready = await connectorFixture().connectorStatus({ name: 'Magi' });
-  assert.equal(ready.enabled, true);
-  assert.equal(ready.tool_count, 12);
-  const duplicate = await connectorFixture({ duplicate: true }).connectorStatus({ name: 'Magi' });
-  assert.equal(duplicate.supported, false);
-  assert.equal(duplicate.reason, 'connector_ambiguous');
-  const login = await connectorFixture({ login: true }).connectorStatus({ name: 'Magi' });
-  assert.equal(login.supported, false);
-  const wrongTunnel = await connectorFixture({ wrongTunnel: true }).configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(wrongTunnel.confirmed_enabled, false);
-  assert.equal(wrongTunnel.reason, 'connector_tunnel_mismatch');
-  const installedOnly = await connectorFixture({ noTools: true }).connectorStatus({ name: 'Magi' });
-  assert.equal(installedOnly.enabled, false, '只有已安装名称不能证明已关联');
-  const associated = await connectorFixture({ unlinked: true }).configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(associated.confirmed_enabled, true);
-  assert.equal(associated.reason, 'connection_confirmed');
-});
-
-test('新版列表的权限摘要不能替代工具就绪证据，加载中的空列表不能触发创建', async () => {
-  const permission = await connectorFixture({ entryText: 'Magi Magi 允许使用低风险工具' }).connectorStatus({ name: 'Magi' });
-  assert.equal(permission.supported, true);
-  assert.equal(permission.enabled, false);
-  assert.equal(permission.tool_count, null);
-  const loading = await connectorFixture({ loading: true }).connectorStatus({ name: 'Magi' });
-  assert.equal(loading.supported, false);
-  assert.equal(loading.reason, 'connector_page_not_open');
-  const empty = await connectorFixture({ empty: true }).connectorStatus({ name: 'Magi' });
-  assert.equal(empty.supported, true);
-  const delayed = await connectorFixture({ listDelay: 2500 }).connectorStatus({ name: 'Magi' });
-  assert.equal(delayed.enabled, true);
-});
-
-test('连接器详情首次加载和刷新超过旧时限时等待完成，只点击一次刷新', async () => {
-  const fixture = connectorFixture({ detailDelay: 12000, refreshDelay: 18000 });
-  const result = await fixture.configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' });
-  assert.equal(result.confirmed_enabled, true);
-  assert.equal(fixture.refreshClicks, 1);
-  const wrong = connectorFixture({ wrongHeading: true });
-  assert.equal((await wrong.configureConnector({ name: 'Magi', tunnel_id: 'tunnel_0123456789abcdef0123456789abcdef' })).reason, 'connector_detail_unconfirmed');
-  assert.equal(wrong.refreshClicks, 0);
 });
 
 test('离屏推理页通过按钮标准激活提交，并回读实际清空状态', async () => {

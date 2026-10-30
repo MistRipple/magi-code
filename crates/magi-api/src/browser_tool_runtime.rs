@@ -450,7 +450,10 @@ impl BrowserToolRuntimeDependencies {
                     .map_err(browser_host_client_error)?;
                 let interaction = interaction_result(reply.response.outcome, "浏览器交互失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, interaction.page_state)?;
-                let (snapshot, snapshot_error) = if bool_arg(arguments, "include_snapshot", false) {
+                let outcome = action_outcome(interaction.target.as_ref());
+                // 页面跳转后旧节点引用全部失效，Agent 唯一能做的就是重新快照：直接随结果返回，省掉一轮模型往返。
+                // 其他情况引用仍然有效，默认不抓快照（抓取会让同一份快照上的后续动作引用失效）。
+                let (snapshot, snapshot_error) = if bool_arg(arguments, "include_snapshot", snapshot_by_default(&outcome)) {
                     match self.capture_snapshot(&client, &tab.tab_id, None).await {
                         Ok(snapshot) => (
                             Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id)),
@@ -473,6 +476,7 @@ impl BrowserToolRuntimeDependencies {
                     "status": "succeeded",
                     "tab": updated,
                     "target": interaction.target,
+                    "outcome": outcome,
                     "snapshot": snapshot,
                     "snapshot_error": snapshot_error,
                 })
@@ -2752,7 +2756,38 @@ fn interaction_result(
     }
 }
 
-fn browser_tool_snapshot_value(
+/// 把 Worker 在页面内观察到的动作效果翻译成 Agent 可直接依据的结论和下一步指引。
+/// “送达”不等于“生效”：没有观察到变化时明确告诉 Agent，避免它靠重复同一动作等待结果。
+pub(crate) fn action_outcome(
+    target: Option<&magi_browser_authority::BrowserActionTarget>,
+) -> serde_json::Value {
+    use magi_browser_authority::BrowserActionVerdict;
+    let Some(effect) = target.and_then(|target| target.effect.as_ref()) else {
+        return json!({"result":"unobserved","instruction":"这个动作没有页面效果证据；请用下一次快照核对结果。"});
+    };
+    let (result, instruction) = match effect.verdict {
+        BrowserActionVerdict::Navigated => (
+            "page_navigated",
+            "动作触发了页面跳转，旧页面的节点引用已失效且不可重放；只依据下一次最新快照核对跳转结果并继续。",
+        ),
+        BrowserActionVerdict::Changed => (
+            "page_changed",
+            "动作已生效，页面或目标状态发生了变化；依据 effect 和下一次快照继续，不需要重复该动作。",
+        ),
+        BrowserActionVerdict::NoVisibleChange => (
+            "no_visible_change",
+            "动作的原生事件已送达，但没有观察到页面或目标状态变化。不要重复同一动作；先回读页面确认是否已经生效，确认没有则换用其他控件或方式，或交还用户。",
+        ),
+    };
+    json!({"result": result, "instruction": instruction, "effect": effect})
+}
+
+/// 页面跳转后旧引用全部失效，新快照是 Agent 的必经一步；其他结果下引用仍有效，不抢先抓快照。
+fn snapshot_by_default(outcome: &Value) -> bool {
+    outcome["result"] == "page_navigated"
+}
+
+pub(crate) fn browser_tool_snapshot_value(
     snapshot: &BrowserHostSnapshot,
     logical_tab_id: &BrowserTabId,
 ) -> Value {
@@ -2765,6 +2800,10 @@ fn browser_tool_snapshot_value(
         json!(snapshot.navigation_revision),
     );
     value.insert("title".to_string(), json!(snapshot.root.name));
+    // 视口、滚动位置和未返回控件的汇总；采集端按「视口内优先」排序，这里让 Agent 知道漏了什么。
+    if let Some(summary) = snapshot.root.description.as_ref() {
+        value.insert("page".to_string(), json!(summary));
+    }
     value.insert("returned_nodes".to_string(), json!(snapshot.returned_nodes));
     value.insert("total_nodes".to_string(), json!(snapshot.total_nodes));
     value.insert("text_bytes".to_string(), json!(snapshot.text_bytes));
@@ -3102,6 +3141,61 @@ impl ApiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_navigating_action_gets_the_follow_up_snapshot_by_default() {
+        use magi_browser_authority::BrowserActionVerdict;
+        let target = |verdict| magi_browser_authority::BrowserActionTarget {
+            role: None,
+            name: None,
+            effect: Some(magi_browser_authority::BrowserActionEffect {
+                verdict,
+                delivered: magi_browser_authority::BrowserActionDelivery::Confirmed,
+                navigated: false,
+                dom_mutations: None,
+                target_connected: None,
+                target_state: None,
+            }),
+        };
+        assert!(snapshot_by_default(&action_outcome(Some(&target(BrowserActionVerdict::Navigated)))));
+        assert!(!snapshot_by_default(&action_outcome(Some(&target(BrowserActionVerdict::Changed)))));
+        assert!(!snapshot_by_default(&action_outcome(Some(&target(BrowserActionVerdict::NoVisibleChange)))));
+        assert!(!snapshot_by_default(&action_outcome(None)));
+    }
+
+    #[test]
+    fn action_outcome_tells_the_agent_whether_the_action_took_effect() {
+        use magi_browser_authority::{
+            BrowserActionDelivery, BrowserActionEffect, BrowserActionTarget, BrowserActionVerdict,
+        };
+        let target = |verdict| BrowserActionTarget {
+            role: Some("button".into()),
+            name: Some("展开".into()),
+            effect: Some(BrowserActionEffect {
+                verdict,
+                delivered: BrowserActionDelivery::Confirmed,
+                navigated: matches!(verdict, BrowserActionVerdict::Navigated),
+                dom_mutations: Some(0),
+                target_connected: Some(true),
+                target_state: None,
+            }),
+        };
+        for (verdict, expected) in [
+            (BrowserActionVerdict::Navigated, "page_navigated"),
+            (BrowserActionVerdict::Changed, "page_changed"),
+            (BrowserActionVerdict::NoVisibleChange, "no_visible_change"),
+        ] {
+            assert_eq!(action_outcome(Some(&target(verdict)))["result"], expected);
+        }
+        let none = action_outcome(None);
+        assert_eq!(none["result"], "unobserved");
+        assert!(
+            action_outcome(Some(&target(BrowserActionVerdict::NoVisibleChange)))["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("不要重复")
+        );
+    }
+
     use super::*;
     #[test]
     fn browser_viewport_auto_returns_actual_metrics_without_fabricating_fixed_config() {

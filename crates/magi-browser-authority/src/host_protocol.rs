@@ -335,24 +335,6 @@ pub enum BrowserHostCommand {
         offset: u64,
         length: u64,
     },
-    /// 只读检查 ChatGPT 侧是否已有名为 `name` 的 Magi 连接器、是否启用以及能列出的工具数。
-    WebConnectorStatus {
-        tab_id: BrowserTabId,
-        name: String,
-    },
-    /// 在 ChatGPT 设置里为 Magi MCP 创建 / 启用连接器，并回读确认。只写连接器设置，不动其它设置。
-    WebConfigureConnector {
-        tab_id: BrowserTabId,
-        control: BrowserHostControl,
-        name: String,
-        tunnel_id: String,
-    },
-    /// 创建 / 回读 OpenAI 平台 Tunnel；只返回固定状态与 Tunnel id。
-    WebPlatformSetup {
-        tab_id: BrowserTabId,
-        control: BrowserHostControl,
-        action: String,
-    },
     /// daemon 持有的浏览器网络策略开关，推送给 Electron Main 在 guest 网络层执行。
     /// Host 连接建立时先推送、设置变化时再推送；Main 重启后默认拒绝局域网，直到收到推送。
     ConfigureNetworkPolicy {
@@ -378,9 +360,7 @@ impl BrowserHostCommand {
             | Self::WebAttachFiles { .. }
             | Self::WebClearAttachments { .. }
             | Self::WebAnswerQuestion { .. }
-            | Self::WebCancelGeneration { .. }
-            | Self::WebConfigureConnector { .. }
-            | Self::WebPlatformSetup { .. } => true,
+            | Self::WebCancelGeneration { .. } => true,
             Self::Ping
             | Self::Cancel { .. }
             | Self::CreatePage { .. }
@@ -404,7 +384,6 @@ impl BrowserHostCommand {
             | Self::WebSavedConversations { .. }
             | Self::WebSavedMessages { .. }
             | Self::WebReadImage { .. }
-            | Self::WebConnectorStatus { .. }
             | Self::ConfigureNetworkPolicy { .. }
             | Self::Shutdown => false,
         }
@@ -597,6 +576,43 @@ pub enum BrowserHostCommandResult {
 pub struct BrowserActionTarget {
     pub role: Option<String>,
     pub name: Option<String>,
+    /// 动作的可观察结果；按键、滚动等没有结果证据的命令为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<BrowserActionEffect>,
+}
+
+/// 交互动作实际产生的效果，由 Worker 在页面内观察得出，是 Agent 判断“操作是否生效”的唯一依据。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserActionEffect {
+    pub verdict: BrowserActionVerdict,
+    pub delivered: BrowserActionDelivery,
+    pub navigated: bool,
+    pub dom_mutations: Option<u32>,
+    pub target_connected: Option<bool>,
+    pub target_state: Option<BrowserActionTargetState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionVerdict {
+    Navigated,
+    Changed,
+    NoVisibleChange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionDelivery {
+    Confirmed,
+    Inferred,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserActionTargetState {
+    pub before: String,
+    pub after: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1125,9 +1141,24 @@ mod tests {
             &Some(BrowserActionTarget {
                 role: Some("button".to_string()),
                 name: Some("提交订单".to_string()),
+                effect: None,
             })
         );
         assert_eq!(serde_json::to_value(&parsed).unwrap(), interaction);
+
+        let with_effect = serde_json::json!({
+            "type": "action_target",
+            "payload": {
+                "role": "button", "name": "展开",
+                "effect": {
+                    "verdict": "changed", "delivered": "confirmed", "navigated": false,
+                    "dom_mutations": 7, "target_connected": true,
+                    "target_state": { "before": "expanded=false", "after": "expanded=true" }
+                }
+            }
+        });
+        let parsed_effect: BrowserHostCommandResult = serde_json::from_value(with_effect.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed_effect).unwrap(), with_effect);
 
         let no_target = serde_json::json!({ "type": "action_target", "payload": null });
         assert_eq!(
