@@ -13,25 +13,23 @@
     <p class="confirm-message">{request.message}</p>
 
     {#snippet footer()}
-      <div class="confirm-footer">
-        <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('cancel')}>
-          {request.cancelLabel}
+      <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('cancel')}>
+        {request.cancelLabel}
+      </button>
+      {#if request.secondaryLabel}
+        <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('secondary')}>
+          {request.secondaryLabel}
         </button>
-        {#if request.secondaryLabel}
-          <button type="button" class="btn btn--secondary btn--sm" onclick={() => settleConfirm('secondary')}>
-            {request.secondaryLabel}
-          </button>
-        {/if}
-        <button
-          type="button"
-          class="btn btn--sm"
-          class:btn--primary={request.tone !== 'danger'}
-          class:btn--error={request.tone === 'danger'}
-          onclick={() => settleConfirm('confirm')}
-        >
-          {request.confirmLabel}
-        </button>
-      </div>
+      {/if}
+      <button
+        type="button"
+        class="btn btn--sm"
+        class:btn--primary={request.tone !== 'danger'}
+        class:btn--error={request.tone === 'danger'}
+        onclick={() => settleConfirm('confirm')}
+      >
+        {request.confirmLabel}
+      </button>
     {/snippet}
   </Modal>
 {/if}
@@ -43,12 +41,5 @@
     font-size: var(--text-sm);
     line-height: 1.6;
     white-space: pre-line;
-  }
-
-  .confirm-footer {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: var(--space-2);
   }
 </style>
