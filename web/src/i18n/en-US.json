@@ -2706,7 +2706,6 @@
   "webModel.quota.sentCount": "{count} messages",
   "webModel.clearData.confirmBody": "This stops any running inference, then clears the GPT Web partition (sign-in) and returns GPT Web to signed-out. Other browser tabs' site data is untouched.",
   "webModel.clearData.done": "GPT Web data cleared; sign in again",
-  "settings.browser.webModel.title": "GPT Web",
   "settings.browser.webModel.desc": "Chat with the ChatGPT account you signed in to in the built-in browser. Magi only sends your message for this turn; context, model and strength are managed by the web page.",
   "settings.browser.webModel.connect": "Check again",
   "settings.browser.webModel.connecting": "Checking the ChatGPT page…",

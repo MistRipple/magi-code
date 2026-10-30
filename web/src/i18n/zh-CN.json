@@ -2706,7 +2706,6 @@
   "webModel.quota.sentCount": "{count} 条消息",
   "webModel.clearData.confirmBody": "会先停止进行中的推理，然后清除 GPT Web 专用分区（登录态）并让 GPT Web 回到未登录；不会动其他浏览器 Tab 的站点数据。",
   "webModel.clearData.done": "已清除 GPT Web 数据，需要重新登录",
-  "settings.browser.webModel.title": "GPT Web",
   "settings.browser.webModel.desc": "使用你在内置浏览器里登录的 ChatGPT 账号对话。Magi 只发送你本轮的消息，上下文、模型与强度都由网页管理。",
   "settings.browser.webModel.connect": "重新检查",
   "settings.browser.webModel.connecting": "正在检查 ChatGPT 页面…",
